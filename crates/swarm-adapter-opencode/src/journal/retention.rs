@@ -14,13 +14,17 @@ use std::{
     fs,
     ops::Bound::{Excluded, Unbounded},
     path::{Path, PathBuf},
-    sync::MutexGuard,
+    sync::{MutexGuard, atomic::Ordering},
 };
 use swarm_process::{RemovalDurability, RemovalOutcome, remove_private_acknowledged};
 
 const MAX_RETENTION_STEPS: usize = 32;
 const RETENTION_CURSOR_FILE: &str = "retention-cursor.json";
-const RETENTION_CURSOR_VERSION: u32 = 2;
+const RETENTION_CURSOR_VERSION: u32 = 3;
+pub(super) const ADDRESS_CHECKPOINT_DIR: &str = "native-checkpoint-addresses";
+pub(super) const ADDRESS_MEMO_VERSION: u32 = 1;
+const ADDRESS_MEMO_LIMIT: usize = HISTORY_LIMIT * 4;
+const RETENTION_CURSOR_LIMIT: usize = 1024;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -33,12 +37,73 @@ struct RetentionCursor {
     cursor: Option<String>,
     #[serde(default)]
     removal_durability_unknown: Option<bool>,
+    /// Bounded startup-inventory position in the same file: the last
+    /// operation key fully classified this cycle, or None when the cycle
+    /// is complete. Traversal-only like `cursor`; never deletion authority.
+    #[serde(default)]
+    startup_cursor: Option<String>,
+    /// Read only to migrate v2 cursors. New cursors omit this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unresolved_keys: Vec<String>,
+    #[serde(default)]
+    address_count: u64,
+    #[serde(default)]
+    address_digest: String,
+    #[serde(default)]
+    legacy_reclamation_pending: bool,
+    /// The address memos have passed one complete legacy convergence.
+    #[serde(default)]
+    startup_complete: bool,
 }
 
 #[derive(Default)]
 struct LoadedRetentionCursor {
     cursor: Option<String>,
     removal_durability_unknown: bool,
+    startup_cursor: Option<String>,
+    address_count: u64,
+    address_digest: String,
+    legacy_reclamation_pending: bool,
+    startup_complete: bool,
+}
+
+/// Address-only metadata for one operation that is unresolved, referenced,
+/// newly appended, or awaiting safe reclamation. It contains no outcome/ACK
+/// authority; the operation journal remains authoritative.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OperationAddressMemo {
+    version: u32,
+    binding_id: String,
+    generation: i64,
+    native_scope_key: String,
+    route_sha256: String,
+    operation_id: String,
+    operation_key: String,
+    references: Vec<String>,
+    pub(super) native_root_ids: Vec<String>,
+}
+
+impl OperationAddressMemo {
+    pub(super) fn new(
+        identity: &StateIdentity,
+        operation_id: String,
+        operation_key: String,
+        references: Vec<String>,
+        native_root_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            version: ADDRESS_MEMO_VERSION,
+            binding_id: identity.binding_id.clone(),
+            generation: identity.generation,
+            native_scope_key: identity.native_scope_key.clone(),
+            route_sha256: identity.route_sha256.clone(),
+            operation_id,
+            operation_key,
+            references,
+            native_root_ids,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -48,6 +113,7 @@ struct IndexedOperation {
 
 pub(super) struct RetentionIndex {
     cursor_path: PathBuf,
+    address_dir: PathBuf,
     identity: StateIdentity,
     cursor: Option<String>,
     entries: BTreeMap<String, IndexedOperation>,
@@ -57,14 +123,50 @@ pub(super) struct RetentionIndex {
     ready: bool,
     references_unknown: bool,
     removal_durability_unknown: bool,
+    startup_cursor: Option<String>,
+    /// True until one accumulation cycle has classified every listed
+    /// operation file. Deletion still requires a complete, damage-free
+    /// index; an incomplete scan only holds, never authorises removal.
+    scan_incomplete: bool,
+    /// Durable mirror of `unresolved_keys`: the steady-state read list.
+    /// Derived from per-operation address memos, never stored as a key vector
+    /// in the traversal cursor.
+    durable_unresolved: BTreeSet<String>,
+    addresses: BTreeMap<String, OperationAddressMemo>,
+    address_digest: [u8; 32],
+    /// A bounded legacy name snapshot is reused across all body windows in
+    /// one in-process convergence.
+    startup_names: Option<Vec<String>>,
+    startup_invalid_names: usize,
+    classified_names: BTreeSet<String>,
+    steady_seen: BTreeSet<String>,
+    /// Safe legacy candidates are rediscovered in one legacy convergence
+    /// after a crash until the bounded reclamation queue drains.
+    legacy_reclamation_pending: bool,
+    startup_complete: bool,
 }
 
 impl RetentionIndex {
-    pub(super) fn open(root: &Path, identity: &StateIdentity) -> Self {
+    pub(super) fn open(root: &Path, address_dir: &Path, identity: &StateIdentity) -> Self {
         let cursor_path = root.join(RETENTION_CURSOR_FILE);
         let saved = read_cursor(&cursor_path, identity);
+        let (addresses, address_digest, addresses_valid) =
+            read_address_memos(address_dir, identity);
+        let address_count = addresses.len() as u64;
+        let saved_address_state_matches = saved.address_count == address_count
+            && saved.address_digest == digest_hex(&address_digest);
+        let startup_complete =
+            saved.startup_complete && addresses_valid && saved_address_state_matches;
+        let mut durable_unresolved = BTreeSet::new();
+        for (key, memo) in &addresses {
+            durable_unresolved.insert(key.clone());
+            for reference in &memo.references {
+                durable_unresolved.insert(operation_key(reference));
+            }
+        }
         Self {
             cursor_path,
+            address_dir: address_dir.to_path_buf(),
             identity: identity.clone(),
             cursor: saved.cursor,
             entries: BTreeMap::new(),
@@ -72,18 +174,45 @@ impl RetentionIndex {
             reverse_references: BTreeMap::new(),
             queue: BTreeSet::new(),
             ready: false,
-            references_unknown: false,
+            references_unknown: !addresses_valid,
             removal_durability_unknown: saved.removal_durability_unknown,
+            startup_cursor: if addresses_valid && saved_address_state_matches {
+                saved.startup_cursor
+            } else {
+                None
+            },
+            scan_incomplete: true,
+            durable_unresolved,
+            addresses,
+            address_digest,
+            startup_names: None,
+            startup_invalid_names: 0,
+            classified_names: BTreeSet::new(),
+            steady_seen: BTreeSet::new(),
+            legacy_reclamation_pending: saved.legacy_reclamation_pending,
+            startup_complete,
         }
     }
 
     fn begin_recovery(&mut self) {
+        // A caller may request another bounded window while a legacy scan or
+        // steady sparse pass is in progress. Preserve its accumulated index.
+        if self.ready && self.scan_incomplete {
+            return;
+        }
         self.entries.clear();
         self.operation_keys.clear();
         self.reverse_references.clear();
         self.queue.clear();
         self.ready = false;
         self.references_unknown = false;
+        // A fresh recovery scan must prove coverage again before deletion.
+        self.scan_incomplete = true;
+        self.classified_names.clear();
+        self.steady_seen.clear();
+        if self.startup_complete && !self.legacy_reclamation_pending {
+            self.startup_names = None;
+        }
     }
 
     fn register(&mut self, retained: RetainedOperation) {
@@ -145,12 +274,14 @@ impl RetentionIndex {
         let Some(key) = self.operation_keys.get(operation_id).cloned() else {
             return;
         };
-        // Keep blocked terminal candidates indexed. A pass advances past an
-        // exact outbox/reference deferral without authorizing its deletion.
+        // Keep blocked terminal records indexed, but do not keep a referenced
+        // record in the reclaim queue. When its final reference is removed,
+        // the source update/removal path calls sync_queue again.
         let eligible = self
             .entries
             .get(&key)
-            .is_some_and(|entry| entry.retained.releasable && !entry.retained.result_source);
+            .is_some_and(|entry| entry.retained.releasable && !entry.retained.result_source)
+            && !self.has_references(operation_id);
         if eligible {
             self.queue.insert(key);
         } else {
@@ -200,11 +331,23 @@ impl RetentionIndex {
             route_sha256: self.identity.route_sha256.clone(),
             cursor: self.cursor.clone(),
             removal_durability_unknown: Some(self.removal_durability_unknown),
+            startup_cursor: self.startup_cursor.clone(),
+            unresolved_keys: Vec::new(),
+            address_count: self.addresses.len() as u64,
+            address_digest: digest_hex(&self.address_digest),
+            legacy_reclamation_pending: self.legacy_reclamation_pending,
+            startup_complete: self.startup_complete,
         }
     }
 
     fn persist_cursor(&self) -> Result<()> {
         let bytes = serde_json::to_vec(&self.cursor_record())?;
+        if bytes.len() > RETENTION_CURSOR_LIMIT {
+            return Err(Error::new(
+                "ADAPTER_RETENTION_STATE",
+                "fixed retention cursor exceeds its byte limit",
+            ));
+        }
         if self.cursor_path.exists() {
             super::ensure_regular(&self.cursor_path, "retention cursor")?;
             replace_private_durable(&self.cursor_path, &bytes)?;
@@ -212,11 +355,112 @@ impl RetentionIndex {
             write_private_new(&self.cursor_path, &bytes)?;
         }
         super::ensure_regular(&self.cursor_path, "retention cursor")?;
-        if read_limited(&self.cursor_path, 1024)? != bytes {
+        if read_limited(&self.cursor_path, RETENTION_CURSOR_LIMIT)? != bytes {
             return Err(Error::new(
                 "ADAPTER_RETENTION_STATE",
                 "retention cursor failed exact durable readback",
             ));
+        }
+        Ok(())
+    }
+
+    fn persist_address_memo(&mut self, memo: OperationAddressMemo) -> Result<()> {
+        if memo.version != ADDRESS_MEMO_VERSION
+            || memo.binding_id != self.identity.binding_id
+            || memo.generation != self.identity.generation
+            || memo.native_scope_key != self.identity.native_scope_key
+            || memo.route_sha256 != self.identity.route_sha256
+            || !valid_operation_key(&memo.operation_key)
+            || memo.operation_key != operation_key(&memo.operation_id)
+            || memo.references.iter().any(|id| id.is_empty())
+        {
+            return Err(Error::new(
+                "ADAPTER_RETENTION_STATE",
+                "operation address memo identity is invalid",
+            ));
+        }
+        let bytes = serde_json::to_vec(&memo)?;
+        if bytes.len() > ADDRESS_MEMO_LIMIT {
+            return Err(Error::new(
+                "ADAPTER_RETENTION_STATE",
+                "operation address memo exceeds its per-operation byte limit",
+            ));
+        }
+        let path = self
+            .address_dir
+            .join(format!("{}.json", memo.operation_key));
+        if path.exists() {
+            super::ensure_regular(&path, "operation address memo")?;
+            replace_private_durable(&path, &bytes)?;
+        } else {
+            write_private_new(&path, &bytes)?;
+        }
+        super::ensure_regular(&path, "operation address memo")?;
+        if read_limited(&path, ADDRESS_MEMO_LIMIT)? != bytes {
+            return Err(Error::new(
+                "ADAPTER_RETENTION_STATE",
+                "operation address memo failed exact durable readback",
+            ));
+        }
+        let key = memo.operation_key.clone();
+        self.address_digest =
+            replace_address_fingerprint(self.address_digest, self.addresses.get(&key), &memo)?;
+        self.addresses.insert(key.clone(), memo.clone());
+        self.durable_unresolved.insert(key);
+        for reference in &memo.references {
+            self.durable_unresolved.insert(operation_key(reference));
+        }
+        Ok(())
+    }
+
+    fn ensure_address_closure(&mut self, memo: OperationAddressMemo) -> Result<()> {
+        // The source record is the write-ahead authority for its outgoing
+        // addresses. Persist it first, then materialize target address slots
+        // so the closure survives if the source later resolves before delete.
+        self.persist_address_memo(memo.clone())?;
+        for reference in &memo.references {
+            let target_key = operation_key(reference);
+            if self.addresses.contains_key(&target_key) {
+                continue;
+            }
+            self.persist_address_memo(OperationAddressMemo {
+                version: ADDRESS_MEMO_VERSION,
+                binding_id: self.identity.binding_id.clone(),
+                generation: self.identity.generation,
+                native_scope_key: self.identity.native_scope_key.clone(),
+                route_sha256: self.identity.route_sha256.clone(),
+                operation_id: reference.clone(),
+                operation_key: target_key,
+                references: Vec::new(),
+                native_root_ids: Vec::new(),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn recompute_durable_unresolved(&mut self) {
+        self.durable_unresolved.clear();
+        for (key, memo) in &self.addresses {
+            self.durable_unresolved.insert(key.clone());
+            for reference in &memo.references {
+                self.durable_unresolved.insert(operation_key(reference));
+            }
+        }
+    }
+
+    fn remove_address_memo(&mut self, key: &str) -> Result<()> {
+        if !self.addresses.contains_key(key) {
+            return Ok(());
+        }
+        let path = self.address_dir.join(format!("{key}.json"));
+        let outcome = remove_private_acknowledged(&path)?;
+        if outcome.removed || outcome.durability == RemovalDurability::Confirmed {
+            self.addresses.remove(key);
+            // Recompute from the remaining records after a confirmed namespace
+            // removal. (Unknown durability is reported separately by the
+            // operation journal deletion path.)
+            self.address_digest = address_set_fingerprint(&self.addresses)?;
+            self.recompute_durable_unresolved();
         }
         Ok(())
     }
@@ -229,6 +473,10 @@ impl RetentionIndex {
     #[cfg(test)]
     pub(super) fn removal_durability_unknown_for_test(&self) -> bool {
         self.removal_durability_unknown
+    }
+    #[cfg(test)]
+    pub(super) fn startup_cursor_for_test(&self) -> Option<&str> {
+        self.startup_cursor.as_deref()
     }
 }
 
@@ -243,7 +491,7 @@ fn read_cursor(path: &Path, identity: &StateIdentity) -> LoadedRetentionCursor {
     if super::ensure_regular(path, "retention cursor").is_err() {
         return untrusted_cursor();
     }
-    let Ok(bytes) = read_limited(path, 1024) else {
+    let Ok(bytes) = read_limited(path, RETENTION_CURSOR_LIMIT) else {
         return untrusted_cursor();
     };
     let Ok(saved) = serde_json::from_slice::<RetentionCursor>(&bytes) else {
@@ -261,16 +509,27 @@ fn read_cursor(path: &Path, identity: &StateIdentity) -> LoadedRetentionCursor {
         return untrusted_cursor();
     }
     match (saved.version, saved.removal_durability_unknown) {
-        // Version 1 predates persisted removal dispositions. Its cursor is
-        // still safe traversal progress, but it cannot prove no Unknown result
-        // was forgotten by the earlier consumer.
-        (1, _) => LoadedRetentionCursor {
+        // Versions 1 and 2 have no per-operation address checkpoint. Keep the
+        // deletion cursor, but rebuild startup coverage before trusting them.
+        (1 | 2, _) => LoadedRetentionCursor {
             cursor: saved.cursor,
-            removal_durability_unknown: true,
+            removal_durability_unknown: saved.removal_durability_unknown.unwrap_or(true),
+            startup_cursor: None,
+            address_count: 0,
+            address_digest: String::new(),
+            legacy_reclamation_pending: true,
+            startup_complete: false,
         },
         (RETENTION_CURSOR_VERSION, Some(removal_durability_unknown)) => LoadedRetentionCursor {
             cursor: saved.cursor,
             removal_durability_unknown,
+            startup_cursor: saved.startup_cursor.filter(|key| valid_operation_key(key)),
+            address_count: saved.address_count,
+            address_digest: saved.address_digest.clone(),
+            legacy_reclamation_pending: saved.legacy_reclamation_pending,
+            startup_complete: saved.startup_complete
+                && saved.unresolved_keys.is_empty()
+                && valid_digest(&saved.address_digest),
         },
         // An existing malformed, incomplete, or future cursor must never be
         // interpreted as a clean durability disposition.
@@ -282,11 +541,118 @@ fn untrusted_cursor() -> LoadedRetentionCursor {
     LoadedRetentionCursor {
         cursor: None,
         removal_durability_unknown: true,
+        startup_cursor: None,
+        address_count: 0,
+        address_digest: String::new(),
+        legacy_reclamation_pending: true,
+        startup_complete: false,
     }
 }
 
 fn valid_operation_key(key: &str) -> bool {
     key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn memo_fingerprint(memo: &OperationAddressMemo) -> Result<[u8; 32]> {
+    let bytes = serde_json::to_vec(memo)?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"eliot-opencode-address-memo-v1\0");
+    hasher.update(bytes);
+    Ok(hasher.finalize().into())
+}
+
+fn xor_digest(mut digest: [u8; 32], fingerprint: [u8; 32]) -> [u8; 32] {
+    for (left, right) in digest.iter_mut().zip(fingerprint) {
+        *left ^= right;
+    }
+    digest
+}
+
+fn replace_address_fingerprint(
+    digest: [u8; 32],
+    previous: Option<&OperationAddressMemo>,
+    next: &OperationAddressMemo,
+) -> Result<[u8; 32]> {
+    let digest = match previous {
+        Some(previous) => xor_digest(digest, memo_fingerprint(previous)?),
+        None => digest,
+    };
+    Ok(xor_digest(digest, memo_fingerprint(next)?))
+}
+
+fn address_set_fingerprint(addresses: &BTreeMap<String, OperationAddressMemo>) -> Result<[u8; 32]> {
+    let mut digest = [0; 32];
+    for memo in addresses.values() {
+        digest = xor_digest(digest, memo_fingerprint(memo)?);
+    }
+    Ok(digest)
+}
+
+fn read_address_memos(
+    address_dir: &Path,
+    identity: &StateIdentity,
+) -> (BTreeMap<String, OperationAddressMemo>, [u8; 32], bool) {
+    let mut addresses = BTreeMap::new();
+    let mut digest = [0; 32];
+    let entries = match fs::read_dir(address_dir) {
+        Ok(entries) => entries,
+        Err(_) => return (addresses, digest, false),
+    };
+    let mut valid = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            valid = false;
+            continue;
+        };
+        let path = entry.path();
+        let Some(key) = path.file_stem().and_then(|value| value.to_str()) else {
+            valid = false;
+            continue;
+        };
+        if !valid_operation_key(key)
+            || path.extension().and_then(|value| value.to_str()) != Some("json")
+            || super::ensure_regular(&path, "operation address memo").is_err()
+        {
+            valid = false;
+            continue;
+        }
+        let Ok(bytes) = read_limited(&path, ADDRESS_MEMO_LIMIT) else {
+            valid = false;
+            continue;
+        };
+        let Ok(memo) = serde_json::from_slice::<OperationAddressMemo>(&bytes) else {
+            valid = false;
+            continue;
+        };
+        if memo.version != ADDRESS_MEMO_VERSION
+            || memo.binding_id != identity.binding_id
+            || memo.generation != identity.generation
+            || memo.native_scope_key != identity.native_scope_key
+            || memo.route_sha256 != identity.route_sha256
+            || memo.operation_key != key
+            || operation_key(&memo.operation_id) != key
+        {
+            valid = false;
+            continue;
+        }
+        match memo_fingerprint(&memo) {
+            Ok(fingerprint) => digest = xor_digest(digest, fingerprint),
+            Err(_) => {
+                valid = false;
+                continue;
+            }
+        }
+        addresses.insert(key.to_owned(), memo);
+    }
+    (addresses, digest, valid)
 }
 
 fn lock_index(journal: &Journal) -> Result<MutexGuard<'_, RetentionIndex>> {
@@ -306,6 +672,16 @@ pub(super) fn register_operation(journal: &Journal, retained: RetainedOperation)
     Ok(())
 }
 
+pub(super) fn refresh_operation_address(
+    journal: &Journal,
+    memo: OperationAddressMemo,
+) -> Result<()> {
+    let mut index = lock_index(journal)?;
+    index.ensure_address_closure(memo)?;
+    index.persist_cursor()?;
+    Ok(())
+}
+
 pub(super) fn mark_damaged(journal: &Journal) -> Result<()> {
     lock_index(journal)?.references_unknown = true;
     Ok(())
@@ -314,6 +690,244 @@ pub(super) fn mark_damaged(journal: &Journal) -> Result<()> {
 pub(super) fn finish_recovery(journal: &Journal) -> Result<()> {
     lock_index(journal)?.ready = true;
     Ok(())
+}
+/// Bounded startup-inventory progress in the shared cursor file: the last
+/// classified operation key and whether the current accumulation still
+/// misses listed files. One lock per call; callers persist once per pass.
+/// Selection is cyclic after the persisted position and skips already
+/// registered keys, so repeated bounded calls partition the listing with
+/// no overlap and the pending tail resumes across restarts.
+pub(super) fn startup_window(
+    journal: &Journal,
+    names: &[String],
+    budget: usize,
+) -> Result<Vec<String>> {
+    let index = lock_index(journal)?;
+    Ok(select_startup_window(&index, names, budget))
+}
+
+pub(super) fn remember_startup_names(
+    journal: &Journal,
+    names: Vec<String>,
+    invalid: usize,
+) -> Result<()> {
+    let mut index = lock_index(journal)?;
+    if index.startup_names.is_none() {
+        index.startup_names = Some(names);
+        index.startup_invalid_names = invalid;
+        index.startup_complete = false;
+        index.startup_cursor = None;
+        index.classified_names.clear();
+        if invalid > 0 {
+            index.references_unknown = true;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn cached_startup_names(journal: &Journal) -> Result<Option<(Vec<String>, usize)>> {
+    let index = lock_index(journal)?;
+    Ok(index
+        .startup_names
+        .clone()
+        .map(|names| (names, index.startup_invalid_names)))
+}
+
+pub(super) fn mark_startup_classified(journal: &Journal, key: &str) -> Result<()> {
+    lock_index(journal)?.classified_names.insert(key.to_owned());
+    Ok(())
+}
+
+fn select_startup_window(index: &RetentionIndex, names: &[String], budget: usize) -> Vec<String> {
+    let start = match index.startup_cursor.as_deref() {
+        None => 0,
+        Some(cursor) => names.partition_point(|name| name.as_str() <= cursor),
+    };
+    names[start..]
+        .iter()
+        .chain(names[..start].iter())
+        .filter(|name| !index.classified_names.contains(*name))
+        .take(budget.max(1))
+        .cloned()
+        .collect()
+}
+
+pub(super) fn scan_covered(journal: &Journal, names: &[String]) -> Result<bool> {
+    let index = lock_index(journal)?;
+    Ok(names
+        .iter()
+        .all(|name| index.classified_names.contains(name)))
+}
+
+pub(super) fn store_startup_progress(
+    journal: &Journal,
+    cursor: Option<String>,
+    complete: bool,
+    legacy: bool,
+) -> Result<()> {
+    let mut index = lock_index(journal)?;
+    index.startup_cursor = cursor;
+    if complete {
+        if index.references_unknown {
+            index.scan_incomplete = true;
+            index.persist_cursor()?;
+            return Err(Error::new(
+                "ADAPTER_STARTUP_RECOVERY_INCOMPLETE",
+                "startup inventory contains an unclassified operation address",
+            ));
+        }
+        // Publish sparse per-operation addresses before the fixed cursor can
+        // claim that the legacy inventory is complete.
+        snapshot_attention(&mut index);
+        persist_attention_memos(&mut index)?;
+        index.startup_complete = true;
+        index.legacy_reclamation_pending = index
+            .queue
+            .iter()
+            .any(|key| !index.durable_unresolved.contains(key));
+        if legacy {
+            index.startup_names = None;
+            index.classified_names.clear();
+            index.scan_incomplete = false;
+        } else {
+            index.scan_incomplete = !index
+                .durable_unresolved
+                .iter()
+                .all(|key| index.steady_seen.contains(key));
+        }
+    } else {
+        index.scan_incomplete = true;
+    }
+    index.persist_cursor()?;
+    Ok(())
+}
+
+/// Fold every entry needing attention into the durable set: entries that
+/// are not releasable plus targets referenced by other entries. Stale
+/// keys (resolved and drained) leave only through reclaim deletion or an
+/// explicit missing-file drop, so the set stays proportional to current
+/// work rather than lifetime history.
+fn snapshot_attention(index: &mut RetentionIndex) {
+    let mut attention = Vec::new();
+    let mut references = Vec::new();
+    for (key, entry) in &index.entries {
+        let referenced = index
+            .reverse_references
+            .get(&entry.retained.operation_id)
+            .is_some_and(|sources| !sources.is_empty());
+        if !entry.retained.releasable
+            || entry.retained.result_source
+            || entry.retained.pending_delivery
+            || referenced
+        {
+            attention.push(key.clone());
+            references.extend(entry.retained.references.iter().cloned());
+        }
+    }
+    for key in attention {
+        index.durable_unresolved.insert(key);
+    }
+    for reference in references {
+        index.durable_unresolved.insert(operation_key(&reference));
+    }
+}
+
+fn persist_attention_memos(index: &mut RetentionIndex) -> Result<()> {
+    let keys: Vec<String> = index.durable_unresolved.iter().cloned().collect();
+    for key in keys {
+        let Some(entry) = index.entries.get(&key).cloned() else {
+            continue;
+        };
+        let retained = entry.retained;
+        let memo = OperationAddressMemo {
+            version: ADDRESS_MEMO_VERSION,
+            binding_id: index.identity.binding_id.clone(),
+            generation: index.identity.generation,
+            native_scope_key: index.identity.native_scope_key.clone(),
+            route_sha256: index.identity.route_sha256.clone(),
+            operation_id: retained.operation_id,
+            operation_key: key,
+            references: retained.references,
+            native_root_ids: retained.native_root_ids,
+        };
+        index.ensure_address_closure(memo)?;
+    }
+    Ok(())
+}
+
+pub(super) fn operation_address_memos(journal: &Journal) -> Result<Vec<OperationAddressMemo>> {
+    Ok(lock_index(journal)?.addresses.values().cloned().collect())
+}
+
+pub(super) fn durable_startup_complete(journal: &Journal) -> Result<bool> {
+    Ok(lock_index(journal)?.startup_complete)
+}
+
+pub(super) fn legacy_reclamation_pending(journal: &Journal) -> Result<bool> {
+    Ok(lock_index(journal)?.legacy_reclamation_pending)
+}
+
+pub(super) fn steady_window_keys(journal: &Journal, budget: usize) -> Result<Vec<String>> {
+    let index = lock_index(journal)?;
+    Ok(index
+        .durable_unresolved
+        .iter()
+        .filter(|key| !index.steady_seen.contains(*key))
+        .take(budget.max(1))
+        .cloned()
+        .collect())
+}
+
+pub(super) fn mark_steady_visited(journal: &Journal, key: &str) -> Result<()> {
+    lock_index(journal)?.steady_seen.insert(key.to_owned());
+    Ok(())
+}
+
+pub(super) fn steady_coverage_complete(journal: &Journal) -> Result<bool> {
+    let index = lock_index(journal)?;
+    Ok(index
+        .durable_unresolved
+        .iter()
+        .all(|key| index.steady_seen.contains(key)))
+}
+
+pub(super) fn startup_has_unknown_addresses(journal: &Journal) -> Result<bool> {
+    Ok(lock_index(journal)?.references_unknown)
+}
+
+/// Persist the operation's own address and outgoing reference targets before
+/// its journal bytes are appended. A crash can leave phantoms, never a live
+/// operation without an address memo.
+pub(super) fn note_operation_append(journal: &Journal, memo: OperationAddressMemo) -> Result<()> {
+    let mut index = lock_index(journal)?;
+    index.ensure_address_closure(memo)?;
+    index.persist_cursor()?;
+    Ok(())
+}
+
+/// Drop a durable key whose file is gone with no pending delivery.
+/// Missing live work always holds elsewhere; this only forgets phantoms.
+pub(super) fn drop_durable_key(journal: &Journal, key: &str) -> Result<()> {
+    let mut index = lock_index(journal)?;
+    let incoming_reference = index.addresses.values().any(|memo| {
+        memo.references
+            .iter()
+            .any(|reference| operation_key(reference) == key)
+    });
+    if incoming_reference {
+        index.references_unknown = true;
+        index.scan_incomplete = true;
+        return Ok(());
+    }
+    if index.addresses.contains_key(key) {
+        index.remove_address_memo(key)?;
+        index.persist_cursor()?;
+    }
+    Ok(())
+}
+
+pub(super) fn scan_incomplete(journal: &Journal) -> Result<bool> {
+    Ok(lock_index(journal)?.scan_incomplete)
 }
 
 pub(super) fn refresh_operation(journal: &Journal, operation_id: &str) {
@@ -337,7 +951,140 @@ fn refresh_operation_inner(journal: &Journal, operation_id: &str) -> Result<()> 
         &journal.identity.native_scope_key,
         pending_delivery,
     )?;
-    register_operation(journal, retained)
+    register_operation(journal, retained.clone())?;
+    refresh_operation_address(
+        journal,
+        OperationAddressMemo {
+            version: ADDRESS_MEMO_VERSION,
+            binding_id: journal.identity.binding_id.clone(),
+            generation: journal.identity.generation,
+            native_scope_key: journal.identity.native_scope_key.clone(),
+            route_sha256: journal.identity.route_sha256.clone(),
+            operation_id: retained.operation_id.clone(),
+            operation_key: operation_key(&retained.operation_id),
+            references: retained.references,
+            native_root_ids: retained.native_root_ids,
+        },
+    )
+}
+/// Extend an incomplete startup accumulation by one bounded window.
+/// Register-only: classification mirrors the recovery scan, but pending
+/// deliveries are left for the recovery window's turn and found unknowns
+/// are only counted. Entries that cannot be releasable (unacked, torn,
+/// damaged) stay retained either way, so deferring publication can only
+/// delay delivery, never authorise deletion. Caller holds the index lock;
+/// no second lock is taken here.
+fn extend_startup_scan(journal: &Journal, index: &mut RetentionIndex, budget: usize) -> Result<()> {
+    if index.startup_names.is_none() {
+        let (names, invalid) = journal.list_operation_names()?;
+        journal
+            .scan_listed
+            .fetch_add(names.len() as u64 + invalid as u64, Ordering::Relaxed);
+        if invalid > 0 {
+            index.references_unknown = true;
+        }
+        index.startup_invalid_names = invalid;
+        index.startup_names = Some(names);
+        index.startup_complete = false;
+        index.startup_cursor = None;
+        index.classified_names.clear();
+    }
+    let names = index.startup_names.clone().unwrap_or_default();
+    let window = select_startup_window(index, &names, budget);
+    for name in &window {
+        index.classified_names.insert(name.clone());
+        let path = journal.operations.join(format!("{name}.jsonl"));
+        super::ensure_regular(&path, "operation journal")?;
+        let observed_bytes = read_limited(&path, HISTORY_LIMIT)?;
+        journal.scan_bodies.fetch_add(1, Ordering::Relaxed);
+        journal
+            .scan_bytes
+            .fetch_add(observed_bytes.len() as u64, Ordering::Relaxed);
+        let history = match read_operation_history_bytes(&observed_bytes, None) {
+            Ok(history) => history,
+            Err(error) if error.code == "ADAPTER_JOURNAL" => {
+                index.references_unknown = true;
+                index.startup_cursor = Some(name.clone());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let known_operation_id = history
+            .intent
+            .as_ref()
+            .map(|intent| intent.operation_id.as_str())
+            .or_else(|| {
+                history
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome["operation_id"].as_str())
+            })
+            .or_else(|| {
+                history
+                    .result_params
+                    .as_ref()
+                    .and_then(|params| params["operation_id"].as_str())
+            });
+        let pending_delivery = match known_operation_id {
+            Some(operation_id) => match journal.operation_has_pending_delivery(operation_id) {
+                Ok(pending) => pending,
+                Err(_) => {
+                    index.references_unknown = true;
+                    true
+                }
+            },
+            None => {
+                index.references_unknown = true;
+                true
+            }
+        };
+        match summarize_retained_operation(
+            path,
+            &observed_bytes,
+            &history,
+            &journal.identity.binding_id,
+            journal.identity.generation,
+            &journal.identity.native_scope_key,
+            pending_delivery,
+        ) {
+            Ok(retained) => {
+                journal.check_native_root_identity(&retained)?;
+                index.register(retained);
+            }
+            Err(_) => index.references_unknown = true,
+        }
+        if history.recovery_unknown() || history.torn_tail_evidence.is_some() {
+            journal.scan_unresolved.fetch_add(1, Ordering::Relaxed);
+        }
+        index.startup_cursor = Some(name.clone());
+    }
+    if names
+        .iter()
+        .all(|name| index.classified_names.contains(name))
+    {
+        if index.references_unknown {
+            index.scan_incomplete = true;
+            index.persist_cursor()?;
+            return Err(Error::new(
+                "ADAPTER_STARTUP_RECOVERY_INCOMPLETE",
+                "legacy startup inventory contains damaged operation state",
+            ));
+        }
+        snapshot_attention(index);
+        persist_attention_memos(index)?;
+        index.startup_complete = true;
+        index.legacy_reclamation_pending = index
+            .queue
+            .iter()
+            .any(|key| !index.durable_unresolved.contains(key));
+        index.scan_incomplete = false;
+        index.startup_names = None;
+        index.classified_names.clear();
+    } else {
+        index.scan_incomplete = true;
+    }
+    index.persist_cursor()?;
+    Ok(())
 }
 
 pub(super) fn reclaim_acknowledged(
@@ -384,6 +1131,22 @@ pub(super) fn reclaim_acknowledged_with_remover(
             durability_unknown: index.removal_durability_unknown,
             ..RetentionSummary::default()
         });
+    }
+    // Incomplete startup accumulation holds deletion while it extends the
+    // index by one more bounded window. The queue stays drained=false so
+    // the command loop retries; nothing is deleted without full coverage.
+    if index.scan_incomplete {
+        extend_startup_scan(
+            journal,
+            &mut index,
+            crate::journal::MAX_STARTUP_SCAN_ENTRIES,
+        )?;
+        if index.scan_incomplete {
+            return Ok(RetentionSummary {
+                durability_unknown: index.removal_durability_unknown,
+                ..RetentionSummary::default()
+            });
+        }
     }
     index.persist_cursor()?;
 
@@ -489,10 +1252,16 @@ pub(super) fn reclaim_acknowledged_with_remover(
         index.removal_durability_unknown =
             previous_durability_unknown || outcome.durability == RemovalDurability::Unknown;
         index.remove_operation(&key);
+        index.remove_address_memo(&key)?;
         index.cursor = Some(key);
         index.persist_cursor()?;
     }
     summary.queue_drained = index.queue.is_empty();
     summary.durability_unknown = index.removal_durability_unknown;
+    index.legacy_reclamation_pending = index
+        .queue
+        .iter()
+        .any(|key| !index.durable_unresolved.contains(key));
+    index.persist_cursor()?;
     Ok(summary)
 }

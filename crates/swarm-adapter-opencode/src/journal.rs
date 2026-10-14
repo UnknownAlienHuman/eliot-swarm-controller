@@ -6,13 +6,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 use swarm_contracts::{
@@ -28,6 +28,28 @@ const RECORD_LIMIT: usize = 1_048_576;
 const HISTORY_LIMIT: usize = 8 * RECORD_LIMIT;
 const OUTBOX_BATCH: usize = 32;
 const RETENTION_ACK_INTERVAL: usize = 32;
+/// Per-call body-parse budget for the startup inventory, mirroring the
+/// retention 32-step discipline. Legacy convergence enumerates names to
+/// find the resume position; steady recovery reads only the durable sparse
+/// tail. Bodies beyond the convergence window wait for a later pass, and
+/// retention-cursor.json preserves progress across restarts.
+pub(super) const MAX_STARTUP_SCAN_ENTRIES: usize = 32;
+
+/// Real counters for startup scanning cost. `operation_bodies_parsed` and
+/// `operation_bytes_read` cover inventory parses with direct reads (the
+/// recovery window, the retention extension, and the hello operations-dir
+/// fallback). Deletion-path re-reads stay bounded separately by the
+/// retention step limit and are excluded. `outbox_entries_scanned` covers
+/// the pending-bounded hello outbox scan; per-item receipt validation
+/// reads behind it are pending-bounded as well and excluded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StartupScanCounts {
+    pub operations_listed: u64,
+    pub operation_bodies_parsed: u64,
+    pub operation_bytes_read: u64,
+    pub outbox_entries_scanned: u64,
+    pub unresolved_found: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -186,7 +208,9 @@ struct RetainedOperation {
     observed_sha256: String,
     releasable: bool,
     result_source: bool,
+    pending_delivery: bool,
     references: Vec<String>,
+    native_root_ids: Vec<String>,
     native_root_id: Option<String>,
     native_scope_key: Option<String>,
 }
@@ -294,6 +318,21 @@ fn summarize_retained_operation(
         ));
     }
 
+    let mut native_root_ids = BTreeSet::new();
+    if let Some(root) = intent_root {
+        native_root_ids.insert(root.to_owned());
+    }
+    if let Some(root) = outcome_root {
+        native_root_ids.insert(root.to_owned());
+    }
+    for revision in &history.outcome_revisions {
+        if revision.outcome["native_scope_key"] == scope
+            && let Some(root) = revision.outcome["native_root_id"].as_str()
+        {
+            native_root_ids.insert(root.to_owned());
+        }
+    }
+
     let mut references = Vec::new();
     if (history_is_unresolved(history) || pending_delivery)
         && let Some(intent) = history.intent.as_ref()
@@ -352,7 +391,9 @@ fn summarize_retained_operation(
         observed_sha256: format!("{:x}", Sha256::digest(observed_bytes)),
         releasable: history_is_releasable(history),
         result_source,
+        pending_delivery,
         references,
+        native_root_ids: native_root_ids.into_iter().collect(),
         native_root_id: outcome_root.or(intent_root).map(ToOwned::to_owned),
         native_scope_key: outcome_scope.or(intent_scope).map(ToOwned::to_owned),
     })
@@ -409,6 +450,11 @@ pub struct Journal {
     checkpoints: PathBuf,
     retention: Mutex<retention::RetentionIndex>,
     acknowledgements_since_retention: AtomicUsize,
+    scan_bodies: AtomicU64,
+    scan_bytes: AtomicU64,
+    scan_listed: AtomicU64,
+    scan_outbox: AtomicU64,
+    scan_unresolved: AtomicU64,
 }
 
 impl Journal {
@@ -453,6 +499,7 @@ impl Journal {
                 "operations",
                 "outbox",
                 "native-checkpoints.jsonl",
+                retention::ADDRESS_CHECKPOINT_DIR,
                 "retention-cursor.json",
             ] {
                 if root.join(existing).exists() {
@@ -467,6 +514,7 @@ impl Journal {
         }
         let operations = root.join("operations");
         let outbox = root.join("outbox");
+        let address_dir = root.join(retention::ADDRESS_CHECKPOINT_DIR);
         fs::create_dir_all(&operations).map_err(|_| {
             Error::new(
                 "ADAPTER_STATE",
@@ -475,17 +523,25 @@ impl Journal {
         })?;
         fs::create_dir_all(&outbox)
             .map_err(|_| Error::new("ADAPTER_STATE", "outbox directory cannot be created"))?;
+        fs::create_dir_all(&address_dir).map_err(|_| {
+            Error::new(
+                "ADAPTER_STATE",
+                "operation address checkpoint cannot be created",
+            )
+        })?;
         ensure_directory(&operations, "operation journal directory")?;
         ensure_directory(&outbox, "outbox directory")?;
+        ensure_directory(&address_dir, "operation address checkpoint")?;
         private_permissions(&operations, true)?;
         private_permissions(&outbox, true)?;
+        private_permissions(&address_dir, true)?;
         let checkpoints = root.join("native-checkpoints.jsonl");
         if !checkpoints.exists() {
             write_private_new(&checkpoints, &[])?;
         } else {
             ensure_regular(&checkpoints, "native checkpoint")?;
         }
-        let retention = retention::RetentionIndex::open(root, &identity);
+        let retention = retention::RetentionIndex::open(root, &address_dir, &identity);
         Ok(Self {
             identity,
             operations,
@@ -493,6 +549,11 @@ impl Journal {
             checkpoints,
             retention: Mutex::new(retention),
             acknowledgements_since_retention: AtomicUsize::new(0),
+            scan_bodies: AtomicU64::new(0),
+            scan_bytes: AtomicU64::new(0),
+            scan_listed: AtomicU64::new(0),
+            scan_outbox: AtomicU64::new(0),
+            scan_unresolved: AtomicU64::new(0),
         })
     }
 
@@ -501,7 +562,7 @@ impl Journal {
         if !path.exists() {
             return Ok(OperationHistory::default());
         }
-        read_operation_history(&path, Some(operation_id))
+        self.load_by_path(&path, operation_id)
     }
 
     pub fn write_intent(&self, intent: &OperationIntent) -> Result<()> {
@@ -715,22 +776,135 @@ impl Journal {
         }
         Ok(items)
     }
+    /// Snapshot of the real startup scanning cost on this handle.
+    pub fn startup_scan_counts(&self) -> StartupScanCounts {
+        StartupScanCounts {
+            operations_listed: self.scan_listed.load(Ordering::Relaxed),
+            operation_bodies_parsed: self.scan_bodies.load(Ordering::Relaxed),
+            operation_bytes_read: self.scan_bytes.load(Ordering::Relaxed),
+            outbox_entries_scanned: self.scan_outbox.load(Ordering::Relaxed),
+            unresolved_found: self.scan_unresolved.load(Ordering::Relaxed),
+        }
+    }
+
+    /// True once one accumulation cycle has classified every listed file.
+    /// A false value only defers deletion and boot reporting; files stay
+    /// retained and the persisted cursor resumes the tail on the next boot.
+    pub fn startup_recovery_complete(&self) -> bool {
+        retention::scan_incomplete(self)
+            .map(|incomplete| !incomplete)
+            .unwrap_or(false)
+    }
+
+    /// Sorted valid operation keys plus a count of unnameable entries.
+    /// Name enumeration is directory metadata only; bodies are parsed
+    /// solely inside the bounded window selected from these names.
+    fn list_operation_names(&self) -> Result<(Vec<String>, usize)> {
+        let entries = fs::read_dir(&self.operations)
+            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be read"))?;
+        let mut names = Vec::new();
+        let mut invalid = 0usize;
+        for entry in entries {
+            let entry = entry
+                .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation entry cannot be read"))?;
+            match entry.path().file_stem().and_then(|value| value.to_str()) {
+                Some(name) => names.push(name.to_owned()),
+                None => invalid += 1,
+            }
+        }
+        names.sort();
+        Ok((names, invalid))
+    }
+
+    /// Targeted steady window over the durable closure: existence-checked
+    /// keys only, with no directory enumeration. Missing keys with pending
+    /// outbox slots hold the scan; the rest are stale phantoms dropped
+    /// with a report.
+    fn steady_recovery_window(&self) -> Result<Vec<String>> {
+        let mut window = Vec::new();
+        for key in retention::steady_window_keys(self, MAX_STARTUP_SCAN_ENTRIES)? {
+            retention::mark_steady_visited(self, &key)?;
+            let path = self.operations.join(format!("{key}.jsonl"));
+            match fs::symlink_metadata(&path) {
+                Ok(_) => window.push(key),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let mut pending = false;
+                    for kind in ["outcome", "result"] {
+                        match fs::symlink_metadata(self.outbox.join(format!("{kind}-{key}.json"))) {
+                            Ok(_) => {
+                                pending = true;
+                                break;
+                            }
+                            Err(nested) if nested.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(_) => {
+                                return Err(Error::new(
+                                    "ADAPTER_OUTBOX",
+                                    "pending operation delivery cannot be inspected",
+                                ));
+                            }
+                        }
+                    }
+                    if pending {
+                        retention::mark_damaged(self)?;
+                    } else {
+                        retention::drop_durable_key(self, &key)?;
+                        eprintln!(
+                            "OpenCode startup inventory dropped a missing operation key with no pending delivery: {key}"
+                        );
+                    }
+                }
+                Err(_) => {
+                    return Err(Error::new(
+                        "ADAPTER_STATE",
+                        "operation journal is unavailable",
+                    ));
+                }
+            }
+        }
+        Ok(window)
+    }
 
     pub fn recover_outbox(&self) -> Result<Vec<OperationRecoveryState>> {
         retention::begin_recovery(self)?;
         let mut recovery_states = Vec::new();
-        let entries = fs::read_dir(&self.operations)
-            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be read"))?;
-        for entry in entries {
-            let entry = entry
-                .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation entry cannot be read"))?;
-            let path = entry.path();
-            ensure_regular(&path, "operation journal")?;
-            let Some(name) = path.file_stem().and_then(|v| v.to_str()) else {
-                retention::mark_damaged(self)?;
-                continue;
+        // Steady state serves the durable closure with targeted reads only:
+        // no directory enumeration once one legacy convergence completed.
+        // The windowed listing below runs solely while converging history.
+        let window: Vec<String>;
+        let mut legacy_names: Option<Vec<String>> = None;
+        if retention::durable_startup_complete(self)?
+            && !retention::legacy_reclamation_pending(self)?
+        {
+            window = self.steady_recovery_window()?;
+        } else {
+            let cached = retention::cached_startup_names(self)?;
+            let (names, invalid) = if let Some((names, invalid)) = cached {
+                (names, invalid)
+            } else {
+                let (names, invalid) = self.list_operation_names()?;
+                self.scan_listed
+                    .fetch_add(names.len() as u64 + invalid as u64, Ordering::Relaxed);
+                retention::remember_startup_names(self, names.clone(), invalid)?;
+                (names, invalid)
             };
+            if invalid > 0 {
+                retention::mark_damaged(self)?;
+            }
+            let selected = retention::startup_window(self, &names, MAX_STARTUP_SCAN_ENTRIES)?;
+            legacy_names = Some(names);
+            window = selected;
+        }
+        for name in &window {
+            let name = name.as_str();
+            if legacy_names.is_some() {
+                retention::mark_startup_classified(self, name)?;
+            }
+            let path = self.operations.join(format!("{name}.jsonl"));
+            ensure_regular(&path, "operation journal")?;
             let observed_bytes = read_limited(&path, HISTORY_LIMIT)?;
+            self.scan_bodies.fetch_add(1, Ordering::Relaxed);
+            self.scan_bytes
+                .fetch_add(observed_bytes.len() as u64, Ordering::Relaxed);
             let history = match read_operation_history_bytes(&observed_bytes, None) {
                 Ok(history) => history,
                 Err(error) if error.code == "ADAPTER_JOURNAL" => {
@@ -778,6 +952,10 @@ impl Journal {
                 pending_delivery,
             ) {
                 Ok(operation) => {
+                    // Convergence-time conflict vigilance: a conflicting root
+                    // fails the window now instead of hiding until a later
+                    // full scan that steady state never performs.
+                    self.check_native_root_identity(&operation)?;
                     retention::register_operation(self, operation)?;
                 }
                 Err(_) => retention::mark_damaged(self)?,
@@ -786,10 +964,12 @@ impl Journal {
                 (history.outcome.as_ref(), history.outcome_sha256.as_ref())
             {
                 let Some(operation_id) = outcome["operation_id"].as_str() else {
+                    retention::mark_damaged(self)?;
                     continue;
                 };
                 let expected = operation_key(operation_id);
                 if name != expected {
+                    retention::mark_damaged(self)?;
                     continue;
                 }
                 let pending_path = self
@@ -853,9 +1033,11 @@ impl Journal {
             ) && history.result_acknowledged_sha256.as_deref() != Some(digest.as_str())
             {
                 let Some(operation_id) = params["operation_id"].as_str() else {
+                    retention::mark_damaged(self)?;
                     continue;
                 };
                 if name != operation_key(operation_id) {
+                    retention::mark_damaged(self)?;
                     continue;
                 }
                 self.write_pending(PendingItem {
@@ -887,6 +1069,7 @@ impl Journal {
                     .as_deref()
                     .is_some_and(|operation_id| name != operation_key(operation_id))
                 {
+                    retention::mark_damaged(self)?;
                     continue;
                 }
                 recovery_states.push(OperationRecoveryState {
@@ -894,7 +1077,29 @@ impl Journal {
                     operation_id,
                     history,
                 });
+                self.scan_unresolved.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if let Some(names) = legacy_names {
+            // One durable cursor write per bounded pass, not per file: a crash
+            // with an older position only revisits checked entries.
+            let covered = retention::scan_covered(self, &names)?;
+            retention::store_startup_progress(
+                self,
+                if covered {
+                    None
+                } else {
+                    window.last().cloned()
+                },
+                covered,
+                true,
+            )?;
+        } else {
+            // Steady pass over the durable closure: stability means every
+            // currently-durable key was visited now; mid-pass additions
+            // wait for the next pass. No enumeration happened above.
+            let stable = retention::steady_coverage_complete(self)?;
+            retention::store_startup_progress(self, None, stable, false)?;
         }
         retention::finish_recovery(self)?;
         Ok(recovery_states)
@@ -1122,6 +1327,9 @@ impl Journal {
         scope: &str,
     ) -> Result<Option<String>> {
         let mut root_checkpoint = self.checkpoint_root(binding_id, generation, scope)?;
+        // The checkpoint is only a candidate. Every live per-operation
+        // address memo is checked even when the root checkpoint exists.
+        let expected = expected_root_id(binding_id, generation);
         // An outcome can be accepted by the host while its reply is lost. Its
         // durable outbox receipt is therefore also a valid identity checkpoint.
         let entries = fs::read_dir(&self.outbox)
@@ -1132,6 +1340,7 @@ impl Journal {
             let path = entry.path();
             ensure_regular(&path, "outbox item")?;
             let bytes = read_limited(&path, RECORD_LIMIT)?;
+            self.scan_outbox.fetch_add(1, Ordering::Relaxed);
             let item: PendingItem = serde_json::from_slice(&bytes)
                 .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
             if item.kind == "outcome"
@@ -1152,30 +1361,30 @@ impl Journal {
                 }
             }
         }
-        let entries = fs::read_dir(&self.operations)
-            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be read"))?;
-        for entry in entries {
-            let entry = entry
-                .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation entry cannot be read"))?;
-            let path = entry.path();
-            ensure_regular(&path, "operation journal")?;
-            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            let history = match self.load_by_path(&path) {
-                Ok(history) => history,
-                Err(error) if error.code == "ADAPTER_JOURNAL" => continue,
-                Err(error) => return Err(error),
-            };
-            if let Some(intent) = history.intent
-                && name == operation_key(&intent.operation_id)
-                && intent.binding_id == binding_id
-                && intent.generation == generation
-                && intent.native_scope_key == scope
-                && let Some(root) = intent.native_root_id
-            {
+        for memo in retention::operation_address_memos(self)? {
+            for root in memo.native_root_ids {
+                if root != expected {
+                    return Err(Error::new(
+                        "NATIVE_IDENTITY_MISMATCH",
+                        "operation address memo conflicts with the deterministic binding root",
+                    ));
+                }
                 remember_one_root(&mut root_checkpoint, root)?;
             }
+        }
+        // A checkpoint cannot hide an unscanned legacy tail or a damaged
+        // address memo. Durable closure completeness (persisted converged
+        // addresses) plus the outbox/memo conflict checks above own coverage;
+        // the caller still converges bounded recovery windows first, but a
+        // fresh handle need not repeat an in-memory pass when durable state
+        // is already complete.
+        if !retention::durable_startup_complete(self)?
+            || retention::startup_has_unknown_addresses(self)?
+        {
+            return Err(Error::new(
+                "ADAPTER_STARTUP_RECOVERY_INCOMPLETE",
+                "native root cannot be confirmed before address coverage completes",
+            ));
         }
         if root_checkpoint
             .as_deref()
@@ -1344,8 +1553,70 @@ impl Journal {
                 "operation history exceeds its total byte boundary",
             ));
         }
+        // Project the operation's own address and all known outgoing targets
+        // before appending the journal frame. The memo is a bounded address
+        // hint only; the operation history remains authoritative.
+        let mut references = BTreeSet::new();
+        let mut native_root_ids = BTreeSet::new();
+        if let Some(intent) = history.intent.as_ref() {
+            collect_intent_references(intent, &mut references);
+            if let Some(root) = intent.native_root_id.as_ref() {
+                native_root_ids.insert(root.clone());
+            }
+        }
+        if let Some(outcome) = history.outcome.as_ref() {
+            collect_outcome_references(outcome, &mut references);
+            if let Some(root) = outcome["native_root_id"].as_str() {
+                native_root_ids.insert(root.to_owned());
+            }
+        }
+        for revision in &history.outcome_revisions {
+            collect_outcome_references(&revision.outcome, &mut references);
+            if let Some(root) = revision.outcome["native_root_id"].as_str() {
+                native_root_ids.insert(root.to_owned());
+            }
+        }
+        if let Some(intent) = record.intent.as_ref() {
+            collect_intent_references(intent, &mut references);
+            if let Some(root) = intent.native_root_id.as_ref() {
+                native_root_ids.insert(root.clone());
+            }
+        }
+        if let Some(outcome) = record.outcome.as_ref() {
+            collect_outcome_references(outcome, &mut references);
+            if let Some(root) = outcome["native_root_id"].as_str() {
+                native_root_ids.insert(root.to_owned());
+            }
+        }
+        let key = operation_key(operation_id);
+        retention::note_operation_append(
+            self,
+            retention::OperationAddressMemo::new(
+                &self.identity,
+                operation_id.to_owned(),
+                key,
+                references.into_iter().collect(),
+                native_root_ids.into_iter().collect(),
+            ),
+        )?;
         append_bytes(&path, &bytes)?;
         retention::refresh_operation(self, operation_id);
+        Ok(())
+    }
+    /// Fail closed on a native root that conflicts with the deterministic
+    /// binding identity. Scope-gated exactly like the hello check: foreign
+    /// scopes stay ignored here as they are there.
+    fn check_native_root_identity(&self, retained: &RetainedOperation) -> Result<()> {
+        if retained.native_scope_key.as_deref() == Some(self.identity.native_scope_key.as_str())
+            && retained.native_root_ids.iter().any(|root| {
+                root != &expected_root_id(&self.identity.binding_id, self.identity.generation)
+            })
+        {
+            return Err(Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "operation native root conflicts with the deterministic binding identity",
+            ));
+        }
         Ok(())
     }
 
@@ -1405,8 +1676,8 @@ impl Journal {
         Ok(())
     }
 
-    fn load_by_path(&self, path: &Path) -> Result<OperationHistory> {
-        read_operation_history(path, None)
+    fn load_by_path(&self, path: &Path, expected_operation_id: &str) -> Result<OperationHistory> {
+        read_operation_history(path, Some(expected_operation_id))
     }
 
     fn validate_intent_state_identity(&self, intent: &OperationIntent) -> Result<()> {
@@ -1782,6 +2053,24 @@ impl Journal {
         })?;
         retention::refresh_operation(self, &item.key);
         Ok(true)
+    }
+}
+
+fn collect_intent_references(intent: &OperationIntent, references: &mut BTreeSet<String>) {
+    if let Some(target) = intent.reconcile_target_operation_id.as_ref() {
+        references.insert(target.clone());
+    }
+    if let Some(result) = intent.result_input_status.as_ref() {
+        references.insert(result.input_operation_id.clone());
+    }
+    if let Some(result) = intent.result_assistant.as_ref() {
+        references.insert(result.input_operation_id.clone());
+    }
+}
+
+fn collect_outcome_references(outcome: &Value, references: &mut BTreeSet<String>) {
+    if let Some(operation_id) = outcome["details"]["reconcile_operation_id"].as_str() {
+        references.insert(operation_id.to_owned());
     }
 }
 
@@ -2312,7 +2601,7 @@ mod journal65_parity_tests {
         let complete_bytes = std::fs::read(&path).unwrap();
 
         let via_load = journal.load(operation_id).unwrap();
-        let via_path = journal.load_by_path(&path).unwrap();
+        let via_path = journal.load_by_path(&path, operation_id).unwrap();
         assert!(via_load.torn_tail_evidence.is_none());
         assert!(via_path.torn_tail_evidence.is_none());
         assert_eq!(via_load.intent, via_path.intent);
@@ -2331,7 +2620,7 @@ mod journal65_parity_tests {
             .unwrap();
         let torn_bytes = std::fs::read(&path).unwrap();
         let via_load = journal.load(operation_id).unwrap();
-        let via_path = journal.load_by_path(&path).unwrap();
+        let via_path = journal.load_by_path(&path, operation_id).unwrap();
         let load_tail = via_load
             .torn_tail_evidence
             .clone()
@@ -2359,12 +2648,30 @@ mod journal65_parity_tests {
         damaged.extend_from_slice(&complete_bytes[newline..]);
         std::fs::write(&path, &damaged).unwrap();
         let load_err = journal.load(operation_id).unwrap_err();
-        let path_err = journal.load_by_path(&path).unwrap_err();
+        let path_err = journal.load_by_path(&path, operation_id).unwrap_err();
         assert_eq!(load_err.code, "ADAPTER_JOURNAL");
         assert_eq!(path_err.code, "ADAPTER_JOURNAL");
         assert_eq!(load_err.message, path_err.message);
         assert!(load_err.message.contains("damaged at byte"));
         assert_eq!(std::fs::read(&path).unwrap(), damaged);
+
+        let newline = complete_bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("complete intent line");
+        let mut mismatched_record: Value =
+            serde_json::from_slice(&complete_bytes[..newline]).unwrap();
+        mismatched_record["operation_id"] = json!("different-operation");
+        let mut mismatched_identity = serde_json::to_vec(&mismatched_record).unwrap();
+        mismatched_identity.push(b'\n');
+        mismatched_identity.extend_from_slice(&complete_bytes[newline + 1..]);
+        std::fs::write(&path, &mismatched_identity).unwrap();
+        let load_err = journal.load(operation_id).unwrap_err();
+        let path_err = journal.load_by_path(&path, operation_id).unwrap_err();
+        assert_eq!(load_err.code, "ADAPTER_JOURNAL");
+        assert_eq!(path_err.code, "ADAPTER_JOURNAL");
+        assert_eq!(load_err.message, path_err.message);
+        assert_eq!(std::fs::read(&path).unwrap(), mismatched_identity);
 
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
@@ -2429,7 +2736,7 @@ mod journal65_parity_tests {
         oversized_complete.push(b'\n');
         std::fs::write(&path, &oversized_complete).unwrap();
         let complete_by_id = journal.load(operation_id).unwrap_err();
-        let complete_by_path = journal.load_by_path(&path).unwrap_err();
+        let complete_by_path = journal.load_by_path(&path, operation_id).unwrap_err();
         let expected_complete = format!(
             "operation journal damaged at byte 0: OversizedCompleteRecord {{ record_bytes: {}, max_record_bytes: {} }}",
             RECORD_LIMIT + 1,
@@ -2444,7 +2751,7 @@ mod journal65_parity_tests {
         let oversized_torn = vec![b'x'; RECORD_LIMIT + 1];
         std::fs::write(&path, &oversized_torn).unwrap();
         let torn_by_id = journal.load(operation_id).unwrap_err();
-        let torn_by_path = journal.load_by_path(&path).unwrap_err();
+        let torn_by_path = journal.load_by_path(&path, operation_id).unwrap_err();
         let expected_torn = format!(
             "operation journal damaged at byte 0: OversizedTornTail {{ tail_bytes: {}, max_record_bytes: {} }}",
             RECORD_LIMIT + 1,
@@ -2469,7 +2776,7 @@ mod journal65_parity_tests {
         std::fs::write(&path, b"").unwrap();
 
         let by_id = journal.load(operation_id).unwrap();
-        let by_path = journal.load_by_path(&path).unwrap();
+        let by_path = journal.load_by_path(&path, operation_id).unwrap();
         assert_eq!(format!("{:?}", by_id), format!("{:?}", by_path));
         assert!(by_id.native_replay_permitted());
         assert!(by_path.native_replay_permitted());
@@ -2497,6 +2804,8 @@ mod journal65_parity_tests {
             "native_root_id": root_id.clone()
         });
         journal.queue_outcome_value(&outcome).unwrap();
+        journal.recover_outbox().unwrap();
+        assert!(journal.startup_recovery_complete());
 
         let operation_path = journal.operation_path(operation_id);
         let outbox_path = root

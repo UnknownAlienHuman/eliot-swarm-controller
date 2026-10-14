@@ -92,7 +92,22 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         &config.native_options.scope_key(),
         &route_sha256,
     )?;
-    let journal_recovery = journal.recover_outbox()?;
+    // Warm startup may take ceil(M/32) bounded passes for a closure of M
+    // addresses. Legacy cold startup without a trusted cursor still scans
+    // O(N) operation bodies before hello (an explicit open PR69 residual). Each
+    // pass classifies at most 32 bodies and persists its resume cursor; steady
+    // boots converge in one pass so hello never accepts an unscanned tail.
+    let mut journal_recovery = Vec::new();
+    loop {
+        let window = journal.recover_outbox()?;
+        journal_recovery.extend(window);
+        if journal.startup_recovery_complete() {
+            break;
+        }
+        eprintln!(
+            "OpenCode startup recovery continues at its bounded scan window; the pending tail resumes in this boot"
+        );
+    }
     let mut native_owner = native_owner::NativeOwnerController::new(config.owned_native.clone());
 
     // The verified owner and boot identity come from the per-scope helper.
@@ -101,6 +116,15 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     let boot_id = worker.boot_id.clone();
     let scope = config.native_options.scope_key();
     let root_hint = journal.native_root_for_hello(&config.binding_id, config.generation, &scope)?;
+    let startup_scan = journal.startup_scan_counts();
+    eprintln!(
+        "OpenCode startup recovery scan: operation_names={}, parsed_bodies={}, bytes={}, outbox_entries={}, unresolved={}",
+        startup_scan.operations_listed,
+        startup_scan.operation_bodies_parsed,
+        startup_scan.operation_bytes_read,
+        startup_scan.outbox_entries_scanned,
+        startup_scan.unresolved_found,
+    );
 
     let native_probe = match NativeClient::connect(&config.native_options).await {
         Ok((service, info)) => match service.probe_route(&config.native_options).await {
@@ -153,7 +177,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     "journal_recovery":{
                         "count":journal_recovery.len(),
                         "entries":entries,
-                        "coverage":if journal_recovery.len() > 32 {"partial"} else {"complete"},
+                        "coverage":if journal.startup_recovery_complete() {"complete"} else {"partial"},
                         "native_replay_permitted":false,
                     },
                 },

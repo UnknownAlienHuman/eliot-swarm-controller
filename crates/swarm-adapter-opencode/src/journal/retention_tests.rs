@@ -354,3 +354,315 @@ fn retention_legacy_or_corrupt_cursor_never_means_confirmed_removal() {
             .removal_durability_unknown_for_test()
     );
 }
+
+/// Startup recovery stays bounded on a large acknowledged history with a
+/// sparse unresolved tail: every inventory call parses at most one window,
+/// the persisted startup cursor resumes across restarts, retention
+/// converges through bounded retries, and the exact sparse tail survives
+/// with ACK truth intact and no native replay.
+#[test]
+fn startup_recovery_bounds_large_history_and_resumes_sparse_tail() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+
+    for index in 0..100 {
+        write_acknowledged_reply(&journal, &format!("startup-bulk-{index:03}"), None);
+    }
+    let unknown_id = "startup-unknown-intent";
+    journal
+        .write_intent(&fixture_intent(unknown_id, "agent.reply"))
+        .unwrap();
+    let pending_id = "startup-pending-outcome";
+    journal
+        .write_intent(&fixture_intent(pending_id, "agent.reply"))
+        .unwrap();
+    journal
+        .queue_outcome_value(&json!({
+            "operation_id": pending_id,
+            "outcome": "applied",
+            "native_scope_key": NATIVE_SCOPE,
+            "details": {}
+        }))
+        .unwrap();
+    let target_id = "startup-reconcile-target";
+    write_acknowledged_reply(&journal, target_id, None);
+    let reconcile_id = "startup-reconcile-open";
+    let mut reconcile_intent = fixture_intent(reconcile_id, "agent.reconcile");
+    reconcile_intent.reconcile_target_operation_id = Some(target_id.to_owned());
+    journal.write_intent(&reconcile_intent).unwrap();
+    let reconcile_outcome = json!({
+        "operation_id": reconcile_id,
+        "outcome": "applied",
+        "native_scope_key": NATIVE_SCOPE,
+        "details": {
+            "module_receipt": reconcile_intent.module_receipt.clone(),
+            "target_operation_id": target_id,
+            "completion_condition": "native_readback_recorded",
+            "resolved": false,
+            "native_replay": false
+        }
+    });
+    journal.queue_outcome_value(&reconcile_outcome).unwrap();
+    journal.acknowledge_outcome(&reconcile_outcome).unwrap();
+    journal
+        .remove_pending(
+            &journal
+                .outbox
+                .join(format!("outcome-{}.json", operation_key(reconcile_id))),
+        )
+        .unwrap();
+
+    // First boot classifies exactly one window and keeps the tail pending.
+    let boot_counts = journal.startup_scan_counts();
+    assert_eq!(boot_counts.operation_bodies_parsed, 0);
+    let first = journal.recover_outbox().unwrap();
+    let after_first = journal.startup_scan_counts();
+    assert_eq!(
+        after_first.operation_bodies_parsed - boot_counts.operation_bodies_parsed,
+        32
+    );
+    assert!(first.len() <= 32);
+    assert!(!journal.startup_recovery_complete());
+    let saved_cursor = journal
+        .retention
+        .lock()
+        .unwrap()
+        .startup_cursor_for_test()
+        .map(str::to_owned);
+    assert!(saved_cursor.is_some());
+
+    // A restart resumes from the persisted position under the same bound.
+    drop(journal);
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    assert_eq!(
+        journal
+            .retention
+            .lock()
+            .unwrap()
+            .startup_cursor_for_test()
+            .map(str::to_owned),
+        saved_cursor
+    );
+    let boot_second = journal.startup_scan_counts();
+    journal.recover_outbox().unwrap();
+    let after_second = journal.startup_scan_counts();
+    assert!(after_second.operation_bodies_parsed - boot_second.operation_bodies_parsed <= 32);
+
+    // Retention converges through bounded retries: no call parses more
+    // than one window, and the sparse tail is never deleted or replayed.
+    for _ in 0..16 {
+        let before = journal.startup_scan_counts();
+        let summary = journal
+            .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
+            .unwrap();
+        let after = journal.startup_scan_counts();
+        assert!(
+            after.operation_bodies_parsed - before.operation_bodies_parsed <= 32,
+            "inventory parses stay within one window per call"
+        );
+        if summary.queue_drained && journal.startup_recovery_complete() {
+            break;
+        }
+    }
+    assert!(journal.startup_recovery_complete());
+    let drained = journal
+        .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
+        .unwrap();
+    assert!(drained.queue_drained);
+
+    for index in 0..100 {
+        assert!(
+            !operation_path(&root.0, &format!("startup-bulk-{index:03}")).exists(),
+            "acknowledged bulk history is reclaimed"
+        );
+    }
+    assert!(operation_path(&root.0, unknown_id).exists());
+    assert!(operation_path(&root.0, pending_id).exists());
+    assert!(operation_path(&root.0, target_id).exists());
+    assert!(operation_path(&root.0, reconcile_id).exists());
+    assert!(journal.load(unknown_id).unwrap().recovery_unknown());
+    assert!(!journal.load(unknown_id).unwrap().native_replay_permitted());
+    let pending_history = journal.load(pending_id).unwrap();
+    assert!(pending_history.outcome.is_some());
+    assert!(pending_history.acknowledged_sha256.is_none());
+    assert!(!pending_history.native_replay_permitted());
+    assert!(
+        journal
+            .outbox
+            .join(format!("outcome-{}.json", operation_key(pending_id)))
+            .exists(),
+        "the unacked delivery stays pending"
+    );
+    assert_eq!(
+        journal.load(reconcile_id).unwrap().outcome.unwrap()["details"]["resolved"],
+        false
+    );
+    assert!(journal.startup_scan_counts().unresolved_found >= 1);
+    // Progress lives only in the shared cursor file: no second index.
+    assert!(!root.0.join("startup-cursor.json").exists());
+    let cursor_bytes = fs::read(root.0.join("retention-cursor.json")).unwrap();
+    let cursor: serde_json::Value = serde_json::from_slice(&cursor_bytes).unwrap();
+    assert_eq!(cursor["version"].as_u64(), Some(3));
+}
+
+/// Steady state after convergence and drain: reopening reads only the
+/// durable closure with targeted loads. Listed entries stay at zero while
+/// bodies parsed equal the exact sparse tail, independent of lifetime
+/// history.
+#[test]
+fn steady_recovery_reads_only_the_sparse_tail() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    for index in 0..100 {
+        write_acknowledged_reply(&journal, &format!("steady-bulk-{index:03}"), None);
+    }
+    let unknown_id = "steady-unknown-intent";
+    journal
+        .write_intent(&fixture_intent(unknown_id, "agent.reply"))
+        .unwrap();
+    journal.recover_outbox().unwrap();
+    for _ in 0..16 {
+        let summary = journal
+            .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
+            .unwrap();
+        if summary.queue_drained && journal.startup_recovery_complete() {
+            break;
+        }
+    }
+    assert!(journal.startup_recovery_complete());
+    drop(journal);
+
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let before = journal.startup_scan_counts();
+    let states = journal.recover_outbox().unwrap();
+    let after = journal.startup_scan_counts();
+    assert!(journal.startup_recovery_complete());
+    assert_eq!(
+        after.operations_listed - before.operations_listed,
+        0,
+        "steady recovery performs no directory enumeration"
+    );
+    assert_eq!(
+        after.operation_bodies_parsed - before.operation_bodies_parsed,
+        1,
+        "steady recovery parses exactly the sparse tail"
+    );
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].operation_id.as_deref(), Some(unknown_id));
+}
+
+/// A durable compact root checkpoint answers hello without reparsing
+/// operation bodies, while the pending-bounded outbox scan still runs.
+#[test]
+fn hello_root_checkpoint_skips_operations_rescan() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let root_id = expected_root_id(BINDING_ID, GENERATION);
+    write_acknowledged_reply_with_root(&journal, "hello-root-evidence", &root_id);
+    journal.recover_outbox().unwrap();
+    let reclaimed = journal
+        .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
+        .unwrap();
+    assert_eq!(reclaimed.namespace_removed, 1);
+    assert_eq!(
+        journal
+            .native_root_checkpoint_for_hello(BINDING_ID, GENERATION, NATIVE_SCOPE)
+            .unwrap()
+            .as_deref(),
+        Some(root_id.as_str())
+    );
+
+    for index in 0..100 {
+        write_acknowledged_reply(&journal, &format!("hello-bulk-{index:03}"), None);
+    }
+    let pending_id = "hello-pending-outcome";
+    journal
+        .write_intent(&fixture_intent(pending_id, "agent.reply"))
+        .unwrap();
+    journal
+        .queue_outcome_value(&json!({
+            "operation_id": pending_id,
+            "outcome": "applied",
+            "native_scope_key": NATIVE_SCOPE,
+            "details": {}
+        }))
+        .unwrap();
+    // Converge first so the reopened hello answers from the checkpoint
+    // plus the bounded dirty set instead of the lifetime history.
+    journal.recover_outbox().unwrap();
+    for _ in 0..16 {
+        let summary = journal
+            .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
+            .unwrap();
+        if summary.queue_drained && journal.startup_recovery_complete() {
+            break;
+        }
+    }
+    assert!(journal.startup_recovery_complete());
+    drop(journal);
+
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let before = journal.startup_scan_counts();
+    let root_hint = journal
+        .native_root_for_hello(BINDING_ID, GENERATION, NATIVE_SCOPE)
+        .unwrap();
+    let after = journal.startup_scan_counts();
+    assert_eq!(root_hint.as_deref(), Some(root_id.as_str()));
+    assert_eq!(
+        after.operations_listed - before.operations_listed,
+        0,
+        "hello performs no operations-directory enumeration in steady state"
+    );
+    assert_eq!(
+        after.operation_bodies_parsed - before.operation_bodies_parsed,
+        0,
+        "hello checks address memos plus outbox, not operation bodies, for conflicts"
+    );
+    assert_eq!(
+        after.outbox_entries_scanned - before.outbox_entries_scanned,
+        1,
+        "the pending outbox receipt is still consulted"
+    );
+}
+
+/// A self-consistent but foreign root fails closed at classification and
+/// at hello: steady state never binds it, and nothing is deleted around it.
+#[test]
+fn conflicting_operation_root_fails_closed() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    write_acknowledged_reply(&journal, "conflict-healthy", None);
+    let mut bad_intent = fixture_intent("conflict-foreign-root", "agent.reply");
+    bad_intent.native_root_id =
+        Some("ses_swarm_ffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned());
+    journal.write_intent(&bad_intent).unwrap();
+    let bad_outcome = json!({
+        "operation_id": "conflict-foreign-root",
+        "outcome": "applied",
+        "native_scope_key": NATIVE_SCOPE,
+        "details": {}
+    });
+    journal.queue_outcome_value(&bad_outcome).unwrap();
+    journal.acknowledge_outcome(&bad_outcome).unwrap();
+    journal
+        .remove_pending(&journal.outbox.join(format!(
+            "outcome-{}.json",
+            operation_key("conflict-foreign-root")
+        )))
+        .unwrap();
+    let classification = journal.recover_outbox().unwrap_err();
+    assert_eq!(classification.code, "NATIVE_IDENTITY_MISMATCH");
+    let hello = journal
+        .native_root_for_hello(BINDING_ID, GENERATION, NATIVE_SCOPE)
+        .unwrap_err();
+    assert_eq!(hello.code, "NATIVE_IDENTITY_MISMATCH");
+    assert!(operation_path(&root.0, "conflict-healthy").exists());
+    assert!(operation_path(&root.0, "conflict-foreign-root").exists());
+}
