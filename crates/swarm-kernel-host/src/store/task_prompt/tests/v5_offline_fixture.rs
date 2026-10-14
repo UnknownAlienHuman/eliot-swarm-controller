@@ -1,3 +1,5 @@
+//! Offline Rust producer to Claude consumer boundary.
+
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, process::Command};

@@ -306,7 +306,7 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
 
-    #[path = "../../task_prompt_v5_offline_fixture.rs"]
+    #[path = "v5_offline_fixture.rs"]
     mod v5_offline_fixture;
 
     const TASK_ID: &str = "task-prompt-retained";
