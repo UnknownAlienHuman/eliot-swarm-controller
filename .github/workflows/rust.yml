@@ -671,7 +671,7 @@ jobs:
           if ($env:QUALIFICATION -ceq 'focused-recovery') {
             Invoke-FocusedCohort 'swarm-adapter-opencode' 'journal65_parity_tests' 5
             Invoke-FocusedCohort 'swarm-adapter-claude' 'journal65_parity_tests' 4
-            Invoke-FocusedCohort 'swarm-process' 'permissions::publication_tests' 11
+            Invoke-FocusedCohort 'swarm-process' 'permissions::publication_tests' 9
             Invoke-FocusedCohort 'swarm-kernel-host' 'probe_resolution_reservations_hold_conflicts_until_both_owners_depart' 1
             Invoke-FocusedCohort 'swarm-kernel-host' 'independent_probe_resolution_io_overlaps_and_remains_in_store_custody' 1
           } elseif ($env:QUALIFICATION -ceq 'focused-store') {
@@ -707,8 +707,8 @@ jobs:
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'issue99_peer_find_advances_after_filtered_task_and_global_pages' -Expected 1 -ExpectedNames @('issue99_peer_find_advances_after_filtered_task_and_global_pages')
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards' -Expected 1 -ExpectedNames @('issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards')
 
-            # This mismatch regression starts worker_process_fixture_waits_for_release as its owned child.
-            Invoke-FocusedCohort -Package 'swarm-supervisor' -Filter 'same_pid_and_birth_with_changed_image_requires_new_hello' -Expected 1 -ExpectedNames @('same_pid_and_birth_with_changed_image_requires_new_hello')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'host_module_supervisor::tests::unknown362_identity_failure_and_health_write_failure_survive_restart' -Expected 1 -ExpectedNames @('unknown362_identity_failure_and_health_write_failure_survive_restart')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'oversized_detached_public_preview_cannot_replace_launch_authority' -Expected 1 -ExpectedNames @('oversized_detached_public_preview_cannot_replace_launch_authority')
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }
