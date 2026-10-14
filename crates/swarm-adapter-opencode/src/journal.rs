@@ -2230,3 +2230,173 @@ pub fn digest_json(value: &Value) -> Result<String> {
     let canonical = serde_json::to_string(value)?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
 }
+
+#[cfg(test)]
+mod journal65_parity_tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::Write;
+
+    const PARITY_BINDING: &str = "parity-binding";
+    const PARITY_GENERATION: i64 = 1;
+    const PARITY_SCOPE: &str = "parity-scope";
+    const PARITY_ROUTE: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn parity_intent(operation_id: &str) -> OperationIntent {
+        let module_receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+            "schema_version": 1,
+            "module_id": "eliot.opencode",
+            "artifact": {"artifact_id": "fixture-opencode", "version": "0.1.0"},
+            "protocol": {"major": 1, "minor": 0},
+            "binding_id": PARITY_BINDING,
+            "binding_generation": PARITY_GENERATION,
+            "operation_id": operation_id,
+            "input_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }))
+        .unwrap();
+
+        OperationIntent {
+            version: 2,
+            operation_id: operation_id.to_owned(),
+            module_receipt,
+            method: "agent.reply".to_owned(),
+            binding_id: PARITY_BINDING.to_owned(),
+            generation: PARITY_GENERATION,
+            native_scope_key: PARITY_SCOPE.to_owned(),
+            native_root_id: None,
+            native_input_id: None,
+            prompt_sha256: None,
+            prompt_bytes: None,
+            reconcile_target_operation_id: None,
+            result_input_status: None,
+            result_assistant: None,
+            dispatch_admission: None,
+            route_sha256: PARITY_ROUTE.to_owned(),
+            model: json!({"id": "fixture-model"}),
+            marker: json!({"fixture": "journal65-parity"}),
+        }
+    }
+
+    fn parity_outcome(operation_id: &str) -> Value {
+        json!({"operation_id": operation_id, "outcome": "unknown"})
+    }
+
+    fn open_parity_journal(root: &Path) -> Journal {
+        Journal::open(root, PARITY_BINDING, PARITY_GENERATION, PARITY_SCOPE, PARITY_ROUTE)
+            .unwrap()
+    }
+
+    fn fresh_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("swarm-opencode-journal65-{}-{}", prefix, uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn load_and_load_by_path_agree_on_complete_torn_and_interior_damage() {
+        let root = fresh_root("parity");
+        let journal = open_parity_journal(&root);
+        let operation_id = "parity-operation";
+        journal.write_intent(&parity_intent(operation_id)).unwrap();
+        let outcome = parity_outcome(operation_id);
+        journal.queue_outcome_value(&outcome).unwrap();
+        let path = journal.operation_path(operation_id);
+        let complete_bytes = std::fs::read(&path).unwrap();
+
+        let via_load = journal.load(operation_id).unwrap();
+        let via_path = journal.load_by_path(&path).unwrap();
+        assert!(via_load.torn_tail_evidence.is_none());
+        assert!(via_path.torn_tail_evidence.is_none());
+        assert_eq!(via_load.intent, via_path.intent);
+        assert_eq!(via_load.outcome, via_path.outcome);
+        assert_eq!(via_load.outcome, Some(outcome.clone()));
+        assert_eq!(via_load.outcome_sha256, via_path.outcome_sha256);
+        assert_eq!(via_load.acknowledged_sha256, via_path.acknowledged_sha256);
+        assert_eq!(format!("{:?}", via_load), format!("{:?}", via_path));
+        assert_eq!(std::fs::read(&path).unwrap(), complete_bytes);
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"kind\":\"outcome\"")
+            .unwrap();
+        let torn_bytes = std::fs::read(&path).unwrap();
+        let via_load = journal.load(operation_id).unwrap();
+        let via_path = journal.load_by_path(&path).unwrap();
+        let load_tail = via_load.torn_tail_evidence.clone().expect("load reports torn tail");
+        let path_tail = via_path
+            .torn_tail_evidence
+            .clone()
+            .expect("load_by_path reports torn tail");
+        assert_eq!(load_tail, path_tail);
+        assert!(!via_load.native_replay_permitted());
+        assert!(!via_path.native_replay_permitted());
+        assert_eq!(via_load.intent, via_path.intent);
+        assert_eq!(via_load.outcome, via_path.outcome);
+        assert_eq!(format!("{:?}", via_load), format!("{:?}", via_path));
+        assert_eq!(std::fs::read(&path).unwrap(), torn_bytes);
+
+        let newline = complete_bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("complete intent line")
+            + 1;
+        let mut damaged = Vec::new();
+        damaged.extend_from_slice(&complete_bytes[..newline]);
+        damaged.extend_from_slice(b"{not-json}\n");
+        damaged.extend_from_slice(&complete_bytes[newline..]);
+        std::fs::write(&path, &damaged).unwrap();
+        let load_err = journal.load(operation_id).unwrap_err();
+        let path_err = journal.load_by_path(&path).unwrap_err();
+        assert_eq!(load_err.code, "ADAPTER_JOURNAL");
+        assert_eq!(path_err.code, "ADAPTER_JOURNAL");
+        assert_eq!(load_err.message, path_err.message);
+        assert!(load_err.message.contains("damaged at byte"));
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repair_refuses_file_changed_after_scan_and_keeps_new_bytes() {
+        let root = fresh_root("changed");
+        let journal = open_parity_journal(&root);
+        let operation_id = "parity-changed-operation";
+        journal.write_intent(&parity_intent(operation_id)).unwrap();
+        let outcome = parity_outcome(operation_id);
+        journal.queue_outcome_value(&outcome).unwrap();
+        let path = journal.operation_path(operation_id);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"kind\":\"outcome\"")
+            .unwrap();
+        let scanned = journal.load(operation_id).unwrap();
+        let evidence = scanned.torn_tail_evidence.clone().expect("torn tail scanned");
+        let torn_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(torn_bytes.len(), evidence.valid_prefix_bytes + evidence.tail_bytes);
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{not-json}\n")
+            .unwrap();
+        let changed_bytes = std::fs::read(&path).unwrap();
+        assert!(changed_bytes.len() > torn_bytes.len());
+        assert!(changed_bytes.starts_with(&torn_bytes));
+
+        let err = journal.repair_torn_outcome_ack(&outcome).unwrap_err();
+        assert_eq!(err.code, "ADAPTER_JOURNAL_RECOVERY_UNKNOWN");
+        assert_eq!(std::fs::read(&path).unwrap(), changed_bytes);
+
+        let rescan = journal.load(operation_id).unwrap_err();
+        assert_eq!(rescan.code, "ADAPTER_JOURNAL");
+        assert!(rescan.message.contains("damaged at byte"));
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
