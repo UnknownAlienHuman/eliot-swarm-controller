@@ -3396,9 +3396,11 @@ mod connected_store {
         .await;
         f.close().await;
     }
-    // PR49 row 4 tail: the coalesced task.dispatch reuse keeps binding NULL
-    // and grants nothing to foreign readers. dispatch_fixture already proves
-    // the owner's closed receipt; this tail proves B/observer gain no grant.
+    // PR49 row 4 tail: the initial task.dispatch retains its valid binding
+    // while the coalesced reuse retains NULL binding. Both grant nothing to
+    // foreign readers. dispatch_fixture already proves the owner's closed
+    // reuse receipt; this tail proves the initial binding is retained and
+    // B/observer gain no grant.
     #[tokio::test]
     async fn store_authenticated_coalesced_dispatch_hides_binding_from_foreign() {
         let f = start().await;
@@ -3427,36 +3429,66 @@ mod connected_store {
         .await;
         assert_eq!(reused["semantic_reuse"], true);
         assert_eq!(reused["start_operation_id"], target["operation_id"]);
-        for operation_id in [&target["operation_id"], &reused["operation_id"]] {
-            let receipt = call(
-                store,
-                &f.manager_a,
-                "operation.get",
-                json!({"operation_id": operation_id}),
-            )
-            .await;
-            assert_eq!(receipt["task_id"], task_id);
-            assert_eq!(receipt["attempt_id"], attempt_id);
-            assert!(receipt["binding_id"].is_null());
-            assert!(receipt["binding_generation"].is_null());
-            assert_closed_receipt(&receipt);
-            denied(
-                store,
-                &f.manager_b,
-                "operation.get",
-                json!({"operation_id": operation_id}),
-                "NOT_FOUND",
-            )
-            .await;
-            denied(
-                store,
-                &f.observer,
-                "operation.get",
-                json!({"operation_id": operation_id}),
-                "NOT_FOUND",
-            )
-            .await;
-        }
+        // Initial dispatch retains the fixture binding (PR49 actual contract:
+        // UPDATE operations SET binding_id/binding_generation on admission).
+        let initial = call(
+            store,
+            &f.manager_a,
+            "operation.get",
+            json!({"operation_id": target["operation_id"]}),
+        )
+        .await;
+        assert_eq!(initial["task_id"], task_id);
+        assert_eq!(initial["attempt_id"], attempt_id);
+        assert_eq!(initial["binding_id"], binding["binding_id"]);
+        assert_eq!(initial["binding_generation"], binding["generation"]);
+        assert_closed_receipt(&initial);
+        denied(
+            store,
+            &f.manager_b,
+            "operation.get",
+            json!({"operation_id": target["operation_id"]}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.observer,
+            "operation.get",
+            json!({"operation_id": target["operation_id"]}),
+            "NOT_FOUND",
+        )
+        .await;
+        // Coalesced reuse retains NULL (retain_task_dispatch_reuse keeps
+        // binding_id/binding_generation NULL, no new native effect).
+        let coalesced = call(
+            store,
+            &f.manager_a,
+            "operation.get",
+            json!({"operation_id": reused["operation_id"]}),
+        )
+        .await;
+        assert_eq!(coalesced["task_id"], task_id);
+        assert_eq!(coalesced["attempt_id"], attempt_id);
+        assert!(coalesced["binding_id"].is_null());
+        assert!(coalesced["binding_generation"].is_null());
+        assert_closed_receipt(&coalesced);
+        denied(
+            store,
+            &f.manager_b,
+            "operation.get",
+            json!({"operation_id": reused["operation_id"]}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.observer,
+            "operation.get",
+            json!({"operation_id": reused["operation_id"]}),
+            "NOT_FOUND",
+        )
+        .await;
         denied(
             store,
             &f.manager_b,
@@ -3476,8 +3508,10 @@ mod connected_store {
         f.close().await;
     }
     // PR51 row 4 tail: the sponsored reviewer keeps only its exact assigned
-    // submission/review evidence. The rest of the Task graph stays denied,
-    // and unrelated inspectors gain nothing from attempt IDs alone.
+    // submission/review evidence. task.get/attempt.get/swarm.agent.inspect are
+    // method-denied FORBIDDEN for participants (ParticipantAccess::None);
+    // operation.get is CoordinationRead so the foreign submit op stays
+    // object-denied NOT_FOUND. Observer/B keep object NOT_FOUND.
     // This also closes the unrelated swarm.agent.inspect denial row.
     #[tokio::test]
     async fn store_authenticated_sponsored_reviewer_rest_graph_and_inspect_denied() {
@@ -3548,7 +3582,7 @@ mod connected_store {
             &reviewer,
             "task.get",
             json!({"task_id": "task-review-tail-rest"}),
-            "NOT_FOUND",
+            "FORBIDDEN",
         )
         .await;
         denied(
@@ -3556,7 +3590,7 @@ mod connected_store {
             &reviewer,
             "attempt.get",
             json!({"attempt_id": "attempt-review-tail-rest"}),
-            "NOT_FOUND",
+            "FORBIDDEN",
         )
         .await;
         denied(
