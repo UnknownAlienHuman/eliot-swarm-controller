@@ -16,10 +16,10 @@
 //! lineage cases are separately assigned.
 use super::super::{SCHEMA, SCRIPT_SCHEMA, WORKSPACE_SCHEMA, set_meta};
 use super::{
-    ArtifactReadBasis, ArtifactReadLevel, OperationReadBasis, OperationReadLevel,
-    TaskGraphIdentity, TaskReadBasis, TaskReadLevel, assembly_source_load_counts,
-    identity_for_attempt, reset_assembly_source_load_counts, resolve_artifact_read,
-    resolve_assembly_sources, resolve_operation_read, resolve_task_read,
+    ArtifactReadBasis, ArtifactReadLevel, AssemblyProof, NativeResultSource, OperationReadBasis,
+    OperationReadLevel, TaskGraphIdentity, TaskReadBasis, TaskReadLevel,
+    assembly_source_load_counts, identity_for_attempt, reset_assembly_source_load_counts,
+    resolve_artifact_read, resolve_assembly_sources, resolve_operation_read, resolve_task_read,
 };
 use crate::{
     artifacts::ArtifactRecord,
@@ -27,6 +27,7 @@ use crate::{
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use std::sync::Arc;
 const PROJECT: &str = "matrix-project";
 fn test_principal(client_id: &str, role: Role) -> Principal {
     Principal {
@@ -573,6 +574,103 @@ fn scope_public_malformed_links_and_unknown_kinds_fail_closed() {
         resolve_assembly_sources(&db, &unrelated, &[]).unwrap(),
         None
     );
+}
+
+#[test]
+fn assembled_record_cache_is_scoped_to_connection_and_reopen() {
+    fn seed_cache_db(db: &Connection, artifact_id: &str) -> ArtifactRecord {
+        db.execute_batch(
+            "CREATE TABLE artifacts(artifact_id TEXT PRIMARY KEY,kind TEXT NOT NULL);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO artifacts(artifact_id,kind) VALUES(?1,'native_result')",
+            [artifact_id],
+        )
+        .unwrap();
+        ArtifactRecord {
+            kind: "native_result".to_owned(),
+            artifact_id: artifact_id.to_owned(),
+            relative_path: "artifacts/cache-scope-probe.bin".to_owned(),
+            byte_length: 0,
+            content_digest: "cache-scope-digest".to_owned(),
+            metadata: json!({"assembly_operation_id":"cache-scope-operation","part_count":1}),
+        }
+    }
+
+    fn seed_cache(
+        db: &Connection,
+        record: ArtifactRecord,
+    ) -> super::super::results::AssemblyReadCacheSnapshot {
+        let snapshot = super::super::results::assembly_read_cache_snapshot(db, &record.artifact_id)
+            .unwrap()
+            .unwrap();
+        let proof = Arc::new(AssemblyProof {
+            sources: Arc::new(vec![NativeResultSource {
+                producer_operation_id: "cache-scope-producer".to_owned(),
+                target_operation_id: "cache-scope-target".to_owned(),
+                task_identity: None,
+                producer_operation_rowid: 0,
+                target_operation_rowid: 0,
+            }]),
+            distinct_tasks: Arc::new(vec![None]),
+            cache_dependencies: Arc::new(vec![super::super::results::AssemblyCacheRow::Artifact(
+                snapshot.artifact_rowid,
+            )]),
+        });
+        super::cache_assembly_proof(&Arc::new(record), proof, &snapshot).unwrap();
+        snapshot
+    }
+
+    let artifact_id = "assembly-cache-namespace-probe";
+    let first_db = Connection::open_in_memory().unwrap();
+    let first = seed_cache_db(&first_db, artifact_id);
+    let first_snapshot = seed_cache(&first_db, first);
+    assert!(super::cached_assembly_record(&first_snapshot).is_some());
+
+    let second_db = Connection::open_in_memory().unwrap();
+    let second = seed_cache_db(&second_db, artifact_id);
+    let second_snapshot =
+        super::super::results::assembly_read_cache_snapshot(&second_db, &second.artifact_id)
+            .unwrap()
+            .unwrap();
+    assert!(!first_snapshot.same_database_state(&second_snapshot));
+    assert!(super::cached_assembly_record(&second_snapshot).is_none());
+
+    let path = std::env::temp_dir().join(format!(
+        "swarm-assembly-cache-reopen-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let file_db = Connection::open(&path).unwrap();
+    let file_record = seed_cache_db(&file_db, artifact_id);
+    let file_snapshot = seed_cache(&file_db, file_record.clone());
+    assert!(super::cached_assembly_record(&file_snapshot).is_some());
+    let external_db = Connection::open(&path).unwrap();
+    external_db
+        .execute(
+            "INSERT INTO artifacts(artifact_id,kind) VALUES('external-unrelated-row','source_snapshot')",
+            [],
+        )
+        .unwrap();
+    drop(external_db);
+    let after_external_write =
+        super::super::results::assembly_read_cache_snapshot(&file_db, artifact_id)
+            .unwrap()
+            .unwrap();
+    assert!(!file_snapshot.same_database_state(&after_external_write));
+    assert!(super::cached_assembly_record(&after_external_write).is_none());
+    seed_cache(&file_db, file_record);
+    drop(file_db);
+
+    let reopened_db = Connection::open(&path).unwrap();
+    let reopened_snapshot =
+        super::super::results::assembly_read_cache_snapshot(&reopened_db, artifact_id)
+            .unwrap()
+            .unwrap();
+    assert!(!file_snapshot.same_database_state(&reopened_snapshot));
+    assert!(super::cached_assembly_record(&reopened_snapshot).is_none());
+    drop(reopened_db);
+    std::fs::remove_file(path).unwrap();
 }
 
 /// Authenticated Store boundary; the synchronous resolver fixtures above are
@@ -1804,6 +1902,12 @@ mod connected_store {
         assert_eq!(warm.source_resolutions, page_count as u64);
         assert_eq!(warm.immutable_proof_cache_hits, 0);
         assert_eq!(warm.current_scope_grant_checks, 1);
+        assert_eq!(warm.assembled_manifest_decodes, 1);
+        assert!(warm.assembled_manifest_bytes_copied > 0);
+        assert_eq!(warm.cache_validation_query_loads, 3);
+        assert_eq!(warm.provenance_point_query_loads, page_count as u64 * 3 + 2);
+        assert_eq!(warm.part_manifest_decodes, 1);
+        assert!(warm.part_manifest_string_bytes_copied > 0);
 
         reset_assembly_source_load_counts(&assembled_id);
         for _ in 0..64 {
@@ -1827,6 +1931,12 @@ mod connected_store {
         assert_eq!(repeated.source_resolutions, 0);
         assert_eq!(repeated.immutable_proof_cache_hits, 64);
         assert_eq!(repeated.current_scope_grant_checks, 64);
+        assert_eq!(repeated.assembled_manifest_decodes, 0);
+        assert_eq!(repeated.assembled_manifest_bytes_copied, 0);
+        assert_eq!(repeated.part_manifest_decodes, 0);
+        assert_eq!(repeated.part_manifest_string_bytes_copied, 0);
+        assert_eq!(repeated.cache_validation_query_loads, 128);
+        assert_eq!(repeated.provenance_point_query_loads, 0);
         setup.fixture.close().await;
         (
             warm.source_artifact_point_loads,
@@ -2101,6 +2211,12 @@ mod connected_store {
             assert_eq!(repeated.grant_loop_iterations, 64);
             assert_eq!(repeated.source_artifact_point_loads, 0);
             assert_eq!(repeated.producer_target_operation_point_loads, 0);
+            assert_eq!(repeated.assembled_manifest_decodes, 0);
+            assert_eq!(repeated.assembled_manifest_bytes_copied, 0);
+            assert_eq!(repeated.part_manifest_decodes, 0);
+            assert_eq!(repeated.part_manifest_string_bytes_copied, 0);
+            assert_eq!(repeated.cache_validation_query_loads, 128);
+            assert_eq!(repeated.provenance_point_query_loads, 0);
             setup.fixture.close().await;
         }
     }
@@ -2123,6 +2239,14 @@ mod connected_store {
             "assembled-{}",
             model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
         );
+        let warm = call(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.parts",
+            json!({"artifact_id": assembled_id, "after": 0, "limit": 1}),
+        )
+        .await;
+        assert_eq!(warm["parts"].as_array().map_or(0, Vec::len), 1);
         reset_assembly_source_load_counts(&assembled_id);
         let window = call(
             store,
@@ -2136,6 +2260,13 @@ mod connected_store {
         assert_eq!(window["next_after"], json!(1));
         let counts = assembly_source_load_counts(&assembled_id);
         assert_eq!(counts.grant_loop_iterations, 1);
+        assert_eq!(counts.immutable_proof_cache_hits, 1);
+        assert_eq!(counts.source_artifact_point_loads, 0);
+        assert_eq!(counts.producer_target_operation_point_loads, 0);
+        assert_eq!(counts.assembled_manifest_decodes, 0);
+        assert_eq!(counts.assembled_manifest_bytes_copied, 0);
+        assert_eq!(counts.cache_validation_query_loads, 2);
+        assert_eq!(counts.provenance_point_query_loads, 3);
         setup.fixture.close().await;
     }
 
@@ -2176,6 +2307,10 @@ mod connected_store {
                     "INSERT INTO observations(source_stream_id, kind, payload_json, recorded_at_ms) VALUES ('unrelated-proof', 'note', '{}', 1)",
                     [],
                 )?;
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES ('unrelated-proof-artifact','artifacts/unrelated-proof.bin','source_snapshot',0,?1,1,'{}')",
+                    [model::digest(b"unrelated proof artifact")],
+                )?;
                 Ok(())
             })
             .await
@@ -2197,6 +2332,142 @@ mod connected_store {
         assert_eq!(counts.producer_target_operation_point_loads, 0);
         assert_eq!(counts.immutable_proof_cache_hits, 1);
         assert_eq!(counts.grant_loop_iterations, 1);
+        assert_eq!(counts.assembled_manifest_decodes, 0);
+        assert_eq!(counts.assembled_manifest_bytes_copied, 0);
+        assert_eq!(counts.cache_validation_query_loads, 2);
+        assert_eq!(counts.provenance_point_query_loads, 0);
+        setup.fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_assembled_warm_manifest_mutation_invalidates_record_and_proof() {
+        let setup = setup_read_cost_pages(2).await;
+        let store = &setup.fixture.owner.store;
+        let assembly = write(
+            store,
+            &setup.fixture.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs": setup.page_refs.clone(),
+                "expected_sha256": model::digest(&setup.payload),
+            }),
+        )
+        .await;
+        let assembled_id = format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
+        let warm = call(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(warm["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+        reset_assembly_source_load_counts(&assembled_id);
+
+        let damage_id = assembled_id.clone();
+        store
+            .run(move |db| {
+                let changed = db.execute(
+                    "UPDATE artifacts SET metadata_json=json_set(metadata_json,'$.parts[0].offset_bytes',1) WHERE artifact_id=?1",
+                    [damage_id],
+                )?;
+                assert_eq!(changed, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        denied(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        let counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(counts.assembled_manifest_decodes, 1);
+        assert!(counts.assembled_manifest_bytes_copied > 0);
+        assert_eq!(counts.source_artifact_point_loads, 1);
+        setup.fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_assembled_warm_producer_mutation_invalidates_proof() {
+        let setup = setup_read_cost_pages(2).await;
+        let store = &setup.fixture.owner.store;
+        let assembly = write(
+            store,
+            &setup.fixture.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs": setup.page_refs.clone(),
+                "expected_sha256": model::digest(&setup.payload),
+            }),
+        )
+        .await;
+        let assembled_id = format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
+        let warm = call(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(warm["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+        reset_assembly_source_load_counts(&assembled_id);
+
+        let source_id = setup.page_refs[0].clone();
+        let source_producer = store
+            .run(move |db| {
+                let producer: String = db.query_row(
+                    "SELECT json_extract(metadata_json,'$.operation_id') FROM artifacts WHERE artifact_id=?1",
+                    [source_id],
+                    |row| row.get(0),
+                )?;
+                let changed = db.execute(
+                    "UPDATE operations SET state='rejected' WHERE operation_id=?1",
+                    [&producer],
+                )?;
+                assert_eq!(changed, 1);
+                Ok(producer)
+            })
+            .await
+            .unwrap();
+        denied(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        assert!(!source_producer.is_empty());
+        let counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(counts.assembled_manifest_decodes, 1);
+        assert!(counts.assembled_manifest_bytes_copied > 0);
+        assert!(counts.producer_target_operation_point_loads > 0);
         setup.fixture.close().await;
     }
 
@@ -2533,14 +2804,26 @@ mod connected_store {
         let first = setup.first.clone();
         let second = setup.second.clone();
         let assembled_id = assemble_pages(f, &first, &second).await;
+        let warm = call(
+            store,
+            &f.operator,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(warm["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+        reset_assembly_source_load_counts(&assembled_id);
 
-        // SQL damages one existing public page only after the entire chain was
-        // admitted and read. Even the verified Operator must fail provenance
-        // before publishing a new assembly or disclosing the inherited parts.
+        // Replacing a public page changes its rowid. Even the verified Operator
+        // must rebuild provenance and fail before disclosing inherited parts.
         let damage_page = second.clone();
         store.run(move |db| {
             let changed = db.execute(
-                "UPDATE artifacts SET metadata_json=json_set(metadata_json,'$.operation_id','missing-producer') WHERE artifact_id=?1",
+                "INSERT OR REPLACE INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) SELECT artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,json_set(metadata_json,'$.operation_id','missing-producer') FROM artifacts WHERE artifact_id=?1",
                 params![damage_page],
             )?;
             assert_eq!(changed, 1);
@@ -2554,6 +2837,10 @@ mod connected_store {
             "OBJECT_SCOPE_DAMAGED",
         )
         .await;
+        let counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(counts.assembled_manifest_decodes, 1);
+        assert!(counts.assembled_manifest_bytes_copied > 0);
+        assert!(counts.source_artifact_point_loads > 0);
         denied_assembly_has_no_output(f, &f.operator, &[first, second], "OBJECT_SCOPE_DAMAGED")
             .await;
         setup.fixture.close().await;

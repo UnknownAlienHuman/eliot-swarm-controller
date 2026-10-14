@@ -7,7 +7,285 @@ use crate::{
     runtime::{EffectOutcome, RuntimeOutcome},
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{functions::FunctionFlags, hooks::PreUpdateCase};
 use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum AssemblyCacheRow {
+    Artifact(i64),
+    Operation(i64),
+}
+
+#[derive(Default)]
+struct AssemblyCacheScope {
+    id: i64,
+    hook_installed: AtomicBool,
+    invalidated_all: AtomicBool,
+    watchers: Mutex<HashMap<AssemblyCacheRow, HashMap<u64, Weak<AtomicBool>>>>,
+}
+
+impl AssemblyCacheScope {
+    fn invalidate(&self, dependency: AssemblyCacheRow) {
+        let Ok(mut watchers) = self.watchers.lock() else {
+            self.invalidated_all.store(true, Ordering::Release);
+            return;
+        };
+        let Some(entries) = watchers.get_mut(&dependency) else {
+            return;
+        };
+        entries.retain(|_, invalidated| {
+            if let Some(invalidated) = invalidated.upgrade() {
+                invalidated.store(true, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        });
+        if entries.is_empty() {
+            watchers.remove(&dependency);
+        }
+    }
+}
+
+fn install_assembly_cache_hook(db: &Connection, scope: &Arc<AssemblyCacheScope>) -> Result<()> {
+    let update_scope = Arc::clone(scope);
+    db.preupdate_hook(Some(move |_action, database, table, change| {
+        if database != "main" {
+            return;
+        }
+        let invalidate = |rowid| {
+            let dependency = match table {
+                "artifacts" => AssemblyCacheRow::Artifact(rowid),
+                "operations" => AssemblyCacheRow::Operation(rowid),
+                _ => return,
+            };
+            update_scope.invalidate(dependency);
+        };
+        match change {
+            PreUpdateCase::Insert(new) => invalidate(new.get_new_row_id()),
+            PreUpdateCase::Delete(old) => invalidate(old.get_old_row_id()),
+            PreUpdateCase::Update {
+                old_value_accessor,
+                new_value_accessor,
+            } => {
+                invalidate(old_value_accessor.get_old_row_id());
+                invalidate(new_value_accessor.get_new_row_id());
+            }
+            PreUpdateCase::Unknown => {}
+        }
+    }))?;
+    scope.hook_installed.store(true, Ordering::Release);
+    Ok(())
+}
+
+static NEXT_ASSEMBLY_CACHE_SCOPE: AtomicU64 = AtomicU64::new(1);
+static NEXT_ASSEMBLY_CACHE_GUARD: AtomicU64 = AtomicU64::new(1);
+static ASSEMBLY_CACHE_SCOPES: OnceLock<Mutex<HashMap<i64, Weak<AssemblyCacheScope>>>> =
+    OnceLock::new();
+
+/// A compact snapshot that binds one assembled row to a connection-local cache
+/// namespace and SQLite's external-connection change counter. `data_version`
+/// intentionally ignores this connection's unrelated Store writes; the preupdate
+/// hook below invalidates only cache entries that watch changed artifact or
+/// Operation rows.
+pub(super) struct AssemblyReadCacheSnapshot {
+    pub(super) artifact_id: String,
+    pub(super) artifact_rowid: i64,
+    pub(super) database_namespace: i64,
+    pub(super) data_version: i64,
+    scope: Arc<AssemblyCacheScope>,
+}
+
+impl AssemblyReadCacheSnapshot {
+    pub(super) fn same_database_state(&self, other: &Self) -> bool {
+        self.artifact_id == other.artifact_id
+            && self.artifact_rowid == other.artifact_rowid
+            && self.database_namespace == other.database_namespace
+            && self.data_version == other.data_version
+    }
+
+    pub(super) fn guard(&self) -> Arc<AssemblyReadCacheGuard> {
+        Arc::new(AssemblyReadCacheGuard {
+            id: NEXT_ASSEMBLY_CACHE_GUARD.fetch_add(1, Ordering::Relaxed),
+            artifact_id: self.artifact_id.clone(),
+            artifact_rowid: self.artifact_rowid,
+            database_namespace: self.database_namespace,
+            data_version: self.data_version,
+            invalidated: Arc::new(AtomicBool::new(false)),
+            scope: Arc::clone(&self.scope),
+            dependencies: Mutex::new(std::collections::HashSet::new()),
+        })
+    }
+}
+
+pub(super) struct AssemblyReadCacheGuard {
+    id: u64,
+    artifact_id: String,
+    artifact_rowid: i64,
+    database_namespace: i64,
+    data_version: i64,
+    invalidated: Arc<AtomicBool>,
+    scope: Arc<AssemblyCacheScope>,
+    dependencies: Mutex<std::collections::HashSet<AssemblyCacheRow>>,
+}
+
+impl AssemblyReadCacheGuard {
+    pub(super) fn matches(&self, snapshot: &AssemblyReadCacheSnapshot) -> bool {
+        self.artifact_id == snapshot.artifact_id
+            && self.artifact_rowid == snapshot.artifact_rowid
+            && self.database_namespace == snapshot.database_namespace
+            && self.data_version == snapshot.data_version
+            && !self.scope.invalidated_all.load(Ordering::Acquire)
+            && !self.invalidated.load(Ordering::Acquire)
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.id
+    }
+
+    pub(super) fn watch(&self, dependencies: impl IntoIterator<Item = AssemblyCacheRow>) {
+        let mut accepted = Vec::new();
+        match self.dependencies.lock() {
+            Ok(mut seen) => {
+                for dependency in dependencies {
+                    if seen.insert(dependency) {
+                        accepted.push(dependency);
+                    }
+                }
+            }
+            Err(_) => {
+                self.scope.invalidated_all.store(true, Ordering::Release);
+                self.invalidated.store(true, Ordering::Release);
+                return;
+            }
+        }
+        match self.scope.watchers.lock() {
+            Ok(mut watchers) => {
+                for dependency in accepted {
+                    watchers
+                        .entry(dependency)
+                        .or_default()
+                        .insert(self.id, Arc::downgrade(&self.invalidated));
+                }
+            }
+            Err(_) => {
+                self.scope.invalidated_all.store(true, Ordering::Release);
+                self.invalidated.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+impl Drop for AssemblyReadCacheGuard {
+    fn drop(&mut self) {
+        let Ok(dependencies) = self.dependencies.lock() else {
+            return;
+        };
+        let Ok(mut watchers) = self.scope.watchers.lock() else {
+            return;
+        };
+        for dependency in dependencies.iter() {
+            let remove_dependency = if let Some(entries) = watchers.get_mut(dependency) {
+                entries.remove(&self.id);
+                entries.is_empty()
+            } else {
+                false
+            };
+            if remove_dependency {
+                watchers.remove(dependency);
+            }
+        }
+    }
+}
+
+fn register_assembly_cache_scope(db: &Connection) -> Result<()> {
+    let id = i64::try_from(NEXT_ASSEMBLY_CACHE_SCOPE.fetch_add(1, Ordering::Relaxed))
+        .map_err(|_| Error::new("ARTIFACT_CACHE", "assembly cache namespace exhausted"))?;
+    let scope = Arc::new(AssemblyCacheScope {
+        id,
+        ..AssemblyCacheScope::default()
+    });
+    let function_scope = Arc::clone(&scope);
+    let registered = db.create_scalar_function(
+        "swarm_native_assembly_read_cache_namespace",
+        0,
+        FunctionFlags::SQLITE_DETERMINISTIC,
+        move |_| {
+            let _keep_scope_alive = &function_scope;
+            Ok(id)
+        },
+    );
+    if registered.is_err() {
+        return Ok(());
+    }
+    if let Ok(mut scopes) = ASSEMBLY_CACHE_SCOPES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        scopes.retain(|_, scope| scope.strong_count() > 0);
+        scopes.insert(id, Arc::downgrade(&scope));
+    }
+    install_assembly_cache_hook(db, &scope)?;
+    Ok(())
+}
+
+pub(super) fn assembly_read_cache_snapshot(
+    db: &Connection,
+    artifact_id: &str,
+) -> Result<Option<AssemblyReadCacheSnapshot>> {
+    const SNAPSHOT_SQL: &str = "SELECT rowid, swarm_native_assembly_read_cache_namespace(), \
+                                (SELECT data_version FROM pragma_data_version) \
+                                FROM artifacts WHERE artifact_id=?1 AND kind='native_result'";
+    let read_snapshot = || {
+        #[cfg(test)]
+        super::object_scope::count_assembly_cache_validation_query(artifact_id);
+        db.query_row(SNAPSHOT_SQL, [artifact_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()
+    };
+    let row = match read_snapshot() {
+        Ok(row) => row,
+        Err(_) => {
+            // On a fresh connection SQLite reports an unknown function. Install
+            // its identity and retry; successful warm reads never redefine it.
+            register_assembly_cache_scope(db)?;
+            read_snapshot()?
+        }
+    };
+    let Some((artifact_rowid, database_namespace, data_version)) = row else {
+        return Ok(None);
+    };
+    let scope = ASSEMBLY_CACHE_SCOPES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|scopes| scopes.get(&database_namespace).and_then(Weak::upgrade))
+        .ok_or_else(|| Error::new("ARTIFACT_CACHE", "assembly cache namespace is unavailable"))?;
+    if database_namespace != scope.id {
+        return Err(Error::new(
+            "ARTIFACT_CACHE",
+            "assembly cache namespace changed during lookup",
+        ));
+    }
+    if !scope.hook_installed.load(Ordering::Acquire) {
+        install_assembly_cache_hook(db, &scope)?;
+    }
+    Ok(Some(AssemblyReadCacheSnapshot {
+        artifact_id: artifact_id.to_owned(),
+        artifact_rowid,
+        database_namespace,
+        data_version,
+        scope,
+    }))
+}
 
 /// Historical input status remains available under its original contract.
 /// Loop-step status additionally requires the exact selected native command
@@ -1275,12 +1553,20 @@ pub(super) fn command_output_artifact_read_plan(
 }
 
 pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
-    let row: Option<(String,String,i64,String,String)> = db.query_row(
-        "SELECT kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind IN ('native_result_page','native_result','task_submission','source_snapshot','check_result','check_output','script_bundle','script_result','script_output')",
-        [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-    let (kind, relative_path, byte_length, content_digest, metadata) =
+    get_with_rowid(db, id).map(|(record, _)| record)
+}
+
+pub(super) fn get_with_rowid(db: &Connection, id: &str) -> Result<(ArtifactRecord, i64)> {
+    let row: Option<(i64, String, String, i64, String, String)> = db.query_row(
+        "SELECT rowid,kind,relative_path,byte_length,content_digest,metadata_json FROM artifacts WHERE artifact_id=?1 AND kind IN ('native_result_page','native_result','task_submission','source_snapshot','check_result','check_output','script_bundle','script_result','script_output')",
+        [id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let (rowid, kind, relative_path, byte_length, content_digest, metadata) =
         row.ok_or_else(|| Error::new("NOT_FOUND", "result artifact is not registered"))?;
-    Ok(ArtifactRecord {
+    if kind == "native_result" {
+        #[cfg(test)]
+        super::object_scope::count_assembly_manifest_decode(id, metadata.len() as u64);
+    }
+    let record = ArtifactRecord {
         kind,
         artifact_id: id.to_string(),
         relative_path,
@@ -1288,7 +1574,8 @@ pub(super) fn get(db: &Connection, id: &str) -> Result<ArtifactRecord> {
             .map_err(|_| Error::new("ARTIFACT_DAMAGED", "negative stored artifact length"))?,
         content_digest,
         metadata: serde_json::from_str(&metadata)?,
-    })
+    };
+    Ok((record, rowid))
 }
 /// Closed projection for one already-authorized artifact. This function never
 /// reopens identity and never widens a resolved grant.

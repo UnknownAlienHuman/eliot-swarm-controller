@@ -3202,7 +3202,7 @@ impl Store {
         if length == 0 || length > MAX_PAGE_BYTES as u64 {
             return Err(Error::invalid("length_bytes must be 1..65536"));
         }
-        let record = self
+        let (record, cache_epoch) = self
             .run(move |db| {
                 let p = current_principal(db, principal)?;
                 if p.role == Role::Module {
@@ -3211,35 +3211,83 @@ impl Store {
                         "module cannot inspect other results",
                     ));
                 }
-                // Precise: always re-fetch fresh; never assume record never changes.
-                let artifact = Arc::new(results::get(db, &id)?);
-                let _grant = object_scope::resolve_artifact_read_at_epoch(
-                    db,
-                    &p,
-                    &artifact,
-                    object_scope::ArtifactReadLevel::Bytes,
-                )?
-                .ok_or_else(object_scope::unauthorized_artifact)?;
-                // Precise TOCTOU: same-artifact O(1) mutation damages;
-                // unrelated writes do not fail.
-                let after = results::get(db, &id)?;
-                if after.content_digest != artifact.content_digest
-                    || after.byte_length != artifact.byte_length
-                    || after.relative_path != artifact.relative_path
-                    || after.metadata["assembly_operation_id"] != artifact.metadata["assembly_operation_id"]
-                    || after.metadata["part_count"] != artifact.metadata["part_count"]
-                {
-                    return Err(Error::new(
-                        "ARTIFACT_DAMAGED",
-                        "artifact sources changed during range authorization",
-                    ));
+                let mut snapshot = results::assembly_read_cache_snapshot(db, &id)?;
+                let cached = snapshot
+                    .as_ref()
+                    .and_then(object_scope::cached_assembly_record);
+                let artifact = match cached {
+                    Some(artifact) => artifact,
+                    None => {
+                        #[cfg(test)]
+                        if snapshot.is_some() {
+                            object_scope::count_assembly_window_query_loads(&id, 1);
+                        }
+                        Arc::new(results::get(db, &id)?)
+                    }
+                };
+                if artifact.kind == "native_result" {
+                    if snapshot.is_none() {
+                        snapshot = results::assembly_read_cache_snapshot(db, &id)?;
+                    }
+                    let snapshot_ref = snapshot.as_ref().ok_or_else(|| {
+                        Error::new(
+                            "ARTIFACT_DAMAGED",
+                            "assembled artifact changed during range authorization",
+                        )
+                    })?;
+                    object_scope::resolve_artifact_read_at_snapshot(
+                        db,
+                        &p,
+                        &artifact,
+                        object_scope::ArtifactReadLevel::Bytes,
+                        snapshot_ref,
+                    )?
+                    .ok_or_else(object_scope::unauthorized_artifact)?;
+                    let after = results::assembly_read_cache_snapshot(db, &id)?;
+                    if !after
+                        .as_ref()
+                        .is_some_and(|after| snapshot_ref.same_database_state(after))
+                    {
+                        return Err(Error::new(
+                            "ARTIFACT_DAMAGED",
+                            "artifact sources changed during range authorization",
+                        ));
+                    }
+                    let cache_epoch = object_scope::assembly_read_cache_epoch(snapshot_ref);
+                    Ok((artifact, cache_epoch))
+                } else {
+                    object_scope::resolve_artifact_read_at_epoch(
+                        db,
+                        &p,
+                        &artifact,
+                        object_scope::ArtifactReadLevel::Bytes,
+                    )?
+                    .ok_or_else(object_scope::unauthorized_artifact)?;
+                    let after = results::get(db, &id)?;
+                    if after.content_digest != artifact.content_digest
+                        || after.byte_length != artifact.byte_length
+                        || after.relative_path != artifact.relative_path
+                        || after.metadata["assembly_operation_id"]
+                            != artifact.metadata["assembly_operation_id"]
+                        || after.metadata["part_count"] != artifact.metadata["part_count"]
+                    {
+                        return Err(Error::new(
+                            "ARTIFACT_DAMAGED",
+                            "artifact sources changed during range authorization",
+                        ));
+                    }
+                    Ok((artifact, None))
                 }
-                Ok(artifact)
             })
             .await?;
         self.file_io(move |files| {
             let mut response = if record.kind == "native_result" {
-                files.read_assembled_at_epoch(&record, offset, length as usize, None)?
+                files.read_assembled_at_epoch(
+                    &record,
+                    offset,
+                    length as usize,
+                    cache_epoch.as_deref(),
+                )?
             } else {
                 files.read(&record, offset, length as usize)?
             };
@@ -3256,18 +3304,38 @@ impl Store {
             .map_err(|_| Error::invalid("part offset exceeds platform range"))?;
         self.run(move |db| {
             let p = current_principal(db, principal)?;
-            // Precise: always re-fetch fresh; aggregate intersects ALL distinct
-            // bases (not just the requested window) so a denied distinct source
-            // can never be bypassed by a narrow limit/after window.
-            let artifact = Arc::new(results::get(db, &id)?);
+            // The cached record/proof is DB-scoped and source-invalidated;
+            // authorization still intersects every distinct grant base before
+            // this requested window is exposed.
+            let snapshot = results::assembly_read_cache_snapshot(db, &id)?;
+            let artifact = match snapshot
+                .as_ref()
+                .and_then(object_scope::cached_assembly_record)
+            {
+                Some(artifact) => artifact,
+                None => {
+                    #[cfg(test)]
+                    if snapshot.is_some() {
+                        object_scope::count_assembly_window_query_loads(&id, 1);
+                    }
+                    Arc::new(results::get(db, &id)?)
+                }
+            };
             if artifact.kind != "native_result" {
                 return Err(Error::invalid("artifact is not an assembled result"));
             }
-            if object_scope::resolve_artifact_read_at_epoch(
+            let snapshot = snapshot.ok_or_else(|| {
+                Error::new(
+                    "ARTIFACT_DAMAGED",
+                    "assembled artifact changed during parts authorization",
+                )
+            })?;
+            if object_scope::resolve_artifact_read_at_snapshot(
                 db,
                 &p,
                 &artifact,
                 object_scope::ArtifactReadLevel::Metadata,
+                &snapshot,
             )?
             .is_none()
             {
@@ -3300,6 +3368,8 @@ impl Store {
                     .get("sha256")
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part digest is malformed"))?;
+                #[cfg(test)]
+                object_scope::count_assembly_window_query_loads(&artifact.artifact_id, 1);
                 let page = results::get(db, page_id)?;
                 if page.kind != "native_result_page" {
                     return Err(Error::new(
@@ -3307,6 +3377,8 @@ impl Store {
                         "assembled part is not a native result page",
                     ));
                 }
+                #[cfg(test)]
+                object_scope::count_assembly_window_query_loads(&artifact.artifact_id, 2);
                 if object_scope::resolve_artifact_read_at_epoch(
                     db,
                     &p,
@@ -3324,12 +3396,12 @@ impl Store {
                     "sha256":sha256,
                 }));
             }
-            // Precise TOCTOU: same-artifact O(1) mutation damages; unrelated
-            // writes do not fail the windowed parts read.
-            let after_artifact = results::get(db, &artifact.artifact_id)?;
-            if after_artifact.content_digest != artifact.content_digest
-                || after_artifact.byte_length != artifact.byte_length
-                || after_artifact.metadata["part_count"] != artifact.metadata["part_count"]
+            // External writes change SQLite's data_version; this connection's
+            // update hook watches the root, every source page and every producer.
+            let after = results::assembly_read_cache_snapshot(db, &artifact.artifact_id)?;
+            if !after
+                .as_ref()
+                .is_some_and(|after| snapshot.same_database_state(after))
             {
                 return Err(Error::new(
                     "ARTIFACT_DAMAGED",

@@ -171,16 +171,11 @@ pub(crate) struct ArtifactReadGrant {
     pub(crate) basis: ArtifactReadBasis,
 }
 
-/// Precise content-based invalidation for cached immutable assembly proofs.
-/// The cache key binds only the assembled record O(1) fields that change when
-/// the immutable proof itself changes (artifact/relative/byte/digest/assembly
-/// operation/part count). Unrelated database writes (observations, other tasks,
-/// other artifacts) do not change this key and therefore do not invalidate.
-/// Current mutable grants (task scope, GM, participant, operation caller) are
-/// never cached and are re-evaluated fresh on every read against the distinct
-/// immutable grant bases below. The assembled record itself is always re-fetched
-/// fresh (1 point load); a changed manifest that preserves these O(1) fields
-/// (pure reorder without count/digest change) is a disclosed remaining bound.
+/// Cached assembly records and proofs are scoped to one live SQLite connection,
+/// its external-write version and the assembled rowid. Same-connection writes
+/// invalidate only watched artifact/source/producer rows through preupdate_hook;
+/// external commits conservatively invalidate through data_version. Mutable
+/// grants are still evaluated on every read against every distinct grant base.
 
 /// One authorized artifact plus the grant that authorized it, handed downstream
 /// instead of reopening identity from an artifact id.
@@ -194,6 +189,7 @@ pub(crate) struct AuthorizedArtifact {
 /// not re-query operations and must not accept a different row shape.
 #[derive(Debug, Clone)]
 pub(crate) struct OperationRow {
+    pub(crate) rowid: i64,
     pub(crate) operation_id: String,
     pub(crate) caller_id: String,
     pub(crate) method: String,
@@ -215,6 +211,8 @@ pub(crate) struct NativeResultSource {
     pub(crate) producer_operation_id: String,
     pub(crate) target_operation_id: String,
     pub(crate) task_identity: Option<TaskGraphIdentity>,
+    pub(crate) producer_operation_rowid: i64,
+    pub(crate) target_operation_rowid: i64,
 }
 
 /// Closed set of artifact domains. Kind selects one decoder; unknown or malformed
@@ -236,7 +234,6 @@ pub(crate) enum ArtifactDomainIdentity {
 
 const MAX_ASSEMBLY_READ_CACHE_ENTRIES: usize = 32;
 const MAX_ASSEMBLY_READ_CACHE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_ASSEMBLY_READ_CACHE_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Immutable assembly proof shared by range/parts hotpaths. `sources` is the
 /// full validated N-source proof used only on fallback; `distinct_tasks` are
@@ -248,10 +245,14 @@ const MAX_ASSEMBLY_READ_CACHE_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) struct AssemblyProof {
     pub(crate) sources: Arc<Vec<NativeResultSource>>,
     pub(crate) distinct_tasks: Arc<Vec<Option<TaskGraphIdentity>>>,
+    cache_dependencies: Arc<Vec<super::results::AssemblyCacheRow>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AssemblyReadCacheKey {
+    database_namespace: i64,
+    data_version: i64,
+    artifact_rowid: i64,
     artifact_id: String,
     relative_path: String,
     byte_length: u64,
@@ -262,6 +263,7 @@ struct AssemblyReadCacheKey {
 
 struct AssemblyReadCacheEntry {
     key: AssemblyReadCacheKey,
+    guard: Arc<super::results::AssemblyReadCacheGuard>,
     record: Arc<ArtifactRecord>,
     proof: Arc<AssemblyProof>,
     bytes: usize,
@@ -273,13 +275,19 @@ fn assembly_read_cache() -> &'static Mutex<VecDeque<AssemblyReadCacheEntry>> {
     ASSEMBLY_READ_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn assembly_read_cache_key(record: &ArtifactRecord) -> Result<AssemblyReadCacheKey> {
+fn assembly_read_cache_key(
+    record: &ArtifactRecord,
+    snapshot: &super::results::AssemblyReadCacheSnapshot,
+) -> Result<AssemblyReadCacheKey> {
     let assembly_operation_id = bounded_text(&record.metadata, "assembly_operation_id")
         .ok_or_else(|| identity_damaged("assembled result has no exact assembly Operation"))?;
     let part_count = record.metadata["part_count"]
         .as_u64()
         .ok_or_else(|| identity_damaged("assembled result has no part count"))?;
     Ok(AssemblyReadCacheKey {
+        database_namespace: snapshot.database_namespace,
+        data_version: snapshot.data_version,
+        artifact_rowid: snapshot.artifact_rowid,
         artifact_id: record.artifact_id.clone(),
         relative_path: record.relative_path.clone(),
         byte_length: record.byte_length,
@@ -300,18 +308,57 @@ fn distinct_tasks_for_sources(sources: &[NativeResultSource]) -> Vec<Option<Task
     distinct
 }
 
-fn cached_assembly_proof(record: &ArtifactRecord) -> Result<Option<Arc<AssemblyProof>>> {
-    let key = assembly_read_cache_key(record)?;
+fn cached_assembly_entry(
+    snapshot: &super::results::AssemblyReadCacheSnapshot,
+) -> Option<(Arc<ArtifactRecord>, Arc<AssemblyProof>, u64)> {
+    let Ok(mut cache) = assembly_read_cache().lock() else {
+        return None;
+    };
+    let Some(index) = cache.iter().position(|entry| entry.guard.matches(snapshot)) else {
+        return None;
+    };
+    let entry = cache.remove(index).expect("located cache entry");
+    let record = Arc::clone(&entry.record);
+    let proof = Arc::clone(&entry.proof);
+    let generation = entry.guard.generation();
+    cache.push_back(entry);
+    Some((record, proof, generation))
+}
+
+fn cached_assembly_proof(
+    record: &ArtifactRecord,
+    snapshot: &super::results::AssemblyReadCacheSnapshot,
+) -> Result<Option<Arc<AssemblyProof>>> {
+    let key = assembly_read_cache_key(record, snapshot)?;
     let Ok(mut cache) = assembly_read_cache().lock() else {
         return Ok(None);
     };
-    let Some(index) = cache.iter().position(|entry| entry.key == key) else {
+    let Some(index) = cache
+        .iter()
+        .position(|entry| entry.key == key && entry.guard.matches(snapshot))
+    else {
         return Ok(None);
     };
     let entry = cache.remove(index).expect("located cache entry");
     let proof = Arc::clone(&entry.proof);
     cache.push_back(entry);
     Ok(Some(proof))
+}
+
+pub(super) fn cached_assembly_record(
+    snapshot: &super::results::AssemblyReadCacheSnapshot,
+) -> Option<Arc<ArtifactRecord>> {
+    cached_assembly_entry(snapshot).map(|(record, _, _)| record)
+}
+
+pub(super) fn assembly_read_cache_epoch(
+    snapshot: &super::results::AssemblyReadCacheSnapshot,
+) -> Option<String> {
+    let (_, _, generation) = cached_assembly_entry(snapshot)?;
+    Some(format!(
+        "{}:{}:{}:{}",
+        snapshot.database_namespace, snapshot.data_version, snapshot.artifact_rowid, generation
+    ))
 }
 
 fn estimated_source_proof_bytes(sources: &[NativeResultSource]) -> usize {
@@ -347,47 +394,98 @@ fn estimated_distinct_tasks_bytes(tasks: &[Option<TaskGraphIdentity>]) -> usize 
 }
 
 fn cache_assembly_proof(
-    record: &ArtifactRecord,
+    record: &Arc<ArtifactRecord>,
     proof: Arc<AssemblyProof>,
+    snapshot: &super::results::AssemblyReadCacheSnapshot,
 ) -> Result<()> {
-    let key = assembly_read_cache_key(record)?;
+    let key = assembly_read_cache_key(record, snapshot)?;
     let key_bytes = key
         .artifact_id
         .len()
         .saturating_add(key.relative_path.len())
         .saturating_add(key.content_digest.len())
         .saturating_add(key.assembly_operation_id.len());
-    let record_bytes = serde_json::to_vec(record)?.len();
+    let record_bytes = estimated_artifact_record_bytes(record);
     let bytes = record_bytes
         .saturating_add(key_bytes)
         .saturating_add(estimated_source_proof_bytes(&proof.sources))
-        .saturating_add(estimated_distinct_tasks_bytes(&proof.distinct_tasks));
-    if bytes > MAX_ASSEMBLY_READ_CACHE_ENTRY_BYTES {
-        return Ok(());
-    }
+        .saturating_add(estimated_distinct_tasks_bytes(&proof.distinct_tasks))
+        .saturating_add(
+            proof
+                .cache_dependencies
+                .len()
+                .saturating_mul(size_of::<super::results::AssemblyCacheRow>()),
+        );
     let mut cache = match assembly_read_cache().lock() {
         Ok(cache) => cache,
         Err(_) => return Ok(()),
     };
-    cache.retain(|entry| entry.key != key);
+    cache.retain(|entry| {
+        entry.key.database_namespace != key.database_namespace
+            || entry.key.artifact_id != key.artifact_id
+    });
     let mut total_bytes = cache
         .iter()
         .fold(0usize, |total, entry| total.saturating_add(entry.bytes));
-    while cache.len() >= MAX_ASSEMBLY_READ_CACHE_ENTRIES
-        || total_bytes.saturating_add(bytes) > MAX_ASSEMBLY_READ_CACHE_BYTES
+    // Oversized valid assemblies remain warm as the sole entry instead of
+    // silently bypassing the cache and rebuilding an N-source proof per read.
+    if bytes <= MAX_ASSEMBLY_READ_CACHE_BYTES && total_bytes > MAX_ASSEMBLY_READ_CACHE_BYTES {
+        return Ok(());
+    }
+    if bytes > MAX_ASSEMBLY_READ_CACHE_BYTES {
+        cache.clear();
+        total_bytes = 0;
+    }
+    while !cache.is_empty()
+        && (cache.len() >= MAX_ASSEMBLY_READ_CACHE_ENTRIES
+            || total_bytes.saturating_add(bytes) > MAX_ASSEMBLY_READ_CACHE_BYTES)
     {
         let Some(removed) = cache.pop_front() else {
             return Ok(());
         };
         total_bytes = total_bytes.saturating_sub(removed.bytes);
     }
+    let guard = snapshot.guard();
+    guard.watch(proof.cache_dependencies.iter().copied());
     cache.push_back(AssemblyReadCacheEntry {
         key,
-        record: Arc::new(record.clone()),
+        guard,
+        record: Arc::clone(record),
         proof,
         bytes,
     });
     Ok(())
+}
+
+fn estimated_artifact_record_bytes(record: &ArtifactRecord) -> usize {
+    fn value_bytes(value: &Value) -> usize {
+        match value {
+            Value::Null => 0,
+            Value::Bool(_) | Value::Number(_) => size_of::<Value>(),
+            Value::String(value) => size_of::<Value>().saturating_add(value.len()),
+            Value::Array(values) => values.iter().fold(
+                size_of::<Vec<Value>>()
+                    .saturating_add(values.len().saturating_mul(size_of::<Value>())),
+                |total, value| total.saturating_add(value_bytes(value)),
+            ),
+            Value::Object(values) => values.iter().fold(
+                size_of::<serde_json::Map<String, Value>>()
+                    .saturating_add(values.len().saturating_mul(size_of::<(String, Value)>())),
+                |total, (key, value)| {
+                    total
+                        .saturating_add(key.len())
+                        .saturating_add(value_bytes(value))
+                },
+            ),
+        }
+    }
+
+    size_of::<ArtifactRecord>()
+        .saturating_add(record.kind.len())
+        .saturating_add(record.artifact_id.len())
+        .saturating_add(record.relative_path.len())
+        .saturating_add(record.content_digest.len())
+        .saturating_add(value_bytes(&record.metadata))
 }
 
 #[cfg(test)]
@@ -399,6 +497,12 @@ pub(crate) struct AssemblySourceLoadCounts {
     pub(crate) immutable_proof_cache_hits: u64,
     pub(crate) current_scope_grant_checks: u64,
     pub(crate) grant_loop_iterations: u64,
+    pub(crate) assembled_manifest_decodes: u64,
+    pub(crate) assembled_manifest_bytes_copied: u64,
+    pub(crate) part_manifest_decodes: u64,
+    pub(crate) part_manifest_string_bytes_copied: u64,
+    pub(crate) cache_validation_query_loads: u64,
+    pub(crate) provenance_point_query_loads: u64,
 }
 
 #[cfg(test)]
@@ -441,9 +545,60 @@ fn count_assembly_source_loads(
         let counts = counts.entry(artifact_id.to_owned()).or_default();
         counts.source_artifact_point_loads += source_artifacts;
         counts.producer_target_operation_point_loads += producer_target_operations;
+        counts.provenance_point_query_loads += source_artifacts + producer_target_operations;
         counts.source_resolutions += source_resolutions;
         counts.immutable_proof_cache_hits += cache_hits;
         counts.current_scope_grant_checks += scope_grant_checks;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn count_assembly_manifest_decode(artifact_id: &str, bytes_copied: u64) {
+    if let Ok(mut counts) = ASSEMBLY_SOURCE_LOAD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        let counts = counts.entry(artifact_id.to_owned()).or_default();
+        counts.assembled_manifest_decodes += 1;
+        counts.assembled_manifest_bytes_copied += bytes_copied;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn count_assembly_part_manifest_decode(artifact_id: &str, string_bytes_copied: u64) {
+    if let Ok(mut counts) = ASSEMBLY_SOURCE_LOAD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        let counts = counts.entry(artifact_id.to_owned()).or_default();
+        counts.part_manifest_decodes += 1;
+        counts.part_manifest_string_bytes_copied += string_bytes_copied;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn count_assembly_cache_validation_query(artifact_id: &str) {
+    if let Ok(mut counts) = ASSEMBLY_SOURCE_LOAD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        counts
+            .entry(artifact_id.to_owned())
+            .or_default()
+            .cache_validation_query_loads += 1;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn count_assembly_window_query_loads(artifact_id: &str, queries: u64) {
+    if let Ok(mut counts) = ASSEMBLY_SOURCE_LOAD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        counts
+            .entry(artifact_id.to_owned())
+            .or_default()
+            .provenance_point_query_loads += queries;
     }
 }
 
@@ -808,23 +963,24 @@ pub(crate) fn resolve_task_read(
 pub(crate) fn load_operation(db: &Connection, operation_id: &str) -> Result<Option<OperationRow>> {
     db
         .query_row(
-            "SELECT operation_id,caller_id,method,state,task_id,attempt_id, \
+            "SELECT rowid,operation_id,caller_id,method,state,task_id,attempt_id, \
                     binding_id,binding_generation,original_request_json,effective_request_json,result_json
              FROM operations WHERE operation_id=?1",
             [operation_id],
             |row| {
                 Ok(OperationRow {
-                    operation_id: row.get(0)?,
-                    caller_id: row.get(1)?,
-                    method: row.get(2)?,
-                    state: row.get(3)?,
-                    task_id: row.get(4)?,
-                    attempt_id: row.get(5)?,
-                    binding_id: row.get(6)?,
-                    binding_generation: row.get(7)?,
-                    original_request_json: row.get(8)?,
-                    effective_request_json: row.get(9)?,
-                    result_json: row.get(10)?,
+                    rowid: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    caller_id: row.get(2)?,
+                    method: row.get(3)?,
+                    state: row.get(4)?,
+                    task_id: row.get(5)?,
+                    attempt_id: row.get(6)?,
+                    binding_id: row.get(7)?,
+                    binding_generation: row.get(8)?,
+                    original_request_json: row.get(9)?,
+                    effective_request_json: row.get(10)?,
+                    result_json: row.get(11)?,
                 })
             },
         )
@@ -1437,6 +1593,15 @@ pub(crate) fn artifact_domain_identity(
     db: &Connection,
     record: &ArtifactRecord,
 ) -> Result<ArtifactDomainIdentity> {
+    artifact_domain_identity_with_cache(db, record, None, None)
+}
+
+fn artifact_domain_identity_with_cache(
+    db: &Connection,
+    record: &ArtifactRecord,
+    snapshot: Option<&super::results::AssemblyReadCacheSnapshot>,
+    shared_record: Option<&Arc<ArtifactRecord>>,
+) -> Result<ArtifactDomainIdentity> {
     match record.kind.as_str() {
         "task_submission" => {
             let evidence = submission_artifact_identity(db, record)?;
@@ -1463,15 +1628,18 @@ pub(crate) fn artifact_domain_identity(
             })
         }
         "native_result_page" => {
-            let source = native_page_source(db, record)?;
+            let source = native_page_source(db, record, None)?;
             let distinct = vec![source.task_identity.clone()];
-            Ok(ArtifactDomainIdentity::NativeResult(Arc::new(AssemblyProof {
-                sources: Arc::new(vec![source]),
-                distinct_tasks: Arc::new(distinct),
-            })))
+            Ok(ArtifactDomainIdentity::NativeResult(Arc::new(
+                AssemblyProof {
+                    sources: Arc::new(vec![source]),
+                    distinct_tasks: Arc::new(distinct),
+                    cache_dependencies: Arc::new(Vec::new()),
+                },
+            )))
         }
         "native_result" => Ok(ArtifactDomainIdentity::NativeResult(
-            assembled_result_sources(db, record)?,
+            assembled_result_sources(db, record, snapshot, shared_record)?,
         )),
         "script_bundle" | "script_result" | "script_output" => {
             // Script identity and historical scope are owned by the existing
@@ -1908,13 +2076,21 @@ fn validate_native_page_producer(
     Ok(target_identity)
 }
 
-fn native_page_source(db: &Connection, record: &ArtifactRecord) -> Result<NativeResultSource> {
+fn native_page_source(
+    db: &Connection,
+    record: &ArtifactRecord,
+    _assembly_owner: Option<&str>,
+) -> Result<NativeResultSource> {
     let metadata = &record.metadata;
     let producer_id = bounded_text(metadata, "operation_id")
         .ok_or_else(|| identity_damaged("native result page has no producer Operation"))?;
     let binding_id = bounded_text(metadata, "binding_id")
         .ok_or_else(|| identity_damaged("native result page has no binding identity"))?;
     let generation = binding_generation(metadata)?;
+    #[cfg(test)]
+    if let Some(assembly_id) = _assembly_owner {
+        count_assembly_source_loads(assembly_id, 0, 1, 0, 0, 0);
+    }
     let producer = load_operation(db, &producer_id)?
         .ok_or_else(|| identity_damaged("native result page producer Operation is absent"))?;
     if producer.state != "settled"
@@ -1936,6 +2112,10 @@ fn native_page_source(db: &Connection, record: &ArtifactRecord) -> Result<Native
         candidate_target_id(metadata)?
             .ok_or_else(|| identity_damaged("agent.result page has no exact target dispatch"))?
     };
+    #[cfg(test)]
+    if let Some(assembly_id) = _assembly_owner {
+        count_assembly_source_loads(assembly_id, 0, 1, 0, 0, 0);
+    }
     let target = load_operation(db, &target_id)?
         .ok_or_else(|| identity_damaged("native result target Operation is absent"))?;
     if !matches!(target.method.as_str(), "task.dispatch" | "agent.send") {
@@ -1952,26 +2132,44 @@ fn native_page_source(db: &Connection, record: &ArtifactRecord) -> Result<Native
         &target_id,
         &target,
     )?;
+    #[cfg(test)]
+    if let Some(assembly_id) = _assembly_owner {
+        count_assembly_source_loads(assembly_id, 0, 0, 1, 0, 0);
+    }
     Ok(NativeResultSource {
         producer_operation_id: producer_id,
         target_operation_id: target_id,
         task_identity,
+        producer_operation_rowid: producer.rowid,
+        target_operation_rowid: target.rowid,
     })
 }
 
 fn assembled_result_sources(
     db: &Connection,
     record: &ArtifactRecord,
+    snapshot: Option<&super::results::AssemblyReadCacheSnapshot>,
+    shared_record: Option<&Arc<ArtifactRecord>>,
 ) -> Result<Arc<AssemblyProof>> {
-    if let Some(proof) = cached_assembly_proof(record)? {
-        #[cfg(test)]
-        count_assembly_source_loads(&record.artifact_id, 0, 0, 0, 1, 0);
-        return Ok(proof);
+    if let Some(snapshot) = snapshot {
+        if let Some(proof) = cached_assembly_proof(record, snapshot)? {
+            #[cfg(test)]
+            count_assembly_source_loads(&record.artifact_id, 0, 0, 0, 1, 0);
+            return Ok(proof);
+        }
     }
     let operation_id = bounded_text(&record.metadata, "assembly_operation_id")
         .ok_or_else(|| identity_damaged("assembled result has no exact assembly Operation"))?;
+    #[cfg(test)]
+    count_assembly_window_query_loads(&record.artifact_id, 1);
     let operation = load_operation(db, &operation_id)?
         .ok_or_else(|| identity_damaged("assembly Operation is not retained"))?;
+    let mut cache_dependencies = vec![super::results::AssemblyCacheRow::Operation(operation.rowid)];
+    if let Some(snapshot) = snapshot {
+        cache_dependencies.push(super::results::AssemblyCacheRow::Artifact(
+            snapshot.artifact_rowid,
+        ));
+    }
     let result = operation_result(&operation)?;
     let original = operation_original(&operation)?;
     let refs = original["page_refs"]
@@ -2019,7 +2217,7 @@ fn assembled_result_sources(
         }
         #[cfg(test)]
         count_assembly_source_loads(&record.artifact_id, 1, 0, 0, 0, 0);
-        let page = match super::results::get(db, page_id) {
+        let (page, page_rowid) = match super::results::get_with_rowid(db, page_id) {
             Ok(page) => page,
             Err(error) if error.code == "NOT_FOUND" => {
                 return Err(identity_damaged("assembled source page is not retained"));
@@ -2031,9 +2229,14 @@ fn assembled_result_sources(
                 "assembly source is not a native result page",
             ));
         }
-        #[cfg(test)]
-        count_assembly_source_loads(&record.artifact_id, 0, 2, 1, 0, 0);
-        let source = native_page_source(db, &page)?;
+        let source = native_page_source(db, &page, Some(&record.artifact_id))?;
+        cache_dependencies.push(super::results::AssemblyCacheRow::Artifact(page_rowid));
+        cache_dependencies.push(super::results::AssemblyCacheRow::Operation(
+            source.producer_operation_rowid,
+        ));
+        cache_dependencies.push(super::results::AssemblyCacheRow::Operation(
+            source.target_operation_rowid,
+        ));
         let identity = assembly_identity(&page)?;
         let comparison = identity_comparison_key(&identity);
         if expected_identity
@@ -2082,8 +2285,11 @@ fn assembled_result_sources(
     let proof = Arc::new(AssemblyProof {
         sources: Arc::new(sources),
         distinct_tasks: Arc::new(distinct),
+        cache_dependencies: Arc::new(cache_dependencies),
     });
-    cache_assembly_proof(record, Arc::clone(&proof))?;
+    if let (Some(snapshot), Some(shared_record)) = (snapshot, shared_record) {
+        cache_assembly_proof(shared_record, Arc::clone(&proof), snapshot)?;
+    }
     Ok(proof)
 }
 
@@ -2246,10 +2452,38 @@ pub(crate) fn resolve_artifact_read_at_epoch(
     record: &ArtifactRecord,
     requested: ArtifactReadLevel,
 ) -> Result<Option<ArtifactReadGrant>> {
+    resolve_artifact_read_inner(db, principal, record, requested, None, None)
+}
+
+pub(super) fn resolve_artifact_read_at_snapshot(
+    db: &Connection,
+    principal: &Principal,
+    record: &Arc<ArtifactRecord>,
+    requested: ArtifactReadLevel,
+    snapshot: &super::results::AssemblyReadCacheSnapshot,
+) -> Result<Option<ArtifactReadGrant>> {
+    resolve_artifact_read_inner(
+        db,
+        principal,
+        record,
+        requested,
+        Some(snapshot),
+        Some(record),
+    )
+}
+
+fn resolve_artifact_read_inner(
+    db: &Connection,
+    principal: &Principal,
+    record: &ArtifactRecord,
+    requested: ArtifactReadLevel,
+    snapshot: Option<&super::results::AssemblyReadCacheSnapshot>,
+    shared_record: Option<&Arc<ArtifactRecord>>,
+) -> Result<Option<ArtifactReadGrant>> {
     if principal.role == Role::Module {
         return Ok(None);
     }
-    match artifact_domain_identity(db, record)? {
+    match artifact_domain_identity_with_cache(db, record, snapshot, shared_record)? {
         ArtifactDomainIdentity::Task {
             identity,
             producer_operation_id,
@@ -2399,12 +2633,8 @@ pub(crate) fn resolve_assembly_sources(
         if record.kind != "native_result_page" {
             return Err(identity_damaged("assembly source is not a result page"));
         }
-        let Some(grant) = resolve_artifact_read_at_epoch(
-            db,
-            principal,
-            record,
-            ArtifactReadLevel::Assemble,
-        )?
+        let Some(grant) =
+            resolve_artifact_read_at_epoch(db, principal, record, ArtifactReadLevel::Assemble)?
         else {
             return Ok(None);
         };

@@ -64,12 +64,12 @@ pub struct ResultPart {
 
 const MAX_ASSEMBLY_PART_CACHE_ENTRIES: usize = 32;
 const MAX_ASSEMBLY_PART_CACHE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ASSEMBLY_PART_CACHE_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Precise content-based part key (no global epoch). Same-artifact O(1)
-/// mutation changes the key and misses; unrelated writes never evict.
+/// The Store-provided epoch binds these decoded parts to one assembled row,
+/// database connection and validated proof generation.
 struct AssemblyPartCacheKey {
+    cache_epoch: String,
     artifact_id: String,
     relative_path: String,
     byte_length: u64,
@@ -89,11 +89,15 @@ fn assembly_part_cache() -> &'static Mutex<VecDeque<AssemblyPartCacheEntry>> {
     ASSEMBLY_PART_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn assembly_part_cache_key(record: &ArtifactRecord) -> Result<AssemblyPartCacheKey> {
+fn assembly_part_cache_key(
+    record: &ArtifactRecord,
+    cache_epoch: &str,
+) -> Result<AssemblyPartCacheKey> {
     let part_count = record.metadata["part_count"]
         .as_u64()
         .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "assembly part count is missing"))?;
     Ok(AssemblyPartCacheKey {
+        cache_epoch: cache_epoch.to_owned(),
         artifact_id: record.artifact_id.clone(),
         relative_path: record.relative_path.clone(),
         byte_length: record.byte_length,
@@ -106,24 +110,81 @@ fn cached_assembly_parts(
     record: &ArtifactRecord,
     cache_epoch: Option<&str>,
 ) -> Result<Arc<Vec<ResultPart>>> {
-    let _ = cache_epoch;
     let expected_part_count = record.metadata["part_count"]
         .as_u64()
         .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "assembly part count is missing"))?;
-    let cache_key = assembly_part_cache_key(record)?;
-    if let Ok(mut cache) = assembly_part_cache().lock() {
-        if let Some(index) = cache.iter().position(|entry| entry.key == cache_key) {
-            let entry = cache.remove(index).expect("located cache entry");
-            let parts = Arc::clone(&entry.parts);
-            cache.push_back(entry);
-            return Ok(parts);
+    let cache_key = cache_epoch
+        .map(|epoch| assembly_part_cache_key(record, epoch))
+        .transpose()?;
+    if let Some(cache_key) = cache_key.as_ref() {
+        if let Ok(mut cache) = assembly_part_cache().lock() {
+            if let Some(index) = cache.iter().position(|entry| entry.key == *cache_key) {
+                let entry = cache.remove(index).expect("located cache entry");
+                let parts = Arc::clone(&entry.parts);
+                cache.push_back(entry);
+                return Ok(parts);
+            }
         }
     }
 
-    let parts: Vec<ResultPart> = serde_json::from_value(record.metadata["parts"].clone())?;
+    let part_values = record.metadata["parts"]
+        .as_array()
+        .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "assembly part manifest is missing"))?;
+    #[cfg(test)]
+    let mut copied_string_bytes = 0u64;
+    let mut parts = Vec::with_capacity(part_values.len());
+    for part in part_values {
+        let fields = part
+            .as_object()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part entry is malformed"))?;
+        if fields.len() != 4
+            || fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "artifact_ref" | "offset_bytes" | "byte_length" | "sha256"
+                )
+            })
+        {
+            return Err(Error::new(
+                "ARTIFACT_DAMAGED",
+                "part entry contains unknown or missing fields",
+            ));
+        }
+        let artifact_ref = part["artifact_ref"]
+            .as_str()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part reference is malformed"))?;
+        let offset_bytes = part["offset_bytes"]
+            .as_u64()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part offset is malformed"))?;
+        let byte_length = part["byte_length"]
+            .as_u64()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part length is malformed"))?;
+        let sha256 = part["sha256"]
+            .as_str()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part digest is malformed"))?;
+        #[cfg(test)]
+        {
+            copied_string_bytes = copied_string_bytes
+                .saturating_add(artifact_ref.len() as u64)
+                .saturating_add(sha256.len() as u64);
+        }
+        parts.push(ResultPart {
+            artifact_ref: artifact_ref.to_owned(),
+            offset_bytes,
+            byte_length,
+            sha256: sha256.to_owned(),
+        });
+    }
+    #[cfg(test)]
+    crate::store::object_scope::count_assembly_part_manifest_decode(
+        &record.artifact_id,
+        copied_string_bytes,
+    );
     if parts.is_empty()
         || expected_part_count != parts.len() as u64
-        || cache_key.part_count != parts.len() as u64
+        || cache_key
+            .as_ref()
+            .is_some_and(|key| key.part_count != parts.len() as u64)
         || record.metadata["sha256"] != record.content_digest
     {
         return Err(Error::new(
@@ -153,8 +214,7 @@ fn cached_assembly_parts(
         ));
     }
     let parts = Arc::new(parts);
-    {
-        let key = &cache_key;
+    if let Some(key) = cache_key.as_ref() {
         let bytes = parts.iter().fold(
             size_of::<Vec<ResultPart>>() + parts.len() * size_of::<ResultPart>(),
             |total, part| {
@@ -164,17 +224,30 @@ fn cached_assembly_parts(
             },
         );
         let bytes = bytes
+            .saturating_add(key.cache_epoch.len())
             .saturating_add(key.artifact_id.len())
             .saturating_add(key.relative_path.len())
             .saturating_add(key.content_digest.len());
-        if bytes <= MAX_ASSEMBLY_PART_CACHE_ENTRY_BYTES {
-            if let Ok(mut cache) = assembly_part_cache().lock() {
-                cache.retain(|entry| entry.key.artifact_id != key.artifact_id);
+        if let Ok(mut cache) = assembly_part_cache().lock() {
+            cache.retain(|entry| {
+                entry.key.artifact_id != key.artifact_id || entry.key.cache_epoch != key.cache_epoch
+            });
             let mut total_bytes = cache
                 .iter()
                 .fold(0usize, |total, entry| total.saturating_add(entry.bytes));
-            while cache.len() >= MAX_ASSEMBLY_PART_CACHE_ENTRIES
-                || total_bytes.saturating_add(bytes) > MAX_ASSEMBLY_PART_CACHE_BYTES
+            // Keep one oversized valid manifest as the cache's sole resident;
+            // rejecting it here would make every warm range parse all N parts.
+            if bytes <= MAX_ASSEMBLY_PART_CACHE_BYTES && total_bytes > MAX_ASSEMBLY_PART_CACHE_BYTES
+            {
+                return Ok(parts);
+            }
+            if bytes > MAX_ASSEMBLY_PART_CACHE_BYTES {
+                cache.clear();
+                total_bytes = 0;
+            }
+            while !cache.is_empty()
+                && (cache.len() >= MAX_ASSEMBLY_PART_CACHE_ENTRIES
+                    || total_bytes.saturating_add(bytes) > MAX_ASSEMBLY_PART_CACHE_BYTES)
             {
                 let Some(removed) = cache.pop_front() else {
                     return Ok(parts);
@@ -186,7 +259,6 @@ fn cached_assembly_parts(
                 parts: Arc::clone(&parts),
                 bytes,
             });
-            }
         }
     }
     Ok(parts)
