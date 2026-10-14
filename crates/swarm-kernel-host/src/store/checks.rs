@@ -4909,7 +4909,7 @@ mod tests {
         path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::{
-            Arc,
+            Arc, Condvar, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
@@ -4919,6 +4919,49 @@ mod tests {
 
     static PR61_PROBE_FAILURE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PR61_PROBE_SUCCESS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default)]
+    struct Pr61ProbeOverlapState {
+        entered: usize,
+        successful_processes: usize,
+        failed_processes: usize,
+        serialized_timeout: bool,
+    }
+
+    struct Pr61ProbeOverlapGate {
+        state: Mutex<Pr61ProbeOverlapState>,
+        changed: Condvar,
+    }
+
+    static PR61_PROBE_OVERLAP_GATE: std::sync::OnceLock<Mutex<Option<Arc<Pr61ProbeOverlapGate>>>> =
+        std::sync::OnceLock::new();
+
+    struct Pr61ProbeOverlapGuard(Arc<Pr61ProbeOverlapGate>);
+
+    impl Drop for Pr61ProbeOverlapGuard {
+        fn drop(&mut self) {
+            if let Some(slot) = PR61_PROBE_OVERLAP_GATE.get()
+                && let Ok(mut active) = slot.lock()
+                && active
+                    .as_ref()
+                    .is_some_and(|gate| Arc::ptr_eq(gate, &self.0))
+            {
+                *active = None;
+            }
+        }
+    }
+
+    fn begin_pr61_probe_overlap() -> Pr61ProbeOverlapGuard {
+        let gate = Arc::new(Pr61ProbeOverlapGate {
+            state: Mutex::new(Pr61ProbeOverlapState::default()),
+            changed: Condvar::new(),
+        });
+        let slot = PR61_PROBE_OVERLAP_GATE.get_or_init(|| Mutex::new(None));
+        let mut active = slot.lock().expect("PR 61 probe overlap gate lock");
+        assert!(active.is_none(), "PR 61 overlap gate must have one owner");
+        *active = Some(gate.clone());
+        Pr61ProbeOverlapGuard(gate)
+    }
 
     const PROBE_OWNER_FIXTURE_MODE: &str = "ELIOT_PROBE_OWNER_FIXTURE_MODE";
     const PROBE_OWNER_FIXTURE_READY: &str = "ELIOT_PROBE_OWNER_FIXTURE_READY";
@@ -4945,6 +4988,110 @@ mod tests {
     ) -> Result<Vec<u8>> {
         PR61_PROBE_SUCCESS_CALLS.fetch_add(1, Ordering::SeqCst);
         Ok(b"fixture resolver version 1\n".to_vec())
+    }
+
+    fn run_pr61_configured_probe(
+        program: &Path,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> std::io::Result<std::process::Output> {
+        let mut child = Command::new(program)
+            .args(args)
+            .envs(env)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return child.wait_with_output(),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "configured version probe exceeded the five-second fixture bound",
+                    ));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn overlap_pr61_input_probe(
+        program: &Path,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<Vec<u8>> {
+        let gate = PR61_PROBE_OVERLAP_GATE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("PR 61 probe overlap gate lock")
+            .clone()
+            .ok_or_else(|| Error::new("TEST_PROBE_GATE_MISSING", "overlap gate is not active"))?;
+        {
+            let mut state = gate.state.lock().expect("PR 61 probe overlap state lock");
+            state.entered += 1;
+            gate.changed.notify_all();
+            let (mut state, _) = gate
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| state.entered < 2)
+                .expect("wait for both Store resolver probes");
+            if state.entered < 2 {
+                state.serialized_timeout = true;
+                return Err(Error::new(
+                    "TEST_PROBE_SERIALIZED",
+                    "only one Store plan reached external probe work before the bounded gate elapsed",
+                ));
+            }
+        }
+
+        // Exercise the configured version-probe command after both independent
+        // Store resolvers have reached this external-I/O boundary.
+        let output = run_pr61_configured_probe(program, args, env, cwd);
+        match output {
+            Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+                gate.state
+                    .lock()
+                    .expect("PR 61 probe overlap state lock")
+                    .successful_processes += 1;
+                Ok(output.stdout)
+            }
+            Ok(output) => {
+                gate.state
+                    .lock()
+                    .expect("PR 61 probe overlap state lock")
+                    .failed_processes += 1;
+                Err(Error::new(
+                    "TEST_PROBE_PROCESS_FAILED",
+                    format!(
+                        "configured version probe exited without usable output: {}",
+                        output.status
+                    ),
+                ))
+            }
+            Err(error) => {
+                gate.state
+                    .lock()
+                    .expect("PR 61 probe overlap state lock")
+                    .failed_processes += 1;
+                Err(Error::new(
+                    "TEST_PROBE_PROCESS_FAILED",
+                    format!("could not run configured version probe: {error}"),
+                ))
+            }
+        }
     }
 
     #[test]
@@ -5421,6 +5568,141 @@ mod tests {
         fixture.owner.close().await.unwrap();
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn store_retained_unknown_scope_blocks_independent_preflight_until_exact_departure() {
+        let fixture = probe_error_fixture_with_profile_revisions_and_executable(
+            "pr61-unknown-owner",
+            "pr61-unknown-incoming",
+            PathBuf::from("rustc"),
+        )
+        .await;
+        let store = &fixture.owner.store;
+        let custody = &store.check_child_custody;
+        let (task_id, attempt_id) = create_attempt(&fixture, "cache-project", None).await;
+        let candidate = source_snapshot(
+            &fixture,
+            &task_id,
+            &attempt_id,
+            b"unknown retained probe owner scope",
+        )
+        .await;
+        let owner_profile = fixture
+            .config
+            .checks
+            .profile("strict", "pr61-unknown-owner")
+            .expect("configured owner profile")
+            .clone();
+        let incoming_profile = fixture
+            .config
+            .checks
+            .profile("strict", "pr61-unknown-incoming")
+            .expect("configured independent incoming profile")
+            .clone();
+        let files = ArtifactFiles::new(&fixture.directory).unwrap();
+        let verified = source::verified_content(&files, &fixture.directory, &candidate).unwrap();
+        let owner_scope = inputs::ProbeCleanupScope::for_candidate(&owner_profile, &verified)
+            .expect("derive the real owner's original scope");
+        let incoming_scope = inputs::ProbeCleanupScope::for_candidate(&incoming_profile, &verified)
+            .expect("derive the otherwise-independent incoming scope");
+        assert!(!owner_scope.overlaps(&incoming_scope));
+
+        let (mut owner, process_fixture) =
+            inputs::tests::pending_probe_custody_fixture(owner_scope.clone());
+        owner.set_scope(None);
+        let helper_identity = process_fixture.helper_launch_identity().clone();
+        let target_identity = process_fixture.process_identity("target.identity.json");
+        let descendant_identity = process_fixture.process_identity("descendant.identity.json");
+        assert!(owner.is_pending());
+        assert!(owner.scope().is_none());
+        assert!(!install_probe_owner(store, owner).await);
+        {
+            let owners = custody.probe_cleanup_owners.lock().await;
+            assert_eq!(owners.len(), 1);
+            assert!(owners[0].is_pending());
+            assert!(
+                owners[0].scope().is_none(),
+                "Store retains the live owner as unknown-scope"
+            );
+        }
+        assert!(
+            !process_fixture.process_departed(&helper_identity)
+                && !process_fixture.process_departed(&target_identity)
+                && !process_fixture.process_departed(&descendant_identity),
+            "the exact native helper family is live before the independent preflight"
+        );
+
+        let blocked_snapshot = probe_plan_snapshot(
+            &fixture,
+            &attempt_id,
+            &candidate.artifact_id,
+            &incoming_profile.profile_revision,
+        )
+        .await;
+        let blocked = store
+            .resolve_check_plan_snapshot(Ok(blocked_snapshot))
+            .await
+            .unwrap();
+        match blocked.result {
+            Err(error) => assert_eq!(error.code, "CHECK_PROBE_CLEANUP_PENDING"),
+            Ok(_) => panic!(
+                "an actually retained unknown-scope owner blocks an otherwise-independent resource"
+            ),
+        }
+        assert!(custody.probe_cleanup_conflicts(Some(&incoming_scope)).await);
+        assert!(
+            custody
+                .reserve_probe_resolution(Some(&incoming_scope.resource))
+                .await
+                .is_none()
+        );
+        assert_eq!(store.check_child_custody_count().await, 1);
+        assert!(
+            !process_fixture.process_departed(&helper_identity)
+                && !process_fixture.process_departed(&target_identity)
+                && !process_fixture.process_departed(&descendant_identity),
+            "the owner remains live while unknown scope blocks B"
+        );
+
+        process_fixture.release_all();
+        reap_probe_owners_to(custody, 0).await;
+        assert!(process_fixture.process_departed(&helper_identity));
+        assert!(process_fixture.process_departed(&target_identity));
+        assert!(process_fixture.process_departed(&descendant_identity));
+        assert!(!custody.probe_cleanup_conflicts(Some(&incoming_scope)).await);
+
+        let retry_snapshot = probe_plan_snapshot(
+            &fixture,
+            &attempt_id,
+            &candidate.artifact_id,
+            &incoming_profile.profile_revision,
+        )
+        .await;
+        let retry = store
+            .resolve_check_plan_snapshot(Ok(retry_snapshot))
+            .await
+            .unwrap();
+        assert!(
+            retry.result.is_ok(),
+            "exact owner departure releases independent B"
+        );
+        assert_eq!(store.check_child_custody_count().await, 0);
+        let admitted = custody
+            .reserve_probe_resolution(Some(&incoming_scope.resource))
+            .await
+            .expect("the formerly blocked resource is available after exact departure");
+        drop(admitted);
+        eprintln!(
+            "unknown_scope_owner_evidence={{\"scope_none_retained\":true,\"helper_pid\":{},\"target_pid\":{},\"descendant_pid\":{},\"blocked_resource\":\"{}\",\"released_after_exact_departure\":true}}",
+            process_fixture.helper_pid(),
+            target_identity["pid"],
+            descendant_identity["pid"],
+            incoming_scope.resource
+        );
+        drop(process_fixture);
+        fixture.owner.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn probe_resolution_reservations_hold_conflicts_until_both_owners_depart() {
         let custody = CheckChildCustody::default();
@@ -5557,6 +5839,108 @@ mod tests {
         fixture.owner.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn healthy_independent_resolve_check_plan_snapshots_overlap_during_external_probe() {
+        let fixture = probe_error_fixture_with_profile_revisions_and_executable(
+            "pr61-healthy-a",
+            "pr61-healthy-b",
+            PathBuf::from("rustc"),
+        )
+        .await;
+        let store = &fixture.owner.store;
+        let (task_id, attempt_id) = create_attempt(&fixture, "cache-project", None).await;
+        let candidate = source_snapshot(
+            &fixture,
+            &task_id,
+            &attempt_id,
+            b"healthy concurrent resolver probes",
+        )
+        .await;
+        let snapshot_a = probe_plan_snapshot(
+            &fixture,
+            &attempt_id,
+            &candidate.artifact_id,
+            "pr61-healthy-b",
+        )
+        .await;
+        let snapshot_b = probe_plan_snapshot(
+            &fixture,
+            &attempt_id,
+            &candidate.artifact_id,
+            "pr61-healthy-a",
+        )
+        .await;
+        let profile_a = fixture
+            .config
+            .checks
+            .profile("strict", "pr61-healthy-b")
+            .expect("configured independent A profile")
+            .clone();
+        let profile_b = fixture
+            .config
+            .checks
+            .profile("strict", "pr61-healthy-a")
+            .expect("configured independent B profile")
+            .clone();
+        let files = ArtifactFiles::new(&fixture.directory).unwrap();
+        let verified = source::verified_content(&files, &fixture.directory, &candidate).unwrap();
+        let scope_a = inputs::ProbeCleanupScope::for_candidate(&profile_a, &verified)
+            .expect("derive A's exact CheckRunner scope");
+        let scope_b = inputs::ProbeCleanupScope::for_candidate(&profile_b, &verified)
+            .expect("derive B's exact CheckRunner scope");
+        assert!(!scope_a.overlaps(&scope_b));
+
+        let overlap_guard = begin_pr61_probe_overlap();
+        let gate = overlap_guard.0.clone();
+        let _probe_a = inputs::override_probe_for_test(&profile_a, overlap_pr61_input_probe);
+        let _probe_b = inputs::override_probe_for_test(&profile_b, overlap_pr61_input_probe);
+        let (resolved_a, resolved_b) = tokio::join!(
+            store.resolve_check_plan_snapshot(Ok(snapshot_a)),
+            store.resolve_check_plan_snapshot(Ok(snapshot_b)),
+        );
+        let resolved_a = resolved_a.unwrap();
+        let resolved_b = resolved_b.unwrap();
+        assert!(resolved_a.result.is_ok(), "healthy A preflight resolves");
+        assert!(resolved_b.result.is_ok(), "healthy B preflight resolves");
+        assert!(resolved_a.cache_hit.is_none());
+        assert!(resolved_b.cache_hit.is_none());
+        {
+            let state = gate.state.lock().unwrap();
+            assert_eq!(
+                state.entered, 2,
+                "both Store preflights reached external probe work"
+            );
+            assert_eq!(
+                state.successful_processes, 2,
+                "both configured version probes exited successfully"
+            );
+            assert_eq!(state.failed_processes, 0);
+            assert!(
+                !state.serialized_timeout,
+                "the second healthy resolver reached the external-probe gate before its bounded timeout"
+            );
+        }
+        drop(overlap_guard);
+
+        let custody = &store.check_child_custody;
+        assert_eq!(store.check_child_custody_count().await, 0);
+        let reservation_a = custody
+            .reserve_probe_resolution(Some(&scope_a.resource))
+            .await
+            .expect("A reservation is released after its resolver returns");
+        let reservation_b = custody
+            .reserve_probe_resolution(Some(&scope_b.resource))
+            .await
+            .expect("B remains independently admissible while A is reserved");
+        drop(reservation_a);
+        drop(reservation_b);
+        eprintln!(
+            "healthy_probe_resolution_overlap={{\"entered\":2,\"successful_processes\":2,\"resources\":[\"{}\",\"{}\"]}}",
+            scope_a.resource, scope_b.resource
+        );
+        fixture.owner.close().await.unwrap();
+    }
+
     struct Fixture {
         directory: PathBuf,
         owner: StoreOwner,
@@ -5624,13 +6008,32 @@ mod tests {
     }
 
     async fn probe_error_fixture() -> Fixture {
+        probe_error_fixture_with_profile_revisions("pr61-owner", "pr61-probe-error").await
+    }
+
+    async fn probe_error_fixture_with_profile_revisions(
+        owner_revision: &str,
+        probe_revision: &str,
+    ) -> Fixture {
+        probe_error_fixture_with_profile_revisions_and_executable(
+            owner_revision,
+            probe_revision,
+            std::env::current_exe().unwrap(),
+        )
+        .await
+    }
+
+    async fn probe_error_fixture_with_profile_revisions_and_executable(
+        owner_revision: &str,
+        probe_revision: &str,
+        executable: PathBuf,
+    ) -> Fixture {
         let directory =
             std::env::temp_dir().join(format!("swarm-check-probe-error-{}", model::new_id()));
         std::fs::create_dir_all(&directory).unwrap();
         let root = DataRoot::acquire(&directory).unwrap();
         let directory = root.path.clone();
         let credential = bootstrap_credential(&root.path).unwrap();
-        let executable = std::env::current_exe().unwrap();
         let profile = |profile_revision: &str, resource: &str| CheckProfile {
             profile_id: "strict".into(),
             profile_revision: profile_revision.into(),
@@ -5649,8 +6052,8 @@ mod tests {
         config.storage.data_dir = directory.clone();
         config.checks.enabled = true;
         config.checks.profiles = vec![
-            profile("pr61-owner", "checks-a"),
-            profile("pr61-probe-error", "checks-b"),
+            profile(owner_revision, "checks-a"),
+            profile(probe_revision, "checks-b"),
         ];
         let config = Arc::new(config);
         let owner = StoreOwner::start(root, config.clone(), credential.clone())
@@ -6643,6 +7046,93 @@ mod tests {
             create_attempt(&fixture, "cache-project", None).await;
         let tampered_source =
             source_snapshot(&fixture, &tampered_task, &tampered_attempt, content).await;
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let store = &fixture.owner.store;
+            let custody = &store.check_child_custody;
+            let files = ArtifactFiles::new(&fixture.directory).unwrap();
+            let verified =
+                source::verified_content(&files, &fixture.directory, &tampered_source).unwrap();
+            let cache_profile = fixture
+                .config
+                .checks
+                .profile("strict", "v2")
+                .expect("configured cache profile")
+                .clone();
+            let cache_scope = inputs::ProbeCleanupScope::for_candidate(&cache_profile, &verified)
+                .expect("derive the cache-verification resource scope");
+            let mut owner_profile = cache_profile.clone();
+            owner_profile.resource = "pr61-independent-cache-owner".into();
+            let owner_scope = inputs::ProbeCleanupScope::for_candidate(&owner_profile, &verified)
+                .expect("derive independent live-owner scope");
+            assert!(!cache_scope.overlaps(&owner_scope));
+
+            let (owner, process_fixture) =
+                inputs::tests::pending_probe_custody_fixture(owner_scope.clone());
+            let helper_identity = process_fixture.helper_launch_identity().clone();
+            let target_identity = process_fixture.process_identity("target.identity.json");
+            let descendant_identity = process_fixture.process_identity("descendant.identity.json");
+            assert!(!install_probe_owner(store, owner).await);
+            assert!(
+                !process_fixture.process_departed(&helper_identity)
+                    && !process_fixture.process_departed(&target_identity)
+                    && !process_fixture.process_departed(&descendant_identity),
+                "the unrelated exact helper family is live before cache verification"
+            );
+
+            let snapshot = probe_plan_snapshot(
+                &fixture,
+                &tampered_attempt,
+                &tampered_source.artifact_id,
+                "v2",
+            )
+            .await;
+            let resolution = store
+                .resolve_check_plan_snapshot(Ok(snapshot))
+                .await
+                .unwrap();
+            assert!(resolution.result.is_ok());
+            assert!(
+                resolution.cache_hit.is_none(),
+                "tampered and missing immutable outputs fail cache verification and become a miss"
+            );
+            assert_eq!(
+                store.check_child_custody_count().await,
+                1,
+                "the cache preflight reservation unwinds while the independent helper owner remains"
+            );
+            {
+                let owners = custody.probe_cleanup_owners.lock().await;
+                assert_eq!(owners.len(), 1);
+                assert!(owners[0].is_pending());
+                assert_eq!(owners[0].scope(), Some(&owner_scope));
+            }
+            assert!(
+                !process_fixture.process_departed(&helper_identity)
+                    && !process_fixture.process_departed(&target_identity)
+                    && !process_fixture.process_departed(&descendant_identity),
+                "cache verification does not release the unrelated live owner"
+            );
+            let cache_reservation = custody
+                .reserve_probe_resolution(Some(&cache_scope.resource))
+                .await
+                .expect("cache miss releases its resolver reservation for the verified resource");
+            drop(cache_reservation);
+            assert!(
+                custody
+                    .reserve_probe_resolution(Some(&owner_scope.resource))
+                    .await
+                    .is_none(),
+                "the independent live owner still holds its exact resource"
+            );
+
+            process_fixture.release_all();
+            reap_probe_owners_to(custody, 0).await;
+            assert!(process_fixture.process_departed(&helper_identity));
+            assert!(process_fixture.process_departed(&target_identity));
+            assert!(process_fixture.process_departed(&descendant_identity));
+            drop(process_fixture);
+        }
         let tampered_miss = admit_check(&fixture, &tampered_attempt, &tampered_source, "v2").await;
         assert_eq!(tampered_miss["state"], "queued");
         assert_ne!(tampered_miss["cached"], true);
