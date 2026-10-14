@@ -44,7 +44,8 @@ pub(crate) type TestProbeFn =
     fn(&Path, &[String], &BTreeMap<String, String>, &Path) -> Result<Vec<u8>>;
 
 #[cfg(test)]
-type TestProbeCleanupOverrides = BTreeMap<(String, String), (TestProbeFn, ProbeCleanupOwner)>;
+type TestProbeCleanupOverrides =
+    BTreeMap<(String, String), (TestProbeFn, Option<ProbeCleanupOwner>)>;
 
 #[cfg(test)]
 static TEST_PROBE_CLEANUP_OVERRIDES: std::sync::OnceLock<
@@ -62,6 +63,23 @@ pub(crate) fn override_probe_cleanup_for_test(
     profile: &CheckProfile,
     probe: TestProbeFn,
     owner: ProbeCleanupOwner,
+) -> TestProbeCleanupOverrideGuard {
+    override_probe_for_test_with_owner(profile, probe, Some(owner))
+}
+
+#[cfg(test)]
+pub(crate) fn override_probe_for_test(
+    profile: &CheckProfile,
+    probe: TestProbeFn,
+) -> TestProbeCleanupOverrideGuard {
+    override_probe_for_test_with_owner(profile, probe, None)
+}
+
+#[cfg(test)]
+fn override_probe_for_test_with_owner(
+    profile: &CheckProfile,
+    probe: TestProbeFn,
+    owner: Option<ProbeCleanupOwner>,
 ) -> TestProbeCleanupOverrideGuard {
     let key = (profile.profile_id.clone(), profile.profile_revision.clone());
     let mut overrides = TEST_PROBE_CLEANUP_OVERRIDES
@@ -91,7 +109,9 @@ impl Drop for TestProbeCleanupOverrideGuard {
 }
 
 #[cfg(test)]
-fn take_probe_cleanup_override(profile: &CheckProfile) -> Option<(TestProbeFn, ProbeCleanupOwner)> {
+fn take_probe_cleanup_override(
+    profile: &CheckProfile,
+) -> Option<(TestProbeFn, Option<ProbeCleanupOwner>)> {
     TEST_PROBE_CLEANUP_OVERRIDES
         .get()?
         .lock()
@@ -132,11 +152,11 @@ impl ProbeContext {
     }
 
     #[cfg(test)]
-    fn test_with_cleanup(probe: TestProbeFn, owner: ProbeCleanupOwner) -> Self {
+    fn test_with_cleanup(probe: TestProbeFn, owner: Option<ProbeCleanupOwner>) -> Self {
         Self {
             executor: ProbeExecutor::TestWithCleanup {
                 probe,
-                owner: Some(Box::new(owner)),
+                owner: owner.map(Box::new),
             },
             cleanup_owner: None,
         }
@@ -2399,7 +2419,7 @@ pub(crate) fn resolve_with_probe_for_test(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::checks::{
         model::Parser,
@@ -3251,17 +3271,59 @@ mod tests {
             .expect("write nested descendant bytes");
     }
 
-    struct ProbeCustodyFixture {
+    pub(crate) struct ProbeCustodyFixture {
         directory: PathBuf,
         control: PathBuf,
         helper_pid: u32,
+        helper_launch_identity: Option<Value>,
     }
 
     impl ProbeCustodyFixture {
+        pub(crate) fn helper_pid(&self) -> u32 {
+            self.helper_pid
+        }
+
+        pub(crate) fn helper_launch_identity(&self) -> &Value {
+            self.helper_launch_identity
+                .as_ref()
+                .expect("capture helper launch identity before handing off custody")
+        }
+
+        pub(crate) fn process_identity(&self, name: &str) -> Value {
+            read_probe_custody_identity(&probe_custody_file(&self.control, name))
+        }
+
+        pub(crate) fn process_departed(&self, identity: &Value) -> bool {
+            let Some(pid) = identity["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+            else {
+                return false;
+            };
+            crate::platform::process_group::process_birth_identity(pid)
+                .is_ok_and(|current| current.as_ref() != Some(identity))
+        }
+
+        pub(crate) fn release_target(&self) {
+            fs::write(probe_custody_file(&self.control, "target.exit"), b"exit")
+                .expect("allow direct probe process to exit");
+        }
+
+        pub(crate) fn release_descendant(&self) {
+            fs::write(
+                probe_custody_file(&self.control, "descendant.exit"),
+                b"exit",
+            )
+            .expect("allow nested process to exit");
+        }
+
+        pub(crate) fn release_all(&self) {
+            self.release_target();
+            self.release_descendant();
+        }
+
         fn cleanup(&self) {
-            for name in ["target.exit", "descendant.exit"] {
-                let _ = fs::write(probe_custody_file(&self.control, name), b"release");
-            }
+            self.release_all();
             let owner_path = self.directory.join("probe-owner.json");
             let deadline = Instant::now() + Duration::from_secs(8);
             let mut family_empty = false;
@@ -3297,8 +3359,9 @@ mod tests {
     }
 
     #[cfg(any(windows, target_os = "linux"))]
-    #[test]
-    fn probe_custody_keeps_nested_family_and_capture_until_exact_departure() {
+    pub(crate) fn pending_probe_custody_fixture(
+        scope: ProbeCleanupScope,
+    ) -> (ProbeCleanupOwner, ProbeCustodyFixture) {
         let directory =
             std::env::temp_dir().join(format!("swarm-probe-custody-{}", model::new_id()));
         let control = std::env::temp_dir().join(format!("swarm-probe-control-{}", model::new_id()));
@@ -3348,17 +3411,20 @@ mod tests {
             .spawn()
             .expect("spawn real CheckRunner probe helper");
         let helper_pid = child.id();
-        let fixture = ProbeCustodyFixture {
+        let mut fixture = ProbeCustodyFixture {
             directory: directory.clone(),
             control: control.clone(),
             helper_pid,
+            helper_launch_identity: None,
         };
-        let launch_identity = spawned_identity(helper_pid).expect("capture helper launch identity");
+        let helper_launch_identity =
+            spawned_identity(helper_pid).expect("capture helper launch identity");
+        fixture.helper_launch_identity = Some(helper_launch_identity.clone());
         let stdout = child.stdout.take().expect("capture helper stdout pipe");
         let custody = ProbeHelperCustody {
             child,
             child_pid: helper_pid,
-            launch_identity: Some(launch_identity.clone()),
+            launch_identity: Some(helper_launch_identity.clone()),
             stdout: Some(stdout),
             response_file: Some(response_file),
             capture: None,
@@ -3372,6 +3438,42 @@ mod tests {
             family_departed_proven: false,
             cleanup_complete: false,
         };
+        let mut owner = ProbeCleanupOwner {
+            custody,
+            scope: Some(scope),
+        };
+        let target_identity_path = probe_custody_file(&control, "target.identity.json");
+        let descendant_identity_path = probe_custody_file(&control, "descendant.identity.json");
+        let target_ready_path = probe_custody_file(&control, "target.ready");
+        let identities_deadline = Instant::now() + Duration::from_secs(10);
+        while (!target_identity_path.exists()
+            || !descendant_identity_path.exists()
+            || !target_ready_path.exists())
+            && Instant::now() < identities_deadline
+        {
+            owner.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            target_identity_path.exists()
+                && descendant_identity_path.exists()
+                && target_ready_path.exists(),
+            "real target and nested process publish identities and become ready"
+        );
+        assert!(
+            owner.custody.capture.is_some() && !owner.custody.capture_setup_failed,
+            "the real helper stdout capture is active at Store handoff"
+        );
+        assert!(
+            owner.is_pending(),
+            "live nested helper custody stays pending"
+        );
+        (owner, fixture)
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn probe_custody_keeps_nested_family_and_capture_until_exact_departure() {
         let profile = profile(false);
         let candidate = source(
             &model::digest(b"probe-custody-candidate"),
@@ -3379,10 +3481,12 @@ mod tests {
         );
         let scope = ProbeCleanupScope::for_candidate(&profile, &candidate)
             .expect("derive exact CheckRunner resource/workspace scope");
-        let mut owner = ProbeCleanupOwner {
-            custody,
-            scope: Some(scope.clone()),
-        };
+        let (mut owner, fixture) = pending_probe_custody_fixture(scope.clone());
+        let directory = fixture.directory.clone();
+        let control = fixture.control.clone();
+        let helper_pid = fixture.helper_pid();
+        let launch_identity = fixture.helper_launch_identity().clone();
+        let response_path = directory.join(PROBE_HELPER_RESPONSE_FILE);
 
         let target_identity_path = probe_custody_file(&control, "target.identity.json");
         let descendant_identity_path = probe_custody_file(&control, "descendant.identity.json");

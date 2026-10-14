@@ -4916,6 +4916,7 @@ mod tests {
     use tokio::time::timeout;
 
     static PR61_PROBE_FAILURE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PR61_PROBE_SUCCESS_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     const PROBE_OWNER_FIXTURE_MODE: &str = "ELIOT_PROBE_OWNER_FIXTURE_MODE";
     const PROBE_OWNER_FIXTURE_READY: &str = "ELIOT_PROBE_OWNER_FIXTURE_READY";
@@ -4932,6 +4933,16 @@ mod tests {
             "TEST_PROBE_FAILURE",
             "injected bounded CheckRunner version-probe failure",
         ))
+    }
+
+    fn count_pr61_successful_input_probe(
+        _program: &Path,
+        _args: &[String],
+        _env: &BTreeMap<String, String>,
+        _cwd: &Path,
+    ) -> Result<Vec<u8>> {
+        PR61_PROBE_SUCCESS_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(b"fixture resolver version 1\n".to_vec())
     }
 
     #[test]
@@ -5230,6 +5241,166 @@ mod tests {
         fixture.owner.close().await.unwrap();
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn real_probe_owner_blocks_only_conflicting_preflight_until_exact_family_departure() {
+        PR61_PROBE_SUCCESS_CALLS.store(0, Ordering::SeqCst);
+        let fixture = probe_error_fixture().await;
+        let store = &fixture.owner.store;
+        let (task_id, attempt_id) = create_attempt(&fixture, "cache-project", None).await;
+        let candidate =
+            source_snapshot(&fixture, &task_id, &attempt_id, b"real probe custody A/B").await;
+        let snapshot_a = probe_plan_snapshot(
+            &fixture,
+            &attempt_id,
+            &candidate.artifact_id,
+            "pr61-probe-error",
+        )
+        .await;
+
+        let files = ArtifactFiles::new(&fixture.directory).unwrap();
+        let verified = source::verified_content(&files, &fixture.directory, &candidate).unwrap();
+        let profile_a = fixture
+            .config
+            .checks
+            .profile("strict", "pr61-probe-error")
+            .unwrap();
+        let profile_b = fixture
+            .config
+            .checks
+            .profile("strict", "pr61-owner")
+            .unwrap();
+        let scope_a = inputs::ProbeCleanupScope::for_candidate(&profile_a, &verified)
+            .expect("derive actual A resource and workspace identity");
+        let scope_b = inputs::ProbeCleanupScope::for_candidate(&profile_b, &verified)
+            .expect("derive actual independent B resource and workspace identity");
+        assert!(!scope_a.overlaps(&scope_b));
+
+        let (owner, process_fixture) =
+            inputs::tests::pending_probe_custody_fixture(scope_a.clone());
+        let target_identity = process_fixture.process_identity("target.identity.json");
+        let descendant_identity = process_fixture.process_identity("descendant.identity.json");
+        let helper_identity = process_fixture.helper_launch_identity().clone();
+        let _probe_a = inputs::override_probe_cleanup_for_test(
+            &profile_a,
+            count_pr61_successful_input_probe,
+            owner,
+        );
+        let first_a = store
+            .resolve_check_plan_snapshot(Ok(snapshot_a))
+            .await
+            .unwrap();
+        match first_a.result {
+            Err(error) => assert_eq!(error.code, "CHECK_PROBE_CLEANUP_PENDING"),
+            Ok(_) => panic!("pending real probe-family custody must hold A preflight"),
+        }
+        assert_eq!(PR61_PROBE_SUCCESS_CALLS.load(Ordering::SeqCst), 1);
+
+        let custody = &store.check_child_custody;
+        assert_eq!(store.check_child_custody_count().await, 1);
+        {
+            let owners = custody.probe_cleanup_owners.lock().await;
+            assert_eq!(owners.len(), 1);
+            assert!(owners[0].is_pending());
+            assert_eq!(owners[0].scope(), Some(&scope_a));
+        }
+        assert!(custody.probe_cleanup_conflicts(None).await);
+        assert!(custody.probe_cleanup_conflicts(Some(&scope_a)).await);
+        assert!(!custody.probe_cleanup_conflicts(Some(&scope_b)).await);
+        assert!(
+            custody
+                .reserve_probe_resolution(Some(&scope_a.resource))
+                .await
+                .is_none(),
+            "conflicting A reservation remains held"
+        );
+
+        let snapshot_a2 = probe_plan_snapshot(
+            &fixture,
+            &attempt_id,
+            &candidate.artifact_id,
+            "pr61-probe-error",
+        )
+        .await;
+        let _probe_a2 =
+            inputs::override_probe_for_test(&profile_a, count_pr61_successful_input_probe);
+        let second_a = store
+            .resolve_check_plan_snapshot(Ok(snapshot_a2))
+            .await
+            .unwrap();
+        match second_a.result {
+            Err(error) => assert_eq!(error.code, "CHECK_PROBE_CLEANUP_PENDING"),
+            Ok(_) => panic!("second conflicting A preflight must stay held"),
+        }
+        assert_eq!(
+            PR61_PROBE_SUCCESS_CALLS.load(Ordering::SeqCst),
+            1,
+            "blocked A2 never starts a second resolver probe"
+        );
+        drop(_probe_a2);
+
+        let snapshot_b =
+            probe_plan_snapshot(&fixture, &attempt_id, &candidate.artifact_id, "pr61-owner").await;
+        let _probe_b =
+            inputs::override_probe_for_test(&profile_b, count_pr61_successful_input_probe);
+        let independent_b = store
+            .resolve_check_plan_snapshot(Ok(snapshot_b))
+            .await
+            .unwrap();
+        assert!(
+            independent_b.result.is_ok(),
+            "independent B completes normal CheckRunner preflight while A remains held"
+        );
+        assert_eq!(PR61_PROBE_SUCCESS_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(store.check_child_custody_count().await, 1);
+        assert!(custody.probe_cleanup_conflicts(Some(&scope_a)).await);
+        assert!(!custody.probe_cleanup_conflicts(Some(&scope_b)).await);
+        let b_reservation = custody
+            .reserve_probe_resolution(Some(&scope_b.resource))
+            .await
+            .expect("independent B remains admissible while A is pending");
+        drop(b_reservation);
+
+        process_fixture.release_all();
+        reap_probe_owners_to(custody, 0).await;
+        assert!(process_fixture.process_departed(&helper_identity));
+        assert!(process_fixture.process_departed(&target_identity));
+        assert!(process_fixture.process_departed(&descendant_identity));
+        assert!(!custody.probe_cleanup_conflicts(Some(&scope_a)).await);
+        let a_reservation = custody
+            .reserve_probe_resolution(Some(&scope_a.resource))
+            .await
+            .expect("exact helper and nested-family departure releases A");
+        drop(a_reservation);
+        let b_reservation = custody
+            .reserve_probe_resolution(Some(&scope_b.resource))
+            .await
+            .expect("A departure leaves independent B available");
+        drop(b_reservation);
+
+        let evidence = json!({
+            "helper_pid":process_fixture.helper_pid(),
+            "helper_launch_identity":helper_identity,
+            "target_identity":target_identity,
+            "descendant_identity":descendant_identity,
+            "owner_resource":scope_a.resource,
+            "owner_workspace_identity":scope_a.workspace_identity,
+            "independent_resource":scope_b.resource,
+            "independent_workspace_identity":scope_b.workspace_identity,
+            "first_a_probe_calls":1,
+            "blocked_a2_probe_calls":1,
+            "independent_b_probe_calls":2,
+            "b_completed_while_a_pending":true,
+            "owner_count_after_exact_departure":0,
+            "helper_departed":true,
+            "target_departed":true,
+            "descendant_departed":true,
+        });
+        eprintln!("probe_store_custody_ab_evidence={evidence}");
+        drop(process_fixture);
+        fixture.owner.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn probe_resolution_reservations_hold_conflicts_until_both_owners_depart() {
         let custody = CheckChildCustody::default();
@@ -5490,6 +5661,32 @@ mod tests {
             writer,
             config,
         }
+    }
+
+    async fn probe_plan_snapshot(
+        fixture: &Fixture,
+        attempt_id: &str,
+        candidate_ref: &str,
+        profile_revision: &str,
+    ) -> CheckPlanInputs {
+        let params = json!({
+            "client_request_id":model::new_id(),
+            "attempt_id":attempt_id,
+            "candidate_ref":candidate_ref,
+            "profile_id":"strict",
+            "profile_revision":profile_revision,
+        });
+        let principal = fixture.principal.clone();
+        let config = fixture.config.clone();
+        fixture
+            .owner
+            .store
+            .run(move |db| {
+                let principal = current_principal(db, principal)?;
+                plan_inputs(db, &principal, &params, &config)
+            })
+            .await
+            .expect("capture preflight snapshot for the selected profile")
     }
 
     async fn create_attempt(
