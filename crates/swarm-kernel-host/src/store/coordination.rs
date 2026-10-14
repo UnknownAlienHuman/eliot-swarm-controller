@@ -3056,6 +3056,9 @@ fn backfill_participant_task_hint(
                 return Ok(());
             };
             let index_key = keys::participant_task_key(task_id, client_id);
+            // Canonical namespace helper is the single source of truth for
+            // derived-index scans; keep the backfill write inside it.
+            debug_assert!(index_key.starts_with(keys::participant_task_namespace_prefix()));
             let expected = json!({
                 "client_id":client_id,
                 "task_id":task_id,
@@ -3182,6 +3185,7 @@ fn backfill_current_card_hints(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Backfill hint carries the exact scope/card identity tuple.
 fn inspect_card_index_hints(
     tx: &Transaction<'_>,
     marker: &mut Value,
@@ -3209,6 +3213,9 @@ fn inspect_card_index_hints(
 
             let global_key =
                 keys::global_relevance_key(term_kind, &term, client_id, card_kind, identity);
+            // Canonical namespace helper is the single source of truth for
+            // derived-index scans; keep the backfill check inside it.
+            debug_assert!(global_key.starts_with(keys::global_relevance_namespace_prefix()));
             let global_value = json!({
                 "client_id":client_id,
                 "scope_id":scope_id,

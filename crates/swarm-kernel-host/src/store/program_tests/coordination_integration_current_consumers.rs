@@ -52,7 +52,10 @@ async fn erase_legacy_coordination_indexes(store: &Store) {
         .unwrap();
 }
 
-async fn reopen_integration_store(directory: &PathBuf, credential: Credential) -> StoreOwner {
+async fn reopen_integration_store(
+    directory: &std::path::Path,
+    credential: Credential,
+) -> StoreOwner {
     let root = DataRoot::acquire(directory).unwrap();
     let mut config = Config::default();
     config.storage.data_dir = root.path.clone();
