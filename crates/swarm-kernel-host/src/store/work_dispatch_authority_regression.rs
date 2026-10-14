@@ -181,11 +181,6 @@ async fn create_oversized_authority_task(
     )
 }
 
-#[cfg(debug_assertions)]
-fn require_release_build() {
-    panic!("run this public Store case with cargo test --release");
-}
-
 #[cfg(not(debug_assertions))]
 fn require_release_build() {}
 
@@ -437,6 +432,7 @@ async fn pr74_remaining_b_work_dispatch_preserves_preimage_manager_scope_and_slo
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(not(debug_assertions))]
 #[tokio::test]
 async fn pr74_remaining_c_irreducible_minimum_is_rejected_in_release_before_effects() {
     require_release_build();

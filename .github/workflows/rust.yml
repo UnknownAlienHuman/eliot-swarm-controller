@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release]
 permissions:
   contents: read
 jobs:
@@ -635,9 +635,11 @@ jobs:
               [string]$Package,
               [string]$Filter,
               [int]$Expected = 0,
-              [string[]]$ExpectedNames = @()
+              [string[]]$ExpectedNames = @(),
+              [switch]$Release
             )
             $listArguments = @('test', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--list')
+            if ($Release) { $listArguments = @('test', '--release', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--list') }
             $listing = @(& cargo @listArguments)
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $selected = @($listing | Where-Object { $_ -match ': test$' })
@@ -659,10 +661,12 @@ jobs:
               [string]$Package,
               [string]$Filter,
               [int]$Expected = 0,
-              [string[]]$ExpectedNames = @()
+              [string[]]$ExpectedNames = @(),
+              [switch]$Release
             )
-            $selected = @(Confirm-FocusedSelection -Package $Package -Filter $Filter -Expected $Expected -ExpectedNames $ExpectedNames)
+            $selected = @(Confirm-FocusedSelection -Package $Package -Filter $Filter -Expected $Expected -ExpectedNames $ExpectedNames -Release:$Release)
             $runArguments = @('test', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--nocapture')
+            if ($Release) { $runArguments = @('test', '--release', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--nocapture') }
             & cargo @runArguments
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $selectedNames = @($selected | ForEach-Object { $_ -replace ': test$', '' })
@@ -741,6 +745,15 @@ jobs:
             )
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'store_authenticated_task_list_delta_bounded_gap_tail_recovery' -Expected 1 -ExpectedNames @('store_authenticated_task_list_delta_bounded_gap_tail_recovery')
             Invoke-FocusedCohort -Package 'swarm-script-worker' -Filter 'script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256' -Expected 1 -ExpectedNames @('script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'worker_readers_quarantine_corrupt_meta_without_poisoning_store' -Expected 1 -ExpectedNames @('worker_readers_quarantine_corrupt_meta_without_poisoning_store')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'assigned_candidate_artifact_is_current_only_and_review_receipts_survive_release' -Expected 1 -ExpectedNames @('assigned_candidate_artifact_is_current_only_and_review_receipts_survive_release')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'store_authenticated_operation_lists_and_delta_preserve_bounded_gaps_and_cursor_tail' -Expected 1 -ExpectedNames @('store_authenticated_operation_lists_and_delta_preserve_bounded_gaps_and_cursor_tail')
+          } elseif ($env:QUALIFICATION -ceq 'focused-authority-release') {
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'pr74_remaining' -Expected 3 -ExpectedNames @(
+              'pr74_remaining_b_work_dispatch_preserves_preimage_manager_scope_and_slot',
+              'pr74_remaining_c_irreducible_minimum_is_rejected_in_release_before_effects',
+              'pr74_remaining_d_malformed_retained_history_stays_damaged_at_effect_gate'
+            ) -Release
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }
