@@ -921,6 +921,96 @@ fn at_limit_root_claims_hold_with_limit_reached_before_any_new_effect() {
     );
 }
 
+#[test]
+fn public_agent_open_is_rejected_at_the_exact_root_limit_before_binding() {
+    let mut db = fixture_db();
+    db.execute_batch(WORKSPACE_SCHEMA).unwrap();
+    db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
+    let route = root_admission_route();
+    insert_task(&db, "task-placeholder");
+
+    for operation_id in ["public-root-claim-1", "public-root-claim-2"] {
+        let admission = serde_json::to_value(
+            launcher::route_admission(&db, &route, None, Some(operation_id)).unwrap(),
+        )
+        .unwrap();
+        insert_retained_root_claim_operation(&db, &route, operation_id, admission);
+    }
+    assert_eq!(
+        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+        Some(2)
+    );
+
+    let operator_id = "public-root-limit-operator";
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+        params![
+            format!("client:{operator_id}"),
+            model::canonical(&json!({"role":"operator","disabled":false})).unwrap()
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+        params![
+            LOCAL_OPERATOR_CLIENT_ID_KEY,
+            model::canonical(&json!(operator_id)).unwrap()
+        ],
+    )
+    .unwrap();
+    let principal = current_principal(
+        &db,
+        read_scope_principal(operator_id, crate::model::Role::Operator),
+    )
+    .unwrap();
+    let config = Config {
+        routes: vec![route.clone()],
+        ..Config::default()
+    };
+    let request = json!({
+        "client_request_id":"public-root-limit-open",
+        "lane_id":"public-root-limit-lane",
+        "route":"oc"
+    });
+    let error = super::mutate(&mut db, &principal, "agent.open", &request, &config)
+        .expect_err("the public root allocator must refuse a full route");
+    assert_eq!(error.code, "ROUTE_ADMISSION_HELD");
+    assert_eq!(error.message, "ROUTE_ROOT_LIMIT_REACHED");
+
+    let (state, result_json): (String, String) = db
+        .query_row(
+            "SELECT state,result_json FROM operations \
+             WHERE caller_id=?1 AND client_request_id=?2 AND method='agent.open'",
+            params![operator_id, "public-root-limit-open"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "rejected");
+    let result: Value = serde_json::from_str(&result_json).unwrap();
+    assert_eq!(result["code"], "ROUTE_ADMISSION_HELD");
+    assert_eq!(result["message"], "ROUTE_ROOT_LIMIT_REACHED");
+
+    let bindings: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM bindings WHERE lane_id='public-root-limit-lane'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let service_starts: i64 = db
+        .query_row("SELECT COUNT(*) FROM owned_service_starts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(bindings, 0);
+    assert_eq!(service_starts, 0);
+    assert_eq!(
+        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+        Some(2),
+        "the rejected public receipt did not add a root claim"
+    );
+}
+
 fn insert_runtime_state_observation(
     db: &Connection,
     binding_id: &str,
