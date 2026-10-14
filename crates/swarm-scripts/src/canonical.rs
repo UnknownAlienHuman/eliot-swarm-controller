@@ -1,4 +1,3 @@
-use crate::{Result, ScriptError};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -17,8 +16,8 @@ fn ordered(value: &Value) -> Value {
     }
 }
 
-pub(crate) fn json(value: &Value) -> Result<String> {
-    serde_json::to_string(&ordered(value)).map_err(|_| ScriptError::new("SCRIPT_PROTOCOL_INVALID"))
+pub(crate) fn json(value: &Value) -> serde_json::Result<String> {
+    serde_json::to_string(&ordered(value))
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {

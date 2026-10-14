@@ -38,6 +38,7 @@ use swarm_scripts::{
         InterpreterKind, MAX_SCHEMA_BYTES, ScriptControllerEffect, ScriptValueSchema,
         validate_bundle_path,
     },
+    script_run_canonical_json_sha256_hex_v1, script_run_canonical_json_v1,
 };
 
 const CONTROL_LIMIT: usize = 16 * 1024 * 1024;
@@ -401,7 +402,7 @@ pub fn materialize_after_go(receipt_path: &Path) -> Result<String> {
         granted_effects: work.invocation.controller_effects.clone(),
     };
     validate_plan_against_work(&plan, &work, &work_sha256, &dir)?;
-    let plan_bytes = canonical_json(&serde_json::to_value(&plan)?)?.into_bytes();
+    let plan_bytes = script_run_canonical_json_v1(&serde_json::to_value(&plan)?)?.into_bytes();
     if plan_bytes.len() > CONTROL_LIMIT {
         return Err(Error::invalid("script execution plan exceeds 16 MiB"));
     }
@@ -417,7 +418,7 @@ pub fn materialize_after_go(receipt_path: &Path) -> Result<String> {
     };
     write_once(
         &dir.join("execution-plan-ready.json"),
-        &canonical_json(&serde_json::to_value(ready)?)?.into_bytes(),
+        &script_run_canonical_json_v1(&serde_json::to_value(ready)?)?.into_bytes(),
     )?;
     Ok(plan_sha256)
 }
@@ -478,7 +479,7 @@ pub fn run_worker(receipt_path: &Path) -> Result<()> {
     });
     let mut group = Some(group);
     let worker_publication = (|| -> Result<()> {
-        let bytes = canonical_json(&identity)?.into_bytes();
+        let bytes = script_run_canonical_json_v1(&identity)?.into_bytes();
         write_once(&dir.join("worker.json"), &bytes)
     })();
     if let Err(error) = worker_publication {
@@ -629,7 +630,7 @@ fn validate_work(work: &ScriptWork) -> Result<()> {
         || work.bundle_record.metadata["bundle_sha256"] != work.bundle_record.content_digest
         || work.bundle_record.metadata["interpreter_sha256"] != work.interpreter.sha256
         || !valid_sha256(&work.environment_sha256)
-        || sha256_hex(canonical_json(&serde_json::to_value(&work.environment)?)?.as_bytes())
+        || script_run_canonical_json_sha256_hex_v1(&serde_json::to_value(&work.environment)?)?
             != work.environment_sha256
     {
         return Err(Error::new(
@@ -647,7 +648,7 @@ fn validate_work(work: &ScriptWork) -> Result<()> {
     if let Some(executor) = &work.executor {
         validate_executor_shape(executor)?;
     }
-    let bundle = canonical_json(&serde_json::to_value(&work.bundle)?)?;
+    let bundle = script_run_canonical_json_v1(&serde_json::to_value(&work.bundle)?)?;
     if bundle.len() as u64 != work.bundle_record.byte_length
         || sha256_hex(bundle.as_bytes()) != work.bundle_record.content_digest
     {
@@ -697,7 +698,7 @@ fn validate_bundle(bundle: &ScriptBundle) -> Result<()> {
         .validate_definition(0)
         .map_err(script_error)?;
     let schema_pair = json!({"input":bundle.input_schema,"result":bundle.result_schema});
-    if canonical_json(&schema_pair)?.len() > MAX_SCHEMA_BYTES {
+    if script_run_canonical_json_v1(&schema_pair)?.len() > MAX_SCHEMA_BYTES {
         return Err(Error::new(
             "SCRIPT_BUNDLE_DAMAGED",
             "retained schemas exceed 32 KiB",
@@ -768,7 +769,8 @@ fn validate_environment(environment: &std::collections::BTreeMap<String, String>
                 || value.len() > MAX_ENVIRONMENT_VALUE_BYTES
                 || value.contains('\0')
         })
-        || canonical_json(&serde_json::to_value(environment)?)?.len() > MAX_ENVIRONMENT_BYTES
+        || script_run_canonical_json_v1(&serde_json::to_value(environment)?)?.len()
+            > MAX_ENVIRONMENT_BYTES
     {
         return Err(Error::new(
             "SCRIPT_WORK_DAMAGED",
@@ -994,7 +996,7 @@ pub fn publish_start_decision(
         });
     }
 
-    let bytes = canonical_json(&serde_json::to_value(&decision)?)?.into_bytes();
+    let bytes = script_run_canonical_json_v1(&serde_json::to_value(&decision)?)?.into_bytes();
     let write_result = write_private_new(&dir.join("start-decision.json"), &bytes);
     if let Err(error) = &write_result
         && error.code != "PRIVATE_FILE_ALREADY_EXISTS"
@@ -1263,8 +1265,9 @@ fn validate_plan_against_work(
     dir: &Path,
 ) -> Result<()> {
     let expected = make_plan(work, work_sha256, dir)?;
-    let expected_invocation = canonical_json(&serde_json::to_value(&expected.invocation)?)?;
-    let actual_invocation = canonical_json(&serde_json::to_value(&plan.invocation)?)?;
+    let expected_invocation =
+        script_run_canonical_json_v1(&serde_json::to_value(&expected.invocation)?)?;
+    let actual_invocation = script_run_canonical_json_v1(&serde_json::to_value(&plan.invocation)?)?;
     if plan.schema_version != 1
         || plan.run_id != work.run_id
         || plan.operation_id != work.operation_id
@@ -1408,7 +1411,7 @@ fn execute(
     let mut cancellation_failure_reported = false;
     if let Err(error) = write_once(
         &dir.join("started.json"),
-        &canonical_json(&json!({"pid":child.id(),"started_at_ms":started_at_ms,"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token}))?.into_bytes(),
+        &script_run_canonical_json_v1(&json!({"pid":child.id(),"started_at_ms":started_at_ms,"run_id":work.run_id,"operation_id":work.operation_id,"token":work.token}))?.into_bytes(),
     ) {
         let _ = error;
         primary_error_code = Some("SCRIPT_START_RECEIPT_FAILED".to_owned());
@@ -2071,7 +2074,7 @@ fn publish_cleanup_pending(
     let dir = directory(&work.data_dir, &work.run_id)?;
     write_once(
         &dir.join("cleanup-pending.json"),
-        &canonical_json(&pending)?.into_bytes(),
+        &script_run_canonical_json_v1(&pending)?.into_bytes(),
     )
 }
 
@@ -2231,7 +2234,7 @@ fn publish_completion(work: &ScriptWork, publication: CompletionPublication<'_>)
         "process_facts":process_facts,
     });
     let result_id = format!("scriptresult-{}", sha256_hex(work.operation_id.as_bytes()));
-    let result_bytes = canonical_json(&result_document)?.into_bytes();
+    let result_bytes = script_run_canonical_json_v1(&result_document)?.into_bytes();
     let result = ArtifactRecord {
         kind: "script_result".into(),
         artifact_id: result_id.clone(),
@@ -2258,7 +2261,7 @@ fn publish_completion(work: &ScriptWork, publication: CompletionPublication<'_>)
         process_facts,
     };
     let dir = directory(&work.data_dir, &work.run_id)?;
-    let bytes = canonical_json(&serde_json::to_value(completion)?)?.into_bytes();
+    let bytes = script_run_canonical_json_v1(&serde_json::to_value(completion)?)?.into_bytes();
     write_once(&dir.join("terminal.json"), &bytes)?;
     write_once(&dir.join("completion.json"), &bytes)?;
     Ok(())
@@ -2706,23 +2709,6 @@ fn sha256_file(path: &Path, maximum: u64) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn canonical_json(value: &Value) -> Result<String> {
-    fn ordered(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => {
-                let sorted: std::collections::BTreeMap<_, _> = map
-                    .iter()
-                    .map(|(key, value)| (key.clone(), ordered(value)))
-                    .collect();
-                Value::Object(sorted.into_iter().collect())
-            }
-            Value::Array(items) => Value::Array(items.iter().map(ordered).collect()),
-            value => value.clone(),
-        }
-    }
-    serde_json::to_string(&ordered(value)).map_err(Into::into)
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -2758,7 +2744,7 @@ fn write_process_control_failure(
             &identity["process"],
         )
         .map_err(script_error)?;
-    let bytes = canonical_json(&json!(failure))?.into_bytes();
+    let bytes = script_run_canonical_json_v1(&json!(failure))?.into_bytes();
     if bytes.len() > MAX_PROCESS_CONTROL_FAILURE_BYTES {
         return Err(Error::new(
             "SCRIPT_PROCESS_CONTROL_DIAGNOSTIC_INVALID",
@@ -2858,6 +2844,28 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+mod script_run_canonical_golden {
+    use super::{script_run_canonical_json_sha256_hex_v1, script_run_canonical_json_v1};
+    use serde_json::Value;
+
+    #[test]
+    fn script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../script-run-canonical-v1.fixture.json")).unwrap();
+        let value = &fixture["value"];
+
+        assert_eq!(
+            script_run_canonical_json_v1(value).unwrap(),
+            fixture["canonical_json"].as_str().unwrap()
+        );
+        assert_eq!(
+            script_run_canonical_json_sha256_hex_v1(value).unwrap(),
+            fixture["sha256_hex"].as_str().unwrap()
+        );
+    }
 }
 
 #[cfg(test)]

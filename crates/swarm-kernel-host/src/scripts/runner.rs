@@ -28,6 +28,7 @@ use super::{
 use swarm_scripts::process::{
     MAX_PROCESS_CONTROL_FAILURE_BYTES, PROCESS_CONTROL_FAILURE_FILE, ProcessControlFailure,
 };
+use swarm_scripts::script_run_canonical_json_sha256_hex_v1;
 
 const CONTROL_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -779,9 +780,9 @@ pub fn directory(data_dir: &Path, run_id: &str) -> Result<PathBuf> {
 }
 
 pub fn environment_sha256(environment: &BTreeMap<String, String>) -> Result<String> {
-    Ok(model::digest(
-        model::canonical(&json!(environment))?.as_bytes(),
-    ))
+    Ok(script_run_canonical_json_sha256_hex_v1(&json!(
+        environment
+    ))?)
 }
 
 /// Capture only the platform's small runtime baseline plus explicitly declared

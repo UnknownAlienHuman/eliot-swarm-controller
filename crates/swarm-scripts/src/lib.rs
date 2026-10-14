@@ -34,8 +34,25 @@ pub const MAX_ENVIRONMENT_BYTES: usize = 256 * 1024;
 pub const MAX_CONTROLLER_EFFECTS: usize = 1;
 pub const MAX_CONTROLLER_EFFECT_TEXT_BYTES: usize = 4096;
 
-pub(crate) fn canonical_json(value: &serde_json::Value) -> Result<String> {
+/// Serialize ScriptRun JSON as compact v1 JSON with recursively sorted object
+/// keys and preserved array order.
+pub fn script_run_canonical_json_v1(
+    value: &serde_json::Value,
+) -> std::result::Result<String, serde_json::Error> {
     canonical::json(value)
+}
+
+/// Hash the UTF-8 bytes from [`script_run_canonical_json_v1`] as bare lowercase
+/// 64-character SHA-256 hex.
+pub fn script_run_canonical_json_sha256_hex_v1(
+    value: &serde_json::Value,
+) -> std::result::Result<String, serde_json::Error> {
+    let canonical = script_run_canonical_json_v1(value)?;
+    Ok(canonical::sha256_hex(canonical.as_bytes()))
+}
+
+pub(crate) fn canonical_json(value: &serde_json::Value) -> Result<String> {
+    script_run_canonical_json_v1(value).map_err(ScriptError::from)
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
