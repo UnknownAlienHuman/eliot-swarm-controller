@@ -8,12 +8,12 @@
 
 use super::{profiles, tool_from_spec};
 use crate::config::McpToolProfile;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rmcp::model::Tool;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) use swarm_contracts::mcp_catalog::{
     AuthorizationBasis, AuthorizationRevision, CatalogError, MAX_SEARCH_RESULTS, Surface,
 };

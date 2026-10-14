@@ -135,8 +135,8 @@ fn exact_search_keeps_full_view_revisions_and_loaded_revision_checks() {
     // Construction seam: each search rebuilds the fresh authorized view;
     // schema bytes inside the digests come from the immutable factory cache.
     reset_search_view_builds();
-    let first = search_catalog(profile, &surface, exact, authorization, |_, _| true)
-        .expect("exact match");
+    let first =
+        search_catalog(profile, &surface, exact, authorization, |_, _| true).expect("exact match");
     assert_eq!(first.matches.len(), 1);
     assert_eq!(first.matches[0].method, "task.create");
     let second = search_catalog(profile, &surface, exact, authorization, |_, _| true)
@@ -145,8 +145,8 @@ fn exact_search_keeps_full_view_revisions_and_loaded_revision_checks() {
     // Revision parity: exact and broad full views share one identity.
     assert_eq!(first.catalog_revision, second.catalog_revision);
     assert_eq!(first.surface_revision, second.surface_revision);
-    let broad_result = search_catalog(profile, &surface, broad, authorization, |_, _| true)
-        .expect("broad view");
+    let broad_result =
+        search_catalog(profile, &surface, broad, authorization, |_, _| true).expect("broad view");
     assert_eq!(broad_result.catalog_revision, first.catalog_revision);
     // Valid loaded revision is honored by exact searches.
     let replay = search_catalog(

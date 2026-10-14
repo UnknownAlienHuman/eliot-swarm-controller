@@ -323,7 +323,7 @@ impl Store {
                     let scope_plan = serde_json::to_value(&resolved.scope_plan)?;
                     Ok(PreparedCheckPlan {
                         context_fingerprint: resolved_context,
-                        project_id: project_id,
+                        project_id,
                         resolved_inputs: resolved.resolved_inputs,
                         scope_plan,
                         input_fingerprint: resolved.input_fingerprint,
@@ -346,7 +346,7 @@ impl Store {
         if install_conflict {
             return Ok(pending_resolution());
         }
-        if matches!(&prepared, Ok(_))
+        if prepared.is_ok()
             && self
                 .check_child_custody
                 .probe_cleanup_conflicts(resolved_scope.as_ref())
