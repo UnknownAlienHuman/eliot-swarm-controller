@@ -13,16 +13,12 @@ use swarm_contracts::error::{Error, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonlScanVerdict {
     /// Every byte belongs to a newline-terminated record accepted by the
-    /// caller's validator. Each range includes its terminating `\n`.
-    Complete {
-        complete_ranges: Vec<Range<usize>>,
-        valid_bytes: usize,
-    },
+    /// caller's validator.
+    Complete { valid_bytes: usize },
     /// Every complete record was accepted, followed by a bounded nonempty
     /// suffix without a newline. The suffix bytes are not exposed; callers
     /// can retain only its length and digest as diagnostic evidence.
     TornLastFrame {
-        complete_ranges: Vec<Range<usize>>,
         valid_bytes: usize,
         tail_digest: String,
         tail_bytes: usize,
@@ -76,7 +72,6 @@ where
         return Err(Error::invalid("JSONL record bound must be nonzero"));
     }
 
-    let mut complete_ranges = Vec::new();
     let mut record_start = 0;
     while record_start < bytes.len() {
         let newline = bytes[record_start..].iter().position(|byte| *byte == b'\n');
@@ -93,7 +88,6 @@ where
             }
             let tail_digest = format!("{:x}", Sha256::digest(&bytes[record_start..]));
             return Ok(JsonlScanVerdict::TornLastFrame {
-                complete_ranges,
                 valid_bytes: record_start,
                 tail_digest,
                 tail_bytes,
@@ -119,12 +113,10 @@ where
                 reason: JsonlDamage::InvalidCompleteRecord,
             });
         }
-        complete_ranges.push(range);
         record_start = record_end;
     }
 
     Ok(JsonlScanVerdict::Complete {
-        complete_ranges,
         valid_bytes: bytes.len(),
     })
 }
