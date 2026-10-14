@@ -2240,8 +2240,7 @@ mod journal65_parity_tests {
     const PARITY_BINDING: &str = "parity-binding";
     const PARITY_GENERATION: i64 = 1;
     const PARITY_SCOPE: &str = "parity-scope";
-    const PARITY_ROUTE: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PARITY_ROUTE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn parity_intent(operation_id: &str) -> OperationIntent {
         let module_receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
@@ -2283,12 +2282,22 @@ mod journal65_parity_tests {
     }
 
     fn open_parity_journal(root: &Path) -> Journal {
-        Journal::open(root, PARITY_BINDING, PARITY_GENERATION, PARITY_SCOPE, PARITY_ROUTE)
-            .unwrap()
+        Journal::open(
+            root,
+            PARITY_BINDING,
+            PARITY_GENERATION,
+            PARITY_SCOPE,
+            PARITY_ROUTE,
+        )
+        .unwrap()
     }
 
     fn fresh_root(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("swarm-opencode-journal65-{}-{}", prefix, uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "swarm-opencode-journal65-{}-{}",
+            prefix,
+            uuid::Uuid::new_v4()
+        ))
     }
 
     #[test]
@@ -2323,7 +2332,10 @@ mod journal65_parity_tests {
         let torn_bytes = std::fs::read(&path).unwrap();
         let via_load = journal.load(operation_id).unwrap();
         let via_path = journal.load_by_path(&path).unwrap();
-        let load_tail = via_load.torn_tail_evidence.clone().expect("load reports torn tail");
+        let load_tail = via_load
+            .torn_tail_evidence
+            .clone()
+            .expect("load reports torn tail");
         let path_tail = via_path
             .torn_tail_evidence
             .clone()
@@ -2374,9 +2386,15 @@ mod journal65_parity_tests {
             .write_all(b"{\"kind\":\"outcome\"")
             .unwrap();
         let scanned = journal.load(operation_id).unwrap();
-        let evidence = scanned.torn_tail_evidence.clone().expect("torn tail scanned");
+        let evidence = scanned
+            .torn_tail_evidence
+            .clone()
+            .expect("torn tail scanned");
         let torn_bytes = std::fs::read(&path).unwrap();
-        assert_eq!(torn_bytes.len(), evidence.valid_prefix_bytes + evidence.tail_bytes);
+        assert_eq!(
+            torn_bytes.len(),
+            evidence.valid_prefix_bytes + evidence.tail_bytes
+        );
 
         std::fs::OpenOptions::new()
             .append(true)

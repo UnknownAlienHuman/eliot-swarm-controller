@@ -3216,7 +3216,11 @@ mod journal65_parity_tests {
     }
 
     fn fresh_root(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("swarm-claude-journal65-{}-{}", prefix, uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "swarm-claude-journal65-{}-{}",
+            prefix,
+            uuid::Uuid::new_v4()
+        ))
     }
 
     #[test]
@@ -3226,7 +3230,9 @@ mod journal65_parity_tests {
         let operation_id = "parity-operation";
         let receipt = parity_receipt(operation_id);
         let intent = parity_intent();
-        journal.write_intent(operation_id, &receipt, "agent.result", &intent).unwrap();
+        journal
+            .write_intent(operation_id, &receipt, "agent.result", &intent)
+            .unwrap();
         let outcome = parity_outcome(operation_id);
         journal.save_outcome_value(operation_id, &outcome).unwrap();
         let path = journal.path(operation_id).unwrap();
@@ -3254,9 +3260,15 @@ mod journal65_parity_tests {
             .write_all(b"{")
             .unwrap();
         let torn_bytes = std::fs::read(&path).unwrap();
-        let via_get = journal.get(operation_id).unwrap().expect("torn state via get");
+        let via_get = journal
+            .get(operation_id)
+            .unwrap()
+            .expect("torn state via get");
         let via_path = journal.read_path(&path, Some(operation_id)).unwrap();
-        let get_tail = via_get.torn_tail_evidence.clone().expect("get reports torn tail");
+        let get_tail = via_get
+            .torn_tail_evidence
+            .clone()
+            .expect("get reports torn tail");
         let path_tail = via_path
             .torn_tail_evidence
             .clone()
@@ -3297,7 +3309,9 @@ mod journal65_parity_tests {
         let operation_id = "parity-changed-operation";
         let receipt = parity_receipt(operation_id);
         let intent = parity_intent();
-        journal.write_intent(operation_id, &receipt, "agent.result", &intent).unwrap();
+        journal
+            .write_intent(operation_id, &receipt, "agent.result", &intent)
+            .unwrap();
         let outcome = parity_outcome(operation_id);
         journal.save_outcome_value(operation_id, &outcome).unwrap();
         let path = journal.path(operation_id).unwrap();
@@ -3307,10 +3321,19 @@ mod journal65_parity_tests {
             .unwrap()
             .write_all(b"{")
             .unwrap();
-        let scanned = journal.get(operation_id).unwrap().expect("torn tail scanned");
-        let evidence = scanned.torn_tail_evidence.clone().expect("torn tail scanned");
+        let scanned = journal
+            .get(operation_id)
+            .unwrap()
+            .expect("torn tail scanned");
+        let evidence = scanned
+            .torn_tail_evidence
+            .clone()
+            .expect("torn tail scanned");
         let torn_bytes = std::fs::read(&path).unwrap();
-        assert_eq!(torn_bytes.len(), evidence.valid_prefix_bytes + evidence.tail_bytes);
+        assert_eq!(
+            torn_bytes.len(),
+            evidence.valid_prefix_bytes + evidence.tail_bytes
+        );
 
         std::fs::OpenOptions::new()
             .append(true)
@@ -3322,7 +3345,9 @@ mod journal65_parity_tests {
         assert!(changed_bytes.len() > torn_bytes.len());
         assert!(changed_bytes.starts_with(&torn_bytes));
 
-        let err = journal.repair_torn_acknowledgement(operation_id, &outcome).unwrap_err();
+        let err = journal
+            .repair_torn_acknowledgement(operation_id, &outcome)
+            .unwrap_err();
         assert_eq!(err.code, "ADAPTER_JOURNAL_RECOVERY_UNKNOWN");
         assert_eq!(std::fs::read(&path).unwrap(), changed_bytes);
 
