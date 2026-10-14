@@ -607,6 +607,67 @@ fn provider_route_disabled_short_circuits_root_roster_and_binding_reads() {
     );
 }
 
+#[test]
+fn zero_root_limit_policy_rejects_public_open_with_a_free_roster() {
+    let mut db = fixture_db();
+    db.execute_batch(WORKSPACE_SCHEMA).unwrap();
+    db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
+    let mut route = root_admission_route();
+    route
+        .admission_policy
+        .as_mut()
+        .unwrap()
+        .max_concurrent_roots = 0;
+    let operator_id = "zero-root-limit-operator";
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+        params![
+            format!("client:{operator_id}"),
+            model::canonical(&json!({"role":"operator","disabled":false})).unwrap()
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+        params![
+            LOCAL_OPERATOR_CLIENT_ID_KEY,
+            model::canonical(&json!(operator_id)).unwrap()
+        ],
+    )
+    .unwrap();
+    let principal = current_principal(
+        &db,
+        read_scope_principal(operator_id, crate::model::Role::Operator),
+    )
+    .unwrap();
+    let config = Config {
+        routes: vec![route.clone()],
+        ..Config::default()
+    };
+    let request = json!({
+        "client_request_id":"zero-root-limit-open",
+        "lane_id":"zero-root-limit-lane",
+        "route":"oc"
+    });
+
+    let error = super::mutate(&mut db, &principal, "agent.open", &request, &config)
+        .expect_err("zero is an invalid admission policy even when the roster is empty");
+    assert_eq!(error.code, "ROUTE_ADMISSION_UNAVAILABLE");
+    assert_eq!(error.message, "ROUTE_POLICY_INVALID");
+    assert_eq!(
+        capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
+        Some(0)
+    );
+    let bindings: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM bindings WHERE lane_id='zero-root-limit-lane'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bindings, 0);
+}
+
 fn insert_retained_root_claim_operation(
     db: &Connection,
     route: &crate::config::Route,
@@ -1040,6 +1101,10 @@ fn public_agent_open_is_rejected_at_the_exact_root_limit_before_binding() {
         current_admission.decision,
         provider_conditions::RouteAdmissionDecision::Admit
     ));
+    assert_eq!(
+        current_admission.condition,
+        provider_conditions::ConditionProjection::ConditionUnobserved
+    );
     let dispatch_attempt_id = "public-root-dispatch-attempt";
     let dispatch_task_id = "public-root-dispatch-task";
     insert_attempt(
@@ -1161,6 +1226,180 @@ fn public_agent_open_is_rejected_at_the_exact_root_limit_before_binding() {
     );
 }
 
+fn provider_usage_snapshot(
+    condition: Value,
+    collected_at_ms: i64,
+    revision: i64,
+) -> swarm_contracts::native_usage::NativeUsageSnapshot {
+    let condition_at_ms = collected_at_ms - 300;
+    let is_available = condition["kind"] == "available";
+    let evidence = json!({
+        "method":"account/rateLimits/read",
+        "revision":revision,
+        "native_observed_at_ms":null
+    });
+    let ordinary_usage_allowed = if is_available {
+        json!({
+            "value":true,
+            "collected_at_ms":condition_at_ms,
+            "evidence":evidence,
+        })
+    } else {
+        Value::Null
+    };
+    let provider_condition = if is_available {
+        Value::Null
+    } else {
+        json!({
+            "condition":condition,
+            "collected_at_ms":condition_at_ms,
+            "evidence":evidence,
+        })
+    };
+    serde_json::from_value(json!({
+        "schema_version":1,
+        "service":"codex",
+        "connection_id":"provider-condition-connection",
+        "auth_context_ref":"a".repeat(64),
+        "ordinary_usage_allowed":ordinary_usage_allowed,
+        "collection_issue":null,
+        "collected_at_ms":collected_at_ms,
+        "freshness":"current",
+        "completeness":"full",
+        "evidence":{
+            "method":"account/rateLimits/read",
+            "revision":revision,
+            "native_observed_at_ms":null
+        },
+        "buckets":[{
+            "id":"primary",
+            "normal_model_slug":{"value":"m1","collected_at_ms":condition_at_ms},
+            "provider_condition":provider_condition
+        }]
+    }))
+    .unwrap()
+}
+
+fn record_provider_usage_snapshot(
+    db: &mut Connection,
+    binding_id: &str,
+    route_value: &Value,
+    native_scope_key: &str,
+    source_epoch: &str,
+    source_observation_key: &str,
+    snapshot: &swarm_contracts::native_usage::NativeUsageSnapshot,
+    module_sequence: i64,
+) -> i64 {
+    let native_usage = json!({"boot_id":source_epoch,"snapshot":snapshot});
+    let source_observation_id = insert_runtime_state_observation(
+        db,
+        binding_id,
+        source_observation_key,
+        &json!({"native_usage":native_usage}),
+        snapshot.collected_at_ms,
+    );
+    db.execute(
+        "UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id',?2,'$.connection','connected', \
+                             '$.native_usage',json(?3)) \
+         WHERE binding_id=?1 AND generation=1",
+        params![
+            binding_id,
+            source_epoch,
+            model::canonical(&json!({"boot_id":source_epoch,"snapshot":snapshot})).unwrap()
+        ],
+    )
+    .unwrap();
+    let source_binding = json!({
+        "binding_id":binding_id,
+        "generation":1,
+        "route":route_value,
+        "native_scope_key":native_scope_key,
+        "released_at_ms":null,
+        "state":"ready",
+        "observation":{"bridge_boot_id":source_epoch}
+    });
+    let tx = db.transaction().unwrap();
+    provider_conditions::observe_usage(
+        &tx,
+        &source_binding,
+        snapshot,
+        module_sequence,
+        source_observation_id,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    source_observation_id
+}
+
+#[test]
+fn provider_hold_survives_elapsed_retry_until_newer_exact_fact() {
+    let mut db = fixture_db();
+    db.execute_batch(WORKSPACE_SCHEMA).unwrap();
+    db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
+    db.execute_batch(PROVIDER_CONDITION_SCHEMA).unwrap();
+    let mut route_value = serde_json::to_value(root_admission_route()).unwrap();
+    route_value["native_options"]["account_id"] = json!("provider-account");
+    let route: crate::config::Route = serde_json::from_value(route_value.clone()).unwrap();
+    insert_binding(
+        &db,
+        "provider-hold-source",
+        "provider-hold-source-lane",
+        &route_value,
+        Some(json!({
+            "native_scope_key":"provider-hold-native-scope",
+            "native_root_id":"provider-hold-native-root"
+        })),
+    );
+
+    let limited =
+        provider_usage_snapshot(json!({"kind":"rate_limited","retry_at_ms":2_500}), 2_000, 1);
+    record_provider_usage_snapshot(
+        &mut db,
+        "provider-hold-source",
+        &route_value,
+        "provider-hold-native-scope",
+        "provider-hold-boot",
+        "provider-hold-usage-v1",
+        &limited,
+        1,
+    );
+
+    let at_retry = provider_conditions::check_route(&db, &route, None, Some(1), 2_500).unwrap();
+    let long_after_retry =
+        provider_conditions::check_route(&db, &route, None, Some(1), 20_000).unwrap();
+    for admission in [&at_retry, &long_after_retry] {
+        assert!(matches!(
+            admission.decision,
+            provider_conditions::RouteAdmissionDecision::Hold { ref code, until_ms: None }
+                if code == "PROVIDER_RATE_LIMITED"
+        ));
+    }
+
+    let available = provider_usage_snapshot(json!({"kind":"available"}), 3_000, 2);
+    record_provider_usage_snapshot(
+        &mut db,
+        "provider-hold-source",
+        &route_value,
+        "provider-hold-native-scope",
+        "provider-hold-boot",
+        "provider-hold-usage-v2",
+        &available,
+        2,
+    );
+    let recovered = launcher::route_admission(&db, &route, None, None).unwrap();
+    assert!(matches!(
+        recovered.decision,
+        provider_conditions::RouteAdmissionDecision::Admit
+    ));
+    assert!(matches!(
+        recovered.condition,
+        provider_conditions::ConditionProjection::Observed {
+            condition: swarm_contracts::provider_condition::ProviderCondition::Available,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn public_agent_open_rejects_auth_required_with_a_free_root_slot() {
     let mut db = fixture_db();
@@ -1182,72 +1421,17 @@ fn public_agent_open_rejects_auth_required_with_a_free_root_slot() {
         })),
     );
 
-    let auth_context_ref = "a".repeat(64);
-    let snapshot: swarm_contracts::native_usage::NativeUsageSnapshot =
-        serde_json::from_value(json!({
-            "schema_version":1,
-            "service":"codex",
-            "connection_id":"provider-condition-connection",
-            "auth_context_ref":auth_context_ref,
-            "ordinary_usage_allowed":null,
-            "collection_issue":null,
-            "collected_at_ms":2_000,
-            "freshness":"current",
-            "completeness":"full",
-            "evidence":{
-                "method":"account/rateLimits/read",
-                "revision":1,
-                "native_observed_at_ms":null
-            },
-            "buckets":[{
-                "id":"primary",
-                "normal_model_slug":{"value":"m1","collected_at_ms":1_700},
-                "provider_condition":{
-                    "condition":{"kind":"auth_required"},
-                    "collected_at_ms":1_700,
-                    "evidence":{
-                        "method":"account/rateLimits/read",
-                        "revision":1,
-                        "native_observed_at_ms":null
-                    }
-                }
-            }]
-        }))
-        .unwrap();
-    let source_observation_id = insert_runtime_state_observation(
-        &db,
+    let snapshot = provider_usage_snapshot(json!({"kind":"auth_required"}), 2_000, 1);
+    record_provider_usage_snapshot(
+        &mut db,
         "provider-condition-source",
+        &route_value,
+        "provider-condition-native-scope",
+        "provider-condition-boot",
         "provider-condition-usage",
-        &json!({"native_usage":snapshot.clone()}),
-        2_000,
+        &snapshot,
+        1,
     );
-    let source_epoch = "provider-condition-boot";
-    let native_usage = json!({"boot_id":source_epoch,"snapshot":snapshot.clone()});
-    db.execute(
-        "UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id',?2,'$.connection','connected', \
-                             '$.native_usage',json(?3)) \
-         WHERE binding_id=?1 AND generation=1",
-        params![
-            "provider-condition-source",
-            source_epoch,
-            model::canonical(&native_usage).unwrap()
-        ],
-    )
-    .unwrap();
-
-    let source_binding = json!({
-        "binding_id":"provider-condition-source",
-        "generation":1,
-        "route":route_value,
-        "native_scope_key":"provider-condition-native-scope",
-        "released_at_ms":null,
-        "state":"ready",
-        "observation":{"bridge_boot_id":source_epoch}
-    });
-    let tx = db.transaction().unwrap();
-    provider_conditions::observe_usage(&tx, &source_binding, &snapshot, 1, source_observation_id)
-        .unwrap();
-    tx.commit().unwrap();
 
     assert_eq!(
         capacity::root_claims_for_route(&db, &route, None, None).unwrap(),
@@ -1394,6 +1578,69 @@ fn public_agent_open_rejects_auth_required_with_a_free_root_slot() {
         Some(1),
         "the rejected Task operation is not a new root claim"
     );
+
+    let current_binding = operations::get_binding(&db, "provider-condition-source", 1).unwrap();
+    let expected_task_admission = serde_json::to_value(
+        runtime::binding_route_admission(&db, &current_binding, Some(&config), None).unwrap(),
+    )
+    .unwrap();
+    let queue =
+        launcher::queue_get(&db, &principal, &json!({"after":0,"limit":5}), &config).unwrap();
+    let queue_admission = queue["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["task_id"] == task_id)
+        .expect("the current provider-bound Task is in the queue")["route_admission"]
+        .clone();
+    assert_eq!(queue_admission, expected_task_admission);
+
+    let dashboard = launcher::dashboard(&db, &principal, &json!({"limit":5}), &config).unwrap();
+    let dashboard_queue_admission = dashboard["queue_preview"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["task_id"] == task_id)
+        .expect("dashboard queue preview contains the same Task")["route_admission"]
+        .clone();
+    assert_eq!(dashboard_queue_admission, queue_admission);
+
+    let capacity_report = super::read(
+        &db,
+        &principal,
+        "report.capacity",
+        &json!({"after":0,"limit":5}),
+        &config,
+    )
+    .unwrap();
+    let route_scope_key = capacity::ScopeKey::from_route(&route_value, "");
+    let capacity_admission = capacity_report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["scope"]["scope_key"] == route_scope_key.as_str())
+        .expect("capacity report projects the matching route scope")["route_admission"]
+        .clone();
+    assert_eq!(capacity_admission["decision"], queue_admission["decision"]);
+    assert_eq!(
+        capacity_admission["condition"],
+        queue_admission["condition"]
+    );
+    assert_eq!(capacity_admission["decision"]["code"], "AUTH_REQUIRED");
+    assert!(
+        capacity_admission["root_limit"]["current_claims"]
+            != queue_admission["root_limit"]["current_claims"],
+        "the prospective-root capacity view and current-binding queue view use their respective exclusions"
+    );
+    let dashboard_capacity_admission = dashboard["capacity"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["scope"]["scope_key"] == route_scope_key.as_str())
+        .expect("dashboard capacity page projects the same route scope")["route_admission"]
+        .clone();
+    assert_eq!(dashboard_capacity_admission, capacity_admission);
+    assert_no_admission_claim(&scope_item(&db, route_scope_key.as_str()));
 }
 fn insert_runtime_state_observation(
     db: &Connection,

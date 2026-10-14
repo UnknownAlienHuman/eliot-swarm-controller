@@ -81,6 +81,21 @@ async fn start_store() -> (StoreOwner, PathBuf, Principal, Credential) {
     (owner, directory, operator, credential)
 }
 
+async fn start_store_with_config(
+    directory: PathBuf,
+    mut config: Config,
+) -> (StoreOwner, Principal, Credential) {
+    std::fs::create_dir_all(&directory).unwrap();
+    config.storage.data_dir = directory.clone();
+    let root = DataRoot::acquire(&directory).unwrap();
+    let credential = bootstrap_credential(&root.path).unwrap();
+    let owner = StoreOwner::start(root, Arc::new(config), credential.clone())
+        .await
+        .unwrap();
+    let operator = owner.store.authenticate(credential.clone()).await.unwrap();
+    (owner, operator, credential)
+}
+
 async fn write(store: &Store, principal: &Principal, method: &str, mut value: Value) -> Value {
     value["client_request_id"] = json!(model::new_id());
     store
@@ -616,6 +631,243 @@ async fn work_dispatch_and_manual_launch_share_one_immutable_manager_scoped_slot
         .unwrap();
     assert_eq!(launch_count, 1);
     assert_eq!(operation_caller, AUTOMATION_TECHNICAL_REQUESTER_ID);
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn manual_launch_final_gate_rejects_new_provider_condition_before_workspace_or_binding() {
+    let directory = std::env::temp_dir().join(format!(
+        "swarm-manual-provider-final-gate-{}",
+        model::new_id()
+    ));
+    let mut config = regression_config(&directory);
+    config.routes[0].native_options = json!({
+        "service_id":"manual-provider-service",
+        "account_id":"provider-account",
+        "model":{"id":"m1","providerID":"prov-a","variant":"v"}
+    });
+    let route = config.routes[0].clone();
+    let route_value = serde_json::to_value(&route).unwrap();
+    let (owner, operator, _credential) = start_store_with_config(directory.clone(), config).await;
+    let manager = register_manager(&owner.store, &operator, "manual-provider-manager").await;
+    select_regression_descriptor(&owner.store, &manager, &route.alias).await;
+    write(
+        &owner.store,
+        &operator,
+        "gm.handover",
+        json!({"client_id":manager.client_id}),
+    )
+    .await;
+
+    let task = write(
+        &owner.store,
+        &operator,
+        "task.create",
+        json!({
+            "project_id":"manual-provider-project",
+            "spec":{
+                "objective":"Reject manual launch when provider state changes after preview",
+                "phase":"implementation",
+                "requirements":[{"id":"R1","statement":"Do not reserve workspace or root after provider denial"}],
+                "scope":{"initial_paths":["src/target.rs"]},
+                "owner_policy_id":OWNER_POLICY_V1_ID,
+            }
+        }),
+    )
+    .await;
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+    let preview_request = json!({
+        "task_id":task_id,
+        "expected_task_revision":1,
+        "route":route.alias,
+        "agent_profile":"manual-provider-agent",
+        "mcp_profile":"work-participant",
+        "mcp_surface":"participant-core",
+        "workspace_policy":"manager_owned_worktree",
+        "requested_model":null,
+        "requested_effort":null,
+        "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+        "stop_conditions":[],
+        "purpose":"implementation",
+    });
+    let preview = owner
+        .store
+        .call(
+            manager.clone(),
+            "swarm.launch.preview".to_owned(),
+            preview_request.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["hard_blocks"], json!([]), "{preview}");
+    assert_eq!(
+        preview["route"]["admission"]["decision"]["decision"], "admit",
+        "the read-only preview sees the initial unobserved condition: {preview}"
+    );
+
+    let mut launch_request = preview_request;
+    launch_request["client_request_id"] = json!("manual-provider-condition-change");
+    launch_request["plan_digest"] = preview["plan_digest"].clone();
+    let launch = owner
+        .store
+        .call(manager.clone(), "swarm.launch".to_owned(), launch_request)
+        .await
+        .unwrap();
+    assert_eq!(launch["launch_state"], "pending_workspace", "{launch}");
+    let operation_id = launch["operation_id"].as_str().unwrap().to_owned();
+
+    let source_binding_id = "manual-provider-condition-source";
+    let source_lane_id = "manual-provider-condition-source-lane";
+    let source_scope_key = "manual-provider-native-scope";
+    let source_root_id = "manual-provider-native-root";
+    let source_epoch = "manual-provider-source-boot";
+    owner
+        .store
+        .run({
+            let route_value = route_value.clone();
+            move |db| {
+                let tx = db.transaction_with_behavior(
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let snapshot: swarm_contracts::native_usage::NativeUsageSnapshot =
+                    serde_json::from_value(json!({
+                        "schema_version":1,
+                        "service":"codex",
+                        "connection_id":"manual-provider-connection",
+                        "auth_context_ref":"b".repeat(64),
+                        "ordinary_usage_allowed":null,
+                        "collection_issue":null,
+                        "collected_at_ms":2_000,
+                        "freshness":"current",
+                        "completeness":"full",
+                        "evidence":{
+                            "method":"account/rateLimits/read",
+                            "revision":1,
+                            "native_observed_at_ms":null
+                        },
+                        "buckets":[{
+                            "id":"primary",
+                            "normal_model_slug":{"value":"m1","collected_at_ms":1_700},
+                            "provider_condition":{
+                                "condition":{"kind":"auth_required"},
+                                "collected_at_ms":1_700,
+                                "evidence":{
+                                    "method":"account/rateLimits/read",
+                                    "revision":1,
+                                    "native_observed_at_ms":null
+                                }
+                            }
+                        }]
+                    }))?;
+                let native_usage = json!({"boot_id":source_epoch,"snapshot":snapshot.clone()});
+                let state = json!({
+                    "execution":"not_observed",
+                    "waiting_for":"runtime_adapter",
+                    "family_completeness":"unknown",
+                    "connection":"connected",
+                    "bridge_boot_id":source_epoch,
+                    "native_usage":native_usage.clone(),
+                    "observed_at_ms":2_000,
+                });
+                tx.execute(
+                    "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) \
+                     VALUES(?1,1,?2,'manual-provider-instance',?3,'ready',?4,?5,?6,?7,2000)",
+                    rusqlite::params![
+                        source_binding_id,
+                        source_lane_id,
+                        route.module_artifact_id,
+                        source_scope_key,
+                        source_root_id,
+                        model::canonical(&route_value)?,
+                        model::canonical(&state)?,
+                    ],
+                )?;
+                let payload = model::canonical(&json!({"native_usage":native_usage}))?;
+                tx.execute(
+                    "INSERT INTO observations(source_stream_id,source_event_key,binding_id,binding_generation,kind,payload_json,recorded_at_ms) \
+                     VALUES(?1,'manual-provider-condition-v1',?2,1,'runtime.state',?3,2000)",
+                    rusqlite::params![
+                        format!("runtime-state:{source_binding_id}:1"),
+                        source_binding_id,
+                        payload,
+                    ],
+                )?;
+                let observation_id = tx.last_insert_rowid();
+                let binding = json!({
+                    "binding_id":source_binding_id,
+                    "generation":1,
+                    "route":route_value,
+                    "native_scope_key":source_scope_key,
+                    "released_at_ms":null,
+                    "state":"ready",
+                    "observation":{"bridge_boot_id":source_epoch}
+                });
+                super::provider_conditions::observe_usage(
+                    &tx,
+                    &binding,
+                    &snapshot,
+                    1,
+                    observation_id,
+                )?;
+                tx.commit()?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    owner.store.reconcile_launches_once().await.unwrap();
+    let final_operation = owner
+        .store
+        .call(
+            manager.clone(),
+            "operation.get".to_owned(),
+            json!({"operation_id":operation_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(final_operation["state"], "settled", "{final_operation}");
+    assert_eq!(final_operation["result"]["launch_state"], "blocked");
+    assert_eq!(
+        final_operation["result"]["failure"]["code"],
+        "route_admission_unavailable"
+    );
+    let operation_id_for_readback = operation_id.clone();
+    let task_id_for_readback = task_id.clone();
+    let (workspace_leases, attempts, launch_bindings, open_children): (i64, i64, i64, i64) = owner
+        .store
+        .run(move |db| {
+            Ok((
+                db.query_row(
+                    "SELECT COUNT(*) FROM workspace_leases WHERE operation_id=?1",
+                    [&operation_id_for_readback],
+                    |row| row.get(0),
+                )?,
+                db.query_row(
+                    "SELECT COUNT(*) FROM attempts WHERE task_id=?1",
+                    [&task_id_for_readback],
+                    |row| row.get(0),
+                )?,
+                db.query_row(
+                    "SELECT COUNT(*) FROM bindings WHERE lane_id LIKE 'launch-%'",
+                    [],
+                    |row| row.get(0),
+                )?,
+                db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE method='agent.open' AND prerequisite_operation_id=?1",
+                    [&operation_id_for_readback],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(workspace_leases, 0);
+    assert_eq!(attempts, 0);
+    assert_eq!(launch_bindings, 0);
+    assert_eq!(open_children, 0);
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();

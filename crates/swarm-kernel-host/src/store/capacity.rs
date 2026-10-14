@@ -62,6 +62,7 @@
 
 use super::{meta, operations, set_meta, tasks};
 use crate::{
+    config::Config,
     error::{Error, Result},
     model,
     runtime::RuntimeOutcome,
@@ -4406,15 +4407,19 @@ fn paginate(
 /// `report.capacity`: per-scope active + reserved accounting with the
 /// manager-facing desired-vs-effective writer view. Read-only.
 pub(crate) fn capacity_report(db: &Connection, limit: i64, after: i64) -> Result<Value> {
-    let mut report = paginate(
-        capacity_items(db)?,
-        "capacity_accounting",
-        limit,
-        after,
-        capacity_gap_reference,
-    )?;
-    report["generated_at_ms"] = json!(model::now_ms()?);
-    Ok(report)
+    capacity_report_from_items(db, capacity_items(db)?, limit, after, None)
+}
+
+/// `report.capacity` with the same bounded route-admission projection used by
+/// launch preview and the Manager queue. The accounting fields remain
+/// descriptive and never grant launch authority.
+pub(crate) fn capacity_report_with_route_admission(
+    db: &Connection,
+    limit: i64,
+    after: i64,
+    config: &Config,
+) -> Result<Value> {
+    capacity_report_from_items(db, capacity_items(db)?, limit, after, Some(config))
 }
 
 /// `capacity_report` restricted to a Manager's accessible Task set.
@@ -4426,8 +4431,90 @@ pub(crate) fn capacity_report_for_scope(
     after: i64,
     owned_tasks: &[String],
 ) -> Result<Value> {
-    let mut report = paginate(
+    capacity_report_from_items(
+        db,
         capacity_items_for_scope(db, Some(owned_tasks))?,
+        limit,
+        after,
+        None,
+    )
+}
+
+pub(crate) fn capacity_report_for_scope_with_route_admission(
+    db: &Connection,
+    limit: i64,
+    after: i64,
+    owned_tasks: &[String],
+    config: &Config,
+) -> Result<Value> {
+    capacity_report_from_items(
+        db,
+        capacity_items_for_scope(db, Some(owned_tasks))?,
+        limit,
+        after,
+        Some(config),
+    )
+}
+
+fn capacity_report_from_items(
+    db: &Connection,
+    mut items: Vec<Value>,
+    limit: i64,
+    after: i64,
+    config: Option<&Config>,
+) -> Result<Value> {
+    if let Some(config) = config {
+        for item in &mut items {
+            if item.get("gap").is_some() {
+                continue;
+            }
+            let scope = &item["scope"];
+            let route_alias = scope["route_alias"].as_str();
+            let Some(route) = route_alias
+                .and_then(|alias| config.routes.iter().find(|route| route.alias == alias))
+            else {
+                item["route_admission"] = json!({
+                    "status":"unknown",
+                    "reason":"configured_route_missing_or_scope_route_unidentified"
+                });
+                continue;
+            };
+            let binding_id = item["bindings"]
+                .as_array()
+                .and_then(|bindings| bindings.first())
+                .and_then(|binding| binding["binding_id"].as_str())
+                .unwrap_or_default();
+            let route_value = serde_json::to_value(route)?;
+            let scope_binding_id = if route.native_options["service_id"].as_str().is_some() {
+                ""
+            } else {
+                binding_id
+            };
+            let expected_scope = scope_facts(&route_value, None, scope_binding_id);
+            let scope_matches = [
+                "scope_key",
+                "runtime",
+                "provider",
+                "account",
+                "service",
+                "route_alias",
+                "identity",
+            ]
+            .into_iter()
+            .all(|field| scope[field] == expected_scope[field]);
+            if !scope_matches {
+                item["route_admission"] = json!({
+                    "status":"unknown",
+                    "reason":"capacity_scope_does_not_match_configured_route"
+                });
+                continue;
+            }
+            item["route_admission"] =
+                serde_json::to_value(super::launcher::route_admission(db, route, None, None)?)?;
+        }
+    }
+    let mut report = paginate(
+        items,
         "capacity_accounting",
         limit,
         after,

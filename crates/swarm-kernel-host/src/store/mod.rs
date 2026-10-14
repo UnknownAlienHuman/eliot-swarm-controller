@@ -5509,7 +5509,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "report.capacity" => {
             model::fields(v, &["after", "limit"])?;
             let (limit, after) = page(v)?;
-            capacity::capacity_report(db, limit, after)
+            capacity::capacity_report_with_route_admission(db, limit, after, config)
         }
         "report.attention" => {
             model::fields(v, &["after", "limit"])?;

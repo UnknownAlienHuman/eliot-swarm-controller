@@ -6854,15 +6854,24 @@ fn sanitize_capacity_item(item: &Value) -> Value {
         "historical_quota_incident_recorded":!item["historical_quota_incident"].is_null(),
         "pending_admission_recorded":item["pending_admission_recorded"],
         "new_work_enabled":item["new_work_enabled"],
+        "route_admission":item["route_admission"],
         "ledger_updated_at_ms":item["ledger_updated_at_ms"],
     })
 }
 
-fn dashboard_capacity(db: &Connection, scope: &FleetReadScope) -> Result<Value> {
+fn dashboard_capacity(db: &Connection, scope: &FleetReadScope, config: &Config) -> Result<Value> {
     let source = match scope {
-        FleetReadScope::Fleet => capacity::capacity_report(db, DASHBOARD_PAGE_LIMIT, 0)?,
+        FleetReadScope::Fleet => {
+            capacity::capacity_report_with_route_admission(db, DASHBOARD_PAGE_LIMIT, 0, config)?
+        }
         FleetReadScope::ManagerTasks { task_ids } => {
-            capacity::capacity_report_for_scope(db, DASHBOARD_PAGE_LIMIT, 0, task_ids)?
+            capacity::capacity_report_for_scope_with_route_admission(
+                db,
+                DASHBOARD_PAGE_LIMIT,
+                0,
+                task_ids,
+                config,
+            )?
         }
     };
     let total = source["total_items"].as_i64().unwrap_or(0);
@@ -6914,7 +6923,7 @@ fn dashboard_summary(
     }
     let queue_params = json!({"after":0,"limit":limit});
     let queue = queue_page(db, &scope, &queue_params, 4_096, config)?;
-    let capacity = dashboard_capacity(db, &scope)?;
+    let capacity = dashboard_capacity(db, &scope, config)?;
     let include_current_gm_actions = super::gm::require_authority(db, p).is_ok();
     let exception = manager_exceptions_page(
         db,
