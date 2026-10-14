@@ -2814,7 +2814,7 @@ mod connected_store {
             }),
         )
         .await;
-        assert_eq!(warm["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+        assert_eq!(warm["byte_length"], PAGES_PAYLOAD.len());
         reset_assembly_source_load_counts(&assembled_id);
 
         // Replacing a public page changes its rowid. Even the verified Operator
