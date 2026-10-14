@@ -213,7 +213,8 @@ fn insert_label_operation(
             METHOD,
             state,
             result.map(|value| value.to_string()),
-            if state == "settled" { Some(1) } else { None::<i64> },
+            matches!(state, "settled" | "rejected" | "cancelled")
+                .then_some(1_i64),
         ],
     )
     .unwrap();

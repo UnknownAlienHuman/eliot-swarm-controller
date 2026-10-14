@@ -3099,29 +3099,30 @@ mod tests {
 
     fn full_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE operations(
-                operation_id TEXT PRIMARY KEY,
-                caller_id TEXT NOT NULL,
-                method TEXT NOT NULL,
-                state TEXT NOT NULL,
-                task_id TEXT,
-                attempt_id TEXT,
-                binding_id TEXT,
-                binding_generation INTEGER,
-                native_refs_json TEXT NOT NULL,
-                result_json TEXT,
-                effective_request_json TEXT NOT NULL
-            );",
-        )
-        .unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        // Model a corrupt persisted lifecycle value that production's CHECK
+        // constraint normally rejects; the bypass is confined to this fixture.
+        db.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
         db
     }
 
     fn insert_full_operation(db: &Connection, operation_id: &str, method: &str, state: &str) {
+        let terminal = matches!(state, "settled" | "rejected" | "cancelled");
         db.execute(
-            "INSERT INTO operations(operation_id,caller_id,method,state,native_refs_json,result_json,effective_request_json) +             VALUES(?1,'fixture',?2,?3,'{}',NULL,'{}')",
-            params![operation_id, method, state],
+            "INSERT INTO operations(\
+                operation_id,caller_id,client_request_id,method,original_request_json,\
+                effective_request_json,state,native_refs_json,result_json,due_at_ms,\
+                settled_at_ms,created_at_ms,updated_at_ms\
+             ) VALUES(?1,'fixture',?2,?3,'{}','{}',?4,'{}',?5,1,?6,1,1)",
+            params![
+                operation_id,
+                format!("request-{operation_id}"),
+                method,
+                state,
+                terminal.then_some("{}"),
+                terminal.then_some(1_i64),
+            ],
         )
         .unwrap();
     }

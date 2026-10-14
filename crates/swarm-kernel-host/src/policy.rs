@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn v1_digest_pins_the_named_owner_decision_section() {
-        let document = include_str!("../docs/owner-decisions.md").replace("\r\n", "\n");
+        let document = include_str!("../../../docs/owner-decisions.md").replace("\r\n", "\n");
         let heading = format!("## {OWNER_POLICY_V1_DOCUMENT_SECTION}");
         let start = document.find(&heading).expect("policy heading exists");
         let end = document[start + heading.len()..]
