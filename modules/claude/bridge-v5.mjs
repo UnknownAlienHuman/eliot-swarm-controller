@@ -14,7 +14,9 @@ import { Control } from './control.mjs';
 import { createFirstQueryControl } from './first-query-control.mjs';
 import { prepareQuery } from './prepared-query.mjs';
 import { explicitQueryModel, modelSelectionFacts } from './model-selection.mjs';
-import { streamEndedSendOutcome } from './pending-outcome.mjs';
+import {
+  firstNativeQueryUnknownOutcome, streamEndedSendOutcome,
+} from './pending-outcome.mjs';
 import {
   CLAUDE_TASK_PROMPT_ARTIFACT_ID, taskDispatchAdmission, taskPromptFor,
   enqueueTaskPrompt, moduleReceipt,
@@ -312,11 +314,20 @@ function finishSession(sess) {
     sess.openWait.reject(error);
     sess.openWait = null;
   }
-  for (const entry of sess.pendingSends.values()) {
+  for (const [inputId, entry] of sess.pendingSends) {
     // settleSends removes an entry only after its queued UUID is echoed by a
-    // native frame. A still-pending send has no admission evidence and takes
-    // the terminal Unknown path; it is reported once and never replayed.
-    saveOutcome(entry.command, streamEndedSendOutcome(entry, sess, bootId));
+    // native frame. A still-pending, validated initial TaskPrompt therefore
+    // has no same-session admission evidence and takes the terminal Unknown
+    // path that retires this worker only after Store accepts module.outcome.
+    const exactInitialTaskPrompt = sess.pendingSends.get(inputId) === entry
+      && entry.initialTaskDispatch === true
+      && entry.method === 'task.dispatch'
+      && entry.taskPrompt?.context?.operation_id === entry.command?.operation_id
+      && entry.taskPrompt?.context?.worker_boot_id === bootId;
+    const outcome = exactInitialTaskPrompt
+      ? firstNativeQueryUnknownOutcome(entry, bootId)
+      : streamEndedSendOutcome(entry, sess, bootId);
+    saveOutcome(entry.command, outcome);
   }
   sess.pendingSends.clear();
   changed();
