@@ -456,3 +456,46 @@ fn legacy_template_is_not_promoted_after_participant_registration_changes() {
     assert_eq!(retained["runtime"]["dispatch_permitted"], false);
     assert_eq!(retained["progress"]["task_dispatch"], "not_started");
 }
+
+/// A malformed retained row at the head of the candidate page must not abort
+/// the pass: it is typed-quarantined with its bytes retained, and the next
+/// due launch is still considered in the same bounded tick.
+#[test]
+fn corrupt_head_row_is_quarantined_without_aborting_the_next_launch() {
+    let mut db = invalid_scope_db();
+    db.execute(
+        "INSERT INTO operations(
+             operation_id,caller_id,client_request_id,method,original_request_json,
+             effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
+         ) VALUES('native-mcp-corrupt-head','current-manager','native-mcp-corrupt-request',
+                  'swarm.launch','{}','{corrupt','queued',1,1,0)",
+        [],
+    )
+    .unwrap();
+
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let outcome = claim_next_readback(&tx, 100, &Config::default()).unwrap();
+    let ClaimOutcome::Deferred(result) = outcome else {
+        panic!("corrupt head row must not abort the next due launch");
+    };
+    assert_eq!(result["operation_id"], LAUNCH_ID);
+    let quarantined: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM meta WHERE key LIKE 'launcher:v1:quarantine:native_mcp:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(quarantined, 1);
+    let retained: String = tx
+        .query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id='native-mcp-corrupt-head'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, "{corrupt");
+    tx.commit().unwrap();
+}

@@ -2877,14 +2877,84 @@ fn validate_install_readback(
 /// when the candidate set is larger than one page. C7's success refresh is
 /// intentionally not a C8 deadline: an `observed_partial` launch is eligible
 /// immediately unless its own C8 marker is waiting/running/terminal.
+///
+/// One malformed subject must never abort the page scan for unrelated
+/// launches. Scope drift reuses the existing stale hold; retained-row and
+/// marker damage is typed-quarantined through the shared launcher quarantine
+/// namespace. Storage and unknown failures still abort the pass loudly.
+fn isolate_tools_candidate(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    source_pointer: &str,
+    error: &Error,
+    now_ms: i64,
+) -> Result<bool> {
+    if is_stale_scope_code(&error.code) {
+        mark_tools_stale(tx, operation_id, &error.code, now_ms)?;
+        return Ok(true);
+    }
+    if matches!(error.code.as_str(), "INVALID_PARAMS" | "NATIVE_MCP_STORE") {
+        launcher_native_mcp::quarantine_launch_subject(
+            tx,
+            operation_id,
+            source_pointer,
+            None,
+            now_ms,
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Retain a visible stale hold for one C8 subject, replacing only the
+/// supervisor marker. The damaged private record and launch row stay
+/// untouched for forensics; a corrupt marker is replaced, never repaired.
+fn mark_tools_stale(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    code: &str,
+    now_ms: i64,
+) -> Result<()> {
+    let key = supervisor_key(operation_id);
+    let mut marker = match meta(tx, &key) {
+        Ok(Some(marker)) => match validate_tools_schedule(&marker, operation_id) {
+            Ok(()) => marker,
+            Err(_) => {
+                launcher_native_mcp::quarantine_launch_subject(
+                    tx,
+                    operation_id,
+                    &key,
+                    None,
+                    now_ms,
+                )?;
+                new_tools_schedule(operation_id, "", now_ms)
+            }
+        },
+        Ok(None) => new_tools_schedule(operation_id, "", now_ms),
+        Err(error) if error.code == "INVALID_PARAMS" => {
+            launcher_native_mcp::quarantine_launch_subject(tx, operation_id, &key, None, now_ms)?;
+            new_tools_schedule(operation_id, "", now_ms)
+        }
+        Err(error) => return Err(error),
+    };
+    marker["state"] = json!("stale");
+    marker["started_at_ms"] = Value::Null;
+    marker["next_retry_at_ms"] = Value::Null;
+    marker["finished_at_ms"] = json!(now_ms);
+    marker["last_error_code"] = json!(safe_error_code(code));
+    set_meta(tx, &key, &marker)?;
+    Ok(())
+}
 fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<ToolsClaimOutcome> {
     let cursor = meta(tx, SUPERVISOR_CURSOR_KEY)?
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_default();
+    launcher_native_mcp::isolate_corrupt_launch_records(tx, now, MAX_CANDIDATES_PER_PASS)?;
     let ids = {
         let mut statement = tx.prepare(
             "SELECT operation_id FROM operations \
              WHERE method='swarm.launch' AND state='queued' \
+               AND json_valid(effective_request_json) \
                AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
                AND json_extract(effective_request_json,'$.launch_manifest.runtime.dispatch_permitted')=0 \
                AND json_extract(effective_request_json,'$.launch_manifest.progress.task_dispatch')='not_started' \
@@ -2913,12 +2983,33 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
     for operation_id in ids {
         last_scanned = Some(operation_id.clone());
         let schedule_key = supervisor_key(&operation_id);
-        if let Some(schedule) = meta(tx, &schedule_key)? {
-            validate_tools_schedule(&schedule, &operation_id)?;
+        let schedule = match meta(tx, &schedule_key) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(schedule) = schedule {
+            if let Err(error) = validate_tools_schedule(&schedule, &operation_id) {
+                if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                    continue;
+                }
+                return Err(error);
+            }
             if schedule["state"] == "retry_wait" {
-                let deadline = schedule["next_retry_at_ms"]
-                    .as_i64()
-                    .ok_or_else(|| record_error("native MCP retry deadline is missing"))?;
+                let deadline = match schedule["next_retry_at_ms"].as_i64() {
+                    Some(deadline) => deadline,
+                    None => {
+                        let error = record_error("native MCP retry deadline is missing");
+                        if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
                 if deadline > now {
                     next_retry_at_ms =
                         Some(next_retry_at_ms.map_or(deadline, |current| current.min(deadline)));
@@ -2929,48 +3020,91 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         let facts = match load_launch_facts(tx, config, &operation_id) {
             Ok(facts) => facts,
             Err(error) if error.code == "STALE_LAUNCH" => {
-                if let Some(deadline) = defer_stale_launch(tx, &operation_id, now)? {
-                    next_retry_at_ms =
-                        Some(next_retry_at_ms.map_or(deadline, |current| current.min(deadline)));
+                match defer_stale_launch(tx, &operation_id, now) {
+                    Ok(deadline) => {
+                        if let Some(deadline) = deadline {
+                            next_retry_at_ms = Some(
+                                next_retry_at_ms.map_or(deadline, |current| current.min(deadline)),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if isolate_tools_candidate(
+                            tx,
+                            &operation_id,
+                            &format!("operations:{operation_id}"),
+                            &error,
+                            now,
+                        )? {
+                            continue;
+                        }
+                        return Err(error);
+                    }
                 }
                 continue;
             }
             Err(error) if is_stale_scope_code(&error.code) => {
-                let key = supervisor_key(&operation_id);
-                let mut marker = match meta(tx, &key)? {
-                    Some(marker) => {
-                        validate_tools_schedule(&marker, &operation_id)?;
-                        marker
-                    }
-                    None => new_tools_schedule(&operation_id, "", now),
-                };
-                marker["state"] = json!("stale");
-                marker["started_at_ms"] = Value::Null;
-                marker["next_retry_at_ms"] = Value::Null;
-                marker["finished_at_ms"] = json!(now);
-                marker["last_error_code"] = json!(safe_error_code(&error.code));
-                set_meta(tx, &key, &marker)?;
+                mark_tools_stale(tx, &operation_id, &error.code, now)?;
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if isolate_tools_candidate(
+                    tx,
+                    &operation_id,
+                    &format!("operations:{operation_id}"),
+                    &error,
+                    now,
+                )? {
+                    continue;
+                }
+                return Err(error);
+            }
         };
 
         let schedule_key = supervisor_key(&operation_id);
         let schedule = meta(tx, &schedule_key)?;
-        if let Some(record) = meta(tx, &record_key(&operation_id))? {
+        let record = match meta(tx, &record_key(&operation_id)) {
+            Ok(record) => record,
+            Err(error) => {
+                if isolate_tools_candidate(
+                    tx,
+                    &operation_id,
+                    &record_key(&operation_id),
+                    &error,
+                    now,
+                )? {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(record) = record {
             if record["schema_version"] != 1
                 || record["kind"] != "launcher_native_mcp_tools"
                 || record["operation_id"].as_str() != Some(operation_id.as_str())
             {
-                return Err(record_error(
-                    "native MCP private intent identity is invalid",
-                ));
+                let error = record_error("native MCP private intent identity is invalid");
+                if isolate_tools_candidate(
+                    tx,
+                    &operation_id,
+                    &record_key(&operation_id),
+                    &error,
+                    now,
+                )? {
+                    continue;
+                }
+                return Err(error);
             }
             if record["launch_identity_digest"].as_str() != Some(facts.identity_digest.as_str()) {
                 let mut stale = schedule.unwrap_or_else(|| {
                     new_tools_schedule(&operation_id, &facts.identity_digest, now)
                 });
-                validate_tools_schedule(&stale, &operation_id)?;
+                if let Err(error) = validate_tools_schedule(&stale, &operation_id) {
+                    if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                        continue;
+                    }
+                    return Err(error);
+                }
                 stale["state"] = json!("stale");
                 stale["launch_identity_digest"] = json!(facts.identity_digest);
                 stale["started_at_ms"] = Value::Null;
@@ -2980,7 +3114,18 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 set_meta(tx, &schedule_key, &stale)?;
                 continue;
             }
-            validate_record(&record, &facts, &facts.assignment)?;
+            if let Err(error) = validate_record(&record, &facts, &facts.assignment) {
+                if isolate_tools_candidate(
+                    tx,
+                    &operation_id,
+                    &record_key(&operation_id),
+                    &error,
+                    now,
+                )? {
+                    continue;
+                }
+                return Err(error);
+            }
             if record["tools_readback"].is_object()
                 || record["install"]["state"] == "observed_after_unknown"
                 || record["challenge"]["state"] == "observed"
@@ -2988,12 +3133,21 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 let mut terminal = schedule.unwrap_or_else(|| {
                     new_tools_schedule(&operation_id, &facts.identity_digest, now)
                 });
-                validate_tools_schedule(&terminal, &operation_id)?;
+                if let Err(error) = validate_tools_schedule(&terminal, &operation_id) {
+                    if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                        continue;
+                    }
+                    return Err(error);
+                }
                 if terminal["launch_identity_digest"]
                     .as_str()
                     .is_some_and(|digest| digest != facts.identity_digest)
                 {
-                    return Err(stale_scope());
+                    let error = stale_scope();
+                    if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                        continue;
+                    }
+                    return Err(error);
                 }
                 terminal["state"] = json!("observed_partial");
                 terminal["launch_identity_digest"] = json!(facts.identity_digest);
@@ -3009,7 +3163,12 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
 
         let mut schedule = schedule
             .unwrap_or_else(|| new_tools_schedule(&operation_id, &facts.identity_digest, now));
-        validate_tools_schedule(&schedule, &operation_id)?;
+        if let Err(error) = validate_tools_schedule(&schedule, &operation_id) {
+            if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                continue;
+            }
+            return Err(error);
+        }
         if schedule["launch_identity_digest"].as_str() != Some(facts.identity_digest.as_str()) {
             schedule["state"] = json!("stale");
             schedule["started_at_ms"] = Value::Null;
@@ -3029,7 +3188,13 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 .as_i64()
                 .is_some_and(|started| started <= now.saturating_sub(CLAIM_STALE_MS)),
             "observed_partial" | "stale" => false,
-            _ => return Err(record_error("native MCP tools scheduler state is invalid")),
+            _ => {
+                let error = record_error("native MCP tools scheduler state is invalid");
+                if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                    continue;
+                }
+                return Err(error);
+            }
         };
         if !due {
             let deadline = if state == "running" {
@@ -4412,5 +4577,80 @@ mod failure_event_tests {
 
         owner.close().await.expect("close local Store owner");
         std::fs::remove_dir_all(&directory).expect("remove exact fixture Store directory");
+    }
+
+    /// A corrupt supervisor marker must not abort the 64-row scan: it is
+    /// typed-quarantined with its bytes retained, the cursor still advances
+    /// past it, and the next candidate is considered in the same pass.
+    #[test]
+    fn corrupt_supervisor_marker_is_quarantined_without_aborting_the_scan() {
+        const POISONED_OPERATION: &str = "native-mcp-tools-poison-01";
+        const NEXT_OPERATION: &str = "native-mcp-tools-poison-02";
+
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        for operation_id in [POISONED_OPERATION, NEXT_OPERATION] {
+            let effective = model::canonical(&json!({"launch_manifest":{
+                "state":"awaiting_native_mcp",
+                "runtime":{"dispatch_permitted":false},
+                "progress":{"task_dispatch":"not_started"},
+                "native_mcp_readback":{"state":"observed_partial"},
+            }}))
+            .unwrap();
+            db.execute(
+                "INSERT INTO operations(
+                     operation_id,caller_id,client_request_id,method,original_request_json,
+                     effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
+                 ) VALUES(?1,'manager','native-mcp-tools-poison-request','swarm.launch',
+                          '{}',?2,'queued',1,1,1)",
+                params![operation_id, effective],
+            )
+            .unwrap();
+        }
+
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        // A supervisor marker that parses but fails validation: damage that
+        // previously aborted the whole page with NATIVE_MCP_STORE.
+        set_meta(
+            &tx,
+            &supervisor_key(POISONED_OPERATION),
+            &json!({
+                "schema_version":1,
+                "kind":"launcher_native_mcp_tools_supervisor",
+                "operation_id":POISONED_OPERATION,
+                "launch_identity_digest":"",
+                "state":"bogus",
+                "claim_generation":0,
+                "started_at_ms":null,
+                "next_retry_at_ms":100,
+                "finished_at_ms":null,
+                "failure_attempts":0,
+                "last_error_code":null,
+            }),
+        )
+        .unwrap();
+        // The next candidate stays untouched behind the poisoned head: its own
+        // valid marker simply waits, so reaching it proves the scan survived.
+        let mut waiting = new_tools_schedule(NEXT_OPERATION, "", 100);
+        waiting["state"] = json!("retry_wait");
+        waiting["next_retry_at_ms"] = json!(200);
+        set_meta(&tx, &supervisor_key(NEXT_OPERATION), &waiting).unwrap();
+        let outcome = claim_next_tools(&tx, 100, &Config::default()).unwrap();
+        assert!(
+            matches!(outcome, ToolsClaimOutcome::Idle(Some(200))),
+            "corrupt marker must not abort unrelated launches"
+        );
+        let quarantined: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key LIKE 'launcher:v1:quarantine:native_mcp:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1);
+        tx.commit().unwrap();
     }
 }

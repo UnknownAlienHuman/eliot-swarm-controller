@@ -5,7 +5,11 @@
 //! use the same descriptor-bound child Operations as C8. This path only records
 //! the facts exposed by OpenCode's public read API; it cannot permit dispatch.
 
-use super::{Store, meta};
+use super::{
+    Store,
+    automation_reconcile::{QuarantineEvidence, persist_quarantine, quarantine_record_key},
+    meta,
+};
 use crate::{
     config::{Config, McpConfig, McpToolProfile, OpenCodeRouteKind, opencode_route_kind},
     error::{Error, Result},
@@ -857,10 +861,12 @@ fn validate_module_assignment_child(
 
 fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<ClaimOutcome> {
     let cutoff = now.saturating_sub(INFLIGHT_STALE_MS);
+    isolate_corrupt_launch_records(tx, now, MAX_CANDIDATES_PER_PASS)?;
     let ids = {
         let mut statement = tx.prepare(
             "SELECT operation_id FROM operations \
              WHERE method='swarm.launch' AND state='queued' \
+               AND json_valid(effective_request_json) \
                AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
                AND ( \
                  json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.state') IS NULL \
@@ -881,8 +887,8 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    if let Some(operation_id) = ids.into_iter().next() {
-        let (mut row, mut manifest) = load_launch_manifest(tx, &operation_id)?;
+    if let Some((mut row, mut manifest)) = load_first_intact_launch(tx, &ids, now)? {
+        let operation_id = row.operation_id.clone();
         let mut legacy_repair_error = None;
         if manifest["state"] == "awaiting_native_mcp"
             && manifest["progress"]["participant_credential"] == "registered_and_refs_retained"
@@ -1664,6 +1670,7 @@ fn next_retry_at(db: &Connection, now: i64) -> Result<Option<i64>> {
            ELSE json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms') \
          END) \
          FROM operations WHERE method='swarm.launch' AND state='queued' \
+           AND json_valid(effective_request_json) \
            AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp'",
         [INFLIGHT_STALE_MS],
         |row| row.get(0),
@@ -1892,6 +1899,122 @@ fn stale_readback() -> Error {
         "NATIVE_MCP_SCOPE_MISMATCH",
         "retained launch is no longer the exact current native MCP assignment",
     )
+}
+
+/// Bounded launcher quarantine namespace for malformed retained launch rows.
+/// One corrupt row must never abort unrelated launches: damage is typed,
+/// digest-pinned, and counted, while the damaged bytes stay retained for
+/// forensics. Storage and unknown failures still abort the pass.
+pub(super) const LAUNCHER_QUARANTINE_PREFIX: &str = "launcher:v1:quarantine:native_mcp:";
+pub(super) const LAUNCHER_RECORD_CORRUPT_CODE: &str = "NATIVE_MCP_RECORD_CORRUPT";
+
+/// Retained-row failures that prove the row itself is malformed. Everything
+/// else (STORE_ERROR, STORE_BUSY, CONFLICT, model, clock) stays fatal so
+/// infrastructure damage is never mistaken for subject damage.
+fn is_launch_record_damage(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "INVALID_PARAMS" | "NATIVE_MCP_SCOPE_MISMATCH"
+    )
+}
+
+pub(super) fn launcher_damage_evidence(
+    operation_id: &str,
+    source_pointer: &str,
+    source_digest: Option<String>,
+) -> QuarantineEvidence {
+    QuarantineEvidence {
+        subject_identity: format!("launch-operation:{operation_id}"),
+        source_pointer: Some(source_pointer.to_owned()),
+        source_digest,
+    }
+}
+
+/// Persist typed quarantine for one malformed launch subject and return the
+/// quarantine key. The damaged operations row and meta records are left
+/// untouched; only bounded quarantine evidence is added.
+pub(super) fn quarantine_launch_subject(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    source_pointer: &str,
+    source_digest: Option<String>,
+    now_ms: i64,
+) -> Result<String> {
+    let evidence = launcher_damage_evidence(operation_id, source_pointer, source_digest);
+    let key = quarantine_record_key(LAUNCHER_QUARANTINE_PREFIX, &evidence)?;
+    persist_quarantine(tx, &key, LAUNCHER_RECORD_CORRUPT_CODE, evidence, now_ms)?;
+    Ok(key)
+}
+
+/// Quarantine every queued launch row whose retained JSON no longer parses.
+/// The candidate selectors below evaluate JSON predicates that abort the
+/// whole statement on malformed input, so damage is typed before selection.
+/// Bounded by `limit`; each damaged row costs one bounded meta write.
+pub(super) fn isolate_corrupt_launch_records(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    limit: i64,
+) -> Result<()> {
+    let damaged: Vec<(String, String)> = {
+        let mut statement = tx.prepare(
+            "SELECT operation_id,effective_request_json FROM operations \
+             WHERE method='swarm.launch' AND state='queued' \
+             ORDER BY updated_at_ms,operation_id LIMIT ?1",
+        )?;
+        statement
+            .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (operation_id, raw) in damaged {
+        if serde_json::from_str::<Value>(&raw).is_err() {
+            let digest = model::digest(raw.as_bytes());
+            quarantine_launch_subject(
+                tx,
+                &operation_id,
+                &format!("operations:{operation_id}"),
+                Some(digest),
+                now_ms,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Return the first candidate whose retained row still decodes. Malformed
+/// rows are typed-quarantined in place so one corrupt record cannot abort
+/// unrelated launches; storage failures still propagate. No subject writes
+/// precede the classification point, so no savepoint scope is needed here:
+/// the shared `automation_subject` savepoint guards subject writes, and
+/// these isolation points perform none before deciding.
+fn load_first_intact_launch(
+    tx: &Transaction<'_>,
+    ids: &[String],
+    now_ms: i64,
+) -> Result<Option<(LaunchRow, Value)>> {
+    for operation_id in ids {
+        match load_launch_manifest(tx, operation_id) {
+            Ok(loaded) => return Ok(Some(loaded)),
+            Err(error) if is_launch_record_damage(&error) => {
+                let raw: Option<String> = tx
+                    .query_row(
+                        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                        [operation_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let digest = raw.as_deref().map(|raw| model::digest(raw.as_bytes()));
+                quarantine_launch_subject(
+                    tx,
+                    operation_id,
+                    &format!("operations:{operation_id}"),
+                    digest,
+                    now_ms,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 fn snapshot_identity(snapshot: &LaunchSnapshot) -> Value {
