@@ -84,6 +84,7 @@ pub(crate) enum TaskReadBasis {
     CurrentGmProjectScope,
     CurrentParticipant,
     RetainedAssignedReviewer,
+    HistoricalAssignedReviewer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -914,45 +915,51 @@ fn current_participant_scope(
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignedReviewerScopeStatus {
+    Current,
+    Historical,
+}
+
 /// Exact retained assigned-reviewer scope, checked by the review assignment
-/// validators. Historical Attempt reads use only the validator that preserves an
-/// assigned late-result slot; raw registration JSON is never itself a grant.
+/// validators. Keeping current and historical validation distinct lets artifact
+/// authorization preserve current candidate reads without extending history.
 fn retained_assigned_reviewer_scope(
     db: &Connection,
     principal: &Principal,
     identity: &TaskGraphIdentity,
-) -> Result<bool> {
+) -> Result<Option<AssignedReviewerScopeStatus>> {
     if principal.role != Role::Participant {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(registration) = super::meta(db, &format!("client:{}", principal.client_id))? else {
-        return Ok(false);
+        return Ok(None);
     };
     if registration["role"] != "participant"
         || registration["disabled"] == true
         || registration["participation_basis"]["kind"] != "sponsored_reviewer"
     {
-        return Ok(false);
+        return Ok(None);
     }
     let scope = registration["participation_basis"]["review_scope"].clone();
     if bounded_text(&scope, "task_id").as_deref() != Some(identity.task_id.as_str()) {
-        return Ok(false);
+        return Ok(None);
     }
     if let Some(expected) = identity.task_revision
         && scope.get("task_revision").and_then(Value::as_i64) != Some(expected)
     {
-        return Ok(false);
+        return Ok(None);
     }
     if let Some(attempt_id) = identity.attempt_id.as_deref()
         && bounded_text(&scope, "attempt_id").as_deref() != Some(attempt_id)
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(assignment_id) = bounded_text(&scope, "review_assignment_id") else {
-        return Ok(false);
+        return Ok(None);
     };
     match super::coordination::require_review_scope(db, principal, &assignment_id, &scope) {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(Some(AssignedReviewerScopeStatus::Current)),
         Err(error) if error.code == "STALE_PARTICIPANT" => {
             match super::coordination::require_historical_review_result_scope(
                 db,
@@ -960,12 +967,12 @@ fn retained_assigned_reviewer_scope(
                 &assignment_id,
                 &scope,
             ) {
-                Ok(()) => Ok(true),
-                Err(error) if known_scope_denial(&error) => Ok(false),
+                Ok(()) => Ok(Some(AssignedReviewerScopeStatus::Historical)),
+                Err(error) if known_scope_denial(&error) => Ok(None),
                 Err(error) => Err(error),
             }
         }
-        Err(error) if known_scope_denial(&error) => Ok(false),
+        Err(error) if known_scope_denial(&error) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -997,10 +1004,15 @@ pub(crate) fn resolve_task_read(
             basis: TaskReadBasis::CurrentParticipant,
         }));
     }
-    if retained_assigned_reviewer_scope(db, principal, identity)? {
+    if let Some(scope_status) = retained_assigned_reviewer_scope(db, principal, identity)? {
         return Ok(Some(TaskReadGrant {
             level: requested.min(TaskReadLevel::Evidence),
-            basis: TaskReadBasis::RetainedAssignedReviewer,
+            basis: match scope_status {
+                AssignedReviewerScopeStatus::Current => TaskReadBasis::RetainedAssignedReviewer,
+                AssignedReviewerScopeStatus::Historical => {
+                    TaskReadBasis::HistoricalAssignedReviewer
+                }
+            },
         }));
     }
     Ok(None)
@@ -2376,13 +2388,18 @@ fn artifact_level_for_relation(
     }
 }
 
-fn basis_for_task_grant(basis: TaskReadBasis) -> ArtifactReadBasis {
+/// Historical assigned-reviewer authority is receipt-only and cannot authorize
+/// artifact metadata or bytes. Current exact assignment access remains narrow.
+fn basis_for_task_grant(basis: TaskReadBasis) -> Option<ArtifactReadBasis> {
     match basis {
-        TaskReadBasis::LocalOperator => ArtifactReadBasis::LocalOperator,
-        TaskReadBasis::CurrentTaskManager => ArtifactReadBasis::CurrentTaskManager,
-        TaskReadBasis::CurrentGmProjectScope => ArtifactReadBasis::CurrentGmTaskScope,
-        TaskReadBasis::CurrentParticipant => ArtifactReadBasis::CurrentParticipantCandidate,
-        TaskReadBasis::RetainedAssignedReviewer => ArtifactReadBasis::AssignedReviewerCandidate,
+        TaskReadBasis::LocalOperator => Some(ArtifactReadBasis::LocalOperator),
+        TaskReadBasis::CurrentTaskManager => Some(ArtifactReadBasis::CurrentTaskManager),
+        TaskReadBasis::CurrentGmProjectScope => Some(ArtifactReadBasis::CurrentGmTaskScope),
+        TaskReadBasis::CurrentParticipant => Some(ArtifactReadBasis::CurrentParticipantCandidate),
+        TaskReadBasis::RetainedAssignedReviewer => {
+            Some(ArtifactReadBasis::AssignedReviewerCandidate)
+        }
+        TaskReadBasis::HistoricalAssignedReviewer => None,
     }
 }
 
@@ -2423,8 +2440,9 @@ fn task_artifact_grant(
     artifact_kind: &str,
     requested: ArtifactReadLevel,
 ) -> Result<Option<ArtifactReadGrant>> {
-    if let Some(grant) = resolve_task_read(db, principal, identity, TaskReadLevel::Evidence)? {
-        let basis = basis_for_task_grant(grant.basis);
+    if let Some(grant) = resolve_task_read(db, principal, identity, TaskReadLevel::Evidence)?
+        && let Some(basis) = basis_for_task_grant(grant.basis)
+    {
         return Ok(Some(ArtifactReadGrant {
             level: artifact_level_for_relation(principal, requested, basis),
             basis,
@@ -2446,8 +2464,9 @@ fn task_read_artifact_grant(
     identity: &TaskGraphIdentity,
     requested: ArtifactReadLevel,
 ) -> Result<Option<ArtifactReadGrant>> {
-    if let Some(grant) = resolve_task_read(db, principal, identity, TaskReadLevel::Evidence)? {
-        let basis = basis_for_task_grant(grant.basis);
+    if let Some(grant) = resolve_task_read(db, principal, identity, TaskReadLevel::Evidence)?
+        && let Some(basis) = basis_for_task_grant(grant.basis)
+    {
         return Ok(Some(ArtifactReadGrant {
             level: artifact_level_for_relation(principal, requested, basis),
             basis,

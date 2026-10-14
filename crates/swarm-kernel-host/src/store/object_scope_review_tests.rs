@@ -7,6 +7,9 @@ use crate::{
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
+#[path = "object_scope_reviewer_artifact_tests.rs"]
+mod reviewer_artifact_current_historical;
+
 const TASK_ID: &str = "review-task";
 const ATTEMPT_ID: &str = "review-attempt";
 const SUBMISSION_REF: &str = "review-submission";
