@@ -311,6 +311,14 @@ fn publication_error(error: std::io::Error) -> Error {
 /// replacement. Windows uses `MOVEFILE_WRITE_THROUGH` without claiming an
 /// equivalent directory fsync.
 pub fn replace_private_durable(path: &Path, data: &[u8]) -> Result<()> {
+    replace_private_durable_with_barrier(path, data, sync_parent_directory)
+}
+
+fn replace_private_durable_with_barrier(
+    path: &Path,
+    data: &[u8],
+    barrier: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let target = private_target_path(path)?;
     let _ = target_is_regular_file(&target)?;
     let temp = private_temp_path(&target)?;
@@ -320,7 +328,7 @@ pub fn replace_private_durable(path: &Path, data: &[u8]) -> Result<()> {
         file.sync_all()?;
         drop(file);
         publish_replace(&temp, &target)?;
-        sync_parent_directory(&target)
+        barrier(&target)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -761,6 +769,32 @@ mod publication_tests {
             "INJECTED_SYNC_FAILURE",
             "injected durability boundary failure",
         ))
+    }
+
+    #[test]
+    fn atomic_replacement_reports_barrier_failure_without_partial_publication() {
+        let root = fixture();
+        let path = root.join("journal.jsonl");
+        write_private_new(&path, b"old complete record\n").unwrap();
+        let replacement = b"replacement complete record\n";
+        let mut barrier_calls = 0;
+        let error = replace_private_durable_with_barrier(&path, replacement, |target| {
+            assert_eq!(target, path.as_path());
+            barrier_calls += 1;
+            assert_eq!(fs::read(target).unwrap(), replacement);
+            failed_barrier(target)
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, "INJECTED_SYNC_FAILURE");
+        assert_eq!(barrier_calls, 1);
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+        replace_private_durable(&path, replacement).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
