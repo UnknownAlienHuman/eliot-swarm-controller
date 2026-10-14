@@ -291,7 +291,7 @@ jobs:
             $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
             if ($actualHash -cne $expectedHash) { throw 'LLVM installer SHA-256 mismatch.' }
             if (Test-Path -LiteralPath $installDir) { throw 'Temporary LLVM install directory must be fresh.' }
-            $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+            $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -WindowStyle Hidden -Wait -PassThru
             if ($process.ExitCode -ne 0) { throw "LLVM installer failed with exit code $($process.ExitCode)." }
             $libclangDir = Join-Path $installDir 'bin'
             if (-not (Test-Path -LiteralPath (Join-Path $libclangDir 'libclang.dll'))) {
@@ -413,7 +413,7 @@ jobs:
             $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
             if ($actualHash -cne $expectedHash) { throw 'LLVM installer SHA-256 mismatch.' }
             if (Test-Path -LiteralPath $installDir) { throw 'Temporary LLVM install directory must be fresh.' }
-            $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+            $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -WindowStyle Hidden -Wait -PassThru
             if ($process.ExitCode -ne 0) { throw "LLVM installer failed with exit code $($process.ExitCode)." }
             $libclangDir = Join-Path $installDir 'bin'
             if (-not (Test-Path -LiteralPath (Join-Path $libclangDir 'libclang.dll'))) {
