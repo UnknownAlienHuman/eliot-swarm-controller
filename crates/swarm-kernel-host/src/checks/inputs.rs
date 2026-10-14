@@ -228,6 +228,37 @@ impl ProbeCleanupOwner {
     }
 }
 
+/// Build a pending owner around a live test child so Store fixtures exercise
+/// the same poll, install, conflict, and departure path as production custody.
+#[cfg(test)]
+pub(crate) fn pending_probe_cleanup_owner_for_test(
+    child: Child,
+    directory: PathBuf,
+    scope: Option<ProbeCleanupScope>,
+) -> ProbeCleanupOwner {
+    let child_pid = child.id();
+    ProbeCleanupOwner {
+        custody: ProbeHelperCustody {
+            child,
+            child_pid,
+            launch_identity: None,
+            stdout: None,
+            response_file: None,
+            capture: None,
+            directory,
+            family_identity: None,
+            family_token: None,
+            exit_status: None,
+            status_observation_failed: false,
+            capture_setup_failed: true,
+            response_group_empty: None,
+            family_departed_proven: false,
+            cleanup_complete: false,
+        },
+        scope,
+    }
+}
+
 impl Drop for ProbeCleanupOwner {
     fn drop(&mut self) {
         if self.custody.cleanup_complete && self.custody.response_group_empty == Some(true) {

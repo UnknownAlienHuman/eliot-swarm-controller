@@ -4896,9 +4896,214 @@ mod tests {
         path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::Arc,
+        thread,
         time::Duration,
     };
     use tokio::time::timeout;
+
+    const PROBE_OWNER_FIXTURE_MODE: &str = "ELIOT_PROBE_OWNER_FIXTURE_MODE";
+    const PROBE_OWNER_FIXTURE_READY: &str = "ELIOT_PROBE_OWNER_FIXTURE_READY";
+    const PROBE_OWNER_FIXTURE_RELEASE: &str = "ELIOT_PROBE_OWNER_FIXTURE_RELEASE";
+
+    #[test]
+    fn probe_owner_fixture_child_entry() {
+        if std::env::var(PROBE_OWNER_FIXTURE_MODE).as_deref() != Ok("held") {
+            return;
+        }
+        let ready = PathBuf::from(
+            std::env::var_os(PROBE_OWNER_FIXTURE_READY).expect("probe owner ready path"),
+        );
+        let release = PathBuf::from(
+            std::env::var_os(PROBE_OWNER_FIXTURE_RELEASE).expect("probe owner release path"),
+        );
+        fs::write(ready, b"ready").expect("publish live child readiness");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !release.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    struct ProbeOwnerProcessFixture {
+        directory: PathBuf,
+        release: PathBuf,
+    }
+
+    impl ProbeOwnerProcessFixture {
+        fn allow_departure(&self) {
+            fs::write(&self.release, b"depart").expect("release the exact probe child");
+        }
+
+        fn cleanup(&self) {
+            fs::remove_dir_all(&self.directory).expect("remove the departed probe fixture");
+        }
+    }
+
+    impl Drop for ProbeOwnerProcessFixture {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.release, b"depart");
+        }
+    }
+
+    fn pending_probe_owner(
+        scope: inputs::ProbeCleanupScope,
+    ) -> (ProbeCleanupOwner, ProbeOwnerProcessFixture) {
+        let directory = std::env::temp_dir().join(format!("swarm-probe-owner-{}", model::new_id()));
+        fs::create_dir(&directory).expect("create private probe owner fixture directory");
+        let ready = directory.join("ready");
+        let release = directory.join("release");
+        let mut child = Command::new(std::env::current_exe().expect("test executable path"))
+            .arg("probe_owner_fixture_child_entry")
+            .env(PROBE_OWNER_FIXTURE_MODE, "held")
+            .env(PROBE_OWNER_FIXTURE_READY, &ready)
+            .env(PROBE_OWNER_FIXTURE_RELEASE, &release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn controlled probe owner child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("probe owner child exited before becoming live: {status}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("probe owner child did not publish readiness");
+        }
+        let fixture = ProbeOwnerProcessFixture { directory, release };
+        let owner = inputs::pending_probe_cleanup_owner_for_test(
+            child,
+            fixture.directory.clone(),
+            Some(scope),
+        );
+        (owner, fixture)
+    }
+
+    async fn install_probe_owner(store: &Store, owner: ProbeCleanupOwner) -> bool {
+        let custody = store.check_child_custody.clone();
+        store
+            .file_io(move |_files| Ok(custody.retain_probe_cleanup(owner)))
+            .await
+            .expect("install retained probe owner")
+    }
+
+    async fn reap_probe_owners_to(custody: &CheckChildCustody, expected: usize) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                custody.reap_probe_cleanup_owners().await;
+                if custody.probe_cleanup_owners.lock().await.len() == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("poll exact probe child departure");
+    }
+
+    fn probe_scope(resource: &str, workspace: &str) -> inputs::ProbeCleanupScope {
+        inputs::ProbeCleanupScope {
+            resource: resource.to_owned(),
+            workspace_identity: json!({"workspace":workspace}),
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_probe_owner_install_conflict_keeps_custody_and_allows_independent_resource() {
+        let fixture = fixture().await;
+        let store = &fixture.owner.store;
+        let custody = &store.check_child_custody;
+        let held_scope = probe_scope("checks-a", "workspace-a");
+        let (first_owner, first_child) = pending_probe_owner(held_scope.clone());
+        assert!(!install_probe_owner(store, first_owner).await);
+
+        let (conflicting_owner, conflicting_child) = pending_probe_owner(held_scope.clone());
+        assert!(install_probe_owner(store, conflicting_owner).await);
+        assert_eq!(custody.probe_cleanup_owners.lock().await.len(), 2);
+        assert!(custody.probe_cleanup_conflicts(Some(&held_scope)).await);
+
+        let independent_scope = probe_scope("checks-b", "workspace-b");
+        assert!(
+            !custody
+                .probe_cleanup_conflicts(Some(&independent_scope))
+                .await
+        );
+        let independent = custody
+            .reserve_probe_resolution(Some("checks-b"))
+            .await
+            .expect("independent CheckRunner resource remains admissible");
+        drop(independent);
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-a"))
+                .await
+                .is_none()
+        );
+
+        first_child.allow_departure();
+        reap_probe_owners_to(custody, 1).await;
+        assert!(custody.probe_cleanup_conflicts(Some(&held_scope)).await);
+        conflicting_child.allow_departure();
+        reap_probe_owners_to(custody, 0).await;
+        assert!(!custody.probe_cleanup_conflicts(Some(&held_scope)).await);
+
+        first_child.cleanup();
+        conflicting_child.cleanup();
+        fixture.owner.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_probe_owner_departure_releases_only_its_checkrunner_resource() {
+        let fixture = fixture().await;
+        let store = &fixture.owner.store;
+        let custody = &store.check_child_custody;
+        let scope_a = probe_scope("checks-a", "workspace-a");
+        let scope_b = probe_scope("checks-b", "workspace-b");
+        let (owner_a, child_a) = pending_probe_owner(scope_a.clone());
+        let (owner_b, child_b) = pending_probe_owner(scope_b.clone());
+        assert!(!install_probe_owner(store, owner_a).await);
+        assert!(!install_probe_owner(store, owner_b).await);
+
+        assert!(custody.probe_cleanup_conflicts(Some(&scope_a)).await);
+        assert!(custody.probe_cleanup_conflicts(Some(&scope_b)).await);
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-a"))
+                .await
+                .is_none()
+        );
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-b"))
+                .await
+                .is_none()
+        );
+
+        child_a.allow_departure();
+        reap_probe_owners_to(custody, 1).await;
+        assert!(!custody.probe_cleanup_conflicts(Some(&scope_a)).await);
+        assert!(custody.probe_cleanup_conflicts(Some(&scope_b)).await);
+        let released_a = custody
+            .reserve_probe_resolution(Some("checks-a"))
+            .await
+            .expect("late exact departure releases resource A");
+        assert!(
+            custody
+                .reserve_probe_resolution(Some("checks-b"))
+                .await
+                .is_none()
+        );
+        drop(released_a);
+
+        child_b.allow_departure();
+        reap_probe_owners_to(custody, 0).await;
+        child_a.cleanup();
+        child_b.cleanup();
+        fixture.owner.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn probe_resolution_reservations_hold_conflicts_until_both_owners_depart() {
