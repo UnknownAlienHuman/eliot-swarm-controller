@@ -253,9 +253,9 @@ jobs:
           }
 
   scoped-rust:
-    name: Changed Rust packages (changed-line Clippy, changed integration targets)
+    name: Changed Rust packages (all-target compile, changed-line Clippy, changed integration targets)
     needs: scope
-    if: (github.event_name == 'pull_request' || github.event_name == 'push') && (needs.scope.outputs.clippy_packages != '[]' || needs.scope.outputs.test_targets != '[]')
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && (needs.scope.outputs.packages != '[]' || needs.scope.outputs.clippy_packages != '[]' || needs.scope.outputs.test_targets != '[]')
     strategy:
       fail-fast: false
       matrix:
@@ -278,7 +278,50 @@ jobs:
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
           & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTarget -TargetDir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Provision temporary libclang for rusqlite bindgen
+        shell: pwsh
+        run: |
+          if ($IsWindows) {
+            $version = '20.1.8'
+            $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+            $installDir = Join-Path $env:RUNNER_TEMP "llvm-$version"
+            $uri = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+            Invoke-WebRequest -Uri $uri -OutFile $installer
+            $expectedHash = '3197846A2B19063687DD56E93E34CD941E3548D907F23A6131571321BDF9FE7B'
+            $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+            if ($actualHash -cne $expectedHash) { throw 'LLVM installer SHA-256 mismatch.' }
+            if (Test-Path -LiteralPath $installDir) { throw 'Temporary LLVM install directory must be fresh.' }
+            $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "LLVM installer failed with exit code $($process.ExitCode)." }
+            $libclangDir = Join-Path $installDir 'bin'
+            if (-not (Test-Path -LiteralPath (Join-Path $libclangDir 'libclang.dll'))) {
+              throw 'The official LLVM installation did not provide libclang.dll.'
+            }
+          } else {
+            & sudo apt-get update
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & sudo apt-get install --yes --no-install-recommends libclang-dev
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $libclang = Get-ChildItem -Path '/usr/lib/llvm-*/lib/libclang.so' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $libclang) { throw 'The libclang development package did not provide libclang.so.' }
+            $libclangDir = $libclang.DirectoryName
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "LIBCLANG_PATH=$libclangDir" -Encoding utf8
+      - name: Compile all targets for changed owned packages
+        if: needs.scope.outputs.packages != '[]'
+        shell: pwsh
+        env:
+          PACKAGE_SPECS: ${{ needs.scope.outputs.packages }}
+        run: |
+          $packages = @($env:PACKAGE_SPECS | ConvertFrom-Json)
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          foreach ($package in $packages) {
+            $packageSpec = [string]$package
+            & cargo check --locked --package $packageSpec --all-targets --target-dir $sharedTargetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Clippy compiler errors and changed-line warnings
+        if: needs.scope.outputs.clippy_packages != '[]'
         shell: pwsh
         env:
           PACKAGE_SPECS: ${{ needs.scope.outputs.clippy_packages }}
@@ -357,6 +400,35 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
           rustc --version
           cargo --version
+      - name: Provision temporary libclang for rusqlite bindgen
+        shell: pwsh
+        run: |
+          if ($IsWindows) {
+            $version = '20.1.8'
+            $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+            $installDir = Join-Path $env:RUNNER_TEMP "llvm-$version"
+            $uri = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+            Invoke-WebRequest -Uri $uri -OutFile $installer
+            $expectedHash = '3197846A2B19063687DD56E93E34CD941E3548D907F23A6131571321BDF9FE7B'
+            $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+            if ($actualHash -cne $expectedHash) { throw 'LLVM installer SHA-256 mismatch.' }
+            if (Test-Path -LiteralPath $installDir) { throw 'Temporary LLVM install directory must be fresh.' }
+            $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "LLVM installer failed with exit code $($process.ExitCode)." }
+            $libclangDir = Join-Path $installDir 'bin'
+            if (-not (Test-Path -LiteralPath (Join-Path $libclangDir 'libclang.dll'))) {
+              throw 'The official LLVM installation did not provide libclang.dll.'
+            }
+          } else {
+            & sudo apt-get update
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & sudo apt-get install --yes --no-install-recommends libclang-dev
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $libclang = Get-ChildItem -Path '/usr/lib/llvm-*/lib/libclang.so' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $libclang) { throw 'The libclang development package did not provide libclang.so.' }
+            $libclangDir = $libclang.DirectoryName
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "LIBCLANG_PATH=$libclangDir" -Encoding utf8
       - name: Format, lint, and test all owned workspace packages from metadata
         shell: pwsh
         run: |
