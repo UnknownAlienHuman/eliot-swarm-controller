@@ -3727,7 +3727,17 @@ pub(super) fn set_meta(db: &Connection, key: &str, value: &Value) -> Result<()> 
     Ok(())
 }
 
-const LAUNCH_RECONCILE_CURSOR_META_KEY: &str = "launcher:reconcile_launches:v1:cursor";
+/// Immutable fair-scan cursor (v2, ordered by `created_at_ms`).
+/// Cycle: an exhausted scan closes and the next batch reopens with a fresh
+/// ceiling. Reopen: the v2 cursor persists in `meta` across Store restarts.
+/// Delivered old unpublished cursor: a leftover v1 cursor checkpoints a
+/// pre-refresh mutable `updated_at_ms` against a fixed ceiling, so it is
+/// never reused for immutable scans; it is discarded and a fresh v2 scan
+/// is reopened. Actual effect, current actor, custody, and no-replay
+/// semantics are preserved by the caller; no timestamp is rewritten and no
+/// extra queue or scheduler is introduced here.
+const LAUNCH_RECONCILE_CURSOR_META_KEY: &str = "launcher:reconcile_launches:v2:cursor";
+const LAUNCH_RECONCILE_CURSOR_META_KEY_V1: &str = "launcher:reconcile_launches:v1:cursor";
 
 #[derive(Clone)]
 struct LaunchReconcileCursor {
@@ -3741,10 +3751,10 @@ struct LaunchReconcileBatch {
 }
 
 fn parse_launch_reconcile_key(value: &Value) -> Result<launcher::LaunchReconcileKey> {
-    let updated_at_ms = value["updated_at_ms"].as_i64().ok_or_else(|| {
+    let created_at_ms = value["created_at_ms"].as_i64().ok_or_else(|| {
         Error::new(
             "LAUNCH_CURSOR_CORRUPT",
-            "launch cursor timestamp is invalid",
+            "launch cursor creation timestamp is invalid",
         )
     })?;
     let operation_id = value["operation_id"]
@@ -3758,31 +3768,48 @@ fn parse_launch_reconcile_key(value: &Value) -> Result<launcher::LaunchReconcile
         })?
         .to_owned();
     Ok(launcher::LaunchReconcileKey {
-        updated_at_ms,
+        created_at_ms,
         operation_id,
     })
 }
 
+fn delete_launch_reconcile_cursors(db: &Connection) -> Result<()> {
+    db.execute(
+        "DELETE FROM meta WHERE key IN (?1,?2)",
+        params![LAUNCH_RECONCILE_CURSOR_META_KEY, LAUNCH_RECONCILE_CURSOR_META_KEY_V1],
+    )?;
+    Ok(())
+}
+
 fn read_launch_reconcile_cursor(db: &Connection) -> Result<Option<LaunchReconcileCursor>> {
-    let Some(value) = meta(db, LAUNCH_RECONCILE_CURSOR_META_KEY)? else {
-        return Ok(None);
-    };
-    let after = match value.get("after") {
-        Some(value) if value.is_null() => None,
-        Some(value) => Some(parse_launch_reconcile_key(value)?),
-        None => {
-            return Err(Error::new(
-                "LAUNCH_CURSOR_CORRUPT",
-                "launch cursor has no after key",
-            ));
-        }
-    };
-    let through = value
-        .get("through")
-        .map(parse_launch_reconcile_key)
-        .transpose()?
-        .ok_or_else(|| Error::new("LAUNCH_CURSOR_CORRUPT", "launch cursor has no scan ceiling"))?;
-    Ok(Some(LaunchReconcileCursor { after, through }))
+    if let Some(value) = meta(db, LAUNCH_RECONCILE_CURSOR_META_KEY)? {
+        let after = match value.get("after") {
+            Some(value) if value.is_null() => None,
+            Some(value) => Some(parse_launch_reconcile_key(value)?),
+            None => {
+                return Err(Error::new(
+                    "LAUNCH_CURSOR_CORRUPT",
+                    "launch cursor has no after key",
+                ));
+            }
+        };
+        let through = value
+            .get("through")
+            .map(parse_launch_reconcile_key)
+            .transpose()?
+            .ok_or_else(|| Error::new("LAUNCH_CURSOR_CORRUPT", "launch cursor has no scan ceiling"))?;
+        return Ok(Some(LaunchReconcileCursor { after, through }));
+    }
+    // Delivered old unpublished cursor: a leftover v1 cursor from the
+    // mutable-`updated_at_ms` writer is never reused for immutable scans.
+    // Discard it and reopen a fresh v2 scan with a new ceiling.
+    if meta(db, LAUNCH_RECONCILE_CURSOR_META_KEY_V1)?.is_some() {
+        db.execute(
+            "DELETE FROM meta WHERE key=?1",
+            [LAUNCH_RECONCILE_CURSOR_META_KEY_V1],
+        )?;
+    }
+    Ok(None)
 }
 
 fn write_launch_reconcile_cursor(db: &Connection, cursor: &LaunchReconcileCursor) -> Result<()> {
@@ -3794,6 +3821,9 @@ fn write_launch_reconcile_cursor(db: &Connection, cursor: &LaunchReconcileCursor
 }
 
 fn next_launch_reconcile_batch(db: &Connection, limit: i64) -> Result<LaunchReconcileBatch> {
+    // Cycle: resume the persisted v2 scan while it still has candidates
+    // within its fixed immutable ceiling. Reopen: when the scan is
+    // exhausted, fall through and open a fresh scan with a new ceiling.
     if let Some(cursor) = read_launch_reconcile_cursor(db)? {
         let candidates =
             launcher::pending_launches(db, limit, cursor.after.as_ref(), &cursor.through)?;
@@ -3803,13 +3833,12 @@ fn next_launch_reconcile_batch(db: &Connection, limit: i64) -> Result<LaunchReco
                 candidates,
             });
         }
+        // Exhausted immutable scan closes its cycle before reopening.
+        delete_launch_reconcile_cursors(db)?;
     }
 
     let Some(through) = launcher::pending_launch_ceiling(db)? else {
-        db.execute(
-            "DELETE FROM meta WHERE key=?1",
-            [LAUNCH_RECONCILE_CURSOR_META_KEY],
-        )?;
+        delete_launch_reconcile_cursors(db)?;
         return Ok(LaunchReconcileBatch {
             cursor: None,
             candidates: Vec::new(),
@@ -3821,10 +3850,7 @@ fn next_launch_reconcile_batch(db: &Connection, limit: i64) -> Result<LaunchReco
     };
     let candidates = launcher::pending_launches(db, limit, None, &cursor.through)?;
     if candidates.is_empty() {
-        db.execute(
-            "DELETE FROM meta WHERE key=?1",
-            [LAUNCH_RECONCILE_CURSOR_META_KEY],
-        )?;
+        delete_launch_reconcile_cursors(db)?;
         return Ok(LaunchReconcileBatch {
             cursor: None,
             candidates,

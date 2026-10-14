@@ -302,6 +302,69 @@ async fn seed_unknown_launch(
         .unwrap();
     operation_id
 }
+ 
+/// Seed a pending-workspace launch that stays route-held: its isolated
+/// hold scope is pre-damaged (`capacity:<hold-scope>` = `{}`), so every
+/// examination retains admission (refreshing `updated_at_ms`) and holds
+/// without progress or leases. `created_at_ms` never moves, so an immutable
+/// `(created_at_ms, operation_id)` cursor still reaches later launches.
+async fn seed_hold_launch(
+    store: &Store,
+    operator: &Principal,
+    manager: &Principal,
+    project_id: &str,
+    route_alias: &str,
+    ordinal: usize,
+) -> String {
+    let task = write(
+        store,
+        operator,
+        "task.create",
+        json!({
+            "project_id":project_id,
+            "spec":{
+                "objective":format!("Retain route-held launch candidate {ordinal}"),
+                "phase":"implementation",
+                "requirements":[{"id":"R1","statement":"Hold without progress while keeping fair order"}],
+                "scope":{"initial_paths":["src/target.rs"]},
+                "owner_policy_id":OWNER_POLICY_V1_ID,
+            }
+        }),
+    )
+    .await;
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+    let mut request = json!({
+        "task_id":task_id,
+        "expected_task_revision":1,
+        "route":route_alias,
+        "agent_profile":"workspace-admission-agent",
+        "mcp_profile":"work-participant",
+        "mcp_surface":"participant-core",
+        "workspace_policy":"manager_owned_worktree",
+        "requested_model":null,
+        "requested_effort":null,
+        "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+        "stop_conditions":[],
+        "purpose":"implementation",
+    });
+    let preview = store
+        .call(
+            manager.clone(),
+            "swarm.launch.preview".to_owned(),
+            request.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["hard_blocks"], json!([]), "{preview}");
+    request["client_request_id"] = json!(format!("launch-hold-{ordinal}-{}", model::new_id()));
+    request["plan_digest"] = preview["plan_digest"].clone();
+    let receipt = store
+        .call(manager.clone(), "swarm.launch".to_owned(), request)
+        .await
+        .unwrap();
+    assert_eq!(receipt["launch_state"], "pending_workspace", "{receipt}");
+    receipt["operation_id"].as_str().unwrap().to_owned()
+}
 
 #[tokio::test]
 async fn work_dispatch_and_manual_launch_share_one_immutable_manager_scoped_slot() {
@@ -591,6 +654,8 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     const ROUTE_ALIAS: &str = "workspace-admission-opencode";
     const DUMMY_ROUTE_ALIAS: &str = "workspace-admission-fairness-dummy";
     const SERVICE_ID: &str = "workspace-admission-service";
+    const HOLD_ROUTE_ALIAS: &str = "workspace-admission-hold";
+    const HOLD_SERVICE_ID: &str = "workspace-admission-hold-service";
     const CANONICAL_REPOSITORY: &str = "github.com/owner/workspace-admission";
     const REMOTE_URL: &str = "https://github.com/owner/workspace-admission.git";
 
@@ -697,6 +762,31 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         },
     );
     config.routes.push(route);
+    let hold_route = Route {
+        alias: HOLD_ROUTE_ALIAS.to_owned(),
+        runtime: "opencode_v2".to_owned(),
+        module_artifact_id: "eliot-opencode-v2.http.2".to_owned(),
+        enabled: true,
+        native_options: json!({
+            "service_id":HOLD_SERVICE_ID,
+            "connection_file":fixture_root.join("unused-connection.json"),
+            "expected_version":"1",
+            "directory":repository.clone(),
+            "model":{"id":"m1","providerID":"prov-a","variant":"v"}
+        }),
+        workspace_option: None,
+        owned_service: None,
+        admission_policy: Some(RouteAdmissionPolicy {
+            max_concurrent_roots: 1,
+        }),
+    };
+    let hold_route_value = serde_json::to_value(&hold_route).unwrap();
+    let hold_scope_key = super::capacity::ScopeKey::from_route(&hold_route_value, "");
+    assert_eq!(
+        hold_scope_key.as_str(),
+        "opencode_v2:workspace-admission-hold-service"
+    );
+    config.routes.push(hold_route);
     config.routes.push(Route {
         alias: DUMMY_ROUTE_ALIAS.to_owned(),
         runtime: "regression-runtime".to_owned(),
@@ -815,48 +905,90 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     assert_eq!(recent["disposition"], "admitted", "{recent}");
     let operation_id = recent["operation_id"].as_str().unwrap().to_owned();
 
-    // Nine independently valid launch receipts are converted through the
-    // real failure helper into exact Unknown/no-ticket readback cases: eight
-    // precede the target and one remains as its unprocessed tail. Their
-    // unrelated route keeps the target's root-capacity admission independent.
-    let mut unknown_ids = Vec::with_capacity(9);
-    for ordinal in 0..9 {
-        unknown_ids.push(
-            seed_unknown_launch(
+    // Eight route-held launches precede the ninth valid target: their
+    // isolated hold scope is damaged, so every examination retains admission
+    // (moving `updated_at_ms`) and holds without progress or leases. The
+    // immutable `(created_at_ms, operation_id)` cursor still reaches the
+    // ninth valid launch and leaves the hard-error tail unprocessed. The
+    // tail remains an exact Unknown/no-ticket readback case on an unrelated
+    // route, keeping the target's root-capacity admission independent.
+    let mut hold_ids = Vec::with_capacity(8);
+    for ordinal in 0..8 {
+        hold_ids.push(
+            seed_hold_launch(
                 &owner.store,
                 &operator,
                 &manager,
                 PROJECT_ID,
-                DUMMY_ROUTE_ALIAS,
+                HOLD_ROUTE_ALIAS,
                 ordinal,
             )
             .await,
         );
     }
-    let tail_id = unknown_ids.pop().expect("the tenth candidate is the tail");
-    unknown_ids.sort();
+    let tail_id = seed_unknown_launch(
+        &owner.store,
+        &operator,
+        &manager,
+        PROJECT_ID,
+        DUMMY_ROUTE_ALIAS,
+        8,
+    )
+    .await;
+    hold_ids.sort();
     let target_id_for_order = operation_id.clone();
     let tail_id_for_order = tail_id.clone();
-    let ordered_unknown_ids = unknown_ids.clone();
+    let ordered_hold_ids = hold_ids.clone();
     owner
         .store
         .run(move |db| {
             let base = model::now_ms()?.saturating_sub(100_000);
-            for operation_id in ordered_unknown_ids {
+            for operation_id in ordered_hold_ids {
                 db.execute(
-                    "UPDATE operations SET updated_at_ms=?2 WHERE operation_id=?1",
+                    "UPDATE operations SET created_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1",
                     rusqlite::params![operation_id, base],
                 )?;
             }
             db.execute(
-                "UPDATE operations SET updated_at_ms=?2 WHERE operation_id=?1",
+                "UPDATE operations SET created_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1",
                 rusqlite::params![target_id_for_order, base.saturating_add(1)],
             )?;
             db.execute(
-                "UPDATE operations SET updated_at_ms=?2 WHERE operation_id=?1",
+                "UPDATE operations SET created_at_ms=?2,updated_at_ms=?2 WHERE operation_id=?1",
                 rusqlite::params![tail_id_for_order, 9_000_000_000_000_000_000i64],
             )?;
             Ok(())
+        })
+        .await
+        .unwrap();
+    // Damage the isolated hold scope before any reconciliation: the eight
+    // hold launches then retain a Hold admission on every examination.
+    let hold_capacity_key = format!("capacity:{}", hold_scope_key.as_str());
+    owner
+        .store
+        .run(move |db| {
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,'{}') ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+                [hold_capacity_key],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let hold_ids_for_stamps = hold_ids.clone();
+    let hold_stamps_before = owner
+        .store
+        .run(move |db| {
+            let mut stamps = Vec::with_capacity(hold_ids_for_stamps.len());
+            for operation_id in hold_ids_for_stamps {
+                let (created_at_ms, updated_at_ms): (i64, i64) = db.query_row(
+                    "SELECT created_at_ms,updated_at_ms FROM operations WHERE operation_id=?1",
+                    [&operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                stamps.push(json!({"operation_id":operation_id,"created_at_ms":created_at_ms,"updated_at_ms":updated_at_ms}));
+            }
+            Ok(json!(stamps))
         })
         .await
         .unwrap();
@@ -890,21 +1022,52 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     assert_eq!(progress["progressed"], 0, "{progress}");
     assert_eq!(progress["held"], 8, "{progress}");
     assert_eq!(progress["outcome_unknown"], 0, "{progress}");
-    let selected_cursor = owner
+    let hold_ids_for_after = hold_ids.clone();
+    let hold_stamps_after = owner
         .store
-        .run(|db| {
-            let value = super::meta(db, "launcher:reconcile_launches:v1:cursor")?
-                .expect("the considered page persists its cursor");
-            Ok(value["after"]["operation_id"].as_str().unwrap().to_owned())
+        .run(move |db| {
+            let mut stamps = Vec::with_capacity(hold_ids_for_after.len());
+            for operation_id in hold_ids_for_after {
+                let (created_at_ms, updated_at_ms): (i64, i64) = db.query_row(
+                    "SELECT created_at_ms,updated_at_ms FROM operations WHERE operation_id=?1",
+                    [&operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                stamps.push(json!({"operation_id":operation_id,"created_at_ms":created_at_ms,"updated_at_ms":updated_at_ms}));
+            }
+            Ok(json!(stamps))
         })
         .await
         .unwrap();
-    assert_eq!(selected_cursor, *unknown_ids.last().unwrap());
+    assert_eq!(hold_stamps_before.as_array().unwrap().len(), 8, "{hold_stamps_before}");
+    assert_eq!(hold_stamps_after.as_array().unwrap().len(), 8, "{hold_stamps_after}");
+    for (before, after) in hold_stamps_before.as_array().unwrap().iter().zip(hold_stamps_after.as_array().unwrap()) {
+        assert_eq!(before["operation_id"], after["operation_id"], "{before} {after}");
+        assert_eq!(before["created_at_ms"], after["created_at_ms"], "immutable creation order never moves {before} {after}");
+        assert!(
+            after["updated_at_ms"].as_i64().unwrap() > before["updated_at_ms"].as_i64().unwrap(),
+            "route-held admission refresh must move updated_at_ms {before} {after}"
+        );
+    }
+    let selected_cursor = owner
+        .store
+        .run(|db| {
+            let value = super::meta(db, "launcher:reconcile_launches:v2:cursor")?
+                .expect("the considered page persists its cursor");
+            Ok((
+                value["after"]["operation_id"].as_str().unwrap().to_owned(),
+                value["through"]["operation_id"].as_str().unwrap().to_owned(),
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(selected_cursor.0, *hold_ids.last().unwrap(), "{selected_cursor:?}");
+    assert_eq!(selected_cursor.1, tail_id, "immutable ceiling still reaches the future tail");
 
     let cursor_failure = format!(
         "CREATE TRIGGER launch_cursor_checkpoint_hard_failure \
          BEFORE INSERT ON meta \
-         WHEN NEW.key='launcher:reconcile_launches:v1:cursor' \
+         WHEN NEW.key='launcher:reconcile_launches:v2:cursor' \
            AND json_extract(NEW.value_json,'$.after.operation_id')='{operation_id}' \
          BEGIN SELECT RAISE(ABORT,'fixture cursor checkpoint failure'); END;"
     );
@@ -934,7 +1097,7 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     let cursor_after_failure = owner
         .store
         .run(move |db| {
-            let cursor = super::meta(db, "launcher:reconcile_launches:v1:cursor")?
+            let cursor = super::meta(db, "launcher:reconcile_launches:v2:cursor")?
                 .expect("hard checkpoint failure preserves the prior cursor");
             let (state, effective_raw, lease_count): (String, String, i64) = db.query_row(
                 "SELECT state,effective_request_json, \
@@ -953,7 +1116,7 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         })
         .await
         .unwrap();
-    assert_eq!(cursor_after_failure["after"], *unknown_ids.last().unwrap());
+    assert_eq!(cursor_after_failure["after"], *hold_ids.last().unwrap());
     assert_eq!(cursor_after_failure["tail_state"], "outcome_unknown");
     assert_eq!(
         cursor_after_failure["tail_manifest_state"],
@@ -987,7 +1150,7 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
             ) = db.query_row(
                 "SELECT lease_id,state,baseline_commit,workspace_path,clean_state_json,attempt_id \
                  FROM workspace_leases WHERE operation_id=?1",
-                [&operation_id],
+                [&operation_id_for_readback],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -1012,7 +1175,7 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
             )?;
             let open_child_count: i64 = db.query_row(
                 "SELECT COUNT(*) FROM operations WHERE method='agent.open' AND prerequisite_operation_id=?1",
-                [&operation_id],
+                [&operation_id_for_readback],
                 |row| row.get(0),
             )?;
             let capacity_raw: String = db.query_row(

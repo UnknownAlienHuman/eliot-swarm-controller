@@ -3972,9 +3972,16 @@ pub(crate) fn opening_actor_for_open(
 
 /// Bounded host selector. Unknown launches are selected for readback only;
 /// callers must inspect the retained manifest phase before acting.
+/// Fair reconcile cursor over immutable creation order. `created_at_ms` never
+/// moves: `retain_launch_admission` refreshes `updated_at_ms` on every
+/// route-held examination, so ordering by the mutable timestamp lets a held
+/// page reselect itself ahead of its fixed ceiling and starve later launches.
+/// Ordering by `(created_at_ms, operation_id)` keeps each candidate at a
+/// stable position for the whole scan cycle. No timestamp is rewritten here
+/// and no extra queue or scheduler is introduced.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct LaunchReconcileKey {
-    pub updated_at_ms: i64,
+    pub created_at_ms: i64,
     pub operation_id: String,
 }
 
@@ -3986,16 +3993,16 @@ pub(super) struct PendingLaunch {
 
 pub(super) fn pending_launch_ceiling(db: &Connection) -> Result<Option<LaunchReconcileKey>> {
     db.query_row(
-        "SELECT updated_at_ms,operation_id FROM operations \
+        "SELECT created_at_ms,operation_id FROM operations \
          WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
            AND json_extract(effective_request_json,'$.launch_manifest.state') \
              IN ('pending_workspace','awaiting_binding','awaiting_capability', \
                  'awaiting_participant_credential','outcome_unknown') \
-         ORDER BY updated_at_ms DESC,operation_id DESC LIMIT 1",
+         ORDER BY created_at_ms DESC,operation_id DESC LIMIT 1",
         [],
         |row| {
             Ok(LaunchReconcileKey {
-                updated_at_ms: row.get(0)?,
+                created_at_ms: row.get(0)?,
                 operation_id: row.get(1)?,
             })
         },
@@ -4016,28 +4023,28 @@ pub(super) fn pending_launches(
         ));
     }
     let mut statement = db.prepare(
-        "SELECT updated_at_ms,operation_id FROM operations \
+        "SELECT created_at_ms,operation_id FROM operations \
          WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
            AND json_extract(effective_request_json,'$.launch_manifest.state') \
              IN ('pending_workspace','awaiting_binding','awaiting_capability', \
                  'awaiting_participant_credential','outcome_unknown') \
-           AND (?1 IS NULL OR updated_at_ms>?1 OR (updated_at_ms=?1 AND operation_id>?2)) \
-           AND (updated_at_ms<?3 OR (updated_at_ms=?3 AND operation_id<=?4)) \
-         ORDER BY updated_at_ms,operation_id LIMIT ?5",
+           AND (?1 IS NULL OR created_at_ms>?1 OR (created_at_ms=?1 AND operation_id>?2)) \
+           AND (created_at_ms<?3 OR (created_at_ms=?3 AND operation_id<=?4)) \
+         ORDER BY created_at_ms,operation_id LIMIT ?5",
     )?;
     statement
         .query_map(
             params![
-                after.map(|key| key.updated_at_ms),
+                after.map(|key| key.created_at_ms),
                 after.map(|key| key.operation_id.as_str()),
-                through.updated_at_ms,
+                through.created_at_ms,
                 through.operation_id,
                 limit,
             ],
             |row| {
                 Ok(PendingLaunch {
                     cursor: LaunchReconcileKey {
-                        updated_at_ms: row.get(0)?,
+                        created_at_ms: row.get(0)?,
                         operation_id: row.get(1)?,
                     },
                     operation_id: row.get(1)?,
