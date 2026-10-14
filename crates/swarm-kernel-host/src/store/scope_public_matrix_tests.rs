@@ -1906,7 +1906,7 @@ mod connected_store {
         assert_eq!(warm.cache_validation_query_loads, 3);
         assert_eq!(warm.provenance_point_query_loads, page_count as u64 * 3 + 2);
         assert_eq!(warm.part_manifest_decodes, 1);
-        assert!(warm.part_manifest_string_bytes_copied > 0);
+        assert_eq!(warm.part_manifest_string_bytes_copied, 0);
 
         reset_assembly_source_load_counts(&assembled_id);
         for _ in 0..64 {

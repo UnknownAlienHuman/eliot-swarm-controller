@@ -234,6 +234,7 @@ pub(crate) enum ArtifactDomainIdentity {
 
 const MAX_ASSEMBLY_READ_CACHE_ENTRIES: usize = 32;
 const MAX_ASSEMBLY_READ_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const ASSEMBLY_CACHE_WATCHER_ACCOUNTING_BYTES_PER_DEPENDENCY: usize = 128;
 
 /// Immutable assembly proof shared by range/parts hotpaths. `sources` is the
 /// full validated N-source proof used only on fallback; `distinct_tasks` are
@@ -361,35 +362,110 @@ pub(super) fn assembly_read_cache_epoch(
     ))
 }
 
-fn estimated_source_proof_bytes(sources: &[NativeResultSource]) -> usize {
+fn estimated_source_proof_bytes(sources: &[NativeResultSource], capacity: usize) -> usize {
     sources.iter().fold(
-        size_of::<Vec<NativeResultSource>>() + std::mem::size_of_val(sources),
+        size_of::<Vec<NativeResultSource>>()
+            .saturating_add(capacity.saturating_mul(size_of::<NativeResultSource>())),
         |total, source| {
             total
-                .saturating_add(source.producer_operation_id.len())
-                .saturating_add(source.target_operation_id.len())
+                .saturating_add(source.producer_operation_id.capacity())
+                .saturating_add(source.target_operation_id.capacity())
                 .saturating_add(source.task_identity.as_ref().map_or(0, |identity| {
-                    identity.project_id.len()
-                        + identity.task_id.len()
-                        + identity.attempt_id.as_deref().map_or(0, str::len)
-                        + identity.binding_id.as_deref().map_or(0, str::len)
+                    identity
+                        .project_id
+                        .capacity()
+                        .saturating_add(identity.task_id.capacity())
+                        .saturating_add(identity.attempt_id.as_ref().map_or(0, String::capacity))
+                        .saturating_add(identity.binding_id.as_ref().map_or(0, String::capacity))
                 }))
         },
     )
 }
 
-fn estimated_distinct_tasks_bytes(tasks: &[Option<TaskGraphIdentity>]) -> usize {
+fn estimated_distinct_tasks_bytes(tasks: &[Option<TaskGraphIdentity>], capacity: usize) -> usize {
     tasks.iter().fold(
-        size_of::<Vec<Option<TaskGraphIdentity>>>() + std::mem::size_of_val(tasks),
+        size_of::<Vec<Option<TaskGraphIdentity>>>()
+            .saturating_add(capacity.saturating_mul(size_of::<Option<TaskGraphIdentity>>())),
         |total, task| {
             total.saturating_add(task.as_ref().map_or(0, |identity| {
-                identity.project_id.len()
-                    + identity.task_id.len()
-                    + identity.attempt_id.as_deref().map_or(0, str::len)
-                    + identity.binding_id.as_deref().map_or(0, str::len)
+                identity
+                    .project_id
+                    .capacity()
+                    .saturating_add(identity.task_id.capacity())
+                    .saturating_add(identity.attempt_id.as_ref().map_or(0, String::capacity))
+                    .saturating_add(identity.binding_id.as_ref().map_or(0, String::capacity))
             }))
         },
     )
+}
+
+fn estimated_assembly_read_cache_entry_bytes(
+    key: &AssemblyReadCacheKey,
+    record: &ArtifactRecord,
+    proof: &AssemblyProof,
+) -> usize {
+    let dependency_count = proof.cache_dependencies.len();
+    size_of::<AssemblyReadCacheEntry>()
+        .saturating_add(estimated_artifact_record_bytes(record))
+        .saturating_add(key.artifact_id.capacity())
+        .saturating_add(key.relative_path.capacity())
+        .saturating_add(key.content_digest.capacity())
+        .saturating_add(key.assembly_operation_id.capacity())
+        .saturating_add(estimated_source_proof_bytes(
+            &proof.sources,
+            proof.sources.capacity(),
+        ))
+        .saturating_add(estimated_distinct_tasks_bytes(
+            &proof.distinct_tasks,
+            proof.distinct_tasks.capacity(),
+        ))
+        .saturating_add(size_of::<Vec<super::results::AssemblyCacheRow>>())
+        .saturating_add(
+            proof
+                .cache_dependencies
+                .capacity()
+                .saturating_mul(size_of::<super::results::AssemblyCacheRow>()),
+        )
+        // A guard duplicates dependency IDs in a HashSet and registers one weak
+        // watcher per unique row in the connection scope. Account conservatively
+        // for those two maps so the resident-byte ceiling includes invalidation.
+        .saturating_add(
+            dependency_count.saturating_mul(ASSEMBLY_CACHE_WATCHER_ACCOUNTING_BYTES_PER_DEPENDENCY),
+        )
+        // Seven Arc allocations retain the record, proof, three proof vectors,
+        // watcher guard, and the guard's invalidation flag.
+        .saturating_add(
+            7usize
+                .saturating_mul(2 * size_of::<usize>())
+                .saturating_add(size_of::<std::sync::atomic::AtomicBool>()),
+        )
+        .saturating_add(size_of::<AssemblyProof>())
+        .saturating_add(size_of::<super::results::AssemblyReadCacheGuard>())
+        // The guard owns a separate copy of the artifact ID.
+        .saturating_add(key.artifact_id.capacity())
+}
+
+fn insert_assembly_read_cache_entry(
+    cache: &mut VecDeque<AssemblyReadCacheEntry>,
+    entry: AssemblyReadCacheEntry,
+) -> bool {
+    if entry.bytes > MAX_ASSEMBLY_READ_CACHE_BYTES {
+        return false;
+    }
+    let mut total_bytes = cache.iter().fold(0usize, |total, resident| {
+        total.saturating_add(resident.bytes)
+    });
+    while !cache.is_empty()
+        && (cache.len() >= MAX_ASSEMBLY_READ_CACHE_ENTRIES
+            || total_bytes.saturating_add(entry.bytes) > MAX_ASSEMBLY_READ_CACHE_BYTES)
+    {
+        let Some(removed) = cache.pop_front() else {
+            return false;
+        };
+        total_bytes = total_bytes.saturating_sub(removed.bytes);
+    }
+    cache.push_back(entry);
+    true
 }
 
 fn cache_assembly_proof(
@@ -398,23 +474,7 @@ fn cache_assembly_proof(
     snapshot: &super::results::AssemblyReadCacheSnapshot,
 ) -> Result<()> {
     let key = assembly_read_cache_key(record, snapshot)?;
-    let key_bytes = key
-        .artifact_id
-        .len()
-        .saturating_add(key.relative_path.len())
-        .saturating_add(key.content_digest.len())
-        .saturating_add(key.assembly_operation_id.len());
-    let record_bytes = estimated_artifact_record_bytes(record);
-    let bytes = record_bytes
-        .saturating_add(key_bytes)
-        .saturating_add(estimated_source_proof_bytes(&proof.sources))
-        .saturating_add(estimated_distinct_tasks_bytes(&proof.distinct_tasks))
-        .saturating_add(
-            proof
-                .cache_dependencies
-                .len()
-                .saturating_mul(size_of::<super::results::AssemblyCacheRow>()),
-        );
+    let bytes = estimated_assembly_read_cache_entry_bytes(&key, record, &proof);
     let mut cache = match assembly_read_cache().lock() {
         Ok(cache) => cache,
         Err(_) => return Ok(()),
@@ -423,36 +483,19 @@ fn cache_assembly_proof(
         entry.key.database_namespace != key.database_namespace
             || entry.key.artifact_id != key.artifact_id
     });
-    let mut total_bytes = cache
-        .iter()
-        .fold(0usize, |total, entry| total.saturating_add(entry.bytes));
-    // Oversized valid assemblies remain warm as the sole entry instead of
-    // silently bypassing the cache and rebuilding an N-source proof per read.
-    if bytes <= MAX_ASSEMBLY_READ_CACHE_BYTES && total_bytes > MAX_ASSEMBLY_READ_CACHE_BYTES {
-        return Ok(());
-    }
     if bytes > MAX_ASSEMBLY_READ_CACHE_BYTES {
-        cache.clear();
-        total_bytes = 0;
-    }
-    while !cache.is_empty()
-        && (cache.len() >= MAX_ASSEMBLY_READ_CACHE_ENTRIES
-            || total_bytes.saturating_add(bytes) > MAX_ASSEMBLY_READ_CACHE_BYTES)
-    {
-        let Some(removed) = cache.pop_front() else {
-            return Ok(());
-        };
-        total_bytes = total_bytes.saturating_sub(removed.bytes);
+        return Ok(());
     }
     let guard = snapshot.guard();
     guard.watch(proof.cache_dependencies.iter().copied());
-    cache.push_back(AssemblyReadCacheEntry {
+    let entry = AssemblyReadCacheEntry {
         key,
         guard,
         record: Arc::clone(record),
         proof,
         bytes,
-    });
+    };
+    insert_assembly_read_cache_entry(&mut cache, entry);
     Ok(())
 }
 
@@ -461,18 +504,24 @@ fn estimated_artifact_record_bytes(record: &ArtifactRecord) -> usize {
         match value {
             Value::Null => 0,
             Value::Bool(_) | Value::Number(_) => size_of::<Value>(),
-            Value::String(value) => size_of::<Value>().saturating_add(value.len()),
+            Value::String(value) => size_of::<Value>().saturating_add(value.capacity()),
             Value::Array(values) => values.iter().fold(
                 size_of::<Vec<Value>>()
-                    .saturating_add(values.len().saturating_mul(size_of::<Value>())),
+                    .saturating_add(values.capacity().saturating_mul(size_of::<Value>())),
                 |total, value| total.saturating_add(value_bytes(value)),
             ),
             Value::Object(values) => values.iter().fold(
                 size_of::<serde_json::Map<String, Value>>()
+                    .saturating_add(1024)
                     .saturating_add(values.len().saturating_mul(size_of::<(String, Value)>())),
                 |total, (key, value)| {
                     total
-                        .saturating_add(key.len())
+                        .saturating_add(key.capacity())
+                        // serde_json does not expose backing capacity uniformly.
+                        // Cover one extra key/value slot per resident entry, plus
+                        // node/control storage for small maps.
+                        .saturating_add(size_of::<(String, Value)>())
+                        .saturating_add(2 * size_of::<usize>())
                         .saturating_add(value_bytes(value))
                 },
             ),
@@ -480,10 +529,10 @@ fn estimated_artifact_record_bytes(record: &ArtifactRecord) -> usize {
     }
 
     size_of::<ArtifactRecord>()
-        .saturating_add(record.kind.len())
-        .saturating_add(record.artifact_id.len())
-        .saturating_add(record.relative_path.len())
-        .saturating_add(record.content_digest.len())
+        .saturating_add(record.kind.capacity())
+        .saturating_add(record.artifact_id.capacity())
+        .saturating_add(record.relative_path.capacity())
+        .saturating_add(record.content_digest.capacity())
         .saturating_add(value_bytes(&record.metadata))
 }
 
@@ -2695,4 +2744,166 @@ pub(crate) fn unauthorized_artifact() -> Error {
         "FORBIDDEN",
         "artifact is outside every retained relation held by this principal",
     )
+}
+
+#[cfg(test)]
+mod assembly_read_cache_budget_tests {
+    use super::*;
+    use std::sync::Weak;
+
+    fn snapshots() -> (
+        rusqlite::Connection,
+        Vec<super::super::results::AssemblyReadCacheSnapshot>,
+    ) {
+        let db = rusqlite::Connection::open_in_memory().expect("open test database");
+        db.execute_batch(
+            "CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+             INSERT INTO artifacts (artifact_id, kind) VALUES
+                 ('cache-cold', 'native_result'),
+                 ('cache-hot', 'native_result'),
+                 ('cache-incoming', 'native_result'),
+                 ('cache-large', 'native_result');",
+        )
+        .expect("create cache fixture rows");
+        let snapshots = ["cache-cold", "cache-hot", "cache-incoming", "cache-large"]
+            .into_iter()
+            .map(|id| {
+                super::super::results::assembly_read_cache_snapshot(&db, id)
+                    .expect("read cache snapshot")
+                    .expect("fixture artifact exists")
+            })
+            .collect();
+        (db, snapshots)
+    }
+
+    fn cache_entry(
+        snapshot: &super::super::results::AssemblyReadCacheSnapshot,
+        sources: Vec<NativeResultSource>,
+        accounted_bytes: usize,
+    ) -> (
+        AssemblyReadCacheEntry,
+        Weak<super::super::results::AssemblyReadCacheGuard>,
+    ) {
+        let dependency = super::super::results::AssemblyCacheRow::Artifact(snapshot.artifact_rowid);
+        let proof = Arc::new(AssemblyProof {
+            sources: Arc::new(sources),
+            distinct_tasks: Arc::new(vec![None]),
+            cache_dependencies: Arc::new(vec![dependency]),
+        });
+        cache_entry_with_proof(snapshot, proof, accounted_bytes)
+    }
+
+    fn cache_entry_with_proof(
+        snapshot: &super::super::results::AssemblyReadCacheSnapshot,
+        proof: Arc<AssemblyProof>,
+        accounted_bytes: usize,
+    ) -> (
+        AssemblyReadCacheEntry,
+        Weak<super::super::results::AssemblyReadCacheGuard>,
+    ) {
+        let record = Arc::new(ArtifactRecord {
+            kind: "native_result".to_owned(),
+            artifact_id: snapshot.artifact_id.clone(),
+            relative_path: format!("artifacts/{}.bin", snapshot.artifact_id),
+            byte_length: 0,
+            content_digest: "content-digest".to_owned(),
+            metadata: json!({"assembly_operation_id":"assembly-op","part_count":1}),
+        });
+        let dependency = super::super::results::AssemblyCacheRow::Artifact(snapshot.artifact_rowid);
+        let guard = snapshot.guard();
+        guard.watch([dependency]);
+        let weak_guard = Arc::downgrade(&guard);
+        let key = assembly_read_cache_key(&record, snapshot).expect("cache key");
+        (
+            AssemblyReadCacheEntry {
+                key,
+                guard,
+                record,
+                proof,
+                bytes: accounted_bytes,
+            },
+            weak_guard,
+        )
+    }
+
+    fn large_source_fixture() -> Vec<NativeResultSource> {
+        let count = MAX_ASSEMBLY_READ_CACHE_BYTES
+            .checked_div(size_of::<NativeResultSource>())
+            .unwrap_or(0)
+            .saturating_add(1);
+        (0..count)
+            .map(|index| NativeResultSource {
+                producer_operation_id: format!("producer-{index}"),
+                target_operation_id: "shared-target".to_owned(),
+                task_identity: None,
+                producer_operation_rowid: index as i64,
+                target_operation_rowid: 1,
+            })
+            .collect()
+    }
+
+    fn resident_bytes(cache: &VecDeque<AssemblyReadCacheEntry>) -> usize {
+        cache
+            .iter()
+            .fold(0usize, |total, entry| total.saturating_add(entry.bytes))
+    }
+
+    #[test]
+    fn large_proof_is_not_resident_and_small_hot_entry_survives_fair_eviction() {
+        let (_db, snapshots) = snapshots();
+        let mut cache = VecDeque::new();
+        let half_budget = MAX_ASSEMBLY_READ_CACHE_BYTES / 2;
+
+        let (cold, cold_guard) = cache_entry(&snapshots[0], Vec::new(), half_budget);
+        let (hot, hot_guard) = cache_entry(&snapshots[1], Vec::new(), half_budget);
+        assert!(insert_assembly_read_cache_entry(&mut cache, cold));
+        assert!(insert_assembly_read_cache_entry(&mut cache, hot));
+        assert_eq!(resident_bytes(&cache), MAX_ASSEMBLY_READ_CACHE_BYTES);
+
+        let large_sources = large_source_fixture();
+        let large_proof = AssemblyProof {
+            sources: Arc::new(large_sources),
+            distinct_tasks: Arc::new(vec![None]),
+            cache_dependencies: Arc::new(vec![super::super::results::AssemblyCacheRow::Artifact(
+                snapshots[3].artifact_rowid,
+            )]),
+        };
+        let large_record = ArtifactRecord {
+            kind: "native_result".to_owned(),
+            artifact_id: snapshots[3].artifact_id.clone(),
+            relative_path: format!("artifacts/{}.bin", snapshots[3].artifact_id),
+            byte_length: 0,
+            content_digest: "content-digest".to_owned(),
+            metadata: json!({"assembly_operation_id":"assembly-op","part_count":1}),
+        };
+        let large_key = assembly_read_cache_key(&large_record, &snapshots[3]).expect("large key");
+        let large_bytes =
+            estimated_assembly_read_cache_entry_bytes(&large_key, &large_record, &large_proof);
+        assert!(large_bytes > MAX_ASSEMBLY_READ_CACHE_BYTES);
+        let (large, large_guard) =
+            cache_entry_with_proof(&snapshots[3], Arc::new(large_proof), large_bytes);
+        assert!(!insert_assembly_read_cache_entry(&mut cache, large));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(resident_bytes(&cache), MAX_ASSEMBLY_READ_CACHE_BYTES);
+        assert!(large_guard.upgrade().is_none());
+        assert!(cold_guard.upgrade().is_some());
+        assert!(hot_guard.upgrade().is_some());
+
+        let (incoming, _) = cache_entry(&snapshots[2], Vec::new(), half_budget);
+        assert!(insert_assembly_read_cache_entry(&mut cache, incoming));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(resident_bytes(&cache), MAX_ASSEMBLY_READ_CACHE_BYTES);
+        assert!(
+            cache
+                .iter()
+                .any(|entry| entry.key.artifact_id == "cache-hot")
+        );
+        assert!(
+            cache
+                .iter()
+                .any(|entry| entry.key.artifact_id == "cache-incoming")
+        );
+        assert!(cold_guard.upgrade().is_none());
+        assert!(hot_guard.upgrade().is_some());
+    }
 }
