@@ -4,6 +4,10 @@
 
 The descriptor declares `agent.open`, `task.dispatch`, `agent.send/next_turn`, `native.opencode.loop_step`, `agent.reply`, `agent.background`, `agent.refresh`, `agent.reconcile`, and `agent.result`, along with the four `native.mcp.*` commands. Loop-step is a vendor command with its own `swarm.opencode_loop_step_command@1` schema; ordinary `agent.send/next_turn` remains native queue delivery. Reply commands use `swarm.opencode_reply_command@1`. Unknown OpenCode-native methods stay unsupported.
 
+The owner-approved current continuation caller remains the host agent.goal action continue: it names the exact goal revision and objective and admits one deterministic queue input.
+native.opencode.loop_step is a separate internal RuntimeCommand, not another MCP or CLI control; it carries the caller request ID and exact binding generation and emits one steer input.
+Ordinary agent.send/next_turn stays queue-only. A lost loop-step POST remains unknown and reconciliation uses exact readback without replay; no terminal event or timer starts another input.
+
 The descriptor opts into `swarm.native_mcp_command@2`. Native MCP observe commands carry an explicit `installed_server` purpose for C8 install readback or `assigned_session` for the C7 assignment observation. Assigned-session readback is pinned to OpenCode 2.0.7, uses location-scoped GETs for the MCP list and exact assigned session, and returns only bounded identity/status facts with server errors and integration IDs removed or hashed. Other command and event schemas remain at version 1.
 
 ## Service lifecycle

@@ -816,6 +816,82 @@ async fn unsupported_exact_turn_steering_never_posts() {
         0
     );
 }
+
+#[tokio::test]
+async fn explicit_goal_control_and_loop_step_keep_queue_and_steer_separate() {
+    let f = Fixture::new().await;
+    let s = f.service().await;
+    f.open(&s).await;
+    let root = root_id("fixture-binding", 1);
+    let prompt_path = goal_prompt_path(&root);
+
+    // The owner-approved current control admits one deterministic queued
+    // activation. It does not turn ordinary agent.send into exact-turn steer.
+    let continuation = f.goal_command(json!({
+        "action":"continue",
+        "objective":"one explicit current-controller continuation",
+        "expected_revision":0
+    }));
+    let continued = s.execute(&continuation, &f.options).await;
+    assert_applied(continued);
+    let queued = {
+        let world = f.world.lock().unwrap();
+        world
+            .requests
+            .iter()
+            .find(|request| request.method == "POST" && request.path == prompt_path)
+            .unwrap()
+            .body
+            .clone()
+    };
+    assert_eq!(queued["delivery"], "queue");
+    assert!(
+        queued["text"]
+            .as_str()
+            .unwrap()
+            .contains("one explicit current-controller continuation")
+    );
+
+    let mut ordinary_send = f.command("agent.send");
+    ordinary_send.input["delivery"] = json!("steer");
+    ordinary_send.input["expected_turn_id"] = json!("turn_fixture");
+    let rejected = s.execute(&ordinary_send, &f.options).await;
+    assert!(matches!(rejected.outcome, EffectOutcome::Rejected));
+    assert_eq!(rejected.details["code"], "UNSUPPORTED_EXACT_TURN_STEER");
+    assert_eq!(f.posts(&prompt_path), 1);
+
+    let mut loop_step = f.command("native.opencode.loop_step");
+    loop_step.input = json!({
+        "client_request_id":"gm-step-fixture",
+        "binding_id":loop_step.binding_id.clone(),
+        "generation":loop_step.generation,
+        "text":"one explicit native loop step"
+    });
+    let loop_step_input = input_id(&loop_step.operation_id);
+    f.world.lock().unwrap().lose_prompt = true;
+    let lost = s.execute(&loop_step, &f.options).await;
+    assert!(matches!(lost.outcome, EffectOutcome::Unknown), "{lost:?}");
+
+    let step_body = {
+        let world = f.world.lock().unwrap();
+        let prompts = world
+            .requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == prompt_path)
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 2);
+        prompts[1].body.clone()
+    };
+    assert_eq!(step_body["id"], loop_step_input);
+    assert_eq!(step_body["text"], "one explicit native loop step");
+    assert_eq!(step_body["delivery"], "steer");
+    assert_eq!(step_body["resume"], true);
+
+    let reconciled = s.reconcile(&loop_step, &f.options).await;
+    assert_applied(reconciled);
+    assert_eq!(f.posts(&prompt_path), 2);
+}
+
 #[tokio::test]
 async fn changed_binding_or_model_cannot_receive_work() {
     let f = Fixture::new().await;
