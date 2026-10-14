@@ -1460,3 +1460,464 @@ async fn legacy_index_backfill_propagates_derived_write_failure() {
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test]
+async fn issue99_negative_no_relation_send_forbidden() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-negative-norelation").await;
+    let unrelated_subject = seed_subject(
+        &owner.store,
+        "issue99-negative-norelation-other",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-negative-norelation-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let unrelated = register_integration_participant(
+        &owner,
+        &unrelated_subject,
+        "issue99-negative-norelation-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-negative-norelation-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-negative-norelation-publish",
+    )
+    .await;
+    let denied = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.send".into(),
+            json!({
+                "client_request_id":"issue99-negative-norelation-send",
+                "recipient":unrelated.client_id,
+                "body":{"fact":"no relation"},
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, "FORBIDDEN");
+    let found = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert!(found["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["client_id"] != unrelated.client_id));
+    let unrelated_inbox = owner
+        .store
+        .call(unrelated.clone(), "coordination.inbox".into(), json!({"limit":10}))
+        .await
+        .unwrap();
+    assert_eq!(unrelated_inbox["task_id"], unrelated_subject.task_id);
+    assert!(unrelated_inbox["items"].as_array().unwrap().is_empty());
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_negative_forged_revision_ack_stale() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-negative-forged").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-negative-forged-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-negative-forged-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-negative-forged-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-negative-forged-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-negative-forged-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-negative-forged-publish-target",
+    )
+    .await;
+    let first_cell = sync_offer(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-negative-forged-sync-source",
+        vec![],
+    )
+    .await;
+    let second_cell = sync_requirement(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-negative-forged-sync-target",
+    )
+    .await;
+    assert_eq!(first_cell["cell"]["cell_id"], second_cell["cell"]["cell_id"]);
+    let mut forged = ack_request(
+        &second_cell["cell"],
+        &source_subject,
+        "issue99-negative-forged-ack",
+    );
+    forged["expected_state_revision"] = json!(second_cell["cell"]["state_revision"].as_i64().unwrap_or(0) + 99);
+    let denied = owner
+        .store
+        .call(source.clone(), "coordination.integration.ack".into(), forged)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, "STALE_REVISION");
+    owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.integration.ack".into(),
+            ack_request(&second_cell["cell"], &source_subject, "issue99-negative-forged-ack-source"),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            target.clone(),
+            "coordination.integration.ack".into(),
+            ack_request(&second_cell["cell"], &target_subject, "issue99-negative-forged-ack-target"),
+        )
+        .await
+        .unwrap();
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_negative_revoked_grant_send_stale() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-negative-revoked").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-negative-revoked-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-negative-revoked-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-negative-revoked-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-negative-revoked-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-negative-revoked-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-negative-revoked-publish-target",
+    )
+    .await;
+    let found = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["coverage"], "complete");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], target.client_id);
+    owner
+        .store
+        .call(
+            principal("review-owner-v2", Role::Manager),
+            "coordination.participant.disable".into(),
+            json!({
+                "client_request_id":"issue99-negative-revoked-disable",
+                "client_id":target.client_id,
+                "expected_grant_revision":1,
+            }),
+        )
+        .await
+        .unwrap();
+    let denied = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.send".into(),
+            json!({
+                "client_request_id":"issue99-negative-revoked-send",
+                "recipient":target.client_id,
+                "body":{"fact":"revoked grant"},
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, "STALE_PARTICIPANT");
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_negative_retry_consult_no_second_delivery() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-negative-retry").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-negative-retry-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-negative-retry-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-negative-retry-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-negative-retry-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-negative-retry-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-negative-retry-publish-target",
+    )
+    .await;
+    let ask_request = json!({
+        "client_request_id":"issue99-negative-retry-ask",
+        "target":{"contract_key":contract_key},
+        "field":"assumptions",
+        "question_kind":"assumption_check",
+        "question":"Which implementation assumption applies?",
+        "why_needed":"The exact contract card has no current assumption value.",
+        "expected_answer":"one_fact",
+        "blocking":false,
+        "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+        "evidence_refs":[],
+    });
+    let asked = owner
+        .store
+        .call(source.clone(), "coordination.consult".into(), ask_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(asked["status"], "asked");
+    assert_eq!(asked["source_context"]["task_id"], source_subject.task_id);
+    assert_eq!(asked["target_context"]["task_id"], target_subject.task_id);
+    let retried = owner
+        .store
+        .call(source.clone(), "coordination.consult".into(), ask_request)
+        .await
+        .unwrap();
+    assert_eq!(retried["operation_id"], asked["operation_id"]);
+    assert_eq!(retried["delivery_id"], asked["delivery_id"]);
+    let inbox = owner
+        .store
+        .call(target.clone(), "coordination.inbox".into(), json!({"limit":10}))
+        .await
+        .unwrap();
+    assert_eq!(inbox["task_id"], target_subject.task_id);
+    assert_eq!(inbox["items"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["items"][0]["operation_id"], asked["operation_id"]);
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_negative_old_delivery_not_rerouted() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-negative-reroute").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-negative-reroute-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let new_home_subject = seed_subject(
+        &owner.store,
+        "issue99-negative-reroute-new-home",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-negative-reroute-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-negative-reroute-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-negative-reroute-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-negative-reroute-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-negative-reroute-publish-target",
+    )
+    .await;
+    let ask_request = json!({
+        "client_request_id":"issue99-negative-reroute-ask",
+        "target":{"contract_key":contract_key},
+        "field":"assumptions",
+        "question_kind":"assumption_check",
+        "question":"Which implementation assumption applies?",
+        "why_needed":"The exact contract card has no current assumption value.",
+        "expected_answer":"one_fact",
+        "blocking":false,
+        "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+        "evidence_refs":[],
+    });
+    let asked = owner
+        .store
+        .call(source.clone(), "coordination.consult".into(), ask_request)
+        .await
+        .unwrap();
+    assert_eq!(asked["target_context"]["task_id"], target_subject.task_id);
+    let before_move = owner
+        .store
+        .call(target.clone(), "coordination.inbox".into(), json!({"limit":10}))
+        .await
+        .unwrap();
+    assert_eq!(before_move["task_id"], target_subject.task_id);
+    assert_eq!(before_move["items"].as_array().unwrap().len(), 1);
+    let target_client_id = target.client_id.clone();
+    let old_task_id = target_subject.task_id.clone();
+    let new_task_id = new_home_subject.task_id.clone();
+    let new_attempt_id = new_home_subject.attempt_id.clone();
+    owner
+        .store
+        .run(move |db| {
+            let key = format!("client:{target_client_id}");
+            let raw: String =
+                db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
+                    row.get(0)
+                })?;
+            let mut registration: Value = serde_json::from_str(&raw)?;
+            registration["task_id"] = json!(new_task_id);
+            registration["task_revision"] = json!(1);
+            registration["attempt_id"] = json!(new_attempt_id);
+            registration["grant_revision"] = json!(2);
+            db.execute(
+                "UPDATE meta SET value_json=?2 WHERE key=?1",
+                params![key, model::canonical(&registration)?],
+            )?;
+            db.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [crate::coordination::participant_task_key(
+                    &old_task_id,
+                    &target_client_id,
+                )],
+            )?;
+            db.execute(
+                "INSERT OR REPLACE INTO meta(key,value_json) VALUES(?1,?2)",
+                params![
+                    crate::coordination::participant_task_key(
+                        registration["task_id"].as_str().unwrap_or_default(),
+                        &target_client_id,
+                    ),
+                    model::canonical(&json!({
+                        "client_id":target_client_id,
+                        "task_id":registration["task_id"],
+                        "task_revision":registration["task_revision"],
+                        "attempt_id":registration["attempt_id"],
+                        "grant_revision":registration["grant_revision"],
+                    }))?,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let moved_inbox = owner
+        .store
+        .call(target, "coordination.inbox".into(), json!({"limit":10}))
+        .await
+        .unwrap();
+    assert_eq!(moved_inbox["task_id"], new_home_subject.task_id);
+    assert!(moved_inbox["items"].as_array().unwrap().is_empty());
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
