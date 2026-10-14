@@ -50,6 +50,21 @@ fn unquarantined_launch_damage(db: &Connection) -> Result<bool> {
     Ok(false)
 }
 
+fn unquarantined_check_damage(db: &Connection) -> Result<bool> {
+    let mut statement = db.prepare(
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id \
+         WHERE c.state='queued' AND o.state='queued' AND NOT json_valid(c.spec_json) \
+         ORDER BY c.check_id",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        if !super::checks::pending_source_is_quarantined(db, &row?)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerDemand> {
     let mut demand = LegacyWorkerDemand {
         checks: config.checks.enabled,
@@ -77,8 +92,9 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
             OR (c.state='queued' AND o.state='queued' \
                 AND CASE WHEN json_valid(c.spec_json) \
                     THEN json_extract(c.spec_json,'$.cancel_requested') IS NOT NULL \
-                    ELSE 1 END)) ",
+                    ELSE 0 END)) ",
     )?;
+    demand.checks |= unquarantined_check_damage(db)?;
     demand.scripts = exists(
         db,
         "SELECT EXISTS(SELECT 1 FROM script_runs \

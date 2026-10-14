@@ -2388,7 +2388,7 @@ fn read_pending_cycle(db: &Connection) -> Result<Option<PendingCycle>> {
 
 fn max_pending_id(tx: &Transaction<'_>) -> Result<Option<String>> {
     let max: Option<String> = tx.query_row(
-        "SELECT max(c.check_id) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')))",
+        "SELECT max(c.check_id) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')) OR (c.state='queued' AND o.state='queued' AND NOT json_valid(c.spec_json)))",
         [],
         |row| row.get(0),
     )?;
@@ -2397,7 +2397,7 @@ fn max_pending_id(tx: &Transaction<'_>) -> Result<Option<String>> {
 
 fn pending_subject_count(tx: &Transaction<'_>) -> Result<i64> {
     Ok(tx.query_row(
-        "SELECT count(*) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')))",
+        "SELECT count(*) FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')) OR (c.state='queued' AND o.state='queued' AND NOT json_valid(c.spec_json)))",
         [],
         |row| row.get(0),
     )?)
@@ -2515,7 +2515,7 @@ fn pending_ids_after(
     limit: usize,
 ) -> Result<Vec<String>> {
     let mut statement = tx.prepare(
-        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND (?1 IS NULL OR c.check_id>?1) AND (?2 IS NULL OR c.check_id<=?2) AND NOT EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?3",
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')) OR (c.state='queued' AND o.state='queued' AND NOT json_valid(c.spec_json))) AND (?1 IS NULL OR c.check_id>?1) AND (?2 IS NULL OR c.check_id<=?2) AND NOT EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?3",
     )?;
     let ids = statement
         .query_map(params![cursor, cut, limit as i64], |row| {
@@ -2527,7 +2527,7 @@ fn pending_ids_after(
 
 fn pending_ids_through(tx: &Transaction<'_>, cursor: &str, limit: usize) -> Result<Vec<String>> {
     let mut statement = tx.prepare(
-        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND c.check_id<=?1 AND NOT EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?2",
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')) OR (c.state='queued' AND o.state='queued' AND NOT json_valid(c.spec_json))) AND c.check_id<=?1 AND NOT EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?2",
     )?;
     let ids = statement
         .query_map(params![cursor, limit as i64], |row| row.get::<_, String>(0))?
@@ -2679,6 +2679,15 @@ fn quarantine_key(check_id: &str) -> String {
         "{PENDING_QUARANTINE_PREFIX}{}",
         model::digest(check_id.as_bytes())
     )
+}
+
+/// Activation may ignore only an intact quarantine of this exact lineage.
+/// A changed source still reaches the pending reader's normal conflict path.
+pub(super) fn pending_source_is_quarantined(db: &Connection, check_id: &str) -> Result<bool> {
+    let Some(record) = load_quarantine_record(db, check_id)? else {
+        return Ok(false);
+    };
+    Ok(record.identity == read_subject_identity(db, check_id)?)
 }
 const HELD_PREFIX: &str = "checks:held:v1:";
 const HELD_SCHEMA: u32 = 1;
@@ -2862,7 +2871,7 @@ fn read_held_audit_cursor(db: &Connection) -> Result<Option<String>> {
 fn validate_bounded_held_quarantines(tx: &Transaction<'_>) -> Result<bool> {
     let cursor = read_held_audit_cursor(tx)?;
     let mut statement = tx.prepare(
-        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) AND (?1 IS NULL OR c.check_id>?1) ORDER BY c.check_id LIMIT ?2",
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')) OR (c.state='queued' AND o.state='queued' AND NOT json_valid(c.spec_json))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) AND (?1 IS NULL OR c.check_id>?1) ORDER BY c.check_id LIMIT ?2",
     )?;
     let mut batch = statement
         .query_map(params![cursor.as_deref(), MAX_PENDING_PAGE as i64], |row| {
@@ -2872,7 +2881,7 @@ fn validate_bounded_held_quarantines(tx: &Transaction<'_>) -> Result<bool> {
     drop(statement);
     if batch.is_empty() && cursor.is_some() {
         let mut wrap = tx.prepare(
-            "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?1",
+            "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')) OR (c.state='queued' AND o.state='queued' AND NOT json_valid(c.spec_json))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?1",
         )?;
         batch = wrap
             .query_map(params![MAX_PENDING_PAGE as i64], |row| {
