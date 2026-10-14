@@ -169,10 +169,8 @@ fn rust_store_task_prompt_v1_crosses_into_claude_bridge5_offline_helpers() {
         .nth(2)
         .expect("swarm-kernel-host must be inside the workspace")
         .to_path_buf();
-    let node_test = workspace_root
-        .join("modules/claude/task-prompt-v5-offline.test.mjs")
-        .canonicalize()
-        .unwrap();
+    let node_test = "modules/claude/task-prompt-v5-offline.test.mjs";
+    assert!(workspace_root.join(node_test).is_file());
     let output = Command::new("node")
         .arg("--test")
         .arg("--test-name-pattern=Rust Store TaskPrompt v1 crosses into Claude bridge.5 consumer helpers")
