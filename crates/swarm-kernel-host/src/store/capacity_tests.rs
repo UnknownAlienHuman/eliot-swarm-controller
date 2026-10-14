@@ -1314,7 +1314,7 @@ fn manager_fleet_projections_preserve_exact_object_and_nested_attention_scope() 
         super::launcher::exceptions_get(&db, &manager_a, &json!({"after":0,"limit":5})).unwrap();
     assert_eq!(
         exceptions_a["source_attention"]["total_items"],
-        attention_a["total_items"]
+        capacity::attention_report(&db, 200, 0).unwrap()["total_items"]
     );
     assert_eq!(exceptions_a["items"].as_array().unwrap().len(), 3);
 
