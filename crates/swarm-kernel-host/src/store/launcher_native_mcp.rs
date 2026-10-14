@@ -1568,8 +1568,7 @@ pub(crate) fn revalidate_mcp_launch_snapshot(
     config: &Config,
     snapshot: &NativeMcpLaunchSnapshot,
 ) -> Result<()> {
-    revalidate_mcp_launch_snapshot_for_tools(db, config, snapshot)
-        .map_err(|failure| *failure.error)
+    revalidate_mcp_launch_snapshot_for_tools(db, config, snapshot).map_err(|failure| *failure.error)
 }
 
 pub(super) fn revalidate_mcp_launch_snapshot_for_tools(
