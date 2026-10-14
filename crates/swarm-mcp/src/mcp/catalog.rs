@@ -13,7 +13,7 @@ use rmcp::model::Tool;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 pub(super) use swarm_contracts::mcp_catalog::{
     AuthorizationBasis, AuthorizationRevision, CatalogError, MAX_SEARCH_RESULTS, Surface,
 };
@@ -24,22 +24,27 @@ use swarm_contracts::mcp_catalog::{
     update_field, validate_registry_metadata,
 };
 
-/// Test-only count of full `surface_view` builds (fresh per-request
-/// authorization views, including exact-method searches). Views rebuild every
-/// call by design: rights are never cached across requests. Schema bytes
-/// inside the digests come from the existing immutable factory cache, so
-/// repeated calls rebuild views but never re-serialize schemas.
 #[cfg(test)]
-static SEARCH_FULL_VIEW_BUILDS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Test-only count of full `surface_view` builds (fresh per-request
+    /// authorization views, including exact-method searches). Views rebuild
+    /// every call by design: rights are never cached across requests. Schema
+    /// bytes inside the digests come from the existing immutable factory
+    /// cache, so repeated calls rebuild views but never re-serialize schemas.
+    ///
+    /// Thread-local attribution: each test thread observes only the builds
+    /// it triggers, so parallel `cargo test` threads cannot interleave counts.
+    static SEARCH_FULL_VIEW_BUILDS: Cell<u64> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn reset_search_view_builds() {
-    SEARCH_FULL_VIEW_BUILDS.store(0, Ordering::Relaxed);
+    SEARCH_FULL_VIEW_BUILDS.set(0);
 }
 
 #[cfg(test)]
 pub(crate) fn search_view_builds() -> u64 {
-    SEARCH_FULL_VIEW_BUILDS.load(Ordering::Relaxed)
+    SEARCH_FULL_VIEW_BUILDS.get()
 }
 
 #[derive(Debug)]
@@ -350,7 +355,7 @@ where
     F: FnMut(&str, Option<&str>) -> bool,
 {
     #[cfg(test)]
-    SEARCH_FULL_VIEW_BUILDS.fetch_add(1, Ordering::Relaxed);
+    SEARCH_FULL_VIEW_BUILDS.with(|builds| builds.set(builds.get().wrapping_add(1)));
     validate_registry_metadata()?;
     let mut entries: Vec<_> = TOOL_METADATA
         .iter()
