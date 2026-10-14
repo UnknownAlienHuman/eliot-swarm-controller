@@ -1041,3 +1041,103 @@ async fn script_run_missing_row_cannot_grant_repointed_task_and_caller_replay_su
     );
     f.close().await;
 }
+
+#[tokio::test]
+async fn attempt_release_fresh_request_noop_retains_public_operation_task_scope() {
+    let f = start().await;
+    let store = &f.owner.store;
+    let manager_c_id = format!("operation-read-release-unrelated-{}", model::new_id());
+    let manager_c = register_manager(store, &f.operator, &manager_c_id).await;
+    store
+        .call(
+            f.operator.clone(),
+            "gm.handover".into(),
+            json!({
+                "client_request_id":model::new_id(),
+                "client_id":f.manager_a.client_id,
+            }),
+        )
+        .await
+        .expect("establish a current GM distinct from the Attempt owner");
+
+    let task = create(store, &f.manager_b, "release-noop-receipt").await;
+    let attempt = claim(store, &f.manager_b, &task).await;
+    let attempt_id = attempt["attempt_id"].as_str().unwrap().to_owned();
+    let first_release = call(
+        store,
+        &f.manager_b,
+        "attempt.release",
+        json!({
+            "client_request_id":model::new_id(),
+            "attempt_id":attempt_id,
+            "outcome":"superseded",
+            "reason":"Close this Attempt once, then verify the repeated receipt.",
+            "assignment_closed":true,
+        }),
+    )
+    .await;
+    let repeated_release = call(
+        store,
+        &f.manager_b,
+        "attempt.release",
+        json!({
+            "client_request_id":model::new_id(),
+            "attempt_id":attempt_id,
+            "outcome":"superseded",
+            "reason":"Close this Attempt once, then verify the repeated receipt.",
+            "assignment_closed":true,
+        }),
+    )
+    .await;
+    assert_eq!(repeated_release["changed"], false);
+    assert_eq!(repeated_release["released"], true);
+    assert_eq!(repeated_release["outcome"], "superseded");
+    assert_ne!(
+        first_release["operation_id"],
+        repeated_release["operation_id"]
+    );
+
+    let operation_id = repeated_release["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let current_gm_read = call(
+        store,
+        &f.manager_a,
+        "operation.get",
+        json!({"operation_id":operation_id}),
+    )
+    .await;
+    assert_eq!(current_gm_read["method"], "attempt.release");
+    assert_eq!(current_gm_read["state"], "settled");
+    assert_eq!(current_gm_read["task_id"], task["task_id"]);
+    assert_eq!(current_gm_read["attempt_id"], attempt["attempt_id"]);
+
+    let owner_list = call(store, &f.manager_a, "operation.list", json!({"limit":50})).await;
+    assert!(
+        owner_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["operation_id"].as_str() == Some(operation_id.as_str()) })
+    );
+    let unrelated_read = store
+        .call(
+            manager_c.clone(),
+            "operation.get".into(),
+            json!({"operation_id":operation_id}),
+        )
+        .await
+        .expect_err("an unrelated Manager cannot read the repeated release receipt");
+    assert_eq!(unrelated_read.code, "NOT_FOUND");
+    let unrelated_list = call(store, &manager_c, "operation.list", json!({"limit":50})).await;
+    assert!(
+        !unrelated_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["operation_id"].as_str() == Some(operation_id.as_str()) })
+    );
+
+    f.close().await;
+}
