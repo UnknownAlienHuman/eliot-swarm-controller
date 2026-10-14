@@ -43,8 +43,23 @@ fn unquarantined_launch_damage(db: &Connection) -> Result<bool> {
     })?;
     for row in rows {
         let (operation_id, raw) = row?;
-        if !super::launcher_native_mcp::launch_request_is_quarantined(db, &operation_id, &raw)? {
-            return Ok(true);
+        match super::launcher_native_mcp::launch_request_is_quarantined(db, &operation_id, &raw) {
+            Ok(true) => {}
+            Ok(false) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "AUTOMATION_RECORD_CORRUPT"
+                        | "AUTOMATION_RECORD_INVALID"
+                        | "AUTOMATION_RECORD_VERSION"
+                        | "AUTOMATION_RECORD_TOO_LARGE"
+                        | "AUTOMATION_QUARANTINE_RECORD_CORRUPT"
+                        | "AUTOMATION_QUARANTINE_IDENTITY_CONFLICT"
+                ) =>
+            {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(false)
@@ -58,8 +73,20 @@ fn unquarantined_check_damage(db: &Connection) -> Result<bool> {
     )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     for row in rows {
-        if !super::checks::pending_source_is_quarantined(db, &row?)? {
-            return Ok(true);
+        match super::checks::pending_source_is_quarantined(db, &row?) {
+            Ok(true) => {}
+            Ok(false) => return Ok(true),
+            // INVALID_PARAMS is the exact marker reader's JSON parse error.
+            // Keep these subject failures with Checks; SQLite still propagates.
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "INVALID_PARAMS" | "CHECK_PENDING_QUARANTINE_CORRUPT"
+                ) =>
+            {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(false)
@@ -75,8 +102,23 @@ fn unquarantined_automation_entry_damage(db: &Connection) -> Result<bool> {
     })?;
     for row in rows {
         let (key, raw) = row?;
-        if !super::automation_publication::entry_quarantine_matches(db, &key, &raw)? {
-            return Ok(true);
+        match super::automation_publication::entry_quarantine_matches(db, &key, &raw) {
+            Ok(true) => {}
+            Ok(false) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "AUTOMATION_RECORD_CORRUPT"
+                        | "AUTOMATION_RECORD_INVALID"
+                        | "AUTOMATION_RECORD_VERSION"
+                        | "AUTOMATION_RECORD_TOO_LARGE"
+                        | "AUTOMATION_QUARANTINE_RECORD_CORRUPT"
+                        | "AUTOMATION_QUARANTINE_IDENTITY_CONFLICT"
+                ) =>
+            {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(false)

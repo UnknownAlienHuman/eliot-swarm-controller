@@ -327,4 +327,80 @@ async fn legacy_poison_activation_preserves_real_host_listener_and_exact_quarant
     }
     drop(db);
     child.stop().await;
+
+    // Corrupt only the exact quarantine records in the now-closed Store.
+    // Restart exercises activation, not a direct call to an isolation helper.
+    let mut db = Connection::open(fixture.config.storage.data_dir.join("swarm.db")).unwrap();
+    db.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    let tx = db.transaction().unwrap();
+    for (key, _) in &markers {
+        let raw = if key.starts_with("checks:") {
+            "{damaged-check-marker"
+        } else {
+            "{}"
+        };
+        tx.execute(
+            "UPDATE meta SET value_json=?2 WHERE key=?1",
+            params![key, raw],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    db.pragma_update(None, "ignore_check_constraints", false)
+        .unwrap();
+    drop(db);
+    let damaged_markers = fixture.quarantine();
+    let mut restarted = fixture.start();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            restarted.assert_running();
+            if let Ok(status) = ipc::call(
+                &fixture.config.storage.data_dir,
+                &fixture.credential,
+                "host.status",
+                json!({}),
+                &fixture.config.ipc,
+            )
+            .await
+                && status["host_lifecycle"]["current"]["state"] == "running"
+                && [
+                    ("checks", "INVALID_PARAMS"),
+                    ("launcher", "AUTOMATION_RECORD_VERSION"),
+                    ("automation", "AUTOMATION_RECORD_VERSION"),
+                ]
+                .iter()
+                .all(|(name, code)| {
+                    let worker = &status["host_lifecycle"]["optional_workers"][*name];
+                    worker["consecutive_failures"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0)
+                        && worker["last_failure"]["code"] == *code
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("corrupt subject markers stay with paced optional owners after restart");
+    let admitted = fixture.call("task.create", json!({
+        "client_request_id":model::new_id(), "project_id":"unrelated-marker-damage",
+        "spec":{"objective":"Marker damage stays owner-local","phase":"implementation",
+            "requirements":[{"id":"isolated","statement":"Independent admission survives corrupt quarantine"}]},
+    })).await;
+    assert!(admitted["task_id"].as_str().is_some());
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        restarted.assert_running();
+        assert_eq!(
+            fixture.quarantine(),
+            damaged_markers,
+            "no guessed marker repair"
+        );
+        let status = fixture.call("host.status", json!({})).await;
+        assert_eq!(status["host_lifecycle"]["current"]["state"], "running");
+    }
+    restarted.stop().await;
 }
