@@ -22,6 +22,7 @@ const SCRIPT_ID: &str = "operation_read_relation_script";
 struct Fixture {
     owner: StoreOwner,
     directory: PathBuf,
+    operator: Principal,
     manager_a: Principal,
     manager_b: Principal,
 }
@@ -42,6 +43,7 @@ async fn start() -> Fixture {
     Fixture {
         owner,
         directory,
+        operator,
         manager_a,
         manager_b,
     }
@@ -140,7 +142,7 @@ async fn start_relation_fixture() -> Fixture {
     owner
         .store
         .call(
-            operator,
+            operator.clone(),
             "gm.handover".into(),
             json!({
                 "client_request_id":model::new_id(),
@@ -152,6 +154,7 @@ async fn start_relation_fixture() -> Fixture {
     Fixture {
         owner,
         directory,
+        operator,
         manager_a,
         manager_b,
     }
@@ -899,5 +902,142 @@ async fn malformed_public_operation_relations_fail_closed() {
         .await
         .unwrap_err();
     assert_eq!(damaged_script.code, "OBJECT_SCOPE_DAMAGED");
+    f.close().await;
+}
+
+#[tokio::test]
+async fn script_run_missing_row_cannot_grant_repointed_task_and_caller_replay_survives() {
+    let f = start_relation_fixture().await;
+    let store = &f.owner.store;
+    let manager_c_id = format!("operation-read-damaged-run-target-{}", model::new_id());
+    let manager_c = register_manager(store, &f.operator, &manager_c_id).await;
+    let caller_task = create_relation_task(store, &f.manager_b, SCRIPT_PROJECT, "run-caller").await;
+    let caller_attempt = claim(store, &f.manager_b, &caller_task).await;
+    let target_task = create_relation_task(store, &manager_c, SCRIPT_PROJECT, "run-target").await;
+    let target_attempt = claim(store, &manager_c, &target_task).await;
+
+    call(
+        store,
+        &f.manager_b,
+        "script.register",
+        json!({
+            "client_request_id":model::new_id(),
+            "bundle":relation_script_bundle(),
+        }),
+    )
+    .await;
+    call(
+        store,
+        &f.manager_b,
+        "script.activate",
+        json!({
+            "client_request_id":model::new_id(),
+            "script_id":SCRIPT_ID,
+            "revision":1,
+        }),
+    )
+    .await;
+
+    let queued_request = json!({
+        "client_request_id":format!("script-run-missing-queued-{}", model::new_id()),
+        "script_id":SCRIPT_ID,
+        "expected_script_revision":1,
+        "attempt_id":caller_attempt["attempt_id"],
+        "expected_task_revision":caller_task["revision"],
+        "input":{},
+    });
+    let queued = call(store, &f.manager_b, "script.run", queued_request.clone()).await;
+    let settled_request = json!({
+        "client_request_id":format!("script-run-missing-settled-{}", model::new_id()),
+        "script_id":SCRIPT_ID,
+        "expected_script_revision":1,
+        "attempt_id":caller_attempt["attempt_id"],
+        "expected_task_revision":caller_task["revision"],
+        "input":{},
+    });
+    let settled = call(store, &f.manager_b, "script.run", settled_request).await;
+    assert_ne!(queued["operation_id"], settled["operation_id"]);
+    assert_ne!(queued["run_id"], settled["run_id"]);
+
+    let queued_operation_id = queued["operation_id"].as_str().unwrap().to_owned();
+    let settled_operation_id = settled["operation_id"].as_str().unwrap().to_owned();
+    for operation_id in [&queued_operation_id, &settled_operation_id] {
+        let error = store
+            .call(
+                manager_c.clone(),
+                "operation.get".into(),
+                json!({"operation_id":operation_id}),
+            )
+            .await
+            .expect_err("an unrelated Task owner cannot read the retained ScriptRun");
+        assert_eq!(error.code, "NOT_FOUND");
+    }
+
+    let queued_for_damage = queued_operation_id.clone();
+    let settled_for_damage = settled_operation_id.clone();
+    let target_task_id = target_task["task_id"].as_str().unwrap().to_owned();
+    let target_attempt_id = target_attempt["attempt_id"].as_str().unwrap().to_owned();
+    let settled_at_ms = model::now_ms().unwrap();
+    store
+        .run(move |db| {
+            db.execute(
+                "DELETE FROM script_runs WHERE operation_id=?1",
+                [&queued_for_damage],
+            )?;
+            db.execute(
+                "DELETE FROM script_runs WHERE operation_id=?1",
+                [&settled_for_damage],
+            )?;
+            db.execute(
+                "UPDATE operations SET task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+                params![queued_for_damage, target_task_id, target_attempt_id],
+            )?;
+            db.execute(
+                "UPDATE operations SET state='settled',settled_at_ms=?4,task_id=?2,attempt_id=?3 WHERE operation_id=?1",
+                params![
+                    settled_for_damage,
+                    target_task_id,
+                    target_attempt_id,
+                    settled_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("simulate loss of both retained runs and forged Operation scope");
+
+    for (operation_id, state) in [
+        (&queued_operation_id, "queued"),
+        (&settled_operation_id, "settled"),
+    ] {
+        let error = store
+            .call(
+                manager_c.clone(),
+                "operation.get".into(),
+                json!({"operation_id":operation_id}),
+            )
+            .await
+            .expect_err("missing ScriptRun identity cannot grant Task/Attempt scope");
+        assert_eq!(error.code, "OBJECT_SCOPE_DAMAGED", "{state}: {error:?}");
+
+        let caller_receipt = call(
+            store,
+            &f.manager_b,
+            "operation.get",
+            json!({"operation_id":operation_id}),
+        )
+        .await;
+        assert_eq!(
+            caller_receipt["operation_id"].as_str(),
+            Some(operation_id.as_str())
+        );
+        assert_eq!(caller_receipt["state"], state);
+    }
+
+    assert_eq!(
+        call(store, &f.manager_b, "script.run", queued_request).await,
+        queued,
+        "exact caller replay still reuses its bounded retained receipt"
+    );
     f.close().await;
 }

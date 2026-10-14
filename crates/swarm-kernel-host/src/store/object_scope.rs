@@ -1115,9 +1115,9 @@ fn verify_script_run_operation_identity(db: &Connection, operation: &OperationRo
         )
         .optional()?;
     let Some((task_id, task_revision, attempt_id)) = retained else {
-        // Rejected admissions can retain a caller receipt without creating a
-        // ScriptRun. Their ordinary Operation Task/Attempt relation still applies.
-        return Ok(());
+        return Err(identity_damaged(
+            "script.run Operation has no exact retained ScriptRun",
+        ));
     };
     if operation.task_id != task_id || operation.attempt_id != attempt_id {
         return Err(identity_damaged(
