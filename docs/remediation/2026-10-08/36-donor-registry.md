@@ -94,7 +94,7 @@ The first 18 entries retain additional field evidence in `33-donor-field-reviews
 | D01 | `agentclientprotocol/rust-sdk` | Apache-2.0 | agent protocol | `TAKE` | Typed ACP roles, request/notification distinction, capability negotiation, session wire types | SDK child ownership, unbounded framing assumptions, HTTP transport as ELIOT authority |
 | D02 | `slawlor/ractor` | MIT | actor supervision | `REFERENCE` | Priority control channels and explicit child stop-and-wait semantics | Actor runtime and implicit parent/child authority |
 | D03 | `mongodb/kingfisher` | Apache-2.0 | secret scanner | `SPIKE` | Compiled rule engine and corpus as a bounded evidence producer | Scanner verdict as authorization or network-send permission |
-| D04 | `agentgateway/agentgateway` | Apache-2.0 | policy gateway | `TAKE` | Phase-typed request/response/tool policy and deny-on-policy-construction-failure | Whole gateway or expression failure that silently removes policy |
+| D04 | `agentgateway/agentgateway` | Apache-2.0 | policy gateway | `SPIKE` | Phase-typed request/response/tool policy and deny-on-policy-construction-failure | Whole gateway or expression failure that silently removes policy |
 | D05 | `smart-mcp-proxy/mcpproxy-go` | MIT | tool catalogue | `SPIKE` | Retrieve-then-describe and approved schema snapshot/quarantine | Ranking as authorization; automatic schema acceptance |
 | D06 | `langfuse/langfuse` | MIT core | observability | `REFERENCE` | Optional trace/cost sink | Required correctness store or unbounded synchronous exporter |
 | D07 | `open-telemetry/opentelemetry-rust` | Apache-2.0 | telemetry | `TAKE` | Bounded asynchronous export contracts and standard trace context | Telemetry as durable controller fact |
