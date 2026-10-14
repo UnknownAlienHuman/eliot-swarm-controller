@@ -171,11 +171,11 @@ pub(crate) struct ArtifactReadGrant {
     pub(crate) basis: ArtifactReadBasis,
 }
 
-/// Cached assembly records and proofs are scoped to one live SQLite connection,
-/// its external-write version and the assembled rowid. Same-connection writes
-/// invalidate only watched artifact/source/producer rows through preupdate_hook;
-/// external commits conservatively invalidate through data_version. Mutable
-/// grants are still evaluated on every read against every distinct grant base.
+// Cached assembly records and proofs are scoped to one live SQLite connection,
+// its external-write version and the assembled rowid. Same-connection writes
+// invalidate only watched artifact/source/producer rows through preupdate_hook;
+// external commits conservatively invalidate through data_version. Mutable
+// grants are still evaluated on every read against every distinct grant base.
 
 /// One authorized artifact plus the grant that authorized it, handed downstream
 /// instead of reopening identity from an artifact id.

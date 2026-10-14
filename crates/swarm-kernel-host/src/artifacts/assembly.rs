@@ -255,7 +255,7 @@ fn cached_assembly_parts(
                 total_bytes = total_bytes.saturating_sub(removed.bytes);
             }
             cache.push_back(AssemblyPartCacheEntry {
-                key: cache_key.clone(),
+                key: key.clone(),
                 parts: Arc::clone(&parts),
                 bytes,
             });

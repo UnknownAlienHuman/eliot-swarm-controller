@@ -17,8 +17,7 @@
 use super::super::{SCHEMA, SCRIPT_SCHEMA, WORKSPACE_SCHEMA, set_meta};
 use super::{
     ArtifactReadBasis, ArtifactReadLevel, AssemblyProof, NativeResultSource, OperationReadBasis,
-    OperationReadLevel, TaskGraphIdentity, TaskReadBasis, TaskReadLevel,
-    assembly_source_load_counts, identity_for_attempt, reset_assembly_source_load_counts,
+    OperationReadLevel, TaskGraphIdentity, TaskReadBasis, TaskReadLevel, identity_for_attempt,
     resolve_artifact_read, resolve_assembly_sources, resolve_operation_read, resolve_task_read,
 };
 use crate::{

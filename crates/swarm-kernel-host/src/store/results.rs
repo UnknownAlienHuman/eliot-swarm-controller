@@ -56,31 +56,33 @@ impl AssemblyCacheScope {
 
 fn install_assembly_cache_hook(db: &Connection, scope: &Arc<AssemblyCacheScope>) -> Result<()> {
     let update_scope = Arc::clone(scope);
-    db.preupdate_hook(Some(move |_action, database, table, change| {
-        if database != "main" {
-            return;
-        }
-        let invalidate = |rowid| {
-            let dependency = match table {
-                "artifacts" => AssemblyCacheRow::Artifact(rowid),
-                "operations" => AssemblyCacheRow::Operation(rowid),
-                _ => return,
-            };
-            update_scope.invalidate(dependency);
-        };
-        match change {
-            PreUpdateCase::Insert(new) => invalidate(new.get_new_row_id()),
-            PreUpdateCase::Delete(old) => invalidate(old.get_old_row_id()),
-            PreUpdateCase::Update {
-                old_value_accessor,
-                new_value_accessor,
-            } => {
-                invalidate(old_value_accessor.get_old_row_id());
-                invalidate(new_value_accessor.get_new_row_id());
+    db.preupdate_hook(Some(
+        move |_action, database, table, change: &PreUpdateCase| {
+            if database != "main" {
+                return;
             }
-            PreUpdateCase::Unknown => {}
-        }
-    }))?;
+            let invalidate = |rowid| {
+                let dependency = match table {
+                    "artifacts" => AssemblyCacheRow::Artifact(rowid),
+                    "operations" => AssemblyCacheRow::Operation(rowid),
+                    _ => return,
+                };
+                update_scope.invalidate(dependency);
+            };
+            match change {
+                PreUpdateCase::Insert(new) => invalidate(new.get_new_row_id()),
+                PreUpdateCase::Delete(old) => invalidate(old.get_old_row_id()),
+                PreUpdateCase::Update {
+                    old_value_accessor,
+                    new_value_accessor,
+                } => {
+                    invalidate(old_value_accessor.get_old_row_id());
+                    invalidate(new_value_accessor.get_new_row_id());
+                }
+                PreUpdateCase::Unknown => {}
+            }
+        },
+    ))?;
     scope.hook_installed.store(true, Ordering::Release);
     Ok(())
 }
