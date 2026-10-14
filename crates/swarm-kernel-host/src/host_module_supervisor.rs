@@ -2154,10 +2154,12 @@ mod tests {
         .await
         .expect("persist launch-pending fence before child start");
 
-        let child = spawn_fixture_child(&release, true);
+        let expected_executable =
+            std::env::current_exe().expect("resolve executable rejected by mismatch fixture");
+        let child = spawn_identity_mismatch_fixture_child(&release);
         let pid = child.id().expect("test child has a PID");
         append_launch_record(&launches, pid).await;
-        let capture_error = capture_supervisor_child_identity(&child, &root)
+        let capture_error = capture_supervisor_child_identity(&child, &expected_executable)
             .expect_err("real process capture must reject the wrong expected image");
         assert_eq!(capture_error.code, "MODULE_SUPERVISOR_CHILD_IMAGE_MISMATCH");
         reap_failed_supervisor_child(
@@ -2231,6 +2233,51 @@ mod tests {
         fixture_child_command(release, pipe_stdin)
             .spawn()
             .expect("start real fixture child process")
+    }
+
+    // Use a compact OS helper for the deliberate image mismatch: the process
+    // identity reader hashes the real child image under a fixed size bound, and
+    // the Cargo test harness is not a stable image-size assumption. Identity is
+    // still captured through the production OS readers.
+    fn spawn_identity_mismatch_fixture_child(release: &Path) -> Child {
+        identity_mismatch_fixture_command(release)
+            .spawn()
+            .expect("start compact real child for image-mismatch fixture")
+    }
+
+    #[cfg(windows)]
+    fn identity_mismatch_fixture_command(release: &Path) -> Command {
+        const WAIT_FOR_RELEASE: &str = "while (-not (Test-Path -LiteralPath $env:ELIOT_SWARM_UNKNOWN362_CHILD_RELEASE)) { Start-Sleep -Milliseconds 20 }";
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WAIT_FOR_RELEASE,
+            ])
+            .env(CHILD_RELEASE_ENV, release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        command
+    }
+
+    #[cfg(not(windows))]
+    fn identity_mismatch_fixture_command(release: &Path) -> Command {
+        const WAIT_FOR_RELEASE: &str =
+            "while [ ! -e \"$ELIOT_SWARM_UNKNOWN362_CHILD_RELEASE\" ]; do sleep 0.02; done";
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", WAIT_FOR_RELEASE])
+            .env(CHILD_RELEASE_ENV, release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        command
     }
 
     fn fixture_child_command(release: &Path, pipe_stdin: bool) -> Command {
