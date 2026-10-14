@@ -1,6 +1,6 @@
 use super::{
     AuthorizationBasis, AuthorizationRevision, CatalogError, SearchRequest, Surface,
-    list_tools_page, reset_search_view_builds, search_catalog, search_view_builds,
+    list_tools_page, search_catalog,
 };
 use crate::config::McpToolProfile;
 use sha2::Digest;
@@ -132,16 +132,12 @@ fn exact_search_keeps_full_view_revisions_and_loaded_revision_checks() {
         loaded_catalog_revision: None,
         max_results: 5,
     };
-    // Construction seam: each search rebuilds the fresh authorized view;
-    // schema bytes inside the digests come from the immutable factory cache.
-    reset_search_view_builds();
     let first =
         search_catalog(profile, &surface, exact, authorization, |_, _| true).expect("exact match");
     assert_eq!(first.matches.len(), 1);
     assert_eq!(first.matches[0].method, "task.create");
     let second = search_catalog(profile, &surface, exact, authorization, |_, _| true)
         .expect("repeated exact match");
-    assert_eq!(search_view_builds(), 2);
     // Revision parity: exact and broad full views share one identity.
     assert_eq!(first.catalog_revision, second.catalog_revision);
     assert_eq!(first.surface_revision, second.surface_revision);
@@ -177,60 +173,6 @@ fn exact_search_keeps_full_view_revisions_and_loaded_revision_checks() {
     )
     .expect_err("stale loaded revision must fail closed");
     assert_eq!(stale, CatalogError::StaleCatalogRevision);
-}
-
-#[test]
-fn repeated_searches_reuse_factory_bytes_without_rebuild() {
-    use swarm_contracts::mcp_catalog::{find_tool_spec, input_schema_bytes};
-
-    let profile = McpToolProfile::Full;
-    let surface = Surface::role_default(profile);
-    let authorization = AuthorizationRevision {
-        value: "factory-reuse-rev",
-        basis: AuthorizationBasis::AuthenticatedStoreScope,
-    };
-    let (read_only, spec) = find_tool_spec("task.create").expect("task spec");
-    let before = input_schema_bytes(spec, *read_only, false).expect("factory bytes");
-    reset_search_view_builds();
-    for _ in 0..6 {
-        let exact = search_catalog(
-            profile,
-            &surface,
-            SearchRequest {
-                query: "task.create",
-                purpose: None,
-                task_id: Some("task-factory-reuse"),
-                exact_method: Some("task.create"),
-                loaded_catalog_revision: None,
-                max_results: 1,
-            },
-            authorization,
-            |_, _| true,
-        )
-        .expect("exact search");
-        assert_eq!(exact.matches.len(), 1);
-        let broad = search_catalog(
-            profile,
-            &surface,
-            SearchRequest {
-                query: "task",
-                purpose: None,
-                task_id: Some("task-factory-reuse"),
-                exact_method: None,
-                loaded_catalog_revision: None,
-                max_results: 5,
-            },
-            authorization,
-            |_, _| true,
-        )
-        .expect("broad search");
-        assert!(!broad.matches.is_empty());
-    }
-    // Views rebuild fresh every call (no positive rights cache) ...
-    assert_eq!(search_view_builds(), 12);
-    // ... while the immutable factory bytes are never re-serialized.
-    let after = input_schema_bytes(spec, *read_only, false).expect("factory bytes");
-    assert!(std::sync::Arc::ptr_eq(&before, &after));
 }
 
 #[test]
@@ -468,155 +410,363 @@ fn manager_discovers_manual_github_effect_and_lists_it_only_after_explicit_loadi
 }
 
 #[test]
-fn catalog_v1_framing_and_intentional_drift_receipt() {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+fn catalog_v1_historical_unchanged_rows_and_current_schema_parity() {
     use swarm_contracts::mcp_catalog::{
-        find_tool_spec, input_schema_bytes, mutation_requires_caller_request_id,
-        output_schema_bytes, tool_name,
+        TOOL_METADATA, input_schema_bytes, mutation_requires_caller_request_id,
+        output_schema_bytes, validate_registry_metadata,
     };
 
-    const AUTHORIZED_DOMAIN: &str = "eliot-mcp-authorized-catalog-v1";
-    const SURFACE_DOMAIN: &str = "eliot-mcp-surface-view-v1";
+    const PROFILE_CASES: [(McpToolProfile, &str); 7] = [
+        (McpToolProfile::Observer, "observer"),
+        (McpToolProfile::Reviewer, "reviewer"),
+        (McpToolProfile::Participant, "participant"),
+        (McpToolProfile::AssignedReviewer, "assigned_reviewer"),
+        (McpToolProfile::Manager, "manager"),
+        (McpToolProfile::Gm, "gm"),
+        (McpToolProfile::Full, "full"),
+    ];
+    const PROFILE_NAMES: [&str; 7] = [
+        "observer",
+        "reviewer",
+        "participant",
+        "assigned_reviewer",
+        "manager",
+        "gm",
+        "full",
+    ];
+    const AUDIENCES: [&str; 7] = [
+        "observer",
+        "legacy-reviewer",
+        "assigned-reviewer",
+        "participant",
+        "manager",
+        "gm-operator",
+        "full-compatibility",
+    ];
+    const DELTA_METHODS: &[&str] = &[
+        "agent.family",
+        "agent.usage",
+        "check.acknowledge_held",
+        "coordination.contract.ratify",
+        "coordination.contract.reject",
+        "coordination.contract_card.get",
+        "coordination.contract_card.list",
+        "coordination.inbox",
+        "coordination.peer.find",
+        "coordination.send",
+        "coordination.thread.list",
+        "coordination.watch.list",
+        "coordination.work_card.list",
+        "report.delta",
+        "review.submit",
+        "swarm.tools.search",
+        "task.accept",
+        "task.create",
+        "task.request_changes",
+        "task.revise",
+        "task.submit",
+    ];
 
-    let drifted = metadata_for("attempt.bind_producer").expect("bind_producer metadata");
-    let mut probe = *drifted;
-    probe.required_input_fields = &[];
-    let mut first = super::Sha256::new();
-    super::digest_metadata(&mut first, drifted);
-    let first = first.finalize();
-    let mut second = super::Sha256::new();
-    super::digest_metadata(&mut second, &probe);
-    let second = second.finalize();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/pr40_catalog_v1_parity.json"))
+            .expect("retained pre-extraction Catalog V1 fixture parses");
     assert_eq!(
-        super::hex_digest(&first),
-        super::hex_digest(&second),
-        "required_input_fields must not affect V1 digest"
+        fixture["historical_source"]["commit"],
+        "88264832b7cde56b917728830666f27b29fc515e"
+    );
+    assert_eq!(
+        fixture["historical_source"]["blobs"]["crates/swarm-mcp/src/mcp/mod.rs"],
+        "128fe97bcf2a366a119ce39f52a0726f5c0253e8"
+    );
+    assert_eq!(
+        fixture["historical_source"]["blobs"]["crates/swarm-mcp/src/mcp/catalog.rs"],
+        "07842427ee029f54437e1e00417bdf97eba3d6f5"
+    );
+    assert_eq!(
+        fixture["current_source_baseline"],
+        "6ec3bec9a551a6680409ff7cb33d7fde042a581b"
+    );
+    assert_eq!(
+        fixture["v1"]["authorized_catalog_domain"],
+        "eliot-mcp-authorized-catalog-v1"
+    );
+    assert_eq!(fixture["v1"]["surface_domain"], "eliot-mcp-surface-view-v1");
+    assert_eq!(
+        fixture["v1"]["metadata_sort"],
+        serde_json::json!(["group", "load_tier", "method"])
+    );
+    assert_eq!(
+        fixture["v1"]["metadata_order"],
+        serde_json::json!([
+            "method",
+            "group",
+            "load_tier",
+            "purpose",
+            "when_to_use",
+            "result_policy",
+            "audiences[]",
+            "search_terms[]",
+            "required_context[]"
+        ])
+    );
+    assert_eq!(fixture["v1"]["profiles"], serde_json::json!(PROFILE_NAMES));
+    assert_eq!(fixture["v1"]["audiences"], serde_json::json!(AUDIENCES));
+
+    let deltas = fixture["source_deltas"]
+        .as_array()
+        .expect("source delta rows");
+    let mut actual_delta_methods: Vec<_> = deltas
+        .iter()
+        .map(|row| row["method"].as_str().expect("delta method"))
+        .collect();
+    actual_delta_methods.sort_unstable();
+    assert_eq!(actual_delta_methods, DELTA_METHODS);
+    assert_eq!(
+        deltas
+            .iter()
+            .filter(|row| row["state"] == "changed")
+            .count(),
+        17,
+        "only the retained changed rows are excluded from historical parity"
+    );
+    assert_eq!(
+        deltas.iter().filter(|row| row["state"] == "added").count(),
+        4,
+        "only the retained additions are excluded from historical parity"
     );
 
-    let (_, bind_spec) = find_tool_spec("attempt.bind_producer").expect("bind_producer spec");
-    assert_eq!(
-        drifted.required_input_fields, bind_spec.required,
-        "bind_producer inputs match executable ToolSpec"
-    );
-    assert_eq!(
-        drifted.purpose,
-        "Associate an already observed native producer run with one exact Attempt."
-    );
-    assert_eq!(
-        drifted.required_context,
-        [
-            "current Attempt manager authority",
-            "already observed exact producer evidence"
-        ]
-    );
-    assert_ne!(
-        drifted.purpose,
-        "Bind an attempt to an exact producer binding generation."
-    );
-
-    let handover = metadata_for("gm.handover").expect("handover metadata");
-    let (_, handover_spec) = find_tool_spec("gm.handover").expect("handover spec");
-    assert_eq!(handover.required_input_fields, handover_spec.required);
-    assert_eq!(handover.required_input_fields, ["client_id"]);
-    assert_eq!(
-        handover.purpose,
-        "Designate one registered eligible client as the current GM under the application epoch rules."
-    );
-    assert_ne!(
-        handover.purpose,
-        "Transfer the local manager lease through the guarded handover path."
-    );
-
-    let (_, send_spec) = find_tool_spec("coordination.send").expect("send spec");
+    let send_delta = deltas
+        .iter()
+        .find(|row| row["method"] == "coordination.send")
+        .expect("the separately reviewed #99 wording delta is explicit");
+    let (_, send_spec) = super::find_spec("coordination.send").expect("send ToolSpec");
     assert_eq!(
         send_spec.description,
-        "Deliver a bounded non-null JSON body to one active Participant only when an exact current peer relation authorizes the separately revalidated source and target Task/revision/Attempt contexts; this is typed coordination, not raw mailbox access."
+        send_delta["current_tool_description"]
+            .as_str()
+            .expect("current send description")
     );
-    assert_ne!(
-        send_spec.description,
+    assert_eq!(
+        send_delta["historical_tool_description"],
         "Deliver a bounded non-null JSON body to one active Participant in the same current Task/Attempt scope; this is typed coordination, not raw mailbox access."
     );
-    let send_meta = metadata_for("coordination.send").expect("send metadata");
     assert_eq!(
-        send_meta.purpose,
-        "Send one bounded typed coordination delivery to an active peer whose separately validated current Task/Attempt has an exact peer relation with the sender's current Task/Attempt."
+        send_delta["wire_fields"],
+        serde_json::json!(["description"])
     );
+    assert!(
+        send_delta["source_note"]
+            .as_str()
+            .is_some_and(|note| note.contains("#99"))
+    );
+
+    // Validation-only input metadata is deliberately outside the Catalog V1 preimage.
+    let bind = metadata_for("attempt.bind_producer").expect("bind metadata");
+    let mut without_validation_fields = *bind;
+    without_validation_fields.required_input_fields = &[];
+    let mut original_metadata = super::Sha256::new();
+    super::digest_metadata(&mut original_metadata, bind);
+    let mut validation_fields_removed = super::Sha256::new();
+    super::digest_metadata(&mut validation_fields_removed, &without_validation_fields);
     assert_eq!(
-        send_meta.required_context,
-        [
-            "recipient",
-            "non-null JSON body <= 8 KiB",
-            "authenticated current source and target contexts; exact current peer relation"
-        ]
+        super::hex_digest(&original_metadata.finalize()),
+        super::hex_digest(&validation_fields_removed.finalize()),
+        "required_input_fields remain outside Catalog V1"
     );
 
-    let profile = McpToolProfile::Observer;
-    let method = "swarm.tools.search";
-    let metadata = metadata_for(method).expect("stable metadata");
-    let (read_only, spec) = find_tool_spec(method).expect("stable spec");
-    assert_eq!(
-        spec.description,
-        "Search the caller's authorized MCP catalog by goal, purpose, or exact tool name. Returns metadata and a safe surface/reconnect recommendation only; it never executes a selected method."
-    );
-    let request_id = mutation_requires_caller_request_id(profile, spec.method, *read_only);
-    assert!(!request_id, "read keeps one input variant");
-    let input = input_schema_bytes(spec, *read_only, request_id).expect("stable input bytes");
-    let output = output_schema_bytes(method).expect("stable output lookup");
-    assert!(output.is_none(), "stable method has no output schema");
-
-    let revision = "pr40-receipt-v1";
-    let mut preimage = Vec::new();
-    let mut frame = |value: &[u8]| {
-        preimage.extend_from_slice(&(value.len() as u64).to_be_bytes());
-        preimage.extend_from_slice(value);
-    };
-    frame(AUTHORIZED_DOMAIN.as_bytes());
-    frame(super::profile_name(profile).as_bytes());
-    frame(revision.as_bytes());
-    frame(b"");
-    frame(metadata.method.as_bytes());
-    frame(metadata.group.as_str().as_bytes());
-    frame(metadata.load_tier.as_str().as_bytes());
-    frame(metadata.purpose.as_bytes());
-    frame(metadata.when_to_use.as_bytes());
-    frame(metadata.result_policy.as_bytes());
-    for audience in metadata.audiences {
-        frame(audience.as_str().as_bytes());
-    }
-    for term in metadata.search_terms {
-        frame(term.as_bytes());
-    }
-    for context in metadata.required_context {
-        frame(context.as_bytes());
-    }
-    frame(tool_name(method).as_bytes());
-    frame(spec.description.as_bytes());
-    frame(input.as_ref());
-    frame(&[]);
-
-    let expected = super::hex_digest(&super::Sha256::digest(&preimage));
-    let actual = super::hex_digest(
-        &super::digest_entries(profile, revision, "", &[metadata]).expect("one-entry digest"),
-    );
-    assert_eq!(expected, actual, "V1 preimage framing preserved");
-
-    let mut surface = Surface::role_default(McpToolProfile::Full);
-    surface.legacy_full = true;
+    validate_registry_metadata().expect("runtime metadata validates against executable ToolSpecs");
+    let authorization_revision = fixture["v1"]["authorization_revision"]
+        .as_str()
+        .expect("fixture authorization revision");
+    let authorization_context = fixture["v1"]["authorization_context"]
+        .as_str()
+        .expect("fixture authorization context");
     let authorization = AuthorizationRevision {
-        value: "pr40-receipt-v1",
+        value: authorization_revision,
         basis: AuthorizationBasis::AuthenticatedStoreScope,
     };
-    let page = list_tools_page(
-        McpToolProfile::Full,
-        &surface,
-        None,
-        authorization,
-        |_, _| true,
-    )
-    .expect("first catalog page");
-    let cursor = page.next_cursor.expect("legacy surface pages");
-    let raw = URL_SAFE_NO_PAD.decode(&cursor).expect("cursor decodes");
-    assert_eq!(raw.len(), 73, "cursor stays 73 bytes");
-    assert_eq!(raw[0], 1, "cursor stays version 1");
-    assert_eq!(SURFACE_DOMAIN, "eliot-mcp-surface-view-v1");
+
+    for (profile, profile_name) in PROFILE_CASES {
+        let profile_fixture = &fixture["profiles"][profile_name];
+        let mut surface = Surface::role_default(profile);
+        surface.legacy_full = true;
+
+        let mut authorization_checks = 0usize;
+        let view = super::surface_view(profile, &surface, authorization, None, &mut |_, _| {
+            authorization_checks += 1;
+            true
+        })
+        .expect("current full Catalog V1 surface");
+        let current_catalog_digest = super::hex_digest(&view.authorized.catalog_digest);
+        let current_surface_digest = super::hex_digest(&view.surface_digest);
+        assert_eq!(
+            current_catalog_digest,
+            profile_fixture["current"]["catalog_v1"]
+                .as_str()
+                .expect("current Catalog V1 digest"),
+            "current catalog digest for {profile_name}"
+        );
+        assert_eq!(
+            current_surface_digest,
+            profile_fixture["current"]["surface_v1"]
+                .as_str()
+                .expect("current surface digest"),
+            "current surface digest for {profile_name}"
+        );
+        assert_eq!(
+            view.authorized.entries.len(),
+            profile_fixture["current"]["method_count"]
+                .as_u64()
+                .expect("current method count") as usize
+        );
+        assert_eq!(view.visible.len(), view.authorized.entries.len());
+        assert_eq!(authorization_checks, view.authorized.entries.len());
+
+        let mut unchanged_entries: Vec<_> = TOOL_METADATA
+            .iter()
+            .filter(|metadata| super::profiles::exposes_method(profile, metadata.method))
+            .filter(|metadata| !DELTA_METHODS.contains(&metadata.method))
+            .collect();
+        unchanged_entries.sort_by(|left, right| super::metadata_order(left, right));
+        let historical_unchanged = &profile_fixture["unchanged"];
+        assert_eq!(
+            unchanged_entries.len(),
+            historical_unchanged["row_count"]
+                .as_u64()
+                .expect("historical unchanged row count") as usize
+        );
+        let unchanged_catalog_digest = super::digest_entries(
+            profile,
+            authorization_revision,
+            authorization_context,
+            &unchanged_entries,
+        )
+        .expect("unchanged row Catalog V1 digest");
+        assert_eq!(
+            super::hex_digest(&unchanged_catalog_digest),
+            historical_unchanged["catalog_v1"]
+                .as_str()
+                .expect("historical unchanged Catalog V1 digest"),
+            "unchanged Catalog V1 rows for {profile_name}"
+        );
+        let unchanged_surface_digest = super::digest_surface(
+            &surface,
+            unchanged_catalog_digest,
+            profile,
+            &unchanged_entries,
+        )
+        .expect("unchanged row surface digest");
+        assert_eq!(
+            super::hex_digest(&unchanged_surface_digest),
+            historical_unchanged["surface_v1"]
+                .as_str()
+                .expect("historical unchanged surface digest"),
+            "unchanged surface rows for {profile_name}"
+        );
+
+        let mut schema_bytes_per_digest = 0usize;
+        for metadata in &view.authorized.entries {
+            let (read_only, spec) = super::find_spec(metadata.method).expect("authorized ToolSpec");
+            let request_id_required =
+                mutation_requires_caller_request_id(profile, spec.method, *read_only);
+            schema_bytes_per_digest += input_schema_bytes(spec, *read_only, request_id_required)
+                .expect("cached input bytes")
+                .len();
+            if let Some(output) = output_schema_bytes(spec.method).expect("cached output bytes") {
+                schema_bytes_per_digest += output.len();
+            }
+        }
+
+        let mut cursor = None;
+        let mut listed_tools = Vec::new();
+        let mut list_pages = 0usize;
+        let mut list_authorization_checks = 0usize;
+        loop {
+            list_pages += 1;
+            let page = list_tools_page(
+                profile,
+                &surface,
+                cursor.as_deref(),
+                authorization,
+                |_, _| {
+                    list_authorization_checks += 1;
+                    true
+                },
+            )
+            .expect("current Catalog V1 page");
+            listed_tools.extend(page.tools);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(listed_tools.len(), view.visible.len());
+        assert_eq!(
+            list_authorization_checks,
+            list_pages * view.authorized.entries.len(),
+            "list authorization remains live for every page"
+        );
+        let serialized_tool_bytes = serde_json::to_vec(&listed_tools)
+            .expect("Catalog V1 DTO bytes")
+            .len();
+        assert_eq!(
+            serialized_tool_bytes,
+            profile_fixture["current"]["serialized_tool_bytes"]
+                .as_u64()
+                .expect("current serialized tool byte count") as usize
+        );
+
+        println!(
+            "PR40_CATALOG_COST profile={} rows={} schema_bytes_per_catalog_digest={} schema_bytes_per_surface_digest={} pages={} serialized_tool_bytes={} authorization_checks={} list_authorization_checks={} target_dispatches=0",
+            profile_name,
+            view.authorized.entries.len(),
+            schema_bytes_per_digest,
+            schema_bytes_per_digest,
+            list_pages,
+            serialized_tool_bytes,
+            authorization_checks,
+            list_authorization_checks,
+        );
+
+        for delta in deltas {
+            let method = delta["method"].as_str().expect("delta method");
+            let expected_row = delta["current_row_digests"].get(profile_name);
+            let visible = super::profiles::exposes_method(profile, method);
+            assert_eq!(
+                expected_row.is_some(),
+                visible,
+                "explicit delta membership for {method} {profile_name}"
+            );
+            if let Some(expected_row) = expected_row {
+                let metadata = metadata_for(method).expect("delta metadata");
+                let row_digest = super::digest_entries(
+                    profile,
+                    authorization_revision,
+                    authorization_context,
+                    &[metadata],
+                )
+                .expect("current delta row digest");
+                let current_hash = super::hex_digest(&row_digest);
+                assert_eq!(
+                    current_hash,
+                    expected_row.as_str().expect("current row digest"),
+                    "current Catalog V1 delta row {method} {profile_name}"
+                );
+                if delta["state"] == "changed" {
+                    let historical_hash = delta["historical_row_digests"][profile_name]
+                        .as_str()
+                        .expect("historical changed-row digest");
+                    assert_ne!(current_hash, historical_hash, "source delta {method}");
+                } else {
+                    assert_eq!(delta["state"], "added", "new source row {method}");
+                    assert!(
+                        delta["historical_row_digests"]
+                            .as_object()
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
 }

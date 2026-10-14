@@ -12,8 +12,6 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rmcp::model::Tool;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use std::cell::Cell;
 pub(super) use swarm_contracts::mcp_catalog::{
     AuthorizationBasis, AuthorizationRevision, CatalogError, MAX_SEARCH_RESULTS, Surface,
 };
@@ -23,29 +21,6 @@ use swarm_contracts::mcp_catalog::{
     mutation_requires_caller_request_id, output_schema_bytes, profile_name, role_core, tool_name,
     update_field, validate_registry_metadata,
 };
-
-#[cfg(test)]
-thread_local! {
-    /// Test-only count of full `surface_view` builds (fresh per-request
-    /// authorization views, including exact-method searches). Views rebuild
-    /// every call by design: rights are never cached across requests. Schema
-    /// bytes inside the digests come from the existing immutable factory
-    /// cache, so repeated calls rebuild views but never re-serialize schemas.
-    ///
-    /// Thread-local attribution: each test thread observes only the builds
-    /// it triggers, so parallel `cargo test` threads cannot interleave counts.
-    static SEARCH_FULL_VIEW_BUILDS: Cell<u64> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_search_view_builds() {
-    SEARCH_FULL_VIEW_BUILDS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn search_view_builds() -> u64 {
-    SEARCH_FULL_VIEW_BUILDS.get()
-}
 
 #[derive(Debug)]
 pub struct CatalogPage {
@@ -354,8 +329,6 @@ fn surface_view<F>(
 where
     F: FnMut(&str, Option<&str>) -> bool,
 {
-    #[cfg(test)]
-    SEARCH_FULL_VIEW_BUILDS.with(|builds| builds.set(builds.get().wrapping_add(1)));
     validate_registry_metadata()?;
     let mut entries: Vec<_> = TOOL_METADATA
         .iter()

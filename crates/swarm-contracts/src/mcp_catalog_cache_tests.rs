@@ -122,3 +122,28 @@ fn schema_cache_absent_output_is_retained_and_unknown_lookup_fails_closed() {
     }
     assert_eq!(counts(&spec), [0, 0, 0, 0, 1, 1]);
 }
+#[test]
+fn schema_cache_registry_cold_and_warm_cost_is_bounded_by_static_slots() {
+    validate_registry_metadata().expect("static catalog validates before factory accounting");
+    let mut factory_calls = 0usize;
+    for metadata in TOOL_METADATA {
+        let (read_only, spec) = fresh_spec(metadata.method);
+        let _optional = input_schema_bytes(&spec, read_only, false).expect("optional bytes");
+        let _required = input_schema_bytes(&spec, read_only, true).expect("required bytes");
+        let _output = output_schema_bytes_for_spec(&spec).expect("output bytes");
+        assert_eq!(counts(&spec), [1; 6], "cold slots: {}", metadata.method);
+        factory_calls += counts(&spec).into_iter().sum::<usize>();
+        for _ in 0..8 {
+            let _ = input_schema_bytes(&spec, read_only, false).expect("warm optional");
+            let _ = input_schema_bytes(&spec, read_only, true).expect("warm required");
+            let _ = output_schema_bytes_for_spec(&spec).expect("warm output");
+        }
+        assert_eq!(counts(&spec), [1; 6], "warm slots: {}", metadata.method);
+    }
+    assert_eq!(factory_calls, TOOL_METADATA.len() * 6);
+    println!(
+        "PR40_SCHEMA_FACTORY_COST static_methods={} slots_per_method=6 cold_factory_calls={} warm_factory_calls=0",
+        TOOL_METADATA.len(),
+        factory_calls,
+    );
+}
