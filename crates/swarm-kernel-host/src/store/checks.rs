@@ -312,6 +312,8 @@ impl Store {
         });
         let resolved_context = context_fingerprint.clone();
         let resolved_scope = scope.clone();
+        let cleanup_scope = resolved_scope.clone();
+        let probe_custody = self.check_child_custody.clone();
         let blocking_resolution = probe_resolution.clone();
         let result = self
             .file_io(move |_files| {
@@ -320,6 +322,14 @@ impl Store {
                 let _resolution = blocking_resolution;
                 let (resolved, cleanup_owner) =
                     inputs::resolve_with_cleanup(&profile, &candidate, baseline.as_ref());
+                // Install custody before returning to the cancellable async
+                // caller. A pending owner never lives only in an await result.
+                let install_conflict = if let Some(mut owner) = cleanup_owner {
+                    owner.set_scope(cleanup_scope);
+                    probe_custody.retain_probe_cleanup(owner)
+                } else {
+                    false
+                };
                 let prepared = resolved.and_then(|mut resolved| {
                     if let Some(reason) = baseline_reason {
                         resolved.add_widening_reason(&reason)?;
@@ -334,18 +344,12 @@ impl Store {
                         reproducible: profile.reproducible,
                     })
                 });
-                Ok((prepared, cleanup_owner))
+                Ok((prepared, install_conflict))
             })
             .await;
-        let (prepared, cleanup_owner) = match result {
-            Ok((prepared, owner)) => (prepared, owner),
-            Err(error) => (Err(error), None),
-        };
-        let install_conflict = if let Some(mut owner) = cleanup_owner {
-            owner.set_scope(resolved_scope.clone());
-            self.check_child_custody.retain_probe_cleanup(owner).await
-        } else {
-            false
+        let (prepared, install_conflict) = match result {
+            Ok(result) => result,
+            Err(error) => (Err(error), false),
         };
         if install_conflict {
             return Ok(pending_resolution());
@@ -3425,14 +3429,14 @@ impl CheckChildCustody {
         });
     }
 
-    async fn retain_probe_cleanup(&self, mut owner: ProbeCleanupOwner) -> bool {
-        let _operation = self.probe_cleanup_operation.lock().await;
+    fn retain_probe_cleanup(&self, mut owner: ProbeCleanupOwner) -> bool {
+        let _operation = self.probe_cleanup_operation.blocking_lock();
         owner.poll();
         if !owner.is_pending() {
             return false;
         }
         let scope = owner.scope().cloned();
-        let mut owners = self.probe_cleanup_owners.lock().await;
+        let mut owners = self.probe_cleanup_owners.blocking_lock();
         owners.retain_mut(|retained| {
             retained.poll();
             retained.is_pending()
