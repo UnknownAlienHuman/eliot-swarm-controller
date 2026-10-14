@@ -4425,6 +4425,7 @@ pub(crate) fn capacity_report_with_route_admission(
 /// `capacity_report` restricted to a Manager's accessible Task set.
 /// Both the scope bindings and ledger entries are filtered before counts
 /// and page totals are constructed.
+#[cfg(test)]
 pub(crate) fn capacity_report_for_scope(
     db: &Connection,
     limit: i64,
@@ -4464,7 +4465,11 @@ fn capacity_report_from_items(
     config: Option<&Config>,
 ) -> Result<Value> {
     if let Some(config) = config {
-        for item in &mut items {
+        // Enrich only this requested window before byte limiting. The limiter
+        // sees the complete projected items and preserves any excluded tail.
+        let start = usize::try_from(after).unwrap_or(0).min(items.len());
+        let end = items.len().min(start + usize::try_from(limit).unwrap_or(0));
+        for item in &mut items[start..end] {
             if item.get("gap").is_some() {
                 continue;
             }

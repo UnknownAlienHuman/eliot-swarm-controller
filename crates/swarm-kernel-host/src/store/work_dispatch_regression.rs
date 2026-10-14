@@ -1389,7 +1389,29 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         )
         .await
         .unwrap();
-    assert_eq!(operation["state"], "queued");
+    let diagnostic_id = operation_id.clone();
+    let diagnostic = owner
+        .store
+        .run(move |db| {
+            let raw: String = db.query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [&diagnostic_id],
+                |row| row.get(0),
+            )?;
+            let retained: Value = serde_json::from_str(&raw)?;
+            Ok(json!({
+                "manifest_state":retained["launch_manifest"]["state"],
+                "failure":retained["launch_manifest"]["failure"],
+                "progress":retained["launch_manifest"]["progress"],
+                "route_admission":retained["launch_manifest"]["current_route_admission"],
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        operation["state"], "queued",
+        "checkpoint_error={hard_failure}; retained={diagnostic}"
+    );
     assert_eq!(operation["binding_id"], Value::Null);
     assert_eq!(operation["attempt_id"], Value::Null);
     let tail_id_for_check = tail_id.clone();

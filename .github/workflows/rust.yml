@@ -447,6 +447,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & cargo build --locked --package swarm-supervisor --bin swarm-supervisor --target-dir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --package swarm-script-worker --bin swarm-script-worker --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $workerName = if ($IsWindows) { 'swarm-script-worker.exe' } else { 'swarm-script-worker' }
+          $worker = Join-Path (Join-Path $sharedTargetDir 'debug') $workerName
+          $deps = Join-Path $sharedTargetDir 'debug/deps'
+          [void][IO.Directory]::CreateDirectory($deps)
+          $stagedWorker = Join-Path $deps $workerName
+          [IO.File]::Copy($worker, $stagedWorker, $false)
+          if ((Get-FileHash -LiteralPath $stagedWorker -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $worker -Algorithm SHA256).Hash) {
+            throw 'Staged ScriptWorker differs from the binary built for full qualification.'
+          }
           & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust -TargetDir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Atlas donor snapshot
@@ -797,10 +808,14 @@ jobs:
           } elseif ($env:QUALIFICATION -ceq 'focused-runtime-remainders') {
             foreach ($case in @(
               'provider_route_disabled_short_circuits_root_roster_and_binding_reads',
+              'zero_root_limit_policy_rejects_public_open_with_a_free_roster',
+              'provider_hold_survives_elapsed_retry_until_newer_exact_fact',
               'public_agent_open_is_rejected_at_the_exact_root_limit_before_binding',
               'public_agent_open_rejects_auth_required_with_a_free_root_slot',
               'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace',
+              'manual_launch_final_gate_rejects_new_provider_condition_before_workspace_or_binding',
               'probe_custody_keeps_nested_family_and_capture_until_exact_departure',
+              'real_probe_owner_blocks_only_conflicting_preflight_until_exact_family_departure',
               'execution_paths_for_layout_selects_exact_legacy_and_compact_paths'
             )) {
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
@@ -816,7 +831,21 @@ jobs:
               Invoke-FocusedCohort -Package 'swarm-adapter-claude' -Filter $case -Expected 1 -ExpectedNames @($case)
             }
           } elseif ($env:QUALIFICATION -ceq 'focused-operation') {
+            & cargo build --locked --package swarm-script-worker --bin swarm-script-worker --target-dir $targetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $workerName = if ($IsWindows) { 'swarm-script-worker.exe' } else { 'swarm-script-worker' }
+            $worker = Join-Path (Join-Path $targetDir 'debug') $workerName
+            $deps = Join-Path $targetDir 'debug/deps'
+            [void][IO.Directory]::CreateDirectory($deps)
+            $stagedWorker = Join-Path $deps $workerName
+            [IO.File]::Copy($worker, $stagedWorker, $false)
+            $workerHash = (Get-FileHash -LiteralPath $worker -Algorithm SHA256).Hash
+            if ((Get-FileHash -LiteralPath $stagedWorker -Algorithm SHA256).Hash -cne $workerHash) {
+              throw 'Staged ScriptWorker differs from the binary built at the recorded source.'
+            }
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "ScriptWorker SHA-256: $workerHash"
             foreach ($case in @(
+              'script_run_missing_row_cannot_grant_repointed_task_and_caller_replay_survives',
               'malformed_public_operation_relations_fail_closed',
               'generic_operation_get_list_delta_bound_relations_and_hide_private_decision_text',
               'store_authenticated_operation_lists_and_delta_preserve_bounded_gaps_and_cursor_tail'

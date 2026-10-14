@@ -6,15 +6,24 @@
 //! calls the script worker or launches the configured interpreter.
 
 /// A content-pinned file for Store-only tests that exercise new ScriptRun
-/// admission. These tests do not start the ScriptRun supervisor, so the host
-/// test image is never executed as a worker and this does not qualify the
-/// standalone worker runtime.
+/// admission. CI builds the real ScriptWorker at the recorded source and
+/// stages it beside the test binary. These tests do not start its supervisor,
+/// so a content pin still does not qualify standalone worker execution.
 #[cfg(test)]
 pub(crate) fn store_only_script_executor_pin() -> swarm_script_worker::ExecutorPin {
     static PIN: std::sync::OnceLock<swarm_script_worker::ExecutorPin> = std::sync::OnceLock::new();
     PIN.get_or_init(|| {
-        let executable =
-            std::env::current_exe().expect("resolve test executable for Store fixture");
+        let test_executable = std::env::current_exe().expect("resolve Store fixture test path");
+        let executable = test_executable.with_file_name(if cfg!(windows) {
+            "swarm-script-worker.exe"
+        } else {
+            "swarm-script-worker"
+        });
+        assert!(
+            executable.is_file(),
+            "build the source swarm-script-worker and stage it beside the Store test binary: {}",
+            executable.display()
+        );
         let bytes = std::fs::read(&executable).expect("read exact Store fixture executable bytes");
         let pin = swarm_script_worker::ExecutorPin {
             executable,

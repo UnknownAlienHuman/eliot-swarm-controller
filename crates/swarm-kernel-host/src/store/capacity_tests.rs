@@ -1285,11 +1285,11 @@ fn record_provider_usage_snapshot(
     binding_id: &str,
     route_value: &Value,
     native_scope_key: &str,
-    source_epoch: &str,
-    source_observation_key: &str,
+    source: (&str, &str),
     snapshot: &swarm_contracts::native_usage::NativeUsageSnapshot,
     module_sequence: i64,
 ) -> i64 {
+    let (source_epoch, source_observation_key) = source;
     let native_usage = json!({"boot_id":source_epoch,"snapshot":snapshot});
     let source_observation_id = insert_runtime_state_observation(
         db,
@@ -1358,8 +1358,7 @@ fn provider_hold_survives_elapsed_retry_until_newer_exact_fact() {
         "provider-hold-source",
         &route_value,
         "provider-hold-native-scope",
-        "provider-hold-boot",
-        "provider-hold-usage-v1",
+        ("provider-hold-boot", "provider-hold-usage-v1"),
         &limited,
         1,
     );
@@ -1381,8 +1380,7 @@ fn provider_hold_survives_elapsed_retry_until_newer_exact_fact() {
         "provider-hold-source",
         &route_value,
         "provider-hold-native-scope",
-        "provider-hold-boot",
-        "provider-hold-usage-v2",
+        ("provider-hold-boot", "provider-hold-usage-v2"),
         &available,
         2,
     );
@@ -1427,8 +1425,7 @@ fn public_agent_open_rejects_auth_required_with_a_free_root_slot() {
         "provider-condition-source",
         &route_value,
         "provider-condition-native-scope",
-        "provider-condition-boot",
-        "provider-condition-usage",
+        ("provider-condition-boot", "provider-condition-usage"),
         &snapshot,
         1,
     );
