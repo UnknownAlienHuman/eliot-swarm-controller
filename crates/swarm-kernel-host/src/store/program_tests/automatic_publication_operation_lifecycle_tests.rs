@@ -1523,3 +1523,6 @@ async fn stale_gm_publication_is_skipped_when_consumer_resumes() {
 
     close_fixture(fixture).await;
 }
+
+#[path = "pr60_automation_reconcile_isolation.rs"]
+mod pr60_automation_reconcile_isolation;
