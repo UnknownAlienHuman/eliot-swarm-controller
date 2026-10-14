@@ -3979,60 +3979,6 @@ fn task_dependency_relation(source: &ScopeData, target: &ScopeData) -> Option<Va
         })
 }
 
-fn current_scope_contract_cards(db: &Connection, scope: &ScopeData) -> Result<Vec<Value>> {
-    let Some(client_id) = scope.client_id.as_deref() else {
-        return Ok(Vec::new());
-    };
-    let prefix = format!("{}contract:", keys::card_prefix(&scope.scope_id));
-    let upper = format!("{prefix}g");
-    let mut statement = db.prepare("SELECT key FROM meta WHERE key>=?1 AND key<?2 ORDER BY key")?;
-    let card_keys: Vec<String> = statement
-        .query_map(params![prefix, upper], |row| row.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    let mut cards = Vec::new();
-    for key in card_keys {
-        let suffix = key.strip_prefix(&prefix).ok_or_else(|| {
-            Error::new(
-                "COORDINATION_INDEX_CORRUPT",
-                "current contract card key is outside its exact scope prefix",
-            )
-        })?;
-        let mut parts = suffix.split(':');
-        let identity = parts
-            .next()
-            .and_then(decode_index_component)
-            .ok_or_else(|| {
-                Error::new(
-                    "COORDINATION_INDEX_CORRUPT",
-                    "current contract card key has a malformed identity",
-                )
-            })?;
-        let indexed_client_id = parts
-            .next()
-            .and_then(decode_index_component)
-            .ok_or_else(|| {
-                Error::new(
-                    "COORDINATION_INDEX_CORRUPT",
-                    "current contract card key has a malformed client ID",
-                )
-            })?;
-        if parts.next().is_some()
-            || keys::card_key(&scope.scope_id, "contract", &identity, &indexed_client_id) != key
-        {
-            return Err(Error::new(
-                "COORDINATION_INDEX_CORRUPT",
-                "current contract card key is malformed",
-            ));
-        }
-        if indexed_client_id == client_id
-            && let Some(card) = current_scope_contract_card(db, scope, &identity)?
-        {
-            cards.push(card);
-        }
-    }
-    Ok(cards)
-}
-
 fn card_relation_ref(card: &Value) -> Value {
     json!({
         "client_id":card["client_id"],
@@ -4095,15 +4041,59 @@ fn shared_card_relation(
         ));
     }
 
-    for source_card in current_scope_contract_cards(db, source)? {
-        let Some(contract_key) = source_card["identity"].as_str() else {
-            continue;
-        };
-        let Some(target_card) = current_scope_contract_card(db, target, contract_key)? else {
+    let (Some(source_client), Some(target_client)) =
+        (source.client_id.as_deref(), target.client_id.as_deref())
+    else {
+        return Ok(None);
+    };
+    let source_prefix = format!("{}contract:", keys::card_prefix(&source.scope_id));
+    let source_upper = format!("{source_prefix}g");
+    let source_suffix = format!(":{}", keys::key_component(source_client));
+    let target_prefix = format!("{}contract:", keys::card_prefix(&target.scope_id));
+    let target_suffix = format!(":{}", keys::key_component(target_client));
+    // Intersect exact actor keys before loading any card bodies. Stream the
+    // matching identities instead of allocating every card in the source
+    // scope. These keys are candidates only; both bodies are revalidated below.
+    let mut statement = db.prepare(
+        "SELECT source.key FROM meta AS source JOIN meta AS target \
+         ON target.key=?4 || substr(source.key,length(?1)+1, \
+             length(source.key)-length(?1)-length(?3)) || ?5 \
+         WHERE source.key>=?1 AND source.key<?2 \
+           AND substr(source.key,-length(?3))=?3 ORDER BY source.key",
+    )?;
+    let candidates = statement.query_map(
+        params![
+            source_prefix,
+            source_upper,
+            source_suffix,
+            target_prefix,
+            target_suffix
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    for candidate in candidates {
+        let key = candidate?;
+        let contract_key = key
+            .strip_prefix(&source_prefix)
+            .and_then(|suffix| suffix.strip_suffix(&source_suffix))
+            .and_then(decode_index_component)
+            .filter(|identity| {
+                keys::card_key(&source.scope_id, "contract", identity, source_client) == key
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    "COORDINATION_INDEX_CORRUPT",
+                    "shared contract candidate key is malformed",
+                )
+            })?;
+        let (Some(source_card), Some(target_card)) = (
+            current_scope_contract_card(db, source, &contract_key)?,
+            current_scope_contract_card(db, target, &contract_key)?,
+        ) else {
             continue;
         };
         if let Some(relation) =
-            current_contract_card_relation(&source_card, &target_card, contract_key)
+            current_contract_card_relation(&source_card, &target_card, &contract_key)
         {
             return Ok(Some(relation));
         }
