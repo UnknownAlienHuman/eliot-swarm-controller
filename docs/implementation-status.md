@@ -2,7 +2,7 @@
 
 ## Current state
 
-### Issue #99 coordination index coverage — source change, unverified
+### Issue #99 cross-Task coordination and index coverage — 2026-10-14
 
 The existing host watch reconciler now advances a versioned coordination
 directory migration in 64-row pages. It rebuilds missing active participant
@@ -12,8 +12,26 @@ revision. Discovery, card lists, consult and cell freshness report partial or
 unknown coverage until the scan finishes without anomalies; integration sync
 does not build a cell from an incomplete member page. New grant and card writes
 continue to maintain their derived indexes. This adds no authority source and
-does not change ACK checks, immutable v1 messages or v2 target contexts. The
-source and fixture changes have not been compiled or tested.
+does not change ACK checks, immutable v1 messages or v2 target contexts.
+
+Discovery, consult, delivery and integration now share exact current peer
+relations while validating each participant against its own Task revision,
+Attempt, actor and grant. Versioned v2 deliveries retain distinct source and
+target contexts; v1 history keeps its original interpretation. Cells retain
+all affected Task tuples and participation bases, and acknowledgements use
+the canonical authenticated endpoint context. Public projections redact
+private participation-basis details.
+
+At source candidate `4f167b5`, Windows strict warnings-denied Clippy passed
+for all `swarm-kernel-host` targets. One focused nextest cohort passed five
+cases covering cross-Task delivery and agreement, stale cells, changed
+participation bases and the 40-item completeness boundary. Three migration
+cases were observed passing earlier, but their complete raw output was not
+retained; only result fragments remain with the operator. The integrated
+production and fixture files match that candidate byte for byte. This is
+scoped Store qualification, not a complete relation-kind, Linux unit or live
+native qualification. The remaining negative/relation matrix is still under
+review; Issue #99 remains open until its acceptance is reconciled.
 
 ### Gates and docs alignment -- 2026-10-14 (this candidate, unqualified)
 
