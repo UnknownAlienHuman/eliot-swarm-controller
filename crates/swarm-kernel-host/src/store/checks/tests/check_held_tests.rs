@@ -604,3 +604,75 @@ async fn reopen_held_never_relaunches() {
     reopened.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test]
+async fn held_audit_resumes_past_bounded_head_to_changed_tail() {
+    let fixture = fixture().await;
+    let operator = fixture.principal.clone();
+    let mut held_ids = Vec::new();
+    for index in 0..17 {
+        let admitted = admit_held(
+            &fixture,
+            &format!("held-audit-prefix-{index}"),
+            b"held audit prefix source",
+        )
+        .await;
+        let check_id = admitted["check_id"].as_str().unwrap().to_owned();
+        mark_sending(&fixture.owner.store, &check_id).await;
+        damage_spec_json(&fixture.owner.store, &check_id).await;
+        held_ids.push(check_id);
+    }
+    for _ in 0..3 {
+        let selected = pending_page(&fixture.owner.store, fixture.directory.clone())
+            .await
+            .unwrap();
+        assert!(
+            selected.is_empty(),
+            "all damaged subjects quarantine without Work"
+        );
+    }
+    held_ids.sort();
+    let head_id = held_ids.first().unwrap().clone();
+    let tail_id = held_ids.last().unwrap().clone();
+    damage_profile_shape(&fixture.owner.store, &tail_id).await;
+    let tail_read = fixture
+        .owner
+        .store
+        .call(
+            operator.clone(),
+            "check.get".to_owned(),
+            json!({"check_id": &tail_id}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        tail_read.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
+    );
+    let head_read = read_check(&fixture.owner.store, &operator, &head_id).await;
+    assert_eq!(head_read["reconciliation"]["held"], json!(true));
+    assert_eq!(head_read["reconciliation"]["acknowledged"], json!(false));
+    assert_eq!(head_read["custody"], json!("unknown"));
+    assert_eq!(head_read["resource_released"], Value::Null);
+    assert!(head_read.get("profile_id").is_none());
+    let mut saw_conflict = false;
+    for _ in 0..5 {
+        match pending_page(&fixture.owner.store, fixture.directory.clone()).await {
+            Ok(work) => {
+                assert!(work.is_empty(), "held rows never re-enter the active page");
+            }
+            Err(conflict) => {
+                assert_eq!(
+                    conflict.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
+                );
+                saw_conflict = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_conflict,
+        "changed tail beyond the first 16 must eventually hard-fail"
+    );
+    fixture.owner.close().await.unwrap();
+    std::fs::remove_dir_all(fixture.directory).unwrap();
+}

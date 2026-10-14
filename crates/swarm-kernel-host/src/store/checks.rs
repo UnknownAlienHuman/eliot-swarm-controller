@@ -2261,6 +2261,7 @@ const PENDING_QUARANTINE_PREFIX: &str = "checks:pending:v1:quarantine:";
 const PENDING_QUARANTINE_SCHEMA: u32 = 1;
 const PENDING_CYCLE_KEY: &str = "checks:pending:v1:cycle";
 const PENDING_CYCLE_SCHEMA: u32 = 1;
+const HELD_AUDIT_CURSOR_KEY: &str = "checks:held_audit:v1:cursor";
 const MAX_PENDING_SUFFIX: usize = 12;
 const MAX_PENDING_WRAP: usize = 4;
 const PENDING_SUBJECT_SAVEPOINT: &str = "checks_pending_subject";
@@ -2769,35 +2770,86 @@ fn read_pending_quarantine(
     Ok(Some(record))
 }
 
-/// Check a bounded prefix of indexed held rows for stale lineage before the
-/// selector excludes them. This preserves the existing hard conflict for a
-/// changed source without returning unchanged quarantines to the active page
-/// or scanning an unbounded cycle.
+/// Bounded resumable audit of indexed held rows before the selector excludes
+/// them. Each call validates at most MAX_PENDING_PAGE rows after the retained
+/// audit cursor, wrapping to the lexical head only when the suffix is empty.
+/// The cursor advances to the last actually validated row, so a 17+ held
+/// prefix with an unchanged head eventually examines the changed tail and
+/// hard-fails, without ever scanning a full cycle in one call. Quarantine
+/// evidence itself is never rewritten; an empty held set stays read-only.
+fn read_held_audit_cursor(db: &Connection) -> Result<Option<String>> {
+    let Some(value) = meta(db, HELD_AUDIT_CURSOR_KEY)? else {
+        return Ok(None);
+    };
+    let Some(cursor) = value.as_str() else {
+        return Err(Error::new(
+            "CHECK_HELD_AUDIT_CURSOR_CORRUPT",
+            "held audit cursor is not a subject key",
+        ));
+    };
+    if !valid_pending_text(cursor) || cursor.len() > 512 {
+        return Err(Error::new(
+            "CHECK_HELD_AUDIT_CURSOR_CORRUPT",
+            "held audit cursor identity is invalid",
+        ));
+    };
+    if !valid_pending_cursor_id(cursor) {
+        return Err(Error::new(
+            "CHECK_HELD_AUDIT_CURSOR_CORRUPT",
+            "held audit cursor is not a canonical CheckRun ordering identity",
+        ));
+    };
+    Ok(Some(cursor.to_owned()))
+}
 fn validate_bounded_held_quarantines(tx: &Transaction<'_>) -> Result<()> {
+    let cursor = read_held_audit_cursor(tx)?;
     let mut statement = tx.prepare(
-        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?1",
+        "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) AND (?1 IS NULL OR c.check_id>?1) ORDER BY c.check_id LIMIT ?2",
     )?;
-    let check_ids = statement
-        .query_map(params![MAX_PENDING_PAGE as i64], |row| {
+    let mut batch = statement
+        .query_map(params![cursor.as_deref(), MAX_PENDING_PAGE as i64], |row| {
             row.get::<_, String>(0)
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    for check_id in check_ids {
-        let identity = read_subject_identity(tx, &check_id)?;
-        let quarantine = read_pending_quarantine(tx, &check_id, &identity)?.ok_or_else(|| {
+    if batch.is_empty() && cursor.is_some() {
+        let mut wrap = tx.prepare(
+            "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) ORDER BY c.check_id LIMIT ?1",
+        )?;
+        batch = wrap
+            .query_map(params![MAX_PENDING_PAGE as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(wrap);
+        if batch.is_empty() {
+            tx.execute("DELETE FROM meta WHERE key=?1", [HELD_AUDIT_CURSOR_KEY])?;
+            return Ok(());
+        }
+    }
+    if batch.is_empty() {
+        return Ok(());
+    }
+    for check_id in &batch {
+        let identity = read_subject_identity(tx, check_id)?;
+        let quarantine = read_pending_quarantine(tx, check_id, &identity)?.ok_or_else(|| {
             Error::new(
                 "CHECK_HELD_RECORD_CORRUPT",
                 "held inventory record has no retained quarantine evidence",
             )
         })?;
-        let held = load_held_record(tx, &check_id)?.ok_or_else(|| {
+        let held = load_held_record(tx, check_id)?.ok_or_else(|| {
             Error::new(
                 "CHECK_HELD_RECORD_CORRUPT",
                 "held inventory record disappeared during validation",
             )
         })?;
         validate_held_matches_quarantine(&held, &quarantine)?;
+    }
+    if let Some(last) = batch.last() {
+        if cursor.as_deref() != Some(last.as_str()) {
+            set_meta(tx, HELD_AUDIT_CURSOR_KEY, &json!(last))?;
+        }
     }
     Ok(())
 }
