@@ -8,7 +8,7 @@
 | Protocol basis | Official vendor docs: `https://antigravity.google/docs/cli/headless/` (AG-HEADLESS) and `https://antigravity.google/docs/subagents/` (AG-CHILDREN), accessed 2026-09-29 by the repo audit and re-read 2026-10-02 for this artifact |
 | Vendor SDK | None exists for this entrypoint; the bridge depends on Node builtins only (`package.json` has no dependencies) |
 | Native binary | The owner's installed `agy` executable, named explicitly in the local module config; the bridge installs and pins no binary |
-| Installed-version evidence | None: runtime matrix records `installed_runtime_verified: false`; the docs' "installed 1.1.27" note from the old research map is explicitly unverified |
+| Installed-version evidence | On 2026-10-14, the PATH-resolved `C:\Users\kleym\AppData\Local\agy\bin\agy.exe --version` returned `1.3.3` (SHA-256 `FBBFB3F15C7628252C5E12765683C688BA05EE122B853CADEB0BBFD4E13CA25B`). This identifies the executable only; the runtime matrix remains `installed_runtime_verified: false`, and bridge.3 warm-stream/live behavior remains unqualified. |
 | Bridge artifact | `antigravity-cli-warm-bridge.3` (committed; bounded fixtures; installed/live unqualified; new binding required) |
 | Executor version reporting | `null` — the native stream reports no version and no version readback is documented for this entrypoint |
 
