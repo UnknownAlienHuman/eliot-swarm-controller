@@ -57,7 +57,10 @@ impl AssemblyCacheScope {
 fn install_assembly_cache_hook(db: &Connection, scope: &Arc<AssemblyCacheScope>) -> Result<()> {
     let update_scope = Arc::clone(scope);
     db.preupdate_hook(Some(
-        move |_action, database, table, change: &PreUpdateCase| {
+        move |_action: rusqlite::hooks::Action,
+              database: &str,
+              table: &str,
+              change: &PreUpdateCase| {
             if database != "main" {
                 return;
             }
