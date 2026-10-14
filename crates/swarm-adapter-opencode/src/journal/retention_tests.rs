@@ -2,6 +2,7 @@ use super::*;
 use serde_json::json;
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -80,6 +81,61 @@ fn write_acknowledged_reply(journal: &Journal, operation_id: &str, resolved: Opt
                 .join(format!("outcome-{}.json", operation_key(operation_id))),
         )
         .unwrap();
+}
+
+fn write_legacy_acknowledged_reply(journal: &Journal, operation_id: &str) {
+    let intent = fixture_intent(operation_id, "agent.reply");
+    let outcome = json!({
+        "operation_id":operation_id,
+        "outcome":"applied",
+        "native_scope_key":NATIVE_SCOPE,
+        "details":{}
+    });
+    let outcome_sha256 = digest_json(&outcome).unwrap();
+    let records = [
+        JournalRecord {
+            version: 2,
+            operation_id: operation_id.to_owned(),
+            kind: "intent".to_owned(),
+            intent: Some(intent),
+            outcome: None,
+            outcome_sha256: None,
+            result_params: None,
+            result_sha256: None,
+        },
+        JournalRecord {
+            version: 2,
+            operation_id: operation_id.to_owned(),
+            kind: "outcome".to_owned(),
+            intent: None,
+            outcome: Some(outcome),
+            outcome_sha256: Some(outcome_sha256.clone()),
+            result_params: None,
+            result_sha256: None,
+        },
+        JournalRecord {
+            version: 2,
+            operation_id: operation_id.to_owned(),
+            kind: "acknowledged".to_owned(),
+            intent: None,
+            outcome: None,
+            outcome_sha256: Some(outcome_sha256),
+            result_params: None,
+            result_sha256: None,
+        },
+    ];
+    let mut bytes = Vec::new();
+    for record in records {
+        bytes.extend(serde_json::to_vec(&record).unwrap());
+        bytes.push(b'\n');
+    }
+    fs::write(
+        journal
+            .operations
+            .join(format!("{}.jsonl", operation_key(operation_id))),
+        bytes,
+    )
+    .unwrap();
 }
 
 fn write_acknowledged_reply_with_root(journal: &Journal, operation_id: &str, root_id: &str) {
@@ -190,9 +246,12 @@ fn retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_tar
     let second = reopened
         .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
         .unwrap();
-    assert_eq!(second.examined, 35 - first.namespace_removed);
+    assert_eq!(second.examined, 34 - first.namespace_removed);
     assert_eq!(second.namespace_removed, 34 - first.namespace_removed);
-    assert!(!second.queue_drained);
+    assert!(
+        second.queue_drained,
+        "the referenced reconcile target remains indexed but is not a reclaim candidate"
+    );
     assert_eq!(first.namespace_removed + second.namespace_removed, 34);
 
     for operation_id in safe_ids {
@@ -288,6 +347,163 @@ fn retention_keeps_unknown_removal_across_empty_pass_and_reopen() {
 }
 
 #[test]
+fn opencode_root_checkpoint_is_durable_before_source_delete_crash_boundary() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let operation_id = "retention-checkpoint-before-delete";
+    let root_id = expected_root_id(BINDING_ID, GENERATION);
+    write_acknowledged_reply_with_root(&journal, operation_id, &root_id);
+    journal.recover_outbox().unwrap();
+    let path = operation_path(&root.0, operation_id);
+    let original = fs::read(&path).unwrap();
+
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::retention::reclaim_acknowledged_with_test_hook(
+            &journal,
+            BINDING_ID,
+            GENERATION,
+            NATIVE_SCOPE,
+            |candidate| {
+                assert_eq!(candidate, path.as_path());
+                let checkpoint = fs::read(root.0.join("native-checkpoints.jsonl"))?;
+                assert!(
+                    String::from_utf8_lossy(&checkpoint).contains(&root_id),
+                    "checkpoint readback precedes the simulated process crash"
+                );
+                panic!("simulated crash after durable root checkpoint")
+            },
+            |_| panic!("source removal must not run before the crash boundary"),
+        )
+    }));
+    assert!(crashed.is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    drop(journal);
+
+    let reopened =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    assert_eq!(
+        reopened
+            .native_root_checkpoint_for_hello(BINDING_ID, GENERATION, NATIVE_SCOPE)
+            .unwrap()
+            .as_deref(),
+        Some(root_id.as_str())
+    );
+    let history = reopened.load(operation_id).unwrap();
+    assert_eq!(history.acknowledged_sha256, history.outcome_sha256);
+    assert!(!history.native_replay_permitted());
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn opencode_cursor_publication_failure_keeps_acknowledged_source_before_delete() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let operation_id = "retention-cursor-publication-failure";
+    let root_id = expected_root_id(BINDING_ID, GENERATION);
+    write_acknowledged_reply_with_root(&journal, operation_id, &root_id);
+    journal.recover_outbox().unwrap();
+    let path = operation_path(&root.0, operation_id);
+    let original = fs::read(&path).unwrap();
+    let cursor = root.0.join("retention-cursor.json");
+
+    let error = super::retention::reclaim_acknowledged_with_test_hook(
+        &journal,
+        BINDING_ID,
+        GENERATION,
+        NATIVE_SCOPE,
+        |_| {
+            let checkpoint = fs::read(root.0.join("native-checkpoints.jsonl"))?;
+            assert!(String::from_utf8_lossy(&checkpoint).contains(&root_id));
+            fs::remove_file(&cursor)?;
+            fs::create_dir(&cursor)?;
+            Ok(())
+        },
+        |_| panic!("cursor failure must prevent the source delete"),
+    )
+    .unwrap_err();
+
+    assert_eq!(fs::read(&path).unwrap(), original);
+    let history = journal.load(operation_id).unwrap();
+    assert_eq!(history.acknowledged_sha256, history.outcome_sha256);
+    assert!(!history.native_replay_permitted());
+    assert_eq!(error.code, "ADAPTER_STATE");
+}
+
+#[test]
+fn opencode_journal_change_between_classification_and_delete_is_retained() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let operation_id = "retention-change-before-delete";
+    let root_id = expected_root_id(BINDING_ID, GENERATION);
+    write_acknowledged_reply_with_root(&journal, operation_id, &root_id);
+    journal.recover_outbox().unwrap();
+    let path = operation_path(&root.0, operation_id);
+    let original = fs::read(&path).unwrap();
+    let mutation = b"changed-after-classification\n";
+
+    let error = super::retention::reclaim_acknowledged_with_test_hook(
+        &journal,
+        BINDING_ID,
+        GENERATION,
+        NATIVE_SCOPE,
+        |candidate| {
+            assert_eq!(candidate, path.as_path());
+            fs::write(candidate, mutation)?;
+            Ok(())
+        },
+        |_| panic!("digest mismatch must prevent the shared removal primitive"),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, "ADAPTER_JOURNAL");
+    assert!(path.exists(), "changed custody bytes must stay present");
+    assert_eq!(fs::read(&path).unwrap(), mutation);
+    assert_ne!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn opencode_cleanup_failure_preserves_store_ack_and_never_authorizes_replay() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let operation_id = "retention-cleanup-failure-no-replay";
+    let root_id = expected_root_id(BINDING_ID, GENERATION);
+    write_acknowledged_reply_with_root(&journal, operation_id, &root_id);
+    journal.recover_outbox().unwrap();
+    let path = operation_path(&root.0, operation_id);
+    let original = fs::read(&path).unwrap();
+    let outbox = root
+        .0
+        .join("outbox")
+        .join(format!("outcome-{}.json", operation_key(operation_id)));
+
+    let error = super::retention::reclaim_acknowledged_with_remover(
+        &journal,
+        BINDING_ID,
+        GENERATION,
+        NATIVE_SCOPE,
+        |_| {
+            Err(Error::new(
+                "INJECTED_REMOVE_FAILURE",
+                "simulated cleanup boundary failure",
+            ))
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, "INJECTED_REMOVE_FAILURE");
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!outbox.exists());
+    let history = journal.load(operation_id).unwrap();
+    assert_eq!(history.acknowledged_sha256, history.outcome_sha256);
+    assert!(history.outcome.is_some());
+    assert!(!history.native_replay_permitted());
+}
+
+#[test]
 fn retention_legacy_or_corrupt_cursor_never_means_confirmed_removal() {
     let legacy_cursor = serde_json::to_vec(&json!({
         "version":1,
@@ -353,6 +569,52 @@ fn retention_legacy_or_corrupt_cursor_never_means_confirmed_removal() {
             .unwrap()
             .removal_durability_unknown_for_test()
     );
+}
+
+#[test]
+fn retention_v3_complete_cursor_migrates_to_versioned_sparse_startup_barrier() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    assert!(journal.recover_outbox().unwrap().is_empty());
+    assert!(journal.startup_recovery_complete());
+    drop(journal);
+
+    let cursor_path = root.0.join("retention-cursor.json");
+    let mut cursor: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cursor_path).unwrap()).unwrap();
+    assert_eq!(cursor["version"].as_u64(), Some(4));
+    cursor["version"] = json!(3);
+    cursor
+        .as_object_mut()
+        .unwrap()
+        .remove("legacy_migration_version");
+    fs::write(&cursor_path, serde_json::to_vec(&cursor).unwrap()).unwrap();
+
+    let reopened =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    assert!(reopened.startup_inventory_required().unwrap());
+    assert_eq!(
+        reopened
+            .retention
+            .lock()
+            .unwrap()
+            .legacy_migration_version_for_test(),
+        0
+    );
+    let before = reopened.startup_scan_counts();
+    assert!(reopened.recover_outbox().unwrap().is_empty());
+    let after = reopened.startup_scan_counts();
+    assert_eq!(after.operations_listed - before.operations_listed, 0);
+    assert_eq!(
+        reopened
+            .retention
+            .lock()
+            .unwrap()
+            .legacy_migration_version_for_test(),
+        1
+    );
+    assert!(reopened.startup_recovery_complete());
 }
 
 /// Startup recovery stays bounded on a large acknowledged history with a
@@ -504,7 +766,8 @@ fn startup_recovery_bounds_large_history_and_resumes_sparse_tail() {
     assert!(!root.0.join("startup-cursor.json").exists());
     let cursor_bytes = fs::read(root.0.join("retention-cursor.json")).unwrap();
     let cursor: serde_json::Value = serde_json::from_slice(&cursor_bytes).unwrap();
-    assert_eq!(cursor["version"].as_u64(), Some(3));
+    assert_eq!(cursor["version"].as_u64(), Some(4));
+    assert_eq!(cursor["legacy_migration_version"].as_u64(), Some(1));
 }
 
 /// Cold legacy inventory is prepared off the service loop; body classification
@@ -516,13 +779,25 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
     let journal =
         Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
 
-    for index in 0..64 {
-        write_acknowledged_reply(&journal, &format!("cold-legacy-{index:03}"), None);
+    for index in 0..256 {
+        write_legacy_acknowledged_reply(&journal, &format!("cold-legacy-{index:03}"));
     }
     let unresolved_id = "cold-legacy-unresolved";
     journal
         .write_intent(&fixture_intent(unresolved_id, "agent.reply"))
         .unwrap();
+    let torn_id = "cold-legacy-torn-tail";
+    journal
+        .write_intent(&fixture_intent(torn_id, "agent.reply"))
+        .unwrap();
+    let torn_path = operation_path(&root.0, torn_id);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&torn_path)
+        .unwrap()
+        .write_all(b"{")
+        .unwrap();
+    let torn_bytes = fs::read(&torn_path).unwrap();
     let address_dir = root.0.join(retention::ADDRESS_CHECKPOINT_DIR);
     for entry in fs::read_dir(&address_dir).unwrap() {
         fs::remove_file(entry.unwrap().path()).unwrap();
@@ -547,11 +822,12 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
     // Preparing all names reads metadata only. The service can poll while
     // this work runs; a body window remains capped at 32 entries.
     journal.prepare_startup_inventory().unwrap();
-    assert_eq!(journal.startup_scan_counts().operations_listed, 65);
+    assert_eq!(journal.startup_scan_counts().operations_listed, 258);
     assert_eq!(journal.startup_scan_counts().operation_bodies_parsed, 0);
     let first = journal.recover_outbox().unwrap();
     assert!(first.len() <= 32);
     assert_eq!(journal.startup_scan_counts().operation_bodies_parsed, 32);
+    assert_eq!(journal.startup_scan_counts().operations_listed, 258);
     let saved_cursor = journal
         .retention
         .lock()
@@ -595,29 +871,111 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
         cursor_before_append
     );
 
-    let first_after_append = journal.recover_outbox().unwrap();
-    assert!(first_after_append.len() <= 32);
-    let second_after_append = journal.recover_outbox().unwrap();
-    assert!(second_after_append.len() <= 32);
-    let final_after_append = journal.recover_outbox().unwrap();
-    assert!(final_after_append.len() <= 32);
+    for _ in 0..16 {
+        let before = journal.startup_scan_counts();
+        let recovered = journal.recover_outbox().unwrap();
+        let after = journal.startup_scan_counts();
+        assert!(recovered.len() <= 32);
+        assert!(after.operation_bodies_parsed - before.operation_bodies_parsed <= 32);
+        assert_eq!(
+            after.operations_listed - before.operations_listed,
+            0,
+            "one in-process migration reuses its single sorted pathname snapshot"
+        );
+        if journal.startup_recovery_complete() {
+            break;
+        }
+    }
     assert!(
         journal.startup_recovery_complete(),
         "recovery remains incomplete: scan={:?}, cursor={:?}",
         journal.startup_scan_counts(),
         journal.retention.lock().unwrap().startup_cursor_for_test()
     );
-    assert!(
-        first_after_append
-            .iter()
-            .chain(&second_after_append)
-            .chain(&final_after_append)
-            .any(|state| state.operation_id.as_deref() == Some(appended_id))
+    assert_eq!(
+        journal
+            .retention
+            .lock()
+            .unwrap()
+            .legacy_migration_version_for_test(),
+        0,
+        "bounded inventory alone cannot publish the steady-startup barrier"
+    );
+    assert_eq!(
+        journal
+            .load(appended_id)
+            .unwrap()
+            .intent
+            .as_ref()
+            .map(|intent| intent.operation_id.as_str()),
+        Some(appended_id)
     );
     let appended = journal.load(appended_id).unwrap();
     assert!(appended.recovery_unknown());
     assert!(!appended.native_replay_permitted());
     assert!(operation_path(&root.0, appended_id).exists());
+    let torn = journal.load(torn_id).unwrap();
+    assert!(torn.torn_tail_evidence.is_some());
+    assert!(!torn.native_replay_permitted());
+    assert_eq!(fs::read(&torn_path).unwrap(), torn_bytes);
+
+    // The compatibility scan is a versioned barrier: old safe candidates
+    // drain before v1 is published; after it, restart opens only exact sparse
+    // address IDs and does not enumerate the legacy pathname inventory.
+    for _ in 0..16 {
+        let summary = journal
+            .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
+            .unwrap();
+        if summary.queue_drained
+            && journal
+                .retention
+                .lock()
+                .unwrap()
+                .legacy_migration_version_for_test()
+                == 1
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        journal
+            .retention
+            .lock()
+            .unwrap()
+            .legacy_migration_version_for_test(),
+        1
+    );
+    for index in 0..256 {
+        assert!(!operation_path(&root.0, &format!("cold-legacy-{index:03}")).exists());
+    }
+    drop(journal);
+
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    assert!(!journal.startup_inventory_required().unwrap());
+    let before_steady = journal.startup_scan_counts();
+    let sparse = journal.recover_outbox().unwrap();
+    let after_steady = journal.startup_scan_counts();
+    assert!(journal.startup_recovery_complete());
+    assert_eq!(sparse.len(), 3);
+    assert_eq!(
+        after_steady.operations_listed - before_steady.operations_listed,
+        0
+    );
+    assert_eq!(
+        after_steady.operation_bodies_parsed - before_steady.operation_bodies_parsed,
+        3,
+        "steady restart parses only unresolved, damaged, and appended exact operation IDs"
+    );
+    assert!(
+        !journal
+            .load(unresolved_id)
+            .unwrap()
+            .native_replay_permitted()
+    );
+    assert!(!journal.load(torn_id).unwrap().native_replay_permitted());
+    assert_eq!(fs::read(&torn_path).unwrap(), torn_bytes);
+    assert!(!journal.load(appended_id).unwrap().native_replay_permitted());
 }
 
 /// Steady state after convergence and drain: reopening reads only the

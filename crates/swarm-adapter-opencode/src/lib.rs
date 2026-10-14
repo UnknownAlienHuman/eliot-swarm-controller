@@ -180,10 +180,15 @@ mod startup_poll_tests {
         let (send, receive) = tokio::sync::oneshot::channel();
         let mut module_next = Box::pin(async move { receive.await.unwrap() });
 
-        assert!(matches!(
-            wait_for_module_next_or_recovery(module_next.as_mut(), &mut recovery_tick, true).await,
-            StartupPoll::RecoveryTick
-        ));
+        // A large legacy census can require many bounded windows. Keep the
+        // same module.next future selectable through every recovery tick.
+        for _ in 0..32 {
+            assert!(matches!(
+                wait_for_module_next_or_recovery(module_next.as_mut(), &mut recovery_tick, true)
+                    .await,
+                StartupPoll::RecoveryTick
+            ));
+        }
         assert!(send.send("agent.reconcile").is_ok());
 
         let response = tokio::time::timeout(Duration::from_secs(1), async {

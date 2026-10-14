@@ -3479,6 +3479,77 @@ mod recovery_tests {
     }
 
     #[test]
+    fn claude_current_boot_dispatch_compacts_before_delete_and_reads_anchor_directly() {
+        let root =
+            std::env::temp_dir().join(format!("swarm-claude-boot-anchor-{}", uuid::Uuid::new_v4()));
+        let boot_id = "boot-compact-anchor-current";
+        let operation_id = "dispatch-last-releasable-journal";
+        let receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+            "schema_version":1,"module_id":"eliot.claude",
+            "artifact":{"artifact_id":crate::ARTIFACT_ID,"version":crate::ARTIFACT_VERSION},
+            "protocol":{"major":1,"minor":0},"binding_id":"binding-boot-anchor",
+            "binding_generation":1,"operation_id":operation_id,"input_sha256":"f".repeat(64)
+        }))
+        .unwrap();
+        receipt.validate().unwrap();
+        let intent = json!({
+            "bridge_boot_id":boot_id,
+            "native":{"native_scope_key":"fixture-scope","native_root_id":"root-current"}
+        });
+        let outcome = json!({
+            "operation_id":operation_id,"outcome":"applied",
+            "details":{"completion_condition":"completed"}
+        });
+        let open = || {
+            OperationJournal::open(
+                &root,
+                "binding-boot-anchor",
+                1,
+                "fixture-scope",
+                &"f".repeat(64),
+            )
+            .unwrap()
+        };
+
+        let journal = open();
+        journal
+            .write_intent(operation_id, &receipt, "task.dispatch", &intent)
+            .unwrap();
+        journal.save_outcome_value(operation_id, &outcome).unwrap();
+        journal.acknowledge(operation_id, &outcome).unwrap();
+
+        let operation_path = journal.path(operation_id).unwrap();
+        assert!(
+            !operation_path.exists(),
+            "the releasable journal is deleted"
+        );
+        let compacted = journal.get(operation_id).unwrap().unwrap();
+        assert!(compacted.compacted);
+        assert_eq!(compacted.acknowledged_sha256, compacted.outcome_sha256);
+        let marker_path = journal.boot_marker_path(boot_id);
+        let marker = journal.read_boot_marker(&marker_path).unwrap();
+        assert_eq!(marker.bridge_boot_id, boot_id);
+        assert_eq!(marker.operation_id, operation_id);
+        assert_eq!(marker.acknowledged_sha256, marker.outcome_sha256);
+        assert!(journal.has_task_dispatch_for_boot(boot_id).unwrap());
+        drop(journal);
+
+        let reopened = open();
+        assert!(
+            !reopened.startup_recovery_complete().unwrap(),
+            "the boot anchor remains readable before legacy recovery completes"
+        );
+        assert!(reopened.has_task_dispatch_for_boot(boot_id).unwrap());
+        let compacted_after_restart = reopened.get(operation_id).unwrap().unwrap();
+        assert!(compacted_after_restart.compacted);
+        assert!(!compacted_after_restart.native_replay_permitted());
+        assert!(!operation_path.exists());
+
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pending_outcomes_discards_torn_suffix_without_ack_then_advances_past_corruption() {
         let root = std::env::temp_dir().join(format!(
             "swarm-claude-torn-ack-recovery-{}",

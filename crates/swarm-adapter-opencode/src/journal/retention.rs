@@ -20,7 +20,8 @@ use swarm_process::{RemovalDurability, RemovalOutcome, remove_private_acknowledg
 
 const MAX_RETENTION_STEPS: usize = 32;
 const RETENTION_CURSOR_FILE: &str = "retention-cursor.json";
-const RETENTION_CURSOR_VERSION: u32 = 3;
+const RETENTION_CURSOR_VERSION: u32 = 4;
+const LEGACY_MIGRATION_VERSION: u32 = 1;
 pub(super) const ADDRESS_CHECKPOINT_DIR: &str = "native-checkpoint-addresses";
 pub(super) const ADDRESS_MEMO_VERSION: u32 = 1;
 const ADDRESS_MEMO_LIMIT: usize = HISTORY_LIMIT * 4;
@@ -54,6 +55,11 @@ struct RetentionCursor {
     /// The address memos have passed one complete legacy convergence.
     #[serde(default)]
     startup_complete: bool,
+    /// Versioned compatibility barrier. Version 1 means the pre-address-memo
+    /// journal inventory was classified and every releasable candidate was
+    /// reclaimed; after that, startup reads only the durable sparse closure.
+    #[serde(default)]
+    legacy_migration_version: u32,
 }
 
 #[derive(Default)]
@@ -65,6 +71,7 @@ struct LoadedRetentionCursor {
     address_digest: String,
     legacy_reclamation_pending: bool,
     startup_complete: bool,
+    legacy_migration_version: u32,
 }
 
 /// Address-only metadata for one operation that is unresolved, referenced,
@@ -146,6 +153,7 @@ pub(super) struct RetentionIndex {
     /// Distinguishes the completed legacy census on this handle from a fresh
     /// handle that still needs to rebuild its volatile reclamation queue.
     legacy_scan_complete_this_handle: bool,
+    legacy_migration_version: u32,
     startup_complete: bool,
 }
 
@@ -194,6 +202,7 @@ impl RetentionIndex {
             steady_seen: BTreeSet::new(),
             legacy_reclamation_pending: saved.legacy_reclamation_pending,
             legacy_scan_complete_this_handle: false,
+            legacy_migration_version: saved.legacy_migration_version,
             startup_complete,
         }
     }
@@ -202,6 +211,19 @@ impl RetentionIndex {
         // A caller may request another bounded window while a legacy scan or
         // steady sparse pass is in progress. Preserve its accumulated index.
         if self.ready && self.scan_incomplete {
+            return;
+        }
+        // Once this handle has crossed the legacy migration barrier, retain
+        // its already-classified reclamation queue across service polls. A
+        // fresh directory census is needed only after a process restart, when
+        // this volatile queue is genuinely absent.
+        if self.ready
+            && self.startup_complete
+            && (self.legacy_migration_version >= LEGACY_MIGRATION_VERSION
+                || self.legacy_scan_complete_this_handle)
+        {
+            self.ready = false;
+            self.steady_seen.clear();
             return;
         }
         self.entries.clear();
@@ -342,6 +364,7 @@ impl RetentionIndex {
             address_digest: digest_hex(&self.address_digest),
             legacy_reclamation_pending: self.legacy_reclamation_pending,
             startup_complete: self.startup_complete,
+            legacy_migration_version: self.legacy_migration_version,
         }
     }
 
@@ -483,6 +506,10 @@ impl RetentionIndex {
     pub(super) fn startup_cursor_for_test(&self) -> Option<&str> {
         self.startup_cursor.as_deref()
     }
+    #[cfg(test)]
+    pub(super) fn legacy_migration_version_for_test(&self) -> u32 {
+        self.legacy_migration_version
+    }
 }
 
 fn read_cursor(path: &Path, identity: &StateIdentity) -> LoadedRetentionCursor {
@@ -524,8 +551,9 @@ fn read_cursor(path: &Path, identity: &StateIdentity) -> LoadedRetentionCursor {
             address_digest: String::new(),
             legacy_reclamation_pending: true,
             startup_complete: false,
+            legacy_migration_version: 0,
         },
-        (RETENTION_CURSOR_VERSION, Some(removal_durability_unknown)) => LoadedRetentionCursor {
+        (3, Some(removal_durability_unknown)) => LoadedRetentionCursor {
             cursor: saved.cursor,
             removal_durability_unknown,
             startup_cursor: saved.startup_cursor.filter(|key| valid_operation_key(key)),
@@ -535,7 +563,30 @@ fn read_cursor(path: &Path, identity: &StateIdentity) -> LoadedRetentionCursor {
             startup_complete: saved.startup_complete
                 && saved.unresolved_keys.is_empty()
                 && valid_digest(&saved.address_digest),
+            // V3's backlog bit ignored candidates already represented by an
+            // address memo, so it cannot prove the sparse-startup barrier.
+            // Reclassify once and drain releasable history before publishing
+            // the explicit v4 migration version.
+            legacy_migration_version: 0,
         },
+        (RETENTION_CURSOR_VERSION, Some(removal_durability_unknown))
+            if saved.legacy_migration_version <= LEGACY_MIGRATION_VERSION
+                && (saved.legacy_migration_version == 0
+                    || (saved.startup_complete && !saved.legacy_reclamation_pending)) =>
+        {
+            LoadedRetentionCursor {
+                cursor: saved.cursor,
+                removal_durability_unknown,
+                startup_cursor: saved.startup_cursor.filter(|key| valid_operation_key(key)),
+                address_count: saved.address_count,
+                address_digest: saved.address_digest.clone(),
+                legacy_reclamation_pending: saved.legacy_reclamation_pending,
+                startup_complete: saved.startup_complete
+                    && saved.unresolved_keys.is_empty()
+                    && valid_digest(&saved.address_digest),
+                legacy_migration_version: saved.legacy_migration_version,
+            }
+        }
         // An existing malformed, incomplete, or future cursor must never be
         // interpreted as a clean durability disposition.
         _ => untrusted_cursor(),
@@ -551,6 +602,7 @@ fn untrusted_cursor() -> LoadedRetentionCursor {
         address_digest: String::new(),
         legacy_reclamation_pending: true,
         startup_complete: false,
+        legacy_migration_version: 0,
     }
 }
 
@@ -702,13 +754,13 @@ pub(super) fn finish_recovery(journal: &Journal) -> Result<()> {
 /// Selection is cyclic after the persisted position and skips already
 /// registered keys, so repeated bounded calls partition the listing with
 /// no overlap and the pending tail resumes across restarts.
-pub(super) fn startup_window(
-    journal: &Journal,
-    names: &[String],
-    budget: usize,
-) -> Result<Vec<String>> {
+pub(super) fn startup_window(journal: &Journal, budget: usize) -> Result<(Vec<String>, usize)> {
     let index = lock_index(journal)?;
-    Ok(select_startup_window(&index, names, budget))
+    let names = index.startup_names.as_deref().unwrap_or_default();
+    Ok((
+        select_startup_window(&index, names, budget),
+        index.startup_invalid_names,
+    ))
 }
 
 pub(super) fn remember_startup_names(
@@ -732,12 +784,9 @@ pub(super) fn remember_startup_names(
     Ok(())
 }
 
-pub(super) fn cached_startup_names(journal: &Journal) -> Result<Option<(Vec<String>, usize)>> {
+pub(super) fn has_cached_startup_names(journal: &Journal) -> Result<bool> {
     let index = lock_index(journal)?;
-    Ok(index
-        .startup_names
-        .clone()
-        .map(|names| (names, index.startup_invalid_names)))
+    Ok(index.startup_names.is_some())
 }
 
 pub(super) fn mark_startup_classified(journal: &Journal, key: &str) -> Result<()> {
@@ -759,15 +808,9 @@ fn select_startup_window(index: &RetentionIndex, names: &[String], budget: usize
         .collect()
 }
 
-pub(super) fn scan_covered(journal: &Journal, names: &[String]) -> Result<bool> {
+pub(super) fn scan_covered(journal: &Journal) -> Result<bool> {
     let index = lock_index(journal)?;
-    Ok(names.iter().all(|name| {
-        index
-            .startup_cursor
-            .as_deref()
-            .is_some_and(|cursor| name.as_str() <= cursor)
-            || index.classified_names.contains(name)
-    }))
+    Ok(index.classified_names.len() == index.startup_names.as_ref().map_or(0, Vec::len))
 }
 
 pub(super) fn store_startup_progress(
@@ -793,10 +836,7 @@ pub(super) fn store_startup_progress(
         snapshot_attention(&mut index);
         persist_attention_memos(&mut index)?;
         index.startup_complete = true;
-        index.legacy_reclamation_pending = index
-            .queue
-            .iter()
-            .any(|key| !index.durable_unresolved.contains(key));
+        index.legacy_reclamation_pending = !index.queue.is_empty();
         if legacy {
             index.startup_names = None;
             index.classified_names.clear();
@@ -814,6 +854,12 @@ pub(super) fn store_startup_progress(
                 .iter()
                 .all(|key| index.steady_seen.contains(key));
         }
+        index.legacy_migration_version =
+            if !index.legacy_reclamation_pending && !index.scan_incomplete {
+                LEGACY_MIGRATION_VERSION
+            } else {
+                0
+            };
     } else {
         index.scan_incomplete = true;
     }
@@ -886,14 +932,16 @@ pub(super) fn legacy_reclamation_pending(journal: &Journal) -> Result<bool> {
     Ok(lock_index(journal)?.legacy_reclamation_pending)
 }
 
-pub(super) fn legacy_scan_complete_this_handle(journal: &Journal) -> Result<bool> {
-    Ok(lock_index(journal)?.legacy_scan_complete_this_handle)
-}
-
 pub(super) fn startup_inventory_required(journal: &Journal) -> Result<bool> {
     let index = lock_index(journal)?;
     Ok(!index.startup_complete
-        || (index.legacy_reclamation_pending && !index.legacy_scan_complete_this_handle))
+        || ((index.legacy_migration_version < LEGACY_MIGRATION_VERSION
+            || index.legacy_reclamation_pending)
+            && !index.legacy_scan_complete_this_handle))
+}
+
+pub(super) fn legacy_migration_version(journal: &Journal) -> Result<u32> {
+    Ok(lock_index(journal)?.legacy_migration_version)
 }
 
 pub(super) fn steady_window_keys(journal: &Journal, budget: usize) -> Result<Vec<String>> {
@@ -1025,8 +1073,10 @@ fn extend_startup_scan(journal: &Journal, index: &mut RetentionIndex, budget: us
         index.startup_cursor = None;
         index.classified_names.clear();
     }
-    let names = index.startup_names.clone().unwrap_or_default();
-    let window = select_startup_window(index, &names, budget);
+    let window = {
+        let names = index.startup_names.as_deref().unwrap_or_default();
+        select_startup_window(index, names, budget)
+    };
     for name in &window {
         index.classified_names.insert(name.clone());
         let path = journal.operations.join(format!("{name}.jsonl"));
@@ -1086,6 +1136,7 @@ fn extend_startup_scan(journal: &Journal, index: &mut RetentionIndex, budget: us
             Ok(retained) => {
                 journal.check_native_root_identity(&retained)?;
                 index.register(retained);
+                index.steady_seen.insert(name.clone());
             }
             Err(_) => index.references_unknown = true,
         }
@@ -1094,10 +1145,8 @@ fn extend_startup_scan(journal: &Journal, index: &mut RetentionIndex, budget: us
         }
         index.startup_cursor = Some(name.clone());
     }
-    if names
-        .iter()
-        .all(|name| index.classified_names.contains(name))
-    {
+    let inventory_len = index.startup_names.as_ref().map_or(0, Vec::len);
+    if index.classified_names.len() == inventory_len {
         if index.references_unknown {
             index.scan_incomplete = true;
             index.persist_cursor()?;
@@ -1109,11 +1158,18 @@ fn extend_startup_scan(journal: &Journal, index: &mut RetentionIndex, budget: us
         snapshot_attention(index);
         persist_attention_memos(index)?;
         index.startup_complete = true;
-        index.legacy_reclamation_pending = index
-            .queue
+        index.legacy_reclamation_pending = !index.queue.is_empty();
+        index.scan_incomplete = index
+            .durable_unresolved
             .iter()
-            .any(|key| !index.durable_unresolved.contains(key));
-        index.scan_incomplete = false;
+            .any(|key| !index.steady_seen.contains(key));
+        index.legacy_migration_version =
+            if !index.legacy_reclamation_pending && !index.scan_incomplete {
+                LEGACY_MIGRATION_VERSION
+            } else {
+                0
+            };
+        index.legacy_scan_complete_this_handle = true;
         index.startup_names = None;
         index.classified_names.clear();
     } else {
@@ -1143,6 +1199,36 @@ pub(super) fn reclaim_acknowledged_with_remover(
     binding_id: &str,
     generation: i64,
     scope: &str,
+    remove: impl Fn(&Path) -> Result<RemovalOutcome>,
+) -> Result<RetentionSummary> {
+    reclaim_acknowledged_with_hooks(journal, binding_id, generation, scope, |_| Ok(()), remove)
+}
+
+#[cfg(test)]
+pub(super) fn reclaim_acknowledged_with_test_hook(
+    journal: &Journal,
+    binding_id: &str,
+    generation: i64,
+    scope: &str,
+    before_remove: impl FnMut(&Path) -> Result<()>,
+    remove: impl Fn(&Path) -> Result<RemovalOutcome>,
+) -> Result<RetentionSummary> {
+    reclaim_acknowledged_with_hooks(
+        journal,
+        binding_id,
+        generation,
+        scope,
+        before_remove,
+        remove,
+    )
+}
+
+fn reclaim_acknowledged_with_hooks(
+    journal: &Journal,
+    binding_id: &str,
+    generation: i64,
+    scope: &str,
+    mut before_remove: impl FnMut(&Path) -> Result<()>,
     remove: impl Fn(&Path) -> Result<RemovalOutcome>,
 ) -> Result<RetentionSummary> {
     if binding_id != journal.identity.binding_id
@@ -1241,6 +1327,7 @@ pub(super) fn reclaim_acknowledged_with_remover(
             generation,
             scope,
         )?;
+        before_remove(&operation.path)?;
         let current_bytes = read_limited(&operation.path, HISTORY_LIMIT)?;
         if format!("{:x}", sha2::Sha256::digest(current_bytes.as_slice()))
             != operation.observed_sha256
@@ -1294,10 +1381,16 @@ pub(super) fn reclaim_acknowledged_with_remover(
     }
     summary.queue_drained = index.queue.is_empty();
     summary.durability_unknown = index.removal_durability_unknown;
-    index.legacy_reclamation_pending = index
-        .queue
-        .iter()
-        .any(|key| !index.durable_unresolved.contains(key));
+    index.legacy_reclamation_pending = !index.queue.is_empty();
+    index.legacy_migration_version = if index.startup_complete
+        && !index.scan_incomplete
+        && !index.legacy_reclamation_pending
+        && !index.references_unknown
+    {
+        LEGACY_MIGRATION_VERSION
+    } else {
+        0
+    };
     index.persist_cursor()?;
     Ok(summary)
 }

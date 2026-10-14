@@ -807,6 +807,7 @@ impl Journal {
     /// after hello, so discovering old names cannot delay the handshake.
     pub fn recover_outbox_before_hello(&self) -> Result<Vec<OperationRecoveryState>> {
         if !retention::durable_startup_complete(self)?
+            || retention::legacy_migration_version(self)? < 1
             || retention::legacy_reclamation_pending(self)?
         {
             return Ok(Vec::new());
@@ -818,13 +819,10 @@ impl Journal {
     /// Owned startup runs this on a blocking worker so a cold directory cannot
     /// hold the module service loop before or between `module.next` polls.
     pub fn prepare_startup_inventory(&self) -> Result<()> {
-        if retention::durable_startup_complete(self)?
-            && (!retention::legacy_reclamation_pending(self)?
-                || retention::legacy_scan_complete_this_handle(self)?)
-        {
+        if !retention::startup_inventory_required(self)? {
             return Ok(());
         }
-        if retention::cached_startup_names(self)?.is_some() {
+        if retention::has_cached_startup_names(self)? {
             return Ok(());
         }
         let (names, invalid) = self.list_operation_names()?;
@@ -908,33 +906,26 @@ impl Journal {
         // no directory enumeration once one legacy convergence completed.
         // The windowed listing below runs solely while converging history.
         let window: Vec<String>;
-        let mut legacy_names: Option<Vec<String>> = None;
-        if retention::durable_startup_complete(self)?
-            && (!retention::legacy_reclamation_pending(self)?
-                || retention::legacy_scan_complete_this_handle(self)?)
-        {
+        let mut legacy_inventory = false;
+        if !retention::startup_inventory_required(self)? {
             window = self.steady_recovery_window()?;
         } else {
-            let cached = retention::cached_startup_names(self)?;
-            let (names, invalid) = if let Some((names, invalid)) = cached {
-                (names, invalid)
-            } else {
+            if !retention::has_cached_startup_names(self)? {
                 let (names, invalid) = self.list_operation_names()?;
                 self.scan_listed
                     .fetch_add(names.len() as u64 + invalid as u64, Ordering::Relaxed);
-                retention::remember_startup_names(self, names.clone(), invalid)?;
-                (names, invalid)
-            };
+                retention::remember_startup_names(self, names, invalid)?;
+            }
+            let (selected, invalid) = retention::startup_window(self, MAX_STARTUP_SCAN_ENTRIES)?;
             if invalid > 0 {
                 retention::mark_damaged(self)?;
             }
-            let selected = retention::startup_window(self, &names, MAX_STARTUP_SCAN_ENTRIES)?;
-            legacy_names = Some(names);
+            legacy_inventory = true;
             window = selected;
         }
         for name in &window {
             let name = name.as_str();
-            if legacy_names.is_some() {
+            if legacy_inventory {
                 retention::mark_startup_classified(self, name)?;
             }
             let path = self.operations.join(format!("{name}.jsonl"));
@@ -1004,7 +995,7 @@ impl Journal {
                     // full scan that steady state never performs.
                     self.check_native_root_identity(&operation)?;
                     retention::register_operation(self, operation)?;
-                    if legacy_names.is_some() {
+                    if legacy_inventory {
                         retention::mark_steady_visited(self, name)?;
                     }
                 }
@@ -1130,10 +1121,10 @@ impl Journal {
                 self.scan_unresolved.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if let Some(names) = legacy_names {
+        if legacy_inventory {
             // One durable cursor write per bounded pass, not per file: a crash
             // with an older position only revisits checked entries.
-            let covered = retention::scan_covered(self, &names)?;
+            let covered = retention::scan_covered(self)?;
             retention::store_startup_progress(
                 self,
                 if covered {
