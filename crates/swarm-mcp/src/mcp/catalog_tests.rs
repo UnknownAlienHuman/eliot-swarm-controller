@@ -469,7 +469,7 @@ fn manager_discovers_manual_github_effect_and_lists_it_only_after_explicit_loadi
 
 #[test]
 fn catalog_v1_framing_and_intentional_drift_receipt() {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use swarm_contracts::mcp_catalog::{
         find_tool_spec, input_schema_bytes, mutation_requires_caller_request_id,
         output_schema_bytes, tool_name,
