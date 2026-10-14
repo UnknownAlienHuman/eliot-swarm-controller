@@ -8,7 +8,7 @@
 use super::{
     Store,
     automation_reconcile::{QuarantineEvidence, persist_quarantine, quarantine_record_key},
-    meta,
+    meta, set_meta,
 };
 use crate::{
     config::{Config, McpConfig, McpToolProfile, OpenCodeRouteKind, opencode_route_kind},
@@ -29,6 +29,7 @@ const INITIAL_RETRY_MS: i64 = 15_000;
 const MAX_RETRY_MS: i64 = 300_000;
 const SUCCESS_REFRESH_MS: i64 = 300_000;
 const MAX_PRIVATE_PROFILE_BYTES: usize = 65_536;
+const LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY: &str = "launcher:native_mcp:corrupt_sweep:v1:cursor";
 type BindingRouteFacts = (String, String, Option<String>, Option<i64>, String);
 
 struct LaunchSnapshot {
@@ -866,18 +867,19 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
         let mut statement = tx.prepare(
             "SELECT operation_id FROM operations \
              WHERE method='swarm.launch' AND state='queued' \
-               AND json_valid(effective_request_json) \
-               AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
-               AND ( \
-                 json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.state') IS NULL \
-                 OR (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state') \
-                       IN ('retry_wait','observed_partial') \
-                     AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms')<=?1) \
-                 OR (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
-                     AND (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.started_at_ms')<=?2 \
-                          OR (json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.module_operation_id')='text' \
-                              AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms')<=?1))) \
-               ) \
+               AND CASE WHEN json_valid(effective_request_json) THEN \
+                 json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
+                 AND ( \
+                   json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.state') IS NULL \
+                   OR (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state') \
+                         IN ('retry_wait','observed_partial') \
+                       AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms')<=?1) \
+                   OR (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
+                       AND (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.started_at_ms')<=?2 \
+                            OR (json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.module_operation_id')='text' \
+                                AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms')<=?1))) \
+                 ) \
+                 ELSE 0 END \
              ORDER BY updated_at_ms,operation_id LIMIT ?3",
         )?;
         statement
@@ -1661,17 +1663,19 @@ fn retry_delay_ms(attempts: i64) -> i64 {
 
 fn next_retry_at(db: &Connection, now: i64) -> Result<Option<i64>> {
     let next: Option<i64> = db.query_row(
-        "SELECT min(CASE \
-           WHEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
-             AND json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.module_operation_id')='text' \
-             THEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms') \
-           WHEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
-             THEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.started_at_ms')+?1 \
-           ELSE json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms') \
+        "SELECT min(CASE WHEN json_valid(effective_request_json) THEN \
+           CASE WHEN json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' THEN \
+             CASE \
+               WHEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
+                 AND json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.module_operation_id')='text' \
+                 THEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms') \
+               WHEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='reading' \
+                 THEN json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.started_at_ms')+?1 \
+               ELSE json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.next_retry_at_ms') \
+             END \
+           END \
          END) \
-         FROM operations WHERE method='swarm.launch' AND state='queued' \
-           AND json_valid(effective_request_json) \
-           AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp'",
+         FROM operations WHERE method='swarm.launch' AND state='queued'",
         [INFLIGHT_STALE_MS],
         |row| row.get(0),
     )?;
@@ -1908,6 +1912,19 @@ fn stale_readback() -> Error {
 pub(super) const LAUNCHER_QUARANTINE_PREFIX: &str = "launcher:v1:quarantine:native_mcp:";
 pub(super) const LAUNCHER_RECORD_CORRUPT_CODE: &str = "NATIVE_MCP_RECORD_CORRUPT";
 
+/// Identifies the retained source whose exact bytes failed validation.
+#[derive(Debug, Clone)]
+pub(super) enum LauncherDamageSource {
+    OperationRequest,
+    MetaKey(String),
+}
+
+#[derive(Debug, Clone)]
+struct LauncherCorruptSweepCursor {
+    ceiling_operation_id: String,
+    after_operation_id: Option<String>,
+}
+
 /// Retained-row failures that prove the row itself is malformed. Everything
 /// else (STORE_ERROR, STORE_BUSY, CONFLICT, model, clock) stays fatal so
 /// infrastructure damage is never mistaken for subject damage.
@@ -1921,13 +1938,57 @@ fn is_launch_record_damage(error: &Error) -> bool {
 pub(super) fn launcher_damage_evidence(
     operation_id: &str,
     source_pointer: &str,
-    source_digest: Option<String>,
+    source_digest: String,
 ) -> QuarantineEvidence {
     QuarantineEvidence {
         subject_identity: format!("launch-operation:{operation_id}"),
         source_pointer: Some(source_pointer.to_owned()),
-        source_digest,
+        source_digest: Some(source_digest),
     }
+}
+
+/// Resolve a typed damaged source to its exact retained bytes before creating
+/// immutable quarantine evidence. A disappeared source is a hard store error;
+/// it must never degrade into evidence with a missing digest.
+pub(super) fn quarantine_launch_damage(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    source: LauncherDamageSource,
+    now_ms: i64,
+) -> Result<String> {
+    let (source_pointer, raw) = match source {
+        LauncherDamageSource::OperationRequest => {
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                    [operation_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            (format!("operations:{operation_id}"), raw)
+        }
+        LauncherDamageSource::MetaKey(key) => {
+            let raw: Option<String> = tx
+                .query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            (format!("meta:{key}"), raw)
+        }
+    };
+    let raw = raw.ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_STORE",
+            "damaged launcher source disappeared before quarantine",
+        )
+    })?;
+    quarantine_launch_subject(
+        tx,
+        operation_id,
+        &source_pointer,
+        model::digest(raw.as_bytes()),
+        now_ms,
+    )
 }
 
 /// Persist typed quarantine for one malformed launch subject and return the
@@ -1937,7 +1998,7 @@ pub(super) fn quarantine_launch_subject(
     tx: &Transaction<'_>,
     operation_id: &str,
     source_pointer: &str,
-    source_digest: Option<String>,
+    source_digest: String,
     now_ms: i64,
 ) -> Result<String> {
     let evidence = launcher_damage_evidence(operation_id, source_pointer, source_digest);
@@ -1946,36 +2007,122 @@ pub(super) fn quarantine_launch_subject(
     Ok(key)
 }
 
-/// Quarantine every queued launch row whose retained JSON no longer parses.
-/// The candidate selectors below evaluate JSON predicates that abort the
-/// whole statement on malformed input, so damage is typed before selection.
-/// Bounded by `limit`; each damaged row costs one bounded meta write.
+fn decode_launcher_corrupt_sweep_cursor(value: Value) -> Result<LauncherCorruptSweepCursor> {
+    let invalid = || {
+        Error::new(
+            "NATIVE_MCP_STORE",
+            "launcher corrupt-row sweep cursor is invalid",
+        )
+    };
+    if value["schema_version"] != 1 {
+        return Err(invalid());
+    }
+    let ceiling_operation_id = value["ceiling_operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(invalid)?
+        .to_owned();
+    let after_operation_id = match value.get("after_operation_id") {
+        Some(Value::Null) => None,
+        Some(Value::String(after))
+            if !after.is_empty() && after.as_str() < ceiling_operation_id.as_str() =>
+        {
+            Some(after.clone())
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(LauncherCorruptSweepCursor {
+        ceiling_operation_id,
+        after_operation_id,
+    })
+}
+
+/// Quarantine one bounded keyset page of queued launch rows whose retained
+/// JSON no longer parses. The immutable Operation ID cursor and fixed ceiling
+/// advance across calls so a stable leading page cannot starve later rows.
 pub(super) fn isolate_corrupt_launch_records(
     tx: &Transaction<'_>,
     now_ms: i64,
     limit: i64,
 ) -> Result<()> {
-    let damaged: Vec<(String, String)> = {
+    if limit <= 0 {
+        return Ok(());
+    }
+    let cursor = match meta(tx, LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY)? {
+        None | Some(Value::Null) => {
+            let ceiling_operation_id: Option<String> = tx.query_row(
+                "SELECT max(operation_id) FROM operations \
+                 WHERE method='swarm.launch' AND state='queued'",
+                [],
+                |row| row.get(0),
+            )?;
+            let Some(ceiling_operation_id) = ceiling_operation_id else {
+                return Ok(());
+            };
+            LauncherCorruptSweepCursor {
+                ceiling_operation_id,
+                after_operation_id: None,
+            }
+        }
+        Some(value) => decode_launcher_corrupt_sweep_cursor(value)?,
+    };
+    let scanned: Vec<(String, String)> = {
         let mut statement = tx.prepare(
             "SELECT operation_id,effective_request_json FROM operations \
              WHERE method='swarm.launch' AND state='queued' \
-             ORDER BY updated_at_ms,operation_id LIMIT ?1",
+               AND operation_id<=?1 \
+               AND (?2 IS NULL OR operation_id>?2) \
+             ORDER BY operation_id LIMIT ?3",
         )?;
         statement
-            .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(
+                params![
+                    cursor.ceiling_operation_id.as_str(),
+                    cursor.after_operation_id.as_deref(),
+                    limit
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (operation_id, raw) in damaged {
+    for (operation_id, raw) in &scanned {
         if serde_json::from_str::<Value>(&raw).is_err() {
-            let digest = model::digest(raw.as_bytes());
             quarantine_launch_subject(
                 tx,
-                &operation_id,
+                operation_id,
                 &format!("operations:{operation_id}"),
-                Some(digest),
+                model::digest(raw.as_bytes()),
                 now_ms,
             )?;
         }
+    }
+
+    let page_limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let page_complete = scanned.len() < page_limit
+        || scanned
+            .last()
+            .is_some_and(|(operation_id, _)| operation_id == &cursor.ceiling_operation_id);
+    if page_complete {
+        set_meta(tx, LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY, &Value::Null)?;
+    } else {
+        let after_operation_id = scanned
+            .last()
+            .map(|(operation_id, _)| operation_id.clone())
+            .ok_or_else(|| {
+                Error::new(
+                    "NATIVE_MCP_STORE",
+                    "launcher corrupt-row sweep produced an empty nonterminal page",
+                )
+            })?;
+        set_meta(
+            tx,
+            LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY,
+            &json!({
+                "schema_version":1,
+                "ceiling_operation_id":cursor.ceiling_operation_id,
+                "after_operation_id":after_operation_id,
+            }),
+        )?;
     }
     Ok(())
 }
@@ -1995,19 +2142,10 @@ fn load_first_intact_launch(
         match load_launch_manifest(tx, operation_id) {
             Ok(loaded) => return Ok(Some(loaded)),
             Err(error) if is_launch_record_damage(&error) => {
-                let raw: Option<String> = tx
-                    .query_row(
-                        "SELECT effective_request_json FROM operations WHERE operation_id=?1",
-                        [operation_id.as_str()],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let digest = raw.as_deref().map(|raw| model::digest(raw.as_bytes()));
-                quarantine_launch_subject(
+                quarantine_launch_damage(
                     tx,
                     operation_id,
-                    &format!("operations:{operation_id}"),
-                    digest,
+                    LauncherDamageSource::OperationRequest,
                     now_ms,
                 )?;
             }

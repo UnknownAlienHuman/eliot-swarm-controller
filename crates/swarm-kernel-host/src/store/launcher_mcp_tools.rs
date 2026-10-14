@@ -2885,7 +2885,7 @@ fn validate_install_readback(
 fn isolate_tools_candidate(
     tx: &Transaction<'_>,
     operation_id: &str,
-    source_pointer: &str,
+    source: launcher_native_mcp::LauncherDamageSource,
     error: &Error,
     now_ms: i64,
 ) -> Result<bool> {
@@ -2894,13 +2894,7 @@ fn isolate_tools_candidate(
         return Ok(true);
     }
     if matches!(error.code.as_str(), "INVALID_PARAMS" | "NATIVE_MCP_STORE") {
-        launcher_native_mcp::quarantine_launch_subject(
-            tx,
-            operation_id,
-            source_pointer,
-            None,
-            now_ms,
-        )?;
+        launcher_native_mcp::quarantine_launch_damage(tx, operation_id, source, now_ms)?;
         return Ok(true);
     }
     Ok(false)
@@ -2920,11 +2914,10 @@ fn mark_tools_stale(
         Ok(Some(marker)) => match validate_tools_schedule(&marker, operation_id) {
             Ok(()) => marker,
             Err(_) => {
-                launcher_native_mcp::quarantine_launch_subject(
+                launcher_native_mcp::quarantine_launch_damage(
                     tx,
                     operation_id,
-                    &key,
-                    None,
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(key.clone()),
                     now_ms,
                 )?;
                 new_tools_schedule(operation_id, "", now_ms)
@@ -2932,7 +2925,12 @@ fn mark_tools_stale(
         },
         Ok(None) => new_tools_schedule(operation_id, "", now_ms),
         Err(error) if error.code == "INVALID_PARAMS" => {
-            launcher_native_mcp::quarantine_launch_subject(tx, operation_id, &key, None, now_ms)?;
+            launcher_native_mcp::quarantine_launch_damage(
+                tx,
+                operation_id,
+                launcher_native_mcp::LauncherDamageSource::MetaKey(key.clone()),
+                now_ms,
+            )?;
             new_tools_schedule(operation_id, "", now_ms)
         }
         Err(error) => return Err(error),
@@ -2954,11 +2952,12 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         let mut statement = tx.prepare(
             "SELECT operation_id FROM operations \
              WHERE method='swarm.launch' AND state='queued' \
-               AND json_valid(effective_request_json) \
-               AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
-               AND json_extract(effective_request_json,'$.launch_manifest.runtime.dispatch_permitted')=0 \
-               AND json_extract(effective_request_json,'$.launch_manifest.progress.task_dispatch')='not_started' \
-               AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='observed_partial' \
+               AND CASE WHEN json_valid(effective_request_json) THEN \
+                 json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
+                 AND json_extract(effective_request_json,'$.launch_manifest.runtime.dispatch_permitted')=0 \
+                 AND json_extract(effective_request_json,'$.launch_manifest.progress.task_dispatch')='not_started' \
+                 AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='observed_partial' \
+                 ELSE 0 END \
                AND operation_id>?1 \
              ORDER BY operation_id LIMIT ?2",
         )?;
@@ -2986,7 +2985,13 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         let schedule = match meta(tx, &schedule_key) {
             Ok(schedule) => schedule,
             Err(error) => {
-                if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                if isolate_tools_candidate(
+                    tx,
+                    &operation_id,
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                    &error,
+                    now,
+                )? {
                     continue;
                 }
                 return Err(error);
@@ -2994,7 +2999,13 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         };
         if let Some(schedule) = schedule {
             if let Err(error) = validate_tools_schedule(&schedule, &operation_id) {
-                if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                if isolate_tools_candidate(
+                    tx,
+                    &operation_id,
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                    &error,
+                    now,
+                )? {
                     continue;
                 }
                 return Err(error);
@@ -3004,7 +3015,15 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                     Some(deadline) => deadline,
                     None => {
                         let error = record_error("native MCP retry deadline is missing");
-                        if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                        if isolate_tools_candidate(
+                            tx,
+                            &operation_id,
+                            launcher_native_mcp::LauncherDamageSource::MetaKey(
+                                schedule_key.clone(),
+                            ),
+                            &error,
+                            now,
+                        )? {
                             continue;
                         }
                         return Err(error);
@@ -3020,26 +3039,9 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         let facts = match load_launch_facts(tx, config, &operation_id) {
             Ok(facts) => facts,
             Err(error) if error.code == "STALE_LAUNCH" => {
-                match defer_stale_launch(tx, &operation_id, now) {
-                    Ok(deadline) => {
-                        if let Some(deadline) = deadline {
-                            next_retry_at_ms = Some(
-                                next_retry_at_ms.map_or(deadline, |current| current.min(deadline)),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        if isolate_tools_candidate(
-                            tx,
-                            &operation_id,
-                            &format!("operations:{operation_id}"),
-                            &error,
-                            now,
-                        )? {
-                            continue;
-                        }
-                        return Err(error);
-                    }
+                if let Some(deadline) = defer_stale_launch(tx, &operation_id, now)? {
+                    next_retry_at_ms =
+                        Some(next_retry_at_ms.map_or(deadline, |current| current.min(deadline)));
                 }
                 continue;
             }
@@ -3051,7 +3053,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 if isolate_tools_candidate(
                     tx,
                     &operation_id,
-                    &format!("operations:{operation_id}"),
+                    launcher_native_mcp::LauncherDamageSource::OperationRequest,
                     &error,
                     now,
                 )? {
@@ -3062,14 +3064,29 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         };
 
         let schedule_key = supervisor_key(&operation_id);
-        let schedule = meta(tx, &schedule_key)?;
-        let record = match meta(tx, &record_key(&operation_id)) {
+        let schedule = match meta(tx, &schedule_key) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                if isolate_tools_candidate(
+                    tx,
+                    &operation_id,
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                    &error,
+                    now,
+                )? {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let record_key = record_key(&operation_id);
+        let record = match meta(tx, &record_key) {
             Ok(record) => record,
             Err(error) => {
                 if isolate_tools_candidate(
                     tx,
                     &operation_id,
-                    &record_key(&operation_id),
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(record_key.clone()),
                     &error,
                     now,
                 )? {
@@ -3087,7 +3104,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 if isolate_tools_candidate(
                     tx,
                     &operation_id,
-                    &record_key(&operation_id),
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(record_key.clone()),
                     &error,
                     now,
                 )? {
@@ -3100,7 +3117,13 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                     new_tools_schedule(&operation_id, &facts.identity_digest, now)
                 });
                 if let Err(error) = validate_tools_schedule(&stale, &operation_id) {
-                    if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                    if isolate_tools_candidate(
+                        tx,
+                        &operation_id,
+                        launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                        &error,
+                        now,
+                    )? {
                         continue;
                     }
                     return Err(error);
@@ -3118,7 +3141,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                 if isolate_tools_candidate(
                     tx,
                     &operation_id,
-                    &record_key(&operation_id),
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(record_key.clone()),
                     &error,
                     now,
                 )? {
@@ -3134,7 +3157,13 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                     new_tools_schedule(&operation_id, &facts.identity_digest, now)
                 });
                 if let Err(error) = validate_tools_schedule(&terminal, &operation_id) {
-                    if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                    if isolate_tools_candidate(
+                        tx,
+                        &operation_id,
+                        launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                        &error,
+                        now,
+                    )? {
                         continue;
                     }
                     return Err(error);
@@ -3144,7 +3173,13 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                     .is_some_and(|digest| digest != facts.identity_digest)
                 {
                     let error = stale_scope();
-                    if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                    if isolate_tools_candidate(
+                        tx,
+                        &operation_id,
+                        launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                        &error,
+                        now,
+                    )? {
                         continue;
                     }
                     return Err(error);
@@ -3164,7 +3199,13 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
         let mut schedule = schedule
             .unwrap_or_else(|| new_tools_schedule(&operation_id, &facts.identity_digest, now));
         if let Err(error) = validate_tools_schedule(&schedule, &operation_id) {
-            if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+            if isolate_tools_candidate(
+                tx,
+                &operation_id,
+                launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                &error,
+                now,
+            )? {
                 continue;
             }
             return Err(error);
@@ -3190,7 +3231,13 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
             "observed_partial" | "stale" => false,
             _ => {
                 let error = record_error("native MCP tools scheduler state is invalid");
-                if isolate_tools_candidate(tx, &operation_id, &schedule_key, &error, now)? {
+                if isolate_tools_candidate(
+                    tx,
+                    &operation_id,
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                    &error,
+                    now,
+                )? {
                     continue;
                 }
                 return Err(error);
@@ -3240,35 +3287,113 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
 
 fn defer_stale_launch(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Result<Option<i64>> {
     let schedule_key = supervisor_key(operation_id);
-    let record = meta(tx, &record_key(operation_id))?;
+    let private_record_key = record_key(operation_id);
+    let record = match meta(tx, &private_record_key) {
+        Ok(record) => record,
+        Err(error) => {
+            if isolate_tools_candidate(
+                tx,
+                operation_id,
+                launcher_native_mcp::LauncherDamageSource::MetaKey(private_record_key.clone()),
+                &error,
+                now,
+            )? {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
     if let Some(record) = record.as_ref()
         && !valid_public_c8_record(record, operation_id)
     {
-        return Err(record_error(
+        let error = record_error(
             "native MCP private intent identity is invalid during stale launch deferral",
-        ));
+        );
+        if isolate_tools_candidate(
+            tx,
+            operation_id,
+            launcher_native_mcp::LauncherDamageSource::MetaKey(private_record_key.clone()),
+            &error,
+            now,
+        )? {
+            return Ok(None);
+        }
+        return Err(error);
     }
 
-    let mut schedule = match meta(tx, &schedule_key)? {
-        Some(schedule) => {
-            validate_tools_schedule(&schedule, operation_id)?;
+    let mut schedule = match meta(tx, &schedule_key) {
+        Ok(Some(schedule)) => {
+            if let Err(error) = validate_tools_schedule(&schedule, operation_id) {
+                if isolate_tools_candidate(
+                    tx,
+                    operation_id,
+                    launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                    &error,
+                    now,
+                )? {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
             schedule
         }
-        None if record.is_some() => {
-            return Err(record_error(
-                "native MCP tools record has no matching supervisor marker",
-            ));
+        Ok(None) if record.is_some() => {
+            let error = record_error("native MCP tools record has no matching supervisor marker");
+            if isolate_tools_candidate(
+                tx,
+                operation_id,
+                launcher_native_mcp::LauncherDamageSource::MetaKey(private_record_key.clone()),
+                &error,
+                now,
+            )? {
+                return Ok(None);
+            }
+            return Err(error);
         }
-        None => new_tools_schedule(operation_id, "", now),
+        Ok(None) => new_tools_schedule(operation_id, "", now),
+        Err(error) => {
+            if isolate_tools_candidate(
+                tx,
+                operation_id,
+                launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                &error,
+                now,
+            )? {
+                return Ok(None);
+            }
+            return Err(error);
+        }
     };
     let already_held_for_stale_launch =
         schedule["state"] == "stale" && schedule["last_error_code"] == "STALE_LAUNCH";
-    let schedule_digest = schedule["launch_identity_digest"]
-        .as_str()
-        .ok_or_else(|| record_error("native MCP tools launch digest is missing"))?
-        .to_owned();
+    let schedule_digest = match schedule["launch_identity_digest"].as_str() {
+        Some(digest) => digest.to_owned(),
+        None => {
+            let error = record_error("native MCP tools launch digest is missing");
+            if isolate_tools_candidate(
+                tx,
+                operation_id,
+                launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+                &error,
+                now,
+            )? {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
     if !schedule_digest.is_empty() && !valid_prefixed_sha256(&schedule_digest) {
-        return Err(record_error("native MCP tools launch digest is invalid"));
+        let error = record_error("native MCP tools launch digest is invalid");
+        if isolate_tools_candidate(
+            tx,
+            operation_id,
+            launcher_native_mcp::LauncherDamageSource::MetaKey(schedule_key.clone()),
+            &error,
+            now,
+        )? {
+            return Ok(None);
+        }
+        return Err(error);
     }
     let record_digest = record
         .as_ref()
@@ -3278,9 +3403,17 @@ fn defer_stale_launch(tx: &Transaction<'_>, operation_id: &str, now: i64) -> Res
         .as_deref()
         .is_some_and(|digest| digest != schedule_digest)
     {
-        return Err(record_error(
-            "native MCP tools record and supervisor launch digests differ",
-        ));
+        let error = record_error("native MCP tools record and supervisor launch digests differ");
+        if isolate_tools_candidate(
+            tx,
+            operation_id,
+            launcher_native_mcp::LauncherDamageSource::MetaKey(private_record_key),
+            &error,
+            now,
+        )? {
+            return Ok(None);
+        }
+        return Err(error);
     }
 
     schedule["started_at_ms"] = Value::Null;
@@ -3952,7 +4085,9 @@ pub(crate) fn participant_capability_projection(
            FROM operations
           WHERE method='swarm.launch'
             AND (attempt_id=?1
-              OR json_extract(effective_request_json,'$.launch_manifest.task.attempt_id')=?1)
+              OR CASE WHEN json_valid(effective_request_json) THEN
+                   json_extract(effective_request_json,'$.launch_manifest.task.attempt_id')=?1
+                 ELSE 0 END)
           ORDER BY created_at_ms,operation_id
           LIMIT ?2"#,
     )?;
