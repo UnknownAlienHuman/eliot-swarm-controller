@@ -21,7 +21,8 @@ use std::{
 use swarm_contracts::error::{Error, Result};
 use swarm_process::{
     CapturePair, CaptureReceipt, CaptureStream, Group, PipeWrite, PollableRead, PollableWrite,
-    create_output, private_permissions, sync_parent_directory, write_private_new,
+    create_output, private_permissions, sync_parent_directory, write_private_exact,
+    write_private_new,
 };
 use swarm_scripts::{
     MAX_ARGUMENT_BYTES, MAX_ARGUMENTS, MAX_BUNDLE_BYTES, MAX_BUNDLE_FILE_BYTES,
@@ -997,9 +998,16 @@ pub fn publish_start_decision(
     }
 
     let bytes = script_run_canonical_json_v1(&serde_json::to_value(&decision)?)?.into_bytes();
-    let write_result = write_private_new(&dir.join("start-decision.json"), &bytes);
+    let write_result = write_private_exact(
+        &dir.join("start-decision.json"),
+        &bytes,
+        CONTROL_LIMIT as u64,
+    );
+    // A byte conflict may be a concurrent replay of the same semantic intent
+    // with a different decision timestamp. Only the durable typed read below
+    // may classify that case; durability-unknown and other errors stay hard.
     if let Err(error) = &write_result
-        && error.code != "PRIVATE_FILE_ALREADY_EXISTS"
+        && error.code != "CONFLICT"
     {
         return Err(error.clone());
     }
@@ -2934,6 +2942,39 @@ mod publication_failure_fault_fixture {
         ));
         assert_eq!(fs::read(root.join("start-decision.json")).unwrap(), bytes);
         assert!(read_start_decision(&root, "run", "different-operation", "token").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_semantic_decision_retry_preserves_first_durable_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-decision-semantic-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let first = ScriptStartDecision::Allow {
+            schema_version: 1,
+            run_id: "run".to_owned(),
+            operation_id: "operation".to_owned(),
+            token: "token".to_owned(),
+            decided_at_ms: 1,
+        };
+        let retry = ScriptStartDecision::Allow {
+            schema_version: 1,
+            run_id: "run".to_owned(),
+            operation_id: "operation".to_owned(),
+            token: "token".to_owned(),
+            decided_at_ms: 2,
+        };
+
+        let retained = publish_start_decision(&root, first).unwrap();
+        let bytes = fs::read(root.join("start-decision.json")).unwrap();
+        assert_eq!(
+            publish_start_decision(&root, retry).unwrap(),
+            retained,
+            "semantic replay retains the first decision even when its timestamp differs"
+        );
+        assert_eq!(fs::read(root.join("start-decision.json")).unwrap(), bytes);
         fs::remove_dir_all(root).unwrap();
     }
 }

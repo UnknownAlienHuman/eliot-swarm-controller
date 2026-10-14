@@ -142,6 +142,127 @@ fn store_allow_keeps_visible_decision_unknown_before_plan_materialization() {
 }
 
 #[test]
+fn concurrent_worker_reader_cannot_bypass_inflight_allow_barrier() {
+    use std::time::Duration;
+
+    let root = std::env::temp_dir().join(format!(
+        "script-allow-reader-barrier-race-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = FixtureDirectory(root.clone());
+    let work = fixture_work(&root, None);
+    let dir = directory(&root, &work.run_id).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let decision_path = dir.join("start-decision.json");
+    let publication_path = decision_path.clone();
+    let (visible_tx, visible_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let publisher_work = work.clone();
+    let publisher = thread::spawn(move || {
+        let should_pause = Rc::new(Cell::new(true));
+        let pause_once = Rc::clone(&should_pause);
+        let _barrier = swarm_process::test_support::scoped_durability_barrier(move |path| {
+            if path == publication_path && pause_once.replace(false) {
+                visible_tx
+                    .send(())
+                    .expect("reader waits for the published decision");
+                resume_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test resumes the publisher after checking the reader");
+            }
+            swarm_process::sync_parent_directory(path)
+        });
+        allow(&publisher_work)
+    });
+
+    visible_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("publisher exposes the decision before completing its barrier");
+    let visible_bytes = fs::read(&decision_path).unwrap();
+    let reader_path = decision_path.clone();
+    let failed_barrier = swarm_process::test_support::scoped_durability_barrier(move |path| {
+        if path == reader_path {
+            Err(swarm_contracts::error::Error::new(
+                "PRIVATE_FILE_DURABILITY_UNKNOWN",
+                "fixture reader barrier remains unconfirmed",
+            ))
+        } else {
+            swarm_process::sync_parent_directory(path)
+        }
+    });
+    let read_while_unknown = start_decision(&work);
+    let bytes_while_unknown = fs::read(&decision_path).unwrap();
+    let plan_while_unknown = dir.join("execution-plan.json").exists();
+    drop(failed_barrier);
+    resume_tx
+        .send(())
+        .expect("release the publisher's durability barrier");
+    publisher
+        .join()
+        .expect("publisher thread completes")
+        .unwrap();
+
+    let error =
+        read_while_unknown.expect_err("reader cannot return Current while its barrier fails");
+    assert_eq!(error.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+    assert_eq!(bytes_while_unknown, visible_bytes);
+    assert!(
+        !plan_while_unknown,
+        "unknown Allow does not materialize a plan"
+    );
+    assert!(matches!(
+        start_decision(&work).unwrap(),
+        swarm_script_worker::StartDecisionRead::Current(
+            swarm_script_worker::ScriptStartDecision::Allow { .. }
+        )
+    ));
+    assert_eq!(fs::read(&decision_path).unwrap(), visible_bytes);
+}
+
+#[test]
+fn store_deny_keeps_visible_decision_unknown_until_retry_barrier() {
+    let root = std::env::temp_dir().join(format!(
+        "script-deny-durable-authority-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let _cleanup = FixtureDirectory(root.clone());
+    let work = fixture_work(&root, None);
+    let dir = directory(&root, &work.run_id).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let decision_path = dir.join("start-decision.json");
+    let fail_barrier = Rc::new(Cell::new(true));
+    let fail_for_scope = Rc::clone(&fail_barrier);
+    let barrier_decision_path = decision_path.clone();
+    let scoped_barrier = swarm_process::test_support::scoped_durability_barrier(move |path| {
+        if path == barrier_decision_path && fail_for_scope.get() {
+            Err(swarm_contracts::error::Error::new(
+                "PRIVATE_FILE_DURABILITY_UNKNOWN",
+                "fixture failed after Deny publication",
+            ))
+        } else {
+            swarm_process::sync_parent_directory(path)
+        }
+    });
+
+    let publication = deny(&work, "DENIED").expect_err("unconfirmed Deny stays unknown");
+    assert_eq!(publication.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+    let visible_bytes = fs::read(&decision_path).expect("Deny bytes remain visible");
+    let read_error = start_decision(&work).expect_err("Deny read remains durability-unknown");
+    assert_eq!(read_error.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+    assert!(!dir.join("execution-plan.json").exists());
+    assert!(!dir.join("started.json").exists());
+
+    fail_barrier.set(false);
+    deny(&work, "DENIED").expect("same Deny converges after its barrier succeeds");
+    let retained = start_decision(&work).unwrap();
+    assert_eq!(start_decision_allows_start(&retained).unwrap(), Some(false));
+    assert_eq!(fs::read(&decision_path).unwrap(), visible_bytes);
+    drop(scoped_barrier);
+}
+
+#[test]
 fn store_allow_and_deny_race_retains_one_decision_across_reopen() {
     let root = std::env::temp_dir().join(format!("script-decision-race-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
