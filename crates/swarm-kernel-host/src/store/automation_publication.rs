@@ -5,8 +5,8 @@
 //! uncertain-effect readback remain in `store::forge`.
 
 use super::automation_reconcile::{
-    self, DomainErrorDisposition, MalformedAutomationEntry, QuarantineEvidence, SubjectDisposition,
-    SubjectErrorDisposition,
+    self, DomainErrorDisposition, MalformedAutomationEntry, QuarantineEvidence, QuarantinedSubject,
+    SubjectDisposition, SubjectErrorDisposition,
 };
 use super::capacity;
 use super::operation_lifecycle::{
@@ -1984,6 +1984,9 @@ fn enabled_entry_page(
             db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
                 row.get(0)
             })?;
+        if entry_quarantine_matches(db, &key, &raw)? {
+            continue;
+        }
         let entry = match automation_reconcile::parse_automation_entry(&raw, "automation entry") {
             Ok(entry) => entry,
             Err(error)
@@ -2026,6 +2029,9 @@ fn persist_malformed_entry(
 ) -> Result<()> {
     let record_key =
         automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &malformed.evidence)?;
+    if quarantine_marker_matches(tx, &record_key, &malformed.code, &malformed.evidence)? {
+        return Ok(());
+    }
     match automation_reconcile::with_subject_savepoint(
         tx,
         || {
@@ -2046,6 +2052,71 @@ fn persist_malformed_entry(
             "malformed publication entry did not produce a durable quarantine",
         )),
     }
+}
+
+/// Read the exact typed quarantine marker without refreshing its occurrence
+/// count or timestamps. A malformed or conflicting marker remains fatal.
+pub(super) fn quarantine_marker_matches(
+    db: &Connection,
+    record_key: &str,
+    code: &str,
+    evidence: &QuarantineEvidence,
+) -> Result<bool> {
+    let Some(value) = config::read_record(db, record_key, "automation quarantine")? else {
+        return Ok(false);
+    };
+    let record: QuarantinedSubject = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "AUTOMATION_QUARANTINE_RECORD_CORRUPT",
+            "retained automation quarantine evidence is invalid",
+        )
+    })?;
+    if record.code != code || record.evidence != *evidence {
+        return Err(Error::new(
+            "AUTOMATION_QUARANTINE_IDENTITY_CONFLICT",
+            "quarantine metadata key resolves to different subject evidence",
+        ));
+    }
+    if record.first_seen_at_ms < 0
+        || record.last_seen_at_ms < record.first_seen_at_ms
+        || record.occurrences == 0
+    {
+        return Err(Error::new(
+            "AUTOMATION_QUARANTINE_RECORD_CORRUPT",
+            "retained automation quarantine bounds are invalid",
+        ));
+    }
+    Ok(true)
+}
+
+/// Return whether this exact malformed entry has already been isolated by the
+/// publication owner. The key and digest derive from the retained raw bytes.
+pub(super) fn entry_quarantine_matches(db: &Connection, key: &str, raw: &str) -> Result<bool> {
+    let evidence = automation_reconcile::automation_entry_evidence(key, raw);
+    let code = match automation_reconcile::parse_automation_entry(raw, "automation entry") {
+        Ok(entry) => {
+            if config::entry_key(
+                &entry.owner_manager_id,
+                &entry.project_id,
+                &entry.automation_id,
+            )? == key
+            {
+                return Ok(false);
+            }
+            "AUTOMATION_RECORD_INVALID".to_owned()
+        }
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "AUTOMATION_RECORD_CORRUPT" | "AUTOMATION_RECORD_INVALID"
+            ) =>
+        {
+            error.code
+        }
+        Err(error) => return Err(error),
+    };
+    let record_key = automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &evidence)?;
+    quarantine_marker_matches(db, &record_key, &code, &evidence)
 }
 
 fn select_entry_keys(

@@ -862,6 +862,16 @@ fn persist_malformed_entry(
     malformed: &MalformedAutomationEntry,
     now_ms: i64,
 ) -> Result<()> {
+    let record_key =
+        automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &malformed.evidence)?;
+    if super::automation_publication::quarantine_marker_matches(
+        tx,
+        &record_key,
+        &malformed.code,
+        &malformed.evidence,
+    )? {
+        return Ok(());
+    }
     persist_goal_quarantine(tx, &malformed.code, malformed.evidence.clone(), now_ms)
 }
 

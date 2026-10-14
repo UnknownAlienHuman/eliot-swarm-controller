@@ -1126,6 +1126,14 @@ fn persist_malformed_entry(
 ) -> Result<()> {
     let record_key =
         automation_reconcile::quarantine_record_key(QUARANTINE_PREFIX, &malformed.evidence)?;
+    if super::automation_publication::quarantine_marker_matches(
+        tx,
+        &record_key,
+        &malformed.code,
+        &malformed.evidence,
+    )? {
+        return Ok(());
+    }
     match automation_reconcile::with_subject_savepoint(
         tx,
         || {

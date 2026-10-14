@@ -3124,8 +3124,11 @@ pub(crate) fn pending_script_triggers(
     let limit = limit.clamp(1, 32);
     let mut statement = db.prepare(
         "SELECT key FROM meta WHERE key LIKE 'automation:v1:script_dispatch:%' \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.pending') AS pending \
-                    WHERE json_extract(pending.value,'$.held')=0) \
+         AND CASE WHEN json_valid(value_json) THEN \
+           EXISTS(SELECT 1 FROM json_each(value_json,'$.record.pending') AS pending \
+                  WHERE CASE WHEN json_valid(pending.value) \
+                             THEN json_extract(pending.value,'$.held')=0 ELSE 0 END) \
+           ELSE 0 END \
          ORDER BY key LIMIT ?1",
     )?;
     let keys = statement
@@ -3329,6 +3332,9 @@ fn enabled_entry_page(
             db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
                 row.get(0)
             })?;
+        if super::automation_publication::entry_quarantine_matches(db, &key, &raw)? {
+            continue;
+        }
         let sealed: Value = serde_json::from_str(&raw).map_err(|_| {
             Error::new(
                 "AUTOMATION_DISPATCH_CONFIG_CORRUPT",
@@ -3377,9 +3383,11 @@ fn select_enabled_entry_keys(
     }
     let mut statement = db.prepare(
         "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
-                    WHERE step.value IN ('review_dispatch','script_run')) \
+         AND CASE WHEN json_valid(value_json) THEN \
+           (json_extract(value_json,'$.record.enabled')=1 \
+            AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
+                       WHERE step.value IN ('review_dispatch','script_run'))) \
+           ELSE 1 END \
          ORDER BY key LIMIT ?3",
     )?;
     Ok(statement
@@ -3401,9 +3409,11 @@ fn select_enabled_entry_keys_before(
     }
     let mut statement = db.prepare(
         "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<=?3 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
-                    WHERE step.value IN ('review_dispatch','script_run')) \
+         AND CASE WHEN json_valid(value_json) THEN \
+           (json_extract(value_json,'$.record.enabled')=1 \
+            AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
+                       WHERE step.value IN ('review_dispatch','script_run'))) \
+           ELSE 1 END \
          ORDER BY key LIMIT ?4",
     )?;
     Ok(statement
@@ -6938,6 +6948,30 @@ mod script_trigger_state_quarantine_tests {
         raw
     }
 
+    fn store_malformed_meta(
+        db: &Connection,
+        key: &str,
+        raw: &str,
+        insert: bool,
+    ) -> crate::error::Result<()> {
+        db.execute_batch("PRAGMA ignore_check_constraints=ON;")?;
+        let write = if insert {
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+                params![key, raw],
+            )
+        } else {
+            db.execute(
+                "UPDATE meta SET value_json=?1 WHERE key=?2",
+                params![raw, key],
+            )
+        };
+        let restore = db.execute_batch("PRAGMA ignore_check_constraints=OFF;");
+        write?;
+        restore?;
+        Ok(())
+    }
+
     fn reconcile_receipt(db: &mut Connection, entry: &AutomationEntry, now_ms: i64) -> Value {
         let app_config = Config::default();
         let tx = db.transaction().unwrap();
@@ -7237,6 +7271,306 @@ mod script_trigger_state_quarantine_tests {
                 "code must stay fatal",
             );
         }
+    }
+    #[tokio::test]
+    async fn worker_readers_quarantine_corrupt_meta_without_poisoning_store() {
+        use crate::{
+            platform::{DataRoot, bootstrap_credential},
+            store::StoreOwner,
+        };
+        use std::sync::Arc;
+
+        const DAMAGED_CURSOR: &str = "{malformed trigger cursor";
+        const DAMAGED_ENTRY: &str = "{malformed automation entry";
+
+        let directory =
+            std::env::temp_dir().join(format!("swarm-automation-json-{}", model::new_id()));
+        std::fs::create_dir_all(&directory).expect("create temporary Store directory");
+        let root = DataRoot::acquire(&directory).expect("acquire temporary Store root");
+        let credential = bootstrap_credential(&root.path).expect("create Operator credential");
+        let mut app_config = Config::default();
+        app_config.storage.data_dir = directory.clone();
+        assert!(
+            !app_config.forge.enabled,
+            "the root Forge config stays disabled"
+        );
+        let owner = StoreOwner::start(root, Arc::new(app_config), credential)
+            .await
+            .expect("start Store with the default disabled feature config");
+
+        let entry = ready_entry("worker-reader-valid");
+        let entry_key = config::entry_key(MANAGER_ID, PROJECT_ID, &entry.automation_id).unwrap();
+        let entry_for_seed = entry.clone();
+        owner
+            .store
+            .run_fixture(move |db| {
+                let tx = db.transaction()?;
+                config::write_record(&tx, &entry_key, &entry_for_seed.value()?)?;
+                let cut = super::automation_intake::observed_event_high_water(&tx)?;
+                super::configure_activation(&tx, None, &entry_for_seed, false, cut, 10)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect("seed a valid ScriptRun entry through the Store writer");
+
+        let valid_pass = owner
+            .store
+            .reconcile_automations_once()
+            .await
+            .expect("the valid entry keeps the existing worker behavior");
+        assert_eq!(
+            valid_pass["review_dispatch"]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let cursor_key = state_key(&entry);
+        let cursor_key_for_update = cursor_key.clone();
+        owner
+            .store
+            .run_fixture(move |db| {
+                store_malformed_meta(db, &cursor_key_for_update, DAMAGED_CURSOR, false)?;
+                Ok(())
+            })
+            .await
+            .expect("retain exact malformed cursor bytes");
+
+        let cursor_pass = owner
+            .store
+            .reconcile_automations_once()
+            .await
+            .expect("quarantine the cursor before downstream trigger selection");
+        assert_eq!(cursor_pass["script_run"]["considered"], 0);
+        let cursor_evidence = super::script_trigger_state_quarantine_evidence(
+            &entry,
+            &cursor_key,
+            Some(DAMAGED_CURSOR),
+        )
+        .unwrap();
+        let cursor_quarantine_key =
+            super::quarantine_record_key("automation:v1:quarantine:dispatch:", &cursor_evidence)
+                .unwrap();
+        let cursor_key_for_read = cursor_key.clone();
+        let cursor_quarantine_key_for_read = cursor_quarantine_key.clone();
+        let (retained_cursor, cursor_marker) = owner
+            .store
+            .run_fixture(move |db| {
+                let raw: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&cursor_key_for_read],
+                    |row| row.get(0),
+                )?;
+                let marker = config::read_record(
+                    db,
+                    &cursor_quarantine_key_for_read,
+                    "automation quarantine",
+                )?;
+                Ok((raw, marker))
+            })
+            .await
+            .expect("read the retained cursor and its typed quarantine");
+        assert_eq!(retained_cursor, DAMAGED_CURSOR);
+        let cursor_marker = cursor_marker.expect("cursor quarantine marker is retained");
+        assert_eq!(cursor_marker["code"], "SCRIPT_TRIGGER_RECORD_DAMAGED");
+        assert_eq!(
+            cursor_marker["evidence"]["source_digest"],
+            json!(model::digest(DAMAGED_CURSOR.as_bytes())),
+        );
+
+        let cursor_key_for_restore = cursor_key.clone();
+        let valid_entry_for_restore = entry.clone();
+        owner
+            .store
+            .run_fixture(move |db| {
+                let tx = db.transaction()?;
+                let state = super::empty_script_trigger_state(&valid_entry_for_restore, 0, 20);
+                config::write_record(&tx, &cursor_key_for_restore, &serde_json::to_value(state)?)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .expect("restore the healthy neighbor cursor after its damage case");
+
+        let damaged_entry_key =
+            config::entry_key(MANAGER_ID, PROJECT_ID, "worker-reader-corrupt").unwrap();
+        let damaged_entry_key_for_write = damaged_entry_key.clone();
+        owner
+            .store
+            .run_fixture(move |db| {
+                db.execute("DELETE FROM meta WHERE key=?1", [super::GLOBAL_CURSOR_KEY])?;
+                store_malformed_meta(db, &damaged_entry_key_for_write, DAMAGED_ENTRY, true)?;
+                Ok(())
+            })
+            .await
+            .expect("retain one malformed automation entry");
+
+        let corrupt_pass = owner
+            .store
+            .reconcile_automations_once()
+            .await
+            .expect("the full automation pass isolates the malformed entry");
+        assert_eq!(
+            corrupt_pass["review_dispatch"]["code"],
+            "AUTOMATION_DISPATCH_CONFIG_CORRUPT",
+        );
+        assert_eq!(corrupt_pass["review_dispatch"]["status"], "degraded");
+        assert_eq!(
+            corrupt_pass["work_dispatch"]["code"],
+            "AUTOMATION_WORK_CONFIG_CORRUPT",
+        );
+        assert_eq!(corrupt_pass["work_dispatch"]["status"], "degraded");
+        assert_eq!(corrupt_pass["publication"]["quarantined"], 1);
+
+        let entry_evidence = super::super::automation_reconcile::automation_entry_evidence(
+            &damaged_entry_key,
+            DAMAGED_ENTRY,
+        );
+        let entry_quarantine_key =
+            super::quarantine_record_key("automation:v1:publication:quarantine:", &entry_evidence)
+                .unwrap();
+        let goal_quarantine_key = super::quarantine_record_key(
+            "automation:v1:goal-progression:quarantine:",
+            &entry_evidence,
+        )
+        .unwrap();
+        let github_quarantine_key = super::quarantine_record_key(
+            "automation:v1:github-projection:quarantine:",
+            &entry_evidence,
+        )
+        .unwrap();
+        let damaged_entry_key_for_read = damaged_entry_key.clone();
+        let entry_quarantine_key_for_read = entry_quarantine_key.clone();
+        let goal_quarantine_key_for_read = goal_quarantine_key.clone();
+        let github_quarantine_key_for_read = github_quarantine_key.clone();
+        let (
+            retained_entry,
+            publication_marker_raw,
+            publication_marker,
+            goal_marker_raw,
+            goal_marker,
+            github_marker_raw,
+            github_marker,
+        ) = owner
+            .store
+            .run_fixture(move |db| {
+                let raw: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&damaged_entry_key_for_read],
+                    |row| row.get(0),
+                )?;
+                let marker_raw: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&entry_quarantine_key_for_read],
+                    |row| row.get(0),
+                )?;
+                let marker = config::read_record(
+                    db,
+                    &entry_quarantine_key_for_read,
+                    "automation quarantine",
+                )?;
+                let goal_marker_raw: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&goal_quarantine_key_for_read],
+                    |row| row.get(0),
+                )?;
+                let goal_marker = config::read_record(
+                    db,
+                    &goal_quarantine_key_for_read,
+                    "automation quarantine",
+                )?;
+                let github_marker_raw: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&github_quarantine_key_for_read],
+                    |row| row.get(0),
+                )?;
+                let github_marker = config::read_record(
+                    db,
+                    &github_quarantine_key_for_read,
+                    "automation quarantine",
+                )?;
+                Ok((
+                    raw,
+                    marker_raw,
+                    marker,
+                    goal_marker_raw,
+                    goal_marker,
+                    github_marker_raw,
+                    github_marker,
+                ))
+            })
+            .await
+            .expect("read exact entry bytes and all domain quarantine markers");
+        assert_eq!(retained_entry, DAMAGED_ENTRY);
+        for marker in [publication_marker, goal_marker, github_marker] {
+            let marker = marker.expect("malformed entry quarantine marker is retained");
+            assert_eq!(marker["code"], "AUTOMATION_RECORD_CORRUPT");
+            assert_eq!(
+                marker["evidence"]["source_digest"],
+                json!(model::digest(DAMAGED_ENTRY.as_bytes())),
+            );
+            assert_eq!(marker["occurrences"], 1);
+        }
+
+        let neighbor_pass = owner
+            .store
+            .reconcile_automations_once()
+            .await
+            .expect("skip the exactly quarantined row and continue the valid neighbor");
+        let neighbor_entries = neighbor_pass["review_dispatch"]["entries"]
+            .as_array()
+            .expect("healthy dispatch entries");
+        assert_eq!(neighbor_entries.len(), 1);
+        assert_eq!(
+            neighbor_entries[0]["script_run"]["automation_id"],
+            entry.automation_id,
+        );
+
+        for _ in 0..10 {
+            let pass = owner
+                .store
+                .reconcile_automations_once()
+                .await
+                .expect("unchanged malformed evidence stays isolated across a full pass");
+            assert!(pass["review_dispatch"]["code"].is_null());
+            assert!(pass["work_dispatch"]["code"].is_null());
+        }
+
+        let stable_marker_raw = owner
+            .store
+            .run_fixture(move |db| {
+                let publication: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&entry_quarantine_key],
+                    |row| row.get(0),
+                )?;
+                let goal: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&goal_quarantine_key],
+                    |row| row.get(0),
+                )?;
+                let github: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&github_quarantine_key],
+                    |row| row.get(0),
+                )?;
+                Ok((publication, goal, github))
+            })
+            .await
+            .expect("read stable automation quarantine markers");
+        assert_eq!(
+            stable_marker_raw,
+            (publication_marker_raw, goal_marker_raw, github_marker_raw)
+        );
+
+        let alive = owner
+            .store
+            .run_fixture(|db| Ok(db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?))
+            .await
+            .expect("Store remains available after repeated full automation passes");
+        assert_eq!(alive, 1);
     }
 }
 

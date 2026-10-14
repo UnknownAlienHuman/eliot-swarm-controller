@@ -644,6 +644,9 @@ fn enabled_entry_page(
             db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
                 row.get(0)
             })?;
+        if super::automation_publication::entry_quarantine_matches(db, &key, &raw)? {
+            continue;
+        }
         let sealed: Value = serde_json::from_str(&raw).map_err(|_| {
             Error::new(
                 "AUTOMATION_WORK_CONFIG_CORRUPT",
@@ -690,9 +693,11 @@ fn select_enabled_entry_keys(
     }
     let mut statement = db.prepare(
         "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
-                    WHERE step.value='work_dispatch') \
+         AND CASE WHEN json_valid(value_json) THEN \
+           (json_extract(value_json,'$.record.enabled')=1 \
+            AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
+                       WHERE step.value='work_dispatch')) \
+           ELSE 1 END \
          ORDER BY key LIMIT ?3",
     )?;
     Ok(statement
@@ -714,9 +719,11 @@ fn select_enabled_entry_keys_before(
     }
     let mut statement = db.prepare(
         "SELECT key FROM meta WHERE key LIKE ?1 AND key>?2 AND key<?3 \
-         AND json_extract(value_json,'$.record.enabled')=1 \
-         AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
-                    WHERE step.value='work_dispatch') \
+         AND CASE WHEN json_valid(value_json) THEN \
+           (json_extract(value_json,'$.record.enabled')=1 \
+            AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
+                       WHERE step.value='work_dispatch')) \
+           ELSE 1 END \
          ORDER BY key LIMIT ?4",
     )?;
     Ok(statement
