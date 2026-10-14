@@ -1284,7 +1284,7 @@ fn command_output_with_cleanup(
         if custody.cleanup_complete {
             let mut response_group_empty_proven = false;
             let output = custody.into_output().and_then(|bytes| {
-                let response = decode_completed_probe_response(&bytes, &mut temp_guard)?;
+                let response = decode_probe_response(&bytes)?;
                 if !response.group_empty {
                     retain_probe_partial(&temp_guard.0, "stdout.partial", &response.stdout)?;
                     retain_probe_partial(&temp_guard.0, "stderr.partial", &response.stderr)?;
@@ -1505,23 +1505,6 @@ fn decode_probe_response(bytes: &[u8]) -> Result<ProbeResponse> {
         stderr: bytes[stderr_start..message_start].to_vec(),
         message: String::from_utf8_lossy(&bytes[message_start..]).into_owned(),
     })
-}
-
-/// Decode a response only after `ProbeHelperCustody::into_output` has proved
-/// direct exit, exact native-family departure and completed capture. A damaged
-/// frame can then discard its private files without retaining an unreachable
-/// temp directory or weakening the response parser.
-fn decode_completed_probe_response(
-    bytes: &[u8],
-    temp_guard: &mut TempProbeDir,
-) -> Result<ProbeResponse> {
-    match decode_probe_response(bytes) {
-        Ok(response) => Ok(response),
-        Err(error) => {
-            temp_guard.allow_cleanup();
-            Err(error)
-        }
-    }
 }
 
 struct ProbeOwner {
@@ -3594,15 +3577,14 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&response.stdout).contains("probe-nested-descendant-output")
         );
-        let mut cleanup_guard = TempProbeDir(directory.clone(), true);
-        let malformed_frame_error =
-            decode_completed_probe_response(&response_bytes[..frame_start], &mut cleanup_guard)
-                .expect_err("the libtest preamble remains an invalid protocol frame");
+        let malformed_frame_error = decode_probe_response(&response_bytes[..frame_start])
+            .expect_err("the libtest preamble remains an invalid protocol frame");
         assert_eq!(malformed_frame_error.code, "CHECK_INPUT_RESOLUTION");
         assert!(
-            !cleanup_guard.1,
-            "proven native departure makes malformed capture cleanup safe"
+            owner.custody.response_group_empty.is_none(),
+            "a malformed full stream supplies no inner-family departure receipt"
         );
+        let temp_guard = TempProbeDir(directory.clone(), true);
         let evidence = json!({
             "helper_pid":helper_pid,
             "helper_launch_identity":launch_identity,
@@ -3622,17 +3604,22 @@ mod tests {
             "owner_pending_before_release":true,
             "owner_pending_after_release":owner.is_pending(),
             "unknown_full_stream_response_disposition":owner.custody.response_group_empty.is_none(),
-            "malformed_frame_cleanup_allowed":!cleanup_guard.1,
+            "malformed_frame_is_error":true,
+            "malformed_frame_temp_evidence_preserved":temp_guard.1,
             "resource":scope.resource.clone(),
             "workspace_identity":scope.workspace_identity.clone(),
         });
         eprintln!("probe_custody_evidence={evidence}");
         drop(owner);
-        drop(cleanup_guard);
+        drop(temp_guard);
         assert!(
-            !directory.exists(),
-            "completed malformed capture directory is removed"
+            directory.exists(),
+            "malformed response preserves private custody evidence"
         );
         drop(fixture);
+        assert!(
+            !directory.exists(),
+            "the real fixture cleans up after known family departure"
+        );
     }
 }
