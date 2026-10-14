@@ -1433,9 +1433,11 @@ async fn stale_gm_publication_is_skipped_when_consumer_resumes() {
         .as_i64()
         .expect("the retained immutable intent records the admitting GM epoch");
 
-    // Reuse the real producer path from the connected handover fixture. The
-    // supervisor sees the changed epoch and retains its structured no-write
-    // receipt before any native Git publication can start.
+    // Reuse the real producer path from the connected handover fixture. Rotate
+    // A -> B -> A before resuming the consumer so returning to the original
+    // manager cannot make this queued on-behalf effect's captured epoch current
+    // again. The supervisor must retain its structured no-write receipt before
+    // any native Git publication can start.
     let handover = fixture
         .owner
         .store
@@ -1450,6 +1452,20 @@ async fn stale_gm_publication_is_skipped_when_consumer_resumes() {
         .await
         .unwrap();
     assert!(handover["gm_epoch"].as_i64().unwrap() > admitted_epoch);
+    let handover_back = fixture
+        .owner
+        .store
+        .call(
+            principal("review-owner-v2", Role::Manager),
+            "gm.handover".into(),
+            json!({
+                "client_request_id":"handover-back-before-publication-consumer-resume",
+                "client_id":"review-gm"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(handover_back["gm_epoch"].as_i64().unwrap() > handover["gm_epoch"].as_i64().unwrap());
     fixture.owner.store.supervise_forge_once().await.unwrap();
 
     let stale = retained_operation(&fixture.owner.store, &fixture.operator, &operation_id).await;
@@ -1458,7 +1474,10 @@ async fn stale_gm_publication_is_skipped_when_consumer_resumes() {
     assert_eq!(stale["result"]["outcome"], "stale_gm_epoch");
     assert_eq!(stale["result"]["publication"], "not_started");
     assert_eq!(stale["result"]["admitted_gm_epoch"], admitted_epoch);
-    assert_eq!(stale["result"]["current_gm_epoch"], handover["gm_epoch"]);
+    assert_eq!(
+        stale["result"]["current_gm_epoch"],
+        handover_back["gm_epoch"]
+    );
     assert_eq!(stale["result"]["force"], false);
     assert_ne!(stale["result"]["publication_may_have_started"], true);
     assert_eq!(
@@ -1470,13 +1489,13 @@ async fn stale_gm_publication_is_skipped_when_consumer_resumes() {
     let resumed_pass = reconcile_publication_fixture(&fixture).await.unwrap();
     assert_eq!(resumed_pass["publication"]["processed"], 1);
 
-    // After handover, only the current GM may inspect the former owner's
+    // After the A -> B -> A cycle, only the current GM may inspect the retained
     // publication state; owner_manager_id keeps this exact entry in scope.
     let explanation = fixture
         .owner
         .store
         .call(
-            principal("review-owner-v2", Role::Manager),
+            fixture.manager.clone(),
             "automation.config.explain".into(),
             json!({
                 "owner_manager_id":"review-gm",
