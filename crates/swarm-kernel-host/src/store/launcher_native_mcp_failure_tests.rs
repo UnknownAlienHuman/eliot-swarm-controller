@@ -463,6 +463,8 @@ fn legacy_template_is_not_promoted_after_participant_registration_changes() {
 #[test]
 fn corrupt_head_row_is_quarantined_without_aborting_the_next_launch() {
     let mut db = invalid_scope_db();
+    db.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
     db.execute(
         "INSERT INTO operations(
              operation_id,caller_id,client_request_id,method,original_request_json,
@@ -472,6 +474,8 @@ fn corrupt_head_row_is_quarantined_without_aborting_the_next_launch() {
         [],
     )
     .unwrap();
+    db.pragma_update(None, "ignore_check_constraints", false)
+        .unwrap();
 
     let tx = db
         .transaction_with_behavior(TransactionBehavior::Immediate)

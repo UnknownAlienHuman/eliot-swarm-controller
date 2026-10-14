@@ -4737,7 +4737,7 @@ mod failure_event_tests {
                 "INSERT INTO operations(
                      operation_id,caller_id,client_request_id,method,original_request_json,
                      effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
-                 ) VALUES(?1,'manager','native-mcp-tools-poison-request','swarm.launch',
+                 ) VALUES(?1,'manager',?1,'swarm.launch',
                           '{}',?2,'queued',1,1,1)",
                 params![operation_id, effective],
             )

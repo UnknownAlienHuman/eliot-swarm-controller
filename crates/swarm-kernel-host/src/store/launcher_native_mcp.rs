@@ -2086,7 +2086,7 @@ pub(super) fn isolate_corrupt_launch_records(
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (operation_id, raw) in &scanned {
-        if serde_json::from_str::<Value>(&raw).is_err() {
+        if serde_json::from_str::<Value>(raw).is_err() {
             quarantine_launch_subject(
                 tx,
                 operation_id,
