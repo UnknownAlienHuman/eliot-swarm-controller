@@ -2417,4 +2417,112 @@ mod journal65_parity_tests {
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn c_oversized_complete_and_torn_frames_are_damage() {
+        let root = fresh_root("oversized");
+        let journal = open_parity_journal(&root);
+        let operation_id = "parity-oversized-operation";
+        let path = journal.operation_path(operation_id);
+
+        let mut oversized_complete = vec![b'x'; RECORD_LIMIT];
+        oversized_complete.push(b'\n');
+        std::fs::write(&path, &oversized_complete).unwrap();
+        let complete_by_id = journal.load(operation_id).unwrap_err();
+        let complete_by_path = journal.load_by_path(&path).unwrap_err();
+        let expected_complete = format!(
+            "operation journal damaged at byte 0: OversizedCompleteRecord {{ record_bytes: {}, max_record_bytes: {} }}",
+            RECORD_LIMIT + 1,
+            RECORD_LIMIT
+        );
+        assert_eq!(complete_by_id.code, "ADAPTER_JOURNAL");
+        assert_eq!(complete_by_id.message, expected_complete);
+        assert_eq!(complete_by_path.code, "ADAPTER_JOURNAL");
+        assert_eq!(complete_by_path.message, expected_complete);
+        assert_eq!(std::fs::read(&path).unwrap(), oversized_complete);
+
+        let oversized_torn = vec![b'x'; RECORD_LIMIT + 1];
+        std::fs::write(&path, &oversized_torn).unwrap();
+        let torn_by_id = journal.load(operation_id).unwrap_err();
+        let torn_by_path = journal.load_by_path(&path).unwrap_err();
+        let expected_torn = format!(
+            "operation journal damaged at byte 0: OversizedTornTail {{ tail_bytes: {}, max_record_bytes: {} }}",
+            RECORD_LIMIT + 1,
+            RECORD_LIMIT
+        );
+        assert_eq!(torn_by_id.code, "ADAPTER_JOURNAL");
+        assert_eq!(torn_by_id.message, expected_torn);
+        assert_eq!(torn_by_path.code, "ADAPTER_JOURNAL");
+        assert_eq!(torn_by_path.message, expected_torn);
+        assert_eq!(std::fs::read(&path).unwrap(), oversized_torn);
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn d_zero_byte_journal_is_complete_empty_history() {
+        let root = fresh_root("zero-byte");
+        let journal = open_parity_journal(&root);
+        let operation_id = "parity-zero-byte-operation";
+        let path = journal.operation_path(operation_id);
+        std::fs::write(&path, b"").unwrap();
+
+        let by_id = journal.load(operation_id).unwrap();
+        let by_path = journal.load_by_path(&path).unwrap();
+        assert_eq!(format!("{:?}", by_id), format!("{:?}", by_path));
+        assert!(by_id.native_replay_permitted());
+        assert!(by_path.native_replay_permitted());
+        assert!(by_id.torn_tail_evidence.is_none());
+        assert!(by_path.torn_tail_evidence.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn g_pending_operation_and_outbox_root_is_only_a_hello_candidate() {
+        let root = fresh_root("hello-root-outbox");
+        let journal = open_parity_journal(&root);
+        let operation_id = "parity-hello-root-candidate";
+        let root_id = expected_root_id(PARITY_BINDING, PARITY_GENERATION);
+        let mut intent = parity_intent(operation_id);
+        intent.native_root_id = Some(root_id.clone());
+        journal.write_intent(&intent).unwrap();
+        let outcome = json!({
+            "operation_id": operation_id,
+            "outcome": "unknown",
+            "native_scope_key": PARITY_SCOPE,
+            "native_root_id": root_id.clone()
+        });
+        journal.queue_outcome_value(&outcome).unwrap();
+
+        let operation_path = journal.operation_path(operation_id);
+        let outbox_path = root
+            .join("outbox")
+            .join(format!("outcome-{}.json", operation_key(operation_id)));
+        assert!(operation_path.exists());
+        assert!(outbox_path.exists());
+        assert_eq!(
+            journal
+                .native_root_for_hello(PARITY_BINDING, PARITY_GENERATION, PARITY_SCOPE)
+                .unwrap()
+                .as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            journal
+                .native_root_checkpoint_for_hello(PARITY_BINDING, PARITY_GENERATION, PARITY_SCOPE)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            std::fs::read(root.join("native-checkpoints.jsonl")).unwrap(),
+            b""
+        );
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

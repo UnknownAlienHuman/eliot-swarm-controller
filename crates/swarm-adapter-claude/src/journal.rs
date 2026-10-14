@@ -3358,4 +3358,65 @@ mod journal65_parity_tests {
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn c_oversized_complete_and_torn_frames_are_damage() {
+        let root = fresh_root("oversized");
+        let journal = open_parity_journal(&root);
+        let operation_id = "parity-oversized-operation";
+        let path = journal.path(operation_id).unwrap();
+
+        let mut oversized_complete = vec![b'x'; MAX_RECORD_BYTES];
+        oversized_complete.push(b'\n');
+        std::fs::write(&path, &oversized_complete).unwrap();
+        let complete_by_id = journal.get(operation_id).unwrap_err();
+        let complete_by_path = journal.read_path(&path, Some(operation_id)).unwrap_err();
+        let expected_complete = format!(
+            "operation record damaged at byte 0: OversizedCompleteRecord {{ record_bytes: {}, max_record_bytes: {} }}",
+            MAX_RECORD_BYTES + 1,
+            MAX_RECORD_BYTES
+        );
+        assert_eq!(complete_by_id.code, "ADAPTER_JOURNAL");
+        assert_eq!(complete_by_id.message, expected_complete);
+        assert_eq!(complete_by_path.code, "ADAPTER_JOURNAL");
+        assert_eq!(complete_by_path.message, expected_complete);
+        assert_eq!(std::fs::read(&path).unwrap(), oversized_complete);
+
+        let oversized_torn = vec![b'x'; MAX_RECORD_BYTES + 1];
+        std::fs::write(&path, &oversized_torn).unwrap();
+        let torn_by_id = journal.get(operation_id).unwrap_err();
+        let torn_by_path = journal.read_path(&path, Some(operation_id)).unwrap_err();
+        let expected_torn = format!(
+            "operation record damaged at byte 0: OversizedTornTail {{ tail_bytes: {}, max_record_bytes: {} }}",
+            MAX_RECORD_BYTES + 1,
+            MAX_RECORD_BYTES
+        );
+        assert_eq!(torn_by_id.code, "ADAPTER_JOURNAL");
+        assert_eq!(torn_by_id.message, expected_torn);
+        assert_eq!(torn_by_path.code, "ADAPTER_JOURNAL");
+        assert_eq!(torn_by_path.message, expected_torn);
+        assert_eq!(std::fs::read(&path).unwrap(), oversized_torn);
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn d_zero_byte_journal_is_complete_empty_state() {
+        let root = fresh_root("zero-byte");
+        let journal = open_parity_journal(&root);
+        let operation_id = "parity-zero-byte-operation";
+        let path = journal.path(operation_id).unwrap();
+        std::fs::write(&path, b"").unwrap();
+
+        let by_path = journal.read_path(&path, Some(operation_id)).unwrap();
+        assert!(journal.get(operation_id).unwrap().is_none());
+        assert_eq!(by_path.operation_id, operation_id);
+        assert!(by_path.receipt.is_none());
+        assert!(by_path.torn_tail_evidence.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
