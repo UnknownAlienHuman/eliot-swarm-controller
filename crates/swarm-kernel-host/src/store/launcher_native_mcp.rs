@@ -7,7 +7,9 @@
 
 use super::{
     Store,
-    automation_reconcile::{QuarantineEvidence, persist_quarantine, quarantine_record_key},
+    automation_reconcile::{
+        QuarantineEvidence, QuarantinedSubject, persist_quarantine, quarantine_record_key,
+    },
     meta, set_meta,
 };
 use crate::{
@@ -2208,8 +2210,60 @@ pub(super) fn quarantine_launch_subject(
 ) -> Result<String> {
     let evidence = launcher_damage_evidence(operation_id, source_pointer, source_digest);
     let key = quarantine_record_key(LAUNCHER_QUARANTINE_PREFIX, &evidence)?;
+    if unchanged_launch_quarantine(tx, &key, &evidence)? {
+        return Ok(key);
+    }
     persist_quarantine(tx, &key, LAUNCHER_RECORD_CORRUPT_CODE, evidence, now_ms)?;
     Ok(key)
+}
+
+fn unchanged_launch_quarantine(
+    db: &Connection,
+    key: &str,
+    evidence: &QuarantineEvidence,
+) -> Result<bool> {
+    let Some(value) =
+        crate::automation::config::read_record(db, key, "launcher quarantine evidence")?
+    else {
+        return Ok(false);
+    };
+    let record: QuarantinedSubject = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "AUTOMATION_QUARANTINE_RECORD_CORRUPT",
+            "retained launcher quarantine cannot be decoded",
+        )
+    })?;
+    if record.code != LAUNCHER_RECORD_CORRUPT_CODE || &record.evidence != evidence {
+        return Err(Error::new(
+            "AUTOMATION_QUARANTINE_IDENTITY_CONFLICT",
+            "launcher quarantine key names different evidence",
+        ));
+    }
+    if record.first_seen_at_ms < 0
+        || record.last_seen_at_ms < record.first_seen_at_ms
+        || record.occurrences == 0
+    {
+        return Err(Error::new(
+            "AUTOMATION_QUARANTINE_RECORD_CORRUPT",
+            "retained launcher quarantine bounds are invalid",
+        ));
+    }
+    Ok(true)
+}
+
+/// A quarantine is current only for these exact bytes, not merely this ID.
+pub(super) fn launch_request_is_quarantined(
+    db: &Connection,
+    operation_id: &str,
+    raw: &str,
+) -> Result<bool> {
+    let evidence = launcher_damage_evidence(
+        operation_id,
+        &format!("operations:{operation_id}"),
+        model::digest(raw.as_bytes()),
+    );
+    let key = quarantine_record_key(LAUNCHER_QUARANTINE_PREFIX, &evidence)?;
+    unchanged_launch_quarantine(db, &key, &evidence)
 }
 
 fn decode_launcher_corrupt_sweep_cursor(value: Value) -> Result<LauncherCorruptSweepCursor> {
@@ -2253,11 +2307,12 @@ pub(super) fn isolate_corrupt_launch_records(
     if limit <= 0 {
         return Ok(());
     }
-    let cursor = match meta(tx, LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY)? {
+    let retained_cursor = meta(tx, LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY)?;
+    let cursor = match retained_cursor.clone() {
         None | Some(Value::Null) => {
             let ceiling_operation_id: Option<String> = tx.query_row(
                 "SELECT max(operation_id) FROM operations \
-                 WHERE method='swarm.launch' AND state='queued'",
+                 WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown')",
                 [],
                 |row| row.get(0),
             )?;
@@ -2274,7 +2329,7 @@ pub(super) fn isolate_corrupt_launch_records(
     let scanned: Vec<(String, String)> = {
         let mut statement = tx.prepare(
             "SELECT operation_id,effective_request_json FROM operations \
-             WHERE method='swarm.launch' AND state='queued' \
+             WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
                AND operation_id<=?1 \
                AND (?2 IS NULL OR operation_id>?2) \
              ORDER BY operation_id LIMIT ?3",
@@ -2307,8 +2362,8 @@ pub(super) fn isolate_corrupt_launch_records(
         || scanned
             .last()
             .is_some_and(|(operation_id, _)| operation_id == &cursor.ceiling_operation_id);
-    if page_complete {
-        set_meta(tx, LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY, &Value::Null)?;
+    let next_cursor = if page_complete {
+        Value::Null
     } else {
         let after_operation_id = scanned
             .last()
@@ -2319,15 +2374,16 @@ pub(super) fn isolate_corrupt_launch_records(
                     "launcher corrupt-row sweep produced an empty nonterminal page",
                 )
             })?;
-        set_meta(
-            tx,
-            LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY,
-            &json!({
-                "schema_version":1,
-                "ceiling_operation_id":cursor.ceiling_operation_id,
-                "after_operation_id":after_operation_id,
-            }),
-        )?;
+        json!({
+            "schema_version":1,
+            "ceiling_operation_id":cursor.ceiling_operation_id,
+            "after_operation_id":after_operation_id,
+        })
+    };
+    if retained_cursor.as_ref() != Some(&next_cursor)
+        && !(retained_cursor.is_none() && next_cursor.is_null())
+    {
+        set_meta(tx, LAUNCHER_CORRUPT_SWEEP_CURSOR_KEY, &next_cursor)?;
     }
     Ok(())
 }

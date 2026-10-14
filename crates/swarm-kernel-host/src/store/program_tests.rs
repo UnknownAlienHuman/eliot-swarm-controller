@@ -1,4 +1,7 @@
 //! Focused Store regressions for the sponsored review disposition lifecycle.
+#[path = "legacy_worker_demand_poison_tests.rs"]
+mod legacy_worker_demand_poison_tests;
+
 use super::*;
 use rusqlite::params;
 use serde_json::{Value, json};

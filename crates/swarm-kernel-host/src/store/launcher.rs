@@ -4001,9 +4001,10 @@ pub(super) fn pending_launch_ceiling(db: &Connection) -> Result<Option<LaunchRec
     db.query_row(
         "SELECT created_at_ms,operation_id FROM operations \
          WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
-           AND json_extract(effective_request_json,'$.launch_manifest.state') \
+           AND CASE WHEN json_valid(effective_request_json) \
+            THEN json_extract(effective_request_json,'$.launch_manifest.state') \
              IN ('pending_workspace','awaiting_binding','awaiting_capability', \
-                 'awaiting_participant_credential','outcome_unknown') \
+                 'awaiting_participant_credential','outcome_unknown') ELSE 0 END \
          ORDER BY created_at_ms DESC,operation_id DESC LIMIT 1",
         [],
         |row| {
@@ -4031,9 +4032,10 @@ pub(super) fn pending_launches(
     let mut statement = db.prepare(
         "SELECT created_at_ms,operation_id FROM operations \
          WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
-           AND json_extract(effective_request_json,'$.launch_manifest.state') \
+           AND CASE WHEN json_valid(effective_request_json) \
+            THEN json_extract(effective_request_json,'$.launch_manifest.state') \
              IN ('pending_workspace','awaiting_binding','awaiting_capability', \
-                 'awaiting_participant_credential','outcome_unknown') \
+                 'awaiting_participant_credential','outcome_unknown') ELSE 0 END \
            AND (?1 IS NULL OR created_at_ms>?1 OR (created_at_ms=?1 AND operation_id>?2)) \
            AND (created_at_ms<?3 OR (created_at_ms=?3 AND operation_id<=?4)) \
          ORDER BY created_at_ms,operation_id LIMIT ?5",

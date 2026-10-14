@@ -32,6 +32,24 @@ fn route_enabled(config: &Config, runtime: &str, artifact: &str) -> bool {
     })
 }
 
+fn unquarantined_launch_damage(db: &Connection) -> Result<bool> {
+    let mut statement = db.prepare(
+        "SELECT operation_id,effective_request_json FROM operations \
+         WHERE method='swarm.launch' AND state IN ('queued','outcome_unknown') \
+           AND NOT json_valid(effective_request_json) ORDER BY operation_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (operation_id, raw) = row?;
+        if !super::launcher_native_mcp::launch_request_is_quarantined(db, &operation_id, &raw)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerDemand> {
     let mut demand = LegacyWorkerDemand {
         checks: config.checks.enabled,
@@ -57,7 +75,9 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
          WHERE c.state IN ('running','reconciling') \
             OR (c.state='queued' AND o.state IN ('sending','outcome_unknown')) \
             OR (c.state='queued' AND o.state='queued' \
-                AND json_extract(c.spec_json,'$.cancel_requested') IS NOT NULL)) ",
+                AND CASE WHEN json_valid(c.spec_json) \
+                    THEN json_extract(c.spec_json,'$.cancel_requested') IS NOT NULL \
+                    ELSE 1 END)) ",
     )?;
     demand.scripts = exists(
         db,
@@ -70,7 +90,9 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
     // owned by the isolated module supervisor, never this built-in worker.
     demand.opencode |= db.query_row(
         "SELECT EXISTS(SELECT 1 FROM bindings WHERE released_at_ms IS NULL \
-         AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id IN (?2,?3))",
+         AND module_artifact_id IN (?2,?3) \
+         AND CASE WHEN json_valid(route_json) THEN json_extract(route_json,'$.runtime')=?1 \
+                  ELSE 1 END)",
         params![
             crate::runtime::opencode_v2::RUNTIME,
             crate::runtime::opencode_v2::ARTIFACT_ID,
@@ -80,7 +102,9 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
     )?;
     demand.zed |= db.query_row(
         "SELECT EXISTS(SELECT 1 FROM bindings WHERE released_at_ms IS NULL \
-         AND json_extract(route_json,'$.runtime')=?1 AND module_artifact_id=?2)",
+         AND module_artifact_id=?2 \
+         AND CASE WHEN json_valid(route_json) THEN json_extract(route_json,'$.runtime')=?1 \
+                  ELSE 1 END)",
         params![
             crate::runtime::zed::RUNTIME,
             crate::runtime::zed::ARTIFACT_ID
@@ -94,55 +118,70 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
            (key LIKE 'automation:v1:cron:active:%' OR key LIKE 'automation:v1:cron:held:%' \
             OR key LIKE 'goals:v1:due:%') \
            OR (key LIKE 'automation:v1:entry:%' \
-               AND json_extract(value_json,'$.record.enabled')=1 \
-               AND json_type(value_json,'$.record.cron')='object'))",
+               AND CASE WHEN json_valid(value_json) \
+                   THEN json_extract(value_json,'$.record.enabled')=1 \
+                    AND json_type(value_json,'$.record.cron')='object' \
+                   ELSE 0 END))",
     )?;
     // The opt-in service owns outstanding RPCs for its configured lifetime;
     // exhausting its due page must not cancel its caller. Legacy demand is unchanged.
     demand.automation_scheduler = super::automation_scheduler::has_demand(config);
-    demand.automation = exists(
-        db,
+    demand.automation = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE \
            (key LIKE 'automation:v1:entry:%' \
-            AND json_extract(value_json,'$.record.enabled')=1 \
-            AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
+            AND CASE WHEN json_valid(value_json) \
+             THEN json_extract(value_json,'$.record.enabled')=1 \
+              AND EXISTS(SELECT 1 FROM json_each(value_json,'$.record.steps') AS step \
                        WHERE step.value IN ('work_dispatch','review_dispatch', \
                          'review_disposition','repair_dispatch','acceptance','publication', \
-                         'check_run','goal_progression','script_run'))) \
+                         'check_run','goal_progression','script_run')) \
+             ELSE 1 END) \
            OR key LIKE 'coordination:watch:v1:active:%') \
          OR EXISTS(SELECT 1 FROM operations WHERE \
            state IN ('queued','sending','native_accepted','outcome_unknown') \
-           AND json_type(effective_request_json,'$.automation_on_behalf')='object')",
+           AND CASE WHEN json_valid(effective_request_json) \
+               THEN json_type(effective_request_json,'$.automation_on_behalf')='object' \
+               ELSE caller_id=?1 END)",
+        [crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID],
+        |row| row.get::<_, bool>(0),
     )?;
 
     demand.launcher = exists(
         db,
         "SELECT EXISTS(SELECT 1 FROM operations WHERE method='swarm.launch' \
            AND state IN ('queued','outcome_unknown') \
-           AND json_extract(effective_request_json,'$.launch_manifest.state') \
+           AND CASE WHEN json_valid(effective_request_json) \
+            THEN json_extract(effective_request_json,'$.launch_manifest.state') \
              IN ('pending_workspace','awaiting_binding','awaiting_capability', \
-                 'awaiting_participant_credential','outcome_unknown')) \
+                 'awaiting_participant_credential','outcome_unknown') \
+            ELSE 0 END) \
          OR EXISTS(SELECT 1 FROM workspace_leases WHERE state IN ('preparing','held','outcome_unknown')) \
          OR EXISTS(SELECT 1 FROM owned_service_starts \
                    WHERE state IN ('reserved','outcome_unknown','service_observed'))",
     )?;
+    // Invalid launch bytes still demand their existing bounded isolator.
+    // An exact, validated quarantine removes only this unchanged obligation.
+    demand.launcher |= unquarantined_launch_damage(db)?;
     demand.native_mcp = exists(
         db,
         "SELECT EXISTS(SELECT 1 FROM operations WHERE method='swarm.launch' \
            AND state='queued' \
-           AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
+           AND CASE WHEN json_valid(effective_request_json) \
+            THEN json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
            AND (json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.state') IS NULL \
              OR json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state') \
-                IN ('retry_wait','observed_partial','reading'))) ",
+                IN ('retry_wait','observed_partial','reading')) ELSE 0 END) ",
     )?;
     demand.native_mcp_tools = exists(
         db,
         "SELECT EXISTS(SELECT 1 FROM operations WHERE method='swarm.launch' \
            AND state='queued' \
-           AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
+           AND CASE WHEN json_valid(effective_request_json) \
+            THEN json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
            AND json_extract(effective_request_json,'$.launch_manifest.runtime.dispatch_permitted')=0 \
            AND json_extract(effective_request_json,'$.launch_manifest.progress.task_dispatch')='not_started' \
-           AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='observed_partial')",
+           AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='observed_partial' \
+            ELSE 0 END)",
     )?;
     demand.forge |= exists(
         db,

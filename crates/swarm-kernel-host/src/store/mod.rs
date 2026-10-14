@@ -1200,7 +1200,13 @@ impl Store {
     /// joins the preparation, then commits verified facts before native open.
     pub(crate) async fn reconcile_launches_once(&self) -> Result<Value> {
         let batch = self
-            .run(move |db| next_launch_reconcile_batch(db, 8))
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                launcher_native_mcp::isolate_corrupt_launch_records(&tx, model::now_ms()?, 16)?;
+                let batch = next_launch_reconcile_batch(&tx, 8)?;
+                tx.commit()?;
+                Ok(batch)
+            })
             .await?;
         let Some(scan_cursor) = batch.cursor else {
             self.changed.send_modify(|n| *n = n.wrapping_add(1));
