@@ -579,7 +579,7 @@ impl Read for ProbeHelperStdout {
 
 impl PollableRead for ProbeHelperStdout {
     fn make_nonblocking(&self) -> std::io::Result<()> {
-        Ok(())
+        self.0.make_nonblocking()
     }
 
     fn read_available(
@@ -1284,7 +1284,7 @@ fn command_output_with_cleanup(
         if custody.cleanup_complete {
             let mut response_group_empty_proven = false;
             let output = custody.into_output().and_then(|bytes| {
-                let response = decode_probe_response(&bytes)?;
+                let response = decode_completed_probe_response(&bytes, &mut temp_guard)?;
                 if !response.group_empty {
                     retain_probe_partial(&temp_guard.0, "stdout.partial", &response.stdout)?;
                     retain_probe_partial(&temp_guard.0, "stderr.partial", &response.stderr)?;
@@ -1507,6 +1507,23 @@ fn decode_probe_response(bytes: &[u8]) -> Result<ProbeResponse> {
     })
 }
 
+/// Decode a response only after `ProbeHelperCustody::into_output` has proved
+/// direct exit, exact native-family departure and completed capture. A damaged
+/// frame can then discard its private files without retaining an unreachable
+/// temp directory or weakening the response parser.
+fn decode_completed_probe_response(
+    bytes: &[u8],
+    temp_guard: &mut TempProbeDir,
+) -> Result<ProbeResponse> {
+    match decode_probe_response(bytes) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            temp_guard.allow_cleanup();
+            Err(error)
+        }
+    }
+}
+
 struct ProbeOwner {
     group: Group,
 }
@@ -1557,7 +1574,9 @@ impl ProbeOwner {
 
 fn probe_initial_cleanup_grace() -> Duration {
     #[cfg(test)]
-    if std::env::var("HOOK_GIT_PROBE_FIXTURE_MODE").as_deref() == Ok("descendant") {
+    if std::env::var("HOOK_GIT_PROBE_FIXTURE_MODE").as_deref() == Ok("descendant")
+        || std::env::var("ELIOT_PROBE_CUSTODY_FIXTURE_GRACE").as_deref() == Ok("nested")
+    {
         return Duration::from_secs(2);
     }
     PROBE_CLEANUP_RETRY
@@ -3139,5 +3158,481 @@ mod tests {
                 "warnings"
             ]
         );
+    }
+
+    const PROBE_CUSTODY_REQUEST_ENV: &str = "ELIOT_PROBE_CUSTODY_REQUEST";
+    const PROBE_CUSTODY_CONTROL_ENV: &str = "ELIOT_PROBE_CUSTODY_CONTROL_DIR";
+    const PROBE_CUSTODY_TARGET_ENV: &str = "ELIOT_PROBE_CUSTODY_TARGET_ENTRY";
+    const PROBE_CUSTODY_DESCENDANT_ENV: &str = "ELIOT_PROBE_CUSTODY_DESCENDANT_ENTRY";
+
+    fn probe_custody_file(control: &Path, name: &str) -> PathBuf {
+        control.join(name)
+    }
+
+    fn write_probe_custody_identity(path: &Path, pid: u32) {
+        let identity = crate::platform::process_group::process_birth_identity(pid)
+            .expect("observe process birth identity")
+            .expect("process must be live when its identity is recorded");
+        fs::write(
+            path,
+            serde_json::to_vec(&identity).expect("serialize process birth identity"),
+        )
+        .expect("persist process birth identity");
+    }
+
+    fn read_probe_custody_identity(path: &Path) -> Value {
+        serde_json::from_slice(&fs::read(path).expect("read process birth identity"))
+            .expect("decode process birth identity")
+    }
+
+    fn wait_probe_custody_file(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        path.exists()
+    }
+
+    #[test]
+    fn probe_nested_helper_entry() {
+        let Some(request) = std::env::var_os(PROBE_CUSTODY_REQUEST_ENV) else {
+            return;
+        };
+        let result = run_probe(Path::new(&request));
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+
+    #[test]
+    fn probe_nested_target_entry() {
+        if std::env::var(PROBE_CUSTODY_TARGET_ENV).as_deref() != Ok("1") {
+            return;
+        }
+        let control = PathBuf::from(
+            std::env::var_os(PROBE_CUSTODY_CONTROL_ENV).expect("probe custody control directory"),
+        );
+        write_probe_custody_identity(
+            &probe_custody_file(&control, "target.identity.json"),
+            std::process::id(),
+        );
+        let executable = std::env::current_exe().expect("test executable path");
+        let descendant = Command::new(executable)
+            .args([
+                "--exact",
+                "checks::inputs::tests::probe_nested_descendant_entry",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(PROBE_CUSTODY_CONTROL_ENV, &control)
+            .env(PROBE_CUSTODY_DESCENDANT_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn real nested probe descendant");
+        write_probe_custody_identity(
+            &probe_custody_file(&control, "descendant.identity.json"),
+            descendant.id(),
+        );
+        assert!(wait_probe_custody_file(
+            &probe_custody_file(&control, "descendant.ready"),
+            Duration::from_secs(5)
+        ));
+        fs::write(probe_custody_file(&control, "target.ready"), b"ready")
+            .expect("publish target readiness");
+        assert!(wait_probe_custody_file(
+            &probe_custody_file(&control, "target.exit"),
+            Duration::from_secs(10)
+        ));
+        std::io::stdout()
+            .write_all(b"probe-nested-direct-output\n")
+            .expect("write direct probe bytes");
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn probe_nested_descendant_entry() {
+        if std::env::var(PROBE_CUSTODY_DESCENDANT_ENV).as_deref() != Ok("1") {
+            return;
+        }
+        let control = PathBuf::from(
+            std::env::var_os(PROBE_CUSTODY_CONTROL_ENV).expect("probe custody control directory"),
+        );
+        fs::write(probe_custody_file(&control, "descendant.ready"), b"ready")
+            .expect("publish nested descendant readiness");
+        assert!(wait_probe_custody_file(
+            &probe_custody_file(&control, "descendant.exit"),
+            Duration::from_secs(15)
+        ));
+        std::io::stdout()
+            .write_all(b"probe-nested-descendant-output\n")
+            .expect("write nested descendant bytes");
+    }
+
+    struct ProbeCustodyFixture {
+        directory: PathBuf,
+        control: PathBuf,
+        helper_pid: u32,
+    }
+
+    impl ProbeCustodyFixture {
+        fn cleanup(&self) {
+            for name in ["target.exit", "descendant.exit"] {
+                let _ = fs::write(probe_custody_file(&self.control, name), b"release");
+            }
+            let owner_path = self.directory.join("probe-owner.json");
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut family_empty = false;
+            while Instant::now() < deadline {
+                if let Ok(bytes) = fs::read(&owner_path) {
+                    if let Ok(identity) = serde_json::from_slice::<Value>(&bytes)
+                        && let Ok(token) = probe_group_token(&identity)
+                        && departed_empty(&identity, &token).is_ok_and(|empty| empty)
+                    {
+                        family_empty = true;
+                        break;
+                    }
+                } else if !owner_path.exists()
+                    && crate::platform::process_group::process_birth_identity(self.helper_pid)
+                        .is_ok_and(|identity| identity.is_none())
+                {
+                    family_empty = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if family_empty {
+                let _ = fs::remove_dir_all(&self.directory);
+                let _ = fs::remove_dir_all(&self.control);
+            }
+        }
+    }
+
+    impl Drop for ProbeCustodyFixture {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn probe_custody_keeps_nested_family_and_capture_until_exact_departure() {
+        let directory =
+            std::env::temp_dir().join(format!("swarm-probe-custody-{}", model::new_id()));
+        let control = std::env::temp_dir().join(format!("swarm-probe-control-{}", model::new_id()));
+        fs::create_dir(&directory).expect("create probe protocol directory");
+        fs::create_dir(&control).expect("create probe control directory");
+        let request_path = directory.join("request.json");
+        let response_path = directory.join(PROBE_HELPER_RESPONSE_FILE);
+        let request = ProbeRequest {
+            probe_version: PROBE_VERSION,
+            program: std::env::current_exe().expect("test executable path"),
+            args: vec![
+                "--exact".into(),
+                "checks::inputs::tests::probe_nested_target_entry".into(),
+                "--quiet".into(),
+                "--nocapture".into(),
+            ],
+            cwd: std::env::current_dir().expect("test working directory"),
+            timeout_ms: PROBE_TIMEOUT_MS,
+            stdout_limit: PROBE_STDOUT_LIMIT,
+            stderr_limit: PROBE_STDERR_LIMIT,
+        };
+        fs::write(
+            &request_path,
+            model::canonical(&json!({"check_probe":request})).expect("encode nested probe request"),
+        )
+        .expect("write nested probe request");
+        let response_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&response_path)
+            .expect("create helper response capture");
+        let executable = std::env::current_exe().expect("test executable path");
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "checks::inputs::tests::probe_nested_helper_entry",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(PROBE_CUSTODY_REQUEST_ENV, &request_path)
+            .env(PROBE_CUSTODY_CONTROL_ENV, &control)
+            .env(PROBE_CUSTODY_TARGET_ENV, "1")
+            .env("ELIOT_PROBE_CUSTODY_FIXTURE_GRACE", "nested")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn real CheckRunner probe helper");
+        let helper_pid = child.id();
+        let fixture = ProbeCustodyFixture {
+            directory: directory.clone(),
+            control: control.clone(),
+            helper_pid,
+        };
+        let launch_identity = spawned_identity(helper_pid).expect("capture helper launch identity");
+        let stdout = child.stdout.take().expect("capture helper stdout pipe");
+        let custody = ProbeHelperCustody {
+            child,
+            child_pid: helper_pid,
+            launch_identity: Some(launch_identity.clone()),
+            stdout: Some(stdout),
+            response_file: Some(response_file),
+            capture: None,
+            directory: directory.clone(),
+            family_identity: None,
+            family_token: None,
+            exit_status: None,
+            status_observation_failed: false,
+            capture_setup_failed: false,
+            response_group_empty: None,
+            family_departed_proven: false,
+            cleanup_complete: false,
+        };
+        let profile = profile(false);
+        let candidate = source(
+            &model::digest(b"probe-custody-candidate"),
+            "probe-custody-candidate",
+        );
+        let scope = ProbeCleanupScope::for_candidate(&profile, &candidate)
+            .expect("derive exact CheckRunner resource/workspace scope");
+        let mut owner = ProbeCleanupOwner {
+            custody,
+            scope: Some(scope.clone()),
+        };
+
+        let target_identity_path = probe_custody_file(&control, "target.identity.json");
+        let descendant_identity_path = probe_custody_file(&control, "descendant.identity.json");
+        let target_ready_path = probe_custody_file(&control, "target.ready");
+        let identities_deadline = Instant::now() + Duration::from_secs(10);
+        while (!target_identity_path.exists()
+            || !descendant_identity_path.exists()
+            || !target_ready_path.exists())
+            && Instant::now() < identities_deadline
+        {
+            owner.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            target_identity_path.exists(),
+            "target process published its exact identity"
+        );
+        assert!(
+            descendant_identity_path.exists(),
+            "nested process published its exact identity"
+        );
+        assert!(
+            target_ready_path.exists(),
+            "target and nested process are ready"
+        );
+        let target_identity = read_probe_custody_identity(&target_identity_path);
+        let descendant_identity = read_probe_custody_identity(&descendant_identity_path);
+        let target_pid = target_identity["pid"].as_u64().unwrap() as u32;
+        let descendant_pid = descendant_identity["pid"].as_u64().unwrap() as u32;
+        assert_eq!(
+            crate::platform::process_group::process_birth_identity(descendant_pid)
+                .expect("observe nested process identity"),
+            Some(descendant_identity.clone()),
+            "the nested process is a live, exact native process instance"
+        );
+
+        fs::write(probe_custody_file(&control, "target.exit"), b"exit")
+            .expect("allow direct probe process to exit");
+        let target_exit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            owner.poll();
+            let current = crate::platform::process_group::process_birth_identity(target_pid)
+                .expect("observe direct process exit");
+            if current.as_ref() != Some(&target_identity) {
+                break;
+            }
+            assert!(
+                Instant::now() < target_exit_deadline,
+                "direct probe process must exit"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            crate::platform::process_group::process_birth_identity(descendant_pid)
+                .expect("observe nested process remains live"),
+            Some(descendant_identity.clone()),
+            "the nested process outlives the observed direct exit"
+        );
+        let family_identity = owner
+            .custody
+            .family_identity
+            .as_ref()
+            .expect("retain helper's native family identity")
+            .clone();
+        let family_token = owner
+            .custody
+            .family_token
+            .as_deref()
+            .expect("retain helper's native family token")
+            .to_owned();
+        assert!(
+            !departed_empty(&family_identity, &family_token).expect("observe live helper family")
+        );
+        assert!(
+            owner.is_pending(),
+            "live nested process retains CheckRunner custody"
+        );
+        assert_eq!(owner.scope(), Some(&scope));
+        assert!(
+            owner.conflicts_with(None),
+            "unidentified incoming scope fails closed"
+        );
+        let mut same_resource_profile = profile.clone();
+        same_resource_profile.profile_id = "different-profile".into();
+        let same_resource_scope =
+            ProbeCleanupScope::for_candidate(&same_resource_profile, &candidate)
+                .expect("derive same-resource scope");
+        assert!(owner.conflicts_with(Some(&same_resource_scope)));
+        let mut independent_profile = profile.clone();
+        independent_profile.resource = "independent-checks".into();
+        let independent_scope = ProbeCleanupScope::for_candidate(&independent_profile, &candidate)
+            .expect("derive independent resource scope");
+        assert!(!owner.conflicts_with(Some(&independent_scope)));
+        owner.poll();
+
+        fs::write(probe_custody_file(&control, "descendant.exit"), b"exit")
+            .expect("allow nested process to exit");
+        let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+        while owner.is_pending() && Instant::now() < cleanup_deadline {
+            owner.poll();
+            if owner.is_pending() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            !owner.is_pending(),
+            "capture EOF and native family departure release custody"
+        );
+        let helper_status = owner
+            .custody
+            .exit_status
+            .as_ref()
+            .expect("observe helper exit");
+        assert!(
+            helper_status.success(),
+            "helper exit status is observed and successful: {helper_status}"
+        );
+        assert!(owner.custody.family_departed_proven);
+        assert!(
+            departed_empty(&family_identity, &family_token)
+                .expect("observe exact family departure")
+        );
+        assert!(
+            crate::platform::process_group::process_birth_identity(descendant_pid)
+                .expect("observe nested process departure")
+                .as_ref()
+                != Some(&descendant_identity)
+        );
+        let capture = owner
+            .custody
+            .capture
+            .take()
+            .expect("retain helper capture receipt");
+        let capture_receipt = capture.finish();
+        assert!(capture_receipt.capture_complete);
+        assert!(!capture_receipt.truncated);
+        assert!(capture_receipt.capture_error.is_none());
+        let response_bytes = read_bounded(
+            File::open(&response_path).expect("open captured probe response"),
+            PROBE_RESPONSE_LIMIT,
+        )
+        .expect("read bounded probe response");
+        // libtest writes a runner preamble to the helper stdout around the real
+        // protocol frame; isolate that frame for assertions while leaving owner
+        // classification fail-closed on the unmodified captured bytes.
+        let frame_start = response_bytes
+            .windows(PROBE_MAGIC.len())
+            .position(|window| window == PROBE_MAGIC)
+            .expect("find actual helper response frame in captured bytes");
+        const RESPONSE_HEADER_LEN: usize = 8 + 1 + 4 + 4 + 4 + 2;
+        let header_end = frame_start + RESPONSE_HEADER_LEN;
+        assert!(header_end <= response_bytes.len());
+        let stdout_len = u32::from_le_bytes(
+            response_bytes[frame_start + 13..frame_start + 17]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let stderr_len = u32::from_le_bytes(
+            response_bytes[frame_start + 17..frame_start + 21]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let message_len = u16::from_le_bytes(
+            response_bytes[frame_start + 21..frame_start + 23]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let frame_end = header_end + stdout_len + stderr_len + message_len;
+        assert_eq!(
+            frame_end,
+            response_bytes.len(),
+            "response frame consumes the helper tail"
+        );
+        let response = decode_probe_response(&response_bytes[frame_start..frame_end])
+            .expect("decode actual nested probe response");
+        assert_eq!(
+            owner.custody.response_group_empty, None,
+            "unframed helper bytes do not become cleanup proof"
+        );
+        assert!(
+            !response.success,
+            "a direct exit with a live descendant is not clean success"
+        );
+        assert_eq!(response.exit_code, Some(0));
+        assert!(response.group_empty);
+        assert!(
+            response
+                .message
+                .contains("left descendants after its command exited")
+        );
+        assert!(String::from_utf8_lossy(&response.stdout).contains("probe-nested-direct-output"));
+        assert!(
+            String::from_utf8_lossy(&response.stdout).contains("probe-nested-descendant-output")
+        );
+        let mut cleanup_guard = TempProbeDir(directory.clone(), true);
+        let malformed_frame_error =
+            decode_completed_probe_response(&response_bytes[..frame_start], &mut cleanup_guard)
+                .expect_err("the libtest preamble remains an invalid protocol frame");
+        assert_eq!(malformed_frame_error.code, "CHECK_INPUT_RESOLUTION");
+        assert!(
+            !cleanup_guard.1,
+            "proven native departure makes malformed capture cleanup safe"
+        );
+        let evidence = json!({
+            "helper_pid":helper_pid,
+            "helper_launch_identity":launch_identity,
+            "family_identity":family_identity,
+            "family_token":family_token,
+            "target_identity":target_identity,
+            "descendant_identity":descendant_identity,
+            "target_exit_observed_before_descendant_release":true,
+            "descendant_departed":true,
+            "probe_exit_code":response.exit_code,
+            "helper_exit_code":helper_status.code(),
+            "capture_bytes_written":capture_receipt.bytes_written,
+            "capture_bytes_observed":capture_receipt.bytes_observed,
+            "capture_sha256":capture_receipt.sha256,
+            "capture_complete":capture_receipt.capture_complete,
+            "capture_truncated":capture_receipt.truncated,
+            "owner_pending_before_release":true,
+            "owner_pending_after_release":owner.is_pending(),
+            "unknown_full_stream_response_disposition":owner.custody.response_group_empty.is_none(),
+            "malformed_frame_cleanup_allowed":!cleanup_guard.1,
+            "resource":scope.resource.clone(),
+            "workspace_identity":scope.workspace_identity.clone(),
+        });
+        eprintln!("probe_custody_evidence={evidence}");
+        drop(owner);
+        drop(cleanup_guard);
+        assert!(
+            !directory.exists(),
+            "completed malformed capture directory is removed"
+        );
+        drop(fixture);
     }
 }
