@@ -3396,4 +3396,264 @@ mod connected_store {
         .await;
         f.close().await;
     }
+    // PR49 row 4 tail: the coalesced task.dispatch reuse keeps binding NULL
+    // and grants nothing to foreign readers. dispatch_fixture already proves
+    // the owner's closed receipt; this tail proves B/observer gain no grant.
+    #[tokio::test]
+    async fn store_authenticated_coalesced_dispatch_hides_binding_from_foreign() {
+        let f = start().await;
+        let descriptor = fixture_descriptor();
+        let (binding, module) = open_fixture_module(&f, &descriptor).await;
+        let store = &f.owner.store;
+        let target = dispatch_fixture(&f, &descriptor, &binding, &module, "coalesced-tail").await;
+        let attempt_id = target["attempt_id"].as_str().unwrap().to_owned();
+        let attempt = call(
+            store,
+            &f.manager_a,
+            "attempt.get",
+            json!({"attempt_id": attempt_id}),
+        )
+        .await;
+        let task_id = attempt["task_id"].clone();
+        let reused = write(
+            store,
+            &f.manager_a,
+            "task.dispatch",
+            json!({
+                "attempt_id": attempt_id,
+                "text": DISPATCH_TEXT,
+            }),
+        )
+        .await;
+        assert_eq!(reused["semantic_reuse"], true);
+        assert_eq!(reused["start_operation_id"], target["operation_id"]);
+        for operation_id in [&target["operation_id"], &reused["operation_id"]] {
+            let receipt = call(
+                store,
+                &f.manager_a,
+                "operation.get",
+                json!({"operation_id": operation_id}),
+            )
+            .await;
+            assert_eq!(receipt["task_id"], task_id);
+            assert_eq!(receipt["attempt_id"], attempt_id);
+            assert!(receipt["binding_id"].is_null());
+            assert!(receipt["binding_generation"].is_null());
+            assert_closed_receipt(&receipt);
+            denied(
+                store,
+                &f.manager_b,
+                "operation.get",
+                json!({"operation_id": operation_id}),
+                "NOT_FOUND",
+            )
+            .await;
+            denied(
+                store,
+                &f.observer,
+                "operation.get",
+                json!({"operation_id": operation_id}),
+                "NOT_FOUND",
+            )
+            .await;
+        }
+        denied(
+            store,
+            &f.manager_b,
+            "task.get",
+            json!({"task_id": task_id}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "attempt.get",
+            json!({"attempt_id": attempt_id}),
+            "NOT_FOUND",
+        )
+        .await;
+        f.close().await;
+    }
+    // PR51 row 4 tail: the sponsored reviewer keeps only its exact assigned
+    // submission/review evidence. The rest of the Task graph stays denied,
+    // and unrelated inspectors gain nothing from attempt IDs alone.
+    // This also closes the unrelated swarm.agent.inspect denial row.
+    #[tokio::test]
+    async fn store_authenticated_sponsored_reviewer_rest_graph_and_inspect_denied() {
+        let f = start().await;
+        let store = &f.owner.store;
+        let owner_id = f.manager_a.client_id.clone();
+        let subject = seed_review_subject(store, &owner_id, "tail-rest").await;
+        let reviewer_id = "scope-tail-reviewer";
+        let reviewer_token = "scope-tail-reviewer-token".to_owned();
+        let pending_scope = json!({
+            "review_assignment_id": null,
+            "task_id": "task-review-tail-rest",
+            "attempt_id": "attempt-review-tail-rest",
+            "task_revision": 1,
+            "submission_ref": subject.submission_ref,
+            "candidate_ref": subject.candidate_ref,
+        });
+        write(
+            store,
+            &f.manager_a,
+            "coordination.participant.register",
+            json!({
+                "client_request_id": format!("register-{reviewer_id}"),
+                "client_id": reviewer_id,
+                "token_hash": model::digest(reviewer_token.as_bytes()),
+                "task_id": "task-review-tail-rest",
+                "task_revision": 1,
+                "attempt_id": "attempt-review-tail-rest",
+                "participation_basis": {"kind": "sponsored_reviewer", "review_scope": pending_scope},
+            }),
+        )
+        .await;
+        let assignment = write(
+            store,
+            &f.manager_a,
+            "review.assign",
+            json!({
+                "client_request_id": format!("assign-{reviewer_id}"),
+                "attempt_id": "attempt-review-tail-rest",
+                "expected_revision": 1,
+                "submission_ref": subject.submission_ref,
+                "candidate_ref": subject.candidate_ref,
+                "reviewer_client_id": reviewer_id,
+            }),
+        )
+        .await;
+        let assignment_id = assignment["review_assignment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let reviewer = store
+            .authenticate(Credential {
+                client_id: reviewer_id.into(),
+                token: reviewer_token,
+            })
+            .await
+            .unwrap();
+        let view = call(
+            store,
+            &reviewer,
+            "review.get",
+            json!({"review_assignment_id": assignment_id}),
+        )
+        .await;
+        assert_eq!(view["assignment"]["reviewer_client_id"], reviewer_id);
+        denied(
+            store,
+            &reviewer,
+            "task.get",
+            json!({"task_id": "task-review-tail-rest"}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &reviewer,
+            "attempt.get",
+            json!({"attempt_id": "attempt-review-tail-rest"}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &reviewer,
+            "operation.get",
+            json!({"operation_id": "submit-op-tail-rest"}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &reviewer,
+            "swarm.agent.inspect",
+            json!({"attempt_id": "attempt-review-tail-rest"}),
+            "FORBIDDEN",
+        )
+        .await;
+        denied(
+            store,
+            &f.observer,
+            "swarm.agent.inspect",
+            json!({"attempt_id": "attempt-review-tail-rest"}),
+            "FORBIDDEN",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "swarm.agent.inspect",
+            json!({"attempt_id": "attempt-review-tail-rest"}),
+            "FORBIDDEN",
+        )
+        .await;
+        denied(
+            store,
+            &f.observer,
+            "task.get",
+            json!({"task_id": "task-review-tail-rest"}),
+            "NOT_FOUND",
+        )
+        .await;
+        denied(
+            store,
+            &f.manager_b,
+            "task.get",
+            json!({"task_id": "task-review-tail-rest"}),
+            "NOT_FOUND",
+        )
+        .await;
+        f.close().await;
+    }
+    // PR51 row 6 / PR52 row 5 tail: task.list and report.delta filter foreign
+    // rows without skipping later visible items, leaking counts, or claiming
+    // complete coverage after a bounded gap. Partial pages stay honest.
+    #[tokio::test]
+    async fn store_authenticated_task_list_delta_filter_and_partial_page() {
+        let f = start().await;
+        let store = &f.owner.store;
+        let a = create(store, &f.manager_a, "tail-list-a").await;
+        let _attempt_a = claim(store, &f.manager_a, &a, None).await;
+        let b = create(store, &f.manager_b, "tail-list-b").await;
+        let _attempt_b = claim(store, &f.manager_b, &b, None).await;
+        let later_a = create(store, &f.manager_a, "tail-list-later-a").await;
+        let _later_attempt_a = claim(store, &f.manager_a, &later_a, None).await;
+        let first = call(store, &f.manager_a, "task.list", json!({"limit": 1})).await;
+        assert!(first.get("filtered_count").is_none());
+        assert_eq!(first["items"].as_array().unwrap().len(), 1);
+        assert_eq!(first["items"][0]["task_id"], a["task_id"]);
+        let second = call(
+            store,
+            &f.manager_a,
+            "task.list",
+            json!({"limit": 1, "after": first["next_after"]}),
+        )
+        .await;
+        assert!(second.get("filtered_count").is_none());
+        assert_eq!(second["items"][0]["task_id"], later_a["task_id"]);
+        let second_json = model::canonical(&second).unwrap();
+        assert!(!second_json.contains(b["task_id"].as_str().unwrap()));
+        let own_b = call(store, &f.manager_b, "task.list", json!({"limit": 10})).await;
+        assert!(own_b.get("filtered_count").is_none());
+        assert_eq!(own_b["items"].as_array().unwrap().len(), 1);
+        assert_eq!(own_b["items"][0]["task_id"], b["task_id"]);
+        let observer_tasks = call(store, &f.observer, "task.list", json!({"limit": 10})).await;
+        assert!(observer_tasks["items"].as_array().unwrap().is_empty());
+        let delta = call(store, &f.manager_a, "report.delta", json!({"limit": 50})).await;
+        assert!(delta["projection"]["range"].get("filtered_count").is_none());
+        let delta_json = model::canonical(&delta).unwrap();
+        assert!(!delta_json.contains(b["task_id"].as_str().unwrap()));
+        assert!(delta_json.contains(later_a["operation_id"].as_str().unwrap()));
+        let first_ops = call(store, &f.manager_a, "operation.list", json!({"limit": 2})).await;
+        assert!(first_ops.get("filtered_count").is_none());
+        assert_eq!(first_ops["items"].as_array().unwrap().len(), 2);
+        for entry in first_ops["items"].as_array().unwrap() {
+            assert_closed_receipt(entry);
+        }
+        f.close().await;
+    }
 }
