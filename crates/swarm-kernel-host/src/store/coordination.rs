@@ -300,7 +300,13 @@ pub(crate) fn watch_creator_authorized_for_subject(
                     {
                         return Ok(false);
                     }
-                    match verify_review_assignment(db, creator_id, &registration, scope) {
+                    match verify_review_assignment(
+                        db,
+                        creator_id,
+                        &registration,
+                        scope,
+                        ReviewAssignmentVerification::Current,
+                    ) {
                         Ok(()) => Ok(true),
                         Err(error) if is_stale_watch_authority(&error) => Ok(false),
                         Err(error) => Err(error),
@@ -581,6 +587,7 @@ pub(crate) fn require_review_scope(
         principal.client_id.as_str(),
         &current.registration,
         &scope,
+        ReviewAssignmentVerification::Current,
     )
 }
 
@@ -615,7 +622,13 @@ pub(crate) fn require_historical_review_result_scope(
         ));
     }
     validate_retained_review_tuple(db, &scope)?;
-    verify_review_assignment(db, &principal.client_id, &registration, &scope)
+    verify_review_assignment(
+        db,
+        &principal.client_id,
+        &registration,
+        &scope,
+        ReviewAssignmentVerification::HistoricalFirstResult,
+    )
 }
 
 /// Canonical typed message request -> existing raw mailbox request. The caller
@@ -1022,7 +1035,13 @@ fn validate_participation_basis(
             if historical_review {
                 validate_retained_review_tuple(db, &scope)?;
             } else {
-                verify_review_assignment(db, client_id, registration, &scope)?;
+                verify_review_assignment(
+                    db,
+                    client_id,
+                    registration,
+                    &scope,
+                    ReviewAssignmentVerification::Current,
+                )?;
             }
         }
         _ => {
@@ -1998,11 +2017,26 @@ fn validate_retained_review_tuple(db: &Connection, scope: &Value) -> Result<()> 
     Ok(())
 }
 
+/// Exact purpose of one review-assignment verification.
+///
+/// `Current` is the strict live authority used by packet/context, ordinary
+/// review actions, watch authority and participation-basis checks: the live
+/// review:slot pointer must name this exact assignment.
+/// `HistoricalFirstResult` is reserved for the retained-assignment result
+/// path, where an exact immutable assignment may already have been retired
+/// by a replacement before its first result was written.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+enum ReviewAssignmentVerification {
+    Current,
+    HistoricalFirstResult,
+}
+
 fn verify_review_assignment(
     db: &Connection,
     reviewer_client_id: &str,
     registration: &Value,
     scope: &Value,
+    purpose: ReviewAssignmentVerification,
 ) -> Result<()> {
     let assignment_id = model::text(scope, "review_assignment_id")?;
     let event_key = format!("assignment:{assignment_id}");
@@ -2037,7 +2071,16 @@ fn verify_review_assignment(
     let identity: crate::review::ReviewSlotIdentity =
         serde_json::from_value(observation["identity"].clone())?;
     let current_slot = meta(db, &format!("review:slot:{}", identity.digest()?))?;
-    if !current_slot.is_some_and(|slot| slot["review_assignment_id"] == assignment_id) {
+    let lives_current_slot =
+        current_slot.is_some_and(|slot| slot["review_assignment_id"] == assignment_id);
+    // Purpose-gated retained-assignment exception. Only the exact
+    // HistoricalFirstResult caller may let an already-retired assignment pass,
+    // and only while that assignment has no retained result yet. Every Current
+    // caller keeps the strict live-slot requirement.
+    let historical_first_result_allowed = !lives_current_slot
+        && !retained_review_result_exists(db, assignment_id)?
+        && purpose == ReviewAssignmentVerification::HistoricalFirstResult;
+    if !lives_current_slot && !historical_first_result_allowed {
         return Err(Error::new(
             "STALE_REVIEW_ASSIGNMENT",
             "reviewer assignment has been replaced for this exact slot",
@@ -2074,6 +2117,26 @@ fn verify_review_assignment(
         ));
     }
     Ok(())
+}
+
+/// Whether this exact assignment already retained a review result observation.
+///
+/// This is the one-result-per-assignment guard for the purpose-specific
+/// retained-assignment relaxation in `verify_review_assignment`. It reads only
+/// retained `review.result` existence, so the semantic-input comparison and
+/// `REVIEW_RESULT_CONFLICT` refusal in `reviews::reserve_submit` remain the sole
+/// authority for what a second result may contain.
+fn retained_review_result_exists(db: &Connection, assignment_id: &str) -> Result<bool> {
+    let event_key = format!("result:{assignment_id}");
+    let row: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM observations WHERE source_stream_id=?1 AND source_event_key=?2 \
+             AND kind='review.result'",
+            params!["controller:review", event_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(row.is_some())
 }
 
 fn review_record_matches(

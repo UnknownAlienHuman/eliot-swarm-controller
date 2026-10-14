@@ -856,6 +856,314 @@ async fn r35_late_predecessor_excluded_from_consumers() {
 }
 
 #[tokio::test]
+async fn r35_first_late_result_of_unanswered_retired_assignment_is_retained_historical() {
+    // R09 O11 normative rows:
+    //   "Review replacement | Inconclusive slot can be deliberately reassigned after
+    //    prior disposition; late result cannot author the new attempt."
+    //   "Late/revoked result | Trusted old evidence retained historically; new effects
+    //    remain forbidden; unauthenticated verdict rejected."
+    // This row is the *unanswered predecessor* case: the assigned reviewer never
+    // answered before the slot was reassigned, so its first result arrives after the
+    // replacement retired the assignment. That trusted first result must be retained
+    // as historical evidence and must not authorize any downstream effect.
+    let (owner, directory, _credential) = start_store("late-unanswered").await;
+    let store = &owner.store;
+    seed_manager(store).await;
+    configure_entry(
+        store,
+        vec![
+            crate::automation::actions::AutomationStep::ReviewDisposition,
+            crate::automation::actions::AutomationStep::Acceptance,
+            crate::automation::actions::AutomationStep::RepairDispatch,
+        ],
+    )
+    .await;
+    let subject = seed_subject(store, "r35-late-unanswered").await;
+    let s = &subject;
+    let (f1_id, f1_token) = (reviewer_id(15), reviewer_token(15));
+    let (f2_id, f2_token) = (reviewer_id(16), reviewer_token(16));
+    register(store, s, &f1_id, &f1_token).await;
+    register(store, s, &f2_id, &f2_token).await;
+    // The predecessor keeps its exact active slot and never answers it.
+    let (f1, a1) = assign(
+        store,
+        s,
+        &f1_id,
+        &f1_token,
+        "r35-late-unanswered-assign-1",
+        None,
+    )
+    .await;
+    assert_eq!(
+        review_get(store, manager(), &a1).await["current_slot"],
+        true
+    );
+    // A distinct reviewer replaces the still-unanswered assignment.
+    let (_f2, a2) = assign(
+        store,
+        s,
+        &f2_id,
+        &f2_token,
+        "r35-late-unanswered-assign-2",
+        Some(&a1),
+    )
+    .await;
+    assert_eq!(
+        review_get(store, manager(), &a2).await["current_slot"],
+        true
+    );
+    assert_eq!(
+        review_get(store, manager(), &a1).await["current_slot"],
+        false
+    );
+    // The trusted first result of the retired assignment is retained, not refused.
+    let late_op = submit(
+        store,
+        &f1,
+        s,
+        &a1,
+        "r35-late-unanswered-submit",
+        ("pass", "complete"),
+        &[],
+    )
+    .await;
+    let late_view = review_get(store, manager(), &a1).await;
+    assert_eq!(late_view["result"]["verdict"], "pass");
+    assert_eq!(late_view["result"]["operation_id"], late_op);
+    // Retention is historical: it can never become current applicability.
+    assert_eq!(late_view["result"]["applicability"], "historical_candidate");
+    assert_eq!(late_view["current_slot"], false);
+    assert_eq!(late_view["current_candidate"], false);
+    // The successor remains the current slot and current candidate.
+    let successor_view = review_get(store, manager(), &a2).await;
+    assert_eq!(successor_view["current_slot"], true);
+    // The retained historical result cannot authorize acceptance evidence.
+    let acceptance = consume_acceptance(store, &a1, &late_op).await;
+    assert_eq!(acceptance["status"], "not_canonical_result_event");
+    assert_eq!(acceptance["task_accepted"], false);
+    // It cannot authorize feedback authority.
+    let stale_assignment = a1.clone();
+    let stale_result = late_op.clone();
+    let feedback = store
+        .run(move |db| {
+            let tx = db.transaction()?;
+            let entry =
+                crate::automation::config::load_entry(&tx, MANAGER_ID, PROJECT_ID, AUTOMATION_ID)?
+                    .unwrap();
+            let result = super::automation_disposition::consume_review_result_for_entry(
+                &tx,
+                &Config::default(),
+                &entry,
+                &stale_assignment,
+                &stale_result,
+                model::now_ms()?,
+            )?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+        .unwrap();
+    assert_eq!(feedback["status"], "skipped");
+    assert_eq!(feedback["reason"], "historical_review_result");
+    assert_eq!(feedback["disposition_applied"], false);
+    // It cannot become repair CorrectionPackage input.
+    let repair = consume_repair(store, &a1, &late_op).await;
+    assert_eq!(repair["status"], "skipped");
+    assert_eq!(repair["reason"], "historical_review_result");
+    // One immutable result stays immutable: a second, differing result is refused.
+    // One immutable result stays immutable. Once the first result is retained,
+    // the purpose-specific relaxation no longer applies, so a second, differing
+    // result is refused at the same live-slot gate rather than minting a second
+    // result for one assignment.
+    let second = store
+        .call(
+            f1,
+            "review.submit".into(),
+            json!({
+                "client_request_id":"r35-late-unanswered-submit-2",
+                "review_assignment_id":a1,
+                "submission_ref":s.2,
+                "candidate_ref":s.3,
+                "verdict":"inconclusive",
+                "coverage":"partial",
+                "findings":[],
+                "evidence_refs":["evidence://review/r35"],
+            }),
+        )
+        .await
+        .expect_err("a second differing result must stay forbidden");
+    assert_eq!(second.code.as_str(), "STALE_REVIEW_ASSIGNMENT");
+    // An unrelated participant cannot submit into the retired slot either.
+    let fx_id = reviewer_id(17);
+    let fx_token = reviewer_token(17);
+    register(store, s, &fx_id, &fx_token).await;
+    let fx = auth(store, &fx_id, &fx_token).await;
+    let forbidden = store
+        .call(
+            fx,
+            "review.submit".into(),
+            json!({
+                "client_request_id":"r35-late-unanswered-submit-3",
+                "review_assignment_id":a1,
+                "submission_ref":s.2,
+                "candidate_ref":s.3,
+                "verdict":"pass",
+                "coverage":"complete",
+                "findings":[],
+                "evidence_refs":["evidence://review/r35"],
+            }),
+        )
+        .await
+        .expect_err("an unrelated reviewer must stay denied");
+    assert_eq!(forbidden.code.as_str(), "FORBIDDEN");
+    drop(owner);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// Negative public proof for the window between a replacement retiring an
+/// unanswered assignment and its first late result. Every current-scope surface
+/// must deny the retired reviewer in that window; only the actual
+/// review.submit historical-first-result path may proceed, and its retained
+/// result then stays excluded from every consumer.
+#[tokio::test]
+async fn r35_retired_unanswered_reviewer_has_no_current_grants_before_its_late_result() {
+    let (owner, directory, _credential) = start_store("late-window").await;
+    let store = &owner.store;
+    seed_manager(store).await;
+    configure_entry(
+        store,
+        vec![
+            crate::automation::actions::AutomationStep::ReviewDisposition,
+            crate::automation::actions::AutomationStep::Acceptance,
+            crate::automation::actions::AutomationStep::RepairDispatch,
+        ],
+    )
+    .await;
+    let subject = seed_subject(store, "r35-late-window").await;
+    let s = &subject;
+    let (f1_id, f1_token) = (reviewer_id(15), reviewer_token(15));
+    let (f2_id, f2_token) = (reviewer_id(16), reviewer_token(16));
+    register(store, s, &f1_id, &f1_token).await;
+    register(store, s, &f2_id, &f2_token).await;
+    let (f1, a1) = assign(
+        store,
+        s,
+        &f1_id,
+        &f1_token,
+        "r35-late-window-assign-1",
+        None,
+    )
+    .await;
+    let (_f2, a2) = assign(
+        store,
+        s,
+        &f2_id,
+        &f2_token,
+        "r35-late-window-assign-2",
+        Some(&a1),
+    )
+    .await;
+    // The window is exactly this state: a1 is retired, a2 is current, and a1 has
+    // no result yet.
+    assert_eq!(
+        review_get(store, manager(), &a1).await["current_slot"],
+        false
+    );
+    assert_eq!(
+        review_get(store, manager(), &a1).await["result"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        review_get(store, manager(), &a2).await["current_slot"],
+        true
+    );
+    // Exact historical assignment readback remains available after retirement.
+    // It must not turn into a current-slot or unrelated-assignment grant.
+    let historical = review_get(store, f1.clone(), &a1).await;
+    assert_eq!(historical["current_slot"], false);
+    assert_eq!(historical["assignment"]["review_assignment_id"], a1);
+    assert_eq!(historical["result"], serde_json::Value::Null);
+    let unrelated = store
+        .call(
+            f1.clone(),
+            "review.get".into(),
+            json!({"review_assignment_id":a2}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unrelated.code, "FORBIDDEN");
+    // Current context and list authority remain unavailable in this window.
+    for (name, call) in [
+        ("swarm.review.context", json!({"review_assignment_id":a1})),
+        ("review.list", json!({})),
+    ] {
+        let denied = store.call(f1.clone(), name.into(), call).await;
+        match denied {
+            Err(error) => assert!(
+                matches!(error.code.as_str(), "FORBIDDEN" | "STALE_REVIEW_ASSIGNMENT"),
+                "{name} must deny the retired reviewer: {error:?}"
+            ),
+            Ok(_) => panic!("{name} must not grant the retired reviewer current scope"),
+        }
+    }
+    // The retired reviewer cannot read the current task submission either.
+    let denied_submission = store
+        .call(f1.clone(), "task.get".into(), json!({"task_id":s.0}))
+        .await;
+    match denied_submission {
+        Err(error) => assert_eq!(
+            error.code, "FORBIDDEN",
+            "task.get must deny the retired reviewer"
+        ),
+        Ok(_) => panic!("task.get must not grant the retired reviewer"),
+    }
+    // Only the actual historical-first-result path proceeds in this window.
+    let late_op = submit(
+        store,
+        &f1,
+        s,
+        &a1,
+        "r35-late-window-submit",
+        ("pass", "complete"),
+        &[],
+    )
+    .await;
+    let late_view = review_get(store, manager(), &a1).await;
+    assert_eq!(late_view["result"]["verdict"], "pass");
+    assert_eq!(late_view["result"]["applicability"], "historical_candidate");
+    assert_eq!(late_view["current_slot"], false);
+    assert_eq!(late_view["current_candidate"], false);
+    // After the result exists the window is closed: even the historical path no
+    // longer relaxes anything, because a result is already retained.
+    let second = store
+        .call(
+            f1.clone(),
+            "review.submit".into(),
+            json!({
+                "client_request_id":"r35-late-window-submit-2",
+                "review_assignment_id":a1,
+                "submission_ref":s.2,
+                "candidate_ref":s.3,
+                "verdict":"inconclusive",
+                "coverage":"partial",
+                "findings":[],
+                "evidence_refs":["evidence://review/r35"],
+            }),
+        )
+        .await
+        .expect_err("a second result must stay forbidden after the first is retained");
+    assert_eq!(second.code.as_str(), "STALE_REVIEW_ASSIGNMENT");
+    // The retained historical result cannot authorize any consumer.
+    let acceptance = consume_acceptance(store, &a1, &late_op).await;
+    assert_eq!(acceptance["status"], "not_canonical_result_event");
+    assert_eq!(acceptance["task_accepted"], false);
+    let repair = consume_repair(store, &a1, &late_op).await;
+    assert_eq!(repair["status"], "skipped");
+    assert_eq!(repair["reason"], "historical_review_result");
+    drop(owner);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+#[tokio::test]
 async fn r35_review_list_pagination_has_no_filtered_skips() {
     let (owner, directory, _credential) = start_store("list").await;
     let store = &owner.store;
@@ -864,6 +1172,7 @@ async fn r35_review_list_pagination_has_no_filtered_skips() {
     let task_b = seed_subject(store, "r35-list-b").await;
     let la = &task_a;
     let lb = &task_b;
+
     let (aa1_id, aa1_token) = (reviewer_id(18), reviewer_token(18));
     let (aa2_id, aa2_token) = (reviewer_id(19), reviewer_token(19));
     let (bb1_id, bb1_token) = (reviewer_id(20), reviewer_token(20));
