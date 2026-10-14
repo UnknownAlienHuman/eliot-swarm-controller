@@ -428,24 +428,22 @@ impl Store {
         let p = principal.clone();
         let v = params.clone();
         let config = self.config.clone();
-        let result = self
-            .run(move |db| {
-                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let p = current_principal(&tx, p)?;
-                let result = super::mutate_in_transaction_with_check_plan(
-                    &tx,
-                    &p,
-                    "check.acknowledge_held",
-                    &v,
-                    &config,
-                    model::now_ms()?,
-                    None,
-                )?;
-                tx.commit()?;
-                result
-            })
-            .await;
-        result
+        self.run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let p = current_principal(&tx, p)?;
+            let result = super::mutate_in_transaction_with_check_plan(
+                &tx,
+                &p,
+                "check.acknowledge_held",
+                &v,
+                &config,
+                model::now_ms()?,
+                None,
+            )?;
+            tx.commit()?;
+            result
+        })
+        .await
     }
 }
 
@@ -1683,7 +1681,7 @@ pub(super) fn held_projection(
             "retained quarantine identity no longer matches the CheckRun source",
         ));
     }
-    let row: Option<(
+    type HeldProjectionRow = (
         String,
         Option<String>,
         String,
@@ -1692,7 +1690,8 @@ pub(super) fn held_projection(
         String,
         Option<String>,
         Option<i64>,
-    )> = db
+    );
+    let row: Option<HeldProjectionRow> = db
         .query_row(
             "SELECT state, cached_from_check_id, resource_key, resource_claimed_at_ms, resource_released_at_ms, coverage_json, result_ref, exit_code FROM check_runs WHERE check_id=?1",
             [check_id],
@@ -2801,7 +2800,7 @@ fn read_held_audit_cursor(db: &Connection) -> Result<Option<String>> {
     };
     Ok(Some(cursor.to_owned()))
 }
-fn validate_bounded_held_quarantines(tx: &Transaction<'_>) -> Result<()> {
+fn validate_bounded_held_quarantines(tx: &Transaction<'_>) -> Result<bool> {
     let cursor = read_held_audit_cursor(tx)?;
     let mut statement = tx.prepare(
         "SELECT c.check_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE (c.state IN ('running','reconciling') OR (c.state='queued' AND o.state IN ('sending','outcome_unknown'))) AND EXISTS (SELECT 1 FROM meta AS held WHERE held.key='checks:held:v1:' || c.check_id) AND (?1 IS NULL OR c.check_id>?1) ORDER BY c.check_id LIMIT ?2",
@@ -2823,12 +2822,12 @@ fn validate_bounded_held_quarantines(tx: &Transaction<'_>) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(wrap);
         if batch.is_empty() {
-            tx.execute("DELETE FROM meta WHERE key=?1", [HELD_AUDIT_CURSOR_KEY])?;
-            return Ok(());
+            let deleted = tx.execute("DELETE FROM meta WHERE key=?1", [HELD_AUDIT_CURSOR_KEY])?;
+            return Ok(deleted != 0);
         }
     }
     if batch.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     for check_id in &batch {
         let identity = read_subject_identity(tx, check_id)?;
@@ -2846,12 +2845,13 @@ fn validate_bounded_held_quarantines(tx: &Transaction<'_>) -> Result<()> {
         })?;
         validate_held_matches_quarantine(&held, &quarantine)?;
     }
-    if let Some(last) = batch.last() {
-        if cursor.as_deref() != Some(last.as_str()) {
-            set_meta(tx, HELD_AUDIT_CURSOR_KEY, &json!(last))?;
-        }
+    if let Some(last) = batch.last()
+        && cursor.as_deref() != Some(last.as_str())
+    {
+        set_meta(tx, HELD_AUDIT_CURSOR_KEY, &json!(last))?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn decode_pending_row(
@@ -3004,13 +3004,26 @@ struct PendingSelection {
     cycle: Option<PendingCycle>,
 }
 
+fn finish_pending_selection(
+    tx: Transaction<'_>,
+    selection: PendingSelection,
+    held_audit_written: bool,
+) -> Result<PendingSelection> {
+    // A successful bounded held audit is independent of active Work progress.
+    // Preserve its cursor even when the active selector otherwise stays read-only.
+    if held_audit_written {
+        tx.commit()?;
+    }
+    Ok(selection)
+}
+
 fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelection> {
     // Deferred snapshot: empty scans and unchanged stable pages stay read-only
     // and never reserve the SQLite writer. Stale-cursor cleanup and new
     // quarantine dispositions upgrade the same transaction atomically.
     let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let cursor = read_pending_cursor(&tx)?;
-    validate_bounded_held_quarantines(&tx)?;
+    let held_audit_written = validate_bounded_held_quarantines(&tx)?;
     let (ids, cycle) = select_pending_page(&tx, cursor.as_deref())?;
     let mut work = Vec::with_capacity(ids.len());
     let mut last_id = None;
@@ -3062,13 +3075,13 @@ fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelect
                     None => {}
                 }
             } else {
-                return Ok(selection);
+                return finish_pending_selection(tx, selection, held_audit_written);
             }
         } else if pending_subject_count(&tx)? == 0 {
             if cursor.is_none() && read_pending_cycle(&tx)?.is_none() {
                 // Empty scan with no retained cursor or cycle: read-only, no
                 // meta mutation.
-                return Ok(selection);
+                return finish_pending_selection(tx, selection, held_audit_written);
             }
             // Stale cursor or cycle with no subjects: delete once; the next
             // empty scan is read-only.
@@ -3077,7 +3090,7 @@ fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelect
         } else {
             // Subjects remain but none are selected (only post-cut admissions
             // remain): keep the cursor and cycle untouched and read-only.
-            return Ok(selection);
+            return finish_pending_selection(tx, selection, held_audit_written);
         }
     } else if pending_metadata_written {
         // New quarantine evidence commits even though healthy Work is also
@@ -3085,7 +3098,7 @@ fn pending_selection(db: &mut Connection, root: PathBuf) -> Result<PendingSelect
         // unexamined healthy Work is never marked visited.
     } else {
         // Healthy page with no new disposition: read-only.
-        return Ok(selection);
+        return finish_pending_selection(tx, selection, held_audit_written);
     }
     tx.commit()?;
     Ok(selection)

@@ -63,13 +63,21 @@ async fn damage_profile_shape(store: &Store, check_id: &str) {
                 [&id],
                 |row| row.get(0),
             )?;
-            let mut spec: Value = serde_json::from_str(&raw).unwrap();
-            spec["profile"] = json!("not-an-object");
+            let damaged = match serde_json::from_str::<Value>(&raw) {
+                Ok(mut spec) => {
+                    spec["profile"] = json!("not-an-object");
+                    model::canonical(&spec)?
+                }
+                // Preserve invalid JSON while changing its exact retained digest.
+                Err(_) => format!("{raw} "),
+            };
+            db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
             let changed = db.execute(
                 "UPDATE check_runs SET spec_json=?2 WHERE check_id=?1",
-                params![id, model::canonical(&spec)?],
-            )?;
-            if changed != 1 {
+                params![id, damaged],
+            );
+            db.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+            if changed? != 1 {
                 return Err(crate::error::Error::new(
                     "TEST_STATE",
                     "admitted CheckRun disappeared before fault injection",
@@ -645,9 +653,7 @@ async fn held_audit_resumes_past_bounded_head_to_changed_tail() {
         )
         .await
         .unwrap_err();
-    assert_eq!(
-        tail_read.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
-    );
+    assert_eq!(tail_read.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT");
     let head_read = read_check(&fixture.owner.store, &operator, &head_id).await;
     assert_eq!(head_read["reconciliation"]["held"], json!(true));
     assert_eq!(head_read["reconciliation"]["acknowledged"], json!(false));
@@ -661,9 +667,7 @@ async fn held_audit_resumes_past_bounded_head_to_changed_tail() {
                 assert!(work.is_empty(), "held rows never re-enter the active page");
             }
             Err(conflict) => {
-                assert_eq!(
-                    conflict.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT"
-                );
+                assert_eq!(conflict.code, "CHECK_PENDING_QUARANTINE_IDENTITY_CONFLICT");
                 saw_conflict = true;
                 break;
             }
