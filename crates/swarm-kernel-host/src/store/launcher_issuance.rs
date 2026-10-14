@@ -158,8 +158,9 @@ fn pending_launch_issuance_page(
     let mut statement = db.prepare(
         "SELECT operation_id FROM operations \
          WHERE method='swarm.launch' AND state='queued' \
-           AND json_extract(effective_request_json,'$.launch_manifest.state') \
-             ='awaiting_participant_credential' \
+           AND CASE WHEN json_valid(effective_request_json) \
+             THEN json_extract(effective_request_json,'$.launch_manifest.state') \
+               ='awaiting_participant_credential' ELSE 0 END \
            AND (?1 IS NULL OR operation_id>?1) \
          ORDER BY operation_id LIMIT ?2",
     )?;
@@ -243,7 +244,8 @@ impl super::Store {
                     let effective_request_json: Option<String> = tx
                         .query_row(
                             "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch' AND state='queued' \
-                             AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_participant_credential'",
+                             AND CASE WHEN json_valid(effective_request_json) \
+                              THEN json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_participant_credential' ELSE 0 END",
                             [&prepare_id],
                             |row| row.get(0),
                         )
@@ -440,7 +442,8 @@ impl super::Store {
                     "UPDATE operations SET effective_request_json=?3,updated_at_ms=?4 \
                      WHERE operation_id=?1 AND method='swarm.launch' AND state='queued' \
                        AND effective_request_json=?2 \
-                       AND json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_participant_credential'",
+                       AND CASE WHEN json_valid(effective_request_json) \
+                        THEN json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_participant_credential' ELSE 0 END",
                     rusqlite::params![
                         operation_id,
                         expected_effective_request_json,

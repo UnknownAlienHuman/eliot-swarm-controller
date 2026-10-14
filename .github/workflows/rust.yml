@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host]
 permissions:
   contents: read
 jobs:
@@ -636,10 +636,13 @@ jobs:
               [string]$Filter,
               [int]$Expected = 0,
               [string[]]$ExpectedNames = @(),
-              [switch]$Release
+              [switch]$Release,
+              [string]$TestTarget = ''
             )
-            $listArguments = @('test', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--list')
-            if ($Release) { $listArguments = @('test', '--release', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--list') }
+            $listArguments = @('test', '--locked', '--package', $Package, '--target-dir', $targetDir)
+            if ($Release) { $listArguments += '--release' }
+            if ($TestTarget) { $listArguments += @('--test', $TestTarget) } else { $listArguments += '--lib' }
+            $listArguments += @($Filter, '--', '--list')
             $listing = @(& cargo @listArguments)
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $selected = @($listing | Where-Object { $_ -match ': test$' })
@@ -662,11 +665,14 @@ jobs:
               [string]$Filter,
               [int]$Expected = 0,
               [string[]]$ExpectedNames = @(),
-              [switch]$Release
+              [switch]$Release,
+              [string]$TestTarget = ''
             )
-            $selected = @(Confirm-FocusedSelection -Package $Package -Filter $Filter -Expected $Expected -ExpectedNames $ExpectedNames -Release:$Release)
-            $runArguments = @('test', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--nocapture')
-            if ($Release) { $runArguments = @('test', '--release', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--nocapture') }
+            $selected = @(Confirm-FocusedSelection -Package $Package -Filter $Filter -Expected $Expected -ExpectedNames $ExpectedNames -Release:$Release -TestTarget $TestTarget)
+            $runArguments = @('test', '--locked', '--package', $Package, '--target-dir', $targetDir)
+            if ($Release) { $runArguments += '--release' }
+            if ($TestTarget) { $runArguments += @('--test', $TestTarget) } else { $runArguments += '--lib' }
+            $runArguments += @($Filter, '--', '--nocapture')
             & cargo @runArguments
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $selectedNames = @($selected | ForEach-Object { $_ -replace ': test$', '' })
@@ -755,7 +761,7 @@ jobs:
               'pr74_remaining_d_malformed_retained_history_stays_damaged_at_effect_gate'
             ) -Release
           } elseif ($env:QUALIFICATION -ceq 'focused-access') {
-            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'scope_public_matrix_tests' -Expected 20 -ExpectedNames @(
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'scope_public_matrix_tests::connected_store' -Expected 20 -ExpectedNames @(
               'store_authenticated_profiles_fleet_queue_and_exact_object_grants',
               'store_authenticated_released_and_stale_attempts_do_not_widen_task_reads',
               'store_authenticated_result_pages_grants_and_denied_assemblies',
@@ -777,6 +783,8 @@ jobs:
               'store_authenticated_task_list_delta_filter_and_partial_page',
               'store_authenticated_task_list_delta_bounded_gap_tail_recovery'
             )
+          } elseif ($env:QUALIFICATION -ceq 'focused-legacy-host') {
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -TestTarget 'legacy_activation' -Filter 'legacy_poison_activation_preserves_real_host_listener_and_exact_quarantine' -Expected 1 -ExpectedNames @('legacy_poison_activation_preserves_real_host_listener_and_exact_quarantine')
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }

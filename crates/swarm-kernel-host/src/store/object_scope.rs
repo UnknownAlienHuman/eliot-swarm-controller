@@ -37,11 +37,11 @@ use std::{
 #[path = "object_scope_review_tests.rs"]
 mod assigned_reviewer_operation_tests;
 #[cfg(test)]
-#[path = "scope_public_matrix_tests.rs"]
-mod scope_public_matrix_tests;
-#[cfg(test)]
 #[path = "operation_read_public_tests.rs"]
 mod operation_read_public_tests;
+#[cfg(test)]
+#[path = "scope_public_matrix_tests.rs"]
+mod scope_public_matrix_tests;
 
 /// Exact Task graph identity, loaded from a retained object.
 ///

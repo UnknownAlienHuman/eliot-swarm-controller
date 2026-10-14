@@ -2161,7 +2161,9 @@ fn next(db: &mut Connection, config: &Config, root: PathBuf) -> Result<Option<Wo
         [],
         |r| r.get(0),
     )?;
-    let row:Option<(String,String,String)>=tx.query_row("SELECT c.check_id,o.caller_id,c.attempt_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE c.state='queued' AND o.state='queued' AND (json_extract(c.spec_json,'$.cancel_requested') IS NOT NULL OR (?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM check_runs active WHERE active.resource_key=c.resource_key AND active.resource_claimed_at_ms IS NOT NULL AND active.resource_released_at_ms IS NULL))) ORDER BY c.created_at_ms,c.check_id LIMIT 1",params![enabled,running < config.checks.max_running as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    // The pending reader owns malformed specs and their exact quarantine.
+    // Admission must remain total after that reader leaves the bytes intact.
+    let row:Option<(String,String,String)>=tx.query_row("SELECT c.check_id,o.caller_id,c.attempt_id FROM check_runs c JOIN operations o ON o.operation_id=c.operation_id WHERE c.state='queued' AND o.state='queued' AND CASE WHEN json_valid(c.spec_json) THEN (json_extract(c.spec_json,'$.cancel_requested') IS NOT NULL OR (?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM check_runs active WHERE active.resource_key=c.resource_key AND active.resource_claimed_at_ms IS NOT NULL AND active.resource_released_at_ms IS NULL))) ELSE 0 END ORDER BY c.created_at_ms,c.check_id LIMIT 1",params![enabled,running < config.checks.max_running as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((id, caller, attempt_id)) = row else {
         return Ok(None);
     };
