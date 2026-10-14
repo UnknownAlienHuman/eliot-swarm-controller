@@ -1405,7 +1405,7 @@ fn manager_fleet_projections_preserve_exact_object_and_nested_attention_scope() 
         )
         .unwrap_err()
         .code,
-        "FORBIDDEN"
+        "LOCAL_OPERATOR_MISMATCH"
     );
 
     assert_eq!(
