@@ -499,6 +499,497 @@ async fn participation_basis_change_invalidates_cell_material_identity() {
 }
 
 #[tokio::test]
+async fn issue99_backfill_rechecks_repaired_hints_and_ignores_inactive_pending_clients() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-backfill-recovery-source").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-backfill-recovery-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let unrelated_subject = seed_subject(
+        &owner.store,
+        "issue99-backfill-recovery-unrelated",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-backfill-recovery-producer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-backfill-recovery-consumer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let inactive = register_integration_participant(
+        &owner,
+        &unrelated_subject,
+        "issue99-backfill-recovery-disabled",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let pending_client_id = "issue99-backfill-recovery-pending-reviewer";
+    let pending_token = format!("{}{}", model::new_id(), model::new_id());
+    owner
+        .store
+        .call(
+            principal("review-owner-v2", Role::Manager),
+            "coordination.participant.register".into(),
+            json!({
+                "client_request_id":"issue99-backfill-recovery-register-pending",
+                "client_id":pending_client_id,
+                "token_hash":model::digest(pending_token.as_bytes()),
+                "task_id":unrelated_subject.task_id,
+                "task_revision":1,
+                "attempt_id":unrelated_subject.attempt_id,
+                "participation_basis":{
+                    "kind":"sponsored_reviewer",
+                    "review_scope":{
+                        "review_assignment_id":null,
+                        "task_id":unrelated_subject.task_id,
+                        "task_revision":1,
+                        "attempt_id":unrelated_subject.attempt_id,
+                        "submission_ref":unrelated_subject.submission_ref,
+                        "candidate_ref":unrelated_subject.candidate_ref,
+                    },
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            principal("review-owner-v2", Role::Manager),
+            "coordination.participant.disable".into(),
+            json!({
+                "client_request_id":"issue99-backfill-recovery-disable",
+                "client_id":inactive.client_id,
+                "expected_grant_revision":1,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let contract_key = "issue99-backfill-recovery-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-backfill-recovery-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-backfill-recovery-publish-target",
+    )
+    .await;
+
+    let source_id = source.client_id.clone();
+    let source_task_id = source_subject.task_id.clone();
+    let source_attempt_id = source_subject.attempt_id.clone();
+    owner
+        .store
+        .run(move |db| {
+            let key = crate::coordination::participant_task_key(&source_task_id, &source_id);
+            let incorrect = json!({
+                "client_id":source_id,
+                "task_id":source_task_id,
+                "task_revision":1,
+                "attempt_id":source_attempt_id,
+                "grant_revision":99,
+            });
+            let changed = db.execute(
+                "UPDATE meta SET value_json=?2 WHERE key=?1",
+                params![key, model::canonical(&incorrect)?],
+            )?;
+            assert_eq!(changed, 1);
+            db.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [crate::coordination::LEGACY_INDEX_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    owner.store.reconcile_watches_once().await.unwrap();
+    owner.store.reconcile_watches_once().await.unwrap();
+    let partial_status = owner
+        .store
+        .run(|db| crate::store::coordination::legacy_index_backfill_status(db))
+        .await
+        .unwrap();
+    assert_eq!(partial_status["scan_complete"], true);
+    assert_eq!(partial_status["complete"], false);
+    assert_eq!(partial_status["anomaly_count"], 1);
+
+    let found = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["coverage"], "complete");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], target.client_id);
+
+    let first_cell = sync_offer(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-backfill-recovery-sync-source",
+        vec![],
+    )
+    .await;
+    let second_cell = sync_requirement(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-backfill-recovery-sync-target",
+    )
+    .await;
+    assert_eq!(
+        first_cell["cell"]["cell_id"],
+        second_cell["cell"]["cell_id"]
+    );
+
+    owner.store.reconcile_watches_once().await.unwrap();
+    owner.store.reconcile_watches_once().await.unwrap();
+    let recovered_status = owner
+        .store
+        .run(|db| crate::store::coordination::legacy_index_backfill_status(db))
+        .await
+        .unwrap();
+    assert_eq!(recovered_status["scan_complete"], true);
+    assert_eq!(recovered_status["complete"], true);
+    assert_eq!(recovered_status["anomaly_count"], 0);
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_peer_find_advances_after_filtered_task_and_global_pages() {
+    let (owner, directory, subject, _) = start_integration_fixture("issue99-filtered-cursor").await;
+    let source = register_integration_participant(
+        &owner,
+        &subject,
+        "zzz-issue99-filtered-source",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &subject,
+        "zzz-issue99-filtered-target",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-filtered-cursor-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-filtered-cursor-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-filtered-cursor-publish-target",
+    )
+    .await;
+
+    let task_id = subject.task_id.clone();
+    let source_id = source.client_id.clone();
+    let target_id = target.client_id.clone();
+    let attempt_id = subject.attempt_id.clone();
+    owner
+        .store
+        .run(move |db| {
+            let source_key = crate::coordination::participant_task_key(&task_id, &source_id);
+            db.execute("DELETE FROM meta WHERE key=?1", [source_key])?;
+            let mut insert = db.prepare("INSERT INTO meta(key,value_json) VALUES(?1,?2)")?;
+            for index in 0..1_000 {
+                let client_id = format!("000-issue99-task-filter-{index:04}");
+                let key = crate::coordination::participant_task_key(&task_id, &client_id);
+                let value = json!({
+                    "client_id":client_id,
+                    "task_id":task_id,
+                    "task_revision":1,
+                    "attempt_id":attempt_id,
+                    "grant_revision":1,
+                });
+                insert.execute(params![key, model::canonical(&value)?])?;
+            }
+            drop(insert);
+            let target_key = crate::coordination::participant_task_key(&task_id, &target_id);
+            let last_filtered_key =
+                crate::coordination::participant_task_key(&task_id, "000-issue99-task-filter-0999");
+            assert!(last_filtered_key < target_key);
+            let prefix = crate::coordination::participant_task_prefix(&task_id);
+            let upper = format!("{prefix}g");
+            let indexed_count: i64 = db.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key>=?1 AND key<?2",
+                params![prefix, upper],
+                |row| row.get(0),
+            )?;
+            assert_eq!(indexed_count, 1_001);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let first_task_page = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"related_task_id":subject.task_id,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert!(first_task_page["items"].as_array().unwrap().is_empty());
+    assert_eq!(first_task_page["coverage"], "partial");
+    let task_cursor = first_task_page["next_scan_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_task_page = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({
+                "related_task_id":subject.task_id,
+                "limit":10,
+                "after_scan_cursor":task_cursor,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_task_page["coverage"], "complete");
+    assert_eq!(second_task_page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(second_task_page["items"][0]["client_id"], target.client_id);
+
+    let source_id = source.client_id.clone();
+    let target_id = target.client_id.clone();
+    let contract_key_for_seed = contract_key.to_owned();
+    owner
+        .store
+        .run(move |db| {
+            let source_key = crate::coordination::global_relevance_key(
+                crate::coordination::TermKind::Contract,
+                &contract_key_for_seed,
+                &source_id,
+                "contract",
+                &contract_key_for_seed,
+            );
+            db.execute("DELETE FROM meta WHERE key=?1", [source_key])?;
+            let mut insert = db.prepare("INSERT INTO meta(key,value_json) VALUES(?1,?2)")?;
+            for index in 0..1_000 {
+                let client_id = format!("000-issue99-global-filter-{index:04}");
+                let key = crate::coordination::global_relevance_key(
+                    crate::coordination::TermKind::Contract,
+                    &contract_key_for_seed,
+                    &client_id,
+                    "contract",
+                    &contract_key_for_seed,
+                );
+                insert.execute(params![key, "{malformed"])?;
+            }
+            drop(insert);
+            let target_key = crate::coordination::global_relevance_key(
+                crate::coordination::TermKind::Contract,
+                &contract_key_for_seed,
+                &target_id,
+                "contract",
+                &contract_key_for_seed,
+            );
+            let last_filtered_key = crate::coordination::global_relevance_key(
+                crate::coordination::TermKind::Contract,
+                &contract_key_for_seed,
+                "000-issue99-global-filter-0999",
+                "contract",
+                &contract_key_for_seed,
+            );
+            assert!(last_filtered_key < target_key);
+            let prefix = crate::coordination::global_relevance_prefix(
+                crate::coordination::TermKind::Contract,
+                &contract_key_for_seed,
+            );
+            let upper = format!("{prefix}g");
+            let indexed_count: i64 = db.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key>=?1 AND key<?2",
+                params![prefix, upper],
+                |row| row.get(0),
+            )?;
+            assert_eq!(indexed_count, 1_001);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let first_global_page = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert!(first_global_page["items"].as_array().unwrap().is_empty());
+    assert_eq!(first_global_page["coverage"], "partial");
+    let global_cursor = first_global_page["next_scan_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_global_page = owner
+        .store
+        .call(
+            source,
+            "coordination.peer.find".into(),
+            json!({
+                "contract_key":contract_key,
+                "limit":10,
+                "after_scan_cursor":global_cursor,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_global_page["coverage"], "complete");
+    assert_eq!(second_global_page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        second_global_page["items"][0]["client_id"],
+        target.client_id
+    );
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards() {
+    let (owner, directory, source_subject, _) =
+        start_integration_fixture("issue99-contract-owner-prefix-source").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-contract-owner-prefix-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-contract-owner-prefix-source-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-contract-owner-prefix-target-peer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "zzz-issue99-seam";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-contract-owner-prefix-publish-source",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-contract-owner-prefix-publish-target",
+    )
+    .await;
+
+    let source_id = source.client_id.clone();
+    let contract_key_for_seed = contract_key.to_owned();
+    owner
+        .store
+        .run(move |db| {
+            let scope = crate::store::coordination::load_current_scope_for_client(db, &source_id)?;
+            let prefix = format!(
+                "coordination:card-owner:{}:{}:contract:",
+                scope.scope_id,
+                crate::coordination::key_component(&source_id),
+            );
+            let mut insert = db.prepare("INSERT INTO meta(key,value_json) VALUES(?1,?2)")?;
+            for index in 0..101 {
+                let identity = format!("000-issue99-prefix-noise-{index:03}");
+                let key = format!("{prefix}{}", crate::coordination::key_component(&identity));
+                let dangling = format!("coordination:card:missing-issue99-prefix-{index:03}");
+                insert.execute(params![
+                    key,
+                    model::canonical(&json!({"card_key":dangling}))?
+                ])?;
+            }
+            drop(insert);
+            let seam_key = format!(
+                "{prefix}{}",
+                crate::coordination::key_component(&contract_key_for_seed)
+            );
+            let last_noise_key = format!(
+                "{prefix}{}",
+                crate::coordination::key_component("000-issue99-prefix-noise-100")
+            );
+            assert!(last_noise_key < seam_key);
+            let upper = format!("{prefix}g");
+            let owner_count: i64 = db.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key>=?1 AND key<?2",
+                params![prefix, upper],
+                |row| row.get(0),
+            )?;
+            assert_eq!(owner_count, 102);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let found = owner
+        .store
+        .call(
+            source,
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["coverage"], "complete");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], target.client_id);
+    assert_eq!(found["items"][0]["match"]["relation"]["term"], contract_key);
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn agreement_get_marks_stale_cell_not_current() {
     let (owner, directory, subject, _) =
         start_integration_fixture("integration-current-pointer").await;

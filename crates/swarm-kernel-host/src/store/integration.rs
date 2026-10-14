@@ -1447,9 +1447,6 @@ pub(super) fn current_peer_cell_relation(
     target_context: &Value,
     contract: Option<(keys::TermKind, String)>,
 ) -> Result<Option<Value>> {
-    if super::coordination::legacy_index_backfill_gap(db)?.is_some() {
-        return Ok(None);
-    }
     let Some(source_id) = source_context
         .pointer("/actor/client_id")
         .and_then(Value::as_str)
@@ -1462,6 +1459,26 @@ pub(super) fn current_peer_cell_relation(
     else {
         return Ok(None);
     };
+    let Some(source_task_id) = source_context.get("task_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(target_task_id) = target_context.get("task_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let migration_gap = match contract.as_ref() {
+        Some((kind, key)) => {
+            super::coordination::legacy_index_backfill_gap_for(db, &[], Some((*kind, key)), &[])?
+        }
+        None => super::coordination::legacy_index_backfill_gap_for(
+            db,
+            &[source_task_id, target_task_id],
+            None,
+            &[source_id, target_id],
+        )?,
+    };
+    if migration_gap.is_some() {
+        return Ok(None);
+    }
     let candidates: Vec<Value> = if let Some((kind, contract_key)) = contract {
         if kind != keys::TermKind::Contract {
             return Ok(None);
