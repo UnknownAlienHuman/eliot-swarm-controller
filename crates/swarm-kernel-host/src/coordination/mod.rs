@@ -657,6 +657,7 @@ pub(crate) fn global_relevance_prefix(kind: TermKind, term: &str) -> String {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn global_relevance_namespace_prefix() -> &'static str {
     "coordination:relevance-global:"
 }

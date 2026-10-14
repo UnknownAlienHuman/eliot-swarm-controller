@@ -847,6 +847,76 @@ async fn issue99_peer_find_advances_after_filtered_task_and_global_pages() {
         .await
         .unwrap();
 
+    let first_card_page = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.contract_card.list".into(),
+            json!({"contract_key":contract_key,"limit":50}),
+        )
+        .await
+        .unwrap();
+    assert!(first_card_page["items"].as_array().unwrap().is_empty());
+    assert_eq!(first_card_page["coverage"], "partial");
+    let first_card_cursor = first_card_page["next_scan_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_card_page = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.contract_card.list".into(),
+            json!({
+                "contract_key":contract_key,
+                "limit":50,
+                "after_scan_cursor":first_card_cursor,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(second_card_page["items"].as_array().unwrap().is_empty());
+    assert_eq!(second_card_page["coverage"], "partial");
+    assert_ne!(
+        first_card_cursor,
+        second_card_page["next_scan_cursor"].as_str().unwrap()
+    );
+
+    let first_contract_get = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.contract_card.get".into(),
+            json!({"contract_key":contract_key,"limit":50}),
+        )
+        .await
+        .unwrap();
+    assert!(first_contract_get["items"].as_array().unwrap().is_empty());
+    assert_eq!(first_contract_get["coverage"], "partial");
+    let first_contract_cursor = first_contract_get["next_scan_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_contract_get = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.contract_card.get".into(),
+            json!({
+                "contract_key":contract_key,
+                "limit":50,
+                "after_scan_cursor":first_contract_cursor,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(second_contract_get["items"].as_array().unwrap().is_empty());
+    assert_eq!(second_contract_get["coverage"], "partial");
+    assert_ne!(
+        first_contract_cursor,
+        second_contract_get["next_scan_cursor"].as_str().unwrap()
+    );
+
     let first_global_page = owner
         .store
         .call(
@@ -974,7 +1044,7 @@ async fn issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards() {
     let found = owner
         .store
         .call(
-            source,
+            source.clone(),
             "coordination.peer.find".into(),
             json!({"contract_key":contract_key,"limit":10}),
         )
@@ -984,6 +1054,28 @@ async fn issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards() {
     assert_eq!(found["items"].as_array().unwrap().len(), 1);
     assert_eq!(found["items"][0]["client_id"], target.client_id);
     assert_eq!(found["items"][0]["match"]["relation"]["term"], contract_key);
+
+    let sent = owner
+        .store
+        .call(
+            source,
+            "coordination.send".into(),
+            json!({
+                "client_request_id":"issue99-contract-owner-prefix-send",
+                "recipient":target.client_id,
+                "body":{"fact":"exact current contract beyond owner prefix"},
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["recipient"], target.client_id);
+    let inbox = owner
+        .store
+        .call(target, "coordination.inbox".into(), json!({"limit":10}))
+        .await
+        .unwrap();
+    assert_eq!(inbox["items"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["items"][0]["operation_id"], sent["operation_id"]);
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();

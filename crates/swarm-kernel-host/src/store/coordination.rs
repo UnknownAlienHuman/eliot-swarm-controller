@@ -60,6 +60,19 @@ struct IndexedCardPage {
     last_scanned_key: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct IndexPageRequest<'a> {
+    after_client_id: Option<&'a str>,
+    after_scan_key: Option<&'a str>,
+    raw_limit: i64,
+}
+
+#[derive(Clone, Copy)]
+struct IndexCursor<'a> {
+    after_client_id: Option<&'a str>,
+    after_scan_cursor: Option<&'a str>,
+}
+
 struct IndexedParticipantPage {
     client_ids: Vec<String>,
     has_more: bool,
@@ -3559,9 +3572,11 @@ fn indexed_cards(
         term_kind,
         term,
         card_kind,
-        after_client_id,
-        None,
-        raw_limit,
+        IndexPageRequest {
+            after_client_id,
+            after_scan_key: None,
+            raw_limit,
+        },
     )
 }
 
@@ -3571,20 +3586,9 @@ fn indexed_cards_after_scan(
     term_kind: keys::TermKind,
     term: &str,
     card_kind: Option<&str>,
-    after_client_id: Option<&str>,
-    after_scan_key: Option<&str>,
-    raw_limit: i64,
+    request: IndexPageRequest<'_>,
 ) -> Result<IndexedCardPage> {
-    indexed_relevance_cards(
-        db,
-        Some(scope_id),
-        term_kind,
-        term,
-        card_kind,
-        after_client_id,
-        after_scan_key,
-        raw_limit,
-    )
+    indexed_relevance_cards(db, Some(scope_id), term_kind, term, card_kind, request)
 }
 
 /// Query only the exact-term cross-Task index. Every entry is checked against
@@ -3603,9 +3607,11 @@ fn indexed_global_cards(
         term_kind,
         term,
         card_kind,
-        after_client_id,
-        None,
-        raw_limit,
+        IndexPageRequest {
+            after_client_id,
+            after_scan_key: None,
+            raw_limit,
+        },
     )
 }
 
@@ -3614,20 +3620,9 @@ fn indexed_global_cards_after_scan(
     term_kind: keys::TermKind,
     term: &str,
     card_kind: Option<&str>,
-    after_client_id: Option<&str>,
-    after_scan_key: Option<&str>,
-    raw_limit: i64,
+    request: IndexPageRequest<'_>,
 ) -> Result<IndexedCardPage> {
-    indexed_relevance_cards(
-        db,
-        None,
-        term_kind,
-        term,
-        card_kind,
-        after_client_id,
-        after_scan_key,
-        raw_limit,
-    )
+    indexed_relevance_cards(db, None, term_kind, term, card_kind, request)
 }
 
 fn indexed_relevance_cards(
@@ -3636,10 +3631,13 @@ fn indexed_relevance_cards(
     term_kind: keys::TermKind,
     term: &str,
     card_kind: Option<&str>,
-    after_client_id: Option<&str>,
-    after_scan_key: Option<&str>,
-    raw_limit: i64,
+    request: IndexPageRequest<'_>,
 ) -> Result<IndexedCardPage> {
+    let IndexPageRequest {
+        after_client_id,
+        after_scan_key,
+        raw_limit,
+    } = request;
     let prefix = match scope_id {
         Some(scope_id) => keys::relevance_prefix(scope_id, term_kind, term),
         None => keys::global_relevance_prefix(term_kind, term),
@@ -3680,7 +3678,7 @@ fn indexed_relevance_cards(
     let last_scanned_key = raw
         .iter()
         .take(raw_limit as usize)
-        .last()
+        .next_back()
         .map(|(key, _)| key.clone());
     let mut cards = Vec::new();
     let mut stale_entries = 0usize;
@@ -3827,7 +3825,7 @@ fn indexed_task_participants(
     let last_scanned_key = rows
         .iter()
         .take(raw_limit as usize)
-        .last()
+        .next_back()
         .map(|(key, _)| key.clone());
     for (key, raw) in rows.iter().take(raw_limit as usize) {
         let indexed_client_id = participant_client_id_from_index_key(&prefix, key)?;
@@ -3996,38 +3994,53 @@ fn task_dependency_relation(source: &ScopeData, target: &ScopeData) -> Option<Va
         })
 }
 
-fn scope_cards(db: &Connection, scope: &ScopeData, card_kind: &str) -> Result<Vec<Value>> {
+fn current_scope_contract_cards(db: &Connection, scope: &ScopeData) -> Result<Vec<Value>> {
     let Some(client_id) = scope.client_id.as_deref() else {
         return Ok(Vec::new());
     };
-    let prefix = format!(
-        "coordination:card-owner:{}:{}:{card_kind}:",
-        scope.scope_id,
-        keys::key_component(client_id)
-    );
+    let prefix = format!("{}contract:", keys::card_prefix(&scope.scope_id));
     let upper = format!("{prefix}g");
-    let mut statement =
-        db.prepare("SELECT value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT 101")?;
-    let owners: Vec<String> = statement
+    let mut statement = db.prepare("SELECT key FROM meta WHERE key>=?1 AND key<?2 ORDER BY key")?;
+    let card_keys: Vec<String> = statement
         .query_map(params![prefix, upper], |row| row.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     let mut cards = Vec::new();
-    for raw in owners {
-        let owner: Value = match serde_json::from_str(&raw) {
-            Ok(owner) => owner,
-            Err(_) => continue,
-        };
-        let Some(card_key) = owner.get("card_key").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(card) = meta(db, card_key)?.filter(|card| card["state"] == "current") else {
-            continue;
-        };
-        if card["client_id"] == client_id
-            && card["task_id"] == scope.task["task_id"]
-            && card["task_revision"] == scope.task["revision"]
-            && card["attempt_id"] == scope.attempt["attempt_id"]
-            && card["card_kind"] == card_kind
+    for key in card_keys {
+        let suffix = key.strip_prefix(&prefix).ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "current contract card key is outside its exact scope prefix",
+            )
+        })?;
+        let mut parts = suffix.split(':');
+        let identity = parts
+            .next()
+            .and_then(decode_index_component)
+            .ok_or_else(|| {
+                Error::new(
+                    "COORDINATION_INDEX_CORRUPT",
+                    "current contract card key has a malformed identity",
+                )
+            })?;
+        let indexed_client_id = parts
+            .next()
+            .and_then(decode_index_component)
+            .ok_or_else(|| {
+                Error::new(
+                    "COORDINATION_INDEX_CORRUPT",
+                    "current contract card key has a malformed client ID",
+                )
+            })?;
+        if parts.next().is_some()
+            || keys::card_key(&scope.scope_id, "contract", &identity, &indexed_client_id) != key
+        {
+            return Err(Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "current contract card key is malformed",
+            ));
+        }
+        if indexed_client_id == client_id
+            && let Some(card) = current_scope_contract_card(db, scope, &identity)?
         {
             cards.push(card);
         }
@@ -4049,85 +4062,65 @@ fn card_relation_ref(card: &Value) -> Value {
     })
 }
 
+fn current_contract_card_relation(
+    source_card: &Value,
+    target_card: &Value,
+    contract_key: &str,
+) -> Option<Value> {
+    let role_is_current = |card: &Value| {
+        card["card_kind"] == "contract"
+            && card["identity"] == contract_key
+            && matches!(
+                card.pointer("/fields/role").and_then(Value::as_str),
+                Some("producer" | "consumer" | "carrier")
+            )
+    };
+    if !role_is_current(source_card) || !role_is_current(target_card) {
+        return None;
+    }
+    Some(json!({
+        "kind":"contract_key",
+        "term_kind":keys::TermKind::Contract.as_str(),
+        "term":contract_key,
+        "source_card":card_relation_ref(source_card),
+        "target_card":card_relation_ref(target_card),
+    }))
+}
+
 fn shared_card_relation(
     db: &Connection,
     source: &ScopeData,
     target: &ScopeData,
     selector: Option<&PeerSelector>,
 ) -> Result<Option<Value>> {
-    let required = relation_term(selector);
-    let (source_cards, target_cards) = match required {
-        Some((keys::TermKind::Contract, contract_key)) => (
-            current_scope_contract_card(db, source, contract_key)?
-                .into_iter()
-                .collect(),
-            current_scope_contract_card(db, target, contract_key)?
-                .into_iter()
-                .collect(),
-        ),
-        _ => (
-            scope_cards(db, source, "contract")?,
-            scope_cards(db, target, "contract")?,
-        ),
-    };
-    for source_card in &source_cards {
-        let source_fields = indexable_card_fields(
-            &source_card["fields"],
-            source_card["card_kind"].as_str().unwrap_or_default(),
-            source_card["identity"].as_str().unwrap_or_default(),
-        );
-        let source_terms = keys::indexed_terms(
-            &source_fields,
-            source_card["card_kind"].as_str().unwrap_or_default(),
-        );
-        for target_card in &target_cards {
-            let target_fields = indexable_card_fields(
-                &target_card["fields"],
-                target_card["card_kind"].as_str().unwrap_or_default(),
-                target_card["identity"].as_str().unwrap_or_default(),
-            );
-            let target_terms = keys::indexed_terms(
-                &target_fields,
-                target_card["card_kind"].as_str().unwrap_or_default(),
-            );
-            for (kind, terms) in &source_terms {
-                // Published path/symbol/interface fields are discovery hints,
-                // not accepted scope authority. Cross-Task scope relations
-                // are derived below from the current accepted code scopes.
-                if *kind != keys::TermKind::Contract {
-                    continue;
-                }
-                let Some(other_terms) = target_terms.get(kind) else {
-                    continue;
-                };
-                for term in terms.intersection(other_terms) {
-                    if required.is_some_and(|(required_kind, required_term)| {
-                        *kind != required_kind || term != required_term
-                    }) {
-                        continue;
-                    }
-                    if *kind == keys::TermKind::Contract {
-                        let role_is_current = |card: &Value| {
-                            card["card_kind"] == "contract"
-                                && card["identity"] == term.as_str()
-                                && matches!(
-                                    card.pointer("/fields/role").and_then(Value::as_str),
-                                    Some("producer" | "consumer" | "carrier")
-                                )
-                        };
-                        if !role_is_current(source_card) || !role_is_current(target_card) {
-                            continue;
-                        }
-                    }
-                    return Ok(Some(json!({
-                        "kind":if *kind == keys::TermKind::Contract { "contract_key" } else { kind.as_str() },
-                        "term_kind":kind.as_str(),
-                        "term":term,
-                        "source_card":card_relation_ref(source_card),
-                        "target_card":card_relation_ref(target_card),
-                    })));
-                }
-            }
+    if let Some((kind, contract_key)) = relation_term(selector) {
+        if kind != keys::TermKind::Contract {
+            return Ok(None);
+        }
+        let (Some(source_card), Some(target_card)) = (
+            current_scope_contract_card(db, source, contract_key)?,
+            current_scope_contract_card(db, target, contract_key)?,
+        ) else {
+            return Ok(None);
+        };
+        return Ok(current_contract_card_relation(
+            &source_card,
+            &target_card,
+            contract_key,
+        ));
+    }
+
+    for source_card in current_scope_contract_cards(db, source)? {
+        let Some(contract_key) = source_card["identity"].as_str() else {
+            continue;
+        };
+        let Some(target_card) = current_scope_contract_card(db, target, contract_key)? else {
+            continue;
+        };
+        if let Some(relation) =
+            current_contract_card_relation(&source_card, &target_card, contract_key)
+        {
+            return Ok(Some(relation));
         }
     }
     Ok(None)
@@ -4611,6 +4604,7 @@ fn card_get(
             "attempt_id",
             "limit",
             "after_client_id",
+            "after_scan_cursor",
         ]
     };
     model::fields(value, allowed)?;
@@ -4681,18 +4675,31 @@ fn card_get(
             })),
         };
     }
-    let (items, next_after, coverage, gaps) = contract_cards_for_term(
+    let after = keys::optional_cursor(value, "after_client_id")?;
+    let after_scan_cursor = keys::parse_list_scan_cursor(value)?;
+    if after.is_some() && after_scan_cursor.is_some() {
+        return Err(Error::invalid(
+            "choose after_client_id or after_scan_cursor",
+        ));
+    }
+    let limit = keys::parse_page(value.get("limit"), 20)?;
+    let (items, next_after, next_scan_cursor, coverage, gaps) = contract_cards_for_term(
         db,
         &scope,
+        &principal.client_id,
         contract_key,
-        value.get("limit"),
-        value.get("after_client_id"),
+        limit,
+        IndexCursor {
+            after_client_id: after.as_deref(),
+            after_scan_cursor: after_scan_cursor.as_deref(),
+        },
         fields,
     )?;
     Ok(json!({
         "contract_key":contract_key,
         "items":items,
         "next_after":next_after,
+        "next_scan_cursor":next_scan_cursor,
         "coverage":coverage,
         "gaps":gaps,
     }))
@@ -4716,6 +4723,7 @@ fn card_list(
             "attempt_id",
             "limit",
             "after_client_id",
+            "after_scan_cursor",
         ]
     } else {
         &[
@@ -4726,6 +4734,7 @@ fn card_list(
             "attempt_id",
             "limit",
             "after_client_id",
+            "after_scan_cursor",
         ]
     };
     model::fields(value, allowed)?;
@@ -4744,29 +4753,64 @@ fn card_list(
     };
     let limit = keys::parse_page(value.get("limit"), 20)?;
     let after = keys::optional_cursor(value, "after_client_id")?;
+    let after_scan_cursor = keys::parse_list_scan_cursor(value)?;
+    if after.is_some() && after_scan_cursor.is_some() {
+        return Err(Error::invalid(
+            "choose after_client_id or after_scan_cursor",
+        ));
+    }
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
-    let (cards, index_more, index_stale) = if principal.role == Role::Participant {
-        let page = indexed_global_cards(
-            db,
-            term_kind,
-            &term,
-            Some(card_kind),
-            after.as_deref(),
-            scan_limit,
-        )?;
-        (page.cards, page.has_more, page.stale_entries)
+    let scan_prefix = if principal.role == Role::Participant {
+        keys::global_relevance_prefix(term_kind, &term)
     } else {
-        let page = indexed_cards(
-            db,
-            &scope.scope_id,
-            term_kind,
-            &term,
-            Some(card_kind),
-            after.as_deref(),
-            limit,
-        )?;
-        (page.cards, page.has_more, page.stale_entries)
+        keys::relevance_prefix(&scope.scope_id, term_kind, &term)
     };
+    let scan_upper = format!("{scan_prefix}g");
+    let after_scan_key = after_scan_cursor
+        .as_deref()
+        .map(|cursor| {
+            keys::decode_list_scan_cursor(&scan_prefix, &principal.client_id, &scan_upper, cursor)
+        })
+        .transpose()?;
+    let (cards, index_more, index_stale, page_last_scanned_key) =
+        if principal.role == Role::Participant {
+            let page = indexed_global_cards_after_scan(
+                db,
+                term_kind,
+                &term,
+                Some(card_kind),
+                IndexPageRequest {
+                    after_client_id: after.as_deref(),
+                    after_scan_key: after_scan_key.as_deref(),
+                    raw_limit: scan_limit,
+                },
+            )?;
+            (
+                page.cards,
+                page.has_more,
+                page.stale_entries,
+                page.last_scanned_key,
+            )
+        } else {
+            let page = indexed_cards_after_scan(
+                db,
+                &scope.scope_id,
+                term_kind,
+                &term,
+                Some(card_kind),
+                IndexPageRequest {
+                    after_client_id: after.as_deref(),
+                    after_scan_key: after_scan_key.as_deref(),
+                    raw_limit: limit,
+                },
+            )?;
+            (
+                page.cards,
+                page.has_more,
+                page.stale_entries,
+                page.last_scanned_key,
+            )
+        };
     let migration_gap =
         legacy_index_backfill_gap_for(db, &[], Some((term_kind, term.as_str())), &[])?;
     let mut items = Vec::new();
@@ -4775,6 +4819,7 @@ fn card_list(
     let mut has_more_peers = false;
     let mut last_scanned_index_key = None;
     for indexed in cards {
+        let cursor_before_current = last_scanned_index_key.clone();
         last_scanned_index_key = Some(indexed.index_key.clone());
         last = Some(indexed.client_id.clone());
         if !indexed.valid_index {
@@ -4836,6 +4881,7 @@ fn card_list(
         }
         if items.len() == limit as usize {
             has_more_peers = true;
+            last_scanned_index_key = cursor_before_current;
             last = items
                 .last()
                 .and_then(|item: &Value| item["client_id"].as_str())
@@ -4844,6 +4890,24 @@ fn card_list(
         }
         items.push(project_card(&card, value.get("fields"))?);
     }
+    if !has_more_peers {
+        last_scanned_index_key = page_last_scanned_key;
+    }
+    let next_scan_cursor = if index_more || has_more_peers {
+        let key = last_scanned_index_key.as_deref().ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "bounded card page has no representable scan position",
+            )
+        })?;
+        Some(keys::encode_list_scan_cursor(
+            &scan_prefix,
+            &principal.client_id,
+            key,
+        )?)
+    } else {
+        None
+    };
     let partial = index_more || stale > 0 || has_more_peers || migration_gap.is_some();
     let mut gaps = Vec::new();
     if stale > 0 {
@@ -4862,6 +4926,7 @@ fn card_list(
         "items":items,
         "selector":{"kind":term_kind.as_str(),"value":term},
         "next_after":if partial { last } else { None },
+        "next_scan_cursor":next_scan_cursor,
         "coverage":if partial { "partial" } else { "complete" },
         "gaps":gaps,
     }))
@@ -4904,44 +4969,79 @@ fn selector(value: &Value) -> Result<Option<(keys::TermKind, String)>> {
 fn contract_cards_for_term(
     db: &Connection,
     scope: &ScopeData,
+    principal_id: &str,
     contract_key: &str,
-    raw_limit: Option<&Value>,
-    raw_after: Option<&Value>,
+    limit: i64,
+    cursor: IndexCursor<'_>,
     fields: Option<&Value>,
-) -> Result<(Vec<Value>, Option<String>, &'static str, Value)> {
+) -> Result<(
+    Vec<Value>,
+    Option<String>,
+    Option<String>,
+    &'static str,
+    Value,
+)> {
     validate_identifier(contract_key, "contract_key", 256)?;
-    let limit = keys::parse_page(raw_limit, 20)?;
-    let after_value = json!({"after_client_id":raw_after.cloned().unwrap_or(Value::Null)});
-    let after = keys::optional_cursor(&after_value, "after_client_id")?;
     let is_participant = scope.client_id.is_some();
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
-    let (cards, index_more, index_stale) = if is_participant {
-        let page = indexed_global_cards(
+    let scan_prefix = if is_participant {
+        keys::global_relevance_prefix(keys::TermKind::Contract, contract_key)
+    } else {
+        keys::relevance_prefix(&scope.scope_id, keys::TermKind::Contract, contract_key)
+    };
+    let scan_upper = format!("{scan_prefix}g");
+    let after_scan_key = cursor
+        .after_scan_cursor
+        .map(|cursor| {
+            keys::decode_list_scan_cursor(&scan_prefix, principal_id, &scan_upper, cursor)
+        })
+        .transpose()?;
+    let (cards, index_more, index_stale, page_last_scanned_key) = if is_participant {
+        let page = indexed_global_cards_after_scan(
             db,
             keys::TermKind::Contract,
             contract_key,
             Some("contract"),
-            after.as_deref(),
-            scan_limit,
+            IndexPageRequest {
+                after_client_id: cursor.after_client_id,
+                after_scan_key: after_scan_key.as_deref(),
+                raw_limit: scan_limit,
+            },
         )?;
-        (page.cards, page.has_more, page.stale_entries)
+        (
+            page.cards,
+            page.has_more,
+            page.stale_entries,
+            page.last_scanned_key,
+        )
     } else {
-        let page = indexed_cards(
+        let page = indexed_cards_after_scan(
             db,
             &scope.scope_id,
             keys::TermKind::Contract,
             contract_key,
             Some("contract"),
-            after.as_deref(),
-            limit,
+            IndexPageRequest {
+                after_client_id: cursor.after_client_id,
+                after_scan_key: after_scan_key.as_deref(),
+                raw_limit: limit,
+            },
         )?;
-        (page.cards, page.has_more, page.stale_entries)
+        (
+            page.cards,
+            page.has_more,
+            page.stale_entries,
+            page.last_scanned_key,
+        )
     };
     let mut items = Vec::new();
     let mut stale = index_stale;
     let mut last = None;
     let mut has_more = false;
+    let mut last_scanned_index_key = None;
     for indexed in cards {
+        let cursor_before_current = last_scanned_index_key.clone();
+        last_scanned_index_key = Some(indexed.index_key.clone());
         last = Some(indexed.client_id.clone());
         if !indexed.valid_index {
             stale = stale.saturating_add(1);
@@ -5000,6 +5100,7 @@ fn contract_cards_for_term(
         }
         if items.len() == limit as usize {
             has_more = true;
+            last_scanned_index_key = cursor_before_current;
             last = items
                 .last()
                 .and_then(|item: &Value| item["client_id"].as_str())
@@ -5008,6 +5109,24 @@ fn contract_cards_for_term(
         }
         items.push(project_card(&card, fields)?);
     }
+    if !has_more {
+        last_scanned_index_key = page_last_scanned_key;
+    }
+    let next_scan_cursor = if index_more || has_more {
+        let key = last_scanned_index_key.as_deref().ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_CORRUPT",
+                "bounded contract-card page has no representable scan position",
+            )
+        })?;
+        Some(keys::encode_list_scan_cursor(
+            &scan_prefix,
+            principal_id,
+            key,
+        )?)
+    } else {
+        None
+    };
     let migration_gap = legacy_index_backfill_gap_for(
         db,
         &[],
@@ -5031,6 +5150,7 @@ fn contract_cards_for_term(
     Ok((
         items,
         if partial { last } else { None },
+        next_scan_cursor,
         if partial { "partial" } else { "complete" },
         Value::Array(gaps),
     ))
@@ -5210,9 +5330,11 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
                     kind,
                     &term,
                     None,
-                    after.as_deref(),
-                    after_scan_key.as_deref(),
-                    scan_limit,
+                    IndexPageRequest {
+                        after_client_id: after.as_deref(),
+                        after_scan_key: after_scan_key.as_deref(),
+                        raw_limit: scan_limit,
+                    },
                 )?
             } else {
                 indexed_cards_after_scan(
@@ -5221,9 +5343,11 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
                     kind,
                     &term,
                     None,
-                    after.as_deref(),
-                    after_scan_key.as_deref(),
-                    scan_limit,
+                    IndexPageRequest {
+                        after_client_id: after.as_deref(),
+                        after_scan_key: after_scan_key.as_deref(),
+                        raw_limit: scan_limit,
+                    },
                 )?
             };
             (
