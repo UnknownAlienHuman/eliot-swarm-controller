@@ -708,6 +708,8 @@ pub fn write_qualification_admit_attempt(
     data_root: &Path,
     pid: u32,
     config_sha256: &str,
+    client_request_id: &str,
+    expected_snapshot_sha256: &str,
 ) -> swarm_contracts::error::Result<u8> {
     use swarm_contracts::error::Error;
 
@@ -732,6 +734,20 @@ pub fn write_qualification_admit_attempt(
             "admission attempt marker requires the exact worker config digest",
         ));
     }
+    let snapshot_is_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let pulse_digest = client_request_id.strip_prefix("automation-pulse-");
+    if !snapshot_is_sha256(expected_snapshot_sha256)
+        || !pulse_digest.is_some_and(snapshot_is_sha256)
+    {
+        return Err(Error::invalid(
+            "admission attempt marker requires the exact page and pulse identities",
+        ));
+    }
 
     let marker = if sequence == 2 {
         ATTEMPT_TWO_MARKER
@@ -744,6 +760,8 @@ pub fn write_qualification_admit_attempt(
         "owner_config_sha256":config_sha256,
         "method":"automation.scheduler.admit",
         "sequence":sequence,
+        "client_request_id":client_request_id,
+        "expected_snapshot_sha256":expected_snapshot_sha256,
     });
     let bytes = serde_json::to_vec(&value)?;
     if bytes.len() > MAX_ADMIT_ATTEMPT_BYTES {
@@ -766,7 +784,7 @@ pub fn write_qualification_admit_attempt(
 
 /// Closed schema for an admission attempt marker.
 #[cfg(feature = "qualification-faults")]
-pub const ATTEMPT_SCHEMA: &str = "eliot.swarm.r48.qualification-admit-attempt.v1";
+pub const ATTEMPT_SCHEMA: &str = "eliot.swarm.r48.qualification-admit-attempt.v2";
 
 /// File name for the first admission attempt marker.
 #[cfg(feature = "qualification-faults")]
@@ -811,6 +829,8 @@ pub enum QualificationWitnessDiagnostic {
     Absent,
     Valid {
         withheld_frame_bytes: usize,
+        jsonrpc_request_id: Option<String>,
+        jsonrpc_reply_id: Option<String>,
         witness_writer_outcome: QualificationWitnessWriterOutcome,
     },
 }
@@ -878,20 +898,37 @@ pub fn write_qualification_witness_diagnostic(
 ) -> swarm_contracts::error::Result<()> {
     if let QualificationWitnessDiagnostic::Valid {
         withheld_frame_bytes,
+        jsonrpc_request_id,
+        jsonrpc_reply_id,
         ..
     } = &diagnostic
-        && (*withheld_frame_bytes == 0
-            || *withheld_frame_bytes > swarm_client::IpcConfig::default().max_frame_bytes)
     {
-        return Err(swarm_contracts::error::Error::invalid(
-            "qualification diagnosis requires a bounded parsed frame length",
-        ));
+        let valid_jsonrpc_id = |value: &str| {
+            value.len() == 36
+                && value.bytes().enumerate().all(|(index, byte)| match index {
+                    8 | 13 | 18 | 23 => byte == b'-',
+                    _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+                })
+        };
+        let ids_are_valid = match (jsonrpc_request_id.as_deref(), jsonrpc_reply_id.as_deref()) {
+            (None, None) => true,
+            (Some(request), Some(reply)) => request == reply && valid_jsonrpc_id(request),
+            _ => false,
+        };
+        if *withheld_frame_bytes == 0
+            || *withheld_frame_bytes > swarm_client::IpcConfig::default().max_frame_bytes
+            || !ids_are_valid
+        {
+            return Err(swarm_contracts::error::Error::invalid(
+                "qualification diagnosis requires bounded frame and matched RPC identity",
+            ));
+        }
     }
     write_qualification_admit_diagnostic(
         data_root,
         ADMIT_WITNESS_DIAGNOSTIC_MARKER,
         QualificationAdmitDiagnostic {
-            schema: "eliot.swarm.r48.qualification-admit-witness-diagnostic.v1",
+            schema: "eliot.swarm.r48.qualification-admit-witness-diagnostic.v2",
             owner_launch_pid: pid,
             owner_config_sha256: config_sha256,
             method: ADMIT_METHOD,
@@ -1058,6 +1095,8 @@ mod qualification_admit_diagnostic_tests {
                     &digest,
                     QualificationWitnessDiagnostic::Valid {
                         withheld_frame_bytes,
+                        jsonrpc_request_id: None,
+                        jsonrpc_reply_id: None,
                         witness_writer_outcome: QualificationWitnessWriterOutcome::Applied,
                     },
                 )
@@ -1081,6 +1120,26 @@ mod qualification_admit_attempt_tests {
 
     fn valid_digest() -> String {
         "a".repeat(64)
+    }
+
+    fn valid_snapshot_sha256() -> String {
+        "b".repeat(64)
+    }
+
+    fn valid_client_request_id() -> String {
+        format!("automation-pulse-{}", "c".repeat(64))
+    }
+
+    fn write_attempt(root: &Path, pid: u32) -> swarm_contracts::error::Result<u8> {
+        let client_request_id = valid_client_request_id();
+        let snapshot_sha256 = valid_snapshot_sha256();
+        write_qualification_admit_attempt(
+            root,
+            pid,
+            &valid_digest(),
+            &client_request_id,
+            &snapshot_sha256,
+        )
     }
 
     /// A fresh private service directory, standing in for a fresh worker lifetime.
@@ -1116,7 +1175,7 @@ mod qualification_admit_attempt_tests {
     #[test]
     fn a_fresh_lifetime_records_marker_one() {
         let root = fresh_service_root("first");
-        let sequence = write_qualification_admit_attempt(&root, 6001, &valid_digest())
+        let sequence = write_attempt(&root, 6001)
             .expect("a create-only write into a fresh directory succeeds");
         assert_eq!(sequence, 1, "a fresh lifetime records the first attempt");
 
@@ -1152,14 +1211,12 @@ mod qualification_admit_attempt_tests {
     fn a_retained_directory_advances_the_sequence_across_a_restart() {
         let root = fresh_service_root("retained");
         assert_eq!(
-            write_qualification_admit_attempt(&root, 6002, &valid_digest())
-                .expect("marker one is written"),
+            write_attempt(&root, 6002).expect("marker one is written"),
             1
         );
         // A later lifetime sees the retained marker one and derives sequence two.
         assert_eq!(
-            write_qualification_admit_attempt(&root, 6003, &valid_digest())
-                .expect("marker two is written"),
+            write_attempt(&root, 6003).expect("marker two is written"),
             2,
             "a retained marker one makes the next attempt the second"
         );
@@ -1177,16 +1234,14 @@ mod qualification_admit_attempt_tests {
     fn a_third_attempt_is_refused_rather_than_recorded() {
         let root = fresh_service_root("third-refused");
         assert_eq!(
-            write_qualification_admit_attempt(&root, 6004, &valid_digest())
-                .expect("marker one is written"),
+            write_attempt(&root, 6004).expect("marker one is written"),
             1
         );
         assert_eq!(
-            write_qualification_admit_attempt(&root, 6004, &valid_digest())
-                .expect("marker two is written"),
+            write_attempt(&root, 6004).expect("marker two is written"),
             2
         );
-        let third = write_qualification_admit_attempt(&root, 6004, &valid_digest());
+        let third = write_attempt(&root, 6004);
         assert!(
             third.is_err(),
             "a third attempt is refused before its request is sent"
@@ -1214,7 +1269,7 @@ mod qualification_admit_attempt_tests {
         std::fs::set_permissions(&service_dir, permissions)
             .expect("the service directory is made read-only");
 
-        let outcome = write_qualification_admit_attempt(&root, 6006, &valid_digest());
+        let outcome = write_attempt(&root, 6006);
         assert!(
             outcome.is_err(),
             "a marker create failure must refuse the request"
@@ -1233,11 +1288,38 @@ mod qualification_admit_attempt_tests {
     fn an_invalid_or_zero_identity_fails_before_any_write() {
         let root = fresh_service_root("invalid-identity");
 
-        let zero_pid = write_qualification_admit_attempt(&root, 0, &valid_digest());
+        let zero_pid = write_attempt(&root, 0);
         assert!(zero_pid.is_err(), "a zero PID is refused");
 
-        let short_digest = write_qualification_admit_attempt(&root, 6007, "abc");
+        let short_digest = write_qualification_admit_attempt(
+            &root,
+            6007,
+            "abc",
+            &valid_client_request_id(),
+            &valid_snapshot_sha256(),
+        );
         assert!(short_digest.is_err(), "a short config digest is refused");
+
+        let invalid_snapshot = write_qualification_admit_attempt(
+            &root,
+            6007,
+            &valid_digest(),
+            &valid_client_request_id(),
+            "not-a-snapshot",
+        );
+        assert!(
+            invalid_snapshot.is_err(),
+            "an invalid page digest is refused"
+        );
+
+        let invalid_request = write_qualification_admit_attempt(
+            &root,
+            6007,
+            &valid_digest(),
+            "arbitrary-request-id",
+            &valid_snapshot_sha256(),
+        );
+        assert!(invalid_request.is_err(), "an invalid pulse ID is refused");
 
         assert!(
             !marker_one(&root).exists(),
@@ -1245,14 +1327,13 @@ mod qualification_admit_attempt_tests {
         );
     }
 
-    /// The marker schema is exactly the contracted five fields and carries no
+    /// The marker schema is exactly the contracted seven fields and carries no
     /// credential, which is why it is closed rather than a passthrough of request
     /// content.
     #[test]
     fn a_written_marker_has_exactly_the_closed_fields() {
         let root = fresh_service_root("closed-schema");
-        write_qualification_admit_attempt(&root, 6008, &valid_digest())
-            .expect("marker one is written");
+        write_attempt(&root, 6008).expect("marker one is written");
         let marker = std::fs::read_to_string(marker_one(&root)).expect("marker one is written");
         for forbidden in ["token", "credential", "service_owner_token", "store_root"] {
             assert!(
@@ -1263,11 +1344,23 @@ mod qualification_admit_attempt_tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&marker).expect("the marker is valid JSON");
         let fields = parsed.as_object().expect("the marker is an object");
+        let mut keys = fields.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
         assert_eq!(
-            fields.len(),
-            5,
-            "the marker schema is exactly the five contracted fields"
+            keys,
+            [
+                "client_request_id",
+                "expected_snapshot_sha256",
+                "method",
+                "owner_config_sha256",
+                "owner_launch_pid",
+                "schema",
+                "sequence",
+            ],
+            "the marker schema is exactly the seven contracted fields"
         );
+        assert_eq!(fields["client_request_id"], valid_client_request_id());
+        assert_eq!(fields["expected_snapshot_sha256"], valid_snapshot_sha256());
     }
 }
 

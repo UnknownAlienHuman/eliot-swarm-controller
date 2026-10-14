@@ -298,10 +298,20 @@ async fn call_once(
     let first_qualified_admit = if method == ADMIT_METHOD
         && QUALIFICATION_ADMIT_INTENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
     {
+        let client_request_id = params
+            .get("client_request_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let expected_snapshot_sha256 = params
+            .get("expected_snapshot_sha256")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         swarm_automation::write_qualification_admit_attempt(
             std::path::Path::new(&config.store_root),
             std::process::id(),
             &config.config_sha256,
+            client_request_id,
+            expected_snapshot_sha256,
         )? == 1
     } else {
         false
@@ -401,13 +411,19 @@ fn record_qualification_admit_result(
     let diagnostic = match swarm_client::qualification_faults::parse_withheld_frame_bytes(
         &error.message,
     ) {
-        Some(withheld_frame_bytes) => swarm_automation::QualificationWitnessDiagnostic::Valid {
-            withheld_frame_bytes,
-            witness_writer_outcome: record_qualification_fault_witness(
-                config,
+        Some(withheld_frame_bytes) => {
+            let rpc_ids =
+                swarm_client::qualification_faults::parse_withheld_jsonrpc_ids(&error.message);
+            swarm_automation::QualificationWitnessDiagnostic::Valid {
                 withheld_frame_bytes,
-            ),
-        },
+                jsonrpc_request_id: rpc_ids.as_ref().map(|(request_id, _)| request_id.clone()),
+                jsonrpc_reply_id: rpc_ids.as_ref().map(|(_, reply_id)| reply_id.clone()),
+                witness_writer_outcome: record_qualification_fault_witness(
+                    config,
+                    withheld_frame_bytes,
+                ),
+            }
+        }
         None => {
             eprintln!(
                 "swarm-automation-worker: qualification witness refused; withheld frame length was absent from the transport error"
@@ -595,7 +611,7 @@ mod qualification_admit_result_tests {
             }
             let result = Err(Error::new(
                 swarm_client::qualification_faults::QUALIFICATION_REPLY_DROPPED,
-                "private-error-message; withheld_frame_bytes=4096",
+                "private-error-message; withheld_frame_bytes=4096; jsonrpc_request_id=d48eec20-e701-4b19-9ec3-cda827a6763d; jsonrpc_reply_id=d48eec20-e701-4b19-9ec3-cda827a6763d",
             ));
             let before = serde_json::to_value(&result).unwrap();
             record_qualification_admit_result(&config, true, &result);
@@ -607,10 +623,18 @@ mod qualification_admit_result_tests {
             assert_eq!(diagnostic["frame_length_state"], "valid");
             assert_eq!(diagnostic["withheld_frame_bytes"], 4096);
             assert_eq!(
+                diagnostic["jsonrpc_request_id"],
+                "d48eec20-e701-4b19-9ec3-cda827a6763d"
+            );
+            assert_eq!(
+                diagnostic["jsonrpc_reply_id"],
+                "d48eec20-e701-4b19-9ec3-cda827a6763d"
+            );
+            assert_eq!(
                 diagnostic["witness_writer_outcome"],
                 if block_witness { "rejected" } else { "applied" }
             );
-            assert_eq!(diagnostic.as_object().unwrap().len(), 8);
+            assert_eq!(diagnostic.as_object().unwrap().len(), 10);
             assert_eq!(witness_path.is_file(), !block_witness);
             fs::remove_dir_all(&config.store_root).unwrap();
         }

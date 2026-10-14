@@ -160,11 +160,14 @@ impl Client {
             // Poison the connection exactly as an uncertain reply does:
             // usable stays false, so the caller must reconnect before any
             // further request and cannot replay this frame.
+            let reply_id = response["id"].as_str().unwrap_or_default();
             return Err(Error::new(
                 crate::qualification_faults::QUALIFICATION_REPLY_DROPPED,
                 format!(
-                    "qualified reply withheld at the transport seam; the request was sent once and is not reusable; withheld_frame_bytes={}",
-                    frame.len()
+                    "qualified reply withheld at the transport seam; the request was sent once and is not reusable; withheld_frame_bytes={}; jsonrpc_request_id={}; jsonrpc_reply_id={}",
+                    frame.len(),
+                    id,
+                    reply_id
                 ),
             ));
         }
@@ -346,6 +349,8 @@ mod tests {
             qualification_faults::QUALIFICATION_REPLY_DROPPED
         );
         assert!(error.message.contains("withheld_frame_bytes="));
+        let withheld_ids = qualification_faults::parse_withheld_jsonrpc_ids(&error.message)
+            .expect("the diagnostic records the matched JSON-RPC request/reply IDs");
         let refused = admit_client
             .request("automation.scheduler.admit", parameters.clone())
             .await
@@ -355,6 +360,8 @@ mod tests {
         let (request, following) = admit_peer.await.unwrap();
         assert_eq!(request["method"], "automation.scheduler.admit");
         assert_eq!(request["params"], parameters);
+        assert_eq!(request["id"], withheld_ids.0);
+        assert_eq!(withheld_ids.0, withheld_ids.1);
         assert!(
             following.is_empty(),
             "the peer must observe one unaltered admit frame only"

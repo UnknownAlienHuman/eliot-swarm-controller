@@ -132,6 +132,18 @@ pub fn take_single_reply_drop_if_armed(method: &str) -> bool {
 /// withheld. The count is never invented: a missing or malformed tail makes the
 /// parser return None and the witness is refused.
 const WITHHELD_FRAME_BYTES_MARKER: &str = "withheld_frame_bytes=";
+const JSONRPC_REQUEST_ID_MARKER: &str = "jsonrpc_request_id=";
+const JSONRPC_REPLY_ID_MARKER: &str = "jsonrpc_reply_id=";
+
+fn marker_value<'a>(message: &'a str, marker: &str) -> Option<&'a str> {
+    let mut matches = message.match_indices(marker);
+    let (offset, _) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let value = message[offset + marker.len()..].split(';').next()?.trim();
+    (!value.is_empty()).then_some(value)
+}
 
 /// Parse the exact withheld frame length from a transport error message.
 ///
@@ -139,12 +151,30 @@ const WITHHELD_FRAME_BYTES_MARKER: &str = "withheld_frame_bytes=";
 /// when the count exceeds the transport frame bound. A fabricated zero is never
 /// returned, so an unparsable message is distinguishable from a real count.
 pub fn parse_withheld_frame_bytes(message: &str) -> Option<usize> {
-    let (_, digits) = message.rsplit_once(WITHHELD_FRAME_BYTES_MARKER)?;
-    if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+    let digits = marker_value(message, WITHHELD_FRAME_BYTES_MARKER)?;
+    if !digits.bytes().all(|digit| digit.is_ascii_digit()) {
         return None;
     }
     let value = digits.parse::<usize>().ok()?;
     withheld_frame_length_is_bounded(value).then_some(value)
+}
+
+/// Parse the request/reply IDs for the matched frame deliberately withheld by
+/// the qualification-only seam. The transport validates the response ID before
+/// reaching that seam; this parser also requires canonical UUID text and equal
+/// IDs so malformed diagnostics never establish a match.
+pub fn parse_withheld_jsonrpc_ids(message: &str) -> Option<(String, String)> {
+    let request_id = marker_value(message, JSONRPC_REQUEST_ID_MARKER)?;
+    let reply_id = marker_value(message, JSONRPC_REPLY_ID_MARKER)?;
+    let request_uuid = uuid::Uuid::parse_str(request_id).ok()?;
+    let reply_uuid = uuid::Uuid::parse_str(reply_id).ok()?;
+    if request_uuid.to_string() != request_id
+        || reply_uuid.to_string() != reply_id
+        || request_id != reply_id
+    {
+        return None;
+    }
+    Some((request_id.to_owned(), reply_id.to_owned()))
 }
 
 /// Report whether a withheld frame length fits the transport frame bound.
@@ -202,6 +232,43 @@ mod tests {
     fn a_present_frame_length_is_parsed_exactly() {
         let message = "qualified reply withheld at the transport seam; withheld_frame_bytes=4096";
         assert_eq!(parse_withheld_frame_bytes(message), Some(4096));
+    }
+
+    #[test]
+    fn matched_rpc_ids_are_parsed_from_the_withheld_reply_diagnostic() {
+        let id = "d48eec20-e701-4b19-9ec3-cda827a6763d";
+        let message = format!(
+            "reply withheld; withheld_frame_bytes=4096; jsonrpc_request_id={id}; jsonrpc_reply_id={id}"
+        );
+        assert_eq!(parse_withheld_frame_bytes(&message), Some(4096));
+        assert_eq!(
+            parse_withheld_jsonrpc_ids(&message),
+            Some((id.to_owned(), id.to_owned()))
+        );
+    }
+
+    #[test]
+    fn unmatched_or_noncanonical_rpc_ids_are_not_reported_as_evidence() {
+        let request = "d48eec20-e701-4b19-9ec3-cda827a6763d";
+        let reply = "e48eec20-e701-4b19-9ec3-cda827a6763d";
+        assert_eq!(
+            parse_withheld_jsonrpc_ids(&format!(
+                "withheld_frame_bytes=1; jsonrpc_request_id={request}; jsonrpc_reply_id={reply}"
+            )),
+            None
+        );
+        assert_eq!(
+            parse_withheld_jsonrpc_ids(
+                "withheld_frame_bytes=1; jsonrpc_request_id=not-a-uuid; jsonrpc_reply_id=not-a-uuid"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_withheld_jsonrpc_ids(
+                "withheld_frame_bytes=1; jsonrpc_request_id=d48eec20-e701-4b19-9ec3-cda827a6763d"
+            ),
+            None
+        );
     }
 
     #[test]
