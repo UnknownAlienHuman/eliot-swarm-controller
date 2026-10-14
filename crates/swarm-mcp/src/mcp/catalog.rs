@@ -8,6 +8,8 @@
 
 use super::{profiles, tool_from_spec};
 use crate::config::McpToolProfile;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rmcp::model::Tool;
 use serde::Serialize;
@@ -21,6 +23,24 @@ use swarm_contracts::mcp_catalog::{
     mutation_requires_caller_request_id, output_schema_bytes, profile_name, role_core, tool_name,
     update_field, validate_registry_metadata,
 };
+
+/// Test-only count of full `surface_view` builds (fresh per-request
+/// authorization views, including exact-method searches). Views rebuild every
+/// call by design: rights are never cached across requests. Schema bytes
+/// inside the digests come from the existing immutable factory cache, so
+/// repeated calls rebuild views but never re-serialize schemas.
+#[cfg(test)]
+static SEARCH_FULL_VIEW_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_search_view_builds() {
+    SEARCH_FULL_VIEW_BUILDS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn search_view_builds() -> u64 {
+    SEARCH_FULL_VIEW_BUILDS.load(Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 pub struct CatalogPage {
@@ -183,6 +203,12 @@ where
 /// Search only the authorized registry. The result contains metadata and a
 /// truthful activation disposition; it carries no schema, arguments, or
 /// execution endpoint. This is catalog lookup, never a generic RPC tool.
+///
+/// Exact-method searches keep full-view revisions and `loaded_catalog_revision`
+/// checks bit-for-bit: the view (fresh per-request authorization over every
+/// method) is never replaced by a query-subset identity, and schemas inside
+/// the digests come from the immutable factory cache rather than per-request
+/// serialization.
 pub fn search_catalog<F>(
     profile: McpToolProfile,
     surface: &Surface,
@@ -323,6 +349,8 @@ fn surface_view<F>(
 where
     F: FnMut(&str, Option<&str>) -> bool,
 {
+    #[cfg(test)]
+    SEARCH_FULL_VIEW_BUILDS.fetch_add(1, Ordering::Relaxed);
     validate_registry_metadata()?;
     let mut entries: Vec<_> = TOOL_METADATA
         .iter()

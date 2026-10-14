@@ -1,6 +1,6 @@
 use super::{
     AuthorizationBasis, AuthorizationRevision, CatalogError, SearchRequest, Surface,
-    list_tools_page, search_catalog,
+    list_tools_page, reset_search_view_builds, search_catalog, search_view_builds,
 };
 use crate::config::McpToolProfile;
 use sha2::Digest;
@@ -106,6 +106,131 @@ fn catalog_direct_schema_bytes_and_profile_membership_match() {
             }
         }
     }
+}
+
+#[test]
+fn exact_search_keeps_full_view_revisions_and_loaded_revision_checks() {
+    let profile = McpToolProfile::Full;
+    let surface = Surface::role_default(profile);
+    let authorization = AuthorizationRevision {
+        value: "exact-revision-parity",
+        basis: AuthorizationBasis::AuthenticatedStoreScope,
+    };
+    let exact = SearchRequest {
+        query: "task.create",
+        purpose: None,
+        task_id: Some("task-exact-parity"),
+        exact_method: Some("task.create"),
+        loaded_catalog_revision: None,
+        max_results: 1,
+    };
+    let broad = SearchRequest {
+        query: "task create",
+        purpose: None,
+        task_id: Some("task-exact-parity"),
+        exact_method: None,
+        loaded_catalog_revision: None,
+        max_results: 5,
+    };
+    // Construction seam: each search rebuilds the fresh authorized view;
+    // schema bytes inside the digests come from the immutable factory cache.
+    reset_search_view_builds();
+    let first = search_catalog(profile, &surface, exact, authorization, |_, _| true)
+        .expect("exact match");
+    assert_eq!(first.matches.len(), 1);
+    assert_eq!(first.matches[0].method, "task.create");
+    let second = search_catalog(profile, &surface, exact, authorization, |_, _| true)
+        .expect("repeated exact match");
+    assert_eq!(search_view_builds(), 2);
+    // Revision parity: exact and broad full views share one identity.
+    assert_eq!(first.catalog_revision, second.catalog_revision);
+    assert_eq!(first.surface_revision, second.surface_revision);
+    let broad_result = search_catalog(profile, &surface, broad, authorization, |_, _| true)
+        .expect("broad view");
+    assert_eq!(broad_result.catalog_revision, first.catalog_revision);
+    // Valid loaded revision is honored by exact searches.
+    let replay = search_catalog(
+        profile,
+        &surface,
+        SearchRequest {
+            loaded_catalog_revision: Some(&first.catalog_revision),
+            ..exact
+        },
+        authorization,
+        |_, _| true,
+    )
+    .expect("valid loaded revision is honored");
+    assert_eq!(replay.catalog_revision, first.catalog_revision);
+    assert_eq!(replay.matches.len(), 1);
+    // Stale loaded revision fails closed for exact searches.
+    let stale = search_catalog(
+        profile,
+        &surface,
+        SearchRequest {
+            loaded_catalog_revision: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            ..exact
+        },
+        authorization,
+        |_, _| true,
+    )
+    .expect_err("stale loaded revision must fail closed");
+    assert_eq!(stale, CatalogError::StaleCatalogRevision);
+}
+
+#[test]
+fn repeated_searches_reuse_factory_bytes_without_rebuild() {
+    use swarm_contracts::mcp_catalog::{find_tool_spec, input_schema_bytes};
+
+    let profile = McpToolProfile::Full;
+    let surface = Surface::role_default(profile);
+    let authorization = AuthorizationRevision {
+        value: "factory-reuse-rev",
+        basis: AuthorizationBasis::AuthenticatedStoreScope,
+    };
+    let (read_only, spec) = find_tool_spec("task.create").expect("task spec");
+    let before = input_schema_bytes(spec, *read_only, false).expect("factory bytes");
+    reset_search_view_builds();
+    for _ in 0..6 {
+        let exact = search_catalog(
+            profile,
+            &surface,
+            SearchRequest {
+                query: "task.create",
+                purpose: None,
+                task_id: Some("task-factory-reuse"),
+                exact_method: Some("task.create"),
+                loaded_catalog_revision: None,
+                max_results: 1,
+            },
+            authorization,
+            |_, _| true,
+        )
+        .expect("exact search");
+        assert_eq!(exact.matches.len(), 1);
+        let broad = search_catalog(
+            profile,
+            &surface,
+            SearchRequest {
+                query: "task",
+                purpose: None,
+                task_id: Some("task-factory-reuse"),
+                exact_method: None,
+                loaded_catalog_revision: None,
+                max_results: 5,
+            },
+            authorization,
+            |_, _| true,
+        )
+        .expect("broad search");
+        assert!(!broad.matches.is_empty());
+    }
+    // Views rebuild fresh every call (no positive rights cache) ...
+    assert_eq!(search_view_builds(), 12);
+    // ... while the immutable factory bytes are never re-serialized.
+    let after = input_schema_bytes(spec, *read_only, false).expect("factory bytes");
+    assert!(std::sync::Arc::ptr_eq(&before, &after));
 }
 
 #[test]
