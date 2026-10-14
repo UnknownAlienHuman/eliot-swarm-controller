@@ -1272,13 +1272,6 @@ fn scope_term_set(scope: &Value) -> BTreeSet<(String, String)> {
     terms
 }
 
-fn scope_intersects_terms(scope: &Value, terms: &BTreeSet<(String, String)>) -> bool {
-    terms.iter().any(|term| scope_covers_term(scope, term))
-        || scope_term_set(scope)
-            .iter()
-            .any(|declared| terms.iter().any(|term| terms_overlap(declared, term)))
-}
-
 fn scope_covers_term(scope: &Value, term: &(String, String)) -> bool {
     let values = scope
         .get(match term.0.as_str() {

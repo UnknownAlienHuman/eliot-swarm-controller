@@ -3557,27 +3557,27 @@ fn current_peer_relation(
     if let Some(scope) = accepted_scope_relation(db, source, target, selector)? {
         return Ok(Some(scope));
     }
-    if matches!(selector, None | Some(PeerSelector::Participant(_)))
+    let cell_selector = matches!(selector, None | Some(PeerSelector::Participant(_)))
         || matches!(
             selector,
             Some(PeerSelector::Term(keys::TermKind::Contract, _))
-        )
-    {
-        if let Some(cell) = super::integration::current_peer_cell_relation(
+        );
+    if cell_selector
+        && let Some(cell) = super::integration::current_peer_cell_relation(
             db,
             &scope_context(source),
             &scope_context(target),
             relation_term(selector).map(|(kind, term)| (kind, term.to_owned())),
-        )? {
-            return Ok(Some(cell));
-        }
-    }
-    if matches!(selector, None | Some(PeerSelector::Participant(_)))
-        || matches!(selector, Some(PeerSelector::Term(_, _)))
+        )?
     {
-        if let Some(pending) = pending_coordination_relation(db, source, target, selector)? {
-            return Ok(Some(pending));
-        }
+        return Ok(Some(cell));
+    }
+    let pending_selector = matches!(selector, None | Some(PeerSelector::Participant(_)))
+        || matches!(selector, Some(PeerSelector::Term(_, _)));
+    if pending_selector
+        && let Some(pending) = pending_coordination_relation(db, source, target, selector)?
+    {
+        return Ok(Some(pending));
     }
     Ok(None)
 }
