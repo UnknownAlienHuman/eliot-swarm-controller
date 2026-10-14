@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries]
 permissions:
   contents: read
 jobs:
@@ -785,6 +785,15 @@ jobs:
             )
           } elseif ($env:QUALIFICATION -ceq 'focused-legacy-host') {
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -TestTarget 'legacy_activation' -Filter 'legacy_poison_activation_preserves_real_host_listener_and_exact_quarantine' -Expected 1 -ExpectedNames @('legacy_poison_activation_preserves_real_host_listener_and_exact_quarantine')
+          } elseif ($env:QUALIFICATION -ceq 'focused-reconcile-boundaries') {
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'pr60_automation_reconcile_fatal_boundaries' -Expected 5 -ExpectedNames @(
+              'pr60_automation_reconcile_fatal_sqlite_write_rolls_back_domain',
+              'pr60_automation_reconcile_savepoint_uncertainty_retains_both_causes',
+              'pr60_automation_reconcile_quarantine_digest_counters_and_namespaces_are_bound',
+              'pr60_automation_reconcile_public_store_read_failure_is_fatal',
+              'pr60_automation_reconcile_foreign_domain_cursors_are_rejected'
+            )
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'quarantine_cas_rejects_whitespace_only_source_mutation' -Expected 1 -ExpectedNames @('quarantine_cas_rejects_whitespace_only_source_mutation')
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }
