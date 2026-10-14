@@ -2386,13 +2386,20 @@ mod catalog_readiness_tests {
         };
 
         let error = client
-            .preflight_send(&command, &options, command.native_root_id.as_deref().unwrap())
+            .preflight_send(
+                &command,
+                &options,
+                command.native_root_id.as_deref().unwrap(),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.code, "UNSUPPORTED_CAPABILITY");
         let payload = input_payload(&command, "msg_swarm_fixture", "one step").unwrap_err();
         assert_eq!(payload.code, "UNSUPPORTED_CAPABILITY");
-        assert_eq!(native_delivery_for_method("native.opencode.loop_step"), Some("steer"));
+        assert_eq!(
+            native_delivery_for_method("native.opencode.loop_step"),
+            Some("steer")
+        );
     }
 
     async fn catalog_fixture(
