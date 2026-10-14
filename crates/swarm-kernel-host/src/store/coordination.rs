@@ -81,6 +81,15 @@ pub(crate) fn current_scope(db: &Connection, principal: &Principal) -> Result<Va
     Ok(scope_projection(&scope))
 }
 
+/// Canonical current endpoint identity for internal membership and ACK checks.
+/// Public registration projections intentionally omit the metadata-key client
+/// identity, so callers must not reconstruct this context from that projection.
+pub(super) fn current_scope_context(db: &Connection, principal: &Principal) -> Result<Value> {
+    principal.require_participant()?;
+    let scope = load_current_scope_for_client(db, &principal.client_id)?;
+    Ok(scope_context(&scope))
+}
+
 /// Admit submission only from a live, ordinary Participant grant for this
 /// exact Task revision and Attempt. Sponsored reviewer grants remain limited
 /// to their retained review slot and never acquire Task submission authority.

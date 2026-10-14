@@ -398,7 +398,7 @@ fn sync_integration(
         old_cell["updated_at_ms"] = json!(now);
         old_cell["operation_id"] = json!(operation_id);
         old_cell["updated_by_client_id"] = json!(principal.client_id);
-        old_cell["updated_by_context"] = participant_context(&scope);
+        old_cell["updated_by_context"] = super::coordination::current_scope_context(tx, principal)?;
         old_cell["previous_material_digest"] = old_digest;
         old_cell["material_digest"] = json!(digest(&json!({
             "prior_material_digest":old_cell["previous_material_digest"],
@@ -443,7 +443,7 @@ fn sync_integration(
         "updated_at_ms":if changed { now } else { prior_cell.as_ref().and_then(|item|item["updated_at_ms"].as_i64()).unwrap_or(now) },
         "operation_id":operation_id,
         "updated_by_client_id":principal.client_id,
-        "updated_by_context":participant_context(&scope),
+        "updated_by_context":super::coordination::current_scope_context(tx, principal)?,
         "membership_digest":membership_digest,
         "purpose":"make producer/carrier/consumer compatible",
         "close_condition":"all required dimensions match or exact mismatch is escalated",
@@ -576,7 +576,7 @@ fn integration_ack(
             "participant basis differs from the exact basis retained by this cell",
         ));
     }
-    if member.get("context") != Some(&participant_context(&scope)) {
+    if member.get("context") != Some(&super::coordination::current_scope_context(tx, principal)?) {
         return Err(Error::new(
             "STALE_PARTICIPANT",
             "participant Task, Attempt, actor, binding, or grant revision differs from the cell member context",
@@ -633,7 +633,7 @@ fn integration_ack(
         "task_revision":task_revision,
         "attempt_id":attempt_id,
         "actor_client_id":principal.client_id,
-        "actor_context":participant_context(&scope),
+        "actor_context":super::coordination::current_scope_context(tx, principal)?,
         "participation_basis":caller_basis,
         "decision":request.decision.as_str(),
         "autonomy_digest":scope_snapshot["autonomy_digest"],
@@ -1734,22 +1734,6 @@ fn authorize_retained_cell_read(
             "integration cell history requires a current Manager or local Operator",
         )),
     }
-}
-
-fn participant_context(scope: &Value) -> Value {
-    let participant = &scope["participant"];
-    json!({
-        "task_id":scope["task"]["task_id"],
-        "task_revision":scope["task"]["revision"],
-        "attempt_id":scope["attempt"]["attempt_id"],
-        "actor":{
-            "client_id":participant["client_id"],
-            "participation_basis":participant["participation_basis"],
-        },
-        "grant_revision":participant["grant_revision"],
-        "binding_id":participant.get("binding_id").cloned().unwrap_or(Value::Null),
-        "binding_generation":participant.get("binding_generation").cloned().unwrap_or(Value::Null),
-    })
 }
 
 fn task_revision_set_contains(
