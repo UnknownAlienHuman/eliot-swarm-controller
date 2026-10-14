@@ -2497,7 +2497,7 @@ fn task_queue_item(
             "start_operation_id":attempt.start_operation_id,
             "binding": match (&attempt.binding_id,attempt.binding_generation) {
                 (Some(id), Some(generation)) => {
-                    binding_summary(db, id, generation, &task_scope)?
+                    binding_summary(db, id, generation, &row.task_id, &task_scope)?
                 }
                 _ => Value::Null,
             },
@@ -2569,12 +2569,15 @@ fn task_queue_item(
     }))
 }
 
-/// Bounded exact-pair projection of the existing Manager attention page. A
-/// partial source page or detached item never becomes a claim of no attention.
+/// Bounded exact-Task/binding projection of the existing Manager attention
+/// page. Source totals retain the caller's page scope while nested items are
+/// limited to the Task represented by this binding row. A partial source page
+/// or detached item never becomes a claim of no attention.
 fn exact_binding_manager_attention(
     db: &Connection,
     binding_id: &str,
     generation: i64,
+    task_id: &str,
     scope: &FleetReadScope,
 ) -> Result<Value> {
     let page = manager_exceptions_page(
@@ -2583,16 +2586,17 @@ fn exact_binding_manager_attention(
         false,
         scope,
     )?;
-    let exact_items = page["items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|item| {
-            item["binding_id"].as_str() == Some(binding_id)
-                && item["generation"].as_i64() == Some(generation)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let task_ids_json = model::canonical(&json!([task_id]))?;
+    let task_ids = std::collections::HashSet::from([task_id]);
+    let mut exact_items = Vec::new();
+    for item in page["items"].as_array().into_iter().flatten() {
+        if item["binding_id"].as_str() == Some(binding_id)
+            && item["generation"].as_i64() == Some(generation)
+            && capacity::attention_item_serves_task(db, item, &task_ids, &task_ids_json)?
+        {
+            exact_items.push(item.clone());
+        }
+    }
     let exact_match_count = exact_items.len();
     let exact_items_truncated = exact_match_count > MAX_ATTEMPT_BINDING_ATTENTION_ITEMS;
     let items = exact_items
@@ -2624,7 +2628,7 @@ fn exact_binding_manager_attention(
     };
     Ok(json!({
         "status":if coverage_complete {"complete_source_page"} else {"partial"},
-        "scope":{"binding_id":binding_id,"generation":generation},
+        "scope":{"binding_id":binding_id,"generation":generation,"task_id":task_id},
         "source":{
             "method":"swarm.exceptions.get",
             "view":"items",
@@ -2648,6 +2652,7 @@ fn binding_summary(
     db: &Connection,
     binding_id: &str,
     generation: i64,
+    task_id: &str,
     scope: &FleetReadScope,
 ) -> Result<Value> {
     let raw: Option<BindingReadRow> = db
@@ -2674,7 +2679,7 @@ fn binding_summary(
             "status":"missing_recorded_binding",
             "manager_attention":{
                 "status":"binding_record_missing",
-                "scope":{"binding_id":binding_id,"generation":generation},
+                "scope":{"binding_id":binding_id,"generation":generation,"task_id":task_id},
                 "coverage_complete":false,
                 "items":[],
                 "requery":{"method":"swarm.exceptions.get","params":{"after":0,"limit":launcher::MAX_PAGE_SIZE}},
@@ -2683,7 +2688,8 @@ fn binding_summary(
     };
     let route: Value = serde_json::from_str(&raw.route_json)?;
     let observation: Value = serde_json::from_str(&raw.state_json)?;
-    let manager_attention = exact_binding_manager_attention(db, binding_id, generation, scope)?;
+    let manager_attention =
+        exact_binding_manager_attention(db, binding_id, generation, task_id, scope)?;
     Ok(json!({
         "binding_id":binding_id,
         "generation":generation,
@@ -5639,7 +5645,8 @@ fn launch_preview_inner(
     let attempt_binding = if let Some(attempt) = exact_current_attempt {
         match (&attempt.binding_id, attempt.binding_generation) {
             (Some(binding_id), Some(generation)) => {
-                let detail = binding_summary(db, binding_id, generation, &attention_scope)?;
+                let detail =
+                    binding_summary(db, binding_id, generation, &row.task_id, &attention_scope)?;
                 let route_alias = detail["route"]["alias"].as_str();
                 if route_alias.is_some_and(|alias| alias != request.route) {
                     hard_blocks.push("requested_route_differs_from_current_attempt_binding");
@@ -7085,7 +7092,9 @@ pub(super) fn agent_inspect(
         "attempt.producers",
     )?;
     let binding = match (&attempt.binding_id, attempt.binding_generation) {
-        (Some(id), Some(generation)) => binding_summary(db, id, generation, &attention_scope)?,
+        (Some(id), Some(generation)) => {
+            binding_summary(db, id, generation, &attempt.task_id, &attention_scope)?
+        }
         _ => Value::Null,
     };
     let capacity = exact_attempt_capacity(db, &attempt)?;

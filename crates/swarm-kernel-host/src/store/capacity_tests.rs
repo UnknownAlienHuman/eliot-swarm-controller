@@ -1302,6 +1302,7 @@ fn manager_fleet_projections_preserve_exact_object_and_nested_attention_scope() 
     assert!(queue_a_end["items"].as_array().unwrap().is_empty());
     let nested_attention =
         &queue_a_next["items"][0]["current_attempt"]["binding"]["manager_attention"];
+    assert_eq!(nested_attention["scope"]["task_id"], "task-a");
     assert_eq!(
         nested_attention["source"]["total_items"],
         capacity::attention_report(&db, 200, 0).unwrap()["total_items"]

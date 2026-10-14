@@ -5012,7 +5012,7 @@ pub(crate) fn attention_report(db: &Connection, limit: i64, after: i64) -> Resul
     Ok(report)
 }
 
-fn attention_item_serves_owned_task(
+pub(crate) fn attention_item_serves_task(
     db: &Connection,
     item: &Value,
     owned_tasks: &std::collections::HashSet<&str>,
@@ -5072,7 +5072,7 @@ pub(crate) fn attention_report_for_scope(
     let items = build_attention_items(db, model::now_ms()?)?;
     let mut scoped_items = Vec::new();
     for item in items {
-        if attention_item_serves_owned_task(db, &item, &owned_task_set, &owned_tasks_json)? {
+        if attention_item_serves_task(db, &item, &owned_task_set, &owned_tasks_json)? {
             scoped_items.push(item);
         }
     }
