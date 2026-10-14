@@ -29,9 +29,18 @@ participation bases and the 40-item completeness boundary. Three migration
 cases were observed passing earlier, but their complete raw output was not
 retained; only result fragments remain with the operator. The integrated
 production and fixture files match that candidate byte for byte. This is
-scoped Store qualification, not a complete relation-kind, Linux unit or live
-native qualification. The remaining negative/relation matrix is still under
-review; Issue #99 remains open until its acceptance is reconciled.
+scoped Store qualification, not Linux unit or live native qualification.
+
+The additional nine public Store cases at `c37bba6` passed on Windows with
+strict all-target Clippy. They cover an unrelated peer, a forged cell revision,
+a disabled recipient, deduplicated consult retry, delivery after reassignment,
+a reviewer coordinating through its contract card, a carrier cell, an exact
+Task dependency, and accepted path/symbol/interface scopes. Each endpoint uses
+its own current Task/Attempt/grant context. Test-only formatting was corrected
+after that run; the assertions and production source are unchanged. A review
+grant still belongs to its reviewed subject: a reviewer can coordinate across
+Tasks through the same current contract/scope relations without broadening
+the sponsored-review grant or creating a cross-Task review authority.
 
 ### Gates and docs alignment -- 2026-10-14 (this candidate, unqualified)
 
