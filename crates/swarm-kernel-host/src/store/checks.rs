@@ -4895,15 +4895,33 @@ mod tests {
         collections::BTreeMap,
         path::{Path, PathBuf},
         process::{Command, Stdio},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
         time::Duration,
     };
     use tokio::time::timeout;
 
+    static PR61_PROBE_FAILURE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
     const PROBE_OWNER_FIXTURE_MODE: &str = "ELIOT_PROBE_OWNER_FIXTURE_MODE";
     const PROBE_OWNER_FIXTURE_READY: &str = "ELIOT_PROBE_OWNER_FIXTURE_READY";
     const PROBE_OWNER_FIXTURE_RELEASE: &str = "ELIOT_PROBE_OWNER_FIXTURE_RELEASE";
+
+    fn fail_pr61_input_probe(
+        _program: &Path,
+        _args: &[String],
+        _env: &BTreeMap<String, String>,
+        _cwd: &Path,
+    ) -> Result<Vec<u8>> {
+        PR61_PROBE_FAILURE_CALLS.fetch_add(1, Ordering::SeqCst);
+        Err(Error::new(
+            "TEST_PROBE_FAILURE",
+            "injected bounded CheckRunner version-probe failure",
+        ))
+    }
 
     #[test]
     fn probe_owner_fixture_child_entry() {
@@ -4947,6 +4965,16 @@ mod tests {
     fn pending_probe_owner(
         scope: inputs::ProbeCleanupScope,
     ) -> (ProbeCleanupOwner, ProbeOwnerProcessFixture) {
+        pending_probe_owner_with_scope(Some(scope))
+    }
+
+    fn pending_unscoped_probe_owner() -> (ProbeCleanupOwner, ProbeOwnerProcessFixture) {
+        pending_probe_owner_with_scope(None)
+    }
+
+    fn pending_probe_owner_with_scope(
+        scope: Option<inputs::ProbeCleanupScope>,
+    ) -> (ProbeCleanupOwner, ProbeOwnerProcessFixture) {
         let directory = std::env::temp_dir().join(format!("swarm-probe-owner-{}", model::new_id()));
         fs::create_dir(&directory).expect("create private probe owner fixture directory");
         let ready = directory.join("ready");
@@ -4974,11 +5002,8 @@ mod tests {
             panic!("probe owner child did not publish readiness");
         }
         let fixture = ProbeOwnerProcessFixture { directory, release };
-        let owner = inputs::pending_probe_cleanup_owner_for_test(
-            child,
-            fixture.directory.clone(),
-            Some(scope),
-        );
+        let owner =
+            inputs::pending_probe_cleanup_owner_for_test(child, fixture.directory.clone(), scope);
         (owner, fixture)
     }
 
@@ -5102,6 +5127,95 @@ mod tests {
         reap_probe_owners_to(custody, 0).await;
         child_a.cleanup();
         child_b.cleanup();
+        fixture.owner.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_probe_retains_owner_drops_resolution_and_holds_only_its_resource() {
+        PR61_PROBE_FAILURE_CALLS.store(0, Ordering::SeqCst);
+        let fixture = probe_error_fixture().await;
+        let store = &fixture.owner.store;
+        let (task_id, attempt_id) = create_attempt(&fixture, "cache-project", None).await;
+        let candidate =
+            source_snapshot(&fixture, &task_id, &attempt_id, b"probe error source").await;
+        let params = json!({
+            "client_request_id":model::new_id(),
+            "attempt_id":attempt_id,
+            "candidate_ref":candidate.artifact_id,
+            "profile_id":"strict",
+            "profile_revision":"pr61-probe-error",
+        });
+        let principal = fixture.principal.clone();
+        let config = fixture.config.clone();
+        let snapshot = store
+            .run(move |db| {
+                let principal = current_principal(db, principal)?;
+                plan_inputs(db, &principal, &params, &config)
+            })
+            .await
+            .unwrap();
+
+        let files = ArtifactFiles::new(&fixture.directory).unwrap();
+        let verified = source::verified_content(&files, &fixture.directory, &candidate).unwrap();
+        let owner_profile = fixture
+            .config
+            .checks
+            .profile("strict", "pr61-owner")
+            .unwrap();
+        let probe_profile = fixture
+            .config
+            .checks
+            .profile("strict", "pr61-probe-error")
+            .unwrap();
+        let owner_scope = inputs::ProbeCleanupScope::for_candidate(&owner_profile, &verified)
+            .expect("derive owner scope from configured profile and verified source");
+        let probe_scope = inputs::ProbeCleanupScope::for_candidate(&probe_profile, &verified)
+            .expect("derive preflight scope from configured profile and verified source");
+        assert_ne!(owner_scope.resource, probe_scope.resource);
+
+        let (owner, child) = pending_unscoped_probe_owner();
+        let _probe_override =
+            inputs::override_probe_cleanup_for_test(&probe_profile, fail_pr61_input_probe, owner);
+        let resolution = store
+            .resolve_check_plan_snapshot(Ok(snapshot))
+            .await
+            .unwrap();
+        let error = match resolution.result {
+            Err(error) => error,
+            Ok(_) => panic!("pending external probe custody must fail preflight"),
+        };
+        assert_eq!(error.code, "CHECK_PROBE_CLEANUP_PENDING");
+        assert_eq!(PR61_PROBE_FAILURE_CALLS.load(Ordering::SeqCst), 1);
+
+        let custody = &store.check_child_custody;
+        assert_eq!(
+            store.check_child_custody_count().await,
+            1,
+            "the retained owner remains; the failed preflight reservation is gone"
+        );
+        {
+            let owners = custody.probe_cleanup_owners.lock().await;
+            assert_eq!(owners.len(), 1);
+            assert!(owners[0].is_pending());
+            assert_eq!(owners[0].scope(), Some(&probe_scope));
+        }
+        assert!(custody.probe_cleanup_conflicts(Some(&probe_scope)).await);
+        assert!(!custody.probe_cleanup_conflicts(Some(&owner_scope)).await);
+        assert!(
+            custody
+                .reserve_probe_resolution(Some(&probe_scope.resource))
+                .await
+                .is_none()
+        );
+        let independent = custody
+            .reserve_probe_resolution(Some(&owner_scope.resource))
+            .await
+            .expect("the unrelated CheckRunner resource remains admissible");
+        drop(independent);
+
+        child.allow_departure();
+        reap_probe_owners_to(custody, 0).await;
+        child.cleanup();
         fixture.owner.close().await.unwrap();
     }
 
@@ -5284,6 +5398,66 @@ mod tests {
         let writer = Principal {
             link_id: model::new_id(),
             client_id: "cache-writer".into(),
+            role: Role::Manager,
+        };
+        let writer_id = writer.client_id.clone();
+        owner
+            .store
+            .run(move |db| {
+                super::set_meta(
+                    db,
+                    &format!("client:{writer_id}"),
+                    &json!({"role":Role::Manager,"disabled":false}),
+                )
+            })
+            .await
+            .unwrap();
+        Fixture {
+            directory,
+            owner,
+            principal,
+            writer,
+            config,
+        }
+    }
+
+    async fn probe_error_fixture() -> Fixture {
+        let directory =
+            std::env::temp_dir().join(format!("swarm-check-probe-error-{}", model::new_id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let root = DataRoot::acquire(&directory).unwrap();
+        let directory = root.path.clone();
+        let credential = bootstrap_credential(&root.path).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let profile = |profile_revision: &str, resource: &str| CheckProfile {
+            profile_id: "strict".into(),
+            profile_revision: profile_revision.into(),
+            executable: executable.clone(),
+            args: vec!["--list".into()],
+            parser: Parser::ExitCode,
+            resource: resource.into(),
+            environment: BTreeMap::new(),
+            inherit_env: Vec::new(),
+            expected_targets: Vec::new(),
+            reproducible: true,
+            fingerprint_env: Vec::new(),
+            versioned_inputs: BTreeMap::new(),
+        };
+        let mut config = Config::default();
+        config.storage.data_dir = directory.clone();
+        config.checks.enabled = true;
+        config.checks.profiles = vec![
+            profile("pr61-owner", "checks-a"),
+            profile("pr61-probe-error", "checks-b"),
+        ];
+        let config = Arc::new(config);
+        let owner = StoreOwner::start(root, config.clone(), credential.clone())
+            .await
+            .unwrap();
+        let principal = owner.store.authenticate(credential).await.unwrap();
+        let writer = Principal {
+            link_id: model::new_id(),
+            client_id: "pr61-probe-error-writer".into(),
             role: Role::Manager,
         };
         let writer_id = writer.client_id.clone();

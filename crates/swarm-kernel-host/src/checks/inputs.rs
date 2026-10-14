@@ -43,10 +43,71 @@ pub(crate) const PROBE_STDERR_CAPTURE_FILE: &str = "probe-stderr.capture";
 pub(crate) type TestProbeFn =
     fn(&Path, &[String], &BTreeMap<String, String>, &Path) -> Result<Vec<u8>>;
 
+#[cfg(test)]
+type TestProbeCleanupOverrides = BTreeMap<(String, String), (TestProbeFn, ProbeCleanupOwner)>;
+
+#[cfg(test)]
+static TEST_PROBE_CLEANUP_OVERRIDES: std::sync::OnceLock<
+    std::sync::Mutex<TestProbeCleanupOverrides>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct TestProbeCleanupOverrideGuard {
+    profile_id: String,
+    profile_revision: String,
+}
+
+#[cfg(test)]
+pub(crate) fn override_probe_cleanup_for_test(
+    profile: &CheckProfile,
+    probe: TestProbeFn,
+    owner: ProbeCleanupOwner,
+) -> TestProbeCleanupOverrideGuard {
+    let key = (profile.profile_id.clone(), profile.profile_revision.clone());
+    let mut overrides = TEST_PROBE_CLEANUP_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("probe cleanup test override lock");
+    assert!(
+        !overrides.contains_key(&key),
+        "probe cleanup test override already exists for this profile"
+    );
+    overrides.insert(key.clone(), (probe, owner));
+    TestProbeCleanupOverrideGuard {
+        profile_id: key.0,
+        profile_revision: key.1,
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestProbeCleanupOverrideGuard {
+    fn drop(&mut self) {
+        if let Some(overrides) = TEST_PROBE_CLEANUP_OVERRIDES.get()
+            && let Ok(mut overrides) = overrides.lock()
+        {
+            overrides.remove(&(self.profile_id.clone(), self.profile_revision.clone()));
+        }
+    }
+}
+
+#[cfg(test)]
+fn take_probe_cleanup_override(profile: &CheckProfile) -> Option<(TestProbeFn, ProbeCleanupOwner)> {
+    TEST_PROBE_CLEANUP_OVERRIDES
+        .get()?
+        .lock()
+        .ok()?
+        .remove(&(profile.profile_id.clone(), profile.profile_revision.clone()))
+}
+
 enum ProbeExecutor {
     Production,
     #[cfg(test)]
     Test(TestProbeFn),
+    #[cfg(test)]
+    TestWithCleanup {
+        probe: TestProbeFn,
+        owner: Option<Box<ProbeCleanupOwner>>,
+    },
 }
 
 struct ProbeContext {
@@ -70,6 +131,17 @@ impl ProbeContext {
         }
     }
 
+    #[cfg(test)]
+    fn test_with_cleanup(probe: TestProbeFn, owner: ProbeCleanupOwner) -> Self {
+        Self {
+            executor: ProbeExecutor::TestWithCleanup {
+                probe,
+                owner: Some(Box::new(owner)),
+            },
+            cleanup_owner: None,
+        }
+    }
+
     fn run(
         &mut self,
         program: &Path,
@@ -87,7 +159,7 @@ impl ProbeContext {
                 "a prior input probe helper remains in Store custody",
             ));
         }
-        match &self.executor {
+        match &mut self.executor {
             ProbeExecutor::Production => {
                 let (result, owner) = command_output_with_cleanup(program, args, env, cwd);
                 self.cleanup_owner = owner;
@@ -95,6 +167,12 @@ impl ProbeContext {
             }
             #[cfg(test)]
             ProbeExecutor::Test(probe) => probe(program, args, env, cwd),
+            #[cfg(test)]
+            ProbeExecutor::TestWithCleanup { probe, owner } => {
+                let result = probe(program, args, env, cwd);
+                self.cleanup_owner = owner.take().map(|owner| *owner);
+                result
+            }
         }
     }
 }
@@ -2116,6 +2194,12 @@ pub(crate) fn resolve_with_cleanup(
     candidate: &VerifiedSource,
     baseline: Option<&VerifiedSource>,
 ) -> (Result<ResolvedCheckPlan>, Option<ProbeCleanupOwner>) {
+    #[cfg(test)]
+    let mut probe = match take_probe_cleanup_override(profile) {
+        Some((probe, owner)) => ProbeContext::test_with_cleanup(probe, owner),
+        None => ProbeContext::production(),
+    };
+    #[cfg(not(test))]
     let mut probe = ProbeContext::production();
     let result = resolve_with_context(profile, candidate, baseline, &mut probe);
     let owner = probe.cleanup_owner;
