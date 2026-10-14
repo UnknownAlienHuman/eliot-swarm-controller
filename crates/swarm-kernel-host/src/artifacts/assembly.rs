@@ -247,14 +247,14 @@ fn cached_assembly_parts_for_range(
             bytes: 0,
         };
         entry.bytes = assembly_part_cache_entry_bytes(&entry);
-        if entry.bytes <= MAX_ASSEMBLY_PART_CACHE_BYTES {
-            if let Ok(mut cache) = assembly_part_cache().lock() {
-                cache.retain(|resident| {
-                    resident.key.artifact_id != entry.key.artifact_id
-                        || resident.key.cache_epoch != entry.key.cache_epoch
-                });
-                insert_assembly_part_cache_entry(&mut cache, entry);
-            }
+        if entry.bytes <= MAX_ASSEMBLY_PART_CACHE_BYTES
+            && let Ok(mut cache) = assembly_part_cache().lock()
+        {
+            cache.retain(|resident| {
+                resident.key.artifact_id != entry.key.artifact_id
+                    || resident.key.cache_epoch != entry.key.cache_epoch
+            });
+            insert_assembly_part_cache_entry(&mut cache, entry);
         }
     }
     Ok(selected)
@@ -322,7 +322,7 @@ fn parse_sha256(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut digest = [0; 32];
-    for (index, pair) in encoded.chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_chunks::<2>().0.iter().enumerate() {
         digest[index] = nibble(pair[0])?.checked_mul(16)? + nibble(pair[1])?;
     }
     Some(digest)
