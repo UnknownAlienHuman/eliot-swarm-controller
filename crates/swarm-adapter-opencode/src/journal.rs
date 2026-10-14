@@ -796,6 +796,18 @@ impl Journal {
             .unwrap_or(false)
     }
 
+    /// Use only the already-durable sparse closure before hello. A cold or
+    /// invalidated legacy inventory is deliberately left for bounded recovery
+    /// after hello, so discovering old names cannot delay the handshake.
+    pub fn recover_outbox_before_hello(&self) -> Result<Vec<OperationRecoveryState>> {
+        if !retention::durable_startup_complete(self)?
+            || retention::legacy_reclamation_pending(self)?
+        {
+            return Ok(Vec::new());
+        }
+        self.recover_outbox()
+    }
+
     /// Sorted valid operation keys plus a count of unnameable entries.
     /// Name enumeration is directory metadata only; bodies are parsed
     /// solely inside the bounded window selected from these names.

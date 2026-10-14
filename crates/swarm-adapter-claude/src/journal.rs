@@ -8,6 +8,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 use swarm_contracts::{
     error::{Error, Result},
@@ -97,6 +98,8 @@ impl OperationState {
 pub struct OperationJournal {
     root: PathBuf,
     retention_root: PathBuf,
+    startup_lock: Mutex<()>,
+    startup_names: Mutex<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,6 +111,10 @@ struct RetentionState {
     next_cleanup_sequence: u64,
     cleanup_cursor_sequence: u64,
     migration_complete: bool,
+    #[serde(default)]
+    startup_complete: bool,
+    #[serde(default)]
+    startup_cursor: Option<String>,
     counters: RetentionCounters,
 }
 
@@ -256,9 +263,11 @@ impl OperationJournal {
         let journal = Self {
             root: root.to_owned(),
             retention_root,
+            startup_lock: Mutex::new(()),
+            startup_names: Mutex::new(None),
         };
         journal.ensure_retention_state()?;
-        journal.migrate_existing_records()?;
+        journal.prepare_startup_recovery()?;
         Ok(journal)
     }
 
@@ -305,6 +314,12 @@ impl OperationJournal {
         method: &str,
         intent: &Value,
     ) -> Result<()> {
+        let _startup_guard = self.startup_lock.lock().map_err(|_| {
+            Error::new(
+                "ADAPTER_RETENTION_STATE",
+                "startup journal recovery lock is unavailable",
+            )
+        })?;
         if let Some(previous) = self.get(operation_id)?
             && !previous.native_replay_permitted()
         {
@@ -342,6 +357,7 @@ impl OperationJournal {
             digest: None,
             outbox_sequence: None,
         };
+        self.invalidate_startup_recovery_for_append()?;
         self.register_references_for_intent(operation_id, intent)?;
         if method == "task.dispatch" {
             self.write_boot_dispatch_marker(operation_id, receipt, intent, None, None)?;
@@ -753,55 +769,73 @@ impl OperationJournal {
         Ok(true)
     }
 
-    pub fn recover_uncertain(&self) -> Result<()> {
-        self.recover_uncertain_with_code("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
-    }
-
     pub fn recover_uncertain_with_code(&self, diagnostic_code: &str) -> Result<()> {
         let diagnostic_code = safe_diagnostic_code(diagnostic_code);
         for state in self.unresolved()? {
-            if state.torn_tail_evidence.is_some() {
-                // The valid prefix and tail digest remain observable through
-                // `unresolved`; appending an unknown outcome would attach it
-                // to the torn frame and destroy the original evidence.
-                continue;
-            }
-            let receipt = state.receipt.as_ref().ok_or_else(|| {
-                Error::new("ADAPTER_JOURNAL", "unresolved operation has no receipt")
-            })?;
-            let scope = state
-                .intent
-                .as_ref()
-                .and_then(|intent| {
-                    intent["native_scope_key"]
-                        .as_str()
-                        .or_else(|| intent["native"]["native_scope_key"].as_str())
-                })
-                .map(ToOwned::to_owned);
-            let native = state.intent.as_ref().map(|intent| &intent["native"]);
-            let outcome = RuntimeOutcome {
-                operation_id: state.operation_id.clone(),
-                outcome: swarm_contracts::runtime::EffectOutcome::Unknown,
-                native_scope_key: scope,
-                native_root_id: state
-                    .intent
-                    .as_ref()
-                    .and_then(|intent| intent["native_root_id"].as_str())
-                    .map(ToOwned::to_owned),
-                turn_id: None,
-                native_input_id: native
-                    .and_then(|intent| intent["user_message_uuid"].as_str())
-                    .map(ToOwned::to_owned),
-                details: serde_json::json!({
-                    "diagnostic_code":diagnostic_code,
-                    "completion_condition":"unknown",
-                    "replay_permitted":false,
-                    "module_receipt":receipt
-                }),
-            };
-            self.save_outcome(&state.operation_id, &outcome)?;
+            self.recover_uncertain_state(&state, diagnostic_code)?;
         }
         Ok(())
+    }
+
+    pub fn startup_recovery_complete(&self) -> Result<bool> {
+        Ok(self.read_retention_state()?.startup_complete)
+    }
+
+    /// Classify one bounded legacy window and persist its last key once. A
+    /// crash may revisit at most 32 operations; migration writes are idempotent
+    /// and effect markers are never replayed.
+    pub fn recover_startup_window(&self, diagnostic_code: &str) -> Result<usize> {
+        let _startup_guard = self.startup_lock.lock().map_err(|_| {
+            Error::new(
+                "ADAPTER_RETENTION_STATE",
+                "startup journal recovery lock is unavailable",
+            )
+        })?;
+        let diagnostic_code = safe_diagnostic_code(diagnostic_code);
+        let state = self.read_retention_state()?;
+        if state.startup_complete {
+            return Ok(0);
+        }
+        let names = {
+            let mut cached = self.startup_names.lock().map_err(|_| {
+                Error::new(
+                    "ADAPTER_RETENTION_STATE",
+                    "startup inventory cache is unavailable",
+                )
+            })?;
+            if cached.is_none() {
+                *cached = Some(self.list_operation_names()?);
+            }
+            cached.clone().unwrap_or_default()
+        };
+        let start = state.startup_cursor.as_deref().map_or(0, |cursor| {
+            names.partition_point(|name| name.as_str() <= cursor)
+        });
+        let end = start.saturating_add(MAX_CURSOR_STEPS).min(names.len());
+        for name in &names[start..end] {
+            if state.migration_complete {
+                self.recover_legacy_operation(name, diagnostic_code)?;
+            } else {
+                self.migrate_legacy_operation(name, diagnostic_code)?;
+            }
+        }
+        let mut progress = self.read_retention_state()?;
+        if end == names.len() {
+            progress.migration_complete = true;
+            progress.startup_complete = true;
+            progress.startup_cursor = None;
+            *self.startup_names.lock().map_err(|_| {
+                Error::new(
+                    "ADAPTER_RETENTION_STATE",
+                    "startup inventory cache is unavailable",
+                )
+            })? = None;
+        } else {
+            progress.startup_cursor = names.get(end - 1).cloned();
+            progress.startup_complete = false;
+        }
+        self.write_retention_state(&progress)?;
+        Ok(end - start)
     }
 
     pub fn retention_status(&self) -> Result<Value> {
@@ -836,6 +870,8 @@ impl OperationJournal {
             next_cleanup_sequence: 0,
             cleanup_cursor_sequence: 0,
             migration_complete: false,
+            startup_complete: false,
+            startup_cursor: None,
             counters: RetentionCounters::default(),
         };
         let bytes = serde_json::to_vec(&state)?;
@@ -855,24 +891,31 @@ impl OperationJournal {
         Ok(())
     }
 
-    fn migrate_existing_records(&self) -> Result<()> {
-        if self.read_retention_state()?.migration_complete {
-            return Ok(());
+    fn prepare_startup_recovery(&self) -> Result<()> {
+        let mut state = self.read_retention_state()?;
+        if state.startup_complete {
+            state.startup_complete = false;
+            state.startup_cursor = None;
+            self.write_retention_state(&state)?;
         }
+        Ok(())
+    }
+
+    fn list_operation_names(&self) -> Result<Vec<String>> {
         let entries = fs::read_dir(&self.root).map_err(|_| {
             Error::new(
-                "ADAPTER_RETENTION_STATE",
+                "ADAPTER_STARTUP_RECOVERY_INCOMPLETE",
                 "journal directory cannot be listed",
             )
         })?;
+        let mut names = Vec::new();
         for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    self.note_deferred_damage()?;
-                    continue;
-                }
-            };
+            let entry = entry.map_err(|_| {
+                Error::new(
+                    "ADAPTER_STARTUP_RECOVERY_INCOMPLETE",
+                    "journal directory entry cannot be read",
+                )
+            })?;
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
@@ -880,79 +923,161 @@ impl OperationJournal {
             let name = path
                 .file_stem()
                 .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_owned();
-            let state = match ensure_regular(&path).and_then(|()| self.read_path(&path, None)) {
-                Ok(state) => state,
-                Err(_) => {
-                    self.note_deferred_damage()?;
-                    continue;
-                }
-            };
-            if state.operation_id.is_empty() || hex_digest(state.operation_id.as_bytes()) != name {
+                .ok_or_else(|| {
+                    Error::new(
+                        "ADAPTER_STARTUP_RECOVERY_INCOMPLETE",
+                        "operation journal has no stable UTF-8 address",
+                    )
+                })?;
+            names.push(name.to_owned());
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn recover_legacy_operation(&self, name: &str, diagnostic_code: &str) -> Result<()> {
+        let path = self.root.join(format!("{name}.jsonl"));
+        let state = match ensure_regular(&path).and_then(|()| self.read_path(&path, None)) {
+            Ok(state) => state,
+            Err(_) => {
                 self.note_deferred_damage()?;
-                continue;
+                return Ok(());
             }
-            self.increment_examined()?;
-            if let Some(intent) = state.intent.as_ref() {
-                if state.method.as_deref() == Some("task.dispatch") {
-                    let outcome_digest = state.outcome_sha256.as_deref();
-                    let acknowledged_digest = state.acknowledged_sha256.as_deref();
-                    if self
-                        .write_boot_dispatch_marker(
-                            &state.operation_id,
-                            state.receipt.as_ref().ok_or_else(|| {
-                                Error::new(
-                                    "ADAPTER_RETENTION_STATE",
-                                    "task dispatch has no exact receipt",
-                                )
-                            })?,
-                            intent,
-                            outcome_digest,
-                            acknowledged_digest,
-                        )
-                        .is_err()
-                    {
-                        self.note_deferred_damage()?;
-                    }
-                }
+        };
+        if state.operation_id.is_empty() || hex_digest(state.operation_id.as_bytes()) != name {
+            self.note_deferred_damage()?;
+            return Ok(());
+        }
+        if state.torn_tail_evidence.is_some() {
+            self.note_deferred_damage()?;
+        }
+        self.recover_uncertain_state(&state, diagnostic_code)
+    }
+
+    fn migrate_legacy_operation(&self, name: &str, diagnostic_code: &str) -> Result<()> {
+        let path = self.root.join(format!("{name}.jsonl"));
+        let state = match ensure_regular(&path).and_then(|()| self.read_path(&path, None)) {
+            Ok(state) => state,
+            Err(_) => {
+                self.note_deferred_damage()?;
+                return Ok(());
+            }
+        };
+        if state.operation_id.is_empty() || hex_digest(state.operation_id.as_bytes()) != name {
+            self.note_deferred_damage()?;
+            return Ok(());
+        }
+        self.increment_examined()?;
+        if let Some(intent) = state.intent.as_ref() {
+            if state.method.as_deref() == Some("task.dispatch") {
+                let outcome_digest = state.outcome_sha256.as_deref();
+                let acknowledged_digest = state.acknowledged_sha256.as_deref();
                 if self
-                    .register_references_for_intent(&state.operation_id, intent)
+                    .write_boot_dispatch_marker(
+                        &state.operation_id,
+                        state.receipt.as_ref().ok_or_else(|| {
+                            Error::new(
+                                "ADAPTER_RETENTION_STATE",
+                                "task dispatch has no exact receipt",
+                            )
+                        })?,
+                        intent,
+                        outcome_digest,
+                        acknowledged_digest,
+                    )
                     .is_err()
                 {
                     self.note_deferred_damage()?;
                 }
             }
-            if let (Some(outcome_digest), Some(outcome)) =
-                (state.outcome_sha256.as_deref(), state.outcome.as_ref())
+            if self
+                .register_references_for_intent(&state.operation_id, intent)
+                .is_err()
             {
-                let outbox_sequence =
-                    self.ensure_outbox_entry(&state.operation_id, Some(outcome_digest.to_owned()))?;
-                if state.acknowledged_sha256.as_deref() == Some(outcome_digest) {
-                    self.enqueue_cleanup(&state.operation_id, outcome_digest)?;
-                    let item_path = self.outbox_item_path(outbox_sequence);
-                    let item = self.read_work_item(&item_path)?;
-                    if item.sequence != outbox_sequence
-                        || item.operation_id != state.operation_id
-                        || item.outcome_sha256.as_deref() != Some(outcome_digest)
-                    {
-                        self.note_deferred_damage()?;
-                    } else {
-                        self.defer_outbox_item(&item, Some(outcome_digest))?;
-                    }
-                } else {
-                    // The exact unacknowledged outcome remains available to the host outbox.
-                }
-                if outcome["outcome"] == "unknown" || outcome["outcome"] == "accepted" {
-                    self.note_outcome_class(outcome)?;
-                }
-            } else if state.torn_tail_evidence.is_some() {
                 self.note_deferred_damage()?;
             }
         }
+        if let (Some(outcome_digest), Some(outcome)) =
+            (state.outcome_sha256.as_deref(), state.outcome.as_ref())
+        {
+            let outbox_sequence =
+                self.ensure_outbox_entry(&state.operation_id, Some(outcome_digest.to_owned()))?;
+            if state.acknowledged_sha256.as_deref() == Some(outcome_digest) {
+                self.enqueue_cleanup(&state.operation_id, outcome_digest)?;
+                let item_path = self.outbox_item_path(outbox_sequence);
+                let item = self.read_work_item(&item_path)?;
+                if item.sequence != outbox_sequence
+                    || item.operation_id != state.operation_id
+                    || item.outcome_sha256.as_deref() != Some(outcome_digest)
+                {
+                    self.note_deferred_damage()?;
+                } else {
+                    self.defer_outbox_item(&item, Some(outcome_digest))?;
+                }
+            }
+            if outcome["outcome"] == "unknown" || outcome["outcome"] == "accepted" {
+                self.note_outcome_class(outcome)?;
+            }
+        } else if state.torn_tail_evidence.is_some() {
+            // Do not append to a torn frame; the original bytes remain the
+            // authoritative custody evidence for this operation.
+            self.note_deferred_damage()?;
+        }
+        self.recover_uncertain_state(&state, diagnostic_code)
+    }
+
+    fn invalidate_startup_recovery_for_append(&self) -> Result<()> {
         let mut state = self.read_retention_state()?;
-        state.migration_complete = true;
+        state.startup_complete = false;
+        state.startup_cursor = None;
+        *self.startup_names.lock().map_err(|_| {
+            Error::new(
+                "ADAPTER_RETENTION_STATE",
+                "startup inventory cache is unavailable",
+            )
+        })? = None;
         self.write_retention_state(&state)
+    }
+
+    fn recover_uncertain_state(&self, state: &OperationState, diagnostic_code: &str) -> Result<()> {
+        if state.torn_tail_evidence.is_some() || !state.recovery_unknown() {
+            return Ok(());
+        }
+        let receipt = state
+            .receipt
+            .as_ref()
+            .ok_or_else(|| Error::new("ADAPTER_JOURNAL", "unresolved operation has no receipt"))?;
+        let scope = state
+            .intent
+            .as_ref()
+            .and_then(|intent| {
+                intent["native_scope_key"]
+                    .as_str()
+                    .or_else(|| intent["native"]["native_scope_key"].as_str())
+            })
+            .map(ToOwned::to_owned);
+        let native = state.intent.as_ref().map(|intent| &intent["native"]);
+        let outcome = RuntimeOutcome {
+            operation_id: state.operation_id.clone(),
+            outcome: swarm_contracts::runtime::EffectOutcome::Unknown,
+            native_scope_key: scope,
+            native_root_id: state
+                .intent
+                .as_ref()
+                .and_then(|intent| intent["native_root_id"].as_str())
+                .map(ToOwned::to_owned),
+            turn_id: None,
+            native_input_id: native
+                .and_then(|intent| intent["user_message_uuid"].as_str())
+                .map(ToOwned::to_owned),
+            details: serde_json::json!({
+                "diagnostic_code":diagnostic_code,
+                "completion_condition":"unknown",
+                "replay_permitted":false,
+                "module_receipt":receipt
+            }),
+        };
+        self.save_outcome(&state.operation_id, &outcome)
     }
 
     fn read_retention_state(&self) -> Result<RetentionState> {
@@ -3033,6 +3158,181 @@ mod recovery_tests {
     }
 
     #[test]
+    fn legacy_migration_is_bounded_resumable_and_append_safe() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-bounded-migration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let make_receipt = |operation_id: &str| -> ModuleReceiptIdentity {
+            let receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+                "schema_version":1,"module_id":"eliot.claude",
+                "artifact":{"artifact_id":crate::ARTIFACT_ID,"version":crate::ARTIFACT_VERSION},
+                "protocol":{"major":1,"minor":0},"binding_id":"binding-legacy-window",
+                "binding_generation":1,"operation_id":operation_id,"input_sha256":"d".repeat(64)
+            }))
+            .unwrap();
+            receipt.validate().unwrap();
+            receipt
+        };
+        let open = || {
+            OperationJournal::open(
+                &root,
+                "binding-legacy-window",
+                1,
+                "fixture-scope",
+                &"e".repeat(64),
+            )
+            .unwrap()
+        };
+        let journal = open();
+        for index in 0..64 {
+            let operation_id = format!("legacy-window-{index:03}");
+            let receipt = make_receipt(&operation_id);
+            journal
+                .write_intent(
+                    &operation_id,
+                    &receipt,
+                    "agent.reply",
+                    &json!({"kind":"legacy"}),
+                )
+                .unwrap();
+        }
+        let torn_id = "legacy-window-torn";
+        let torn_receipt = make_receipt(torn_id);
+        journal
+            .write_intent(
+                torn_id,
+                &torn_receipt,
+                "agent.reply",
+                &json!({"kind":"legacy"}),
+            )
+            .unwrap();
+        let torn_path = journal.path(torn_id).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&torn_path)
+            .unwrap()
+            .write_all(b"{")
+            .unwrap();
+        let torn_bytes = std::fs::read(&torn_path).unwrap();
+
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            MAX_CURSOR_STEPS
+        );
+        let saved_cursor = journal.read_retention_state().unwrap().startup_cursor;
+        assert!(saved_cursor.is_some());
+        assert!(!journal.startup_recovery_complete().unwrap());
+        drop(journal);
+
+        let journal = open();
+        assert_eq!(
+            journal.read_retention_state().unwrap().startup_cursor,
+            saved_cursor
+        );
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            MAX_CURSOR_STEPS
+        );
+        assert_ne!(
+            journal.read_retention_state().unwrap().startup_cursor,
+            saved_cursor
+        );
+
+        let appended_id = "legacy-window-appended-after-restart";
+        let appended_receipt = make_receipt(appended_id);
+        journal
+            .write_intent(
+                appended_id,
+                &appended_receipt,
+                "agent.reply",
+                &json!({"kind":"appended"}),
+            )
+            .unwrap();
+        assert_eq!(journal.read_retention_state().unwrap().startup_cursor, None);
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            MAX_CURSOR_STEPS
+        );
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            MAX_CURSOR_STEPS
+        );
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            2
+        );
+        assert!(journal.startup_recovery_complete().unwrap());
+
+        for index in 0..64 {
+            let operation_id = format!("legacy-window-{index:03}");
+            let state = journal.get(&operation_id).unwrap().unwrap();
+            assert_eq!(state.outcome.as_ref().unwrap()["outcome"], "unknown");
+            assert!(!state.native_replay_permitted());
+        }
+        let appended = journal.get(appended_id).unwrap().unwrap();
+        assert_eq!(appended.outcome.as_ref().unwrap()["outcome"], "unknown");
+        assert!(!appended.native_replay_permitted());
+        let torn = journal.get(torn_id).unwrap().unwrap();
+        assert!(torn.torn_tail_evidence.is_some());
+        assert!(!torn.native_replay_permitted());
+        assert_eq!(std::fs::read(&torn_path).unwrap(), torn_bytes);
+
+        // A new effect marker written after startup completion invalidates the
+        // per-boot cursor before append; restart then recovers it in windows.
+        let runtime_id = "legacy-window-appended-after-completion";
+        let runtime_receipt = make_receipt(runtime_id);
+        journal
+            .write_intent(
+                runtime_id,
+                &runtime_receipt,
+                "agent.reply",
+                &json!({"kind":"runtime-append"}),
+            )
+            .unwrap();
+        assert!(!journal.startup_recovery_complete().unwrap());
+        assert_eq!(journal.read_retention_state().unwrap().startup_cursor, None);
+        drop(journal);
+
+        let journal = open();
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            MAX_CURSOR_STEPS
+        );
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            MAX_CURSOR_STEPS
+        );
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            3
+        );
+        assert!(journal.startup_recovery_complete().unwrap());
+        let runtime = journal.get(runtime_id).unwrap().unwrap();
+        assert_eq!(runtime.outcome.as_ref().unwrap()["outcome"], "unknown");
+        assert!(!runtime.native_replay_permitted());
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pending_outcomes_discards_torn_suffix_without_ack_then_advances_past_corruption() {
         let root = std::env::temp_dir().join(format!(
             "swarm-claude-torn-ack-recovery-{}",
@@ -3109,7 +3409,13 @@ mod recovery_tests {
             &"c".repeat(64),
         )
         .unwrap();
-        journal.recover_uncertain().unwrap();
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            3
+        );
+        assert!(journal.startup_recovery_complete().unwrap());
         let pending = journal.pending_outcomes().unwrap();
         assert_eq!(
             pending

@@ -67,7 +67,10 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         &config.native_options.scope_key(),
         &route_sha256,
     )?;
-    journal.recover_uncertain()?;
+    while !journal.startup_recovery_complete()? {
+        let recovered = journal.recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")?;
+        eprintln!("Claude startup journal recovery classified {recovered} entries");
+    }
     let interactions = InteractionJournal::open(
         &config.state_dir,
         &config.binding_id,

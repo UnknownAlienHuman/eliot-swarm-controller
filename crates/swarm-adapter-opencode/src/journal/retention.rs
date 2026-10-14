@@ -716,7 +716,9 @@ pub(super) fn remember_startup_names(
         index.startup_names = Some(names);
         index.startup_invalid_names = invalid;
         index.startup_complete = false;
-        index.startup_cursor = None;
+        // A validated cursor resumes the sorted legacy listing after restart.
+        // Appends during an incomplete scan invalidate it before their journal
+        // frame is written.
         index.classified_names.clear();
         if invalid > 0 {
             index.references_unknown = true;
@@ -754,9 +756,13 @@ fn select_startup_window(index: &RetentionIndex, names: &[String], budget: usize
 
 pub(super) fn scan_covered(journal: &Journal, names: &[String]) -> Result<bool> {
     let index = lock_index(journal)?;
-    Ok(names
-        .iter()
-        .all(|name| index.classified_names.contains(name)))
+    Ok(names.iter().all(|name| {
+        index
+            .startup_cursor
+            .as_deref()
+            .is_some_and(|cursor| name.as_str() <= cursor)
+            || index.classified_names.contains(name)
+    }))
 }
 
 pub(super) fn store_startup_progress(
@@ -901,6 +907,14 @@ pub(super) fn startup_has_unknown_addresses(journal: &Journal) -> Result<bool> {
 pub(super) fn note_operation_append(journal: &Journal, memo: OperationAddressMemo) -> Result<()> {
     let mut index = lock_index(journal)?;
     index.ensure_address_closure(memo)?;
+    if !index.startup_complete {
+        // A new file can sort before the saved cursor. Restart the incomplete
+        // inventory from the beginning so it cannot be skipped after a crash.
+        index.startup_cursor = None;
+        index.startup_names = None;
+        index.classified_names.clear();
+        index.scan_incomplete = true;
+    }
     index.persist_cursor()?;
     Ok(())
 }

@@ -507,6 +507,87 @@ fn startup_recovery_bounds_large_history_and_resumes_sparse_tail() {
     assert_eq!(cursor["version"].as_u64(), Some(3));
 }
 
+/// Cold legacy inventory is deferred until after hello; the durable cursor
+/// resumes a bounded body window, and an append during incomplete recovery
+/// invalidates that cursor before the new operation is written.
+#[test]
+fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+
+    for index in 0..64 {
+        write_acknowledged_reply(&journal, &format!("cold-legacy-{index:03}"), None);
+    }
+    let address_dir = root.0.join(retention::ADDRESS_CHECKPOINT_DIR);
+    for entry in fs::read_dir(&address_dir).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    drop(journal);
+
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    assert!(journal.recover_outbox_before_hello().unwrap().is_empty());
+    let before_hello = journal.startup_scan_counts();
+    assert_eq!(before_hello.operations_listed, 0);
+    assert_eq!(before_hello.operation_bodies_parsed, 0);
+    assert!(!journal.startup_recovery_complete());
+
+    // The first post-hello recovery pass classifies one fixed-size window.
+    let first = journal.recover_outbox().unwrap();
+    assert!(first.len() <= 32);
+    assert_eq!(journal.startup_scan_counts().operation_bodies_parsed, 32);
+    let saved_cursor = journal
+        .retention
+        .lock()
+        .unwrap()
+        .startup_cursor_for_test()
+        .map(str::to_owned);
+    assert!(saved_cursor.is_some());
+    drop(journal);
+
+    // Restart first restores the cursor. The append then resets it before its
+    // intent is written, so the sorted inventory cannot skip the new key.
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    assert_eq!(
+        journal
+            .retention
+            .lock()
+            .unwrap()
+            .startup_cursor_for_test()
+            .map(str::to_owned),
+        saved_cursor
+    );
+    let appended_id = "cold-legacy-appended-after-restart";
+    journal
+        .write_intent(&fixture_intent(appended_id, "agent.reply"))
+        .unwrap();
+    assert_eq!(
+        journal.retention.lock().unwrap().startup_cursor_for_test(),
+        None
+    );
+
+    let first_after_append = journal.recover_outbox().unwrap();
+    assert!(first_after_append.len() <= 32);
+    let second_after_append = journal.recover_outbox().unwrap();
+    assert!(second_after_append.len() <= 32);
+    let final_after_append = journal.recover_outbox().unwrap();
+    assert!(final_after_append.len() <= 32);
+    assert!(journal.startup_recovery_complete());
+    assert!(
+        first_after_append
+            .iter()
+            .chain(&second_after_append)
+            .chain(&final_after_append)
+            .any(|state| state.operation_id.as_deref() == Some(appended_id))
+    );
+    let appended = journal.load(appended_id).unwrap();
+    assert!(appended.recovery_unknown());
+    assert!(!appended.native_replay_permitted());
+    assert!(operation_path(&root.0, appended_id).exists());
+}
+
 /// Steady state after convergence and drain: reopening reads only the
 /// durable closure with targeted loads. Listed entries stay at zero while
 /// bodies parsed equal the exact sparse tail, independent of lifetime
