@@ -5067,3 +5067,7 @@ async fn request_changes_legacy_v1_shape_rejected_before_attempt_lookup() {
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[cfg(test)]
+#[path = "program_tests/pr60_automation_reconcile_fatal_boundaries.rs"]
+mod pr60_automation_reconcile_fatal_boundaries;
