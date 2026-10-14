@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation]
 permissions:
   contents: read
 jobs:
@@ -801,10 +801,7 @@ jobs:
               'public_agent_open_rejects_auth_required_with_a_free_root_slot',
               'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace',
               'probe_custody_keeps_nested_family_and_capture_until_exact_departure',
-              'execution_paths_for_layout_selects_exact_legacy_and_compact_paths',
-              'malformed_public_operation_relations_fail_closed',
-              'generic_operation_get_list_delta_bound_relations_and_hide_private_decision_text',
-              'store_authenticated_operation_lists_and_delta_preserve_bounded_gaps_and_cursor_tail'
+              'execution_paths_for_layout_selects_exact_legacy_and_compact_paths'
             )) {
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
             }
@@ -818,6 +815,15 @@ jobs:
             foreach ($case in @('legacy_migration_is_bounded_resumable_and_append_safe', 'pending_outcomes_discards_torn_suffix_without_ack_then_advances_past_corruption')) {
               Invoke-FocusedCohort -Package 'swarm-adapter-claude' -Filter $case -Expected 1 -ExpectedNames @($case)
             }
+          } elseif ($env:QUALIFICATION -ceq 'focused-operation') {
+            foreach ($case in @(
+              'malformed_public_operation_relations_fail_closed',
+              'generic_operation_get_list_delta_bound_relations_and_hide_private_decision_text',
+              'store_authenticated_operation_lists_and_delta_preserve_bounded_gaps_and_cursor_tail'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+          } elseif ($env:QUALIFICATION -ceq 'focused-catalog') {
             Invoke-FocusedCohort -Package 'swarm-mcp' -Filter 'catalog_' -Expected 4 -ExpectedNames @(
               'catalog_search_schema_matches_dispatch_max_results_bounds',
               'warm_catalog_rechecks_live_membership_and_rejects_unknown_exact_method',
