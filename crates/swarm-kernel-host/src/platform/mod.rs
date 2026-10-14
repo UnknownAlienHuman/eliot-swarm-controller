@@ -45,6 +45,31 @@ impl DataRoot {
 pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
     swarm_process::private_permissions(path, directory).map_err(Into::into)
 }
+/// Only for fresh directories created by this host or an exact workspace lease.
+/// Configured repositories/roots are inspected, never repaired through this API.
+pub(crate) fn private_owned_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !path.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            "PRIVATE_PATH_INVALID",
+            "owned path must be an absolute regular directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(Error::new(
+                "PRIVATE_PATH_INVALID",
+                "owned directory cannot be a reparse point",
+            ));
+        }
+    }
+    private_permissions(path, true)?;
+    #[cfg(windows)]
+    windows::set_current_user_owner(path)?;
+    Ok(())
+}
 pub fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
     swarm_process::write_private_new(path, data).map_err(Into::into)
 }

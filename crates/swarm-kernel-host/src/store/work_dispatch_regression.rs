@@ -937,8 +937,8 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     let data_directory = fixture_root.join("store");
     for directory in [&repository, &workspace_root, &empty_hooks, &data_directory] {
         std::fs::create_dir_all(directory).expect("create the isolated fixture directory");
-        crate::platform::private_permissions(directory, true)
-            .expect("restrict the fixture directory to its workspace owner");
+        crate::platform::private_owned_directory(directory)
+            .expect("establish the exact fixture directory owner and private ACL");
     }
     let repository = std::fs::canonicalize(repository).expect("canonicalize fixture repository");
     let workspace_root =

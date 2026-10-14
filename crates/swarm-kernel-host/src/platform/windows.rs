@@ -9,8 +9,9 @@ use windows_sys::Win32::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         },
-        DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
-        SECURITY_ATTRIBUTES, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        DACL_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SetFileSecurityW, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     },
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -55,9 +56,19 @@ fn current_sid() -> Result<String> {
         Ok(value)
     }
 }
-fn with_descriptor<T>(inherit: bool, f: impl FnOnce(*mut c_void) -> Result<T>) -> Result<T> {
+fn with_descriptor<T>(
+    inherit: bool,
+    include_owner: bool,
+    f: impl FnOnce(*mut c_void) -> Result<T>,
+) -> Result<T> {
     let flags = if inherit { "OICI" } else { "" };
-    let sddl: Vec<u16> = format!("D:P(A;{flags};GA;;;{})", current_sid()?)
+    let sid = current_sid()?;
+    let owner = if include_owner {
+        format!("O:{sid}")
+    } else {
+        String::new()
+    };
+    let sddl: Vec<u16> = format!("{owner}D:P(A;{flags};GA;;;{sid})")
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -80,7 +91,7 @@ fn with_descriptor<T>(inherit: bool, f: impl FnOnce(*mut c_void) -> Result<T>) -
 }
 pub fn restrict_path(path: &Path, directory: bool) -> Result<()> {
     let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    with_descriptor(directory, |descriptor| {
+    with_descriptor(directory, false, |descriptor| {
         // SAFETY: path is NUL-terminated, descriptor lives throughout the call.
         let ok = unsafe {
             SetFileSecurityW(
@@ -92,8 +103,28 @@ pub fn restrict_path(path: &Path, directory: bool) -> Result<()> {
         if ok == 0 { Err(last_error()) } else { Ok(()) }
     })
 }
+/// Set only the owner of a fresh directory created by the current host.
+/// The caller first applies its private DACL, including WRITE_OWNER. No token
+/// privileges are enabled, and an ordinary permission failure remains an error.
+pub(crate) fn set_current_user_owner(path: &Path) -> Result<()> {
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    with_descriptor(true, true, |descriptor| {
+        // SAFETY: the descriptor contains the current TokenUser SID and remains
+        // alive throughout the owner-only security update on this fresh path.
+        let ok = unsafe { SetFileSecurityW(path.as_ptr(), OWNER_SECURITY_INFORMATION, descriptor) };
+        if ok == 0 {
+            let error = last_error();
+            Err(crate::error::Error::new(
+                error.code,
+                format!("SetFileSecurityW(owner) failed: {}", error.message),
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
 pub fn create_pipe(name: &str, first: bool) -> Result<NamedPipeServer> {
-    with_descriptor(false, |descriptor| {
+    with_descriptor(false, false, |descriptor| {
         let mut sa = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor,

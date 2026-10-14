@@ -515,8 +515,8 @@ pub(crate) fn prepare_lease(
     )?;
     // Git creates the target directory as part of `worktree add`; harden it
     // immediately before inspecting or accepting any worktree contents.
-    crate::platform::private_permissions(workspace_path, true)?;
     reject_reparse_components(workspace_path)?;
+    crate::platform::private_owned_directory(workspace_path)?;
     validate_directory_security(workspace_path)?;
 
     verify_trusted_repository(git, forge_config, forge_project, registration)?;
@@ -1350,6 +1350,7 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
     false
 }
 
+#[cfg_attr(test, track_caller)]
 fn validate_directory_security(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1377,7 +1378,18 @@ fn validate_directory_security(path: &Path) -> Result<()> {
         }
     }
     #[cfg(windows)]
-    validate_windows_directory_acl(path)?;
+    {
+        let result = validate_windows_directory_acl(path);
+        #[cfg(test)]
+        if let Err(error) = &result {
+            eprintln!(
+                "workspace_acl_failed call_site={} path={} error={error}",
+                std::panic::Location::caller(),
+                path.display()
+            );
+        }
+        result?;
+    }
     Ok(())
 }
 
@@ -1664,6 +1676,67 @@ fn workspace_config_error(message: &str) -> Error {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_workspace_directory_preserves_strict_acl_validation() {
+        use std::{os::windows::ffi::OsStrExt, ptr};
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{
+                Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+            },
+        };
+        let path =
+            std::env::temp_dir().join(format!("swarm-workspace-acl-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).expect("create one fresh owned test directory");
+        let path = path.canonicalize().unwrap();
+        let before = validate_directory_security(&path);
+        eprintln!("workspace_acl_before_owned_hardening={before:?}");
+        crate::platform::private_owned_directory(&path)
+            .expect("set exact user owner and private DACL");
+        validate_directory_security(&path)
+            .expect("exact user owner passes the unchanged ACL policy");
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let sddl: Vec<u16> = "D:P(A;;GA;;;WD)".encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: this modifies only the DACL of the fresh test directory. Its
+        // exact owner remains unchanged; the descriptor is released once.
+        unsafe {
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut()
+                ),
+                0
+            );
+            let set = SetFileSecurityW(
+                wide.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor,
+            );
+            LocalFree(descriptor.cast());
+            assert_ne!(set, 0);
+        }
+        let error = validate_directory_security(&path).unwrap_err();
+        assert_eq!(error.code, "WORKSPACE_ACL");
+        assert_eq!(
+            error.message,
+            "workspace root grants write access to another local principal"
+        );
+        assert!(
+            validate_directory_security(&path).is_err(),
+            "configured-root validation must not repair the ACL"
+        );
+        // Validation did not repair the permissive root. Restore only this
+        // fresh test directory's DACL before removing the empty directory.
+        crate::platform::private_permissions(&path, true).unwrap();
+        fs::remove_dir(path).unwrap();
+    }
+
     #[tokio::test]
     async fn disabled_forge_registration_passes_trusted_repository_readback() {
         let root = std::env::temp_dir().join(format!("swarm-wr-{}", uuid::Uuid::new_v4()));
@@ -1675,12 +1748,13 @@ mod tests {
             }
         }
         let _cleanup = Cleanup(root.clone());
-        swarm_process::private_permissions(&root, true).expect("private test root");
+        crate::platform::private_owned_directory(&root).expect("private owned test root");
         let repository = root.join("repository");
         let allowed = root.join("worktrees");
         for directory in [&repository, &allowed] {
             fs::create_dir(directory).expect("fresh child directory");
-            swarm_process::private_permissions(directory, true).expect("private child directory");
+            crate::platform::private_owned_directory(directory)
+                .expect("private owned child directory");
         }
         let executable = if cfg!(windows) { "git.exe" } else { "git" };
         let git = std::env::split_paths(&std::env::var_os("PATH").expect("Git search path"))
