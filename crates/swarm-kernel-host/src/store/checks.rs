@@ -5049,10 +5049,17 @@ mod tests {
             cached_acceptance["result"]["outcome"], "applied",
             "real task.accept must consume the legitimate cache hit: {cached_acceptance}"
         );
-        assert_eq!(
-            cached_acceptance["result"]["check_ids"],
-            json!([cached_check])
-        );
+        let cached_decision = fixture
+            .owner
+            .store
+            .call(
+                fixture.principal.clone(),
+                "task.acceptance".into(),
+                json!({"acceptance_operation_id":cached_acceptance_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached_decision["check_ids"], json!([cached_check]));
 
         let (refusal_task, refusal_attempt) =
             create_acceptance_attempt(&fixture, "cache-project", Some("v1"), None).await;
