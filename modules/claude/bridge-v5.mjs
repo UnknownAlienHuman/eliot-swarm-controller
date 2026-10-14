@@ -11,12 +11,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { startup } from '@anthropic-ai/claude-agent-sdk';
 import { Control } from './control.mjs';
-import { createFirstQueryFaultControl } from './first-query-spawn-control.test.mjs';
+import { createFirstQueryControl } from './first-query-control.mjs';
 import { prepareQuery } from './prepared-query.mjs';
 import { explicitQueryModel, modelSelectionFacts } from './model-selection.mjs';
-import {
-  firstNativeQueryUnknownOutcome, streamEndedSendOutcome,
-} from './pending-outcome.mjs';
+import { streamEndedSendOutcome } from './pending-outcome.mjs';
 import {
   CLAUDE_TASK_PROMPT_ARTIFACT_ID, taskDispatchAdmission, taskPromptFor,
   enqueueTaskPrompt, moduleReceipt,
@@ -73,7 +71,7 @@ if (argv.length !== 2 || argv[0] !== '--config') {
 const bootstrap = await loadModuleBootstrap(argv[1]);
 const { config, credential, managedOwner, bootId, moduleContract } = bootstrap;
 if (config.moduleArtifactId !== MODULE_ARTIFACT_ID) throw new Error('MODULE_ARTIFACT_MISMATCH');
-const firstQueryFaultControl = await createFirstQueryFaultControl({
+const firstQueryControl = await createFirstQueryControl({
   bindingId: bootstrap.bindingId,
   generation: bootstrap.generation,
   bootId,
@@ -314,20 +312,11 @@ function finishSession(sess) {
     sess.openWait.reject(error);
     sess.openWait = null;
   }
-  for (const [inputId, entry] of sess.pendingSends) {
+  for (const entry of sess.pendingSends.values()) {
     // settleSends removes an entry only after its queued UUID is echoed by a
-    // native frame. A still-pending, validated initial TaskPrompt therefore
-    // has no same-session admission evidence and takes the terminal Unknown
-    // path that retires this worker only after Store accepts module.outcome.
-    const exactInitialTaskPrompt = sess.pendingSends.get(inputId) === entry
-      && entry.initialTaskDispatch === true
-      && entry.method === 'task.dispatch'
-      && entry.taskPrompt?.context?.operation_id === entry.command?.operation_id
-      && entry.taskPrompt?.context?.worker_boot_id === bootId;
-    const outcome = exactInitialTaskPrompt
-      ? firstNativeQueryUnknownOutcome(entry, bootId)
-      : streamEndedSendOutcome(entry, sess, bootId);
-    saveOutcome(entry.command, outcome);
+    // native frame. A still-pending send has no admission evidence and takes
+    // the terminal Unknown path; it is reported once and never replayed.
+    saveOutcome(entry.command, streamEndedSendOutcome(entry, sess, bootId));
   }
   sess.pendingSends.clear();
   changed();
@@ -339,7 +328,7 @@ async function pump(sess) {
       applySdkMessage(sess.state, msg);
       if (!sess.rootId && sess.state.init?.session_id) {
         sess.rootId = sess.state.init.session_id;
-        await firstQueryFaultControl.noteSdkInitIdentity(sess.rootId);
+        await firstQueryControl.noteSdkInitIdentity(sess.rootId);
         if (sess.openWait) { sess.openWait.resolve(); sess.openWait = null; }
       }
       if (sess.state.phase === 'init_failed' && sess.openWait) {
@@ -389,7 +378,11 @@ async function startNative(command) {
     includePartialMessages: true,
     // Complete child messages (not only tool heartbeats) are the C08 mapping.
     forwardSubagentText: true,
-    spawnClaudeCodeProcess: firstQueryFaultControl.spawnClaudeCodeProcess,
+    // Normal execution keeps the SDK default child spawn. The overriding
+    // fault composition lives only in bridge-v5-fault-test.mjs.
+    ...(firstQueryControl.spawnClaudeCodeProcess
+      ? { spawnClaudeCodeProcess: firstQueryControl.spawnClaudeCodeProcess }
+      : {}),
     canUseTool: (toolName, _toolInput, toolOptions) => {
       notePermissionRequest(state, { tool_name: toolName, tool_use_id: toolOptions.toolUseID });
       changed();
@@ -478,7 +471,7 @@ function sendNative(command) {
       try {
           const input = sess.input.iterable();
           const gatedInput = taskPrompt
-            ? firstQueryFaultControl.gateFirstTaskPrompt(input, {
+            ? firstQueryControl.gateFirstTaskPrompt(input, {
                 operationId: command.operation_id,
                 inputId: uuid,
                 taskPrompt,
@@ -616,7 +609,7 @@ let admissionTail = Promise.resolve();
 while (!stopping) {
   try {
     control = new Control(config.endpoint, credential, bootstrap.maxFrameBytes);
-    firstQueryFaultControl.instrumentControl(control);
+    firstQueryControl.instrumentControl(control);
     await control.connect();
     helloRetainedIdentity = null;
     const hello = await control.call('module.hello', {

@@ -17,6 +17,7 @@ import {
   createStreamState, applySdkMessage, noteStreamEnd, noteStreamFailure, snapshot,
 } from './stream.mjs';
 import { streamEndedSendOutcome } from './pending-outcome.mjs';
+import { createFirstQueryControl } from './first-query-control.mjs';
 
 assert.equal(typeof startup, 'function', 'pinned SDK must export startup()');
 
@@ -481,6 +482,46 @@ function messageById(snap, id) {
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });
   }
+}
+
+// 9. Normal bridge.5 first-query control is a pass-through: no fault env,
+// no spawn override, unchanged input, unwrapped Control, unlimited hellos.
+{
+  delete process.env.ELIOT_CLAUDE_V5_FIRST_QUERY_FAULT_DIR;
+  const normal = await createFirstQueryControl({ bindingId: 'selftest', generation: 1, bootId: 'selftest-boot' });
+  assert.equal(normal.spawnClaudeCodeProcess, undefined, 'SDK default spawn, no test override');
+  const input = { type: 'user', uuid: 'selftest-input', parent_tool_use_id: null, message: { role: 'user', content: 'prompt bytes' } };
+  async function* source() { yield input; }
+  const seen = [];
+  for await (const item of normal.gateFirstTaskPrompt(source(), { operationId: 'op', inputId: 'selftest-input', taskPrompt: null })) seen.push(item);
+  assert.deepEqual(seen, [input], 'first TaskPrompt reaches the SDK unchanged without waiting');
+  assert.equal(seen[0], input, 'same object, no copy or rewrite');
+  await normal.noteSdkInitIdentity('ses_selftest');
+  const link = { calls: 0, call: async () => { link.calls++; return { recorded: true }; } };
+  const before = link.call;
+  normal.instrumentControl(link);
+  assert.equal(link.call, before, 'Control calls pass through unwrapped');
+  for (let i = 0; i < 3; i++) await link.call('module.hello', {});
+  assert.equal(link.calls, 3, 'ordinary reconnects are not capped at two hellos');
+  await link.call('module.outcome', { operation_id: 'op', outcome: 'unknown', details: { diagnostic_code: 'FIRST_NATIVE_QUERY_UNKNOWN' } });
+  assert.equal(link.calls, 4, 'genuine store ACK accepted, never withheld');
+  console.log('PASS normal-first-query-control: no env, default spawn, unchanged input, uncapped reconnect, ACK accepted');
+}
+
+// 10. Normal bridge.5 graph contains no test fault controller; the fault
+// composition stays explicitly selectable and distinguishable.
+{
+  const bridgeText = await readFile(path.join(here, 'bridge-v5.mjs'), 'utf8');
+  assert.equal(bridgeText.includes('first-query-spawn-control.test.mjs'), false, 'production entrypoint imports no test file');
+  assert.equal(bridgeText.includes('ELIOT_CLAUDE_V5_FIRST_QUERY_FAULT_DIR'), false, 'normal bootstrap requires no fault directory');
+  assert.ok(bridgeText.includes("from './first-query-control.mjs'"), 'normal control seam imported');
+  const descriptor = JSON.parse(await readFile(path.join(here, 'module-descriptor.template.json'), 'utf8'));
+  assert.equal(descriptor.artifact.artifact_id, 'claude-agent-sdk-0.3.287-bridge.5');
+  assert.ok(JSON.stringify(descriptor.launch).includes('bridge-v5.mjs'));
+  assert.equal(JSON.stringify(descriptor).includes('FIRST_QUERY_FAULT'), false, 'standard descriptor carries no fault requirement');
+  const faultEntry = await readFile(path.join(here, 'bridge-v5-fault-test.mjs'), 'utf8');
+  assert.ok(faultEntry.includes('first-query-spawn-control.test.mjs'), 'fault scenario remains reproducible via its explicit entrypoint');
+  console.log('PASS bridge-v5-graph: production entry clean, descriptor clean, fault entry explicit');
 }
 
 console.log('Claude bridge self-test: all fixture assertions passed');

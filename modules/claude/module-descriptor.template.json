@@ -24,15 +24,7 @@
         }
       }
     ],
-    "environment": [
-      {
-        "name": "ELIOT_CLAUDE_V5_FIRST_QUERY_FAULT_DIR",
-        "value": {
-          "kind": "literal",
-          "value": "<MANAGER_MUST_SUBSTITUTE_UNIQUE_ABSOLUTE_CONTROL_DIRECTORY>"
-        }
-      }
-    ],
+    "environment": [],
     "credential_ref": "host.module-binding-credential",
     "working_directory": null,
     "inherited_environment_allowlist": [],
