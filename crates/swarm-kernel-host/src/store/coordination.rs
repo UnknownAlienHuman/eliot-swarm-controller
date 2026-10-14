@@ -3651,7 +3651,7 @@ fn indexed_relevance_cards(
         ));
     }
     let (comparison, lower) = match after_scan_key {
-        Some(key) if key.starts_with(&prefix) && key.as_str() > prefix && key < &upper => {
+        Some(key) if key.starts_with(&prefix) && key > prefix.as_str() && key < upper.as_str() => {
             (">", key.to_owned())
         }
         Some(_) => return Err(Error::invalid("after_scan_cursor is outside this index")),
@@ -3796,7 +3796,7 @@ fn indexed_task_participants(
         ));
     }
     let (comparison, lower) = match after_scan_key {
-        Some(key) if key.starts_with(&prefix) && key.as_str() > prefix && key < &upper => {
+        Some(key) if key.starts_with(&prefix) && key > prefix.as_str() && key < upper.as_str() => {
             (">", key.to_owned())
         }
         Some(_) => return Err(Error::invalid("after_scan_cursor is outside this index")),
@@ -4775,7 +4775,6 @@ fn card_list(
     let mut has_more_peers = false;
     let mut last_scanned_index_key = None;
     for indexed in cards {
-        let cursor_before_current = last_scanned_index_key.clone();
         last_scanned_index_key = Some(indexed.index_key.clone());
         last = Some(indexed.client_id.clone());
         if !indexed.valid_index {
