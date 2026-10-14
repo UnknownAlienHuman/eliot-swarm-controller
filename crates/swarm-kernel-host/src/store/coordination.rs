@@ -2889,13 +2889,16 @@ pub(super) fn reconcile_legacy_index_backfill(tx: &Transaction<'_>) -> Result<()
     if marker["scan_complete"] == true {
         return Ok(());
     }
-    let phase = marker["phase"].as_str().ok_or_else(|| {
-        Error::new(
-            "COORDINATION_INDEX_MARKER_DAMAGED",
-            "legacy coordination index marker has no phase",
-        )
-    })?;
-    let (prefix, upper) = match phase {
+    let phase = marker["phase"]
+        .as_str()
+        .ok_or_else(|| {
+            Error::new(
+                "COORDINATION_INDEX_MARKER_DAMAGED",
+                "legacy coordination index marker has no phase",
+            )
+        })?
+        .to_owned();
+    let (prefix, upper) = match phase.as_str() {
         "participants" => ("client:", "client;"),
         "cards" => ("coordination:card:", "coordination:card;"),
         _ => {
@@ -2940,7 +2943,7 @@ pub(super) fn reconcile_legacy_index_backfill(tx: &Transaction<'_>) -> Result<()
                 .unwrap_or_default()
                 .saturating_add(1)
         );
-        match phase {
+        match phase.as_str() {
             "participants" => backfill_participant_task_hint(tx, key, raw, &mut marker)?,
             "cards" => backfill_current_card_hints(tx, key, raw, &mut marker)?,
             _ => unreachable!("the phase was validated above"),
