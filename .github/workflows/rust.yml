@@ -36,13 +36,13 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery]
+        options: [full, focused-recovery, focused-store]
 permissions:
   contents: read
 jobs:
   scope:
     name: Classify changed paths and package ownership
-    if: github.event_name != 'workflow_dispatch' || inputs.qualification != 'focused-recovery'
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
     runs-on: ubuntu-latest
     outputs:
       docs_changed: ${{ steps.classify.outputs.docs_changed }}
@@ -393,7 +393,7 @@ jobs:
   build:
     name: Full existing qualification (manual only)
     needs: scope
-    if: github.event_name == 'workflow_dispatch' && inputs.qualification != 'focused-recovery'
+    if: github.event_name == 'workflow_dispatch' && inputs.qualification == 'full'
     strategy:
       fail-fast: false
       matrix:
@@ -569,9 +569,9 @@ jobs:
             ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-supervisor
             ${{ runner.temp }}/eliot-full-rust-shared-target/release/swarm-supervisor.exe
 
-  focused-recovery:
-    name: Focused journal and probe runtime qualification
-    if: github.event_name == 'workflow_dispatch' && inputs.qualification == 'focused-recovery'
+  focused:
+    name: Focused Rust qualification
+    if: github.event_name == 'workflow_dispatch' && (inputs.qualification == 'focused-recovery' || inputs.qualification == 'focused-store')
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -580,6 +580,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       RUST_BACKTRACE: '1'
+      QUALIFICATION: ${{ inputs.qualification }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -625,23 +626,89 @@ jobs:
             $libclangDir = $libclang.DirectoryName
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "LIBCLANG_PATH=$libclangDir" -Encoding utf8
-      - name: Run focused runtime cohorts and reject empty selections
+      - name: Run selected focused cohorts and reject empty or miscounted selections
         shell: pwsh
         run: |
-          $targetDir = Join-Path $env:RUNNER_TEMP 'eliot-focused-recovery-target'
-          function Invoke-FocusedCohort([string]$Package, [string]$Filter, [int]$Expected = 0) {
-            $listing = @(& cargo test --locked --package $Package --lib --target-dir $targetDir $Filter -- --list)
+          $targetDir = Join-Path $env:RUNNER_TEMP "eliot-$($env:QUALIFICATION)-target"
+          function Confirm-FocusedSelection {
+            param(
+              [string]$Package,
+              [string]$Filter,
+              [int]$Expected = 0,
+              [string[]]$ExpectedNames = @()
+            )
+            $listArguments = @('test', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--list')
+            $listing = @(& cargo @listArguments)
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $selected = @($listing | Where-Object { $_ -match ': test$' })
-            if ($selected.Count -eq 0 -or ($Expected -gt 0 -and $selected.Count -ne $Expected)) {
-              throw "Unexpected test selection for ${Package}/${Filter}: $($selected.Count); expected $Expected (nonzero)."
+            $actualNames = @(
+              $selected | ForEach-Object { (($_ -replace ': test$', '') -split '::')[-1] } | Sort-Object -CaseSensitive
+            )
+            $expectedNames = @($ExpectedNames | Sort-Object -CaseSensitive)
+            $namesMismatch = $false
+            if ($ExpectedNames.Count -gt 0) {
+              $namesMismatch = [string]::Join('|', $actualNames) -cne [string]::Join('|', $expectedNames)
             }
-            & cargo test --locked --package $Package --lib --target-dir $targetDir $Filter -- --nocapture
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "PASS: ${Package}/${Filter}: $($selected.Count) tests on $env:RUNNER_OS"
+            if ($selected.Count -eq 0 -or ($Expected -gt 0 -and $selected.Count -ne $Expected) -or $namesMismatch) {
+              throw ('Unexpected selection for {0}/{1}: selected {2}, expected {3} and exact names [{4}]; got [{5}].' -f $Package, $Filter, $selected.Count, $Expected, [string]::Join(', ', $expectedNames), [string]::Join(', ', $actualNames))
+            }
+            return $selected
           }
-          Invoke-FocusedCohort 'swarm-adapter-opencode' 'journal65_parity_tests' 5
-          Invoke-FocusedCohort 'swarm-adapter-claude' 'journal65_parity_tests' 4
-          Invoke-FocusedCohort 'swarm-process' 'permissions::publication_tests'
-          Invoke-FocusedCohort 'swarm-kernel-host' 'probe_resolution_reservations_hold_conflicts_until_both_owners_depart' 1
-          Invoke-FocusedCohort 'swarm-kernel-host' 'independent_probe_resolution_io_overlaps_and_remains_in_store_custody' 1
+          function Invoke-FocusedCohort {
+            param(
+              [string]$Package,
+              [string]$Filter,
+              [int]$Expected = 0,
+              [string[]]$ExpectedNames = @()
+            )
+            $selected = @(Confirm-FocusedSelection -Package $Package -Filter $Filter -Expected $Expected -ExpectedNames $ExpectedNames)
+            $runArguments = @('test', '--locked', '--package', $Package, '--lib', '--target-dir', $targetDir, $Filter, '--', '--nocapture')
+            & cargo @runArguments
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $selectedNames = @($selected | ForEach-Object { $_ -replace ': test$', '' })
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "PASS: $Package/$Filter; $($selected.Count) listed tests on $env:RUNNER_OS; selected: $([string]::Join(', ', $selectedNames))"
+          }
+          if ($env:QUALIFICATION -ceq 'focused-recovery') {
+            Invoke-FocusedCohort 'swarm-adapter-opencode' 'journal65_parity_tests' 5
+            Invoke-FocusedCohort 'swarm-adapter-claude' 'journal65_parity_tests' 4
+            Invoke-FocusedCohort 'swarm-process' 'permissions::publication_tests' 11
+            Invoke-FocusedCohort 'swarm-kernel-host' 'probe_resolution_reservations_hold_conflicts_until_both_owners_depart' 1
+            Invoke-FocusedCohort 'swarm-kernel-host' 'independent_probe_resolution_io_overlaps_and_remains_in_store_custody' 1
+          } elseif ($env:QUALIFICATION -ceq 'focused-store') {
+            $gmNames = @(
+              'gm_epoch_fencing_old_new_unrelated_and_unchanged_conflict',
+              'successor_continues_retained_attempt_without_replay',
+              'lost_reply_readback_returns_retained_receipt',
+              'missing_designation_reports_high_water_and_operator_recovers',
+              'malformed_current_designation_recovers_only_by_operator_at_high_water_plus_one',
+              'malformed_handover_history_reports_damage_without_grant_or_recovery',
+              'damaged_designation_without_high_water_stays_unavailable_not_epoch_one',
+              'gm_handover_denies_roles_without_grant',
+              'gm_public_projections_expose_no_private_credential_material'
+            )
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'gm_public_matrix_tests' -Expected 9 -ExpectedNames $gmNames
+
+            # Root integration must supply this PR64 fixture before dispatch.
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'public_agent_open_rejects_auth_required_with_a_free_root_slot' -Expected 1 -ExpectedNames @('public_agent_open_rejects_auth_required_with_a_free_root_slot')
+
+            $probeOwnerNames = @(
+              'probe_owner_fixture_child_entry',
+              'retained_probe_owner_install_conflict_keeps_custody_and_allows_independent_resource',
+              'late_probe_owner_departure_releases_only_its_checkrunner_resource'
+            )
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'probe_owner' -Expected 3 -ExpectedNames $probeOwnerNames
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'failed_probe_retains_owner_drops_resolution_and_holds_only_its_resource' -Expected 1 -ExpectedNames @('failed_probe_retains_owner_drops_resolution_and_holds_only_its_resource')
+
+            node --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'rust_store_task_prompt_v1_crosses_into_claude_bridge5_offline_helpers' -Expected 1 -ExpectedNames @('rust_store_task_prompt_v1_crosses_into_claude_bridge5_offline_helpers')
+
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'issue99_backfill_rechecks_repaired_hints_and_ignores_inactive_pending_clients' -Expected 1 -ExpectedNames @('issue99_backfill_rechecks_repaired_hints_and_ignores_inactive_pending_clients')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'issue99_peer_find_advances_after_filtered_task_and_global_pages' -Expected 1 -ExpectedNames @('issue99_peer_find_advances_after_filtered_task_and_global_pages')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards' -Expected 1 -ExpectedNames @('issue99_exact_contract_lookup_bypasses_unrelated_owner_prefix_cards')
+
+            # This mismatch regression starts worker_process_fixture_waits_for_release as its owned child.
+            Invoke-FocusedCohort -Package 'swarm-supervisor' -Filter 'same_pid_and_birth_with_changed_image_requires_new_hello' -Expected 1 -ExpectedNames @('same_pid_and_birth_with_changed_image_requires_new_hello')
+          } else {
+            throw "Unsupported focused qualification selector: $env:QUALIFICATION"
+          }
