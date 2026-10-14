@@ -297,6 +297,8 @@ Historical baselines: C06 `c56f50a4` passed [CI 36828917649](https://github.com/
 
 The workflow pins Rust 1.98.1/Cargo.lock and runs scoped formatting/strict Clippy for changed packages and reverse dependents on PRs and main pushes, with changed integration targets and donor integrity checked by path. The full Rust, native fixture, and release matrix remains available through manual `workflow_dispatch`, not every code push; its Rust checks enumerate all owned metadata workspace packages and exclude targets sourced from the Atlas vendor tree. `just verify BASE_SHA HEAD_SHA` runs scoped formatting/Clippy for two full commit SHAs; `just verify-full` retains the full local gate. CI performs no vendor model sessions, login or global installation. Artifacts include exact source SHA and a source archive; consult the exact commit's run before claiming a platform pass.
 
+Verification records under `docs/remediation` were produced by the implementation pipeline. Some reference operator-retained logs by hash without publishing those logs; those hashes alone do not let another reader reproduce or independently verify the historical result. Use the recorded command, exact source revision, committed fixture and accessible CI artifact to assess each claim. A successful scoped push run does not establish a passing kernel-host unit suite or live qualification. [Audit #153](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/153) records the remaining suite failures and the scope of the independent audit.
+
 | Document | Purpose |
 | --- | --- |
 | [Architecture](docs/agent_swarm.md) | Target execution model |

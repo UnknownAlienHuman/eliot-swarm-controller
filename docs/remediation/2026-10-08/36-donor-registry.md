@@ -32,12 +32,16 @@ Forks, mirrors, product directories, `awesome-*` lists and several repositories 
 
 | Status | Meaning |
 |---|---|
-| `TAKE` | Mechanism is sufficiently understood to write an ELIOT implementation task |
+| `TAKE` | Planned reuse of the named upstream package or mechanism; adoption is not yet proved |
 | `SPIKE` | Worth a bounded implementation experiment before adoption |
 | `REFERENCE` | Use semantics, fixtures or failure cases; do not add a runtime dependency |
 | `DO NOT IMPORT` | Useful mainly as an anti-pattern or evidence source |
 
 A donor can be verified while its status remains `SPIKE` or `REFERENCE`.
+
+**Clarification, 14 October 2026:** source review, a reuse decision and landed adoption are separate facts. A landed adoption needs the exact dependency or imported source, its license/notices, the ELIOT consumer path and a relevant verifier. A new implementation inspired by upstream is `REFERENCE` reuse, not adoption of the whole client. A `TAKE` entry does not replace the complete-package requirements in the [donor inventory](../../agent_swarm.donors-20260929.toml) or the [operations donor map](../../agent-operations/donor-map.md). This registry's count measures reviewed donors, not imported mechanisms.
+
+The standalone [`rust-vmm/seccompiler`](https://github.com/rust-vmm/seccompiler) repository is archived (GitHub metadata rechecked 14 October 2026). [`firecracker-microvm/firecracker/src/seccompiler`](https://github.com/firecracker-microvm/firecracker/tree/main/src/seccompiler) exists as an alternative source to review. D13 remains an unqualified Linux spike; no replacement source, installed version or runtime qualification is inferred from that location.
 
 ## 2. How these systems are named
 
