@@ -905,8 +905,8 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     assert_eq!(recent["disposition"], "admitted", "{recent}");
     let operation_id = recent["operation_id"].as_str().unwrap().to_owned();
 
-    // Eight route-held launches precede the ninth valid target: their
-    // isolated hold scope is damaged, so every examination retains admission
+    // Eight route-held launches precede the ninth valid target: the
+    // hold ledger is damaged, so every examination retains admission
     // (moving `updated_at_ms`) and holds without progress or leases. The
     // immutable `(created_at_ms, operation_id)` cursor still reaches the
     // ninth valid launch and leaves the hard-error tail unprocessed. The
@@ -961,7 +961,7 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         })
         .await
         .unwrap();
-    // Damage the isolated hold scope before any reconciliation: the eight
+    // Damage the hold scope before any reconciliation: the eight
     // hold launches then retain a Hold admission on every examination.
     let hold_capacity_key = format!("capacity:{}", hold_scope_key.as_str());
     owner
@@ -1092,6 +1092,19 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
         selected_cursor.1, tail_id,
         "immutable ceiling still reaches the future tail"
     );
+
+    // A malformed ledger makes fleet capacity unknown conservatively, including
+    // the target runtime. Remove this first-stage fault before the target's
+    // independent post-workspace fault, so the latter actually reaches Git.
+    let hold_capacity_key = format!("capacity:{}", hold_scope_key.as_str());
+    owner
+        .store
+        .run(move |db| {
+            db.execute("DELETE FROM meta WHERE key=?1", [hold_capacity_key])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
 
     let cursor_failure = format!(
         "CREATE TRIGGER launch_cursor_checkpoint_hard_failure \
@@ -1343,7 +1356,21 @@ async fn work_dispatch_rechecks_root_admission_after_committing_a_verified_works
     assert_eq!(admitted_counts["bindings"], 1, "{admitted_counts}");
     assert_eq!(admitted_counts["open_children"], 1, "{admitted_counts}");
 
-    // The exhausted scan wraps over the eight no-op Unknown rows. A following
+    // Restore the first-stage hold only after the target was admitted. The
+    // exhausted scan wraps over those eight retained rows without new work.
+    let hold_capacity_key = format!("capacity:{}", hold_scope_key.as_str());
+    owner
+        .store
+        .run(move |db| {
+            db.execute(
+                "INSERT INTO meta(key,value_json) VALUES(?1,'{}')",
+                [hold_capacity_key],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // A following
     // pass can revisit the admitted launch without creating another child.
     let wrapped = owner.store.reconcile_launches_once().await.unwrap();
     assert_eq!(wrapped["examined"], 8, "{wrapped}");
