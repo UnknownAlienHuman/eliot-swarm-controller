@@ -1,6 +1,6 @@
 # Donor Map — Rust Operations and Manager-Owned Automation
 
-Revision 6 · reviewed 2026-10-05. Earlier source observations retain their recorded dates.
+Revision 7 · source links rechecked 2026-10-14; donor observations retain their 2026-10-05 review dates.
 
 `CODE` means an inspected source behavior; `DOC` means official/library documentation; `OWNER_AUDIT` means supplied operating evidence; `DESIGN` means an ELIOT proposal. Earlier inspections are not new live qualification. Commit/blob identities locate evidence, not required installed versions.
 
@@ -12,17 +12,17 @@ The operations program now also includes [Modular Runtime](modularity.md) and [O
 
 ## 2. Earlier ELIOT evidence
 
-Inspected main baseline: `504199d14135c030ad3951a3c5023a098a3d03f0`. Recheck current symbols when implementation starts.
+Inspected main baseline: `504199d14135c030ad3951a3c5023a098a3d03f0`. Links below resolve to the physical crate owners; this path recheck is not a new donor or runtime qualification. Recheck current symbols when implementation starts.
 
 | Unit | Source fact | Reuse/required change |
 |---|---|---|
-| [`src/model.rs`](../../src/model.rs) | Manager actor has no invented generation; internal Scheduler has a special ownership path; negative not-observer is not a complete capability model. | Keep identity semantics; new on-behalf actions resolve their manager, not the Scheduler shortcut. |
-| [`src/store/mod.rs`](../../src/store/mod.rs) | Store owns serialized DB work and shared change notification; several effects use dedicated outer methods. | One common action/authorization boundary, no recursive public IPC in a transaction; notification is not durable delivery. |
-| [`src/store/schedules.rs`](../../src/store/schedules.rs), [`docs/schedules.md`](../schedules.md) | Considered cursor, request identity and scheduled check admission are coupled in one transaction. | Extend this property to event routing/pending subjects; preserve legacy slots and receipts. |
-| [`src/store/submissions.rs`](../../src/store/submissions.rs) | Reserve is queued; finish commits applied `task.submission`; feedback is guarded and not a native prompt. | Applied-submission triggers; explicit auditor result versus manager disposition versus repair delivery. |
+| [`src/model.rs`](../../crates/swarm-kernel-host/src/model.rs) | Manager actor has no invented generation; internal Scheduler has a special ownership path; negative not-observer is not a complete capability model. | Keep identity semantics; new on-behalf actions resolve their manager, not the Scheduler shortcut. |
+| [`src/store/mod.rs`](../../crates/swarm-kernel-host/src/store/mod.rs) | Store owns serialized DB work and shared change notification; several effects use dedicated outer methods. | One common action/authorization boundary, no recursive public IPC in a transaction; notification is not durable delivery. |
+| [`src/store/schedules.rs`](../../crates/swarm-kernel-host/src/store/schedules.rs), [`docs/schedules.md`](../schedules.md) | Considered cursor, request identity and scheduled check admission are coupled in one transaction. | Extend this property to event routing/pending subjects; preserve legacy slots and receipts. |
+| [`src/store/submissions.rs`](../../crates/swarm-kernel-host/src/store/submissions.rs) | Reserve is queued; finish commits applied `task.submission`; feedback is guarded and not a native prompt. | Applied-submission triggers; explicit auditor result versus manager disposition versus repair delivery. |
 | [`docs/task-policy.md`](../task-policy.md), [`docs/owner-decisions.md`](../owner-decisions.md) | Frozen policy/source/Attempt evidence, one manager worktree, GM-fenced effects and current first-slice restrictions. | Add accepted policy and shared code deliberately; keep earlier evidence recognizable. A design document does not silently grant rights. |
 | [`docs/forge-publication.md`](../forge-publication.md) | Accepted non-force publication, process disposition and readback; preflight is not atomic remote old-ref CAS. | Preserve actual guarantees for manual/automatic callers and separate upload/merge. |
-| [`src/mcp/subscriptions.rs`](../../src/mcp/subscriptions.rs) | Existing bounded committed-fact polling and lag/resync. | Shared projectors plus separate live-native rings, not a transcript per subscriber. |
+| [`src/mcp/subscriptions.rs`](../../crates/swarm-mcp/src/mcp/subscriptions.rs) | Existing bounded committed-fact polling and lag/resync. | Shared projectors plus separate live-native rings, not a transcript per subscriber. |
 
 PR #22's proposed reviewer core included `task.request_changes`, while its Participant path forbids Task transitions. PR #23 supplies `review.assign/submit`. **DESIGN:** reconcile the two at implementation: assigned auditor submits its anchored verdict; manager or manager-owned automation applies guarded feedback. No role escalation by MCP visibility.
 
