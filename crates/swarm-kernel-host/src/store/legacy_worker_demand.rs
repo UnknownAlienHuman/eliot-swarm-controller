@@ -65,6 +65,23 @@ fn unquarantined_check_damage(db: &Connection) -> Result<bool> {
     Ok(false)
 }
 
+fn unquarantined_automation_entry_damage(db: &Connection) -> Result<bool> {
+    let mut statement = db.prepare(
+        "SELECT key,value_json FROM meta WHERE key LIKE 'automation:v1:entry:%' \
+         AND NOT json_valid(value_json) ORDER BY key",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (key, raw) = row?;
+        if !super::automation_publication::entry_quarantine_matches(db, &key, &raw)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerDemand> {
     let mut demand = LegacyWorkerDemand {
         checks: config.checks.enabled,
@@ -151,7 +168,7 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
                        WHERE step.value IN ('work_dispatch','review_dispatch', \
                          'review_disposition','repair_dispatch','acceptance','publication', \
                          'check_run','goal_progression','script_run')) \
-             ELSE 1 END) \
+             ELSE 0 END) \
            OR key LIKE 'coordination:watch:v1:active:%') \
          OR EXISTS(SELECT 1 FROM operations WHERE \
            state IN ('queued','sending','native_accepted','outcome_unknown') \
@@ -161,6 +178,7 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
         [crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID],
         |row| row.get::<_, bool>(0),
     )?;
+    demand.automation |= unquarantined_automation_entry_damage(db)?;
 
     demand.launcher = exists(
         db,
