@@ -23,6 +23,7 @@ const MAX_OVERLAP_MATCHES: usize = wire::MAX_OVERLAP_RESULTS;
 struct Member {
     client_id: String,
     participation_basis: Value,
+    context: Value,
     card: Value,
     role: Option<String>,
 }
@@ -119,9 +120,6 @@ fn sync_integration(
     }
     let mut members = current_members(
         &page,
-        task_id,
-        task_revision,
-        attempt_id,
         &request.contract_key,
     )?;
     let caller = members
@@ -154,12 +152,41 @@ fn sync_integration(
     validate_side_role(&request.side, caller_role)?;
     members.sort_by(|left, right| left.client_id.cmp(&right.client_id));
 
+    // A cross-Task cell has one stable storage anchor, chosen by its first
+    // current publisher. Every later member writes its own scoped facts under
+    // that anchor while retaining its own immutable Task/Attempt context.
+    let global_current_index_key = global_current_cell_index_key(&request.contract_key);
+    let previous_pointer = meta(tx, &global_current_index_key)?;
+    let cell_scope_id = if let Some(pointer) = previous_pointer.as_ref() {
+        text_at(pointer, &["scope_id"], "integration cell anchor scope")?.to_owned()
+    } else {
+        scope_id.to_owned()
+    };
+    let previous_id = previous_pointer
+        .as_ref()
+        .and_then(|pointer| pointer.get("cell_id"))
+        .and_then(Value::as_str);
+    let previous_cell_key = previous_id
+        .map(|cell_id| cell_record_key(&cell_scope_id, &request.contract_key, cell_id));
+    let previous_cell = previous_cell_key
+        .as_deref()
+        .map(|key| meta(tx, key))
+        .transpose()?
+        .flatten();
+    if previous_id.is_some() && previous_cell.is_none() {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "global integration pointer references a missing cell record",
+        ));
+    }
+
     let member_basis_set = members
         .iter()
         .map(|member| {
             json!({
                 "client_id":member.client_id,
                 "participation_basis":member.participation_basis,
+                "context":member.context,
             })
         })
         .collect::<Vec<_>>();
@@ -169,6 +196,7 @@ fn sync_integration(
             json!({
                 "client_id":member.client_id,
                 "participation_basis_kind":member.participation_basis["kind"],
+                "context":member.context,
             })
         })
         .collect::<Vec<_>>();
@@ -184,21 +212,19 @@ fn sync_integration(
         })
         .collect::<Vec<_>>();
     let membership_digest = digest(&json!({
-        "task_id":task_id,
-        "task_revision":task_revision,
-        "attempt_id":attempt_id,
         "contract_key":request.contract_key,
         "member_identity_set":member_identity_set,
     }))?;
 
-    let contribution_key = contribution_key(scope_id, &request.contract_key, &principal.client_id);
+    let contribution_key = contribution_key(&cell_scope_id, &request.contract_key, &principal.client_id);
     let prior = meta(tx, &contribution_key)?;
     let prior_is_current = prior.as_ref().is_some_and(|prior| {
-        prior["scope_id"] == scope_id
+        prior["scope_id"] == cell_scope_id
             && prior["task_id"] == task_id
             && prior["task_revision"] == task_revision
             && prior["attempt_id"] == attempt_id
             && prior["participation_basis"] == caller.participation_basis
+            && prior["member_context"] == caller.context
             && prior["card_revision"] == caller.card["card_revision"]
             && prior["card_material_digest"] == caller.card["material_digest"]
             && prior["role"] == caller_role
@@ -227,7 +253,8 @@ fn sync_integration(
     }))?;
     let contribution = json!({
         "schema":"eliot.integration.contribution.v1",
-        "scope_id":scope_id,
+        "scope_id":cell_scope_id,
+        "member_context":caller.context,
         "task_id":task_id,
         "task_revision":task_revision,
         "attempt_id":attempt_id,
@@ -260,7 +287,7 @@ fn sync_integration(
         gaps.push(json!({"kind":"contract_participant_relevance_incomplete"}));
     }
     let cell_facts =
-        collect_cell_facts(tx, &members, scope_id, &request.contract_key, operation_id)?;
+        collect_cell_facts(tx, &members, &cell_scope_id, &request.contract_key, operation_id)?;
     gaps.extend(cell_facts.gaps.clone());
     let canonical_sources = canonical_sources(&members, &mut gaps);
     if gaps
@@ -288,10 +315,11 @@ fn sync_integration(
     } else {
         wire::CellState::Compatible
     };
+    let task_revision_set = task_revision_set(&members);
     let facts = json!({
-        "scope_id":scope_id,
+        "scope_id":cell_scope_id,
         "task_id":task_id,
-        "task_revision_set":[{"task_id":task_id,"task_revision":task_revision,"attempt_id":attempt_id}],
+        "task_revision_set":task_revision_set,
         "attempt_id":attempt_id,
         "contract_key":request.contract_key,
         "membership_digest":membership_digest,
@@ -322,25 +350,13 @@ fn sync_integration(
         "gaps":gaps,
     });
     let material_digest = digest(&material)?;
-    let current_index_key = current_cell_index_key(scope_id, &request.contract_key);
-    let previous_pointer = meta(tx, &current_index_key)?;
-    let previous_id = previous_pointer
-        .as_ref()
-        .and_then(|pointer| pointer.get("cell_id"))
-        .and_then(Value::as_str);
-    let previous_cell_key =
-        previous_id.map(|cell_id| cell_record_key(scope_id, &request.contract_key, cell_id));
-    let previous_cell = previous_cell_key
-        .as_deref()
-        .map(|key| meta(tx, key))
-        .transpose()?
-        .flatten();
+    let current_index_key = current_cell_index_key(&cell_scope_id, &request.contract_key);
     let membership_changed = previous_cell
         .as_ref()
         .is_some_and(|cell| cell.get("membership_digest") != Some(&json!(membership_digest)));
     let cell_id = if membership_changed || previous_id.is_none() {
         digest(&json!({
-            "scope_id":scope_id,
+            "scope_id":cell_scope_id,
             "contract_key":request.contract_key,
             "membership_digest":membership_digest,
             "previous_cell_id":if membership_changed { previous_id } else { None },
@@ -351,16 +367,17 @@ fn sync_integration(
     if membership_changed
         && let (Some(previous_id), Some(previous)) = (previous_id, previous_cell.as_ref())
     {
-        retain_cell_version(tx, scope_id, &request.contract_key, previous)?;
+        retain_cell_version(tx, &cell_scope_id, &request.contract_key, previous)?;
         set_meta(
             tx,
             &cell_id_index_key(previous_id),
             &json!({
                 "cell_id":previous_id,
-                "scope_id":scope_id,
+                "scope_id":cell_scope_id,
                 "task_id":previous["facts"]["task_revision_set"][0]["task_id"],
                 "task_revision":previous["facts"]["task_revision_set"][0]["task_revision"],
                 "attempt_id":previous["facts"]["attempt_id"],
+                "task_revision_set":previous["facts"]["task_revision_set"],
                 "contract_key":request.contract_key,
                 "cell_record_key":previous_cell_key,
             }),
@@ -378,6 +395,7 @@ fn sync_integration(
         old_cell["updated_at_ms"] = json!(now);
         old_cell["operation_id"] = json!(operation_id);
         old_cell["updated_by_client_id"] = json!(principal.client_id);
+        old_cell["updated_by_context"] = participant_context(&scope);
         old_cell["previous_material_digest"] = old_digest;
         old_cell["material_digest"] = json!(digest(&json!({
             "prior_material_digest":old_cell["previous_material_digest"],
@@ -386,9 +404,9 @@ fn sync_integration(
             "state_revision":old_cell["state_revision"],
         }))?);
         set_meta(tx, old_key, &old_cell)?;
-        retain_cell_version(tx, scope_id, &request.contract_key, &old_cell)?;
+        retain_cell_version(tx, &cell_scope_id, &request.contract_key, &old_cell)?;
     }
-    let cell_record_key = cell_record_key(scope_id, &request.contract_key, &cell_id);
+    let cell_record_key = cell_record_key(&cell_scope_id, &request.contract_key, &cell_id);
     let prior_cell = if membership_changed {
         None
     } else {
@@ -422,25 +440,27 @@ fn sync_integration(
         "updated_at_ms":if changed { now } else { prior_cell.as_ref().and_then(|item|item["updated_at_ms"].as_i64()).unwrap_or(now) },
         "operation_id":operation_id,
         "updated_by_client_id":principal.client_id,
+        "updated_by_context":participant_context(&scope),
         "membership_digest":membership_digest,
         "purpose":"make producer/carrier/consumer compatible",
         "close_condition":"all required dimensions match or exact mismatch is escalated",
         "facts":facts,
     });
     if let Some(previous) = prior_cell.as_ref() {
-        retain_cell_version(tx, scope_id, &request.contract_key, previous)?;
+        retain_cell_version(tx, &cell_scope_id, &request.contract_key, previous)?;
     }
     set_meta(tx, &cell_record_key, &cell)?;
-    retain_cell_version(tx, scope_id, &request.contract_key, &cell)?;
+    retain_cell_version(tx, &cell_scope_id, &request.contract_key, &cell)?;
     set_meta(
         tx,
         &cell_id_index_key(&cell_id),
         &json!({
             "cell_id":cell_id,
-            "scope_id":scope_id,
+            "scope_id":cell_scope_id,
             "task_id":task_id,
             "task_revision":task_revision,
             "attempt_id":attempt_id,
+            "task_revision_set":task_revision_set,
             "contract_key":request.contract_key,
             "cell_record_key":cell_record_key,
         }),
@@ -448,8 +468,14 @@ fn sync_integration(
     set_meta(
         tx,
         &current_index_key,
-        &json!({"cell_id":cell_id,"cell_record_key":cell_record_key,"membership_digest":membership_digest}),
+        &json!({"cell_id":cell_id,"scope_id":cell_scope_id,"contract_key":request.contract_key,"cell_record_key":cell_record_key,"membership_digest":membership_digest}),
     )?;
+    set_meta(
+        tx,
+        &global_current_index_key,
+        &json!({"cell_id":cell_id,"scope_id":cell_scope_id,"contract_key":request.contract_key,"cell_record_key":cell_record_key,"membership_digest":membership_digest}),
+    )?;
+    write_current_peer_cell_indexes(tx, &members, &request.contract_key, &cell_scope_id, &cell_id, &cell_record_key, &membership_digest)?;
     super::coordination::attach_operation_scope(tx, operation_id, task_id, attempt_id, attempt)?;
 
     let next_action = match state {
@@ -496,10 +522,12 @@ fn integration_ack(
         ));
     }
     let location = cell_location(tx, &request.cell_id)?;
-    if location["scope_id"] != scope_id
-        || location["task_id"] != task_id
-        || location["task_revision"] != task_revision
-        || location["attempt_id"] != attempt_id
+    if !cell_location_contains_task(
+        &location,
+        task_id,
+        task_revision,
+        attempt_id,
+    )
     {
         return Err(Error::new(
             "NOT_FOUND",
@@ -544,10 +572,16 @@ fn integration_ack(
             "participant basis differs from the exact basis retained by this cell",
         ));
     }
+    if member.get("context") != Some(&participant_context(&scope)) {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "participant Task, Attempt, actor, binding, or grant revision differs from the cell member context",
+        ));
+    }
     match current_cell_freshness(
         tx,
         principal,
-        scope_id,
+        text_at(&location, &["scope_id"], "cell anchor scope id")?,
         task_id,
         task_revision,
         attempt_id,
@@ -595,6 +629,7 @@ fn integration_ack(
         "task_revision":task_revision,
         "attempt_id":attempt_id,
         "actor_client_id":principal.client_id,
+        "actor_context":participant_context(&scope),
         "participation_basis":caller_basis,
         "decision":request.decision.as_str(),
         "autonomy_digest":scope_snapshot["autonomy_digest"],
@@ -636,9 +671,12 @@ fn integration_ack(
 fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Result<Value> {
     let request = wire::AgreementGetRequest::parse(value)?;
     let location = cell_location(db, &request.cell_id)?;
-    if location["task_id"] != request.task_id
-        || location["task_revision"] != request.task_revision
-        || location["attempt_id"] != request.attempt_id
+    if !cell_location_contains_task(
+        &location,
+        &request.task_id,
+        request.task_revision,
+        &request.attempt_id,
+    )
     {
         return Err(Error::new(
             "NOT_FOUND",
@@ -647,7 +685,18 @@ fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Resul
     }
     if principal.role != Role::Participant {
         authorize_retained_cell_read(db, principal, &request, &location)?;
-    }
+    } else {
+        let current_scope = super::coordination::current_scope(db, principal)?;
+        if current_scope["task"]["task_id"] != request.task_id
+            || current_scope["task"]["revision"] != request.task_revision
+            || current_scope["attempt"]["attempt_id"] != request.attempt_id
+        {
+            return Err(Error::new(
+                "STALE_PARTICIPANT",
+                "agreement read must name this Participant's own current Task/Attempt",
+            ));
+        }
+    };
     let scope_id = text_at(&location, &["scope_id"], "scope id")?;
     let contract_key = text_at(&location, &["contract_key"], "contract key")?;
     let (state_revision, material_digest, cell) =
@@ -708,7 +757,7 @@ fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Resul
         request.limit,
     )?;
     let current_pointer =
-        meta(db, &current_cell_index_key(scope_id, contract_key))?.ok_or_else(|| {
+        current_cell_pointer(db, scope_id, contract_key)?.ok_or_else(|| {
             Error::new(
                 "STORE_INVARIANT",
                 "retained integration cell lacks its authoritative current pointer",
@@ -720,7 +769,8 @@ fn agreement_get(db: &Connection, principal: &Principal, value: &Value) -> Resul
         &["cell_record_key"],
         "current cell record key",
     )?;
-    let expected_current_record_key = cell_record_key(scope_id, contract_key, current_cell_id);
+    let pointer_scope_id = text_at(&current_pointer, &["scope_id"], "current cell scope id")?;
+    let expected_current_record_key = cell_record_key(pointer_scope_id, contract_key, current_cell_id);
     if current_record_key != expected_current_record_key.as_str() {
         return Err(Error::new(
             "STORE_INVARIANT",
@@ -829,6 +879,7 @@ fn classify_agreement(db: &Connection, cell: &Value, version_prefix: &str) -> Re
                 )
             })?;
         if position["actor_client_id"] != client_id
+            || position["actor_context"] != member["context"]
             || position["state_revision"] != cell["state_revision"]
             || position["material_digest"] != cell["material_digest"]
             || position["membership_digest"] != cell["membership_digest"]
@@ -942,18 +993,6 @@ fn classify_agreement(db: &Connection, cell: &Value, version_prefix: &str) -> Re
 
 fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
     let facts = &cell["facts"];
-    let task_revision_fact = facts["task_revision_set"]
-        .as_array()
-        .and_then(|items| items.first())
-        .ok_or_else(|| Error::new("STORE_INVARIANT", "cell Task revision set is missing"))?;
-    let task_id = text_at(task_revision_fact, &["task_id"], "cell Task id")?;
-    let task_revision = task_revision_fact["task_revision"]
-        .as_i64()
-        .filter(|revision| *revision > 0)
-        .ok_or_else(|| Error::new("STORE_INVARIANT", "cell Task revision is missing"))?;
-    let attempt_id = text_at(facts, &["attempt_id"], "cell Attempt id")?;
-    let scope_evidence =
-        super::code_scopes::current_scope_revisions(db, task_id, task_revision, attempt_id)?;
     let members = facts["member_basis_set"]
         .as_array()
         .cloned()
@@ -962,6 +1001,48 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
         .iter()
         .filter_map(|member| member["client_id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
+    let mut reasons = BTreeSet::new();
+    let mut scopes = Vec::new();
+    let mut scope_evidence_by_task = BTreeMap::<(String, i64, String), Value>::new();
+    for member in &members {
+        let Some(client_id) = member["client_id"].as_str() else {
+            reasons.insert("affected_owner_identity_missing".to_owned());
+            continue;
+        };
+        let context = &member["context"];
+        let (Some(task_id), Some(task_revision), Some(attempt_id)) = (
+            context["task_id"].as_str(),
+            context["task_revision"].as_i64().filter(|revision| *revision > 0),
+            context["attempt_id"].as_str(),
+        ) else {
+            reasons.insert("affected_owner_task_context_missing".to_owned());
+            continue;
+        };
+        let tuple = (task_id.to_owned(), task_revision, attempt_id.to_owned());
+        if !scope_evidence_by_task.contains_key(&tuple) {
+            let evidence = super::code_scopes::current_scope_revisions(
+                db,
+                task_id,
+                task_revision,
+                attempt_id,
+            )?;
+            if evidence["task_id"] != task_id
+                || evidence["task_revision"] != task_revision
+                || evidence["attempt_id"] != attempt_id
+            {
+                reasons.insert("scope_evidence_scope_mismatch".to_owned());
+            }
+            scope_evidence_by_task.insert(tuple.clone(), evidence);
+        }
+        if let Some(owner_scopes) = scope_evidence_by_task
+            .get(&tuple)
+            .and_then(|evidence| evidence["items"].as_array())
+        {
+            scopes.extend(owner_scopes.iter().filter(|scope| {
+                scope["owner_client_id"].as_str() == Some(client_id)
+            }).cloned());
+        }
+    }
     let mut required_by_owner = BTreeMap::<String, BTreeSet<(String, String)>>::new();
     let contract_key = text_at(facts, &["contract_key"], "cell contract key")?.to_owned();
     for client_id in &member_ids {
@@ -1006,31 +1087,9 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
             terms.insert(("symbol".to_owned(), symbol.to_owned()));
         }
     }
-    let mut reasons = BTreeSet::new();
-    if scope_evidence["task_id"] != task_id
-        || scope_evidence["task_revision"] != task_revision
-        || scope_evidence["attempt_id"] != attempt_id
-    {
-        reasons.insert("scope_evidence_scope_mismatch".to_owned());
-    }
-    if scope_evidence["coverage"] != "complete"
-        || scope_evidence["gaps"]
-            .as_array()
-            .is_none_or(|gaps| !gaps.is_empty())
-    {
-        reasons.insert("current_scope_coverage_incomplete".to_owned());
-    }
-    let scopes = scope_evidence["items"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
     let mut scope_refs = BTreeMap::<String, Value>::new();
     let mut unrepresented = BTreeSet::new();
     let mut unknown_dimensions = BTreeSet::new();
-    let mut terms = BTreeSet::<(String, String)>::new();
-    for owned_terms in required_by_owner.values() {
-        terms.extend(owned_terms.iter().cloned());
-    }
     let mut scopes_by_owner = BTreeMap::<String, Vec<&Value>>::new();
     for scope in &scopes {
         if scope["state"] != "active" {
@@ -1056,12 +1115,9 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
             .entry(owner_id.to_owned())
             .or_default()
             .push(scope);
-        if scope_intersects_terms(scope, &terms) && !member_ids.contains(owner_id) {
-            unrepresented.insert(owner_id.to_owned());
-        }
-    }
-    if !unrepresented.is_empty() {
-        reasons.insert("unrepresented_scope_owner".to_owned());
+        // Only members whose exact contract relation entered this cell are an
+        // autonomy obligation. Other Task owners never become a global ACK
+        // barrier.
     }
     let mut matching_scopes = Vec::new();
     for member in &members {
@@ -1076,6 +1132,12 @@ fn classify_scope_authority(db: &Connection, cell: &Value) -> Result<Value> {
         if !owner_scopes.iter().any(|scope| {
             scope.get("participation_basis") == member.get("participation_basis")
                 && scope.pointer("/actor/client_id").and_then(Value::as_str) == Some(client_id)
+                && scope["task_id"].as_str()
+                    == member.pointer("/context/task_id").and_then(Value::as_str)
+                && scope["task_revision"].as_i64()
+                    == member.pointer("/context/task_revision").and_then(Value::as_i64)
+                && scope["attempt_id"].as_str()
+                    == member.pointer("/context/attempt_id").and_then(Value::as_str)
         }) {
             reasons.insert("affected_owner_scope_basis_stale".to_owned());
             continue;
@@ -1276,6 +1338,7 @@ fn public_position(position: &Value) -> Value {
         "task_revision":position["task_revision"],
         "attempt_id":position["attempt_id"],
         "actor_client_id":position["actor_client_id"],
+        "actor_context":position["actor_context"],
         "participation_basis_kind":position.pointer("/participation_basis/kind").cloned().unwrap_or(Value::Null),
         "decision":position["decision"],
         "autonomy_digest":position["autonomy_digest"],
@@ -1348,6 +1411,240 @@ fn cell_location(db: &Connection, cell_id: &str) -> Result<Value> {
     Ok(location)
 }
 
+/// Exact active-cell relation lookup. Contract selectors use the single
+/// current pointer for that contract; an unqualified peer lookup reads only
+/// the addressed pair's bounded index, never the fleet's cell table.
+pub(super) fn current_peer_cell_relation(
+    db: &Connection,
+    source_context: &Value,
+    target_context: &Value,
+    contract: Option<(keys::TermKind, String)>,
+) -> Result<Option<Value>> {
+    let Some(source_id) = source_context.pointer("/actor/client_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(target_id) = target_context.pointer("/actor/client_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let candidates: Vec<Value> = if let Some((kind, contract_key)) = contract {
+        if kind != keys::TermKind::Contract {
+            return Ok(None);
+        }
+        meta(db, &global_current_cell_index_key(&contract_key))?
+            .into_iter()
+            .collect()
+    } else {
+        let prefix = peer_cell_pair_prefix(source_id, target_id);
+        let upper = format!("{prefix}g");
+        let mut statement = db.prepare(
+            "SELECT value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT 65",
+        )?;
+        statement
+            .query_map(params![prefix, upper], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .collect()
+    };
+    for pointer in candidates {
+        let Some(cell_id) = pointer.get("cell_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(scope_id) = pointer.get("scope_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(contract_key) = pointer.get("contract_key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(record_key) = pointer.get("cell_record_key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(current) = meta(db, &global_current_cell_index_key(contract_key))? else {
+            continue;
+        };
+        if current["cell_id"] != cell_id
+            || current["scope_id"] != scope_id
+            || current["cell_record_key"] != record_key
+        {
+            continue;
+        }
+        let Some(cell) = meta(db, record_key)? else {
+            continue;
+        };
+        if cell["cell_id"] != cell_id
+            || cell["state"] == wire::CellState::Superseded.as_str()
+            || cell["membership_digest"] != pointer["membership_digest"]
+        {
+            continue;
+        }
+        let Some(members) = cell["facts"]["member_basis_set"].as_array() else {
+            continue;
+        };
+        let Some(stored_card_facts) = cell["facts"]["member_card_facts"].as_array() else {
+            continue;
+        };
+        if members.is_empty() || members.len() > MAX_CELL_MEMBERS as usize {
+            continue;
+        }
+        let mut member_identity_set = Vec::with_capacity(members.len());
+        let mut current_card_facts = Vec::with_capacity(members.len());
+        let mut current_contexts = Vec::with_capacity(members.len());
+        let mut seen_members = BTreeSet::new();
+        let mut all_members_current = true;
+        for member in members {
+            let Some(client_id) = member.get("client_id").and_then(Value::as_str) else {
+                all_members_current = false;
+                break;
+            };
+            if !seen_members.insert(client_id.to_owned()) {
+                all_members_current = false;
+                break;
+            }
+            let Some(context) = member.get("context").filter(|context| context.is_object()) else {
+                all_members_current = false;
+                break;
+            };
+            let scope = match super::coordination::load_current_scope_for_client(db, client_id) {
+                Ok(scope) => scope,
+                Err(error) if matches!(
+                    error.code.as_str(),
+                    "FORBIDDEN"
+                        | "NOT_FOUND"
+                        | "UNAUTHORIZED"
+                        | "STALE_PARTICIPANT"
+                        | "STALE_REVISION"
+                        | "PARTICIPANT_NOT_ASSIGNED"
+                        | "STALE_REVIEW_ASSIGNMENT"
+                ) => {
+                    all_members_current = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if super::coordination::scope_context(&scope) != *context
+                || member.get("participation_basis")
+                    != scope.registration.get("participation_basis")
+            {
+                all_members_current = false;
+                break;
+            }
+            let Some(card) = meta(
+                db,
+                &keys::card_key(&scope.scope_id, "contract", contract_key, client_id),
+            )?
+            .filter(|card| {
+                card["state"] == "current"
+                    && card["card_kind"] == "contract"
+                    && card["identity"] == contract_key
+                    && card["client_id"] == client_id
+                    && card["task_id"] == context["task_id"]
+                    && card["task_revision"] == context["task_revision"]
+                    && card["attempt_id"] == context["attempt_id"]
+                    && matches!(
+                        card.pointer("/fields/role").and_then(Value::as_str),
+                        Some("producer" | "consumer" | "carrier")
+                    )
+            })
+            else {
+                all_members_current = false;
+                break;
+            };
+            let role = card.pointer("/fields/role").cloned().unwrap_or(Value::Null);
+            let Some(card_revision) = card.get("card_revision").and_then(Value::as_i64) else {
+                all_members_current = false;
+                break;
+            };
+            let Some(card_material_digest) = card.get("material_digest").and_then(Value::as_str) else {
+                all_members_current = false;
+                break;
+            };
+            let stored = stored_card_facts.iter().find(|fact| fact["client_id"] == client_id);
+            if stored.is_none_or(|fact| {
+                fact["role"] != role
+                    || fact["card_revision"] != card_revision
+                    || fact["card_material_digest"] != card_material_digest
+            }) {
+                all_members_current = false;
+                break;
+            }
+            member_identity_set.push(json!({
+                "client_id":client_id,
+                "participation_basis_kind":member
+                    .pointer("/participation_basis/kind")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "context":context,
+            }));
+            current_card_facts.push(json!({
+                "client_id":client_id,
+                "role":role,
+                "card_revision":card_revision,
+                "card_material_digest":card_material_digest,
+            }));
+            current_contexts.push(context.clone());
+        }
+        member_identity_set
+            .sort_by(|left, right| left["client_id"].as_str().cmp(&right["client_id"].as_str()));
+        current_card_facts
+            .sort_by(|left, right| left["client_id"].as_str().cmp(&right["client_id"].as_str()));
+        let membership_digest = digest(&json!({
+            "contract_key":contract_key,
+            "member_identity_set":member_identity_set,
+        }))?;
+        if !all_members_current
+            || stored_card_facts != &current_card_facts
+            || cell["facts"]["task_revision_set"]
+                != json!(task_revision_set_from_contexts(&current_contexts))
+            || cell["facts"]["membership_digest"] != membership_digest
+            || cell["membership_digest"] != membership_digest
+        {
+            continue;
+        }
+        let exact_member = |context: &Value| {
+            members.iter().any(|member| {
+                member["client_id"] == context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                    && member["context"] == *context
+                    && member.pointer("/participation_basis")
+                        == context.pointer("/actor/participation_basis")
+            })
+        };
+        if exact_member(source_context) && exact_member(target_context) {
+            return Ok(Some(json!({
+                "kind":"active_integration_cell",
+                "cell_id":cell_id,
+                "contract_key":contract_key,
+                "membership_digest":cell["membership_digest"],
+                "task_revision_set":cell["facts"]["task_revision_set"],
+            })));
+        }
+    }
+    Ok(None)
+}
+
+fn write_current_peer_cell_indexes(
+    tx: &Transaction<'_>,
+    members: &[Member],
+    contract_key: &str,
+    scope_id: &str,
+    cell_id: &str,
+    cell_record_key: &str,
+    membership_digest: &str,
+) -> Result<()> {
+    for left in 0..members.len() {
+        for right in (left + 1)..members.len() {
+            let key = peer_cell_pair_key(&members[left].client_id, &members[right].client_id, contract_key);
+            set_meta(tx, &key, &json!({
+                "cell_id":cell_id,
+                "scope_id":scope_id,
+                "contract_key":contract_key,
+                "cell_record_key":cell_record_key,
+                "membership_digest":membership_digest,
+            }))?;
+        }
+    }
+    Ok(())
+}
+
 fn authorize_retained_cell_read(
     db: &Connection,
     principal: &Principal,
@@ -1356,12 +1653,15 @@ fn authorize_retained_cell_read(
 ) -> Result<()> {
     let task = super::tasks::get_task(db, &request.task_id)?;
     let retained_attempt = super::tasks::get_attempt(db, &request.attempt_id)?;
-    let expected_scope_id =
-        keys::scope_id(&request.task_id, request.task_revision, &request.attempt_id)?;
     if task["task_id"] != request.task_id
         || retained_attempt["task_id"] != request.task_id
         || retained_attempt["task_revision"] != request.task_revision
-        || location["scope_id"] != expected_scope_id
+        || !cell_location_contains_task(
+            location,
+            &request.task_id,
+            request.task_revision,
+            &request.attempt_id,
+        )
     {
         return Err(Error::new(
             "NOT_FOUND",
@@ -1406,11 +1706,59 @@ fn authorize_retained_cell_read(
     }
 }
 
-fn current_members(
-    page: &Value,
+fn participant_context(scope: &Value) -> Value {
+    let participant = &scope["participant"];
+    json!({
+        "task_id":scope["task"]["task_id"],
+        "task_revision":scope["task"]["revision"],
+        "attempt_id":scope["attempt"]["attempt_id"],
+        "actor":{
+            "client_id":participant["client_id"],
+            "participation_basis":participant["participation_basis"],
+        },
+        "grant_revision":participant["grant_revision"],
+        "binding_id":participant.get("binding_id").cloned().unwrap_or(Value::Null),
+        "binding_generation":participant.get("binding_generation").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn task_revision_set_contains(
+    set: &Value,
     task_id: &str,
     task_revision: i64,
     attempt_id: &str,
+) -> bool {
+    set.as_array().is_some_and(|items| items.iter().any(|item| {
+        item["task_id"] == task_id
+            && item["task_revision"] == task_revision
+            && item["attempt_id"] == attempt_id
+    }))
+}
+
+fn cell_location_contains_task(
+    location: &Value,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+) -> bool {
+    if location["task_revision_set"].as_array().is_some() {
+        task_revision_set_contains(
+            &location["task_revision_set"],
+            task_id,
+            task_revision,
+            attempt_id,
+        )
+    } else {
+        // Retained v1 locations predate the multi-Task set and described one
+        // exact Task/Attempt tuple at the location's top level.
+        location["task_id"] == task_id
+            && location["task_revision"] == task_revision
+            && location["attempt_id"] == attempt_id
+    }
+}
+
+fn current_members(
+    page: &Value,
     contract_key: &str,
 ) -> Result<Vec<Member>> {
     let items = page
@@ -1425,19 +1773,23 @@ fn current_members(
             .filter(|basis| basis.is_object())
             .ok_or_else(|| Error::new("STORE_INVARIANT", "participant page lacks current basis"))?
             .clone();
+        let context = item
+            .get("context")
+            .filter(|context| context.is_object())
+            .ok_or_else(|| Error::new("STORE_INVARIANT", "participant page lacks exact context"))?
+            .clone();
+        if context.pointer("/actor/participation_basis") != Some(&basis) {
+            return Err(Error::new(
+                "STORE_INVARIANT",
+                "participant basis differs from its versioned context",
+            ));
+        }
         let card = item
             .get("card")
             .filter(|card| card["state"] == "current")
             .ok_or_else(|| Error::new("STORE_INVARIANT", "participant page lacks current card"))?
             .clone();
-        validate_card_scope(
-            &card,
-            task_id,
-            task_revision,
-            attempt_id,
-            contract_key,
-            &client_id,
-        )?;
+        validate_card_scope(&card, &context, contract_key, &client_id)?;
         let role = card
             .get("fields")
             .and_then(|fields| fields.get("role"))
@@ -1447,11 +1799,13 @@ fn current_members(
         let member = Member {
             client_id: client_id.clone(),
             participation_basis: basis,
+            context,
             card,
             role,
         };
         if let Some(prior) = members.insert(client_id, member.clone())
             && (prior.participation_basis != member.participation_basis
+                || prior.context != member.context
                 || prior.card["material_digest"] != member.card["material_digest"]
                 || prior.card["card_revision"] != member.card["card_revision"])
         {
@@ -1466,19 +1820,18 @@ fn current_members(
 
 fn validate_card_scope(
     card: &Value,
-    task_id: &str,
-    task_revision: i64,
-    attempt_id: &str,
+    context: &Value,
     contract_key: &str,
     client_id: &str,
 ) -> Result<()> {
     if card["state"] != "current"
         || card["card_kind"] != "contract"
         || card["identity"] != contract_key
-        || card["task_id"] != task_id
-        || card["task_revision"] != task_revision
-        || card["attempt_id"] != attempt_id
+        || card["task_id"] != context["task_id"]
+        || card["task_revision"] != context["task_revision"]
+        || card["attempt_id"] != context["attempt_id"]
         || card["client_id"] != client_id
+        || context.pointer("/actor/client_id").and_then(Value::as_str) != Some(client_id)
         || card["fields"].as_object().is_none()
         || card["card_revision"].as_i64().is_none()
         || card["material_digest"].as_str().is_none()
@@ -1489,6 +1842,19 @@ fn validate_card_scope(
         ));
     }
     Ok(())
+}
+
+fn task_revision_set(members: &[Member]) -> Vec<Value> {
+    let mut tuples = BTreeMap::<(String, i64, String), Value>::new();
+    for member in members {
+        let task_id = member.context["task_id"].as_str().unwrap_or_default();
+        let revision = member.context["task_revision"].as_i64().unwrap_or_default();
+        let attempt_id = member.context["attempt_id"].as_str().unwrap_or_default();
+        tuples.entry((task_id.to_owned(), revision, attempt_id.to_owned())).or_insert_with(|| {
+            json!({"task_id":task_id,"task_revision":revision,"attempt_id":attempt_id})
+        });
+    }
+    tuples.into_values().collect()
 }
 
 fn validate_side_role(side: &wire::Side, role: &str) -> Result<()> {
@@ -1571,6 +1937,7 @@ fn collect_cell_facts(
             carriers.push(json!({
                 "client_id":member.client_id,
                 "participation_basis":member.participation_basis,
+                "context":member.context,
                 "card_revision":member.card["card_revision"],
                 "card_material_digest":member.card["material_digest"],
                 "constraints":selected_card_dimensions(&member.card),
@@ -1586,6 +1953,7 @@ fn collect_cell_facts(
         let Some(record) = record.filter(|record| {
             record["schema"] == "eliot.integration.contribution.v1"
                 && record["scope_id"] == scope_id
+                && record["member_context"] == member.context
                 && record["task_id"] == member.card["task_id"]
                 && record["task_revision"] == member.card["task_revision"]
                 && record["attempt_id"] == member.card["attempt_id"]
@@ -1627,6 +1995,7 @@ fn collect_cell_facts(
         let base = json!({
             "client_id":member.client_id,
             "participation_basis":member.participation_basis,
+            "context":member.context,
             "card_revision":member.card["card_revision"],
             "card_material_digest":member.card["material_digest"],
             "contribution_digest":record["material_digest"],
@@ -2040,7 +2409,7 @@ fn overlap_check(db: &Connection, principal: &Principal, value: &Value) -> Resul
         gaps.push(json!({"kind":"candidate_ref_not_current_attempt_candidate"}));
     }
     for contract_key in &request.contracts {
-        if let Some(pointer) = meta(db, &current_cell_index_key(scope_id, contract_key))? {
+        if let Some(pointer) = current_cell_pointer(db, scope_id, contract_key)? {
             let record_key = pointer["cell_record_key"].as_str().ok_or_else(|| {
                 Error::new(
                     "STORE_INVARIANT",
@@ -2048,7 +2417,7 @@ fn overlap_check(db: &Connection, principal: &Principal, value: &Value) -> Resul
                 )
             })?;
             if let Some(cell) = meta(db, record_key)? {
-                if !retained_sync_operation_matches(db, &cell, task_id, attempt_id)? {
+                if !retained_sync_operation_matches(db, &cell)? {
                     gaps.push(json!({"kind":"integration_cell_operation_provenance_missing","contract_key":contract_key}));
                     selector_facts.push(unknown_cell_summary(
                         contract_key,
@@ -2060,7 +2429,7 @@ fn overlap_check(db: &Connection, principal: &Principal, value: &Value) -> Resul
                 let freshness = current_cell_freshness(
                     db,
                     principal,
-                    scope_id,
+                    cell["facts"]["scope_id"].as_str().unwrap_or(scope_id),
                     task_id,
                     task_revision,
                     attempt_id,
@@ -2139,13 +2508,6 @@ fn current_cell_freshness(
     contract_key: &str,
     cell: &Value,
 ) -> Result<CellFreshness> {
-    let params = json!({
-        "task_id":task_id,
-        "task_revision":task_revision,
-        "attempt_id":attempt_id,
-        "contract_key":contract_key,
-        "limit":MAX_CELL_MEMBERS,
-    });
     let page = if principal.role == Role::Participant {
         super::coordination::list_current_contract_participants(
             db,
@@ -2154,7 +2516,15 @@ fn current_cell_freshness(
             MAX_CELL_MEMBERS,
         )?
     } else {
-        super::coordination::read(db, principal, "coordination.peer.find", &params)?
+        super::coordination::list_current_contract_participants_for_manager(
+            db,
+            principal,
+            task_id,
+            task_revision,
+            attempt_id,
+            contract_key,
+            MAX_CELL_MEMBERS,
+        )?
     };
     if page["coverage"] != "complete"
         || page["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
@@ -2164,13 +2534,6 @@ fn current_cell_freshness(
     {
         return Ok(CellFreshness::Incomplete);
     }
-    if (page.get("scope_id").is_some() && page["scope_id"] != scope_id)
-        || page["task_id"] != task_id
-        || page["task_revision"] != task_revision
-        || page["attempt_id"] != attempt_id
-    {
-        return Ok(CellFreshness::Changed);
-    }
     let Some(items) = page.get("items").and_then(Value::as_array) else {
         return Ok(CellFreshness::Incomplete);
     };
@@ -2179,7 +2542,9 @@ fn current_cell_freshness(
     }
 
     let mut member_identity_set = Vec::with_capacity(items.len());
+    let mut member_basis_set = Vec::with_capacity(items.len());
     let mut member_card_facts = Vec::with_capacity(items.len());
+    let mut contexts = Vec::with_capacity(items.len());
     let mut seen = BTreeSet::new();
     for item in items {
         let Some(client_id) = item.get("client_id").and_then(Value::as_str) else {
@@ -2189,43 +2554,32 @@ fn current_cell_freshness(
             return Ok(CellFreshness::Changed);
         }
         let card = &item["card"];
-        let basis_kind = if principal.role == Role::Participant {
-            item.pointer("/participation_basis/kind")
-        } else {
-            item.pointer("/participant/participation_basis_kind")
-        };
-        let Some(basis_kind) = basis_kind.and_then(Value::as_str) else {
+        let Some(context) = item.get("context").filter(|context| context.is_object()) else {
             return Ok(CellFreshness::Incomplete);
         };
-        let card_available = if principal.role == Role::Participant {
-            card["state"] == "current"
-        } else {
-            card["available"] == true
+        let Some(basis) = context.pointer("/actor/participation_basis") else {
+            return Ok(CellFreshness::Incomplete);
         };
-        if !card_available
+        let Some(basis_kind) = basis.get("kind").and_then(Value::as_str) else {
+            return Ok(CellFreshness::Incomplete);
+        };
+        if (principal.role == Role::Participant && card["state"] != "current")
+            || (principal.role != Role::Participant && card["available"] != true)
             || card["card_kind"] != "contract"
             || card["identity"] != contract_key
-            || card["task_id"] != task_id
-            || card["task_revision"] != task_revision
-            || card["attempt_id"] != attempt_id
+            || card["task_id"] != context["task_id"]
+            || card["task_revision"] != context["task_revision"]
+            || card["attempt_id"] != context["attempt_id"]
             || card["client_id"] != client_id
+            || context.pointer("/actor/client_id").and_then(Value::as_str) != Some(client_id)
             || card.get("fields").and_then(Value::as_object).is_none()
         {
             return Ok(CellFreshness::Changed);
         }
-        if principal.role == Role::Participant {
-            let current_basis = item.get("participation_basis");
-            let retained_basis = cell["facts"]["member_basis_set"]
-                .as_array()
-                .and_then(|members| {
-                    members
-                        .iter()
-                        .find(|member| member["client_id"].as_str() == Some(client_id))
-                })
-                .and_then(|member| member.get("participation_basis"));
-            if current_basis.is_none() || current_basis != retained_basis {
-                return Ok(CellFreshness::Changed);
-            }
+        if principal.role == Role::Participant
+            && item.get("participation_basis") != Some(basis)
+        {
+            return Ok(CellFreshness::Changed);
         }
         let Some(card_revision) = card.get("card_revision").and_then(Value::as_i64) else {
             return Ok(CellFreshness::Incomplete);
@@ -2240,7 +2594,14 @@ fn current_cell_freshness(
         member_identity_set.push(json!({
             "client_id":client_id,
             "participation_basis_kind":basis_kind,
+            "context":context,
         }));
+        member_basis_set.push(json!({
+            "client_id":client_id,
+            "participation_basis":basis,
+            "context":context,
+        }));
+        contexts.push(context.clone());
         member_card_facts.push(json!({
             "client_id":client_id,
             "role":role,
@@ -2250,23 +2611,21 @@ fn current_cell_freshness(
     }
     member_identity_set
         .sort_by(|left, right| left["client_id"].as_str().cmp(&right["client_id"].as_str()));
+    member_basis_set
+        .sort_by(|left, right| left["client_id"].as_str().cmp(&right["client_id"].as_str()));
     member_card_facts
         .sort_by(|left, right| left["client_id"].as_str().cmp(&right["client_id"].as_str()));
     let current_membership_digest = digest(&json!({
-        "task_id":task_id,
-        "task_revision":task_revision,
-        "attempt_id":attempt_id,
         "contract_key":contract_key,
         "member_identity_set":member_identity_set,
     }))?;
+    let current_task_revision_set = task_revision_set_from_contexts(&contexts);
     let facts = &cell["facts"];
     let exact_record_scope = cell["schema"] == "eliot.integration.cell.v1"
         && facts["scope_id"] == scope_id
-        && facts["task_id"] == task_id
-        && facts["attempt_id"] == attempt_id
         && facts["contract_key"] == contract_key
-        && facts["task_revision_set"]
-            == json!([{"task_id":task_id,"task_revision":task_revision,"attempt_id":attempt_id}]);
+        && facts["task_revision_set"] == json!(current_task_revision_set)
+        && facts["member_basis_set"] == json!(member_basis_set);
     if !exact_record_scope
         || cell["membership_digest"] != current_membership_digest
         || facts["membership_digest"] != current_membership_digest
@@ -2277,6 +2636,19 @@ fn current_cell_freshness(
         return Ok(CellFreshness::Changed);
     }
     Ok(CellFreshness::Current)
+}
+
+fn task_revision_set_from_contexts(contexts: &[Value]) -> Vec<Value> {
+    let mut tuples = BTreeMap::<(String, i64, String), Value>::new();
+    for context in contexts {
+        let task_id = context["task_id"].as_str().unwrap_or_default();
+        let revision = context["task_revision"].as_i64().unwrap_or_default();
+        let attempt_id = context["attempt_id"].as_str().unwrap_or_default();
+        tuples.entry((task_id.to_owned(), revision, attempt_id.to_owned())).or_insert_with(|| {
+            json!({"task_id":task_id,"task_revision":revision,"attempt_id":attempt_id})
+        });
+    }
+    tuples.into_values().collect()
 }
 
 fn unknown_cell_summary(contract_key: &str, cell: &Value, gap_kind: &str) -> Value {
@@ -2296,13 +2668,18 @@ fn unknown_cell_summary(contract_key: &str, cell: &Value, gap_kind: &str) -> Val
 fn retained_sync_operation_matches(
     db: &Connection,
     cell: &Value,
-    task_id: &str,
-    attempt_id: &str,
 ) -> Result<bool> {
     let Some(operation_id) = cell.get("operation_id").and_then(Value::as_str) else {
         return Ok(false);
     };
     let Some(caller_id) = cell.get("updated_by_client_id").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let context = &cell["updated_by_context"];
+    let Some(task_id) = context.get("task_id").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(attempt_id) = context.get("attempt_id").and_then(Value::as_str) else {
         return Ok(false);
     };
     sync_operation_matches(db, operation_id, caller_id, task_id, attempt_id)
@@ -2438,6 +2815,54 @@ fn contribution_key(scope_id: &str, contract_key: &str, client_id: &str) -> Stri
 fn current_cell_index_key(scope_id: &str, contract_key: &str) -> String {
     format!(
         "coordination:integration-cell-current:v1:{scope_id}:{}",
+        keys::key_component(contract_key),
+    )
+}
+
+fn current_cell_pointer(
+    db: &Connection,
+    scope_id: &str,
+    contract_key: &str,
+) -> Result<Option<Value>> {
+    if let Some(pointer) = meta(db, &global_current_cell_index_key(contract_key))? {
+        return Ok(Some(pointer));
+    }
+    let Some(mut pointer) = meta(db, &current_cell_index_key(scope_id, contract_key))? else {
+        return Ok(None);
+    };
+    if pointer.get("scope_id").is_none() {
+        pointer["scope_id"] = json!(scope_id);
+    }
+    if pointer.get("contract_key").is_none() {
+        pointer["contract_key"] = json!(contract_key);
+    }
+    Ok(Some(pointer))
+}
+
+fn global_current_cell_index_key(contract_key: &str) -> String {
+    format!(
+        "coordination:integration-cell-current-global:v1:{}",
+        keys::key_component(contract_key),
+    )
+}
+
+fn peer_cell_pair_prefix(left_client_id: &str, right_client_id: &str) -> String {
+    let (left, right) = if left_client_id <= right_client_id {
+        (left_client_id, right_client_id)
+    } else {
+        (right_client_id, left_client_id)
+    };
+    format!(
+        "coordination:integration-peer-cell:v1:{}:{}:",
+        keys::key_component(left),
+        keys::key_component(right),
+    )
+}
+
+fn peer_cell_pair_key(left_client_id: &str, right_client_id: &str, contract_key: &str) -> String {
+    format!(
+        "{}{}",
+        peer_cell_pair_prefix(left_client_id, right_client_id),
         keys::key_component(contract_key),
     )
 }

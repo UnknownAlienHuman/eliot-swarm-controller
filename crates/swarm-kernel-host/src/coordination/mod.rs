@@ -586,6 +586,20 @@ pub(crate) fn participant_prefix(scope: &str) -> String {
     format!("coordination:participant:{scope}:")
 }
 
+/// Exact Task-local address index for current Participant grants. Entries are
+/// revalidated against the grant and each endpoint's Task/Attempt before use.
+pub(crate) fn participant_task_prefix(task_id: &str) -> String {
+    format!("coordination:participant-task:{}:", key_component(task_id))
+}
+
+pub(crate) fn participant_task_key(task_id: &str, client_id: &str) -> String {
+    format!(
+        "{}{client}",
+        participant_task_prefix(task_id),
+        client = key_component(client_id)
+    )
+}
+
 pub(crate) fn mailbox_prefix(scope: &str, recipient: &str) -> String {
     format!("coordination:mailbox:{scope}:{}:", key_component(recipient))
 }
@@ -618,6 +632,16 @@ pub(crate) fn card_prefix(scope: &str) -> String {
 pub(crate) fn relevance_prefix(scope: &str, kind: TermKind, term: &str) -> String {
     format!(
         "coordination:relevance:{scope}:{}:{}:",
+        kind.as_str(),
+        key_component(term)
+    )
+}
+
+/// Cross-Task sparse relevance index. The exact term is the partition; it is
+/// never a project roster and every hit still passes the current pair check.
+pub(crate) fn global_relevance_prefix(kind: TermKind, term: &str) -> String {
+    format!(
+        "coordination:relevance-global:{}:{}:",
         kind.as_str(),
         key_component(term)
     )
@@ -678,6 +702,22 @@ pub(crate) fn relevance_key(
     format!(
         "{}{}:{}:{}",
         relevance_prefix(scope, kind, term),
+        key_component(client_id),
+        card_kind,
+        key_component(identity)
+    )
+}
+
+pub(crate) fn global_relevance_key(
+    kind: TermKind,
+    term: &str,
+    client_id: &str,
+    card_kind: &str,
+    identity: &str,
+) -> String {
+    format!(
+        "{}{}:{}:{}",
+        global_relevance_prefix(kind, term),
         key_component(client_id),
         card_kind,
         key_component(identity)

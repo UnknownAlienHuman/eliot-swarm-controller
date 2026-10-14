@@ -80,6 +80,31 @@ async fn publish_producer_contract_card(
         .unwrap();
 }
 
+async fn publish_consumer_contract_card(
+    owner: &StoreOwner,
+    participant: &Principal,
+    contract_key: &str,
+    request_id: &str,
+) {
+    owner
+        .store
+        .call(
+            participant.clone(),
+            "coordination.contract_card.publish".into(),
+            json!({
+                "client_request_id":request_id,
+                "contract_key":contract_key,
+                "fields":{
+                    "role":"consumer",
+                    "paths":[format!("src/{contract_key}.rs")],
+                    "interfaces":[format!("producer contract {contract_key}")],
+                },
+            }),
+        )
+        .await
+        .unwrap();
+}
+
 async fn sync_offer(
     owner: &StoreOwner,
     participant: &Principal,
@@ -100,6 +125,33 @@ async fn sync_offer(
                     "will_be_available_at":{"path":format!("src/{contract_key}.rs")},
                     "candidate_ref":null,
                     "assumptions":assumptions,
+                },
+            }),
+        )
+        .await
+        .unwrap()
+}
+
+async fn sync_requirement(
+    owner: &StoreOwner,
+    participant: &Principal,
+    contract_key: &str,
+    request_id: &str,
+) -> Value {
+    owner
+        .store
+        .call(
+            participant.clone(),
+            "coordination.sync_integration".into(),
+            json!({
+                "client_request_id":request_id,
+                "contract_key":contract_key,
+                "requirement":{
+                    "consumer_path":format!("src/{contract_key}.rs"),
+                    "consumer_symbol":null,
+                    "required_dimensions":{"version":"v1"},
+                    "must_be_ready_before":"integration-test",
+                    "assumptions":[],
                 },
             }),
         )
@@ -292,8 +344,8 @@ async fn participation_basis_change_invalidates_cell_material_identity() {
         vec!["same offer".to_owned()],
     )
     .await;
-    assert_eq!(changed["cell"]["cell_id"], first["cell"]["cell_id"]);
-    assert_eq!(
+    assert_ne!(changed["cell"]["cell_id"], first["cell"]["cell_id"]);
+    assert_ne!(
         changed["cell"]["membership_digest"],
         first["cell"]["membership_digest"]
     );
@@ -593,6 +645,281 @@ async fn cell_assumptions_at_forty_items_has_no_omission_gap() {
             .all(|gap| { gap["kind"] != "cell_assumptions_projection_bound" })
     );
     assert_ne!(result["coverage"], "partial");
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn exact_cross_task_peer_delivery_and_cell_use_each_owners_current_context() {
+    let (owner, directory, source_subject) =
+        start_integration_fixture("issue99-cross-task-source").await;
+    let target_subject = seed_subject(
+        &owner.store,
+        "issue99-cross-task-target",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let unrelated_subject = seed_subject(
+        &owner.store,
+        "issue99-cross-task-unrelated",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let source = register_integration_participant(
+        &owner,
+        &source_subject,
+        "issue99-cross-task-producer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let target = register_integration_participant(
+        &owner,
+        &target_subject,
+        "issue99-cross-task-consumer",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let unrelated = register_integration_participant(
+        &owner,
+        &unrelated_subject,
+        "issue99-cross-task-unrelated",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let contract_key = "issue99-cross-task-contract";
+    publish_producer_contract_card(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-cross-task-publish-producer",
+    )
+    .await;
+    publish_consumer_contract_card(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-cross-task-publish-consumer",
+    )
+    .await;
+
+    let found = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.peer.find".into(),
+            json!({"contract_key":contract_key,"limit":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["coverage"], "complete");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["client_id"], target.client_id);
+    assert_eq!(found["items"][0]["context"]["task_id"], target_subject.task_id);
+    assert_eq!(found["items"][0]["match"]["relation"]["kind"], "contract_key");
+
+    let ready_answer = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.consult".into(),
+            json!({
+                "client_request_id":"issue99-cross-task-ready-consult",
+                "target":{"contract_key":contract_key},
+                "field":"interfaces",
+                "question_kind":"contract_shape",
+                "question":"Which interface is current?",
+                "why_needed":"Use the retained exact contract card.",
+                "expected_answer":"one_fact",
+                "blocking":false,
+                "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+                "evidence_refs":[],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready_answer["status"], "answered_from_card");
+    assert_eq!(ready_answer["delivery_created"], false);
+
+    let ask_request = json!({
+        "client_request_id":"issue99-cross-task-ask",
+        "target":{"contract_key":contract_key},
+        "field":"assumptions",
+        "question_kind":"assumption_check",
+        "question":"Which implementation assumption applies?",
+        "why_needed":"The exact contract card has no current assumption value.",
+        "expected_answer":"one_fact",
+        "blocking":false,
+        "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+        "evidence_refs":[],
+    });
+    let asked = owner
+        .store
+        .call(source.clone(), "coordination.consult".into(), ask_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(asked["status"], "asked");
+    assert_eq!(asked["recipient"], target.client_id);
+    assert_eq!(asked["source_context"]["task_id"], source_subject.task_id);
+    assert_eq!(asked["target_context"]["task_id"], target_subject.task_id);
+    let retried = owner
+        .store
+        .call(source.clone(), "coordination.consult".into(), ask_request)
+        .await
+        .unwrap();
+    assert_eq!(retried["operation_id"], asked["operation_id"]);
+    assert_eq!(retried["delivery_id"], asked["delivery_id"]);
+
+    let inbox = owner
+        .store
+        .call(target.clone(), "coordination.inbox".into(), json!({"limit":10}))
+        .await
+        .unwrap();
+    assert_eq!(inbox["task_id"], target_subject.task_id);
+    assert_eq!(inbox["items"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["items"][0]["operation_id"], asked["operation_id"]);
+    assert_eq!(inbox["items"][0]["body"]["schema"], "eliot.coordination.consult.v1");
+
+    let unrelated_send = owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.send".into(),
+            json!({
+                "client_request_id":"issue99-cross-task-no-relation",
+                "recipient":unrelated.client_id,
+                "body":{"fact":"should not be delivered"},
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unrelated_send.code, "FORBIDDEN");
+    let first_cell = sync_offer(
+        &owner,
+        &source,
+        contract_key,
+        "issue99-cross-task-sync-producer",
+        vec![],
+    )
+    .await;
+    let second_cell = sync_requirement(
+        &owner,
+        &target,
+        contract_key,
+        "issue99-cross-task-sync-consumer",
+    )
+    .await;
+    assert_eq!(first_cell["cell"]["cell_id"], second_cell["cell"]["cell_id"]);
+    let task_revision_set = second_cell["cell"]["facts"]["task_revision_set"]
+        .as_array()
+        .unwrap();
+    assert_eq!(task_revision_set.len(), 2);
+    assert!(task_revision_set.iter().any(|item| item["task_id"] == source_subject.task_id));
+    assert!(task_revision_set.iter().any(|item| item["task_id"] == target_subject.task_id));
+    assert_eq!(second_cell["cell"]["facts"]["member_basis_set"].as_array().unwrap().len(), 2);
+    owner
+        .store
+        .call(
+            source.clone(),
+            "coordination.integration.ack".into(),
+            ack_request(&second_cell["cell"], &source_subject, "issue99-cross-task-ack-producer"),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            target.clone(),
+            "coordination.integration.ack".into(),
+            ack_request(&second_cell["cell"], &target_subject, "issue99-cross-task-ack-consumer"),
+        )
+        .await
+        .unwrap();
+    let agreed_cell = owner
+        .store
+        .call(
+            target.clone(),
+            "coordination.agreement.get".into(),
+            agreement_get_request(
+                second_cell["cell"]["cell_id"].as_str().unwrap(),
+                &target_subject,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(agreed_cell["current"], true);
+    assert_eq!(agreed_cell["positions"]["items"].as_array().unwrap().len(), 2);
+    let foreign_read = owner
+        .store
+        .call(
+            unrelated.clone(),
+            "coordination.agreement.get".into(),
+            agreement_get_request(
+                second_cell["cell"]["cell_id"].as_str().unwrap(),
+                &unrelated_subject,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(foreign_read.code, "NOT_FOUND");
+
+    // Model a new current assignment for the same recipient. The old delivery
+    // remains at the original target tuple and does not follow the actor.
+    let target_client_id = target.client_id.clone();
+    let old_task_id = target_subject.task_id.clone();
+    let new_task_id = unrelated_subject.task_id.clone();
+    let new_attempt_id = unrelated_subject.attempt_id.clone();
+    owner
+        .store
+        .run(move |db| {
+            let key = format!("client:{target_client_id}");
+            let raw: String = db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| row.get(0))?;
+            let mut registration: Value = serde_json::from_str(&raw)?;
+            registration["task_id"] = json!(new_task_id);
+            registration["task_revision"] = json!(1);
+            registration["attempt_id"] = json!(new_attempt_id);
+            registration["grant_revision"] = json!(2);
+            db.execute(
+                "UPDATE meta SET value_json=?2 WHERE key=?1",
+                params![key, model::canonical(&registration)?],
+            )?;
+            db.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [crate::coordination::participant_task_key(&old_task_id, &target_client_id)],
+            )?;
+            db.execute(
+                "INSERT OR REPLACE INTO meta(key,value_json) VALUES(?1,?2)",
+                params![
+                    crate::coordination::participant_task_key(
+                        registration["task_id"].as_str().unwrap_or_default(),
+                        &target_client_id,
+                    ),
+                    model::canonical(&json!({
+                        "client_id":target_client_id,
+                        "task_id":registration["task_id"],
+                        "task_revision":registration["task_revision"],
+                        "attempt_id":registration["attempt_id"],
+                        "grant_revision":registration["grant_revision"],
+                    }))?,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let moved_inbox = owner
+        .store
+        .call(target, "coordination.inbox".into(), json!({"limit":10}))
+        .await
+        .unwrap();
+    assert_eq!(moved_inbox["task_id"], unrelated_subject.task_id);
+    assert!(moved_inbox["items"].as_array().unwrap().is_empty());
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();

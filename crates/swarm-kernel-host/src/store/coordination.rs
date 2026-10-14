@@ -33,12 +33,12 @@ const RELEVANCE_SCAN_FACTOR: i64 = 4;
 const INBOX_NORMALIZE_BOUND: i64 = 64;
 
 #[derive(Clone)]
-struct ScopeData {
-    client_id: Option<String>,
-    registration: Value,
-    task: Value,
-    attempt: Value,
-    scope_id: String,
+pub(super) struct ScopeData {
+    pub(super) client_id: Option<String>,
+    pub(super) registration: Value,
+    pub(super) task: Value,
+    pub(super) attempt: Value,
+    pub(super) scope_id: String,
 }
 
 #[derive(Clone)]
@@ -46,6 +46,14 @@ struct IndexedCard {
     client_id: String,
     card_kind: String,
     identity: String,
+    valid_index: bool,
+}
+
+#[derive(Clone)]
+enum PeerSelector {
+    Term(keys::TermKind, String),
+    Task(String),
+    Participant(String),
 }
 
 struct ConsultCardMatch {
@@ -164,9 +172,8 @@ pub(super) fn list_current_contract_participants(
     }
     let caller = load_current_scope(db, principal)?;
     let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
-    let (indexed, more) = indexed_cards(
+    let (indexed, more) = indexed_global_cards(
         db,
-        &caller.scope_id,
         keys::TermKind::Contract,
         contract_key,
         Some("contract"),
@@ -177,25 +184,19 @@ pub(super) fn list_current_contract_participants(
     let mut stale = 0usize;
     let mut overflow = false;
     for index in indexed {
+        if !index.valid_index {
+            stale += 1;
+            continue;
+        }
         let member = match load_current_scope_for_client(db, &index.client_id) {
-            Ok(member) if member.scope_id == caller.scope_id => member,
-            Ok(_) => {
-                stale += 1;
-                continue;
-            }
+            Ok(member) => member,
             Err(error) if is_stale_watch_authority(&error) => {
                 stale += 1;
                 continue;
             }
             Err(error) => return Err(error),
         };
-        let Some(card) = current_card(
-            db,
-            &caller.scope_id,
-            "contract",
-            &index.identity,
-            &index.client_id,
-        )?
+        let Some(card) = current_card(db, &member.scope_id, "contract", &index.identity, &index.client_id)?
         else {
             stale += 1;
             continue;
@@ -203,25 +204,162 @@ pub(super) fn list_current_contract_participants(
         if card["identity"] != contract_key
             || index.identity != contract_key
             || card["client_id"] != index.client_id
-            || card["task_id"] != caller.task["task_id"]
-            || card["task_revision"] != caller.task["revision"]
-            || card["attempt_id"] != caller.attempt["attempt_id"]
+            || card["task_id"] != member.task["task_id"]
+            || card["task_revision"] != member.task["revision"]
+            || card["attempt_id"] != member.attempt["attempt_id"]
             || card["card_kind"] != "contract"
         {
             stale += 1;
             continue;
         }
+        let relation = if index.client_id == principal.client_id {
+            Some(json!({"kind":"self","context":scope_context(&member)}))
+        } else {
+            current_peer_relation(
+                db,
+                &caller,
+                &member,
+                Some(&PeerSelector::Term(keys::TermKind::Contract, contract_key.to_owned())),
+            )?
+        };
+        let Some(relation) = relation else {
+            continue;
+        };
         if items.len() == limit as usize {
             overflow = true;
             break;
         }
-        items.push(json!({"client_id":index.client_id,"participation_basis":member.registration["participation_basis"],"card":card}));
+        items.push(json!({
+            "client_id":index.client_id,
+            "participation_basis":member.registration["participation_basis"],
+            "context":scope_context(&member),
+            "participant":{
+                "display_alias":member.registration["display_alias"],
+                "inbound_policy":member.registration["inbound_policy"],
+            },
+            "relation":relation,
+            "card":card,
+        }));
     }
     let incomplete = more || overflow || stale > 0;
     Ok(json!({
         "scope_id":caller.scope_id,
         "task_id":caller.task["task_id"],"task_revision":caller.task["revision"],"attempt_id":caller.attempt["attempt_id"],
         "items":items,"coverage":if incomplete { "partial" } else { "complete" },
+        "gaps":if incomplete { json!([{"kind":"bounded_or_stale_contract_relevance","stale_entries":stale,"more":more || overflow}]) } else { json!([]) },
+    }))
+}
+
+/// Manager-side freshness uses the same sparse exact-contract directory and
+/// pair validator while retaining each participant's own current context.
+/// The manager's Task scope authorizes the read; it does not become a cell
+/// member or an acknowledgement obligation.
+pub(super) fn list_current_contract_participants_for_manager(
+    db: &Connection,
+    principal: &Principal,
+    task_id: &str,
+    task_revision: i64,
+    attempt_id: &str,
+    contract_key: &str,
+    limit: i64,
+) -> Result<Value> {
+    validate_identifier(contract_key, "contract_key", 1024)?;
+    if !(1..=keys::MAX_PAGE_SIZE).contains(&limit) {
+        return Err(Error::invalid("contract participant limit must be 1..=50"));
+    }
+    let caller = manager_scope(db, principal, task_id, task_revision, attempt_id)?;
+    let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
+    let (indexed, more) = indexed_global_cards(
+        db,
+        keys::TermKind::Contract,
+        contract_key,
+        Some("contract"),
+        None,
+        scan_limit,
+    )?;
+    let mut candidates = Vec::<(ScopeData, Value)>::new();
+    let mut seen = BTreeSet::new();
+    let mut stale = 0usize;
+    let mut overflow = false;
+    for index in indexed {
+        if !index.valid_index {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        let member = match load_current_scope_for_client(db, &index.client_id) {
+            Ok(member) => member,
+            Err(error) if is_stale_watch_authority(&error) => {
+                stale = stale.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(card) = current_card(
+            db,
+            &member.scope_id,
+            "contract",
+            contract_key,
+            &index.client_id,
+        )? else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if card["identity"] != contract_key
+            || card["client_id"] != index.client_id
+            || card["task_id"] != member.task["task_id"]
+            || card["task_revision"] != member.task["revision"]
+            || card["attempt_id"] != member.attempt["attempt_id"]
+            || card["card_kind"] != "contract"
+            || !matches!(
+                card.pointer("/fields/role").and_then(Value::as_str),
+                Some("producer" | "consumer" | "carrier")
+            )
+        {
+            stale = stale.saturating_add(1);
+            continue;
+        }
+        if !seen.insert(index.client_id.clone()) {
+            continue;
+        }
+        if let Some((anchor, _)) = candidates.first()
+            && current_peer_relation(
+                db,
+                anchor,
+                &member,
+                Some(&PeerSelector::Term(
+                    keys::TermKind::Contract,
+                    contract_key.to_owned(),
+                )),
+            )?
+            .is_none()
+        {
+            continue;
+        }
+        if candidates.len() == limit as usize {
+            overflow = true;
+            break;
+        }
+        candidates.push((member, card));
+    }
+    let items = candidates
+        .iter()
+        .map(|(member, card)| {
+            Ok(json!({
+                "client_id":member.client_id,
+                "participation_basis":member.registration["participation_basis"],
+                "context":scope_context(member),
+                "card":project_card(card, None)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let incomplete = more || overflow || stale > 0;
+    Ok(json!({
+        "scope_id":caller.scope_id,
+        "task_id":caller.task["task_id"],
+        "task_revision":caller.task["revision"],
+        "attempt_id":caller.attempt["attempt_id"],
+        "items":items,
+        "coverage":if incomplete { "partial" } else { "complete" },
         "gaps":if incomplete { json!([{"kind":"bounded_or_stale_contract_relevance","stale_entries":stale,"more":more || overflow}]) } else { json!([]) },
     }))
 }
@@ -662,18 +800,23 @@ pub(crate) fn normalize_send(
         ));
     }
     let target = load_current_scope_for_client(db, recipient)?;
-    if target.scope_id != sender.scope_id {
+    let Some(relation) = current_peer_relation(db, &sender, &target, None)? else {
         return Err(Error::new(
             "FORBIDDEN",
-            "coordination delivery must target a participant in the exact Task/Attempt scope",
+            "coordination delivery requires an exact current peer relation",
         ));
-    }
+    };
     let body = value
         .get("body")
         .filter(|body| !body.is_null())
         .ok_or_else(|| Error::invalid("body must be a non-null JSON value"))?;
     let envelope = json!({
-        "schema": "eliot.coordination.message.v1",
+        "schema": "eliot.coordination.message.v2",
+        "source_context": scope_context(&sender),
+        "target_context": scope_context(&target),
+        "relation": relation,
+        // Kept as the source tuple for retained Operation projections. V2
+        // consumers use the separate source and target contexts above.
         "task_id": sender.task["task_id"],
         "task_revision": sender.task["revision"],
         "attempt_id": sender.attempt["attempt_id"],
@@ -816,7 +959,7 @@ fn participant_scope_lookup_error(error: Error, missing_message: &'static str) -
     }
 }
 
-fn load_current_scope_for_client(db: &Connection, client_id: &str) -> Result<ScopeData> {
+pub(super) fn load_current_scope_for_client(db: &Connection, client_id: &str) -> Result<ScopeData> {
     let registration = participant_registration(db, client_id)?;
     if registration["disabled"] == true {
         return Err(Error::new(
@@ -1597,6 +1740,17 @@ fn register_participant_with_actor(
         &keys::participant_key(&scope_id, client_id),
         &json!({"client_id":client_id,"grant_revision":1}),
     )?;
+    set_meta(
+        tx,
+        &keys::participant_task_key(task_id, client_id),
+        &json!({
+            "client_id":client_id,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "grant_revision":1,
+        }),
+    )?;
     if basis["kind"] == "sponsored_reviewer"
         && let Some(profile) = review_profile.as_deref()
     {
@@ -1787,6 +1941,10 @@ fn disable_participant(
         tx.execute(
             "DELETE FROM meta WHERE key=?1",
             [keys::participant_key(&scope_id, client_id)],
+        )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key=?1",
+            [keys::participant_task_key(&task_id, client_id)],
         )?;
         if registration["participation_basis"]["kind"] == "sponsored_reviewer"
             && registration["participation_basis"]["review_scope"]["review_assignment_id"].is_null()
@@ -2416,6 +2574,17 @@ fn publish_card(
         && prior["state"] == "current"
         && prior["material_digest"] == digest
     {
+        // Heal the derived exact-term indexes when a retained card predates
+        // the cross-Task directory projection.
+        write_relevance_indexes(
+            tx,
+            &scope.scope_id,
+            &principal.client_id,
+            card_kind,
+            identity,
+            prior["card_revision"].as_i64().unwrap_or(1),
+            fields,
+        )?;
         attach_operation_scope(
             tx,
             operation_id,
@@ -2670,6 +2839,26 @@ fn write_relevance_indexes(
                     "card_revision":revision,
                 }),
             )?;
+            let global_key = keys::global_relevance_key(
+                term_kind,
+                &term,
+                client_id,
+                card_kind,
+                identity,
+            );
+            set_meta(
+                tx,
+                &global_key,
+                &json!({
+                    "client_id":client_id,
+                    "scope_id":scope,
+                    "card_kind":card_kind,
+                    "identity":identity,
+                    "term_kind":term_kind.as_str(),
+                    "term":term,
+                    "card_revision":revision,
+                }),
+            )?;
         }
     }
     Ok(())
@@ -2690,6 +2879,16 @@ fn remove_relevance_indexes(
                 "DELETE FROM meta WHERE key=?1",
                 [keys::relevance_key(
                     scope, term_kind, &term, client_id, card_kind, identity,
+                )],
+            )?;
+            tx.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [keys::global_relevance_key(
+                    term_kind,
+                    &term,
+                    client_id,
+                    card_kind,
+                    identity,
                 )],
             )?;
         }
@@ -2767,10 +2966,664 @@ fn indexed_cards(
                 client_id: value.get("client_id")?.as_str()?.to_owned(),
                 card_kind: value.get("card_kind")?.as_str()?.to_owned(),
                 identity: value.get("identity")?.as_str()?.to_owned(),
+                valid_index: true,
             })
         })
         .collect();
     Ok((cards, has_more))
+}
+
+/// Query only the exact-term cross-Task index. Every entry is checked against
+/// the candidate's separately revalidated current scope before projection.
+fn indexed_global_cards(
+    db: &Connection,
+    term_kind: keys::TermKind,
+    term: &str,
+    card_kind: Option<&str>,
+    after_client_id: Option<&str>,
+    raw_limit: i64,
+) -> Result<(Vec<IndexedCard>, bool)> {
+    let prefix = keys::global_relevance_prefix(term_kind, term);
+    let upper = format!("{prefix}g");
+    let lower = match after_client_id {
+        Some(client_id) => format!("{}{client}:~", prefix, client = keys::key_component(client_id)),
+        None => prefix.clone(),
+    };
+    let comparison = if after_client_id.is_some() { ">" } else { ">=" };
+    let raw: Vec<(String, String)> = if let Some(card_kind) = card_kind {
+        let sql = format!(
+            "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 \
+             AND json_extract(value_json,'$.card_kind')=?3 ORDER BY key LIMIT ?4"
+        );
+        let mut statement = db.prepare(&sql)?;
+        statement
+            .query_map(params![lower, upper, card_kind, raw_limit + 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?
+    } else {
+        let sql = format!(
+            "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+        );
+        let mut statement = db.prepare(&sql)?;
+        statement
+            .query_map(params![lower, upper, raw_limit + 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let has_more = raw.len() as i64 > raw_limit;
+    let cards = raw
+        .iter()
+        .take(raw_limit as usize)
+        .filter_map(|(key, raw)| Some((key, serde_json::from_str::<Value>(raw).ok()?)))
+        .filter_map(|(key, value)| {
+            let client_id = value.get("client_id")?.as_str()?.to_owned();
+            let card_kind = value.get("card_kind")?.as_str()?.to_owned();
+            let identity = value.get("identity")?.as_str()?.to_owned();
+            Some(IndexedCard {
+                valid_index: key
+                    == keys::global_relevance_key(
+                        term_kind,
+                        term,
+                        &client_id,
+                        &card_kind,
+                        &identity,
+                    ),
+                client_id,
+                card_kind,
+                identity,
+            })
+        })
+        .collect();
+    Ok((cards, has_more))
+}
+
+fn indexed_task_participants(
+    db: &Connection,
+    task_id: &str,
+    after_client_id: Option<&str>,
+    raw_limit: i64,
+) -> Result<(Vec<String>, bool)> {
+    let prefix = keys::participant_task_prefix(task_id);
+    let upper = format!("{prefix}g");
+    let lower = match after_client_id {
+        Some(client_id) => format!("{}{client}", prefix, client = keys::key_component(client_id)),
+        None => prefix.clone(),
+    };
+    let comparison = if after_client_id.is_some() { ">" } else { ">=" };
+    let sql = format!(
+        "SELECT key,value_json FROM meta WHERE key {comparison} ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+    );
+    let mut statement = db.prepare(&sql)?;
+    let rows: Vec<(String, String)> = statement
+        .query_map(params![lower, upper, raw_limit + 1], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let has_more = rows.len() as i64 > raw_limit;
+    let items = rows
+        .iter()
+        .take(raw_limit as usize)
+        .filter_map(|(key, raw)| {
+            let entry: Value = serde_json::from_str(raw).ok()?;
+            let client_id = entry.get("client_id")?.as_str()?.to_owned();
+            (key == &keys::participant_task_key(task_id, &client_id)).then_some(client_id)
+        })
+        .collect();
+    Ok((items, has_more))
+}
+
+pub(super) fn scope_context(scope: &ScopeData) -> Value {
+    json!({
+        "task_id":scope.task["task_id"],
+        "task_revision":scope.task["revision"],
+        "attempt_id":scope.attempt["attempt_id"],
+        "actor":{
+            "client_id":scope.client_id,
+            "participation_basis":scope.registration["participation_basis"],
+        },
+        "grant_revision":scope.registration["grant_revision"],
+        "binding_id":scope.registration.get("binding_id").cloned().unwrap_or(Value::Null),
+        "binding_generation":scope.registration.get("binding_generation").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn relation_term(selector: Option<&PeerSelector>) -> Option<(keys::TermKind, &str)> {
+    match selector {
+        Some(PeerSelector::Term(kind, term)) => Some((*kind, term.as_str())),
+        _ => None,
+    }
+}
+
+fn relation_selector_matches(relation: &Value, selector: Option<&PeerSelector>) -> bool {
+    match selector {
+        None => true,
+        Some(PeerSelector::Participant(client_id)) => {
+            relation["source_context"]["actor"]["client_id"] == client_id.as_str()
+                || relation["target_context"]["actor"]["client_id"] == client_id.as_str()
+                || relation["kind"] != "unresolved_coordination"
+        }
+        Some(PeerSelector::Task(task_id)) => {
+            relation["target_task_id"] == task_id.as_str()
+                || relation["task_id"] == task_id.as_str()
+                || relation["kind"] == "same_task_assignment"
+                || relation["kind"] == "task_dependency"
+        }
+        Some(PeerSelector::Term(kind, term)) => {
+            relation["term_kind"] == kind.as_str() && relation["term"] == term.as_str()
+                || (relation["kind"] == "active_integration_cell"
+                    && *kind == keys::TermKind::Contract
+                    && relation["contract_key"] == term.as_str())
+                || relation["original_relation"].is_object()
+                    && relation_selector_matches(&relation["original_relation"], selector)
+        }
+    }
+}
+
+fn task_dependency_relation(source: &ScopeData, target: &ScopeData) -> Option<Value> {
+    let source_dependencies = source.task.pointer("/spec/dependencies").and_then(Value::as_array);
+    if let Some(dependency) = source_dependencies.into_iter().flatten().find(|dependency| {
+        dependency.get("task_id") == target.task.get("task_id")
+            && dependency.get("required_revision") == target.task.get("revision")
+            && dependency.get("required_phase").and_then(Value::as_str)
+                == target.task.pointer("/spec/phase").and_then(Value::as_str)
+    }) {
+        return Some(json!({
+            "kind":"task_dependency",
+            "direction":"source_depends_on_target",
+            "source_task_id":source.task["task_id"],
+            "source_task_revision":source.task["revision"],
+            "source_attempt_id":source.attempt["attempt_id"],
+            "target_task_id":target.task["task_id"],
+            "target_task_revision":target.task["revision"],
+            "target_attempt_id":target.attempt["attempt_id"],
+            "required_phase":dependency["required_phase"],
+        }));
+    }
+    let target_dependencies = target.task.pointer("/spec/dependencies").and_then(Value::as_array);
+    target_dependencies
+        .into_iter()
+        .flatten()
+        .find(|dependency| {
+            dependency.get("task_id") == source.task.get("task_id")
+                && dependency.get("required_revision") == source.task.get("revision")
+                && dependency.get("required_phase").and_then(Value::as_str)
+                    == source.task.pointer("/spec/phase").and_then(Value::as_str)
+        })
+        .map(|dependency| {
+            json!({
+                "kind":"task_dependency",
+                "direction":"target_depends_on_source",
+                "source_task_id":source.task["task_id"],
+                "source_task_revision":source.task["revision"],
+                "source_attempt_id":source.attempt["attempt_id"],
+                "target_task_id":target.task["task_id"],
+                "target_task_revision":target.task["revision"],
+                "target_attempt_id":target.attempt["attempt_id"],
+                "required_phase":dependency["required_phase"],
+            })
+        })
+}
+
+fn scope_cards(db: &Connection, scope: &ScopeData, card_kind: &str) -> Result<Vec<Value>> {
+    let Some(client_id) = scope.client_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!(
+        "coordination:card-owner:{}:{}:{card_kind}:",
+        scope.scope_id,
+        keys::key_component(client_id)
+    );
+    let upper = format!("{prefix}g");
+    let mut statement = db.prepare(
+        "SELECT value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT 101",
+    )?;
+    let owners: Vec<String> = statement
+        .query_map(params![prefix, upper], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut cards = Vec::new();
+    for raw in owners {
+        let owner: Value = match serde_json::from_str(&raw) {
+            Ok(owner) => owner,
+            Err(_) => continue,
+        };
+        let Some(card_key) = owner.get("card_key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(card) = meta(db, card_key)?.filter(|card| card["state"] == "current") else {
+            continue;
+        };
+        if card["client_id"] == client_id
+            && card["task_id"] == scope.task["task_id"]
+            && card["task_revision"] == scope.task["revision"]
+            && card["attempt_id"] == scope.attempt["attempt_id"]
+            && card["card_kind"] == card_kind
+        {
+            cards.push(card);
+        }
+    }
+    Ok(cards)
+}
+
+fn card_relation_ref(card: &Value) -> Value {
+    json!({
+        "client_id":card["client_id"],
+        "card_kind":card["card_kind"],
+        "identity":card["identity"],
+        "task_id":card["task_id"],
+        "task_revision":card["task_revision"],
+        "attempt_id":card["attempt_id"],
+        "card_revision":card["card_revision"],
+        "material_digest":card["material_digest"],
+        "role":card.pointer("/fields/role").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn shared_card_relation(
+    db: &Connection,
+    source: &ScopeData,
+    target: &ScopeData,
+    selector: Option<&PeerSelector>,
+) -> Result<Option<Value>> {
+    let source_cards = scope_cards(db, source, "contract")?
+        .into_iter()
+        .chain(scope_cards(db, source, "work")?)
+        .collect::<Vec<_>>();
+    let target_cards = scope_cards(db, target, "contract")?
+        .into_iter()
+        .chain(scope_cards(db, target, "work")?)
+        .collect::<Vec<_>>();
+    let required = relation_term(selector);
+    for source_card in &source_cards {
+        let source_fields = indexable_card_fields(
+            &source_card["fields"],
+            source_card["card_kind"].as_str().unwrap_or_default(),
+            source_card["identity"].as_str().unwrap_or_default(),
+        );
+        let source_terms = keys::indexed_terms(
+            &source_fields,
+            source_card["card_kind"].as_str().unwrap_or_default(),
+        );
+        for target_card in &target_cards {
+            let target_fields = indexable_card_fields(
+                &target_card["fields"],
+                target_card["card_kind"].as_str().unwrap_or_default(),
+                target_card["identity"].as_str().unwrap_or_default(),
+            );
+            let target_terms = keys::indexed_terms(
+                &target_fields,
+                target_card["card_kind"].as_str().unwrap_or_default(),
+            );
+            for (kind, terms) in &source_terms {
+                // Published path/symbol/interface fields are discovery hints,
+                // not accepted scope authority. Cross-Task scope relations
+                // are derived below from the current accepted code scopes.
+                if *kind != keys::TermKind::Contract {
+                    continue;
+                }
+                let Some(other_terms) = target_terms.get(kind) else {
+                    continue;
+                };
+                for term in terms.intersection(other_terms) {
+                    if required.is_some_and(|(required_kind, required_term)| {
+                        *kind != required_kind || term != required_term
+                    }) {
+                        continue;
+                    }
+                    if *kind == keys::TermKind::Contract {
+                        let role_is_current = |card: &Value| {
+                            card["card_kind"] == "contract"
+                                && card["identity"] == term.as_str()
+                                && matches!(
+                                    card.pointer("/fields/role").and_then(Value::as_str),
+                                    Some("producer" | "consumer" | "carrier")
+                                )
+                        };
+                        if !role_is_current(source_card) || !role_is_current(target_card) {
+                            continue;
+                        }
+                    }
+                    return Ok(Some(json!({
+                        "kind":if *kind == keys::TermKind::Contract { "contract_key" } else { kind.as_str() },
+                        "term_kind":kind.as_str(),
+                        "term":term,
+                        "source_card":card_relation_ref(source_card),
+                        "target_card":card_relation_ref(target_card),
+                    })));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn accepted_scope_relation(
+    db: &Connection,
+    source: &ScopeData,
+    target: &ScopeData,
+    selector: Option<&PeerSelector>,
+) -> Result<Option<Value>> {
+    let Some((required_kind, required_term)) = relation_term(selector) else {
+        if selector.is_some() {
+            return Ok(None);
+        }
+        return accepted_scope_relation_for_terms(db, source, target, None);
+    };
+    if required_kind == keys::TermKind::Contract {
+        return Ok(None);
+    }
+    accepted_scope_relation_for_terms(db, source, target, Some((required_kind, required_term)))
+}
+
+fn accepted_scope_relation_for_terms(
+    db: &Connection,
+    source: &ScopeData,
+    target: &ScopeData,
+    required: Option<(keys::TermKind, &str)>,
+) -> Result<Option<Value>> {
+    let source_scopes = super::code_scopes::current_scope_revisions(
+        db,
+        source.task["task_id"].as_str().unwrap_or_default(),
+        source.task["revision"].as_i64().unwrap_or_default(),
+        source.attempt["attempt_id"].as_str().unwrap_or_default(),
+    )?;
+    let target_scopes = super::code_scopes::current_scope_revisions(
+        db,
+        target.task["task_id"].as_str().unwrap_or_default(),
+        target.task["revision"].as_i64().unwrap_or_default(),
+        target.attempt["attempt_id"].as_str().unwrap_or_default(),
+    )?;
+    if source_scopes["coverage"] != "complete"
+        || source_scopes["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
+        || target_scopes["coverage"] != "complete"
+        || target_scopes["gaps"].as_array().is_none_or(|gaps| !gaps.is_empty())
+    {
+        return Ok(None);
+    }
+    for left in source_scopes["items"].as_array().into_iter().flatten() {
+        if left["state"] != "active"
+            || left["owner_client_id"].as_str() != source.client_id.as_deref()
+        {
+            continue;
+        }
+        for right in target_scopes["items"].as_array().into_iter().flatten() {
+            if right["state"] != "active"
+                || right["owner_client_id"].as_str() != target.client_id.as_deref()
+            {
+                continue;
+            }
+            for (kind, field) in [
+                (keys::TermKind::Path, "paths"),
+                (keys::TermKind::Symbol, "symbols"),
+                (keys::TermKind::Interface, "interfaces"),
+            ] {
+                if required.is_some_and(|(required_kind, _)| kind != required_kind) {
+                    continue;
+                }
+                let left_terms = left[field]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|term| !scope_term_has_glob(term))
+                    .collect::<Vec<_>>();
+                let right_terms = right[field]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|term| !scope_term_has_glob(term))
+                    .collect::<Vec<_>>();
+                let matched = left_terms.iter().find_map(|left_term| {
+                    right_terms.iter().find_map(|right_term| {
+                        let overlap = if kind == keys::TermKind::Path {
+                            path_scope_covers(left_term, right_term)
+                                || path_scope_covers(right_term, left_term)
+                        } else {
+                            left_term == right_term
+                        };
+                        let selected = required.is_none_or(|(required_kind, required_term)| {
+                            kind == required_kind
+                                && if kind == keys::TermKind::Path {
+                                    path_scope_covers(left_term, required_term)
+                                        || path_scope_covers(right_term, required_term)
+                                        || path_scope_covers(required_term, left_term)
+                                        || path_scope_covers(required_term, right_term)
+                                } else {
+                                    *left_term == required_term && *right_term == required_term
+                                }
+                        });
+                        (overlap && selected).then_some(if required.is_some() {
+                            required.map(|(_, term)| term).unwrap_or(*left_term)
+                        } else if kind == keys::TermKind::Path
+                            && path_scope_covers(left_term, right_term)
+                        {
+                            *right_term
+                        } else {
+                            *left_term
+                        })
+                    })
+                });
+                if let Some(term) = matched {
+                    return Ok(Some(json!({
+                        "kind":"accepted_scope_overlap",
+                        "term_kind":kind.as_str(),
+                        "term":term,
+                        "source_scope":{
+                            "scope_intent_id":left["scope_intent_id"],
+                            "state_revision":left["state_revision"],
+                            "digest":left["digest"],
+                            "owner_client_id":left["owner_client_id"],
+                        },
+                        "target_scope":{
+                            "scope_intent_id":right["scope_intent_id"],
+                            "state_revision":right["state_revision"],
+                            "digest":right["digest"],
+                            "owner_client_id":right["owner_client_id"],
+                        },
+                    })));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn scope_term_has_glob(term: &str) -> bool {
+    term.contains('*') || term.contains('?') || term.contains('[') || term.contains('{')
+}
+
+fn path_scope_covers(declared: &str, target: &str) -> bool {
+    !scope_term_has_glob(declared)
+        && (target == declared
+            || target.starts_with(&format!("{}/", declared.trim_end_matches('/'))))
+}
+
+fn pending_peer_relation_key(left_client_id: &str, right_client_id: &str) -> String {
+    let (left, right) = if left_client_id <= right_client_id {
+        (left_client_id, right_client_id)
+    } else {
+        (right_client_id, left_client_id)
+    };
+    format!(
+        "coordination:peer-pending:{}:{}",
+        keys::key_component(left),
+        keys::key_component(right)
+    )
+}
+
+fn pending_coordination_relation(
+    db: &Connection,
+    source: &ScopeData,
+    target: &ScopeData,
+    selector: Option<&PeerSelector>,
+) -> Result<Option<Value>> {
+    let (Some(source_id), Some(target_id)) = (source.client_id.as_deref(), target.client_id.as_deref()) else {
+        return Ok(None);
+    };
+    let Some(pending) = meta(db, &pending_peer_relation_key(source_id, target_id))? else {
+        return Ok(None);
+    };
+    let source_context = scope_context(source);
+    let target_context = scope_context(target);
+    for ask in pending["asks"].as_array().into_iter().flatten() {
+        let exact_direction = ask["source_context"] == source_context
+            && ask["target_context"] == target_context;
+        let reverse_direction = ask["source_context"] == target_context
+            && ask["target_context"] == source_context;
+        if !(exact_direction || reverse_direction) {
+            continue;
+        }
+        if !relation_selector_matches(&ask["original_relation"], selector) {
+            continue;
+        }
+        return Ok(Some(json!({
+            "kind":"unresolved_coordination",
+            "ask_id":ask["ask_id"],
+            "source_context":ask["source_context"],
+            "target_context":ask["target_context"],
+            "original_relation":ask["original_relation"],
+        })));
+    }
+    Ok(None)
+}
+
+fn current_peer_relation(
+    db: &Connection,
+    source: &ScopeData,
+    target: &ScopeData,
+    selector: Option<&PeerSelector>,
+) -> Result<Option<Value>> {
+    if source.client_id == target.client_id {
+        return Ok(Some(json!({"kind":"self","context":scope_context(source)})));
+    }
+    let target_task_id = target.task["task_id"].as_str().unwrap_or_default();
+    let task_selector_matches = match selector {
+        Some(PeerSelector::Task(task_id)) => task_id == target_task_id,
+        _ => true,
+    };
+    if task_selector_matches
+        && let Some(review) = sponsored_review_relation(source, target)
+        && !matches!(selector, Some(PeerSelector::Term(_, _)))
+    {
+        return Ok(Some(review));
+    }
+    if task_selector_matches
+        && source.task["task_id"] == target.task["task_id"]
+        && source.task["revision"] == target.task["revision"]
+        && source.attempt["attempt_id"] == target.attempt["attempt_id"]
+        && !matches!(selector, Some(PeerSelector::Term(_, _)))
+    {
+        return Ok(Some(json!({
+            "kind":"same_task_assignment",
+            "source_task_id":source.task["task_id"],
+            "source_task_revision":source.task["revision"],
+            "source_attempt_id":source.attempt["attempt_id"],
+            "target_task_id":target.task["task_id"],
+            "target_task_revision":target.task["revision"],
+            "target_attempt_id":target.attempt["attempt_id"],
+        })));
+    }
+    if task_selector_matches
+        && let Some(dependency) = task_dependency_relation(source, target)
+        && !matches!(selector, Some(PeerSelector::Term(_, _)))
+    {
+        return Ok(Some(dependency));
+    }
+    if let Some(card) = shared_card_relation(db, source, target, selector)? {
+        return Ok(Some(card));
+    }
+    if let Some(scope) = accepted_scope_relation(db, source, target, selector)? {
+        return Ok(Some(scope));
+    }
+    if matches!(selector, None | Some(PeerSelector::Participant(_)))
+        || matches!(selector, Some(PeerSelector::Term(keys::TermKind::Contract, _)))
+    {
+        if let Some(cell) = super::integration::current_peer_cell_relation(
+            db,
+            &scope_context(source),
+            &scope_context(target),
+            relation_term(selector).map(|(kind, term)| (kind, term.to_owned())),
+        )? {
+            return Ok(Some(cell));
+        }
+    }
+    if matches!(selector, None | Some(PeerSelector::Participant(_)))
+        || matches!(selector, Some(PeerSelector::Term(_, _)))
+    {
+        if let Some(pending) = pending_coordination_relation(db, source, target, selector)? {
+            return Ok(Some(pending));
+        }
+    }
+    Ok(None)
+}
+
+fn sponsored_review_relation(source: &ScopeData, target: &ScopeData) -> Option<Value> {
+    if source.task["task_id"] != target.task["task_id"]
+        || source.task["revision"] != target.task["revision"]
+        || source.attempt["attempt_id"] != target.attempt["attempt_id"]
+    {
+        return None;
+    }
+    let review = if source.registration["participation_basis"]["kind"] == "sponsored_reviewer" {
+        (&source.registration["participation_basis"]["review_scope"], source)
+    } else if target.registration["participation_basis"]["kind"] == "sponsored_reviewer" {
+        (&target.registration["participation_basis"]["review_scope"], target)
+    } else {
+        return None;
+    };
+    let review_scope = review.0;
+    if review_scope["task_id"] != source.task["task_id"]
+        || review_scope["task_revision"] != source.task["revision"]
+        || review_scope["attempt_id"] != source.attempt["attempt_id"]
+        || review_scope["submission_ref"] != source.attempt["submission_ref"]
+        || review_scope["candidate_ref"] != source.attempt["candidate_ref"]
+    {
+        return None;
+    }
+    Some(json!({
+        "kind":"sponsored_review",
+        "task_id":source.task["task_id"],
+        "task_revision":source.task["revision"],
+        "attempt_id":source.attempt["attempt_id"],
+        "reviewer_client_id":review.1.client_id,
+        "review_assignment_id":review_scope["review_assignment_id"],
+        "submission_ref":review_scope["submission_ref"],
+        "candidate_ref":review_scope["candidate_ref"],
+    }))
+}
+
+fn relation_snapshot_current(
+    db: &Connection,
+    source: &ScopeData,
+    target: &ScopeData,
+    expected_relation: &Value,
+    ask_id: Option<&str>,
+) -> Result<bool> {
+    if current_peer_relation(db, source, target, None)?.as_ref() == Some(expected_relation) {
+        return Ok(true);
+    }
+    let (Some(source_id), Some(target_id), Some(ask_id)) = (
+        source.client_id.as_deref(),
+        target.client_id.as_deref(),
+        ask_id,
+    ) else {
+        return Ok(false);
+    };
+    let Some(pending) = meta(db, &pending_peer_relation_key(source_id, target_id))? else {
+        return Ok(false);
+    };
+    let source_context = scope_context(source);
+    let target_context = scope_context(target);
+    Ok(pending["asks"].as_array().is_some_and(|asks| {
+        asks.iter().any(|ask| {
+            ask["ask_id"] == ask_id
+                && ask["source_context"] == source_context
+                && ask["target_context"] == target_context
+                && ask["original_relation"] == *expected_relation
+        })
+    }))
 }
 
 fn current_card(
@@ -2889,17 +3742,20 @@ fn card_get(
                 ));
             }
         };
-        if principal.role == Role::Participant && owner != principal.client_id {
+        let participant = load_current_scope_for_client(db, owner)?;
+        if principal.role == Role::Participant
+            && owner != principal.client_id
+            && current_peer_relation(db, &scope, &participant, None)?.is_none()
+        {
             return Err(Error::new(
-                "FORBIDDEN",
-                "participants discover another owner's card through exact peer.find matches",
+                "NOT_FOUND",
+                "no exact current relation authorizes this work-card read",
             ));
         }
-        let participant = load_current_scope_for_client(db, owner)?;
-        if participant.scope_id != scope.scope_id {
+        if principal.role != Role::Participant && participant.scope_id != scope.scope_id {
             return Err(Error::new("NOT_FOUND", "participant is outside this scope"));
         }
-        return match current_card(db, &scope.scope_id, "work", "work", owner)? {
+        return match current_card(db, &participant.scope_id, "work", "work", owner)? {
             Some(card) => project_card(&card, fields),
             None => Ok(json!({"available":false,"card_kind":"work","participant_id":owner})),
         };
@@ -2908,17 +3764,29 @@ fn card_get(
     validate_identifier(contract_key, "contract_key", 256)?;
     if value.get("participant_id").is_some() {
         let owner = model::text(value, "participant_id")?;
-        if principal.role == Role::Participant && owner != principal.client_id {
+        let participant = load_current_scope_for_client(db, owner)?;
+        if principal.role == Role::Participant
+            && owner != principal.client_id
+            && current_peer_relation(
+                db,
+                &scope,
+                &participant,
+                Some(&PeerSelector::Term(
+                    keys::TermKind::Contract,
+                    contract_key.to_owned(),
+                )),
+            )?
+            .is_none()
+        {
             return Err(Error::new(
-                "FORBIDDEN",
-                "participants discover another owner's card through exact peer.find matches",
+                "NOT_FOUND",
+                "no exact current contract relation authorizes this card read",
             ));
         }
-        let participant = load_current_scope_for_client(db, owner)?;
-        if participant.scope_id != scope.scope_id {
+        if principal.role != Role::Participant && participant.scope_id != scope.scope_id {
             return Err(Error::new("NOT_FOUND", "participant is outside this scope"));
         }
-        return match current_card(db, &scope.scope_id, "contract", contract_key, owner)? {
+        return match current_card(db, &participant.scope_id, "contract", contract_key, owner)? {
             Some(card) => project_card(&card, fields),
             None => Ok(json!({
                 "available":false,
@@ -2991,20 +3859,37 @@ fn card_list(
     };
     let limit = keys::parse_page(value.get("limit"), 20)?;
     let after = keys::optional_cursor(value, "after_client_id")?;
-    let (cards, index_more) = indexed_cards(
-        db,
-        &scope.scope_id,
-        term_kind,
-        &term,
-        Some(card_kind),
-        after.as_deref(),
-        limit,
-    )?;
+    let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
+    let (cards, index_more) = if principal.role == Role::Participant {
+        indexed_global_cards(
+            db,
+            term_kind,
+            &term,
+            Some(card_kind),
+            after.as_deref(),
+            scan_limit,
+        )?
+    } else {
+        indexed_cards(
+            db,
+            &scope.scope_id,
+            term_kind,
+            &term,
+            Some(card_kind),
+            after.as_deref(),
+            limit,
+        )?
+    };
     let mut items = Vec::new();
     let mut stale = 0usize;
     let mut last = None;
+    let mut has_more_peers = false;
     for indexed in cards {
         last = Some(indexed.client_id.clone());
+        if !indexed.valid_index {
+            stale = stale.saturating_add(1);
+            continue;
+        }
         let participant = match load_current_scope_for_client(db, &indexed.client_id) {
             Ok(participant) => participant,
             Err(error) if is_stale_watch_authority(&error) => {
@@ -3013,27 +3898,60 @@ fn card_list(
             }
             Err(error) => return Err(error),
         };
-        if participant.scope_id != scope.scope_id {
+        if principal.role != Role::Participant && participant.scope_id != scope.scope_id {
             stale = stale.saturating_add(1);
             continue;
         }
-        if let Some(card) = current_card(
+        let Some(card) = current_card(
             db,
-            &scope.scope_id,
+            &participant.scope_id,
             &indexed.card_kind,
             &indexed.identity,
             &indexed.client_id,
-        )? {
-            items.push(project_card(&card, value.get("fields"))?);
-        } else {
+        )? else {
             stale = stale.saturating_add(1);
+            continue;
+        };
+        let indexed_fields = indexable_card_fields(&card["fields"], card_kind, &indexed.identity);
+        let exact_term = keys::indexed_terms(&indexed_fields, card_kind)
+            .get(&term_kind)
+            .is_some_and(|terms| terms.contains(&term));
+        if !exact_term
+            || card["task_id"] != participant.task["task_id"]
+            || card["task_revision"] != participant.task["revision"]
+            || card["attempt_id"] != participant.attempt["attempt_id"]
+            || card["client_id"] != indexed.client_id
+        {
+            stale = stale.saturating_add(1);
+            continue;
         }
+        if principal.role == Role::Participant
+            && indexed.client_id != principal.client_id
+            && current_peer_relation(
+                db,
+                &scope,
+                &participant,
+                Some(&PeerSelector::Term(term_kind, term.clone())),
+            )?
+            .is_none()
+        {
+            continue;
+        }
+        if items.len() == limit as usize {
+            has_more_peers = true;
+            last = items
+                .last()
+                .and_then(|item: &Value| item["client_id"].as_str())
+                .map(str::to_owned);
+            break;
+        }
+        items.push(project_card(&card, value.get("fields"))?);
     }
-    let partial = index_more || stale > 0;
+    let partial = index_more || stale > 0 || has_more_peers;
     Ok(json!({
         "items":items,
         "selector":{"kind":term_kind.as_str(),"value":term},
-        "next_after":if index_more { last } else { None },
+        "next_after":if partial { last } else { None },
         "coverage":if partial { "partial" } else { "complete" },
         "gaps":if stale > 0 { json!([{"kind":"stale_card_index_entries","count":stale}]) } else if index_more { json!([{"kind":"more_indexed_cards","count":null}]) } else { json!([]) },
     }))
@@ -3085,20 +4003,38 @@ fn contract_cards_for_term(
     let limit = keys::parse_page(raw_limit, 20)?;
     let after_value = json!({"after_client_id":raw_after.cloned().unwrap_or(Value::Null)});
     let after = keys::optional_cursor(&after_value, "after_client_id")?;
-    let (cards, index_more) = indexed_cards(
-        db,
-        &scope.scope_id,
-        keys::TermKind::Contract,
-        contract_key,
-        Some("contract"),
-        after.as_deref(),
-        limit,
-    )?;
+    let is_participant = scope.client_id.is_some();
+    let scan_limit = (limit * RELEVANCE_SCAN_FACTOR + 32).min(keys::MAX_INBOX_SCAN);
+    let (cards, index_more) = if is_participant {
+        indexed_global_cards(
+            db,
+            keys::TermKind::Contract,
+            contract_key,
+            Some("contract"),
+            after.as_deref(),
+            scan_limit,
+        )?
+    } else {
+        indexed_cards(
+            db,
+            &scope.scope_id,
+            keys::TermKind::Contract,
+            contract_key,
+            Some("contract"),
+            after.as_deref(),
+            limit,
+        )?
+    };
     let mut items = Vec::new();
     let mut stale = 0usize;
     let mut last = None;
+    let mut has_more = false;
     for indexed in cards {
         last = Some(indexed.client_id.clone());
+        if !indexed.valid_index {
+            stale = stale.saturating_add(1);
+            continue;
+        }
         let participant = match load_current_scope_for_client(db, &indexed.client_id) {
             Ok(participant) => participant,
             Err(error) if is_stale_watch_authority(&error) => {
@@ -3107,25 +4043,57 @@ fn contract_cards_for_term(
             }
             Err(error) => return Err(error),
         };
-        if participant.scope_id != scope.scope_id {
+        if !is_participant && participant.scope_id != scope.scope_id {
             stale = stale.saturating_add(1);
             continue;
         }
-        match current_card(
+        let Some(card) = current_card(
             db,
-            &scope.scope_id,
+            &participant.scope_id,
             "contract",
             contract_key,
             &indexed.client_id,
-        )? {
-            Some(card) => items.push(project_card(&card, fields)?),
-            None => stale = stale.saturating_add(1),
+        )? else {
+            stale = stale.saturating_add(1);
+            continue;
+        };
+        if card["task_id"] != participant.task["task_id"]
+            || card["task_revision"] != participant.task["revision"]
+            || card["attempt_id"] != participant.attempt["attempt_id"]
+            || card["identity"] != contract_key
+        {
+            stale = stale.saturating_add(1);
+            continue;
         }
+        if let Some(actor) = scope.client_id.as_deref()
+            && indexed.client_id != actor
+            && current_peer_relation(
+                db,
+                scope,
+                &participant,
+                Some(&PeerSelector::Term(
+                    keys::TermKind::Contract,
+                    contract_key.to_owned(),
+                )),
+            )?
+            .is_none()
+        {
+            continue;
+        }
+        if items.len() == limit as usize {
+            has_more = true;
+            last = items
+                .last()
+                .and_then(|item: &Value| item["client_id"].as_str())
+                .map(str::to_owned);
+            break;
+        }
+        items.push(project_card(&card, fields)?);
     }
-    let partial = index_more || stale > 0;
+    let partial = index_more || stale > 0 || has_more;
     Ok((
         items,
-        if index_more { last } else { None },
+        if partial { last } else { None },
         if partial { "partial" } else { "complete" },
         if stale > 0 {
             json!([{"kind":"stale_card_index_entries","count":stale}])
@@ -3236,6 +4204,8 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
             "task_id",
             "task_revision",
             "attempt_id",
+            "related_task_id",
+            "participant_id",
             "contract_key",
             "path",
             "symbol",
@@ -3247,22 +4217,96 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
     )?;
     validate_projection_fields(value.get("fields"))?;
     let scope = read_scope(db, principal, value)?;
-    let (term_kind, term) = selector(value)?
-        .ok_or_else(|| Error::invalid("peer.find requires one exact relationship selector"))?;
+    let term = selector(value)?;
+    let related_task = value
+        .get("related_task_id")
+        .filter(|value| !value.is_null())
+        .map(|_| model::text(value, "related_task_id").map(str::to_owned))
+        .transpose()?;
+    if let Some(task_id) = related_task.as_deref() {
+        validate_identifier(task_id, "related_task_id", 128)?;
+    }
+    let participant_id = value
+        .get("participant_id")
+        .filter(|value| !value.is_null())
+        .map(|_| model::text(value, "participant_id").map(str::to_owned))
+        .transpose()?;
+    if let Some(client_id) = participant_id.as_deref() {
+        validate_identifier(client_id, "participant_id", 128)?;
+    }
+    if (term.is_some() as usize)
+        + (related_task.is_some() as usize)
+        + (participant_id.is_some() as usize)
+        != 1
+    {
+        return Err(Error::invalid(
+            "peer.find requires exactly one contract/path/symbol/interface, related_task_id, or participant_id selector",
+        ));
+    }
     let limit = keys::parse_page(value.get("limit"), 20)?;
     let after = keys::optional_cursor(value, "after_client_id")?;
-    // Scan a bounded selector index, then collapse multiple matching cards to
-    // one peer. This is a sparse directory query, never a roster walk.
+    if participant_id.is_some() && after.is_some() {
+        return Err(Error::invalid("participant_id lookup cannot be paged"));
+    }
+    // Exact term and Task indexes keep the query proportional to this local
+    // neighborhood. Candidate grants and both endpoint contexts are always
+    // revalidated before any card is projected.
     let scan_limit = keys::MAX_INBOX_SCAN;
-    let (cards, index_more) = indexed_cards(
-        db,
-        &scope.scope_id,
-        term_kind,
-        &term,
-        None,
-        after.as_deref(),
-        scan_limit,
-    )?;
+    let (cards, index_more, selector) = if let Some((kind, term)) = term {
+        let (cards, more) = if principal.role == Role::Participant {
+            indexed_global_cards(
+                db,
+                kind,
+                &term,
+                None,
+                after.as_deref(),
+                scan_limit,
+            )?
+        } else {
+            indexed_cards(
+                db,
+                &scope.scope_id,
+                kind,
+                &term,
+                None,
+                after.as_deref(),
+                scan_limit,
+            )?
+        };
+        (cards, more, PeerSelector::Term(kind, term))
+    } else if let Some(task_id) = related_task {
+        let (clients, more) = indexed_task_participants(
+            db,
+            &task_id,
+            after.as_deref(),
+            scan_limit,
+        )?;
+        (
+            clients
+                .into_iter()
+                .map(|client_id| IndexedCard {
+                    client_id,
+                    card_kind: "work".to_owned(),
+                    identity: "work".to_owned(),
+                    valid_index: true,
+                })
+                .collect(),
+            more,
+            PeerSelector::Task(task_id),
+        )
+    } else {
+        let client_id = participant_id.unwrap_or_default();
+        (
+            vec![IndexedCard {
+                client_id: client_id.clone(),
+                card_kind: "work".to_owned(),
+                identity: "work".to_owned(),
+                valid_index: true,
+            }],
+            false,
+            PeerSelector::Participant(client_id),
+        )
+    };
     let mut items = Vec::new();
     let mut seen = BTreeSet::new();
     let mut stale = 0usize;
@@ -3270,6 +4314,10 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
     let mut has_more_peers = false;
     for indexed in cards {
         last = Some(indexed.client_id.clone());
+        if !indexed.valid_index {
+            stale = stale.saturating_add(1);
+            continue;
+        }
         if principal.role == Role::Participant && indexed.client_id == principal.client_id {
             continue;
         }
@@ -3284,21 +4332,57 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
             }
             Err(error) => return Err(error),
         };
-        if candidate.scope_id != scope.scope_id {
-            stale = stale.saturating_add(1);
+        let manager_local_term = principal.role != Role::Participant
+            && matches!(&selector, PeerSelector::Term(_, _));
+        if manager_local_term && candidate.scope_id != scope.scope_id {
             continue;
         }
-        let Some(card) = current_card(
+        let relation = if manager_local_term {
+            Some(Value::Null)
+        } else {
+            current_peer_relation(db, &scope, &candidate, Some(&selector))?
+        };
+        let Some(relation) = relation else {
+            continue;
+        };
+        if matches!(&selector, PeerSelector::Task(task_id)
+            if candidate.task["task_id"] != task_id.as_str()
+                || !matches!(relation["kind"].as_str(), Some("same_task_assignment" | "task_dependency" | "sponsored_review")))
+        {
+            continue;
+        }
+        let card = current_card(
             db,
-            &scope.scope_id,
+            &candidate.scope_id,
             &indexed.card_kind,
             &indexed.identity,
             &indexed.client_id,
-        )?
-        else {
+        )?;
+        let card = match card {
+            Some(card) if matches!(&selector, PeerSelector::Term(_, _)) => {
+                let Some((kind, term)) = relation_term(Some(&selector)) else { unreachable!() };
+                let fields = indexable_card_fields(&card["fields"], &indexed.card_kind, &indexed.identity);
+                if !keys::indexed_terms(&fields, &indexed.card_kind)
+                    .get(&kind)
+                    .is_some_and(|terms| terms.contains(term))
+                {
+                    stale = stale.saturating_add(1);
+                    continue;
+                }
+                Some(card)
+            }
+            Some(card) => Some(card),
+            None => None,
+        };
+        if let Some(card) = card.as_ref()
+            && (card["client_id"] != indexed.client_id
+                || card["task_id"] != candidate.task["task_id"]
+                || card["task_revision"] != candidate.task["revision"]
+                || card["attempt_id"] != candidate.attempt["attempt_id"])
+        {
             stale = stale.saturating_add(1);
             continue;
-        };
+        }
         if items.len() >= limit as usize {
             has_more_peers = true;
             // Continue from the last returned peer; this candidate remains
@@ -3316,14 +4400,15 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
                 "inbound_policy":candidate.registration["inbound_policy"],
                 "participation_basis_kind":candidate.registration["participation_basis"]["kind"],
             },
-            "match":{"kind":term_kind.as_str(),"value":term,"reason":"exact_card_index"},
-            "card":project_card(&card, value.get("fields"))?,
+            "context":scope_context(&candidate),
+            "match":{"kind":selector_kind(&selector),"value":selector_value(&selector),"reason":if relation.is_null() { "exact_card_index" } else { relation["kind"].as_str().unwrap_or("exact_relation") },"relation":relation},
+            "card":card.as_ref().map(|card| project_card(card, value.get("fields"))).transpose()?,
         }));
     }
     let partial = index_more || stale > 0 || has_more_peers;
     Ok(json!({
         "items":items,
-        "selector":{"kind":term_kind.as_str(),"value":term},
+        "selector":{"kind":selector_kind(&selector),"value":selector_value(&selector)},
         "task_id":scope.task["task_id"],
         "task_revision":scope.task["revision"],
         "attempt_id":scope.attempt["attempt_id"],
@@ -3331,6 +4416,22 @@ fn peer_find(db: &Connection, principal: &Principal, value: &Value) -> Result<Va
         "coverage":if partial { "partial" } else { "complete" },
         "gaps":if stale > 0 { json!([{"kind":"stale_card_index_entries","count":stale}]) } else if index_more { json!([{"kind":"relevance_scan_bound","count":null}]) } else if has_more_peers { json!([{"kind":"more_relevant_peers","count":null}]) } else { json!([]) },
     }))
+}
+
+fn selector_kind(selector: &PeerSelector) -> &'static str {
+    match selector {
+        PeerSelector::Term(kind, _) => kind.as_str(),
+        PeerSelector::Task(_) => "task",
+        PeerSelector::Participant(_) => "participant",
+    }
+}
+
+fn selector_value(selector: &PeerSelector) -> &str {
+    match selector {
+        PeerSelector::Term(_, value)
+        | PeerSelector::Task(value)
+        | PeerSelector::Participant(value) => value,
+    }
 }
 
 #[derive(Clone)]
@@ -3554,14 +4655,33 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
             ));
         }
         let envelope: Value = serde_json::from_str(raw_envelope)?;
-        if envelope["schema"] != "eliot.coordination.message.v1"
-            || envelope["body"].is_null()
+        let legacy_envelope = envelope["schema"] == "eliot.coordination.message.v1"
+            && envelope["task_id"] == scope.task["task_id"]
+            && envelope["task_revision"] == scope.task["revision"]
+            && envelope["attempt_id"] == scope.attempt["attempt_id"];
+        let versioned_envelope = envelope["schema"] == "eliot.coordination.message.v2"
+            && envelope
+                .pointer("/source_context/actor/client_id")
+                .and_then(Value::as_str)
+                == Some(sender.as_str())
+            && envelope
+                .pointer("/target_context/actor/client_id")
+                .and_then(Value::as_str)
+                == Some(principal.client_id.as_str())
+            && envelope["source_context"]["task_id"] == result["task_id"]
+            && envelope["source_context"]["task_revision"] == result["task_revision"]
+            && envelope["source_context"]["attempt_id"] == result["attempt_id"]
+            && envelope["target_context"]["task_id"] == scope.task["task_id"]
+            && envelope["target_context"]["task_revision"] == scope.task["revision"]
+            && envelope["target_context"]["attempt_id"] == scope.attempt["attempt_id"]
+            && envelope["relation"] == result["relation"]
+            && envelope["source_context"] == result["source_context"]
+            && envelope["target_context"] == result["target_context"];
+        if envelope["body"].is_null()
             || result["sender"] != sender
             || envelope["sender"] != sender
             || envelope["recipient"] != result["recipient"]
-            || envelope["task_id"] != result["task_id"]
-            || envelope["task_revision"] != result["task_revision"]
-            || envelope["attempt_id"] != result["attempt_id"]
+            || !(legacy_envelope || versioned_envelope)
         {
             return Err(Error::new(
                 "INBOX_OPERATION_BODY_DAMAGED",
@@ -3618,6 +4738,13 @@ fn inbox(db: &Connection, principal: &Principal, value: &Value) -> Result<Value>
         }
 
         if !delivery_matches_scope(&result, &scope, &principal.client_id)?
+            || !retained_relation_matches_delivery(
+                db,
+                &envelope,
+                &scope,
+                &principal.client_id,
+                &sender,
+            )?
             || (method == "coordination.send" && request["recipient"] != principal.client_id)
         {
             stale = stale.saturating_add(1);
@@ -4066,16 +5193,221 @@ fn delivery_matches_scope(result: &Value, scope: &ScopeData, recipient: &str) ->
         Ok(envelope) => envelope,
         Err(_) => return Ok(false),
     };
-    Ok(envelope["schema"] == "eliot.coordination.message.v1"
-        && envelope["sender"] == result["sender"]
-        && envelope["recipient"] == recipient
+    let legacy = envelope["schema"] == "eliot.coordination.message.v1"
         && envelope["task_id"] == scope.task["task_id"]
         && envelope["task_revision"] == scope.task["revision"]
         && envelope["attempt_id"] == scope.attempt["attempt_id"]
-        && result["recipient"] == recipient
         && result["task_id"] == scope.task["task_id"]
         && result["task_revision"] == scope.task["revision"]
-        && result["attempt_id"] == scope.attempt["attempt_id"])
+        && result["attempt_id"] == scope.attempt["attempt_id"];
+    let versioned = envelope["schema"] == "eliot.coordination.message.v2"
+        && envelope["target_context"]["actor"]["client_id"] == recipient
+        && envelope["target_context"]["task_id"] == scope.task["task_id"]
+        && envelope["target_context"]["task_revision"] == scope.task["revision"]
+        && envelope["target_context"]["attempt_id"] == scope.attempt["attempt_id"]
+        && envelope["target_context"]["grant_revision"] == scope.registration["grant_revision"]
+        && envelope["target_context"]["actor"]["participation_basis"]
+            == scope.registration["participation_basis"]
+        && envelope["target_context"]["binding_id"]
+            == scope.registration.get("binding_id").cloned().unwrap_or(Value::Null)
+        && envelope["target_context"]["binding_generation"]
+            == scope.registration.get("binding_generation").cloned().unwrap_or(Value::Null)
+        && envelope["source_context"]["actor"]["client_id"] == result["sender"]
+        && envelope["source_context"]["task_id"] == result["task_id"]
+        && envelope["source_context"]["task_revision"] == result["task_revision"]
+        && envelope["source_context"]["attempt_id"] == result["attempt_id"]
+        && envelope["source_context"] == result["source_context"]
+        && envelope["target_context"] == result["target_context"]
+        && envelope["relation"] == result["relation"];
+    Ok((legacy || versioned)
+        && envelope["sender"] == result["sender"]
+        && envelope["recipient"] == recipient
+        && result["recipient"] == recipient)
+}
+
+fn retained_relation_matches_delivery(
+    db: &Connection,
+    envelope: &Value,
+    target: &ScopeData,
+    recipient: &str,
+    sender: &str,
+) -> Result<bool> {
+    if envelope["schema"] == "eliot.coordination.message.v1" {
+        return Ok(true);
+    }
+    let source_context = &envelope["source_context"];
+    let target_context = &envelope["target_context"];
+    if envelope["schema"] != "eliot.coordination.message.v2"
+        || target_context != &scope_context(target)
+        || target_context.pointer("/actor/client_id").and_then(Value::as_str) != Some(recipient)
+        || source_context.pointer("/actor/client_id").and_then(Value::as_str) != Some(sender)
+        || !retained_relation_contexts_match(
+            &envelope["relation"],
+            source_context,
+            target_context,
+        )
+    {
+        return Ok(false);
+    }
+    let ask_id = envelope["body"]["ask_id"].as_str();
+    match load_current_scope_for_client(db, sender) {
+        Ok(source) if scope_context(&source) == *source_context => relation_snapshot_current(
+            db,
+            &source,
+            target,
+            &envelope["relation"],
+            ask_id,
+        ),
+        // The receipt remains pinned to the source context that was validated
+        // at send time. A later assignment or grant change cannot redirect it.
+        Ok(_) => Ok(true),
+        Err(error) if is_stale_watch_authority(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn retained_relation_contexts_match(
+    relation: &Value,
+    source_context: &Value,
+    target_context: &Value,
+) -> bool {
+    let context_matches_tuple = |context: &Value, prefix: &str, tuple: &Value| {
+        let task_id_key = format!("{prefix}_task_id");
+        let task_revision_key = format!("{prefix}_task_revision");
+        let attempt_id_key = format!("{prefix}_attempt_id");
+        context["task_id"] == tuple[task_id_key.as_str()]
+            && context["task_revision"] == tuple[task_revision_key.as_str()]
+            && tuple
+                .get(attempt_id_key.as_str())
+                .is_none_or(|attempt| context["attempt_id"] == *attempt)
+    };
+    match relation["kind"].as_str() {
+        Some("same_task_assignment") => {
+            context_matches_tuple(source_context, "source", relation)
+                && context_matches_tuple(target_context, "target", relation)
+                && source_context["task_id"] == target_context["task_id"]
+                && source_context["task_revision"] == target_context["task_revision"]
+                && source_context["attempt_id"] == target_context["attempt_id"]
+        }
+        Some("task_dependency") => {
+            context_matches_tuple(source_context, "source", relation)
+                && context_matches_tuple(target_context, "target", relation)
+                && matches!(
+                    relation["direction"].as_str(),
+                    Some("source_depends_on_target" | "target_depends_on_source")
+                )
+                && relation["required_phase"].as_str().is_some()
+        }
+        Some("sponsored_review") => {
+            let review_context = |context: &Value| {
+                context["task_id"] == relation["task_id"]
+                    && context["task_revision"] == relation["task_revision"]
+                    && context["attempt_id"] == relation["attempt_id"]
+                    && context
+                        .pointer("/actor/participation_basis/kind")
+                        .and_then(Value::as_str)
+                        == Some("sponsored_reviewer")
+                    && context
+                        .pointer("/actor/participation_basis/review_scope/task_id")
+                        .and_then(Value::as_str)
+                        == relation["task_id"].as_str()
+                    && context
+                        .pointer("/actor/participation_basis/review_scope/task_revision")
+                        .and_then(Value::as_i64)
+                        == relation["task_revision"].as_i64()
+                    && context
+                        .pointer("/actor/participation_basis/review_scope/attempt_id")
+                        .and_then(Value::as_str)
+                        == relation["attempt_id"].as_str()
+                    && context
+                        .pointer("/actor/participation_basis/review_scope/submission_ref")
+                        .and_then(Value::as_str)
+                        == relation["submission_ref"].as_str()
+                    && context
+                        .pointer("/actor/participation_basis/review_scope/candidate_ref")
+                        .and_then(Value::as_str)
+                        == relation["candidate_ref"].as_str()
+            };
+            relation["review_assignment_id"].as_str().is_some()
+                && ((relation["reviewer_client_id"]
+                    == source_context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                    && review_context(source_context))
+                    || (relation["reviewer_client_id"]
+                        == target_context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                        && review_context(target_context)))
+                && source_context["task_id"] == target_context["task_id"]
+                && source_context["task_revision"] == target_context["task_revision"]
+                && source_context["attempt_id"] == target_context["attempt_id"]
+        }
+        Some("contract_key") => {
+            let card_matches = |card: &Value, context: &Value| {
+                card["client_id"] == context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+                    && card["task_id"] == context["task_id"]
+                    && card["task_revision"] == context["task_revision"]
+                    && card["attempt_id"] == context["attempt_id"]
+            };
+            let contract_role = |card: &Value| {
+                matches!(
+                    card["role"].as_str(),
+                    Some("producer" | "consumer" | "carrier")
+                )
+            };
+            relation["term"].as_str().is_some()
+                && card_matches(&relation["source_card"], source_context)
+                && card_matches(&relation["target_card"], target_context)
+                && contract_role(&relation["source_card"])
+                && contract_role(&relation["target_card"])
+                && relation["source_card"]["identity"] == relation["term"]
+                && relation["target_card"]["identity"] == relation["term"]
+        }
+        Some("accepted_scope_overlap") => {
+            let scope_ref_valid = |scope: &Value, context: &Value| {
+                scope["scope_intent_id"].as_str().is_some()
+                    && scope["state_revision"].as_i64().is_some_and(|revision| revision > 0)
+                    && scope["digest"].as_str().is_some_and(|digest| {
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+                    && scope["owner_client_id"]
+                        == context.pointer("/actor/client_id").cloned().unwrap_or(Value::Null)
+            };
+            relation["term"].as_str().is_some()
+                && matches!(relation["term_kind"].as_str(), Some("path" | "symbol" | "interface"))
+                && scope_ref_valid(&relation["source_scope"], source_context)
+                && scope_ref_valid(&relation["target_scope"], target_context)
+        }
+        Some("active_integration_cell") => {
+            let tuple_matches = |context: &Value| {
+                relation["task_revision_set"].as_array().is_some_and(|tuples| {
+                    tuples.iter().any(|tuple| {
+                        tuple["task_id"] == context["task_id"]
+                            && tuple["task_revision"] == context["task_revision"]
+                            && tuple["attempt_id"] == context["attempt_id"]
+                    })
+                })
+            };
+            relation["cell_id"].as_str().is_some()
+                && relation["contract_key"].as_str().is_some()
+                && tuple_matches(source_context)
+                && tuple_matches(target_context)
+        }
+        Some("unresolved_coordination") => {
+            let direction_matches = (relation["source_context"] == *source_context
+                && relation["target_context"] == *target_context)
+                || (relation["source_context"] == *target_context
+                    && relation["target_context"] == *source_context);
+            relation["ask_id"].as_str().is_some()
+                && direction_matches
+                && retained_relation_contexts_match(
+                    &relation["original_relation"],
+                    source_context,
+                    target_context,
+                )
+        }
+        _ => false,
+    }
 }
 
 fn consult_delivery_matches(
@@ -4424,6 +5756,13 @@ fn send(
         ));
     }
     let recipient = model::text(&mailbox_result, "recipient")?;
+    let envelope: Value = serde_json::from_str(model::text(&mailbox_result, "text")?)?;
+    let target_context = envelope["target_context"].clone();
+    let target_scope_id = keys::scope_id(
+        model::text(&target_context, "task_id")?,
+        model::positive(&target_context, "task_revision")?,
+        model::text(&target_context, "attempt_id")?,
+    )?;
     let Some((read_position, _)) = operation_read_position(tx, operation_id)? else {
         return Err(Error::new(
             "STORE_INVARIANT",
@@ -4436,7 +5775,7 @@ fn send(
             "admitted coordination Operation has an invalid read-position marker",
         ));
     }
-    let index_key = mailbox_position_key(&sender.scope_id, recipient, read_position, operation_id);
+    let index_key = mailbox_position_key(&target_scope_id, recipient, read_position, operation_id);
     set_meta(
         tx,
         &index_key,
@@ -4445,12 +5784,13 @@ fn send(
             "read_position":read_position,
             "sender":principal.client_id,
             "recipient":recipient,
-            "task_id":sender.task["task_id"],
-            "task_revision":sender.task["revision"],
-            "attempt_id":sender.attempt["attempt_id"],
+            "task_id":target_context["task_id"],
+            "task_revision":target_context["task_revision"],
+            "attempt_id":target_context["attempt_id"],
             "created_at_ms":now,
         }),
     )?;
+    remember_or_resolve_coordination(tx, &envelope, operation_id)?;
     attach_operation_scope(
         tx,
         operation_id,
@@ -4466,10 +5806,81 @@ fn send(
         "task_id":sender.task["task_id"],
         "task_revision":sender.task["revision"],
         "attempt_id":sender.attempt["attempt_id"],
+        "source_context":envelope["source_context"],
+        "target_context":target_context,
+        "relation":envelope["relation"],
         "payload_digest":mailbox_result["payload_digest"],
         "text":mailbox_result["text"],
         "delivery":"durable_mailbox_only",
     }))
+}
+
+/// Consult asks keep a narrow pair edge until an exact typed reply settles the
+/// ask. The edge records the original relation and both immutable grant
+/// contexts, so it cannot be reused after reassignment or revocation.
+fn remember_or_resolve_coordination(
+    tx: &Transaction<'_>,
+    envelope: &Value,
+    operation_id: &str,
+) -> Result<()> {
+    let source_context = &envelope["source_context"];
+    let target_context = &envelope["target_context"];
+    let source_id = source_context.pointer("/actor/client_id").and_then(Value::as_str);
+    let target_id = target_context.pointer("/actor/client_id").and_then(Value::as_str);
+    let (Some(source_id), Some(target_id)) = (source_id, target_id) else {
+        return Err(Error::new(
+            "STORE_INVARIANT",
+            "versioned coordination message omitted an exact actor context",
+        ));
+    };
+    let key = pending_peer_relation_key(source_id, target_id);
+    let body = &envelope["body"];
+    if body["schema"] == "eliot.coordination.consult.v1" {
+        let ask_id = model::text(body, "ask_id")?.to_owned();
+        let mut record = meta(tx, &key)?.unwrap_or_else(|| json!({"asks":[]}));
+        let asks = record
+            .get_mut("asks")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| Error::new("STORE_INVARIANT", "pending coordination index is malformed"))?;
+        let candidate = json!({
+            "ask_id":ask_id,
+            "source_context":source_context,
+            "target_context":target_context,
+            "original_relation":envelope["relation"],
+            "operation_id":operation_id,
+        });
+        if let Some(existing) = asks.iter().find(|item| item["ask_id"] == ask_id) {
+            if existing != &candidate {
+                return Err(Error::new(
+                    "STORE_INVARIANT",
+                    "consult ask identity was reused for a different coordination delivery",
+                ));
+            }
+        } else {
+            asks.push(candidate);
+            asks.sort_by(|left, right| left["ask_id"].as_str().cmp(&right["ask_id"].as_str()));
+        }
+        set_meta(tx, &key, &record)?;
+    } else if body["schema"] == "eliot.coordination.reply.v1"
+        && let Some(ask_id) = body.get("ask_id").and_then(Value::as_str)
+        && let Some(mut record) = meta(tx, &key)?
+    {
+        let asks = record
+            .get_mut("asks")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| Error::new("STORE_INVARIANT", "pending coordination index is malformed"))?;
+        asks.retain(|ask| {
+            !(ask["ask_id"] == ask_id
+                && ask["source_context"] == *target_context
+                && ask["target_context"] == *source_context)
+        });
+        if asks.is_empty() {
+            tx.execute("DELETE FROM meta WHERE key=?1", [&key])?;
+        } else {
+            set_meta(tx, &key, &record)?;
+        }
+    }
+    Ok(())
 }
 
 fn consult(
@@ -4512,8 +5923,24 @@ fn consult(
                 .is_some_and(|answer| !answer.is_null())
         })
         .collect();
-    if field_matches.len() == 1 {
-        let candidate = field_matches[0];
+    let mut field_matches_by_owner = BTreeMap::<String, BTreeMap<String, &ConsultCardMatch>>::new();
+    for candidate in &field_matches {
+        let answer = &candidate.card["fields"][request.field.as_str()];
+        let canonical = model::canonical(answer)?;
+        field_matches_by_owner
+            .entry(candidate.indexed.client_id.clone())
+            .or_default()
+            .entry(canonical)
+            .or_insert(*candidate);
+    }
+    if field_matches_by_owner.len() == 1
+        && field_matches_by_owner.values().next().is_some_and(|facts| facts.len() == 1)
+    {
+        let candidate = *field_matches_by_owner
+            .values()
+            .next()
+            .and_then(|facts| facts.values().next())
+            .expect("one owner and one card fact were checked");
         let selected_fields = json!([request.field]);
         let card = project_card(&candidate.card, Some(&selected_fields))?;
         let mut answer = serde_json::Map::new();
@@ -4547,18 +5974,13 @@ fn consult(
             }),
         );
     }
-    // Ambiguity is about distinct peer owners, not the number of cards one
-    // owner published. Keep the fact count for callers, but resolve its
-    // recipient population by the public exact-owner contract.
-    let mut field_owner_matches = Vec::new();
-    let mut seen_field_owners = BTreeSet::new();
-    for candidate in &field_matches {
-        let owner = candidate.indexed.client_id.as_str();
-        if owner != principal.client_id && seen_field_owners.insert(owner.to_owned()) {
-            field_owner_matches.push(*candidate);
-        }
-    }
-    if field_owner_matches.len() > 1 {
+    if field_matches_by_owner.len() > 1
+        || field_matches_by_owner.values().any(|facts| facts.len() > 1)
+    {
+        let candidates = field_matches_by_owner
+            .values()
+            .flat_map(|facts| facts.values().copied())
+            .collect::<Vec<_>>();
         return scoped_consult_result(
             tx,
             operation_id,
@@ -4569,8 +5991,9 @@ fn consult(
                 "target":consult_target_json(&request),
                 "field":request.field,
                 "card_fact_count":field_matches.len(),
-                "candidate_count":field_owner_matches.len(),
-                "candidates":consult_candidates(&field_owner_matches),
+                "candidate_count":field_matches_by_owner.len(),
+                "candidates":consult_candidates(&candidates),
+                "gap":"conflicting_or_ambiguous_current_card_field",
                 "delivery_created":false,
                 "coverage":"complete",
                 "gaps":[],
@@ -4580,18 +6003,7 @@ fn consult(
 
     let mut owner_matches = Vec::new();
     let mut seen_owners = BTreeSet::new();
-    let owner_candidates: Vec<&ConsultCardMatch> =
-        if field_matches.len() > 1 && field_owner_matches.len() == 1 {
-            // Several current cards contain the requested field, but they resolve
-            // to one peer. Ask that exact owner instead of selecting a fact or
-            // reporting false owner ambiguity.
-            field_owner_matches
-        } else {
-            cards
-                .iter()
-                .filter(|candidate| candidate.indexed.client_id != principal.client_id)
-                .collect()
-        };
+    let owner_candidates: Vec<&ConsultCardMatch> = cards.iter().collect();
     for candidate in owner_candidates {
         if seen_owners.insert(candidate.indexed.client_id.clone()) {
             owner_matches.push(candidate);
@@ -4774,60 +6186,26 @@ fn consult_matching_cards(
     sender: &ScopeData,
     request: &keys::ConsultRequest,
 ) -> Result<(Vec<ConsultCardMatch>, bool, usize)> {
-    let prefix =
-        keys::relevance_prefix(&sender.scope_id, request.target_kind, &request.target_value);
-    let upper = format!("{prefix}g");
     let raw_limit = keys::MAX_INBOX_SCAN;
-    let mut statement = db.prepare(
-        "SELECT key,value_json FROM meta WHERE key>=?1 AND key<?2 ORDER BY key LIMIT ?3",
+    let (indexed_cards, index_more) = indexed_global_cards(
+        db,
+        request.target_kind,
+        &request.target_value,
+        None,
+        None,
+        raw_limit,
     )?;
-    let raw: Vec<(String, String)> = statement
-        .query_map(params![prefix, upper, raw_limit + 1], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-    let index_more = raw.len() as i64 > raw_limit;
     let mut cards = Vec::new();
     let mut stale = 0usize;
-    for (index_key, raw_index) in raw.iter().take(raw_limit as usize) {
-        let index: Value = match serde_json::from_str(raw_index) {
-            Ok(index) => index,
-            Err(_) => {
-                stale = stale.saturating_add(1);
-                continue;
-            }
-        };
-        let Some(client_id) = index.get("client_id").and_then(Value::as_str) else {
-            stale = stale.saturating_add(1);
-            continue;
-        };
-        let Some(card_kind) = index.get("card_kind").and_then(Value::as_str) else {
-            stale = stale.saturating_add(1);
-            continue;
-        };
-        let Some(identity) = index.get("identity").and_then(Value::as_str) else {
-            stale = stale.saturating_add(1);
-            continue;
-        };
-        if !matches!(card_kind, "work" | "contract")
-            || keys::relevance_key(
-                &sender.scope_id,
-                request.target_kind,
-                &request.target_value,
-                client_id,
-                card_kind,
-                identity,
-            ) != index_key.as_str()
-        {
+    for indexed in indexed_cards {
+        if !indexed.valid_index {
             stale = stale.saturating_add(1);
             continue;
         }
-        let indexed = IndexedCard {
-            client_id: client_id.to_owned(),
-            card_kind: card_kind.to_owned(),
-            identity: identity.to_owned(),
-        };
-        let participant = match load_current_scope_for_client(db, client_id) {
+        if indexed.client_id == sender.client_id.as_deref().unwrap_or_default() {
+            continue;
+        }
+        let participant = match load_current_scope_for_client(db, &indexed.client_id) {
             Ok(participant) => participant,
             Err(error) if is_stale_watch_authority(&error) => {
                 stale = stale.saturating_add(1);
@@ -4835,30 +6213,45 @@ fn consult_matching_cards(
             }
             Err(error) => return Err(error),
         };
-        if participant.scope_id != sender.scope_id {
-            stale = stale.saturating_add(1);
-            continue;
-        }
-        let Some(card) = current_card(db, &sender.scope_id, card_kind, identity, client_id)? else {
+        let Some(card) = current_card(
+            db,
+            &participant.scope_id,
+            &indexed.card_kind,
+            &indexed.identity,
+            &indexed.client_id,
+        )? else {
             stale = stale.saturating_add(1);
             continue;
         };
-        if card["client_id"] != client_id
-            || card["task_id"] != sender.task["task_id"]
-            || card["task_revision"] != sender.task["revision"]
-            || card["attempt_id"] != sender.attempt["attempt_id"]
-            || card["card_kind"] != card_kind
-            || card["identity"] != identity
+        if card["client_id"] != indexed.client_id
+            || card["task_id"] != participant.task["task_id"]
+            || card["task_revision"] != participant.task["revision"]
+            || card["attempt_id"] != participant.attempt["attempt_id"]
+            || card["card_kind"] != indexed.card_kind
+            || card["identity"] != indexed.identity
         {
             stale = stale.saturating_add(1);
             continue;
         }
-        let indexed_fields = indexable_card_fields(&card["fields"], card_kind, identity);
-        let exact_term = keys::indexed_terms(&indexed_fields, card_kind)
+        let indexed_fields = indexable_card_fields(&card["fields"], &indexed.card_kind, &indexed.identity);
+        let exact_term = keys::indexed_terms(&indexed_fields, &indexed.card_kind)
             .get(&request.target_kind)
             .is_some_and(|terms| terms.contains(&request.target_value));
         if !exact_term {
             stale = stale.saturating_add(1);
+            continue;
+        }
+        if current_peer_relation(
+            db,
+            sender,
+            &participant,
+            Some(&PeerSelector::Term(
+                request.target_kind,
+                request.target_value.clone(),
+            )),
+        )?
+        .is_none()
+        {
             continue;
         }
         cards.push(ConsultCardMatch {
