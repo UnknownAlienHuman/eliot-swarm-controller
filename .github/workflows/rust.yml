@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store]
+        options: [full, focused-recovery, focused-store, focused-publication]
 permissions:
   contents: read
 jobs:
@@ -571,7 +571,7 @@ jobs:
 
   focused:
     name: Focused Rust qualification
-    if: github.event_name == 'workflow_dispatch' && (inputs.qualification == 'focused-recovery' || inputs.qualification == 'focused-store')
+    if: github.event_name == 'workflow_dispatch' && (inputs.qualification == 'focused-recovery' || inputs.qualification == 'focused-store' || inputs.qualification == 'focused-publication')
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -709,6 +709,29 @@ jobs:
 
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'host_module_supervisor::tests::unknown362_identity_failure_and_health_write_failure_survive_restart' -Expected 1 -ExpectedNames @('unknown362_identity_failure_and_health_write_failure_survive_restart')
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'oversized_detached_public_preview_cannot_replace_launch_authority' -Expected 1 -ExpectedNames @('oversized_detached_public_preview_cannot_replace_launch_authority')
+          } elseif ($env:QUALIFICATION -ceq 'focused-publication') {
+            & cargo build --locked --package swarm-forge-worker --bin swarm-forge-worker --target-dir $targetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $workerName = if ($IsWindows) { 'swarm-forge-worker.exe' } else { 'swarm-forge-worker' }
+            $worker = Join-Path (Join-Path $targetDir 'debug') $workerName
+            $deps = Join-Path $targetDir 'debug/deps'
+            [void][IO.Directory]::CreateDirectory($deps)
+            $stagedWorker = Join-Path $deps $workerName
+            [IO.File]::Copy($worker, $stagedWorker, $false)
+            $workerHash = (Get-FileHash -LiteralPath $worker -Algorithm SHA256).Hash
+            if ((Get-FileHash -LiteralPath $stagedWorker -Algorithm SHA256).Hash -cne $workerHash) {
+              throw 'Staged Forge worker differs from the binary built at the recorded source.'
+            }
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Forge worker SHA-256: $workerHash"
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'pr60_automation_reconcile_isolation' -Expected 3 -ExpectedNames @(
+              'earlier_review_commit_survives_later_publication_quarantine_without_replay',
+              'later_publication_commits_after_review_subject_quarantine',
+              'work_dispatch_pending_second_item_preserves_and_resumes_tail'
+            )
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'stale_gm_publication_is_skipped_when_consumer_resumes' -Expected 1 -ExpectedNames @('stale_gm_publication_is_skipped_when_consumer_resumes')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'unknown_effect_handover_fences_former_gm_and_continues_exact_owner' -Expected 1 -ExpectedNames @('unknown_effect_handover_fences_former_gm_and_continues_exact_owner')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 're_promoted_gm_does_not_make_an_old_queued_epoch_current_again' -Expected 1 -ExpectedNames @('re_promoted_gm_does_not_make_an_old_queued_epoch_current_again')
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'attempt_control_requires_current_gm_scope_and_exact_live_attempt' -Expected 1 -ExpectedNames @('attempt_control_requires_current_gm_scope_and_exact_live_attempt')
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }
