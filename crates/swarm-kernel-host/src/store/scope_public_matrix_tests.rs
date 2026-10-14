@@ -578,6 +578,9 @@ fn scope_public_malformed_links_and_unknown_kinds_fail_closed() {
 /// Authenticated Store boundary; the synchronous resolver fixtures above are
 /// intentionally kept separate from these publicly admitted facts.
 mod connected_store {
+    use crate::store::object_scope::{
+        assembly_source_load_counts, reset_assembly_source_load_counts,
+    };
     use crate::{
         artifacts::ResultPage,
         config::{Config, McpToolProfile, Route},
@@ -2043,6 +2046,241 @@ mod connected_store {
         let large = measure_repeated_assembled_ranges(32).await;
         assert_eq!(small, (2, 4, 0, 64));
         assert_eq!(large, (32, 64, 0, 64));
+    }
+
+    #[tokio::test]
+    async fn store_assembled_grant_loop_is_distinct_bounded() {
+        for page_count in [2usize, 32usize] {
+            let setup = setup_read_cost_pages(page_count).await;
+            let store = &setup.fixture.owner.store;
+            let assembly = write(
+                store,
+                &setup.fixture.operator,
+                "artifact.assemble",
+                json!({
+                    "page_refs": setup.page_refs.clone(),
+                    "expected_sha256": model::digest(&setup.payload),
+                }),
+            )
+            .await;
+            let assembled_id = format!(
+                "assembled-{}",
+                model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+            );
+            reset_assembly_source_load_counts(&assembled_id);
+            let first = call(
+                store,
+                &setup.fixture.manager_a,
+                "artifact.read",
+                json!({
+                    "artifact_id": assembled_id,
+                    "offset_bytes": 0,
+                    "length_bytes": crate::artifacts::MAX_PAGE_BYTES,
+                }),
+            )
+            .await;
+            assert_eq!(first["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+            let warm = assembly_source_load_counts(&assembled_id);
+            assert_eq!(warm.grant_loop_iterations, 1);
+            reset_assembly_source_load_counts(&assembled_id);
+            for _ in 0..64 {
+                let read = call(
+                    store,
+                    &setup.fixture.manager_a,
+                    "artifact.read",
+                    json!({
+                        "artifact_id": assembled_id,
+                        "offset_bytes": 0,
+                        "length_bytes": crate::artifacts::MAX_PAGE_BYTES,
+                    }),
+                )
+                .await;
+                assert_eq!(read["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+            }
+            let repeated = assembly_source_load_counts(&assembled_id);
+            assert_eq!(repeated.grant_loop_iterations, 64);
+            assert_eq!(repeated.source_artifact_point_loads, 0);
+            assert_eq!(repeated.producer_target_operation_point_loads, 0);
+            setup.fixture.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn store_assembled_parts_limit_one_on_32() {
+        let setup = setup_read_cost_pages(32).await;
+        let store = &setup.fixture.owner.store;
+        let assembly = write(
+            store,
+            &setup.fixture.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs": setup.page_refs.clone(),
+                "expected_sha256": model::digest(&setup.payload),
+            }),
+        )
+        .await;
+        let assembled_id = format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
+        reset_assembly_source_load_counts(&assembled_id);
+        let window = call(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.parts",
+            json!({"artifact_id": assembled_id, "after": 0, "limit": 1}),
+        )
+        .await;
+        assert_eq!(window["part_count"], 32);
+        assert_eq!(window["parts"].as_array().map_or(0, Vec::len), 1);
+        assert_eq!(window["next_after"], json!(1));
+        let counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(counts.grant_loop_iterations, 1);
+        setup.fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_assembled_unrelated_write_preserves_proof() {
+        let setup = setup_read_cost_pages(32).await;
+        let store = &setup.fixture.owner.store;
+        let assembly = write(
+            store,
+            &setup.fixture.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs": setup.page_refs.clone(),
+                "expected_sha256": model::digest(&setup.payload),
+            }),
+        )
+        .await;
+        let assembled_id = format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
+        let first = call(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id": assembled_id,
+                "offset_bytes": 0,
+                "length_bytes": crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(first["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+        reset_assembly_source_load_counts(&assembled_id);
+        store
+            .run(move |db| {
+                db.execute(
+                    "INSERT INTO observations(source_stream_id, kind, payload_json, recorded_at_ms) VALUES ('unrelated-proof', 'note', '{}', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let read = call(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id": assembled_id,
+                "offset_bytes": 0,
+                "length_bytes": crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(read["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+        let counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(counts.source_artifact_point_loads, 0);
+        assert_eq!(counts.producer_target_operation_point_loads, 0);
+        assert_eq!(counts.immutable_proof_cache_hits, 1);
+        assert_eq!(counts.grant_loop_iterations, 1);
+        setup.fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn store_assembled_warm_revocation_and_tamper_negative() {
+        let setup = setup_read_cost_pages(2).await;
+        let store = &setup.fixture.owner.store;
+        let assembly = write(
+            store,
+            &setup.fixture.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs": setup.page_refs.clone(),
+                "expected_sha256": model::digest(&setup.payload),
+            }),
+        )
+        .await;
+        let assembled_id = format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
+        write(
+            store,
+            &setup.fixture.operator,
+            "gm.handover",
+            json!({"client_id": setup.fixture.manager_b.client_id}),
+        )
+        .await;
+        let warm = call(
+            store,
+            &setup.fixture.manager_b,
+            "artifact.read",
+            json!({
+                "artifact_id": assembled_id,
+                "offset_bytes": 0,
+                "length_bytes": crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(warm["byte_length"], crate::artifacts::MAX_PAGE_BYTES);
+        write(
+            store,
+            &setup.fixture.operator,
+            "gm.handover",
+            json!({"client_id": setup.fixture.manager_a.client_id}),
+        )
+        .await;
+        denied(
+            store,
+            &setup.fixture.manager_b,
+            "artifact.read",
+            json!({
+                "artifact_id": assembled_id,
+                "offset_bytes": 0,
+                "length_bytes": crate::artifacts::MAX_PAGE_BYTES,
+            }),
+            "FORBIDDEN",
+        )
+        .await;
+        let tamper_id = assembled_id.clone();
+        store
+            .run(move |db| {
+                let changed = db.execute(
+                    "UPDATE artifacts SET byte_length = byte_length + 1 WHERE artifact_id = ?1",
+                    params![tamper_id],
+                )?;
+                assert_eq!(changed, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        denied(
+            store,
+            &setup.fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id": assembled_id,
+                "offset_bytes": 0,
+                "length_bytes": crate::artifacts::MAX_PAGE_BYTES,
+            }),
+            "OBJECT_SCOPE_DAMAGED",
+        )
+        .await;
+        setup.fixture.close().await;
     }
 
     #[tokio::test]

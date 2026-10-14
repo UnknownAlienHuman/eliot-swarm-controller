@@ -3202,7 +3202,7 @@ impl Store {
         if length == 0 || length > MAX_PAGE_BYTES as u64 {
             return Err(Error::invalid("length_bytes must be 1..65536"));
         }
-        let (record, epoch) = self
+        let record = self
             .run(move |db| {
                 let p = current_principal(db, principal)?;
                 if p.role == Role::Module {
@@ -3211,37 +3211,35 @@ impl Store {
                         "module cannot inspect other results",
                     ));
                 }
-                let epoch = object_scope::artifact_cache_epoch(db)?;
-                let artifact = match object_scope::cached_assembled_artifact(epoch, &id) {
-                    Some(artifact) => artifact,
-                    None => Arc::new(results::get(db, &id)?),
-                };
+                // Precise: always re-fetch fresh; never assume record never changes.
+                let artifact = Arc::new(results::get(db, &id)?);
                 let _grant = object_scope::resolve_artifact_read_at_epoch(
                     db,
                     &p,
                     &artifact,
                     object_scope::ArtifactReadLevel::Bytes,
-                    epoch,
                 )?
                 .ok_or_else(object_scope::unauthorized_artifact)?;
-                let after = object_scope::artifact_cache_epoch(db)?;
-                if after != epoch {
+                // Precise TOCTOU: same-artifact O(1) mutation damages;
+                // unrelated writes do not fail.
+                let after = results::get(db, &id)?;
+                if after.content_digest != artifact.content_digest
+                    || after.byte_length != artifact.byte_length
+                    || after.relative_path != artifact.relative_path
+                    || after.metadata["assembly_operation_id"] != artifact.metadata["assembly_operation_id"]
+                    || after.metadata["part_count"] != artifact.metadata["part_count"]
+                {
                     return Err(Error::new(
                         "ARTIFACT_DAMAGED",
                         "artifact sources changed during range authorization",
                     ));
                 }
-                Ok((artifact, epoch))
+                Ok(artifact)
             })
             .await?;
         self.file_io(move |files| {
             let mut response = if record.kind == "native_result" {
-                files.read_assembled_at_epoch(
-                    &record,
-                    offset,
-                    length as usize,
-                    Some(&epoch.token()),
-                )?
+                files.read_assembled_at_epoch(&record, offset, length as usize, None)?
             } else {
                 files.read(&record, offset, length as usize)?
             };
@@ -3258,11 +3256,10 @@ impl Store {
             .map_err(|_| Error::invalid("part offset exceeds platform range"))?;
         self.run(move |db| {
             let p = current_principal(db, principal)?;
-            let epoch = object_scope::artifact_cache_epoch(db)?;
-            let artifact = match object_scope::cached_assembled_artifact(epoch, &id) {
-                Some(artifact) => artifact,
-                None => Arc::new(results::get(db, &id)?),
-            };
+            // Precise: always re-fetch fresh; aggregate intersects ALL distinct
+            // bases (not just the requested window) so a denied distinct source
+            // can never be bypassed by a narrow limit/after window.
+            let artifact = Arc::new(results::get(db, &id)?);
             if artifact.kind != "native_result" {
                 return Err(Error::invalid("artifact is not an assembled result"));
             }
@@ -3271,7 +3268,6 @@ impl Store {
                 &p,
                 &artifact,
                 object_scope::ArtifactReadLevel::Metadata,
-                epoch,
             )?
             .is_none()
             {
@@ -3316,7 +3312,6 @@ impl Store {
                     &p,
                     &page,
                     object_scope::ArtifactReadLevel::Bytes,
-                    epoch,
                 )?
                 .is_none()
                 {
@@ -3329,7 +3324,13 @@ impl Store {
                     "sha256":sha256,
                 }));
             }
-            if object_scope::artifact_cache_epoch(db)? != epoch {
+            // Precise TOCTOU: same-artifact O(1) mutation damages; unrelated
+            // writes do not fail the windowed parts read.
+            let after_artifact = results::get(db, &artifact.artifact_id)?;
+            if after_artifact.content_digest != artifact.content_digest
+                || after_artifact.byte_length != artifact.byte_length
+                || after_artifact.metadata["part_count"] != artifact.metadata["part_count"]
+            {
                 return Err(Error::new(
                     "ARTIFACT_DAMAGED",
                     "artifact sources changed during parts authorization",

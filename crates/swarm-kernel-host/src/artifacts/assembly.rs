@@ -67,8 +67,9 @@ const MAX_ASSEMBLY_PART_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ASSEMBLY_PART_CACHE_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Precise content-based part key (no global epoch). Same-artifact O(1)
+/// mutation changes the key and misses; unrelated writes never evict.
 struct AssemblyPartCacheKey {
-    cache_epoch: String,
     artifact_id: String,
     relative_path: String,
     byte_length: u64,
@@ -88,15 +89,11 @@ fn assembly_part_cache() -> &'static Mutex<VecDeque<AssemblyPartCacheEntry>> {
     ASSEMBLY_PART_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn assembly_part_cache_key(
-    record: &ArtifactRecord,
-    cache_epoch: &str,
-) -> Result<AssemblyPartCacheKey> {
+fn assembly_part_cache_key(record: &ArtifactRecord) -> Result<AssemblyPartCacheKey> {
     let part_count = record.metadata["part_count"]
         .as_u64()
         .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "assembly part count is missing"))?;
     Ok(AssemblyPartCacheKey {
-        cache_epoch: cache_epoch.to_owned(),
         artifact_id: record.artifact_id.clone(),
         relative_path: record.relative_path.clone(),
         byte_length: record.byte_length,
@@ -109,19 +106,13 @@ fn cached_assembly_parts(
     record: &ArtifactRecord,
     cache_epoch: Option<&str>,
 ) -> Result<Arc<Vec<ResultPart>>> {
+    let _ = cache_epoch;
     let expected_part_count = record.metadata["part_count"]
         .as_u64()
         .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "assembly part count is missing"))?;
-    let cache_key = cache_epoch
-        .map(|epoch| assembly_part_cache_key(record, epoch))
-        .transpose()?;
-    if let Some(key) = cache_key.as_ref()
-        && let Ok(mut cache) = assembly_part_cache().lock()
-    {
-        cache.retain(|entry| {
-            entry.key.artifact_id != key.artifact_id || entry.key.cache_epoch == key.cache_epoch
-        });
-        if let Some(index) = cache.iter().position(|entry| &entry.key == key) {
+    let cache_key = assembly_part_cache_key(record)?;
+    if let Ok(mut cache) = assembly_part_cache().lock() {
+        if let Some(index) = cache.iter().position(|entry| entry.key == cache_key) {
             let entry = cache.remove(index).expect("located cache entry");
             let parts = Arc::clone(&entry.parts);
             cache.push_back(entry);
@@ -132,9 +123,7 @@ fn cached_assembly_parts(
     let parts: Vec<ResultPart> = serde_json::from_value(record.metadata["parts"].clone())?;
     if parts.is_empty()
         || expected_part_count != parts.len() as u64
-        || key
-            .as_ref()
-            .is_some_and(|key| key.part_count != parts.len() as u64)
+        || cache_key.part_count != parts.len() as u64
         || record.metadata["sha256"] != record.content_digest
     {
         return Err(Error::new(
@@ -164,7 +153,8 @@ fn cached_assembly_parts(
         ));
     }
     let parts = Arc::new(parts);
-    if let Some(key) = cache_key {
+    {
+        let key = &cache_key;
         let bytes = parts.iter().fold(
             size_of::<Vec<ResultPart>>() + parts.len() * size_of::<ResultPart>(),
             |total, part| {
@@ -174,14 +164,12 @@ fn cached_assembly_parts(
             },
         );
         let bytes = bytes
-            .saturating_add(key.cache_epoch.len())
             .saturating_add(key.artifact_id.len())
             .saturating_add(key.relative_path.len())
             .saturating_add(key.content_digest.len());
-        if bytes <= MAX_ASSEMBLY_PART_CACHE_ENTRY_BYTES
-            && let Ok(mut cache) = assembly_part_cache().lock()
-        {
-            cache.retain(|entry| entry.key.artifact_id != key.artifact_id);
+        if bytes <= MAX_ASSEMBLY_PART_CACHE_ENTRY_BYTES {
+            if let Ok(mut cache) = assembly_part_cache().lock() {
+                cache.retain(|entry| entry.key.artifact_id != key.artifact_id);
             let mut total_bytes = cache
                 .iter()
                 .fold(0usize, |total, entry| total.saturating_add(entry.bytes));
@@ -194,10 +182,11 @@ fn cached_assembly_parts(
                 total_bytes = total_bytes.saturating_sub(removed.bytes);
             }
             cache.push_back(AssemblyPartCacheEntry {
-                key,
+                key: cache_key.clone(),
                 parts: Arc::clone(&parts),
                 bytes,
             });
+            }
         }
     }
     Ok(parts)
