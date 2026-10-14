@@ -23,6 +23,10 @@ use swarm_contracts::{
     module_contract::ModuleContractTemplate,
 };
 
+#[cfg(test)]
+#[path = "work_dispatch_authority_regression.rs"]
+mod pr74_remaining;
+
 fn regression_config(directory: &Path) -> Config {
     let mut config = Config::default();
     config.storage.data_dir = directory.to_path_buf();
