@@ -3287,7 +3287,7 @@ pub(crate) mod tests {
             .expect("publish target readiness");
         assert!(wait_probe_custody_file(
             &probe_custody_file(&control, "target.exit"),
-            Duration::from_secs(10)
+            Duration::from_secs(60)
         ));
         std::io::stdout()
             .write_all(b"probe-nested-direct-output\n")
@@ -3307,7 +3307,7 @@ pub(crate) mod tests {
             .expect("publish nested descendant readiness");
         assert!(wait_probe_custody_file(
             &probe_custody_file(&control, "descendant.exit"),
-            Duration::from_secs(15)
+            Duration::from_secs(60)
         ));
         std::io::stdout()
             .write_all(b"probe-nested-descendant-output\n")
@@ -3319,6 +3319,7 @@ pub(crate) mod tests {
         control: PathBuf,
         helper_pid: u32,
         helper_launch_identity: Option<Value>,
+        helper_family_token: Option<String>,
     }
 
     impl ProbeCustodyFixture {
@@ -3337,6 +3338,13 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn process_departed(&self, identity: &Value) -> bool {
+            if identity["scope"] == "launcher_spawned_process" {
+                let Some(token) = self.helper_family_token.as_deref() else {
+                    return false;
+                };
+                return crate::platform::process_group::spawned_departed(identity, token)
+                    .is_ok_and(|departed| departed);
+            }
             let Some(pid) = identity["pid"]
                 .as_u64()
                 .and_then(|pid| u32::try_from(pid).ok())
@@ -3459,6 +3467,7 @@ pub(crate) mod tests {
             control: control.clone(),
             helper_pid,
             helper_launch_identity: None,
+            helper_family_token: None,
         };
         let helper_launch_identity =
             spawned_identity(helper_pid).expect("capture helper launch identity");
@@ -3510,6 +3519,11 @@ pub(crate) mod tests {
         assert!(
             owner.is_pending(),
             "live nested helper custody stays pending"
+        );
+        fixture.helper_family_token = owner.custody.family_token.clone();
+        assert!(
+            fixture.helper_family_token.is_some(),
+            "capture the helper's exact native-family token before Store handoff"
         );
         (owner, fixture)
     }

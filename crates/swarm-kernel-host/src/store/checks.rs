@@ -5306,7 +5306,19 @@ mod tests {
             assert!(owners[0].is_pending());
             assert_eq!(owners[0].scope(), Some(&scope_a));
         }
+        assert!(
+            !process_fixture.process_departed(&helper_identity)
+                && !process_fixture.process_departed(&target_identity)
+                && !process_fixture.process_departed(&descendant_identity),
+            "the exact helper, target, and descendant are still live before unknown-scope admission"
+        );
         assert!(custody.probe_cleanup_conflicts(None).await);
+        assert!(
+            !process_fixture.process_departed(&helper_identity)
+                && !process_fixture.process_departed(&target_identity)
+                && !process_fixture.process_departed(&descendant_identity),
+            "unknown-scope conflict is observed while the actual helper family remains live"
+        );
         assert!(custody.probe_cleanup_conflicts(Some(&scope_a)).await);
         assert!(!custody.probe_cleanup_conflicts(Some(&scope_b)).await);
         assert!(
@@ -5363,6 +5375,12 @@ mod tests {
             .expect("independent B remains admissible while A is pending");
         drop(b_reservation);
 
+        assert!(
+            !process_fixture.process_departed(&helper_identity)
+                && !process_fixture.process_departed(&target_identity)
+                && !process_fixture.process_departed(&descendant_identity),
+            "the exact helper family remains live through the A/B ownership assertions"
+        );
         process_fixture.release_all();
         reap_probe_owners_to(custody, 0).await;
         assert!(process_fixture.process_departed(&helper_identity));
