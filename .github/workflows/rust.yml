@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders]
 permissions:
   contents: read
 jobs:
@@ -794,6 +794,42 @@ jobs:
               'pr60_automation_reconcile_foreign_domain_cursors_are_rejected'
             )
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'quarantine_cas_rejects_whitespace_only_source_mutation' -Expected 1 -ExpectedNames @('quarantine_cas_rejects_whitespace_only_source_mutation')
+          } elseif ($env:QUALIFICATION -ceq 'focused-runtime-remainders') {
+            foreach ($case in @(
+              'provider_route_disabled_short_circuits_root_roster_and_binding_reads',
+              'public_agent_open_is_rejected_at_the_exact_root_limit_before_binding',
+              'public_agent_open_rejects_auth_required_with_a_free_root_slot',
+              'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace',
+              'probe_custody_keeps_nested_family_and_capture_until_exact_departure',
+              'execution_paths_for_layout_selects_exact_legacy_and_compact_paths',
+              'malformed_public_operation_relations_fail_closed',
+              'generic_operation_get_list_delta_bound_relations_and_hide_private_decision_text',
+              'store_authenticated_operation_lists_and_delta_preserve_bounded_gaps_and_cursor_tail'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter 'loop_step' -Expected 2 -ExpectedNames @(
+              'loop_step_is_not_advertised_without_a_supported_internal_caller',
+              'loop_step_submission_fails_before_native_io_and_retains_historical_readback'
+            )
+            foreach ($case in @('cold_legacy_before_hello_is_bounded_and_append_resumes', 'startup_recovery_bounds_large_history_and_resumes_sparse_tail')) {
+              Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            foreach ($case in @('legacy_migration_is_bounded_resumable_and_append_safe', 'pending_outcomes_discards_torn_suffix_without_ack_then_advances_past_corruption')) {
+              Invoke-FocusedCohort -Package 'swarm-adapter-claude' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            Invoke-FocusedCohort -Package 'swarm-mcp' -Filter 'catalog_' -Expected 4 -ExpectedNames @(
+              'catalog_search_schema_matches_dispatch_max_results_bounds',
+              'warm_catalog_rechecks_live_membership_and_rejects_unknown_exact_method',
+              'catalog_direct_schema_bytes_and_profile_membership_match',
+              'catalog_v1_historical_unchanged_rows_and_current_schema_parity'
+            )
+            Invoke-FocusedCohort -Package 'swarm-contracts' -Filter 'schema_cache_' -Expected 4 -ExpectedNames @(
+              'schema_cache_absent_output_is_retained_and_unknown_lookup_fails_closed',
+              'schema_cache_concurrent_first_use_initializes_each_slot_once',
+              'schema_cache_exact_cold_and_warm_factory_counts',
+              'schema_cache_registry_cold_and_warm_cost_is_bounded_by_static_slots'
+            )
           } else {
             throw "Unsupported focused qualification selector: $env:QUALIFICATION"
           }
