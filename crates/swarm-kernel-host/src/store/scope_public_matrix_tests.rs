@@ -3723,4 +3723,7 @@ mod connected_store {
         }
         f.close().await;
     }
+
+    #[path = "../scope_public_gap_tests.rs"]
+    mod bounded_gap_tests;
 }
