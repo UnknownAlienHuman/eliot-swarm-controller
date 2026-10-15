@@ -4192,6 +4192,22 @@ mod failed_prepare_lifecycle_fixture {
             events.lock().expect("fixture event log lock").push(event);
         }
 
+        fn resolved_node_executable() -> PathBuf {
+            let output = std::process::Command::new("node")
+                .args(["-p", "process.execPath"])
+                .output()
+                .expect("Node.js is installed for the Claude prepared-frame fixture");
+            assert!(
+                output.status.success(),
+                "resolve the installed Node.js path"
+            );
+            PathBuf::from(
+                String::from_utf8(output.stdout)
+                    .expect("Node path is UTF-8")
+                    .trim(),
+            )
+        }
+
         async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> Value {
             let mut line = String::new();
             let count = reader
@@ -4331,7 +4347,10 @@ mod failed_prepare_lifecycle_fixture {
             let operation_id = "prepared-open-fixture";
             let boot_id = "prepared-frame-fixture-boot";
             write_fixture_intent(&journal, &config, operation_id, "agent.open", None);
-            config.native_options.node_executable = PathBuf::from("node");
+            // NativeHarness clears the child environment before copying its
+            // bounded allowlist. Pass the resolved executable so Windows PATH
+            // shims cannot prevent the prepared frame from being emitted.
+            config.native_options.node_executable = resolved_node_executable();
             fs::create_dir_all(&config.native_options.workspace_root)
                 .expect("create fake SDK workspace");
             fs::create_dir_all(&config.native_options.claude_config_dir)
