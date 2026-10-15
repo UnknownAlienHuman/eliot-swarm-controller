@@ -100,134 +100,145 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     loop {
         flush_outbox(&mut link, &journal, &interactions).await?;
         interactions.process_retention_batch(&journal)?;
-        tokio::select! {
-            signal = &mut ctrl_c => {
-                signal.map_err(|_| Error::new("ADAPTER_SIGNAL", "shutdown signal could not be installed"))?;
-                if let Some(native) = harness.as_mut() {
-                    let _ = native.send(json!({"kind":"stop"})).await;
-                }
-                return Ok(());
-            }
-            frame = receive_frame(&mut frame_rx, frames_closed) => {
-                match frame {
-                    Some(frame) => {
-                        let action = handle_frame(
-                            frame,
-                            &config,
-                            &boot_id,
-                            &journal,
-                            &interactions,
-                            &mut harness_alive,
-                            &mut native_prepared,
-                            &mut latest_state,
-                            &mut session_root,
-                            &mut native_control,
-                        )?;
-                        if action.retire_bridge {
-                            // Closing stdin ends this generation's Node owner;
-                            // the parent still proves process-family departure.
-                            retire_owned_harness(
-                                &mut harness,
-                                &interactions,
+        let mut reconnect_requested = false;
+        let mut retire_requested = false;
+        let response = {
+            // Keep one authenticated module.next exchange alive while native
+            // frames arrive. Dropping Client::exchange after its request write
+            // poisons that link; the following call would report DISCONNECTED.
+            let next = link.next();
+            tokio::pin!(next);
+            loop {
+                tokio::select! {
+                    signal = &mut ctrl_c => {
+                        signal.map_err(|_| Error::new("ADAPTER_SIGNAL", "shutdown signal could not be installed"))?;
+                        if let Some(native) = harness.as_mut() {
+                            let _ = native.send(json!({"kind":"stop"})).await;
+                        }
+                        return Ok(());
+                    }
+                    poll = select_module_next_or_frame(
+                        &mut next,
+                        &mut frame_rx,
+                        frames_closed,
+                        &mut recovery_tick,
+                        || {
+                            if startup_recovery_blocked {
+                                return false;
+                            }
+                            match journal.startup_recovery_complete() {
+                                Ok(true) => return false,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    eprintln!("Claude startup recovery remains incomplete: {}", error.code);
+                                    startup_recovery_blocked = true;
+                                    return false;
+                                }
+                            }
+                            if let Err(error) = journal.try_recover_startup_window_for_boot(
+                                "ADAPTER_RESTART_AFTER_EFFECT_MARKER", &boot_id,
+                            ) {
+                                eprintln!("Claude startup recovery remains incomplete: {}", error.code);
+                                startup_recovery_blocked = true;
+                                return false;
+                            }
+                            true
+                        },
+                    ) => match poll {
+                        ModuleNextPoll::Frame(Some(frame)) => {
+                            let action = handle_frame(
+                                frame,
+                                &config,
                                 &boot_id,
                                 &journal,
+                                &interactions,
+                                &mut harness_alive,
+                                &mut native_prepared,
+                                &mut latest_state,
+                                &mut session_root,
+                                &mut native_control,
                             )?;
-                            // Retire this adapter process instead of serving a
-                            // dead bridge or reopening it in-process. The
-                            // parent owner retains the process-family identity
-                            // and gates replacement on exact departure proof.
-                            return Err(Error::new(
-                                "SDK_HARNESS_RETIRED",
-                                "retired bridge requires parent-owned process-family readback before replacement",
-                            ));
+                            reconnect_requested |= action.reconnect;
+                            if action.retire_bridge {
+                                // Retire this bridge, then let the already-sent
+                                // read-only module.next finish on this link.
+                                retire_owned_harness(
+                                    &mut harness,
+                                    &interactions,
+                                    &boot_id,
+                                    &journal,
+                                )?;
+                                retire_requested = true;
+                                frames_closed = true;
+                            }
                         }
-                        if action.reconnect {
-                            let (reconnected, _, recovery) = open_link(LinkInvocation {
-                                host_config: &host_config,
-                                expected_options: Some(&config.native_options),
-                                credential: &credential,
-                                claim: &contract,
-                                owner: &worker.owner_record,
-                                boot_id: &boot_id,
-                                native_ready: harness_alive,
-                                native_root: session_root.as_deref(),
-                            }).await?;
-                            link = reconnected;
-                            recovery_required = recovery;
-                        }
-                    }
-                    None => frames_closed = true,
+                        ModuleNextPoll::Frame(None) => frames_closed = true,
+                        ModuleNextPoll::Response(response) => break response?,
+                    },
                 }
             }
-            response = wait_for_next_with_recovery(
-                link.next(),
-                &mut recovery_tick,
-                || {
-                    if startup_recovery_blocked {
-                        return false;
-                    }
-                    match journal.startup_recovery_complete() {
-                        Ok(true) => return false,
-                        Ok(false) => {}
-                        Err(error) => {
-                            eprintln!("Claude startup recovery remains incomplete: {}", error.code);
-                            startup_recovery_blocked = true;
-                            return false;
-                        }
-                    }
-                    if let Err(error) = journal.try_recover_startup_window_for_boot(
-                        "ADAPTER_RESTART_AFTER_EFFECT_MARKER", &boot_id,
-                    ) {
-                        eprintln!("Claude startup recovery remains incomplete: {}", error.code);
-                        startup_recovery_blocked = true;
-                        return false;
-                    }
-                    true
-                },
-            ) => {
-                let response = response?;
-                let command_value = response.get("command").ok_or_else(|| {
-                    Error::new("HOST_COMMAND_SCHEMA", "module.next response lacks command state")
+        };
+        if retire_requested {
+            // The parent owner retains the process-family identity and gates
+            // replacement on exact departure proof.
+            return Err(Error::new(
+                "SDK_HARNESS_RETIRED",
+                "retired bridge requires parent-owned process-family readback before replacement",
+            ));
+        }
+        let command_value = response.get("command").ok_or_else(|| {
+            Error::new(
+                "HOST_COMMAND_SCHEMA",
+                "module.next response lacks command state",
+            )
+        })?;
+        if !command_value.is_null() {
+            let command: RuntimeCommand =
+                serde_json::from_value(command_value.clone()).map_err(|_| {
+                    Error::new(
+                        "HOST_COMMAND_SCHEMA",
+                        "module command does not match the shared contract",
+                    )
                 })?;
-                if !command_value.is_null() {
-                    let command: RuntimeCommand = serde_json::from_value(command_value.clone())
-                        .map_err(|_| Error::new("HOST_COMMAND_SCHEMA", "module command does not match the shared contract"))?;
-                    verify_command_scope(&config, &command, &contract)?;
-                    if handle_command(CommandInvocation {
-                        config: &config,
-                        claim: &contract,
-                        journal: &journal,
-                        interactions: &interactions,
-                        link: &mut link,
-                        harness: &mut harness,
-                        frame_tx: &frame_tx,
-                        boot_id: &boot_id,
-                        recovery_required,
-                        harness_alive: &mut harness_alive,
-                        native_prepared,
-                        latest_state: &latest_state,
-                        native_root_id: session_root.as_deref(),
-                        native_control: &mut native_control,
-                        bridge_path: &bridge_path,
-                        command: &command,
-                    }).await? {
-                        let (reconnected, _, recovery) = open_link(LinkInvocation {
-                            host_config: &host_config,
-                            expected_options: Some(&config.native_options),
-                            credential: &credential,
-                            claim: &contract,
-                            owner: &worker.owner_record,
-                            boot_id: &boot_id,
-                            native_ready: harness_alive,
-                            native_root: session_root.as_deref(),
-                        }).await?;
-                        link = reconnected;
-                        recovery_required = recovery;
-                    }
-                } else {
-                    sleep(Duration::from_millis(IDLE_POLL_MS)).await;
-                }
-            }
+            verify_command_scope(&config, &command, &contract)?;
+            reconnect_requested |= handle_command(CommandInvocation {
+                config: &config,
+                claim: &contract,
+                journal: &journal,
+                interactions: &interactions,
+                link: &mut link,
+                harness: &mut harness,
+                frame_tx: &frame_tx,
+                boot_id: &boot_id,
+                recovery_required,
+                harness_alive: &mut harness_alive,
+                native_prepared,
+                latest_state: &latest_state,
+                native_root_id: session_root.as_deref(),
+                native_control: &mut native_control,
+                bridge_path: &bridge_path,
+                command: &command,
+            })
+            .await?;
+        } else {
+            sleep(Duration::from_millis(IDLE_POLL_MS)).await;
+        }
+        if reconnect_requested {
+            // Store readiness may only advance after its prepared outcome ACK.
+            let reconnect = open_link(LinkInvocation {
+                host_config: &host_config,
+                expected_options: Some(&config.native_options),
+                credential: &credential,
+                claim: &contract,
+                owner: &worker.owner_record,
+                boot_id: &boot_id,
+                native_ready: native_prepared,
+                native_root: session_root.as_deref(),
+            });
+            let (reconnected, _, recovery) =
+                flush_before_reconnect(&mut link, &journal, &interactions, reconnect).await?;
+            link = reconnected;
+            recovery_required = recovery;
         }
 
         if !stale_interactions_recovered {
@@ -299,6 +310,30 @@ async fn wait_for_next_with_recovery<F: std::future::Future>(
             response = &mut next => return response,
             _ = recovery_tick.tick(), if enabled => enabled = advance(),
         }
+    }
+}
+
+enum ModuleNextPoll<T> {
+    Frame(Option<HarnessFrame>),
+    Response(T),
+}
+
+async fn select_module_next_or_frame<F, Advance>(
+    next: &mut F,
+    frames: &mut mpsc::Receiver<HarnessFrame>,
+    frames_closed: bool,
+    recovery_tick: &mut tokio::time::Interval,
+    advance_recovery: Advance,
+) -> ModuleNextPoll<F::Output>
+where
+    F: std::future::Future + Unpin,
+    Advance: FnMut() -> bool,
+{
+    tokio::select! {
+        frame = receive_frame(frames, frames_closed) => ModuleNextPoll::Frame(frame),
+        response = wait_for_next_with_recovery(next, recovery_tick, advance_recovery) => {
+            ModuleNextPoll::Response(response)
+        },
     }
 }
 
@@ -2303,7 +2338,10 @@ fn handle_frame(
                     journal.save_outcome(operation_id, &outcome)?;
                     *harness_alive = true;
                     *native_prepared = true;
-                    Ok(FrameAction::default())
+                    Ok(FrameAction {
+                        reconnect: true,
+                        retire_bridge: false,
+                    })
                 }
                 "sdk_frame" => {
                     let frame = value.get("frame").ok_or_else(|| {
@@ -3297,6 +3335,16 @@ async fn flush_outbox(
     Ok(())
 }
 
+async fn flush_before_reconnect<T>(
+    link: &mut ModuleLink,
+    journal: &OperationJournal,
+    interactions: &InteractionJournal,
+    reconnect: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    flush_outbox(link, journal, interactions).await?;
+    reconnect.await
+}
+
 fn required_message_text<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value
         .get(field)
@@ -3859,6 +3907,382 @@ mod failed_prepare_lifecycle_fixture {
         });
         assert!(validate_reply(&request, &projected_reply).is_ok());
         assert!(!projected_reply.to_string().contains("Use this key sk-"));
+    }
+    #[cfg(windows)]
+    mod pending_next_ipc_fixture {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+        use tokio::{
+            io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+            net::windows::named_pipe::{NamedPipeServer, ServerOptions},
+            sync::oneshot,
+        };
+
+        fn record(events: &Arc<Mutex<Vec<&'static str>>>, event: &'static str) {
+            events.lock().expect("fixture event log lock").push(event);
+        }
+
+        async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> Value {
+            let mut line = String::new();
+            let count = reader
+                .read_line(&mut line)
+                .await
+                .expect("read one local IPC request");
+            assert_ne!(count, 0, "local IPC client closed before its request");
+            serde_json::from_str(line.trim_end()).expect("decode local IPC request")
+        }
+
+        async fn write_reply<W: AsyncWrite + Unpin>(
+            writer: &mut W,
+            request: &Value,
+            result: Value,
+        ) {
+            let bytes = serde_json::to_vec(&json!({
+                "jsonrpc":"2.0",
+                "id":request["id"],
+                "result":result
+            }))
+            .expect("encode local IPC response");
+            writer
+                .write_all(&bytes)
+                .await
+                .expect("write local IPC response");
+            writer
+                .write_all(b"\n")
+                .await
+                .expect("terminate local IPC response");
+            writer.flush().await.expect("flush local IPC response");
+        }
+
+        async fn serve_not_ready(
+            pipe: NamedPipeServer,
+            connected: oneshot::Sender<()>,
+            next_seen: oneshot::Sender<()>,
+            prepared_processed: oneshot::Receiver<()>,
+            events: Arc<Mutex<Vec<&'static str>>>,
+        ) {
+            pipe.connect().await.expect("accept initial IPC client");
+            let _ = connected.send(());
+            let (read, mut write) = tokio::io::split(pipe);
+            let mut read = BufReader::new(read);
+
+            let request = read_request(&mut read).await;
+            assert_eq!(request["method"], "client.hello");
+            write_reply(&mut write, &request, json!({"authenticated":true})).await;
+
+            let request = read_request(&mut read).await;
+            assert_eq!(request["method"], "module.hello");
+            assert_eq!(request["params"]["native_ready"], false);
+            record(&events, "not_ready_hello");
+            write_reply(&mut write, &request, json!({})).await;
+
+            let request = read_request(&mut read).await;
+            assert_eq!(request["method"], "module.next");
+            record(&events, "pending_next");
+            let _ = next_seen.send(());
+            prepared_processed
+                .await
+                .expect("adapter handles prepared frame before next reply");
+            write_reply(&mut write, &request, json!({"command":null})).await;
+
+            let request = read_request(&mut read).await;
+            assert_eq!(request["method"], "module.outcome");
+            assert_eq!(request["params"]["operation_id"], "prepared-open-fixture");
+            record(&events, "prepared_outcome");
+            write_reply(&mut write, &request, json!({"recorded":true})).await;
+            record(&events, "prepared_outcome_ack");
+        }
+
+        async fn serve_ready(pipe: NamedPipeServer, events: Arc<Mutex<Vec<&'static str>>>) {
+            pipe.connect().await.expect("accept ready IPC client");
+            let (read, mut write) = tokio::io::split(pipe);
+            let mut read = BufReader::new(read);
+
+            let request = read_request(&mut read).await;
+            assert_eq!(request["method"], "client.hello");
+            write_reply(&mut write, &request, json!({"authenticated":true})).await;
+
+            let request = read_request(&mut read).await;
+            assert_eq!(request["method"], "module.hello");
+            assert_eq!(request["params"]["native_ready"], true);
+            record(&events, "ready_hello");
+            write_reply(&mut write, &request, json!({})).await;
+
+            let request = read_request(&mut read).await;
+            assert_eq!(request["method"], "module.next");
+            record(&events, "ready_next");
+            write_reply(&mut write, &request, json!({"command":null})).await;
+        }
+
+        #[tokio::test]
+        async fn claude_minimal_regression_prepared_frame_ack_precedes_ready_without_replay() {
+            let (directory, mut config, journal, interactions) = fixture_context();
+            let root = directory.0.clone();
+            let ipc_endpoint = swarm_client::ipc_endpoint(&root).expect("derive local pipe name");
+            let mut first_options = ServerOptions::new();
+            first_options.first_pipe_instance(true);
+            let first_pipe = first_options
+                .create(&ipc_endpoint)
+                .expect("create initial named-pipe instance");
+            let (connected_tx, connected_rx) = oneshot::channel();
+            let (next_seen_tx, next_seen_rx) = oneshot::channel();
+            let (prepared_processed_tx, prepared_processed_rx) = oneshot::channel();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let first_events = Arc::clone(&events);
+            let first_server = tokio::spawn(serve_not_ready(
+                first_pipe,
+                connected_tx,
+                next_seen_tx,
+                prepared_processed_rx,
+                first_events,
+            ));
+
+            let credential = Credential {
+                client_id: "fixture-client".to_owned(),
+                token: "fixture-token".to_owned(),
+            };
+            let ipc = swarm_client::IpcConfig::default();
+            let mut link = ModuleLink::connect(&root, &credential, &ipc)
+                .await
+                .expect("connect over the real local IPC endpoint");
+            connected_rx
+                .await
+                .expect("initial pipe is connected before creating its successor");
+            link.hello(json!({"native_ready":false}), None)
+                .await
+                .expect("authenticate the initial not-ready module link");
+
+            let ready_pipe = ServerOptions::new()
+                .create(&ipc_endpoint)
+                .expect("create ready-reconnect named-pipe instance");
+            let ready_events = Arc::clone(&events);
+            let ready_server = tokio::spawn(serve_ready(ready_pipe, ready_events));
+
+            let operation_id = "prepared-open-fixture";
+            let boot_id = "prepared-frame-fixture-boot";
+            write_fixture_intent(&journal, &config, operation_id, "agent.open", None);
+            config.native_options.node_executable = PathBuf::from("node");
+            fs::create_dir_all(&config.native_options.workspace_root)
+                .expect("create fake SDK workspace");
+            fs::create_dir_all(&config.native_options.claude_config_dir)
+                .expect("create fake Claude config directory");
+            let sdk_directory = config
+                .native_options
+                .sdk_runtime_root
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-agent-sdk");
+            fs::create_dir_all(&sdk_directory).expect("create local fake SDK package");
+            fs::write(
+                sdk_directory.join("package.json"),
+                r#"{"name":"@anthropic-ai/claude-agent-sdk","version":"0.3.287","type":"module","main":"./sdk.mjs"}"#,
+            )
+            .expect("write local fake SDK manifest");
+            let query_marker = root.join("fake-sdk-query-called");
+            let query_marker_json = serde_json::to_string(&query_marker.to_string_lossy().as_ref())
+                .expect("encode fake SDK marker path");
+            fs::write(
+                sdk_directory.join("sdk.mjs"),
+                format!(
+                    "import {{ writeFileSync }} from 'node:fs';\nconst marker = {query_marker_json};\nexport async function startup() {{ return {{ query() {{ writeFileSync(marker, 'called'); throw new Error('fake query must not run'); }}, close() {{}} }}; }}\n"
+                ),
+            )
+            .expect("write fake SDK startup implementation");
+
+            let bridge_path = sdk_harness::materialize(&config.sdk_harness_dir)
+                .expect("materialize the real private SDK bridge");
+            let (frame_tx, mut frame_rx) = mpsc::channel(MAX_FRAMES);
+            let mut harness =
+                NativeHarness::spawn(config.native_options.clone(), bridge_path, frame_tx)
+                    .expect("start the real Node bridge with a fake SDK package");
+
+            {
+                let next = link.next();
+                tokio::pin!(next);
+                let mut recovery_tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                    Duration::from_secs(30),
+                );
+                {
+                    let pending_poll = select_module_next_or_frame(
+                        &mut next,
+                        &mut frame_rx,
+                        false,
+                        &mut recovery_tick,
+                        || false,
+                    );
+                    tokio::pin!(pending_poll);
+                    tokio::select! {
+                        event = next_seen_rx => event.expect("host received the one pending module.next"),
+                        _ = &mut pending_poll => panic!("module.next replied before the prepared SDK frame"),
+                    }
+                }
+
+                harness
+                    .send(json!({
+                        "kind":"prepare",
+                        "operation_id":operation_id,
+                        "bridge_boot_id":boot_id,
+                        "native_scope_key":config.native_options.scope_key(),
+                        "binding_id":config.binding_id,
+                        "generation":config.generation,
+                        "workspace_root":config.native_options.workspace_root,
+                        "sdk_runtime_root":config.native_options.sdk_runtime_root,
+                        "model_id":config.native_options.model_id,
+                        "permission_mode":null,
+                        "allow_dangerously_skip_permissions":false,
+                        "native_executable":null
+                    }))
+                    .await
+                    .expect("start the fake SDK warm-query preparation");
+
+                let prepared = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    select_module_next_or_frame(
+                        &mut next,
+                        &mut frame_rx,
+                        false,
+                        &mut recovery_tick,
+                        || false,
+                    ),
+                )
+                .await
+                .expect("prepared SDK frame arrives while the original next is pending");
+                let prepared = match prepared {
+                    ModuleNextPoll::Frame(Some(HarnessFrame::Message(frame))) => frame,
+                    _ => panic!("expected the fake SDK prepared frame before module.next replied"),
+                };
+                assert_eq!(prepared["kind"], "prepared");
+                assert_eq!(prepared["operation_id"], operation_id);
+                let mut harness_alive = false;
+                let mut native_prepared = false;
+                let mut latest_state = Value::Null;
+                let mut session_root = None;
+                let mut native_control = NativeControl::default();
+                let action = handle_frame(
+                    HarnessFrame::Message(prepared),
+                    &config,
+                    boot_id,
+                    &journal,
+                    &interactions,
+                    &mut harness_alive,
+                    &mut native_prepared,
+                    &mut latest_state,
+                    &mut session_root,
+                    &mut native_control,
+                )
+                .expect("durably prepare the exact open operation");
+                assert!(action.reconnect);
+                assert!(harness_alive && native_prepared);
+                prepared_processed_tx
+                    .send(())
+                    .expect("release the same pending module.next after frame handling");
+
+                let response = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    select_module_next_or_frame(
+                        &mut next,
+                        &mut frame_rx,
+                        false,
+                        &mut recovery_tick,
+                        || false,
+                    ),
+                )
+                .await
+                .expect("the original module.next resolves after prepared handling");
+                let response = match response {
+                    ModuleNextPoll::Response(response) => {
+                        response.expect("complete original exchange")
+                    }
+                    ModuleNextPoll::Frame(_) => {
+                        panic!("unexpected extra SDK frame before next reply")
+                    }
+                };
+                assert!(response["command"].is_null());
+            }
+
+            let ready_root = root.clone();
+            let ready_credential = credential.clone();
+            let ready_ipc = ipc.clone();
+            let reconnect = async move {
+                let mut ready_link =
+                    ModuleLink::connect(&ready_root, &ready_credential, &ready_ipc).await?;
+                ready_link.hello(json!({"native_ready":true}), None).await?;
+                Ok::<_, swarm_contracts::error::Error>(ready_link)
+            };
+            let mut ready_link =
+                flush_before_reconnect(&mut link, &journal, &interactions, reconnect)
+                    .await
+                    .expect("prepared outcome ACK completes before ready hello");
+            drop(link);
+
+            // A second outbox pass after reconnect must not replay the prepared
+            // outcome, and the fake SDK's first native query must remain unused.
+            flush_outbox(&mut ready_link, &journal, &interactions)
+                .await
+                .expect("acknowledged outcome is absent from the reconnect outbox");
+            let after_ready = ready_link.next().await.expect("poll after ready hello");
+            assert!(after_ready["command"].is_null());
+            drop(ready_link);
+
+            harness
+                .send(json!({"kind":"stop"}))
+                .await
+                .expect("close the fake SDK bridge cleanly");
+            drop(harness);
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(5), frame_rx.recv())
+                    .await
+                    .expect("Node bridge exits after stdin closes")
+                    .expect("Node bridge frame channel remains open until child exit");
+                match frame {
+                    HarnessFrame::Exited { .. } => {
+                        break;
+                    }
+                    HarnessFrame::ReadFailure => panic!("fake SDK bridge output pipe failed"),
+                    HarnessFrame::Message(_) => {}
+                }
+            }
+            assert!(
+                !query_marker.exists(),
+                "startup and reconnect did not call the SDK query"
+            );
+
+            first_server
+                .await
+                .expect("initial fake host connection completes");
+            ready_server
+                .await
+                .expect("ready fake host connection completes");
+            let events = events.lock().expect("read fixture event log").clone();
+            let outcome_ack = events
+                .iter()
+                .position(|event| *event == "prepared_outcome_ack")
+                .expect("prepared outcome was acknowledged over IPC");
+            let ready_hello = events
+                .iter()
+                .position(|event| *event == "ready_hello")
+                .expect("reconnect performed the ready hello");
+            assert!(
+                outcome_ack < ready_hello,
+                "ACK precedes readiness: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == "pending_next")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == "prepared_outcome")
+                    .count(),
+                1
+            );
+            assert!(events.contains(&"ready_next"));
+        }
     }
 }
 

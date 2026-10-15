@@ -44,9 +44,10 @@ impl NativeHarness {
                 "installed SDK harness is unavailable",
             ));
         }
+        let node_entrypoint = node_entrypoint_path(&bridge_path);
         let mut command = Command::new(&options.node_executable);
         command
-            .arg(&bridge_path)
+            .arg(&node_entrypoint)
             .current_dir(&options.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -102,6 +103,40 @@ impl NativeHarness {
             .await
             .map_err(|_| Error::new("SDK_HARNESS_PIPE", "harness command delivery is uncertain"))
     }
+}
+
+#[cfg(windows)]
+fn node_entrypoint_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    let Some(rest) = wide.strip_prefix(&prefix) else {
+        return path.to_path_buf();
+    };
+    let is_drive_path = rest.len() >= 3
+        && rest[1] == b':' as u16
+        && matches!(rest[2], value if value == b'\\' as u16 || value == b'/' as u16)
+        && matches!(rest[0], 65..=90 | 97..=122);
+    if is_drive_path {
+        return PathBuf::from(std::ffi::OsString::from_wide(rest));
+    }
+    let is_unc_path = rest.len() >= 4
+        && matches!(rest[0], 85 | 117)
+        && matches!(rest[1], 78 | 110)
+        && matches!(rest[2], 67 | 99)
+        && matches!(rest[3], value if value == b'\\' as u16 || value == b'/' as u16);
+    if is_unc_path {
+        let mut normalized = vec![b'\\' as u16, b'\\' as u16];
+        normalized.extend_from_slice(&rest[4..]);
+        return PathBuf::from(std::ffi::OsString::from_wide(&normalized));
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn node_entrypoint_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 /// Materialize the small pinned protocol shim inside this binding owner's
@@ -291,4 +326,28 @@ fn spawn_child_waiter(mut child: Child, tx: mpsc::Sender<HarnessFrame>) {
         let code = child.wait().await.ok().and_then(|status| status.code());
         let _ = tx.send(HarnessFrame::Exited { code }).await;
     });
+}
+
+#[cfg(all(test, windows))]
+mod startup_node_entrypoint_path_tests {
+    use super::node_entrypoint_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn claude_minimal_regression_strips_extended_drive_prefix_for_node() {
+        let extended = PathBuf::from(r"\\?\C:\Program Files\Eliot\sdk-harness\bridge.mjs");
+        assert_eq!(
+            node_entrypoint_path(&extended),
+            PathBuf::from(r"C:\Program Files\Eliot\sdk-harness\bridge.mjs")
+        );
+    }
+
+    #[test]
+    fn claude_minimal_regression_normalizes_extended_unc_path_for_node() {
+        let extended = PathBuf::from(r"\\?\UNC\server\share\sdk-harness\bridge.mjs");
+        assert_eq!(
+            node_entrypoint_path(&extended),
+            PathBuf::from(r"\\server\share\sdk-harness\bridge.mjs")
+        );
+    }
 }
