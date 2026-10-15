@@ -1881,7 +1881,7 @@ fn load_launch_facts(
     config: &Config,
     operation_id: &str,
 ) -> std::result::Result<LaunchFacts, launcher_native_mcp::LauncherFactsFailure> {
-    if operation_id.is_empty() || operation_id.len() > 256 {
+    if launcher_native_mcp::is_invalid_operation_id(operation_id) {
         return Err(Error::invalid("launch Operation ID is invalid").into());
     }
     let snapshot =
@@ -5059,10 +5059,14 @@ mod failure_event_tests {
     /// byte is rejected by the shared ingress guard before any damage context
     /// can record evidence. The generic invalid-ID path must quarantine the
     /// exact retained OperationRequest bytes, leave the bad row unchanged,
-    /// and still reach the next healthy candidate in the same bounded pass.
-    /// A second quiet pass must be write-stable.
+    /// and still reach a waiting follower in the same bounded pass.
+    /// The follower here is a deadline waiter (retry_wait, future deadline,
+    /// incomplete body), so Idle(Some(200)) proves the scan reached the
+    /// waiter, not that an eligible ready launch was claimed; eligible-ready
+    /// claim proof remains pending. A second pass must add no redundant
+    /// quarantine/operation writes.
     #[test]
-    fn invalid_operation_id_is_quarantined_without_starving_the_next_launch() {
+    fn invalid_operation_id_is_quarantined_and_waiting_deadline_survives() {
         const CORRUPT_OPERATION: &str = "native-mcp-tools-corrupt-id\nbad";
         const HEALTHY_OPERATION: &str = "native-mcp-tools-healthy-next";
 
@@ -5098,6 +5102,14 @@ mod failure_event_tests {
         assert!(crate::store::launcher_native_mcp::is_invalid_operation_id(CORRUPT_OPERATION));
         assert!(!crate::store::launcher_native_mcp::is_invalid_operation_id(HEALTHY_OPERATION));
 
+        let pre_updated: i64 = db
+            .query_row(
+                "SELECT updated_at_ms FROM operations WHERE operation_id=?1",
+                [CORRUPT_OPERATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
@@ -5108,7 +5120,7 @@ mod failure_event_tests {
         let outcome = claim_next_tools(&tx, 100, &Config::default()).unwrap();
         assert!(
             matches!(outcome, ToolsClaimOutcome::Idle(Some(200))),
-            "corrupt ID must not abort the next healthy launch"
+            "corrupt ID must not abort the waiting follower deadline"
         );
         let quarantine_count: i64 = tx
             .query_row(
@@ -5138,6 +5150,26 @@ mod failure_event_tests {
         )
         .unwrap();
         assert_eq!(quarantine_key, expected_key);
+        let payload = crate::automation::config::read_record(&tx, &quarantine_key, "launcher quarantine fixture")
+            .unwrap()
+            .expect("sealed quarantine record is retained");
+        assert_eq!(
+            payload["code"],
+            crate::store::launcher_native_mcp::LAUNCHER_RECORD_CORRUPT_CODE
+        );
+        assert_eq!(
+            payload["evidence"]["subject_identity"],
+            format!("launch-operation-digest:{id_digest}")
+        );
+        assert_eq!(
+            payload["evidence"]["source_pointer"],
+            format!("operations-digest:{id_digest}")
+        );
+        assert_eq!(
+            payload["evidence"]["source_digest"],
+            model::digest(pre_bytes.as_bytes())
+        );
+        assert_eq!(payload["occurrences"], 1);
         let retained: String = tx
             .query_row(
                 "SELECT effective_request_json FROM operations WHERE operation_id=?1",
@@ -5146,6 +5178,14 @@ mod failure_event_tests {
             )
             .unwrap();
         assert_eq!(retained, pre_bytes);
+        let post_updated: i64 = tx
+            .query_row(
+                "SELECT updated_at_ms FROM operations WHERE operation_id=?1",
+                [CORRUPT_OPERATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(post_updated, pre_updated);
         let cursor: String = tx
             .query_row(
                 "SELECT value_json FROM meta WHERE key='launcher:native_mcp_tools:supervisor:v1:cursor'",
@@ -5156,24 +5196,23 @@ mod failure_event_tests {
         assert!(cursor.contains(HEALTHY_OPERATION));
         tx.commit().unwrap();
 
-        let meta_count_before: i64 = db
-            .query_row("SELECT count(*) FROM meta", [], |row| row.get(0))
+        let writes_before: u64 = db.total_changes();
+        let rewound = db
+            .execute(
+                "UPDATE meta SET value_json='\"\"' WHERE key='launcher:native_mcp_tools:supervisor:v1:cursor'",
+                [],
+            )
             .unwrap();
-        let op_count_before: i64 = db
-            .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))
-            .unwrap();
-        db.execute(
-            "UPDATE meta SET value_json='\"\"' WHERE key='launcher:native_mcp_tools:supervisor:v1:cursor'",
-            [],
-        )
-        .unwrap();
+        assert_eq!(rewound, 1);
+        assert_eq!(db.total_changes() - writes_before, 1);
+        let writes_after_rewind: u64 = db.total_changes();
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         let outcome = claim_next_tools(&tx, 100, &Config::default()).unwrap();
         assert!(
             matches!(outcome, ToolsClaimOutcome::Idle(Some(200))),
-            "second pass must reach the same healthy deadline"
+            "second pass must reach the same waiting deadline"
         );
         let quarantine_count: i64 = tx
             .query_row(
@@ -5183,6 +5222,20 @@ mod failure_event_tests {
             )
             .unwrap();
         assert_eq!(quarantine_count, 1);
+        let second_key: String = tx
+            .query_row(
+                "SELECT key FROM meta WHERE key LIKE 'launcher:v1:quarantine:native_mcp:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_key, expected_key);
+        let second_payload =
+            crate::automation::config::read_record(&tx, &second_key, "launcher quarantine fixture")
+                .unwrap()
+                .expect("sealed quarantine record is retained");
+        assert_eq!(second_payload["occurrences"], 1);
+        assert_eq!(second_payload["evidence"], payload["evidence"]);
         let retained: String = tx
             .query_row(
                 "SELECT effective_request_json FROM operations WHERE operation_id=?1",
@@ -5191,15 +5244,24 @@ mod failure_event_tests {
             )
             .unwrap();
         assert_eq!(retained, pre_bytes);
-        tx.commit().unwrap();
-        let meta_count_after: i64 = db
-            .query_row("SELECT count(*) FROM meta", [], |row| row.get(0))
+        let retained_updated: i64 = tx
+            .query_row(
+                "SELECT updated_at_ms FROM operations WHERE operation_id=?1",
+                [CORRUPT_OPERATION],
+                |row| row.get(0),
+            )
             .unwrap();
-        let op_count_after: i64 = db
+        assert_eq!(retained_updated, pre_updated);
+        let op_count: i64 = tx
             .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(meta_count_after, meta_count_before);
-        assert_eq!(op_count_after, op_count_before);
+        assert_eq!(op_count, 2);
+        tx.commit().unwrap();
+        assert_eq!(
+            db.total_changes() - writes_after_rewind,
+            1,
+            "second pass must write only the expected cursor advance"
+        );
     }
 }
 #[cfg(test)]

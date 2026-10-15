@@ -1502,10 +1502,7 @@ pub(super) fn current_mcp_launch_snapshot_for_tools(
     config: &Config,
     operation_id: &str,
 ) -> std::result::Result<NativeMcpLaunchSnapshot, LauncherFactsFailure> {
-    if operation_id.is_empty()
-        || operation_id.len() > 256
-        || operation_id.bytes().any(|byte| byte.is_ascii_control())
-    {
+    if is_invalid_operation_id(operation_id) {
         return Err(Error::invalid("launch Operation ID is invalid").into());
     }
     let mut damage_context = LauncherFactsDamageContext::default();
@@ -1538,16 +1535,8 @@ pub(crate) fn current_mcp_launch_snapshot_for_dispatch(
     launch_operation_id: &str,
     dispatch_operation_id: Option<&str>,
 ) -> Result<NativeMcpLaunchSnapshot> {
-    if launch_operation_id.is_empty()
-        || launch_operation_id.len() > 256
-        || launch_operation_id
-            .bytes()
-            .any(|byte| byte.is_ascii_control())
-        || dispatch_operation_id.is_some_and(|operation_id| {
-            operation_id.is_empty()
-                || operation_id.len() > 256
-                || operation_id.bytes().any(|byte| byte.is_ascii_control())
-        })
+    if is_invalid_operation_id(launch_operation_id)
+        || dispatch_operation_id.is_some_and(is_invalid_operation_id)
     {
         return Err(Error::invalid("launch or dispatch Operation ID is invalid"));
     }
@@ -2117,11 +2106,11 @@ fn is_launch_record_damage(error: &Error) -> bool {
     )
 }
 
-/// True when an ingress-guard INVALID_PARAMS failure names an invalid Operation
-/// ID. It mirrors the shared ingress predicate in
-/// `current_mcp_launch_snapshot_for_tools` (empty, longer than 256 bytes, or
-/// containing an ASCII control byte) so a selected candidate rejected before
-/// any damage context can be recorded still quarantines its exact retained
+/// Single shared ingress predicate for Operation IDs (empty, longer than 256
+/// bytes, or containing an ASCII control byte). The C8/C10 ingress guards and
+/// the generic invalid-ID isolation path all call this one function so the
+/// definitions cannot drift. A selected candidate rejected before any damage
+/// context can be recorded still quarantines its exact retained
 /// OperationRequest bytes and lets the bounded page scan continue. Any other
 /// INVALID_PARAMS with a valid ID stays loud and is not quarantined here.
 pub(super) fn is_invalid_operation_id(operation_id: &str) -> bool {
