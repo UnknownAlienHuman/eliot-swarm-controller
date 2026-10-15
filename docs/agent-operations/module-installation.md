@@ -148,15 +148,21 @@ Each route must use the exact Rust artifact ID and workspace field enforced by `
 | Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` (select version 4) | `workspaceRoot` | `modelId = 'gemini-3.8-flash-high'`, `workspaceRoot`; optional `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
 
 The current standalone OpenCode coordinate is
-`eliot-opencode-v2.rust-http.1@0.5.0`, pinned to
+`eliot-opencode-v2.rust-http.1@0.6.0`, pinned to
 `opencode-v2-native-options@3` with schema SHA-256
 `070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e` in its
-descriptor. Its external-attach route has no `expected_version`; observed server
-version remains diagnostic. The host correction is limited to route validation
-and schema-aware projection, so the immutable descriptor, schema digest and
-artifact coordinate remain unchanged. Retained v1/v2 descriptors continue to
-decode their historical version field, and fresh-owned routes keep the exact
-owner-contract version check. The separate built-in
+descriptor. The OpenCode 2.0.7 compatibility path submits flat `text` plus the
+`metadata.eliot` marker and admits only an exact `SessionInbox.User` item.
+Its acknowledgement carries no admission or promotion sequence; actual
+`session.inbox.enqueued` and `session.inbox.delivered` history events provide
+the bounded readback, and no sequence is synthesized. A legacy
+`promoted_sequence` may represent inbox delivery only; it is not execution
+proof and does not set `execution_complete`. Its external-attach route
+has no `expected_version`; observed server version remains diagnostic. The
+artifact ID and config schema digest remain stable while the artifact version
+is `0.6.0` for this changed input-admission contract. Retained v1/v2
+descriptors continue to decode their historical version field, and fresh-owned
+routes keep the exact owner-contract version check. The separate built-in
 `eliot-opencode-v2.http.2` route is current for new TaskPrompt bindings and keeps
 its own native service version contract. Built-in `.1` remains available only
 for retained bindings and Operations; new `.1` bindings are rejected.

@@ -1300,7 +1300,7 @@ function Get-AdapterContract {
     switch ($Adapter) {
         'OpenCode' {
             return [pscustomobject]@{
-                module_id = 'eliot.opencode.v2'; artifact_id = 'eliot-opencode-v2.rust-http.1'; version = '0.5.0'; runtime = 'module';
+                module_id = 'eliot.opencode.v2'; artifact_id = 'eliot-opencode-v2.rust-http.1'; version = '0.6.0'; runtime = 'module';
                 build_package = 'swarm-adapter-opencode'; build_target = 'swarm-adapter-opencode';
                 build_manifest = 'crates/swarm-adapter-opencode/Cargo.toml';
                 capabilities = @('agent.background', 'agent.open', 'agent.reconcile', 'agent.refresh', 'agent.reply', 'agent.result', 'agent.send/next_turn', 'native.mcp.arm', 'native.mcp.install', 'native.mcp.observe', 'native.mcp.read', 'task.dispatch');

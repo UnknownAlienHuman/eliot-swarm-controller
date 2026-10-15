@@ -1,6 +1,6 @@
 # OpenCode V2 module adapter
 
-`eliot-opencode-v2.rust-http.1@0.5.0` is the standalone OpenCode adapter. Its descriptor uses `opencode-v2-native-options@3` (SHA-256 `070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e`) and protocol 1.0. It declares `swarm.task_prompt@1`; every selected `task.dispatch` requires the Store-produced immutable envelope and submits its exact prompt bytes. Artifact selection is explicit, disabled by default, and requires a trusted catalog entry.
+`eliot-opencode-v2.rust-http.1@0.6.0` is the standalone OpenCode adapter. Its descriptor uses `opencode-v2-native-options@3` (SHA-256 `070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e`) and protocol 1.0. It declares `swarm.task_prompt@1`; every selected `task.dispatch` requires the Store-produced immutable envelope and submits its exact prompt text to the OpenCode 2.0.7 inbox as flat `text` plus `metadata.eliot`. Admission is checked against the actual `SessionInbox.User` shape and its durable inbox readback; the native acknowledgement has no admission or promotion sequence, so the adapter never invents one. A legacy public `promoted_sequence` may represent inbox delivery only; it is not execution evidence and does not set `execution_complete`. Artifact selection is explicit, disabled by default, and requires a trusted catalog entry.
 
 The descriptor declares agent.open, task.dispatch, agent.send/next_turn, agent.reply, agent.background, agent.refresh, agent.reconcile, and agent.result, along with the four native.mcp.* commands. Unknown OpenCode-native methods stay unsupported. This artifact does not declare native.opencode.loop_step because no supported internal producer exists.
 
@@ -20,7 +20,7 @@ The example model is the exact selected route inclusionai/ling-3.1-flash: `provi
 
 ## Native history and controls
 
-Queue sends use the durable admission/readback path and persist their exact native delivery identity. The adapter retains loop-step delivery recognition only to reconcile previously retained intents; it does not admit new loop-step submissions. History gaps and uncertain prior POSTs remain unknown.
+Queue sends use the durable OpenCode 2.0.7 inbox admission/readback path and persist their exact native delivery identity. Each admitted `SessionInbox.User` item must retain the exact flat text, `metadata.eliot` marker, session, input identity, and delivery. `session.inbox.enqueued` proves admission; `session.inbox.delivered` can extend an admitted input but cannot establish admission or provide a fabricated sequence. A legacy `promoted_sequence` may therefore mean inbox delivery only; it is not execution proof, and `execution_complete` remains false. The adapter retains loop-step delivery recognition only to reconcile previously retained intents; it does not admit new loop-step submissions. History gaps and uncertain prior POSTs remain unknown.
 
 Questions and permissions are read from the current pending endpoints and projected as bounded typed observations. Replies bind the exact current request fingerprint. Generic permission replies allow only `once` and `reject`; `always` is unsupported. Lost reply responses reconcile from complete contiguous durable history and exact reply payload digests. Permission feedback text is not exposed by that history, so a reject carrying feedback remains unknown after a lost response.
 
@@ -35,6 +35,6 @@ Acknowledged non-source operation journals are eligible for bounded reclamation 
 - `registration/route.example.json` shows external attach.
 - `registration/route.fresh-owner.example.json` shows the explicit fresh-owner declaration and opaque protected provider reference. Its path and digest placeholders need locally reviewed values; the example remains disabled.
 - `registration/binding-launch-values.example.json` shows the route fields for external attach. Owner fields are supplied only when that explicit owner declaration is admitted.
-- `registration/select-route.request.example.json` selects artifact version `0.5.0`.
+- `registration/select-route.request.example.json` selects artifact version `0.6.0`.
 
 The launch argument remains `--config <absolute-host-connection-config-path>`. That route-neutral file contains only host connection settings; descriptor-declared route values are supplied separately by the supervisor.
