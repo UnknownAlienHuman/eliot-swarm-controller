@@ -3,6 +3,8 @@ mod app299_connected_consumer;
 #[cfg(test)]
 mod app320_connected_consumer;
 mod config;
+#[cfg(test)]
+mod control_consumer_tests;
 mod journal;
 mod mcp_plugin;
 mod module_link;
