@@ -6487,10 +6487,41 @@ async fn drain_retired_then_exit(
     ipc: &IpcConfig,
     journal: &mut Journal,
 ) -> Result<(), AdapterError> {
-    let mut host = connect_host(config, context, ipc).await?;
-    let normalized_results = module_contract::normalized_result_enabled(&context.claim);
-    report_pending(&mut host, journal, normalized_results).await?;
-    Ok(())
+    let drain_results = module_contract::normalized_result_enabled(&context.claim);
+    loop {
+        let mut host = match connect_host(config, context, ipc).await {
+            Ok(host) => host,
+            Err(_) => {
+                tokio::time::sleep(HOST_RETRY_DELAY).await;
+                continue;
+            }
+        };
+        let hello = json!({
+            "boot_id": journal.state.boot_id.clone(),
+            "module_artifact_id": ARTIFACT_ID,
+            "native_root_id": Value::Null,
+            "native_scope_key": Value::Null,
+            "native_ready": false,
+            "managed_owner": context.worker.owner_record.clone(),
+        });
+        let hello_result = match host.hello(hello, Some(&context.claim)).await {
+            Ok(value) => value,
+            Err(_) => {
+                tokio::time::sleep(HOST_RETRY_DELAY).await;
+                continue;
+            }
+        };
+        module_contract::validate_negotiated_hello(&hello_result, context)?;
+        journal.bind(&context.binding_id, context.generation)?;
+        match report_pending(&mut host, journal, drain_results).await {
+            Ok(()) => return Ok(()),
+            Err(AdapterError::Host) => {
+                tokio::time::sleep(HOST_RETRY_DELAY).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn connect_host(
