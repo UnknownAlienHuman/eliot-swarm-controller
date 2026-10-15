@@ -1716,6 +1716,49 @@ fn store_startup_rejects_incomplete_and_foreign_front_without_deletion() {
 }
 
 #[test]
+fn store_startup_rejects_oversized_complete_selected_journal_frame() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let operation_id = "store-front-oversized-complete";
+    let path = operation_path(&root.0, operation_id);
+    let mut bytes = serde_json::to_vec(&"x".repeat(RECORD_LIMIT)).unwrap();
+    bytes.push(b'\n');
+    assert!(bytes.len() > RECORD_LIMIT);
+    assert!(bytes.len() <= HISTORY_LIMIT);
+    fs::write(&path, &bytes).unwrap();
+    let manifest = store_startup_manifest("current-boot", None, &[(operation_id, "agent.reply")]);
+
+    let error = journal
+        .recover_store_startup(&manifest, "current-boot", None)
+        .unwrap_err();
+    assert_eq!(error.code, "ADAPTER_JOURNAL");
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(journal.startup_damaged_record_observations(), 0);
+}
+
+#[test]
+fn store_startup_rejects_oversized_selected_journal_torn_tail() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let operation_id = "store-front-oversized-torn-tail";
+    let path = operation_path(&root.0, operation_id);
+    let bytes = serde_json::to_vec(&"x".repeat(RECORD_LIMIT)).unwrap();
+    assert!(bytes.len() > RECORD_LIMIT);
+    assert!(bytes.len() <= HISTORY_LIMIT);
+    fs::write(&path, &bytes).unwrap();
+    let manifest = store_startup_manifest("current-boot", None, &[(operation_id, "agent.reply")]);
+
+    let error = journal
+        .recover_store_startup(&manifest, "current-boot", None)
+        .unwrap_err();
+    assert_eq!(error.code, "ADAPTER_JOURNAL");
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(journal.startup_damaged_record_observations(), 0);
+}
+
+#[test]
 fn store_startup_holds_corrupt_selected_records_and_recovers_other_deliveries() {
     let root = FixtureRoot::new();
     let journal =

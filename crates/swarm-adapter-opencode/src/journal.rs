@@ -2589,8 +2589,14 @@ fn read_recovery_operation_history_bytes(
                 tail_bytes,
             });
         }
-        JsonlScanVerdict::Damaged { .. } => {
-            return Ok(RecoveryHistoryRead::Damaged(history));
+        JsonlScanVerdict::Damaged {
+            valid_prefix_bytes,
+            reason,
+        } => {
+            return Err(Error::new(
+                "ADAPTER_JOURNAL",
+                format!("operation journal damaged at byte {valid_prefix_bytes}: {reason:?}"),
+            ));
         }
     }
     if malformed_record {
