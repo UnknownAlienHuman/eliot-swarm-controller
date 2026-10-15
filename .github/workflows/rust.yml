@@ -955,6 +955,9 @@ jobs:
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
             }
             foreach ($case in @(
+              'store_startup_recovers_cold_legacy_front_without_lifetime_census',
+              'store_startup_rejects_incomplete_foreign_and_damaged_front_without_deletion',
+              'store_startup_connected_hello_recovers_current_root_and_exact_unresolved_before_census',
               'cold_legacy_before_hello_is_bounded_and_append_resumes',
               'startup_recovery_bounds_large_history_and_resumes_sparse_tail',
               'steady_recovery_reads_only_the_sparse_tail',
@@ -986,6 +989,13 @@ jobs:
           } elseif ($env:QUALIFICATION -ceq 'focused-retention-tail') {
             $connectedCase = 'run_owned_keeps_module_service_live_through_256_legacy_records_and_recovers_exact_memo_after_restart'
             Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter $connectedCase -Expected 1 -ExpectedNames @($connectedCase)
+            foreach ($case in @(
+              'store_startup_recovers_cold_legacy_front_without_lifetime_census',
+              'store_startup_rejects_incomplete_foreign_and_damaged_front_without_deletion',
+              'store_startup_connected_hello_recovers_current_root_and_exact_unresolved_before_census'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
             if (-not $IsWindows) {
               foreach ($case in @(
                 'retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_target',
@@ -1069,6 +1079,7 @@ jobs:
               'pr71_a2_birth_tuple_changed_between_reads_keeps_exact_child_custody',
               'scheduler_owner_status_stale_generation_or_host_scope_cannot_be_ready',
               'constructor_failure_is_persisted_without_blocking_healthy_scope',
+              'empty_group_wait_error_holds_child_until_exit_readback',
               'reconcile_scripts_retains_operation_and_source_worker_across_allow_durability_unknown',
               'store_source_worker_waits_for_durable_allow_and_runs_once_after_recovery'
             )) {
