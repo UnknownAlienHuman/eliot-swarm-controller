@@ -950,7 +950,10 @@ jobs:
               'probe_reservation_contention_keeps_one_shot_eligible_after_release',
               'work_dispatch_public_root_limit_refuses_before_reserving_launch_or_effects',
               'work_dispatch_public_disabled_route_refuses_before_reserving_launch_or_effects',
-              'owner_readback_requires_the_configured_model_catalog_mode'
+              'owner_readback_requires_the_configured_model_catalog_mode',
+              'startup_recovery_projection_is_exact_fenced_and_fails_closed',
+              'module_hello_startup_recovery_projects_unknown_after_worker_replacement',
+              'public_store_module_hello_startup_recovery_is_scoped_and_bounded'
             )) {
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
             }
@@ -987,6 +990,13 @@ jobs:
             }
             Invoke-FocusedCohort -Package 'swarm-process' -Filter $removalCase -Expected 1 -ExpectedNames @($removalCase)
           } elseif ($env:QUALIFICATION -ceq 'focused-retention-tail') {
+            foreach ($case in @(
+              'startup_recovery_projection_is_exact_fenced_and_fails_closed',
+              'module_hello_startup_recovery_projects_unknown_after_worker_replacement',
+              'public_store_module_hello_startup_recovery_is_scoped_and_bounded'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
             $connectedCase = 'run_owned_keeps_module_service_live_through_256_legacy_records_and_recovers_exact_memo_after_restart'
             Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter $connectedCase -Expected 1 -ExpectedNames @($connectedCase)
             foreach ($case in @(
