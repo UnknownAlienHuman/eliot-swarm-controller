@@ -5099,8 +5099,12 @@ mod failure_event_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(crate::store::launcher_native_mcp::is_invalid_operation_id(CORRUPT_OPERATION));
-        assert!(!crate::store::launcher_native_mcp::is_invalid_operation_id(HEALTHY_OPERATION));
+        assert!(crate::store::launcher_native_mcp::is_invalid_operation_id(
+            CORRUPT_OPERATION
+        ));
+        assert!(!crate::store::launcher_native_mcp::is_invalid_operation_id(
+            HEALTHY_OPERATION
+        ));
 
         let pre_updated: i64 = db
             .query_row(
@@ -5150,9 +5154,13 @@ mod failure_event_tests {
         )
         .unwrap();
         assert_eq!(quarantine_key, expected_key);
-        let payload = crate::automation::config::read_record(&tx, &quarantine_key, "launcher quarantine fixture")
-            .unwrap()
-            .expect("sealed quarantine record is retained");
+        let payload = crate::automation::config::read_record(
+            &tx,
+            &quarantine_key,
+            "launcher quarantine fixture",
+        )
+        .unwrap()
+        .expect("sealed quarantine record is retained");
         assert_eq!(
             payload["code"],
             crate::store::launcher_native_mcp::LAUNCHER_RECORD_CORRUPT_CODE
