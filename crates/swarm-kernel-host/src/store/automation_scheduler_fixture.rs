@@ -1131,3 +1131,342 @@ fn scheduler_owner_status_requires_current_running_host_and_supervisor_marker() 
         }
     }
 }
+
+async fn scheduler_store_fixture() -> (crate::store::StoreOwner, std::path::PathBuf) {
+    use crate::{
+        config::Config,
+        model,
+        platform::{DataRoot, bootstrap_credential},
+        store::StoreOwner,
+    };
+    use std::sync::Arc;
+
+    let directory = std::env::temp_dir().join(format!("scheduler-owner-{}", model::new_id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let root = DataRoot::acquire(&directory).unwrap();
+    let directory = root.path.clone();
+    let credential = bootstrap_credential(&directory).unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = directory.clone();
+    config.automation_scheduler.enabled = true;
+    let owner = StoreOwner::start(root, Arc::new(config), credential)
+        .await
+        .unwrap();
+    (owner, directory)
+}
+
+fn scheduler_fixture_identity(
+    child: &SchedulerFixtureChild,
+    store: &crate::store::Store,
+) -> serde_json::Value {
+    let process_identity = swarm_process::spawned_identity(child.0.id()).unwrap();
+    swarm_automation::service_owner_group_identity(
+        &process_identity,
+        store.scheduler_owner_token().unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn r48_owner_lost_store_results_hold_intent_and_process_capacity() {
+    let (owner, directory) = scheduler_store_fixture().await;
+    let store = &owner.store;
+
+    store.lose_next_automation_scheduler_begin_reply_after_commit();
+    let mut child_launch_calls = 0;
+    let lost_begin = crate::host::begin_scheduler_worker_then_spawn(store, || {
+        child_launch_calls += 1;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(lost_begin.code, "STORE_CLOSED");
+    assert_eq!(child_launch_calls, 0);
+
+    let retained = store
+        .run(|db| super::owner_record(db))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.phase, super::SchedulerOwnerPhase::Launching);
+    assert_eq!(
+        retained.scope,
+        store.run(|db| super::current_scope(db)).await.unwrap()
+    );
+    let retained_before = serde_json::to_value(&retained).unwrap();
+    let retry = crate::host::begin_scheduler_worker_then_spawn(store, || {
+        child_launch_calls += 1;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(retry.code, "AUTOMATION_SERVICE_OWNER_UNKNOWN");
+    assert_eq!(child_launch_calls, 0);
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .run(|db| super::owner_record(db))
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        retained_before
+    );
+
+    // The lost begin reply returned no launch tuple. Read back that exact
+    // reservation and settle it only after the host launch closure proves it
+    // was never called.
+    store
+        .abandon_automation_scheduler_worker(retained.scope, retained.launch_id)
+        .await
+        .unwrap();
+
+    let ready_path = directory.join("r48-scheduler-owner-ready");
+    let (scope, launch_id, mut child) =
+        crate::host::begin_scheduler_worker_then_spawn(store, || {
+            child_launch_calls += 1;
+            Ok::<_, std::io::Error>(SchedulerFixtureChild::spawn(
+                &store.automation_scheduler_worker_config_path(),
+                &ready_path,
+            ))
+        })
+        .await
+        .unwrap();
+    let identity = scheduler_fixture_identity(&child, store);
+
+    store.lose_next_automation_scheduler_activate_reply_after_commit();
+    let lost_activate = store
+        .activate_automation_scheduler_worker(scope.clone(), launch_id.clone(), identity.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(lost_activate.code, "STORE_CLOSED");
+    let active = store
+        .run(|db| super::owner_record(db))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.phase, super::SchedulerOwnerPhase::Active);
+    assert_eq!(active.scope, scope);
+    assert_eq!(active.launch_id, launch_id);
+    assert_eq!(active.group_identity, Some(identity.clone()));
+
+    let blocked = crate::host::begin_scheduler_worker_then_spawn(store, || {
+        child_launch_calls += 1;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(blocked.code, "AUTOMATION_SERVICE_OWNER_RETAINED");
+    assert_eq!(child_launch_calls, 1);
+    assert!(child.0.try_wait().unwrap().is_none());
+
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    store
+        .finish_automation_scheduler_worker(scope, launch_id, identity)
+        .await
+        .unwrap();
+    let (next_scope, next_launch_id) = store.begin_automation_scheduler_worker().await.unwrap();
+    assert_eq!(next_scope, active.scope);
+    assert_ne!(next_launch_id, active.launch_id);
+    store
+        .abandon_automation_scheduler_worker(next_scope, next_launch_id)
+        .await
+        .unwrap();
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn r48_owner_stale_callbacks_keep_old_receipt_out_of_current_host_status() {
+    use super::super::{meta, set_meta};
+    use serde_json::json;
+
+    let (owner, directory) = scheduler_store_fixture().await;
+    let store = &owner.store;
+    let ready_path = directory.join("r48-stale-scheduler-owner-ready");
+    let mut child_launches = 0;
+    let (old_scope, old_launch_id, mut old_child) =
+        crate::host::begin_scheduler_worker_then_spawn(store, || {
+            child_launches += 1;
+            Ok::<_, std::io::Error>(SchedulerFixtureChild::spawn(
+                &store.automation_scheduler_worker_config_path(),
+                &ready_path,
+            ))
+        })
+        .await
+        .unwrap();
+    let old_identity = scheduler_fixture_identity(&old_child, store);
+
+    store
+        .run(|db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            set_meta(&tx, "controller_id", &json!("scheduler-next-host"))?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let launching_before = store
+        .run(|db| super::owner_record(db))
+        .await
+        .unwrap()
+        .unwrap();
+    let delayed_activation = store
+        .activate_automation_scheduler_worker(
+            old_scope.clone(),
+            old_launch_id.clone(),
+            old_identity.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(delayed_activation.code, "AUTOMATION_SERVICE_OWNER_STALE");
+    let launching_after = store
+        .run(|db| super::owner_record(db))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&launching_after).unwrap(),
+        serde_json::to_value(&launching_before).unwrap()
+    );
+    assert_eq!(launching_after.phase, super::SchedulerOwnerPhase::Launching);
+    let status = store
+        .run(|db| super::super::host_lifecycle::status(db))
+        .await
+        .unwrap();
+    let owner_receipt = &status["optional_workers"]["automation-scheduler"]["owner"];
+    assert_eq!(owner_receipt["status"], "stale");
+    assert_eq!(owner_receipt["ready"], false);
+    assert_eq!(owner_receipt["launch_id"], old_launch_id);
+
+    let mut replacement_launches = 0;
+    let blocked = crate::host::begin_scheduler_worker_then_spawn(store, || {
+        replacement_launches += 1;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(blocked.code, "AUTOMATION_SERVICE_OWNER_UNKNOWN");
+    assert_eq!(replacement_launches, 0);
+    assert_eq!(child_launches, 1);
+    assert!(old_child.0.try_wait().unwrap().is_none());
+
+    old_child.0.kill().unwrap();
+    old_child.0.wait().unwrap();
+    store
+        .abandon_exited_automation_scheduler_worker(old_scope, old_launch_id, old_identity)
+        .await
+        .unwrap();
+
+    let ready_path = directory.join("r48-current-scheduler-owner-ready");
+    let (scope, launch_id, mut child) =
+        crate::host::begin_scheduler_worker_then_spawn(store, || {
+            child_launches += 1;
+            Ok::<_, std::io::Error>(SchedulerFixtureChild::spawn(
+                &store.automation_scheduler_worker_config_path(),
+                &ready_path,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(child_launches, 2);
+    let identity = scheduler_fixture_identity(&child, store);
+    store
+        .activate_automation_scheduler_worker(scope.clone(), launch_id.clone(), identity.clone())
+        .await
+        .unwrap();
+    let active_before = store
+        .run(|db| super::owner_record(db))
+        .await
+        .unwrap()
+        .unwrap();
+
+    store
+        .run(|db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            set_meta(&tx, "host_epoch", &json!(4))?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let delayed_finish = store
+        .finish_automation_scheduler_worker(scope, launch_id.clone(), identity)
+        .await
+        .unwrap_err();
+    assert_eq!(delayed_finish.code, "AUTOMATION_SERVICE_OWNER_STALE");
+    let active_after = store
+        .run(|db| super::owner_record(db))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&active_after).unwrap(),
+        serde_json::to_value(&active_before).unwrap()
+    );
+    assert_eq!(active_after.phase, super::SchedulerOwnerPhase::Active);
+
+    store
+        .run(|db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let registration_key = format!("client:{}", super::SERVICE_ID);
+            let mut registration = meta(&tx, &registration_key)?.unwrap();
+            registration["automation_scheduler"]["scope"]["generation"] = json!(2);
+            set_meta(&tx, &registration_key, &registration)?;
+            set_meta(&tx, super::GENERATION_KEY, &json!(2))?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let status = store
+        .run(|db| super::super::host_lifecycle::status(db))
+        .await
+        .unwrap();
+    let owner_receipt = &status["optional_workers"]["automation-scheduler"]["owner"];
+    assert_eq!(owner_receipt["status"], "stale");
+    assert_eq!(owner_receipt["ready"], false);
+    assert_eq!(owner_receipt["launch_id"], launch_id);
+    assert_eq!(owner_receipt["scope"]["generation"], 1);
+    assert_eq!(
+        owner_receipt["host_scope"]["controller_id"],
+        "scheduler-next-host"
+    );
+    assert_eq!(
+        owner_receipt["host_scope"]["host_epoch"].as_i64(),
+        active_before
+            .host_scope
+            .as_ref()
+            .map(|host_scope| host_scope.host_epoch)
+    );
+
+    let no_replacement = crate::host::begin_scheduler_worker_then_spawn(store, || {
+        replacement_launches += 1;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(no_replacement.code, "AUTOMATION_SERVICE_OWNER_SCOPE_STALE");
+    assert_eq!(replacement_launches, 0);
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .run(|db| super::owner_record(db))
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&active_before).unwrap()
+    );
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}

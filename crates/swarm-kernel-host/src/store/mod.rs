@@ -121,6 +121,8 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, named_params, params,
 };
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{fs::File, path::Path, sync::Arc, thread::JoinHandle, time::Duration};
 use tokio::sync::{Semaphore, oneshot, watch};
 
@@ -177,6 +179,8 @@ pub struct Store {
     script_child_custody: crate::scripts::runner::ScriptChildCustody,
     forge_git_custody: forge::ForgeGitCustody,
     automation_scheduler_owner_token: Option<Arc<String>>,
+    #[cfg(test)]
+    automation_scheduler_owner_reply_loss: Arc<AtomicU8>,
     launch_issuance: Arc<launcher_issuance::IssuanceRuntime>,
     telemetry: swarm_telemetry::Producer,
 }
@@ -453,6 +457,8 @@ impl StoreOwner {
             script_child_custody: crate::scripts::runner::ScriptChildCustody::default(),
             forge_git_custody: forge::ForgeGitCustody::default(),
             automation_scheduler_owner_token: scheduler_owner_token.clone().map(Arc::new),
+            #[cfg(test)]
+            automation_scheduler_owner_reply_loss: Arc::new(AtomicU8::new(0)),
             launch_issuance: Arc::new(launcher_issuance::IssuanceRuntime::new()),
             artifact_io: Arc::new(Semaphore::new(4)),
             telemetry: swarm_telemetry::Producer::with_line_observer(
@@ -801,6 +807,33 @@ impl Store {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn lose_next_automation_scheduler_begin_reply_after_commit(&self) {
+        self.automation_scheduler_owner_reply_loss
+            .store(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lose_next_automation_scheduler_activate_reply_after_commit(&self) {
+        self.automation_scheduler_owner_reply_loss
+            .store(2, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn scheduler_owner_reply_after_commit(&self, boundary: u8) -> Result<()> {
+        if self
+            .automation_scheduler_owner_reply_loss
+            .compare_exchange(boundary, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Err(Error::new(
+                "STORE_CLOSED",
+                "database operation lost its response",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn begin_automation_scheduler_worker(
         &self,
     ) -> Result<(swarm_contracts::DeclaredServiceScope, String)> {
@@ -833,6 +866,8 @@ impl Store {
             Ok(())
         })
         .await?;
+        #[cfg(test)]
+        self.scheduler_owner_reply_after_commit(1)?;
         Ok((scope, launch_id))
     }
 
@@ -858,7 +893,10 @@ impl Store {
             tx.commit()?;
             Ok(())
         })
-        .await
+        .await?;
+        #[cfg(test)]
+        self.scheduler_owner_reply_after_commit(2)?;
+        Ok(())
     }
 
     pub(crate) async fn abandon_automation_scheduler_worker(

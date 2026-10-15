@@ -726,6 +726,25 @@ fn save_owner(tx: &Transaction<'_>, owner: &SchedulerOwner) -> Result<()> {
     set_meta(tx, OWNER_KEY, &serde_json::to_value(owner)?)
 }
 
+fn require_current_owner_scope(
+    tx: &Transaction<'_>,
+    owner: &SchedulerOwner,
+    scope: &DeclaredServiceScope,
+    launch_id: &str,
+) -> Result<()> {
+    if current_scope(tx)? == *scope
+        && owner.scope == *scope
+        && owner.host_scope.as_ref() == Some(&current_host_scope(tx)?)
+        && owner.launch_id == launch_id
+    {
+        return Ok(());
+    }
+    Err(Error::new(
+        "AUTOMATION_SERVICE_OWNER_STALE",
+        "scheduler owner callback no longer matches the current host and service scope",
+    ))
+}
+
 /// Reserve the one Store-owned worker launch. A retained active process may
 /// be replaced only after the exact service family is proven empty. An
 /// interrupted `launching` receipt has no child identity and therefore holds
@@ -814,10 +833,8 @@ pub(crate) fn activate_owner(
             "scheduler launch reservation is missing",
         )
     })?;
-    if current_scope(tx)? != *scope
-        || owner.scope != *scope
-        || owner.launch_id != launch_id
-        || owner.phase != SchedulerOwnerPhase::Launching
+    require_current_owner_scope(tx, &owner, scope, launch_id)?;
+    if owner.phase != SchedulerOwnerPhase::Launching
         || swarm_automation::service_owner_family_empty(&identity, owner_token).map_err(|_| {
             Error::new(
                 "AUTOMATION_SERVICE_OWNER_PROOF_UNAVAILABLE",
@@ -911,9 +928,8 @@ pub(crate) fn finish_owner(
             "scheduler process owner receipt is missing",
         )
     })?;
-    if owner.scope != *scope
-        || owner.launch_id != launch_id
-        || owner.phase != SchedulerOwnerPhase::Active
+    require_current_owner_scope(tx, &owner, scope, launch_id)?;
+    if owner.phase != SchedulerOwnerPhase::Active
         || owner.group_identity.as_ref() != Some(identity)
         || !swarm_automation::service_owner_family_empty(identity, owner_token).map_err(|_| {
             Error::new(

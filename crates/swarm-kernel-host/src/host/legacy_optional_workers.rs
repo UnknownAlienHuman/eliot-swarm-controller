@@ -328,44 +328,29 @@ async fn run_automation_scheduler_worker(
         ));
     }
     let config_path = store.automation_scheduler_worker_config_path();
-    let (scope, launch_id) = store.begin_automation_scheduler_worker().await?;
-    let mut command = Command::new(executable);
-    command.env_clear();
-    #[cfg(windows)]
-    if let Some(system_root) = std::env::var_os("SystemRoot") {
-        command.env("SystemRoot", system_root);
-    }
-    command.arg("run").arg("--config").arg(config_path);
-    // Qualification-only. The Store-owned launch stays byte-identical to its
-    // production shape unless this exact flag was requested on the host
-    // process command line. A build without the qualification-faults feature
-    // never evaluates this, so a release-default host cannot carry the flag
-    // at all. The flag reaches the very process the Store launched and owns,
-    // so the owner receipt, the birth identity and the readiness projection
-    // all remain the ones the Store produced.
-    // The worker accepts this optional flag only after run --config <path>.
-    #[cfg(feature = "qualification-faults")]
-    if qualification_reply_fault_requested() {
-        command.arg("--qualification-drop-first-admit-reply");
-    }
-    let spawn = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(false)
-        .spawn();
-    let mut child = match spawn {
-        Ok(child) => child,
-        Err(_) => {
-            store
-                .abandon_automation_scheduler_worker(scope, launch_id)
-                .await?;
-            return Err(Error::new(
-                "AUTOMATION_WORKER_START_FAILED",
-                "standalone scheduler process could not be started",
-            ));
+    let (scope, launch_id, mut child) = begin_scheduler_worker_then_spawn(&store, move || {
+        let mut command = Command::new(executable);
+        command.env_clear();
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
         }
-    };
+        command.arg("run").arg("--config").arg(config_path);
+        // Qualification-only. The Store-owned launch stays byte-identical to
+        // its production shape unless this exact flag was requested on the
+        // host process command line. A release-default host cannot carry it.
+        #[cfg(feature = "qualification-faults")]
+        if qualification_reply_fault_requested() {
+            command.arg("--qualification-drop-first-admit-reply");
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+    })
+    .await?;
     let Some(pid) = child.id() else {
         let identity_error = Error::new(
             "AUTOMATION_WORKER_IDENTITY_UNKNOWN",
@@ -490,6 +475,26 @@ async fn run_automation_scheduler_worker(
             }
         }
     }
+}
+
+pub(crate) async fn begin_scheduler_worker_then_spawn<T>(
+    store: &Store,
+    spawn: impl FnOnce() -> std::io::Result<T>,
+) -> Result<(swarm_contracts::DeclaredServiceScope, String, T)> {
+    let (scope, launch_id) = store.begin_automation_scheduler_worker().await?;
+    let child = match spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            store
+                .abandon_automation_scheduler_worker(scope, launch_id)
+                .await?;
+            return Err(Error::new(
+                "AUTOMATION_WORKER_START_FAILED",
+                "standalone scheduler process could not be started",
+            ));
+        }
+    };
+    Ok((scope, launch_id, child))
 }
 
 /// A spawned child with no exact service-family identity cannot settle the

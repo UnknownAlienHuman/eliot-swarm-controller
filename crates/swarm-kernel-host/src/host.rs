@@ -14,6 +14,8 @@ use tokio::{
 
 mod legacy_optional_workers;
 pub(crate) use legacy_optional_workers::ShutdownCustody;
+#[cfg(test)]
+pub(crate) use legacy_optional_workers::begin_scheduler_worker_then_spawn;
 
 pub async fn run(config: Config) -> Result<()> {
     run_until(config, async {
