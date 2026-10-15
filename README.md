@@ -4,6 +4,8 @@ Headless, provider-neutral transactional Rust framework for durable commands, Op
 
 Eliot Memory OS is not yet connected on the owner machine. The standalone controller remains usable; the requested conditional `eliot_compile_packet_l3` integration and its verification requirements are recorded in [the integration contract](docs/eliot-memory-os-integration.md). This records a request, not an implemented or qualified packet capability.
 
+The current owner scope is contracts and integration preparation only. Runtime implementation and use await a separate owner instruction.
+
 ## Current implementation — 0.1.0
 
 The Rust core provides authenticated clients, task revisions/ownership, durable request receipts, directed mailbox, incremental reports, binding-scoped module admission, immutable artifacts, submission/review and acceptance. Windows uses user-restricted Named Pipes; Unix uses a private socket. No TCP control listener is opened.

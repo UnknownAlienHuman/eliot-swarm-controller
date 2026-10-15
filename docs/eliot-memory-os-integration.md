@@ -2,6 +2,8 @@
 
 **Status:** requested, runtime integration not implemented. **Owner decision:** 3 October 2026. Eliot is not ready on the owner machine; commit the compile-packet request now, or enable it when Eliot Memory OS is connected. Standalone controller development and ordinary verification continue without an Eliot packet.
 
+**Current owner scope, 15 October 2026:** document the contracts and prepare the integration boundary only. Runtime implementation and use are deferred until a separate owner instruction. A service becoming available does not enable integration. The connection behavior and acceptance criteria below describe future implementation, not work ordered for this stage.
+
 ## Requested capability
 
 When a real Eliot Memory OS connection exposes `eliot_compile_packet_l3`, request context for the concrete work goal before a material change. The requested tool argument is:
