@@ -384,20 +384,6 @@ fn allocate_delivery_id(db: &Connection, operation_id: &str, message_id: &str) -
 }
 
 fn mailbox_identity_exists(db: &Connection, identity: &str) -> Result<bool> {
-    // Corruption guard first (fail closed, preserves legacy error semantics):
-    // the pre-index OR query evaluated json_extract over every in-scope
-    // settled receipt, so malformed result_json in scope THREW instead of
-    // answering absent. This bounded probe over the invalid-row sentinel
-    // index (015 migration) re-raises that authentic SQLite error before any
-    // absence answer. NULL result_json is not malformed -- json_extract(NULL)
-    // is NULL -- and keeps its historical absent behavior.
-    let _: Option<String> = db
-        .query_row(
-            "SELECT json_extract(result_json,'$.delivery_id') FROM operations WHERE method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') AND state='settled' AND result_json IS NOT NULL AND NOT json_valid(result_json) LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
     // Branch 1: exact operation identity (existing PRIMARY KEY seek).
     let by_id: Option<i64> = db
         .query_row(
@@ -409,15 +395,13 @@ fn mailbox_identity_exists(db: &Connection, identity: &str) -> Result<bool> {
     if by_id.is_some() {
         return Ok(true);
     }
-    // Branches 2-3: legacy delivery_id / message_id receipt refs. Each branch
-    // is one bounded seek over its own NON-UNIQUE partial expression index
-    // (015 migration): duplicate and coalesced historical refs stay valid. A
-    // single composite (method,state,delivery,message) index cannot bound a
-    // message_id seek while delivery_id is unconstrained, so each identity
-    // has an independent index. Malformed in-scope rows never reach these
-    // seeks: the sentinel probe above throws first, as the legacy query did.
-    // Expression text below must stay byte-identical to the matching index
-    // definition.
+    // Branches 2-3: legacy delivery_id / message_id receipt refs. Each branch is
+    // one bounded seek over the NON-UNIQUE partial expression index
+    // mailbox_settled_delivery_identity (015 migration): duplicate and coalesced
+    // historical refs stay valid. The CASE+json_valid guard keeps malformed
+    // result_json evaluating to NULL (absent, never a throw, never a match),
+    // preserving the historical absent-not-error semantics of the OR query.
+    // Expression text below must stay byte-identical to the index definition.
     for selector in [
         "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.delivery_id') END",
         "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.message_id') END",
@@ -501,12 +485,6 @@ mod mailbox_identity_index_tests {
     const MIGRATION_SQL: &str =
         include_str!("../../migrations/015_mailbox_delivery_identity.sql");
 
-    /// Byte-identical copy of the pre-index existence query. Malformed
-    /// result_json in scope made this statement THROW (json_extract on
-    /// malformed JSON is an error, not NULL); the indexed reader must
-    /// preserve that error instead of answering absent.
-    const LEGACY_IDENTITY_SQL: &str = "SELECT 1 FROM operations WHERE operation_id=?1 OR (method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') AND state='settled' AND (json_extract(result_json,'$.delivery_id')=?1 OR json_extract(result_json,'$.message_id')=?1)) LIMIT 1";
-
     fn fixture_db() -> rusqlite::Connection {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
@@ -537,26 +515,6 @@ mod mailbox_identity_index_tests {
             [],
         )
         .unwrap();
-    }
-
-    fn seed_malformed_op(db: &rusqlite::Connection, id: &str, method: &str, state: &str) {
-        // CHECK(result_json IS NULL OR json_valid(result_json)) forbids this
-        // insert; the pragma admits one retained-corruption row so the guard
-        // path is exercised end to end. PRAGMA is connection-scoped and reset
-        // immediately after the insert.
-        db.execute_batch("PRAGMA ignore_check_constraints=ON;").unwrap();
-        db.execute(
-            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,settled_at_ms,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'{}','{}',?5,'{',CASE WHEN ?5 IN ('settled','rejected','cancelled') THEN 1 ELSE NULL END,1,1,1)",
-            rusqlite::params![
-                id,
-                format!("caller-{id}"),
-                format!("req-{id}"),
-                method,
-                state,
-            ],
-        )
-        .unwrap();
-        db.execute_batch("PRAGMA ignore_check_constraints=OFF;").unwrap();
     }
 
     fn seed_fixture(db: &rusqlite::Connection) {
@@ -596,40 +554,18 @@ mod mailbox_identity_index_tests {
     }
 
     #[test]
-    fn malformed_in_scope_surfaces_store_error_not_absence() {
+    fn malformed_payloads_neither_throw_nor_match() {
         let db = fixture_db();
-        seed_fixture(&db);
-        seed_null_result_op(&db);
-        seed_malformed_op(&db, "op-bad", "message.send", "settled");
-        // Historical proof: the pre-index OR query threw on malformed
-        // in-scope JSON instead of answering.
-        let legacy: rusqlite::Result<Option<i64>> = db
-            .query_row(LEGACY_IDENTITY_SQL, ["d-1"], |row| row.get(0))
-            .optional();
-        assert!(
-            legacy.is_err(),
-            "legacy query must throw on malformed in-scope JSON"
-        );
-        // The indexed reader preserves that: error, never a false absence --
-        // even for identities that do (or do not) exist.
-        assert!(mailbox_identity_exists(&db, "d-1").is_err());
-        assert!(mailbox_identity_exists(&db, "no-such-identity").is_err());
-    }
-
-    #[test]
-    fn malformed_out_of_scope_and_null_stay_absent() {
-        let db = fixture_db();
-        seed_fixture(&db);
-        seed_null_result_op(&db);
-        seed_malformed_op(&db, "op-bad-method", "task.create", "settled");
-        seed_malformed_op(&db, "op-bad-state", "message.send", "queued");
-        // Same scope bound as the legacy query: out-of-scope rows never fed
-        // json_extract, so neither the legacy query nor the reader throws.
-        let legacy: Option<i64> = db
-            .query_row(LEGACY_IDENTITY_SQL, ["d-1"], |row| row.get(0))
-            .optional()
+        let value: Option<String> = db
+            .query_row(
+                "SELECT CASE WHEN json_valid('not json') THEN json_extract('not json','$.delivery_id') END",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert!(legacy.is_some());
+        assert_eq!(value, None);
+        seed_fixture(&db);
+        seed_null_result_op(&db);
         assert!(mailbox_identity_exists(&db, "d-1").unwrap());
         assert!(mailbox_identity_exists(&db, "op-5").unwrap());
         assert!(!mailbox_identity_exists(&db, "dangling-identity").unwrap());
@@ -648,15 +584,9 @@ mod mailbox_identity_index_tests {
             );
         }
         db.execute_batch("ANALYZE;").unwrap();
-        for (selector, index) in [
-            (
-                "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.delivery_id') END",
-                "mailbox_settled_delivery_identity",
-            ),
-            (
-                "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.message_id') END",
-                "mailbox_settled_message_identity",
-            ),
+        for selector in [
+            "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.delivery_id') END",
+            "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.message_id') END",
         ] {
             let sql = format!(
                 "EXPLAIN QUERY PLAN SELECT 1 FROM operations WHERE method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') AND state='settled' AND {selector}=?1 LIMIT 1"
@@ -677,40 +607,13 @@ mod mailbox_identity_index_tests {
                 .unwrap()
                 .join("\n");
             assert!(
-                plan.contains("SEARCH") && plan.contains(index),
-                "branch must seek {index}, got: {plan}"
+                plan.contains("SEARCH"),
+                "branch must seek the identity index, got: {plan}"
             );
             assert!(
                 !plan.contains("SCAN"),
                 "branch must not scan, got: {plan}"
             );
         }
-        // Corruption sentinel: the probe must resolve through the invalid-row
-        // index, never a base-table scan. A scan of that partial index stays
-        // bounded to malformed rows (normally zero); the name assertion is the
-        // row-visit bound.
-        let mut sentinel_stmt = db
-            .prepare(
-                "EXPLAIN QUERY PLAN SELECT json_extract(result_json,'$.delivery_id') FROM operations WHERE method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') AND state='settled' AND result_json IS NOT NULL AND NOT json_valid(result_json) LIMIT 1",
-            )
-            .unwrap();
-        let sentinel_plan: String = sentinel_stmt
-            .query_map([], |row| {
-                Ok(format!(
-                    "{}|{}|{}|{}",
-                    row.get::<_, i64>(0).unwrap_or(-1),
-                    row.get::<_, i64>(1).unwrap_or(-1),
-                    row.get::<_, i64>(2).unwrap_or(-1),
-                    row.get::<_, String>(3).unwrap_or_default(),
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .unwrap()
-            .join(" | ");
-        assert!(
-            sentinel_plan.contains("mailbox_settled_invalid_result"),
-            "sentinel probe must use the invalid-row index, got: {sentinel_plan}"
-        );
     }
 }

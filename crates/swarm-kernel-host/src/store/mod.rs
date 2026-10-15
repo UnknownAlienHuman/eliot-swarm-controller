@@ -3823,7 +3823,7 @@ fn initialize_database(
     )?;
     install_schema_extension(
         tx,
-        "schema_extension:mailbox_delivery_identity:v2",
+        "schema_extension:mailbox_delivery_identity:v1",
         MAILBOX_IDENTITY_SCHEMA,
         &[],
     )?;
