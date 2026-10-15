@@ -131,6 +131,11 @@ jobs:
         run: |
           & pwsh -NoProfile -File tools/ci/Test-NativeJsonOutput.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Installed frontend inventory preserves legacy resource contracts
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tools/qualification/Test-InstallFrontendLegacyCompat.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Rustfmt attribution classifier self-test
         shell: pwsh
         run: |

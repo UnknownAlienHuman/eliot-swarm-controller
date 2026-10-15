@@ -36,12 +36,12 @@ enabled = false
 workspaceRoot = 'C:\Projects\YourRepository'
 modelId = 'sonnet'
 
-# Disabled. One owned Antigravity warm CLI process per binding; terminal
-# results use explicit local receipts because the CLI exposes no turn ID.
+# Disabled descriptor-backed Node bridge. Select its installed descriptor
+# before opening a binding; native turn and terminal qualification remain pending.
 [[routes]]
 alias = 'antigravity-manager'
-runtime = 'antigravity'
-module_artifact_id = 'antigravity-cli-warm-bridge.3'
+runtime = 'module'
+module_artifact_id = 'antigravity-cli-warm-bridge.4'
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'

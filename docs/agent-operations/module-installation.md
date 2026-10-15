@@ -53,7 +53,15 @@ Copy the selected descriptor template outside the checkout. Set `enabled` to `tr
 
 For Command version 3, keep the typed `module_host_config_path` argument marker unchanged; the supervisor materializes that schema-v1 IPC config inside the exact binding's private state directory at launch. Replace only the final `--config` argument with the absolute path to the operator-maintained Command native config JSON, and make sure that file exists and is readable by the adapter. The installer rejects unresolved `<INSTALLER_...>` and `REPLACE_AT_INSTALL` placeholders, preserves the typed marker, and copies neither the native config nor the Command CLI/mod. The native config contains the native executable and preserved mod paths; it does not select the model. Version 2 keeps its original descriptor and config contract for existing installations.
 
-For Antigravity, use descriptor version 4 with the exact command schemas
+The separate Antigravity Node artifact `antigravity-cli-warm-bridge.4` uses
+[`modules/antigravity/module-descriptor.template.json`](../../modules/antigravity/module-descriptor.template.json),
+the existing native Node executable and the pinned bridge resources included
+in the kernel-host package. Its route uses `runtime = 'module'`; the
+[Node setup guide](../../modules/antigravity/README.md#bridge4-descriptor-backed-setup)
+describes installation and selection. It is disabled by default and retains
+its own qualification boundary alongside the Rust artifact below.
+
+For the Antigravity Rust artifact, use descriptor version 4 with the exact command schemas
 `swarm.normalized_result_context@1`, `swarm.runtime_command@1`, and
 `swarm.task_dispatch_context@1`, plus the exact event schemas
 `swarm.normalized_result_page@1`, `swarm.runtime_outcome@1`, and

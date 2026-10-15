@@ -185,7 +185,19 @@ try {
     [void][IO.Directory]::CreateDirectory($emptyRoot)
     Assert-True ($null -eq (Get-InstalledFrontend 'swarm-kernel-host' $emptyRoot $spec 'swarm-mcp')) 'empty root still inventories as absent'
 } finally {
-    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -Confirm:$false }
+    $cleanupPath = [IO.Path]::GetFullPath($work)
+    $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $cleanupPath.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($cleanupPath) -notmatch '^legacy-compat-[0-9a-f]{32}$') {
+        throw 'Fixture cleanup target escaped its generated temporary directory.'
+    }
+    if (Test-Path -LiteralPath $cleanupPath) {
+        $cleanupItem = Get-Item -LiteralPath $cleanupPath -Force
+        if (($cleanupItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Fixture cleanup target became a reparse point.'
+        }
+        Remove-Item -LiteralPath $cleanupPath -Recurse -Force -Confirm:$false
+    }
 }
 if ($failures.Count -gt 0) { Write-Output ("FAILURES: $($failures.Count)"); exit 1 }
 Write-Output 'ALL PASS'
