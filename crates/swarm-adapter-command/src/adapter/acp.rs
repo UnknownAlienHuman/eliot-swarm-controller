@@ -198,7 +198,17 @@ struct SelectConfigSetting<'a> {
     field: &'a str,
     option: &'a SessionConfigOption,
     requested: &'a str,
-    current_options: &'a [SessionConfigOption],
+}
+
+struct SessionModeConfigContext<'a> {
+    connection: &'a ConnectionTo<Agent>,
+    journal: &'a AcpJournal,
+    command: &'a RuntimeCommand,
+    session_id: &'a SessionId,
+    requested_mode: Option<&'a str>,
+    advertised_modes: Option<&'a SessionModeState>,
+    options: &'a mut Vec<SessionConfigOption>,
+    capture: &'a Arc<Mutex<Capture>>,
 }
 
 struct CommandContext<'a> {
@@ -219,7 +229,9 @@ struct CommandContext<'a> {
 struct SessionRestoreContext<'a> {
     connection: &'a ConnectionTo<Agent>,
     journal: &'a AcpJournal,
-    link: &'a Link,
+    binding_id: &'a str,
+    generation: i64,
+    route: &'a Value,
     owner: &'a Owner,
     features: &'a AgentFeatures,
     capture: &'a Arc<Mutex<Capture>>,
@@ -1157,7 +1169,9 @@ pub(super) async fn run(
                                     SessionRestoreContext {
                                         connection: &connection,
                                         journal: &journal,
-                                        link: &link,
+                                        binding_id: &link.binding_id,
+                                        generation: link.generation,
+                                        route: &link.route,
                                         owner: &owner,
                                         features: &features,
                                         capture: &capture,
@@ -2143,6 +2157,14 @@ async fn open_session(
     context: SessionOpenContext<'_>,
     route: &SessionRouteConfiguration,
 ) -> Result<ActiveSession> {
+    open_session_with_policy(context, route, false).await
+}
+
+async fn open_session_with_policy(
+    context: SessionOpenContext<'_>,
+    route: &SessionRouteConfiguration,
+    require_initial_values: bool,
+) -> Result<ActiveSession> {
     let SessionOpenContext {
         connection,
         journal,
@@ -2185,10 +2207,13 @@ async fn open_session(
         .send_request(NewSessionRequest::new(workspace))
         .block_task()
         .await
-        .map_err(|_| {
+        .map_err(|native_error| {
             Error::new(
                 "ACP_SESSION_OPEN_UNKNOWN",
-                "ACP session/new response is uncertain",
+                format!(
+                    "ACP session/new failed with native JSON-RPC code {}; response is uncertain",
+                    i32::from(native_error.code)
+                ),
             )
         })?;
     let session_id = opened.session_id;
@@ -2204,7 +2229,8 @@ async fn open_session(
             &SessionConfigOptionCategory::ThoughtLevel,
         ),
         requested_mode: requested_mode.map(str::to_owned),
-        effective_mode: mode_current_value(opened.modes.as_ref()),
+        effective_mode: mode_current_value(opened.modes.as_ref())
+            .or_else(|| category_config_value(&options, &SessionConfigOptionCategory::Mode)),
         close_supported: false,
         closed: false,
     };
@@ -2267,7 +2293,17 @@ async fn open_session(
             "workspace":session.workspace,
             "requested_model":requested_model,
             "requested_effort":session.requested_effort,
-            "requested_mode":session.requested_mode
+            "requested_mode":session.requested_mode,
+            "initial_config_options":session_config_options_snapshot(&options).map_err(|error| {
+                Error::new(
+                    "ACP_SESSION_OPEN_UNKNOWN",
+                    format!("initial ACP configuration could not be retained: {}", error.code),
+                )
+            })?,
+            "initial_mode_id":mode_current_value(opened.modes.as_ref()),
+            "initial_mode_value_ids":opened.modes.as_ref().map(|modes| {
+                modes.available_modes.iter().map(|mode| mode.id.to_string()).collect::<Vec<_>>()
+            })
             }),
         )
         .map_err(|error| {
@@ -2279,39 +2315,62 @@ async fn open_session(
                 ),
             )
         })?;
+    if require_initial_values
+        && (!model_current_value_matches(&options, requested_model)
+            || requested_effort.is_some_and(|effort| {
+                !category_config_value_matches(
+                    &options,
+                    &SessionConfigOptionCategory::ThoughtLevel,
+                    effort,
+                )
+            })
+            || requested_mode.is_some_and(|mode| {
+                if opened.modes.is_some() {
+                    mode_current_value(opened.modes.as_ref()).as_deref() != Some(mode)
+                } else {
+                    !category_config_value_matches(
+                        &options,
+                        &SessionConfigOptionCategory::Mode,
+                        mode,
+                    )
+                }
+            }))
+    {
+        return Err(Error::new(
+            "CONFIGURATION_UNSUPPORTED",
+            "ACP live qualification requires the exact route values to match initial typed current values; no selector was changed",
+        ));
+    }
     if !model_value_available(&options, requested_model) {
         return Err(Error::new(
             "ACP_SESSION_OPEN_UNKNOWN",
             "ACP created a session but did not advertise one unambiguous typed option with the exact routed model value; the retained session requires readback",
         ));
     }
-    if !model_current_value_matches(&options, requested_model) {
-        let option_id = model_config_option_id(&options, requested_model).ok_or_else(|| {
-            Error::new(
-                "ACP_SESSION_OPEN_UNKNOWN",
-                "ACP model option identity is ambiguous; the retained session requires readback",
-            )
-        })?;
-        let option = config_option_by_id(&options, &option_id).ok_or_else(|| {
-            Error::new(
-                "ACP_SESSION_OPEN_UNKNOWN",
-                "ACP model option ID is missing or ambiguous in the advertised configuration",
-            )
-        })?;
-        options = set_select_config_option(
-            connection,
-            journal,
-            command,
-            &session_id,
-            SelectConfigSetting {
-                field: "model",
-                option,
-                requested: requested_model,
-                current_options: &options,
-            },
+    let option_id = model_config_option_id(&options, requested_model).ok_or_else(|| {
+        Error::new(
+            "ACP_SESSION_OPEN_UNKNOWN",
+            "ACP model option identity is ambiguous; the retained session requires readback",
         )
-        .await?;
-    }
+    })?;
+    let option = config_option_by_id(&options, &option_id).ok_or_else(|| {
+        Error::new(
+            "ACP_SESSION_OPEN_UNKNOWN",
+            "ACP model option ID is missing or ambiguous in the advertised configuration",
+        )
+    })?;
+    options = set_select_config_option(
+        connection,
+        journal,
+        command,
+        &session_id,
+        SelectConfigSetting {
+            field: "model",
+            option,
+            requested: requested_model,
+        },
+    )
+    .await?;
     if !model_current_value_matches(&options, requested_model) {
         return Err(Error::new(
             "ACP_SESSION_OPEN_UNKNOWN",
@@ -2336,7 +2395,6 @@ async fn open_session(
                 field: "effort",
                 option,
                 requested: effort,
-                current_options: &options,
             },
         )
         .await?;
@@ -2354,22 +2412,21 @@ async fn open_session(
     session.effective_effort =
         category_config_value(&options, &SessionConfigOptionCategory::ThoughtLevel);
 
-    if let Some(mode) = requested_mode {
-        session.effective_mode = Some(
-            set_session_mode(
-                connection,
-                journal,
-                command,
-                &session_id,
-                mode,
-                opened.modes.as_ref(),
-                capture,
-            )
-            .await?,
-        );
-    }
+    session.effective_mode = configure_session_mode(SessionModeConfigContext {
+        connection,
+        journal,
+        command,
+        session_id: &session_id,
+        requested_mode,
+        advertised_modes: opened.modes.as_ref(),
+        options: &mut options,
+        capture,
+    })
+    .await?;
     if session.effective_mode.is_none() {
-        session.effective_mode = capture_mode_readback(capture)?.0;
+        session.effective_mode = capture_mode_readback(capture)?
+            .0
+            .or_else(|| category_config_value(&options, &SessionConfigOptionCategory::Mode));
     }
     let config_snapshot = session_config_options_snapshot(&options).map_err(|error| {
         Error::new(
@@ -2428,7 +2485,6 @@ async fn set_select_config_option(
         field,
         option,
         requested,
-        current_options,
     } = setting;
     let config_id = option.id.to_string();
     if !config_select_contains(option, requested) {
@@ -2436,9 +2492,6 @@ async fn set_select_config_option(
             "CONFIGURATION_UNSUPPORTED",
             "ACP configuration option did not advertise the exact requested value",
         ));
-    }
-    if config_select_current(option).as_deref() == Some(requested) {
-        return Ok(current_options.to_vec());
     }
     let effect_id = format!("session/config-option/{field}");
     journal.record_effect(
@@ -2459,10 +2512,13 @@ async fn set_select_config_option(
         ))
         .block_task()
         .await
-        .map_err(|_| {
+        .map_err(|native_error| {
             Error::new(
                 "ACP_SESSION_OPEN_UNKNOWN",
-                "ACP config-option setter response is uncertain after session creation",
+                format!(
+                    "ACP config-option setter failed with native JSON-RPC code {}; response is uncertain after session creation",
+                    i32::from(native_error.code)
+                ),
             )
         })?;
     let actual =
@@ -2504,9 +2560,8 @@ async fn set_session_mode(
             "ACP did not advertise one unambiguous session mode with the exact requested value",
         ));
     }
-    if mode_current_value(advertised_modes).as_deref() == Some(requested_mode) {
-        return Ok(requested_mode.to_owned());
-    }
+    let initial_mode = mode_current_value(advertised_modes);
+    let already_selected = initial_mode.as_deref() == Some(requested_mode);
     let (_, updates_before) = capture_mode_readback(capture)?;
     journal.record_effect(
         command,
@@ -2524,12 +2579,33 @@ async fn set_session_mode(
         ))
         .block_task()
         .await
-        .map_err(|_| {
+        .map_err(|native_error| {
             Error::new(
                 "ACP_SESSION_OPEN_UNKNOWN",
-                "ACP mode setter response is uncertain after session creation",
+                format!(
+                    "ACP mode setter failed with native JSON-RPC code {}; response is uncertain after session creation",
+                    i32::from(native_error.code)
+                ),
             )
         })?;
+    let (immediate_mode, immediate_updates) = capture_mode_readback(capture)?;
+    if immediate_mode.as_deref() == Some(requested_mode)
+        && (already_selected || immediate_updates > updates_before)
+    {
+        journal.record_effect(
+            command,
+            "session/set-mode",
+            "receipt",
+            json!({
+                "native_session_id":session_id,
+                "requested_mode_id":requested_mode,
+                "effective_mode_id":requested_mode,
+                "readback_verified":true,
+                "readback_source":if immediate_updates > updates_before {"current_mode_update"}else{"session_new_current_mode"}
+            }),
+        )?;
+        return Ok(requested_mode.to_owned());
+    }
     let mode_readback = time::timeout(Duration::from_secs(2), async {
         loop {
             let (current, updates) = capture_mode_readback(capture)?;
@@ -2563,6 +2639,64 @@ async fn set_session_mode(
             "readback_verified":true
         }),
     )?;
+    Ok(effective_mode)
+}
+
+async fn configure_session_mode(context: SessionModeConfigContext<'_>) -> Result<Option<String>> {
+    let SessionModeConfigContext {
+        connection,
+        journal,
+        command,
+        session_id,
+        requested_mode,
+        advertised_modes,
+        options,
+        capture,
+    } = context;
+    let Some(requested_mode) = requested_mode else {
+        return Ok(mode_current_value(advertised_modes)
+            .or_else(|| category_config_value(options, &SessionConfigOptionCategory::Mode)));
+    };
+    if let Some(advertised_modes) = advertised_modes {
+        return set_session_mode(
+            connection,
+            journal,
+            command,
+            session_id,
+            requested_mode,
+            Some(advertised_modes),
+            capture,
+        )
+        .await
+        .map(Some);
+    }
+    let option = category_config_option(options, &SessionConfigOptionCategory::Mode)
+        .filter(|option| config_select_contains(option, requested_mode))
+        .ok_or_else(|| {
+            Error::new(
+                "CONFIGURATION_UNSUPPORTED",
+                "ACP did not advertise one unambiguous typed mode selector with the exact requested mode",
+            )
+        })?;
+    *options = set_select_config_option(
+        connection,
+        journal,
+        command,
+        session_id,
+        SelectConfigSetting {
+            field: "mode",
+            option,
+            requested: requested_mode,
+        },
+    )
+    .await?;
+    let effective_mode = category_config_value(options, &SessionConfigOptionCategory::Mode);
+    if effective_mode.as_deref() != Some(requested_mode) {
+        return Err(Error::new(
+            "ACP_SESSION_OPEN_UNKNOWN",
+            "ACP mode selector did not read back the exact requested value",
+        ));
+    }
     Ok(effective_mode)
 }
 
@@ -2700,10 +2834,13 @@ async fn load_retained_session(
         })?;
         finish_history_replay(&mut capture);
     }
-    loaded.map_err(|_| {
+    loaded.map_err(|native_error| {
         Error::new(
             "RECOVERY_REQUIRED",
-            "ACP session/load failed; original TaskPrompt will not be replayed",
+            format!(
+                "ACP session/load failed with native JSON-RPC code {}; original TaskPrompt will not be replayed",
+                i32::from(native_error.code)
+            ),
         )
     })
 }
@@ -2740,7 +2877,7 @@ fn validate_restore_configuration(
             "ACP session/load did not read back the retained exact effort configuration",
         ));
     }
-    let effective_mode = mode_current_value(modes).or_else(|| observed_mode_id.map(str::to_owned));
+    let effective_mode = mode_readback_value(options, modes, observed_mode_id);
     if requested_mode.is_some_and(|requested| effective_mode.as_deref() != Some(requested))
         || saved["effective_mode"]
             .as_str()
@@ -2762,7 +2899,9 @@ async fn restore_session(
     let SessionRestoreContext {
         connection,
         journal,
-        link,
+        binding_id,
+        generation,
+        route,
         owner,
         features,
         capture,
@@ -2777,9 +2916,9 @@ async fn restore_session(
         owner_operation_id,
     } = validate_restore_identity(
         &saved,
-        &link.binding_id,
-        link.generation,
-        &link.route,
+        binding_id,
+        generation,
+        route,
         features.load_session_supported,
     )?;
     journal.record_effect(
@@ -3861,6 +4000,23 @@ fn mode_current_value(modes: Option<&SessionModeState>) -> Option<String> {
     modes.map(|modes| modes.current_mode_id.to_string())
 }
 
+fn mode_readback_value(
+    options: &[SessionConfigOption],
+    modes: Option<&SessionModeState>,
+    observed_mode_id: Option<&str>,
+) -> Option<String> {
+    if let Some(modes) = modes {
+        return mode_current_value(Some(modes)).or_else(|| observed_mode_id.map(str::to_owned));
+    }
+    if options
+        .iter()
+        .any(|option| option.category.as_ref() == Some(&SessionConfigOptionCategory::Mode))
+    {
+        return category_config_value(options, &SessionConfigOptionCategory::Mode);
+    }
+    observed_mode_id.map(str::to_owned)
+}
+
 fn capture_mode_readback(capture: &Arc<Mutex<Capture>>) -> Result<(Option<String>, u64)> {
     let capture = capture
         .lock()
@@ -3876,15 +4032,8 @@ fn model_config_option<'a>(
     requested: &str,
 ) -> Option<&'a SessionConfigOption> {
     let mut candidates = options.iter().filter(|option| {
-        let category_is_model_candidate = matches!(
-            option.category.as_ref(),
-            None | Some(SessionConfigOptionCategory::Model)
-                | Some(SessionConfigOptionCategory::Other(_))
-        );
-        if !category_is_model_candidate {
-            return false;
-        }
-        config_select_contains(option, requested)
+        option.category.as_ref() == Some(&SessionConfigOptionCategory::Model)
+            && config_select_contains(option, requested)
     });
     let option = candidates.next()?;
     if candidates.next().is_some() {
@@ -4334,6 +4483,9 @@ fn invalid(message: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    mod installed_qualification;
+
     use std::{
         fs,
         path::PathBuf,
@@ -4368,8 +4520,8 @@ mod tests {
     use super::{
         AcpJournal, AcpLineCodec, MAX_ACP_FRAME_BYTES, PreparedAcpDispatch, SelectConfigSetting,
         acp_prompt, add_family_custody_facts, capture_session_notification, digest,
-        load_retained_session, set_select_config_option, set_session_mode, stop_direct_child,
-        validate_acp_route, validate_restore_identity,
+        load_retained_session, set_select_config_option, stop_direct_child, validate_acp_route,
+        validate_restore_identity,
     };
 
     struct TestState {
@@ -4761,6 +4913,53 @@ mod tests {
             &saved,
         )?;
         assert_eq!(mode_from_replay.1.as_deref(), Some("plan"));
+
+        let mut typed_mode_options = options.clone();
+        typed_mode_options.push(
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "plan",
+                vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("plan", "Plan"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Mode),
+        );
+        let typed_mode_readback = super::validate_restore_configuration(
+            &typed_mode_options,
+            None,
+            None,
+            "model-a",
+            Some("high"),
+            Some("plan"),
+            &saved,
+        )?;
+        assert_eq!(typed_mode_readback.1.as_deref(), Some("plan"));
+
+        typed_mode_options[2] = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "default",
+            vec![
+                SessionConfigSelectOption::new("default", "Default"),
+                SessionConfigSelectOption::new("plan", "Plan"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode);
+        assert_error_code(
+            super::validate_restore_configuration(
+                &typed_mode_options,
+                None,
+                None,
+                "model-a",
+                Some("high"),
+                Some("plan"),
+                &saved,
+            ),
+            "RECOVERY_REQUIRED",
+        );
         Ok(())
     }
 
@@ -4769,7 +4968,7 @@ mod tests {
         let state = TestState::new()?;
         let command = restore_command();
         let session_id = SessionId::new("session-config-fixture");
-        let initial = vec![
+        let initial = [
             SessionConfigOption::select(
                 "model",
                 "Model",
@@ -4790,11 +4989,23 @@ mod tests {
                 ],
             )
             .category(SessionConfigOptionCategory::ThoughtLevel),
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "default",
+                vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("plan", "Plan"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Mode),
         ];
         let (transport, mut peer) = Channel::duplex();
         let client_journal = state.journal.clone();
         let client_command = command.clone();
         let client_session_id = session_id.clone();
+        let mode_capture = Arc::new(Mutex::new(super::Capture::default()));
+        let client_capture = Arc::clone(&mode_capture);
         let client = Client
             .builder()
             .connect_with(transport, async move |connection| {
@@ -4807,7 +5018,6 @@ mod tests {
                         field: "model",
                         option: &initial[0],
                         requested: "model-b",
-                        current_options: &initial,
                     },
                 )
                 .await
@@ -4830,7 +5040,6 @@ mod tests {
                         field: "effort",
                         option: effort,
                         requested: "high",
-                        current_options: &selected_model,
                     },
                 )
                 .await
@@ -4840,12 +5049,43 @@ mod tests {
                     &SessionConfigOptionCategory::ThoughtLevel,
                     "high"
                 ));
+                let mut selected_options = selected_effort;
+                let selected_mode =
+                    super::configure_session_mode(super::SessionModeConfigContext {
+                        connection: &connection,
+                        journal: &client_journal,
+                        command: &client_command,
+                        session_id: &client_session_id,
+                        requested_mode: Some("plan"),
+                        advertised_modes: None,
+                        options: &mut selected_options,
+                        capture: &client_capture,
+                    })
+                    .await
+                    .map_err(super::to_acp_error)?
+                    .expect("requested mode returns an exact selector value");
+                assert_eq!(selected_mode, "plan");
+                let mut unsupported_options = Vec::new();
+                let unsupported_mode =
+                    super::configure_session_mode(super::SessionModeConfigContext {
+                        connection: &connection,
+                        journal: &client_journal,
+                        command: &client_command,
+                        session_id: &client_session_id,
+                        requested_mode: Some("bypass"),
+                        advertised_modes: None,
+                        options: &mut unsupported_options,
+                        capture: &client_capture,
+                    })
+                    .await;
+                assert_error_code(unsupported_mode, "CONFIGURATION_UNSUPPORTED");
                 Ok::<(), agent_client_protocol::Error>(())
             });
         let peer = async move {
-            for (expected_id, expected_value, model_value, effort_value) in [
-                ("model", "model-b", "model-b", "default"),
-                ("effort", "high", "model-b", "high"),
+            for (expected_id, expected_value, model_value, effort_value, mode_value) in [
+                ("model", "model-b", "model-b", "default", "default"),
+                ("effort", "high", "model-b", "high", "default"),
+                ("mode", "plan", "model-b", "high", "plan"),
             ] {
                 let Some(TransportFrame::Single(RawJsonRpcMessage::Request(request))) =
                     peer.rx.next().await
@@ -4880,6 +5120,16 @@ mod tests {
                         ],
                     )
                     .category(SessionConfigOptionCategory::ThoughtLevel),
+                    SessionConfigOption::select(
+                        "mode",
+                        "Mode",
+                        mode_value,
+                        vec![
+                            SessionConfigSelectOption::new("default", "Default"),
+                            SessionConfigSelectOption::new("plan", "Plan"),
+                        ],
+                    )
+                    .category(SessionConfigOptionCategory::Mode),
                 ];
                 peer.tx
                     .unbounded_send(TransportFrame::Single(RawJsonRpcMessage::response(
@@ -4899,7 +5149,7 @@ mod tests {
         .await
         .expect("config-option fixture timed out")
         .expect("config-option fixture failed");
-        assert_eq!(journal_effect_count(&state, &command)?, 4);
+        assert_eq!(journal_effect_count(&state, &command)?, 6);
         Ok(())
     }
 
@@ -4920,12 +5170,12 @@ mod tests {
             current_mode_id: Some("default".to_owned()),
             ..super::Capture::default()
         }));
-        let client_capture = Arc::clone(&capture);
         let client_journal = state.journal.clone();
         let client_command = command.clone();
         let client_session_id = session_id.clone();
         let peer_session_id = session_id.clone();
         let notification_capture = Arc::clone(&capture);
+        let client_capture = Arc::clone(&capture);
         let (transport, mut peer) = Channel::duplex();
         let client = Client
             .builder()
@@ -4939,17 +5189,20 @@ mod tests {
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(transport, async move |connection| {
-                let mode = set_session_mode(
-                    &connection,
-                    &client_journal,
-                    &client_command,
-                    &client_session_id,
-                    "plan",
-                    Some(&modes),
-                    &client_capture,
-                )
+                let mut options = Vec::new();
+                let mode = super::configure_session_mode(super::SessionModeConfigContext {
+                    connection: &connection,
+                    journal: &client_journal,
+                    command: &client_command,
+                    session_id: &client_session_id,
+                    requested_mode: Some("plan"),
+                    advertised_modes: Some(&modes),
+                    options: &mut options,
+                    capture: &client_capture,
+                })
                 .await
-                .map_err(super::to_acp_error)?;
+                .map_err(super::to_acp_error)?
+                .expect("requested mode returns an exact mode ID");
                 assert_eq!(mode, "plan");
                 Ok::<(), agent_client_protocol::Error>(())
             });
@@ -5594,21 +5847,31 @@ mod tests {
             "model-a",
             vec![SessionConfigSelectOption::new("model-a", "Model A")],
         )];
+        assert!(super::model_config_option_id(&untagged, "model-a").is_none());
+        assert!(!super::model_value_available(&untagged, "model-a"));
+        let custom = SessionConfigOption::select(
+            "custom-option",
+            "Custom",
+            "model-a",
+            vec![SessionConfigSelectOption::new("model-a", "Same value")],
+        )
+        .category(SessionConfigOptionCategory::Other("custom".to_owned()));
+        assert!(super::model_config_option_id(std::slice::from_ref(&custom), "model-a").is_none());
+        let typed_and_custom = vec![options[0].clone(), custom];
         assert_eq!(
-            super::model_config_option_id(&untagged, "model-a").as_deref(),
-            Some("provider-specific-model-option")
+            super::model_config_option_id(&typed_and_custom, "model-a").as_deref(),
+            Some("command-model-choice")
         );
-        let mut ambiguous = untagged.clone();
-        ambiguous.push(
+        let model_config = vec![
             SessionConfigOption::select(
-                "custom-option",
-                "Custom",
+                "model-tuning",
+                "Model tuning",
                 "model-a",
-                vec![SessionConfigSelectOption::new("model-a", "Same value")],
+                vec![SessionConfigSelectOption::new("model-a", "Model A")],
             )
-            .category(SessionConfigOptionCategory::Other("custom".to_owned())),
-        );
-        assert!(super::model_config_option_id(&ambiguous, "model-a").is_none());
+            .category(SessionConfigOptionCategory::ModelConfig),
+        ];
+        assert!(super::model_config_option_id(&model_config, "model-a").is_none());
         assert_eq!(
             snapshot,
             json!({
