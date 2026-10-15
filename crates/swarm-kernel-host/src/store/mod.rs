@@ -7358,6 +7358,8 @@ mod automation_transfer_tests;
 #[cfg(test)]
 mod capacity_tests;
 #[cfg(test)]
+mod claude_result_page_tests;
+#[cfg(test)]
 mod contract_decision_public_tests;
 #[cfg(test)]
 mod core_failure_tests;

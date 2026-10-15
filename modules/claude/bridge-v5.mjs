@@ -3,7 +3,7 @@
 // SDK. Host IPC reconnect never closes the SDK query or repeats input.
 // Artifact scope (bridge.5): Store TaskPrompt v1 bytes are submitted unchanged
 // and normalized admission is emitted only after the matching native UUID echo.
-// Attach/resume/configure/goal/steer/result pages remain unavailable.
+// Attach/resume/configure/goal/steer remain unavailable.
 import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -25,8 +25,9 @@ import { createInteractionManager } from './interactions.mjs';
 import { loadModuleBootstrap, verifyModuleHello, verifyModuleCommand } from './module-bootstrap-v5.mjs';
 import {
   createStreamState, applySdkMessage, notePermissionRequest, noteStderr,
-  noteStreamEnd, noteStreamFailure, snapshot,
+  noteStreamEnd, noteStreamFailure, resultSourceForInput, snapshot,
 } from './stream.mjs';
+import { publishClaudeResultPage } from './result-pages.mjs';
 
 const SDK_VERSION = '0.3.287';
 const MODULE_ARTIFACT_ID = CLAUDE_TASK_PROMPT_ARTIFACT_ID;
@@ -48,7 +49,7 @@ const CAPABILITIES = {
   pretool_use_guard: 'implemented',
   pretool_use_runtime_coverage: 'unknown',
   durable_defer: 'unavailable',
-  result_pages: 'unavailable',
+  result_pages: 'implemented',
   recover: 'unavailable',
 };
 const DEFERRED = Symbol('deferred-outcome');
@@ -200,6 +201,48 @@ function saveOutcome(command, result) {
     diagnostic_code: outcome.details?.diagnostic_code ?? null,
   });
   if (journal.size > 128) journal.delete(journal.keys().next().value);
+  changed();
+}
+
+async function publishResultPage(command) {
+  const sess = session;
+  if (!sess || sess.ended || !sess.identityAdopted || !sess.rootId
+      || command.native_root_id !== sess.rootId) {
+    throw codedError('NATIVE_SESSION_NOT_READY');
+  }
+  if (sess.resultAttempts.has(command.operation_id)) {
+    throw codedError('CLAUDE_RESULT_PAGE_REPLAY_PREVENTED', true);
+  }
+  const origin = command.input?.claude_result_origin;
+  const source = resultSourceForInput(
+    sess.state,
+    origin?.native_input_id,
+    origin?.native_session_id,
+  );
+  const link = control;
+  const { page, acknowledgement } = await publishClaudeResultPage(
+    command,
+    source?.execution,
+    source?.body,
+    moduleContract,
+    {
+      bridgeBootId: bootId,
+      nativeRootId: sess.rootId,
+      nativeScopeKey: sess.scopeKey,
+    },
+    (method, input) => link.call(method, input),
+    sess.resultAttempts,
+  );
+  journal.set(command.operation_id, {
+    method: 'agent.result',
+    outcome: 'applied',
+    completion_condition: 'result_page_recorded',
+    artifact_ref: acknowledgement.artifact_ref,
+    target_operation_id: origin.target_operation_id,
+    result_frame_uuid: page.source.result_frame_uuid,
+    bridge_boot_id: bootId,
+  });
+  while (journal.size > 128) journal.delete(journal.keys().next().value);
   changed();
 }
 async function retireAcceptedUnknown() {
@@ -392,7 +435,8 @@ async function startNative(command) {
   const input = new InputQueue();
   const sess = {
     state, input, query: null, preparedQuery: null, rootId: null, scopeKey: nativeScopeKey(),
-    requestedModel, pendingSends: new Map(), ended: false, firstDispatchStarted: false,
+    requestedModel, pendingSends: new Map(), resultAttempts: new Map(),
+    ended: false, firstDispatchStarted: false,
     identityAdopted: false, interactions: null,
   };
   sess.interactions = createInteractionManager({
@@ -565,6 +609,9 @@ async function execute(command) {
       const record = journal.get(targetId);
       if (!record) throw codedError('UNKNOWN_OPERATION');
       result = { details: { completion_condition: 'module_journal_readback', recorded: record } };
+    } else if (command.method === 'agent.result') {
+      await publishResultPage(command);
+      return;
     } else if (command.method === 'agent.configure') {
       throw capabilityError(command.input?.settings?.model !== undefined ? 'configure_model' : 'configure_effort');
     } else if (command.method === 'agent.goal') throw capabilityError('goal');
@@ -585,7 +632,6 @@ async function execute(command) {
       };
     }
     else if (command.method === 'agent.recover') throw capabilityError('recover');
-    else if (command.method === 'agent.result') throw capabilityError('result_pages');
     else throw codedError('UNSUPPORTED_OPERATION');
     if (session?.rootId && !(command.method === 'task.dispatch' && !session.identityAdopted)) {
       result.native_root_id = session.rootId;

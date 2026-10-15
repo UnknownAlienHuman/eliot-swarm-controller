@@ -28,6 +28,9 @@ const MAX_FRAME_UUIDS = 8192;
 const MAX_PERMISSION_REQUESTS = 32;
 const MAX_TASK_NOTIFICATIONS = 32;
 const MAX_INPUT_EXECUTIONS = 64;
+const MAX_RESULT_BODY_BYTES = 512_000;
+const MAX_RESULT_BODY_CACHE_BYTES = 2_097_152;
+const MAX_RESULT_BODY_CACHE_ENTRIES = 8;
 const SDK_RESULT_ERROR_SUBTYPES = new Set([
   'error_during_execution',
   'error_max_turns',
@@ -58,6 +61,8 @@ export function createStreamState() {
     permission_requests: [],
     task_notifications: [],
     input_executions: [], // native user UUID -> one exact SDK result frame, when unambiguous
+    result_bodies: new Map(), // private current-boot SDK result text, never included in snapshots
+    result_body_bytes: 0,
     native_events_seen: 0,
     partial_events_seen: 0,
     other_events: 0,
@@ -206,6 +211,54 @@ function compactUsageNumbers(value) {
   return Object.keys(out).length ? out : null;
 }
 
+function resultBody(msg) {
+  if (typeof msg.result === 'string') return msg.result;
+  if (Array.isArray(msg.errors)) {
+    return msg.errors.filter(error => typeof error === 'string').join('\n');
+  }
+  return null;
+}
+
+function retainResultBody(state, frameId, body, sha256, bytes) {
+  if (bytes > MAX_RESULT_BODY_BYTES) return;
+  const previous = state.result_bodies.get(frameId);
+  if (previous) state.result_body_bytes -= previous.bytes;
+  state.result_bodies.delete(frameId);
+  state.result_bodies.set(frameId, { body, sha256, bytes });
+  state.result_body_bytes += bytes;
+  while (state.result_bodies.size > MAX_RESULT_BODY_CACHE_ENTRIES
+      || state.result_body_bytes > MAX_RESULT_BODY_CACHE_BYTES) {
+    const oldest = state.result_bodies.keys().next().value;
+    if (oldest === undefined) break;
+    const evicted = state.result_bodies.get(oldest);
+    state.result_bodies.delete(oldest);
+    state.result_body_bytes -= evicted?.bytes ?? 0;
+  }
+}
+
+export function resultBodyForFrame(state, frameId) {
+  const entry = state?.result_bodies?.get(frameId);
+  if (!entry) return null;
+  // Treat this as a small boot-local LRU. Eviction loses page availability;
+  // it never authorizes a transcript rescan or native query replay.
+  state.result_bodies.delete(frameId);
+  state.result_bodies.set(frameId, entry);
+  return { ...entry };
+}
+
+export function resultSourceForInput(state, nativeInputId, nativeSessionId) {
+  const executions = state?.input_executions?.filter(event =>
+    event.native_input_id === nativeInputId
+      && event.native_session_id === nativeSessionId) ?? [];
+  if (executions.length !== 1) return null;
+  const execution = executions[0];
+  if (execution.correlation !== 'unique'
+      || execution.user_message_uuids?.length !== 1
+      || execution.user_message_uuids[0] !== nativeInputId) return null;
+  const body = resultBodyForFrame(state, execution.result_frame_uuid);
+  return body ? { execution: { ...execution }, body } : null;
+}
+
 function applyResult(state, msg) {
   const rawSubtype = typeof msg.subtype === 'string' && msg.subtype.length > 0
     ? msg.subtype
@@ -243,7 +296,9 @@ function applyResult(state, msg) {
     const uniqueLink = listedIds === null
       ? primaryId !== null
       : listedIds.length === 1 && listedIds[0] === primaryId;
-    const output = typeof msg.result === 'string' ? msg.result : null;
+    const output = resultBody(msg);
+    const outputBytes = output === null ? null : Buffer.byteLength(output, 'utf8');
+    const outputSha256 = output === null ? null : createHash('sha256').update(output, 'utf8').digest('hex');
     const inputExecution = {
       native_session_id: sessionId,
       native_input_id: null,
@@ -257,11 +312,14 @@ function applyResult(state, msg) {
       is_error: isError,
       stop_reason: typeof msg.stop_reason === 'string' ? msg.stop_reason : null,
       effective_model: typeof state.init?.model === 'string' ? state.init.model : null,
-      result_sha256: output === null ? null : createHash('sha256').update(output, 'utf8').digest('hex'),
-      result_bytes: output === null ? null : Buffer.byteLength(output, 'utf8'),
+      result_sha256: outputSha256,
+      result_bytes: outputBytes,
     };
     for (const inputId of inputExecution.user_message_uuids) {
       state.input_executions.push({ ...inputExecution, native_input_id: inputId });
+    }
+    if (uniqueLink && inputIds.length === 1 && output !== null && outputBytes !== null) {
+      retainResultBody(state, msg.uuid, output, outputSha256, outputBytes);
     }
     if (state.input_executions.length > MAX_INPUT_EXECUTIONS) {
       state.input_executions.splice(0, state.input_executions.length - MAX_INPUT_EXECUTIONS);

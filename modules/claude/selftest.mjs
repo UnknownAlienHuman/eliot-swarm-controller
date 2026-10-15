@@ -523,10 +523,12 @@ function messageById(snap, id) {
   assert.ok(bridgeText.includes("from './first-query-control.mjs'"), 'normal control seam imported');
   assert.ok(bridgeText.includes('PreToolUse'), 'normal bridge configures the permission hook guard');
   assert.ok(bridgeText.includes("command.method === 'agent.reply'"), 'normal bridge handles one-shot replies');
+  assert.ok(bridgeText.includes("command.method === 'agent.result'"), 'normal bridge publishes exact result pages');
   const descriptor = JSON.parse(await readFile(path.join(here, 'module-descriptor.template.json'), 'utf8'));
   assert.equal(descriptor.artifact.artifact_id, 'claude-agent-sdk-0.3.287-bridge.5');
   assert.ok(JSON.stringify(descriptor.launch).includes('bridge-v5.mjs'));
   assert.ok(descriptor.capabilities.includes('agent.reply'), 'bridge.5 publishes the live one-shot reply capability');
+  assert.ok(descriptor.capabilities.includes('agent.result'), 'bridge.5 advertises its implemented result-page path');
   assert.equal(JSON.stringify(descriptor).includes('FIRST_QUERY_FAULT'), false, 'standard descriptor carries no fault requirement');
   const faultEntry = await readFile(path.join(here, 'bridge-v5-fault-test.mjs'), 'utf8');
   assert.ok(faultEntry.includes('first-query-spawn-control.test.mjs'), 'fault scenario remains reproducible via its explicit entrypoint');

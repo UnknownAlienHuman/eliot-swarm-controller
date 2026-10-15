@@ -87,6 +87,7 @@
     "agent.reconcile",
     "agent.refresh",
     "agent.reply",
+    "agent.result",
     "agent.send/next_turn",
     "task.dispatch"
   ],

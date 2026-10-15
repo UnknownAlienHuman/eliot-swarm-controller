@@ -12,16 +12,18 @@ use serde_json::{Value, json};
 use swarm_contracts::module_catalog::PreInputOpenContract;
 
 pub const CLAUDE_RUNTIME: &str = "claude";
+pub const CLAUDE_MODULE_RUNTIME: &str = "module";
 pub const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.5";
 pub const CLAUDE_RETAINED_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.3";
 pub const CLAUDE_RETAINED_ARTIFACT_ID_V4: &str = "claude-agent-sdk-0.3.287-bridge.4";
 
 pub fn is_prepared_claude_route(route: &Value) -> bool {
     let artifact_id = route["module_artifact_id"].as_str();
-    route["runtime"] == CLAUDE_RUNTIME
-        && (artifact_id == Some(CLAUDE_ARTIFACT_ID)
-            || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID)
-            || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID_V4))
+    (route["runtime"] == CLAUDE_MODULE_RUNTIME && artifact_id == Some(CLAUDE_ARTIFACT_ID))
+        || (route["runtime"] == CLAUDE_RUNTIME
+            && (artifact_id == Some(CLAUDE_ARTIFACT_ID)
+                || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID)
+                || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID_V4)))
 }
 
 fn nonempty<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str> {
@@ -680,6 +682,26 @@ mod tests {
         let mut wrong_boot = open;
         wrong_boot.details["bridge_boot_id"] = json!("another-boot");
         assert!(validate_prepared_open(&binding, &wrong_boot).is_err());
+    }
+
+    #[test]
+    fn selected_bridge5_module_route_is_prepared_without_admitting_rust_artifact() {
+        let route = json!({
+            "runtime":CLAUDE_MODULE_RUNTIME,
+            "module_artifact_id":CLAUDE_ARTIFACT_ID
+        });
+        assert!(is_prepared_claude_route(&route));
+
+        for artifact_id in [CLAUDE_RETAINED_ARTIFACT_ID, CLAUDE_RETAINED_ARTIFACT_ID_V4] {
+            assert!(!is_prepared_claude_route(&json!({
+                "runtime":CLAUDE_MODULE_RUNTIME,
+                "module_artifact_id":artifact_id
+            })));
+        }
+        assert!(!is_prepared_claude_route(&json!({
+            "runtime":CLAUDE_MODULE_RUNTIME,
+            "module_artifact_id":"claude-agent-sdk-rust-controller.5"
+        })));
     }
 
     #[test]

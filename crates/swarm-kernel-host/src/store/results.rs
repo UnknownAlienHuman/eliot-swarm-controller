@@ -543,6 +543,7 @@ pub(super) fn load_claude_result_origin(
         || origin["target_method"] != "task.dispatch"
         || origin["binding_id"] != binding_id
         || origin["binding_generation"] != generation
+        || origin["bridge_boot_id"].as_str().is_none_or(str::is_empty)
         || origin["result_selector"]["kind"] != "claude_assistant_result"
         || origin["result_selector"]["input_operation_id"] != target_operation_id
         || !origin["result_selector"]["session_id"].is_string()
@@ -553,6 +554,21 @@ pub(super) fn load_claude_result_origin(
         return Err(Error::new(
             "RESULT_TARGET_ORIGIN_INVALID",
             "Claude result Operation has no valid sealed origin",
+        ));
+    }
+    let binding = operations::get_binding(db, binding_id, generation)?;
+    if binding["observation"]["bridge_boot_id"] != origin["bridge_boot_id"] {
+        return Err(Error::new(
+            "CLAUDE_RESULT_RETIRED_BOOT",
+            "Claude result page belongs to a replaced bridge boot",
+        ));
+    }
+    if binding["native_root_id"] != origin["native_session_id"]
+        || binding["native_scope_key"] != origin["native_scope_key"]
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_SCOPE_INVALID",
+            "Claude result page no longer matches the current native binding root",
         ));
     }
     let result_raw: String = db.query_row(
@@ -593,21 +609,20 @@ pub(super) fn load_claude_result_origin(
                 "Claude result target has no typed retained outcome",
             )
         })?;
-    if target_outcome.operation_id != target_operation_id
-        || !matches!(target_outcome.outcome, EffectOutcome::Applied)
-        || target_outcome.native_root_id.as_deref() != origin["native_session_id"].as_str()
-        || target_outcome.native_scope_key.as_deref() != origin["native_scope_key"].as_str()
-        || target_outcome.details["completion_condition"] != "native_input_admitted"
-        || target_outcome.details["execution_complete"] != false
-        || target_outcome.details["task_completion"] != "unknown"
-        || target_outcome.details["module_receipt"] != origin["target_module_receipt"]
-        || target_outcome.details["dispatch_admission"] != origin["dispatch_admission"]
-    {
-        return Err(Error::new(
-            "RESULT_TARGET_NOT_ADMITTED",
-            "Claude result target differs from the sealed native admission",
-        ));
-    }
+    let target_module_receipt: swarm_contracts::runtime::ModuleReceiptIdentity =
+        serde_json::from_value(origin["target_module_receipt"].clone()).map_err(|_| {
+            Error::new(
+                "RESULT_TARGET_ORIGIN_INVALID",
+                "sealed Claude result origin has an invalid module receipt",
+            )
+        })?;
+    let retained_module_receipt: swarm_contracts::runtime::ModuleReceiptIdentity =
+        serde_json::from_value(target_outcome.details["module_receipt"].clone()).map_err(|_| {
+            Error::new(
+                "RESULT_TARGET_RECEIPT_INVALID",
+                "Claude result target has an invalid module receipt",
+            )
+        })?;
     let admission: swarm_contracts::runtime::TaskDispatchAdmissionReceipt =
         serde_json::from_value(origin["dispatch_admission"].clone()).map_err(|_| {
             Error::new(
@@ -615,12 +630,43 @@ pub(super) fn load_claude_result_origin(
                 "sealed Claude result origin has an invalid dispatch admission",
             )
         })?;
+    let retained_admission: swarm_contracts::runtime::TaskDispatchAdmissionReceipt =
+        serde_json::from_value(target_outcome.details["dispatch_admission"].clone()).map_err(
+            |_| {
+                Error::new(
+                    "RESULT_TARGET_RECEIPT_INVALID",
+                    "Claude result target has an invalid dispatch admission",
+                )
+            },
+        )?;
+    if target_outcome.operation_id != target_operation_id
+        || !matches!(target_outcome.outcome, EffectOutcome::Applied)
+        || target_outcome.native_root_id.as_deref() != origin["native_session_id"].as_str()
+        || target_outcome.native_scope_key.as_deref() != origin["native_scope_key"].as_str()
+        || target_outcome.details["bridge_boot_id"] != origin["bridge_boot_id"]
+        || target_outcome.details["completion_condition"] != "native_input_admitted"
+        || target_outcome.details["execution_complete"] != false
+        || target_outcome.details["task_completion"] != "unknown"
+        || retained_module_receipt != target_module_receipt
+        || retained_admission != admission
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_NOT_ADMITTED",
+            "Claude result target differs from the sealed native admission",
+        ));
+    }
     admission.validate().map_err(|_| {
         Error::new(
             "RESULT_TARGET_ORIGIN_INVALID",
             "sealed Claude result dispatch admission is invalid",
         )
     })?;
+    if admission.worker_boot_id != origin["bridge_boot_id"] {
+        return Err(Error::new(
+            "RESULT_TARGET_ORIGIN_INVALID",
+            "Claude result dispatch admission belongs to another bridge boot",
+        ));
+    }
     if serde_json::to_value(&admission.module_receipt)? != origin["target_module_receipt"]
         || admission.operation_id != target_operation_id
         || admission.binding_id != binding_id
@@ -714,12 +760,9 @@ pub(super) fn antigravity_status_page_bytes(metadata: &Value) -> Result<Vec<u8>>
     }))?)
 }
 
-/// Re-admit only an already-authenticated Claude result against its retained
-/// binding generation and sealed dispatch origin. Historical result pages may
-/// arrive after the binding or current module link has been released, so this
-/// deliberately avoids the live `runtime::scope` release/link checks. The
-/// module registration, result Operation, retained target and immutable origin
-/// still have to agree before any page is prepared or recorded.
+/// Admit a Claude result page only on the current authenticated module link and
+/// boot. The sealed result origin still binds it to the exact result Operation,
+/// dispatch receipt, native root and input before any page is prepared.
 fn admitted_claude_result_scope(
     db: &Connection,
     p: &Principal,
@@ -752,13 +795,13 @@ fn admitted_claude_result_scope(
         return Ok(None);
     }
 
-    let binding_id = model::text(&client, "binding_id")?.to_owned();
-    let generation = model::positive(&client, "binding_generation")?;
-    let binding = operations::get_binding(db, &binding_id, generation)?;
-    if binding["observation"]["module_client_id"] != p.client_id {
+    let (binding_id, generation, binding) = runtime::scope(db, p, true)?;
+    if binding["observation"]["module_client_id"] != p.client_id
+        || binding["observation"]["module_link_id"] != p.link_id
+    {
         return Err(Error::new(
             "MODULE_OWNER_MISMATCH",
-            "credential does not own the retained Claude result binding",
+            "credential does not own the current Claude result module link",
         ));
     }
     // The Manager is the result Operation's caller; the Module is its carrier.
@@ -937,6 +980,7 @@ pub(super) fn prepare(
         context["target_task_id"] = origin["target_task_id"].clone();
         context["target_task_revision"] = origin["target_task_revision"].clone();
         context["native_session_id"] = origin["native_session_id"].clone();
+        context["bridge_boot_id"] = origin["bridge_boot_id"].clone();
         context["native_input_id"] = origin["native_input_id"].clone();
         context["native_payload_sha256"] = origin["native_payload_sha256"].clone();
         context["native_payload_bytes"] = origin["native_payload_bytes"].clone();
@@ -971,6 +1015,7 @@ pub(super) fn validate_claude_assistant_result_source(
         source,
         &[
             "kind",
+            "bridge_boot_id",
             "result_operation_id",
             "result_input_sha256",
             "result_module_receipt",
@@ -1006,6 +1051,7 @@ pub(super) fn validate_claude_assistant_result_source(
         .filter(|bytes| *bytes <= 512_000)
         .ok_or_else(|| Error::invalid("Claude result byte length is invalid"))?;
     if source["kind"] != "claude_assistant_result"
+        || source["bridge_boot_id"] != context["bridge_boot_id"]
         || source["result_operation_id"] != context["operation_id"]
         || source["result_input_sha256"] != context["result_input_sha256"]
         || source["result_module_receipt"] != context["result_module_receipt"]
@@ -1258,6 +1304,7 @@ pub(super) fn record(
         ]);
     } else if artifact.metadata["selector"]["kind"] == "claude_assistant_result" {
         context_keys.extend([
+            "bridge_boot_id",
             "result_input_sha256",
             "result_module_receipt",
             "target_operation_id",

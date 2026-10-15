@@ -1959,6 +1959,35 @@ fn next_internal(
                     "Claude assistant results require the exact task.dispatch and prepared session",
                 ));
             }
+            let selected = b["observation"]
+                .get("module_contract_selector")
+                .ok_or_else(|| {
+                    Error::new(
+                        "MODULE_DESCRIPTOR_MISSING",
+                        "Claude result admission requires the selected bridge.5 descriptor",
+                    )
+                })?;
+            let retained = super::module_handshake::retained_contract_identity(
+                &tx,
+                model::text(&b, "module_artifact_id")?,
+                Some(selected),
+            )?
+            .ok_or_else(|| {
+                Error::new(
+                    "MODULE_DESCRIPTOR_MISSING",
+                    "Claude result admission has no retained bridge descriptor",
+                )
+            })?;
+            if !retained
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == "agent.result")
+            {
+                return Err(Error::new(
+                    "RESULT_SELECTOR_UNSUPPORTED",
+                    "selected Claude bridge does not advertise agent.result",
+                ));
+            }
         }
         if antigravity_status_result {
             if b["route"]["runtime"] != "antigravity" {
@@ -2027,6 +2056,16 @@ fn next_internal(
     } else {
         None
     };
+    if claude_assistant_result {
+        let origin = effective["claude_result_origin"].clone();
+        if !origin.is_object() {
+            return Err(Error::new(
+                "RESULT_TARGET_ORIGIN_INVALID",
+                "Claude result command has no Store-sealed origin",
+            ));
+        }
+        input["claude_result_origin"] = origin;
+    }
     let command = RuntimeCommand {
         operation_id: op,
         method,
@@ -4995,6 +5034,15 @@ fn seal_claude_result_origin(
         &target_outcome,
         &target_receipt,
     )?;
+    let bridge_boot_id = model::text(&binding["observation"], "bridge_boot_id")?;
+    if target_outcome.details["bridge_boot_id"] != bridge_boot_id
+        || admission.worker_boot_id != bridge_boot_id
+    {
+        return Err(Error::new(
+            "RESULT_TARGET_RETIRED_BOOT",
+            "Claude result target was admitted by a different bridge boot",
+        ));
+    }
     let producer = attempt["producers"]
         .as_array()
         .and_then(|producers| {
@@ -5078,6 +5126,7 @@ fn seal_claude_result_origin(
         "target_task_revision":attempt["task_revision"],
         "binding_id":binding_id,
         "binding_generation":generation,
+        "bridge_boot_id":bridge_boot_id,
         "native_session_id":native_session_id,
         "native_scope_key":binding["native_scope_key"],
         "native_input_id":admission.native_input_id,
