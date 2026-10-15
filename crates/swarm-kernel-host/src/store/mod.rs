@@ -63,6 +63,7 @@ mod module_credential;
 pub(crate) mod module_demand;
 pub(crate) use legacy_worker_demand::LegacyWorkerDemand;
 mod module_handshake;
+mod module_observations;
 mod module_supervisor_observation;
 mod monitor;
 mod native_mcp;
