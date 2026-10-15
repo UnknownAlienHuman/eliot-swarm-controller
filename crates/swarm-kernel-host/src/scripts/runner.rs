@@ -702,7 +702,106 @@ fn script_child_family_departed(owner: &ScriptChildOwner) -> bool {
     } else {
         departed_empty(process, &owner.token)
     };
-    departed.unwrap_or(false)
+    match departed {
+        Ok(departed) => departed,
+        // A positively validated terminal receipt is a second, exact proof
+        // path only when the token-named Job has already disappeared. Keep
+        // querying a present Job so live descendants still fence custody.
+        Err(error) if error.code == "PROCESS_FAMILY_UNKNOWN" => {
+            terminal_completion_confirms_child_family_departure(owner, launch)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Consume the same full terminal wire validation used by reconciliation, then
+/// bind its worker identity to the birth tuple captured from the retained Child.
+/// The mutable ready receipt alone never proves family departure.
+fn terminal_completion_confirms_child_family_departure(
+    owner: &ScriptChildOwner,
+    launch: &Value,
+) -> bool {
+    let Some(run_id) = launch["run_id"].as_str() else {
+        return false;
+    };
+    let Ok(dir) = directory(&owner.data_dir, run_id) else {
+        return false;
+    };
+    let Ok((work, work_digest)) = read_work_record(&dir.join("receipt.json")) else {
+        return false;
+    };
+    if work_digest != owner.work_digest
+        || work.data_dir != owner.data_dir
+        || work.run_id != run_id
+        || work.operation_id != owner.operation_id
+        || work.token != owner.token
+        || validate_script_launch_identity(&work, launch).is_err()
+    {
+        return false;
+    }
+    let Ok(files) = ArtifactFiles::new(&work.data_dir) else {
+        return false;
+    };
+    let Ok(Some(completion)) = completion(&work, &files) else {
+        return false;
+    };
+    completion.run_id == work.run_id
+        && completion.operation_id == owner.operation_id
+        && completion.token == owner.token
+        && completion_confirms_family_release(&completion)
+        && script_launch_birth_matches_worker(
+            &launch["process"],
+            &completion.process,
+            owner.pid,
+            &owner.token,
+        )
+}
+
+fn script_launch_birth_matches_worker(
+    launch: &Value,
+    worker: &Value,
+    expected_pid: u32,
+    token: &str,
+) -> bool {
+    if launch["scope"] != "launcher_spawned_process"
+        || launch["purpose"] != "check"
+        || launch["pid"].as_u64() != Some(u64::from(expected_pid))
+        || worker["purpose"] != "script"
+        || worker["pid"] != launch["pid"]
+    {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        worker["scope"] == "windows_job"
+            && worker["job_name"] == format!("Global\\EliotSwarmCheck-{token}")
+            && launch["creation_filetime"].as_u64().is_some()
+            && launch["creation_filetime"] == worker["creation_filetime"]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = token;
+        let launch_start = launch["start_ticks"]
+            .as_str()
+            .filter(|value| !value.is_empty());
+        let worker_start = worker["start_ticks"]
+            .as_str()
+            .filter(|value| !value.is_empty());
+        let launch_boot = launch["boot_id"].as_str().filter(|value| !value.is_empty());
+        let worker_boot = worker["boot_id"].as_str().filter(|value| !value.is_empty());
+        worker["scope"] == "linux_process_group"
+            && worker["pgid"].as_u64() == worker["pid"].as_u64()
+            && launch_start.is_some()
+            && launch_start == worker_start
+            && launch_boot.is_some()
+            && launch_boot == worker_boot
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (launch, worker, expected_pid, token);
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1189,6 +1288,10 @@ pub fn terminal_receipt_exists(data_dir: &Path, run_id: &str) -> Result<bool> {
 #[path = "runner_durable_authority_tests.rs"]
 pub(crate) mod durable_authority_tests;
 
+#[cfg(all(test, any(windows, target_os = "linux")))]
+#[path = "runner_terminal_receipt_tests.rs"]
+mod terminal_receipt_tests;
+
 pub fn started_receipt_exists(data_dir: &Path, run_id: &str) -> Result<bool> {
     receipt_exists(&directory(data_dir, run_id)?.join("started.json"))
 }
@@ -1524,8 +1627,9 @@ fn capture_fact_matches_length(fact: &Value, byte_length: u64) -> bool {
 }
 
 /// A validated terminal receipt is written only after interpreter output has
-/// been drained and the worker has disarmed its owned Group. Wait for that
-/// exact worker Group to leave before Store applies any declared effects.
+/// been drained and the worker has disarmed its owned Group. Query that exact
+/// Group before Store applies effects; if its name is gone, require the
+/// terminal release facts to match the persisted launch birth identity.
 pub fn completion_family_departed(work: &Work, completion: &Completion) -> Result<bool> {
     let dir = directory(&work.data_dir, &work.run_id)?;
     let worker = read_json(&dir.join("worker.json"))?;
@@ -1543,7 +1647,65 @@ pub fn completion_family_departed(work: &Work, completion: &Completion) -> Resul
             "terminal ScriptRun does not retain its exact worker process identity",
         ));
     }
-    departed_empty(&completion.process, &work.token)
+    if completion
+        .process_facts
+        .as_ref()
+        .is_some_and(|_| !completion_process_facts_valid(completion))
+    {
+        return Ok(false);
+    }
+    match departed_empty(&completion.process, &work.token) {
+        Ok(departed) => Ok(departed),
+        Err(error) if error.code == "PROCESS_FAMILY_UNKNOWN" => {
+            Ok(completion_confirms_family_release(completion)
+                && completion_matches_persisted_launch(work, completion, &dir))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn completion_matches_persisted_launch(
+    work: &Work,
+    completion: &Completion,
+    run_dir: &Path,
+) -> bool {
+    let Ok(launch) = read_json(&run_dir.join("launch.json")) else {
+        return false;
+    };
+    if launch["process"].is_null() || validate_script_launch_identity(work, &launch).is_err() {
+        return false;
+    }
+    let Some(pid) = launch["process"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return false;
+    };
+    script_launch_birth_matches_worker(&launch["process"], &completion.process, pid, &work.token)
+}
+
+fn completion_process_facts_valid(completion: &Completion) -> bool {
+    let Some(facts) = completion.process_facts.as_ref() else {
+        return false;
+    };
+    validate_process_facts(facts, &completion.process, false).is_ok()
+        && capture_fact_matches_length(&facts["stdout_capture"], completion.stdout.byte_length)
+        && capture_fact_matches_length(&facts["stderr_capture"], completion.stderr.byte_length)
+}
+
+fn completion_confirms_family_release(completion: &Completion) -> bool {
+    completion.process["purpose"] == "script"
+        && matches!(
+            completion.process["scope"].as_str(),
+            Some("windows_job" | "linux_process_group")
+        )
+        && completion_process_facts_valid(completion)
+        && completion.process_facts.as_ref().is_some_and(|facts| {
+            facts["resource_released"] == true
+                && facts["cleanup_pending"] == false
+                && facts["family_departure"]["state"] == "confirmed"
+                && facts["family_departure"]["process"] == completion.process
+        })
 }
 
 fn output_matches(work: &Work, stream: &str, artifact: &ArtifactRecord) -> bool {
