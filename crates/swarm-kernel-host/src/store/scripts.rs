@@ -3266,16 +3266,66 @@ fn validate_script_custody_process(
     child: Option<&runner::ScriptChildObservation>,
     process: &Value,
 ) -> Result<()> {
-    if child
+    let Some(launcher_process) = child
         .and_then(|child| child.launch.as_ref())
-        .is_some_and(|launch| launch["process"] != *process)
-    {
+        .map(|launch| &launch["process"])
+    else {
+        return Ok(());
+    };
+    if !script_launcher_birth_matches_worker(launcher_process, process) {
         return Err(Error::new(
             "SCRIPT_LAUNCH_DAMAGED",
-            "completion process identity differs from Store-owned Child launch identity",
+            "completion worker identity differs from the Store-owned Child birth identity",
         ));
     }
     Ok(())
+}
+
+/// The Store launch and worker receipts describe the same direct child at two
+/// different lifecycle points: the launch is a `check` child, while the worker
+/// receipt identifies that process after it creates its script process group/Job.
+/// Bind those schemas using the immutable process birth tuple, never by
+/// comparing their intentionally different scope and purpose labels.
+fn script_launcher_birth_matches_worker(launcher: &Value, worker: &Value) -> bool {
+    if launcher["scope"] != "launcher_spawned_process"
+        || launcher["purpose"] != "check"
+        || worker["purpose"] != "script"
+        || launcher["pid"].as_u64().is_none()
+        || launcher["pid"] != worker["pid"]
+    {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        worker["scope"] == "windows_job"
+            && launcher["creation_filetime"].as_u64().is_some()
+            && launcher["creation_filetime"] == worker["creation_filetime"]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let launcher_start = launcher["start_ticks"]
+            .as_str()
+            .filter(|value| !value.is_empty());
+        let worker_start = worker["start_ticks"]
+            .as_str()
+            .filter(|value| !value.is_empty());
+        let launcher_boot = launcher["boot_id"]
+            .as_str()
+            .filter(|value| !value.is_empty());
+        let worker_boot = worker["boot_id"].as_str().filter(|value| !value.is_empty());
+        worker["scope"] == "linux_process_group"
+            && launcher["spawned_pgid"].as_i64().is_some()
+            && worker["pgid"].as_u64() == worker["pid"].as_u64()
+            && launcher_start.is_some()
+            && launcher_start == worker_start
+            && launcher_boot.is_some()
+            && launcher_boot == worker_boot
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
 }
 
 fn record_cleanup_pending(
