@@ -92,7 +92,11 @@ assert.deepEqual(questionResult.updatedInput.answers, {
 assert.deepEqual(manager.snapshot(), []);
 assert.throws(() => manager.reply(questionCommand), /INTERACTION_REPLY_MISMATCH/);
 
-const permissionInput = { file_path: 'C:\\fixture\\report.txt' };
+const dynamicPrivateKey = 'ghp_0123456789abcdef0123456789abcdef';
+const permissionInput = {
+  file_path: 'C:\\fixture\\report.txt',
+  [dynamicPrivateKey]: 'opaque dynamic field',
+};
 const permissionToolUseId = 'toolu_permission_fixture';
 assert.equal(manager.preToolUse({
   hook_event_name: 'PreToolUse',
@@ -109,6 +113,8 @@ const permissionPromise = manager.canUseTool('Read', permissionInput, {
 const publicPermission = requests.at(-1);
 assert.equal(publicPermission.kind, 'permission');
 assert.equal(JSON.stringify(publicPermission).includes('report.txt'), false);
+assert.equal(JSON.stringify(publicPermission).includes(dynamicPrivateKey), false);
+assert.deepEqual(publicPermission.input.fields.map(field => field.name), ['field_1', 'field_2']);
 
 const changedReply = {
   type: 'permission',

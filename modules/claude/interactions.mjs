@@ -4,7 +4,6 @@ const MAX_PENDING = 8;
 const MAX_REQUEST_BYTES = 32 * 1024;
 const MAX_REPLY_BYTES = 16 * 1024;
 const MAX_EVENTS = 32;
-const SECRET_KEY = /token|secret|api[-_]?key|authorization|password|credential/i;
 
 function codedError(code) {
   const error = new Error(code);
@@ -91,11 +90,11 @@ function safeQuestionProjection(input, secrets) {
 }
 
 function permissionProjection(input) {
-  const fields = Object.keys(input).sort().slice(0, 64).map(key => ({
-    name: SECRET_KEY.test(key) ? '[redacted field]' : key.slice(0, 128),
-    type: Array.isArray(input[key]) ? 'array'
-      : input[key] === null ? 'null'
-        : typeof input[key] === 'object' ? 'object' : typeof input[key],
+  const fields = Object.values(input).slice(0, 64).map((value, index) => ({
+    name: `field_${index + 1}`,
+    type: Array.isArray(value) ? 'array'
+      : value === null ? 'null'
+        : typeof value === 'object' ? 'object' : typeof value,
   }));
   return { field_count: Object.keys(input).length, fields };
 }
