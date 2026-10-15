@@ -1147,6 +1147,13 @@ jobs:
               'store_startup_rejects_unclassifiable_outbox_identity_without_mutation',
               'store_startup_keeps_decoded_journal_identity_and_root_mismatches_fail_closed'
             )
+            Invoke-FocusedCohort -Package 'swarm-telemetry' -Filter 'tests::' -Expected 5 -ExpectedNames @(
+              'stderr_failure_keeps_observer_admission_without_retrying_stderr',
+              'stderr_failure_without_observer_is_terminal_and_does_not_retry',
+              'observer_panic_does_not_disable_healthy_stderr',
+              'bounded_queue_rejects_overload_and_flush_waits_for_active_write',
+              'bounded_queue_rejects_byte_overload_without_exceeding_capacity'
+            )
             Invoke-FocusedCohort -Package 'swarm-adapter-claude' -Filter 'legacy_question_reply' -Expected 4 -ExpectedNames @(
               'reading_legacy_question_reply_removes_raw_keys_and_preserves_ack_identity',
               'schema_two_partial_migration_scrubs_legacy_question_reply_only',

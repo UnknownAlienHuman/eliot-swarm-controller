@@ -405,13 +405,20 @@ pub(super) fn producer_projection(
             "expires_at_ms":policy.expires_at_ms,
         })
     });
+    let producer_stats = producer.stats();
     json!({
         "configured":configured["configured"],
         "durable_policy_active":configured["active"],
         "configured_policy_live_in_producer":configured_policy_matches,
         "producer_selected_policy":live_policy,
         "scoped_filter_count":producer.scoped_filter_count(),
-        "sink":format!("{:?}", producer.stats().sink_state).to_lowercase(),
+        "sink":format!("{:?}", producer_stats.sink_state).to_lowercase(),
+        "sink_kind":"stderr",
+        "producer_worker_state":format!("{:?}", producer_stats.worker_state).to_lowercase(),
+        "producer_stderr_state":format!("{:?}", producer_stats.stderr_state).to_lowercase(),
+        "producer_stderr_failures":producer_stats.stderr_failures,
+        "producer_worker_failures":producer_stats.worker_failures,
+        "producer_observer_panics":producer_stats.observer_panics,
         "text_capture_path_ready":components.ready(),
         "producer_enabled":components.producer_enabled,
         "observer_callback_attached":components.observer_attached,
