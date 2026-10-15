@@ -819,14 +819,28 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
     );
 
     let reassignment_id = "bridge5-result-reassigned-attempt";
+    let reassignment_manager_id = "bridge5-result-reassigned-manager";
+    let unrelated_manager_id = "bridge5-result-unrelated-manager";
     let reassignment_id_for_store = reassignment_id.to_owned();
+    let reassignment_manager_for_store = reassignment_manager_id.to_owned();
+    let unrelated_manager_for_store = unrelated_manager_id.to_owned();
     owner
         .store
         .run_fixture(move |db| {
-            let (snapshot, owner_id): (String, String) = db.query_row(
-                "SELECT task_snapshot_json,owner_id FROM attempts WHERE attempt_id=?1",
+            let snapshot: String = db.query_row(
+                "SELECT task_snapshot_json FROM attempts WHERE attempt_id=?1",
                 [ATTEMPT_ID],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
+            )?;
+            super::set_meta(
+                db,
+                &format!("client:{reassignment_manager_for_store}"),
+                &json!({"role":"manager","disabled":false}),
+            )?;
+            super::set_meta(
+                db,
+                &format!("client:{unrelated_manager_for_store}"),
+                &json!({"role":"manager","disabled":false}),
             )?;
             db.execute(
                 "UPDATE attempts SET state='superseded',released_at_ms=2,updated_at_ms=2 WHERE attempt_id=?1 AND released_at_ms IS NULL",
@@ -839,7 +853,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
                     reassignment_id_for_store,
                     TASK_ID,
                     snapshot,
-                    owner_id,
+                    reassignment_manager_for_store,
                     BINDING_ID
                 ],
             )?;
@@ -918,6 +932,56 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
         .expect("retain readback for the already committed historical result");
     assert_eq!(historical_artifact["content"], RESULT_TEXT);
     assert_eq!(historical_artifact["eof"], true);
+    let reassigned_manager = Principal {
+        link_id: "bridge5-result-reassigned-manager-link".to_owned(),
+        client_id: reassignment_manager_id.to_owned(),
+        role: Role::Manager,
+    };
+    let current_task_grant = owner
+        .store
+        .call(
+            reassigned_manager.clone(),
+            "artifact.get".to_owned(),
+            json!({"artifact_id":lost_artifact_ref}),
+        )
+        .await
+        .expect("grant historical page metadata through the current Task manager basis");
+    assert_eq!(current_task_grant["grant"]["basis"], "current_task_manager");
+    let current_task_bytes = owner
+        .store
+        .call(
+            reassigned_manager,
+            "artifact.read".to_owned(),
+            json!({
+                "artifact_id":lost_artifact_ref,
+                "offset_bytes":0,
+                "length_bytes":RESULT_TEXT.len()
+            }),
+        )
+        .await
+        .expect("the Store's existing current-Task scope grants historical bytes");
+    assert_eq!(current_task_bytes["content"], RESULT_TEXT);
+
+    let unrelated_manager = Principal {
+        link_id: "bridge5-result-unrelated-manager-link".to_owned(),
+        client_id: unrelated_manager_id.to_owned(),
+        role: Role::Manager,
+    };
+    let unrelated_read = owner
+        .store
+        .call(
+            unrelated_manager,
+            "artifact.read".to_owned(),
+            json!({
+                "artifact_id":lost_artifact_ref,
+                "offset_bytes":0,
+                "length_bytes":RESULT_TEXT.len()
+            }),
+        )
+        .await
+        .expect_err("reassignment must not grant historical page bytes to an unrelated manager");
+    assert_eq!(unrelated_read.code, "FORBIDDEN");
+
     let historical_replay = owner
         .store
         .call(
