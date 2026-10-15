@@ -647,9 +647,7 @@ fn reconcile_scripts_retains_operation_and_source_worker_across_allow_durability
         let script_id = format!("pr67_reconcile_{}", uuid::Uuid::new_v4().simple());
         let marker_path = data_dir.join("reconcile-interpreter-started.txt");
         let marker_literal = marker_path.to_string_lossy().replace('\'', "''");
-        // Keep the terminal-path fixture distinct from the known Option<Value>
-        // null-result receipt ambiguity; the exploratory null result is tracked
-        // separately and is not an identity, artifact, or authority mismatch.
+        // Exercise the valid null ScriptResult through terminal receipt readback.
         let script_bytes = r#"
 $invocation = [Console]::In.ReadToEnd() | ConvertFrom-Json
 [System.IO.File]::AppendAllText('__MARKER__', "started`n")
@@ -658,7 +656,7 @@ $result = [ordered]@{
     protocol_version = 1
     operation_id = $invocation.operation_id
     run_id = $invocation.run_id
-    result = [ordered]@{ receipt = 'reconciled' }
+    result = $null
 }
 [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress -Depth 8))
 "#
@@ -683,12 +681,7 @@ $result = [ordered]@{
             "inherit_environment":inherited_environment,
             "controller_effects":[],
             "input_schema":{"type":"object","properties":{},"required":[],"additional_properties":true},
-            "result_schema":{
-                "type":"object",
-                "properties":{"receipt":{"type":"string","max_bytes":32}},
-                "required":["receipt"],
-                "additional_properties":false,
-            },
+            "result_schema":{"type":"null"},
             "files":[{
                 "path":"main.ps1",
                 "content_base64":base64::engine::general_purpose::STANDARD.encode(&script_bytes),
@@ -981,7 +974,7 @@ $result = [ordered]@{
         assert_eq!(completion["token"], work.token);
         assert_eq!(completion["state"], "completed");
         assert_eq!(completion["exit_code"], 0);
-        assert_eq!(completion["result_value"], json!({"receipt":"reconciled"}));
+        assert_eq!(completion["result_value"], Value::Null);
         assert_eq!(
             fs::read_to_string(&marker_path)
                 .expect("read actual interpreter invocation marker")

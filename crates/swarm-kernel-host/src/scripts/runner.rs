@@ -1213,6 +1213,7 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
         return Ok(None);
     };
     let value = read_json(&path)?;
+    let result_value_present = value.get("result_value").is_some();
     let completion: Completion = serde_json::from_value(value).map_err(|_| {
         Error::new(
             "SCRIPT_COMPLETION_DAMAGED",
@@ -1234,7 +1235,12 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
         || (completion.state == "completed"
             && (completion.exit_code != Some(0)
                 || completion.error_code.is_some()
-                || completion.result_value.is_none()
+                || !result_value_present
+                || (completion.result_value.is_none()
+                    && !matches!(
+                        &work.bundle.result_schema,
+                        manifest::ScriptValueSchema::Null
+                    ))
                 || completion.started_at_ms.is_none()))
         || (completion.state != "completed"
             && (completion.error_code.is_none()
@@ -1296,6 +1302,7 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
                 "script result document cannot be parsed",
             )
         })?;
+    let expected_result_value = completion.result_value.clone().unwrap_or(Value::Null);
     if result_value["protocol_version"] != 1
         || result_value["run_id"] != work.run_id
         || result_value["operation_id"] != work.operation_id
@@ -1305,7 +1312,7 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
         || result_value["started_at_ms"] != json!(completion.started_at_ms)
         || result_value["exit_code"] != json!(completion.exit_code)
         || result_value["error_code"] != json!(completion.error_code)
-        || result_value["result"] != json!(completion.result_value)
+        || result_value.get("result") != Some(&expected_result_value)
         || result_value["stdout_ref"] != completion.stdout.artifact_id
         || result_value["stderr_ref"] != completion.stderr.artifact_id
         || result_value["controller_effects"] != json!(completion.controller_effects)
@@ -1320,6 +1327,10 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
     }
     if let Some(value) = completion.result_value.as_ref() {
         work.bundle.result_schema.validate_value(value)?;
+    } else if completion.state == "completed" {
+        work.bundle
+            .result_schema
+            .validate_value(&expected_result_value)?;
     }
     Ok(Some(completion))
 }
