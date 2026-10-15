@@ -8,11 +8,7 @@ const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = JSON.parse(
   readFileSync(path.join(MODULE_DIR, "fixtures", "native-inbox-2.0.7.json"), "utf8"),
 );
-const INSTALLED_ROOT = process.env.ELIOT_OPENCODE_INSTALLED_ROOT;
-
-if (!INSTALLED_ROOT) {
-  throw new Error("ELIOT_OPENCODE_INSTALLED_ROOT must point to the installed OpenCode resource root");
-}
+const INSTALLED_ROOT = process.env.ELIOT_OPENCODE_INSTALLED_ROOT ?? MODULE_DIR;
 
 const installedPackage = (packageName, relativePath) => pathToFileURL(
   path.join(INSTALLED_ROOT, "node_modules", "@opencode", packageName, "dist", relativePath),

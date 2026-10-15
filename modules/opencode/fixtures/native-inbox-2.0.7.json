@@ -13,11 +13,13 @@
     "id": "msg_swarm_fixture",
     "text": "Documented task input",
     "metadata": {
-      "binding": "fixture-binding",
-      "generation": 1,
-      "operation": "op207-input",
-      "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "native_delivery": "queue"
+      "eliot": {
+        "binding": "fixture-binding",
+        "generation": 1,
+        "operation": "op207-input",
+        "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "native_delivery": "queue"
+      }
     },
     "delivery": "queue",
     "resume": true
@@ -36,11 +38,13 @@
         "agents": [],
         "skills": [],
         "metadata": {
-          "binding": "fixture-binding",
-          "generation": 1,
-          "operation": "op207-input",
-          "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "native_delivery": "queue"
+          "eliot": {
+            "binding": "fixture-binding",
+            "generation": 1,
+            "operation": "op207-input",
+            "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "native_delivery": "queue"
+          }
         }
       },
       "delivery": "queue"
@@ -86,11 +90,13 @@
             "agents": [],
             "skills": [],
             "metadata": {
-              "binding": "fixture-binding",
-              "generation": 1,
-              "operation": "op207-input",
-              "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-              "native_delivery": "queue"
+              "eliot": {
+                "binding": "fixture-binding",
+                "generation": 1,
+                "operation": "op207-input",
+                "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "native_delivery": "queue"
+              }
             }
           },
           "delivery": "queue"
@@ -118,11 +124,13 @@
       "created": 124
     },
     "metadata": {
-      "binding": "fixture-binding",
-      "generation": 1,
-      "operation": "op207-input",
-      "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "native_delivery": "queue"
+      "eliot": {
+        "binding": "fixture-binding",
+        "generation": 1,
+        "operation": "op207-input",
+        "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "native_delivery": "queue"
+      }
     },
     "text": "Documented task input",
     "files": [],

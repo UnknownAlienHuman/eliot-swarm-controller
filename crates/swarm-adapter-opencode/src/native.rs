@@ -39,6 +39,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MODEL_CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[cfg(test)]
+#[path = "native/inbox_tests.rs"]
+mod inbox_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CatalogFailureCategory {
     CatalogUnavailable,
@@ -117,7 +121,7 @@ pub struct InputEvidence {
 
 #[derive(Debug, Clone, Copy)]
 pub struct InputAdmissionEvidence {
-    pub admitted_sequence: u64,
+    pub admitted_sequence: Option<u64>,
     pub promoted_sequence: Option<u64>,
 }
 
@@ -715,24 +719,40 @@ impl NativeClient {
                     })?;
                 if matches!(
                     event_type,
-                    "session.next.prompt.admitted" | "session.next.prompted"
-                ) && required_text(data, "messageID")? == input_id
+                    "session.inbox.enqueued" | "session.inbox.delivered"
+                ) && required_text(data, "inboxID")? == input_id
                 {
+                    if durable["version"] != 1 {
+                        return Err(Error::new(
+                            "NATIVE_HISTORY_SCHEMA",
+                            "native inbox event has an unsupported schema version",
+                        ));
+                    }
                     validate_prompt_history_event(
                         event_type, data, session, input_id, delivery, intent,
                     )?;
-                    if event_type == "session.next.prompt.admitted" {
+                    if event_type == "session.inbox.enqueued" {
                         if evidence.admitted_sequence.replace(sequence).is_some() {
                             return Err(Error::new(
                                 "NATIVE_HISTORY_CONFLICT",
                                 "the exact native input has more than one admission event",
                             ));
                         }
-                    } else if evidence.prompted_sequence.replace(sequence).is_some() {
-                        return Err(Error::new(
-                            "NATIVE_HISTORY_CONFLICT",
-                            "the exact native input has more than one promotion event",
-                        ));
+                    } else {
+                        // Delivery has no text or marker. It can extend an
+                        // already verified admission, never establish one.
+                        if evidence.admitted_sequence.is_none() {
+                            return Err(Error::new(
+                                "NATIVE_HISTORY_GAP",
+                                "native inbox delivery lacks its verified admission",
+                            ));
+                        }
+                        if evidence.prompted_sequence.replace(sequence).is_some() {
+                            return Err(Error::new(
+                                "NATIVE_HISTORY_CONFLICT",
+                                "the exact native input has more than one delivery event",
+                            ));
+                        }
                     }
                 }
                 expected = sequence.checked_add(1).ok_or_else(|| {
@@ -1743,7 +1763,8 @@ pub fn input_payload(command: &RuntimeCommand, input_id: &str, prompt_text: &str
     })?;
     Ok(json!({
         "id":input_id,
-        "prompt":{"text":prompt_text},
+        "text":prompt_text,
+        "metadata":{"eliot":marker(command)},
         "delivery":delivery,
         "resume":true
     }))
@@ -1953,37 +1974,32 @@ fn admitted_input_matches(
 ) -> Result<InputAdmissionEvidence> {
     if !exact_fields(
         item,
-        &[
-            "admittedSeq",
-            "id",
-            "sessionID",
-            "prompt",
-            "delivery",
-            "timeCreated",
-        ],
-        &["promotedSeq"],
+        &["id", "sessionID", "time", "type", "payload", "delivery"],
+        &[],
     ) {
         return Err(Error::new(
             "NATIVE_SCHEMA_ERROR",
-            "prompt response is outside the current SessionInput.Admitted schema",
+            "prompt response is outside the current SessionInbox.User schema",
         ));
     }
-    let admitted_sequence = item["admittedSeq"]
-        .as_u64()
-        .ok_or_else(|| Error::new("NATIVE_SCHEMA_ERROR", "prompt admittedSeq is invalid"))?;
-    if item["timeCreated"]
-        .as_f64()
-        .is_none_or(|time| !time.is_finite())
+    if !exact_fields(&item["time"], &["created"], &[])
+        || item["time"]["created"]
+            .as_f64()
+            .is_none_or(|time| !time.is_finite())
     {
         return Err(Error::new(
             "NATIVE_SCHEMA_ERROR",
-            "prompt timeCreated is invalid",
+            "prompt creation time is invalid",
         ));
     }
-    let prompt = &item["prompt"];
-    if !exact_fields(prompt, &["text"], &["files", "agents"])
-        || prompt["text"].as_str() != Some(text)
+    let prompt = &item["payload"];
+    if !exact_fields(
+        prompt,
+        &["text"],
+        &["files", "agents", "skills", "metadata"],
+    ) || prompt["text"].as_str() != Some(text)
         || !no_attachments(prompt)
+        || prompt["metadata"]["eliot"] != marker(command)
     {
         return Err(Error::new(
             "NATIVE_OUTCOME_UNKNOWN",
@@ -1997,6 +2013,7 @@ fn admitted_input_matches(
         )
     })?;
     if item["id"] != input_id
+        || item["type"] != "user"
         || item["sessionID"] != root
         || item["delivery"].as_str() != Some(delivery)
     {
@@ -2005,23 +2022,11 @@ fn admitted_input_matches(
             "prompt response identity or delivery differs from the exact Operation",
         ));
     }
-    let promoted_sequence = item
-        .get("promotedSeq")
-        .map(|value| {
-            value
-                .as_u64()
-                .ok_or_else(|| Error::new("NATIVE_SCHEMA_ERROR", "prompt promotedSeq is invalid"))
-        })
-        .transpose()?;
-    if promoted_sequence.is_some_and(|sequence| sequence < admitted_sequence) {
-        return Err(Error::new(
-            "NATIVE_SCHEMA_ERROR",
-            "prompt promotedSeq precedes its admission sequence",
-        ));
-    }
     Ok(InputAdmissionEvidence {
-        admitted_sequence,
-        promoted_sequence,
+        // The 2.0.7 inbox acknowledgement has no event-log sequence. A
+        // matching durable admission is not evidence of promotion/execution.
+        admitted_sequence: None,
+        promoted_sequence: None,
     })
 }
 
@@ -2034,12 +2039,12 @@ fn saved_message_matches(
     exact_fields(
         message,
         &["id", "time", "text", "type"],
-        &["metadata", "files", "agents", "sessionID"],
+        &["metadata", "files", "agents", "skills", "sessionID"],
     ) && exact_fields(&message["time"], &["created"], &[])
         && message["time"]["created"]
             .as_f64()
             .is_some_and(f64::is_finite)
-        && message.get("metadata").is_none_or(Value::is_object)
+        && message["metadata"]["eliot"] == intent.marker
         && message["id"] == input_id
         && message["type"] == "user"
         && message
@@ -2150,36 +2155,50 @@ fn validate_prompt_history_event(
     expected_delivery: &str,
     intent: &OperationIntent,
 ) -> Result<()> {
-    if !matches!(
-        event_type,
-        "session.next.prompt.admitted" | "session.next.prompted"
-    ) || !exact_fields(
-        data,
-        &["timestamp", "sessionID", "messageID", "prompt", "delivery"],
-        &[],
-    ) || data["timestamp"]
-        .as_f64()
-        .is_none_or(|timestamp| !timestamp.is_finite())
-    {
+    let fields: &[&str] = match event_type {
+        "session.inbox.enqueued" => &["sessionID", "inboxID", "item"],
+        "session.inbox.delivered" => &["sessionID", "inboxID"],
+        _ => {
+            return Err(Error::new(
+                "NATIVE_HISTORY_SCHEMA",
+                "unsupported native input history event",
+            ));
+        }
+    };
+    if !exact_fields(data, fields, &[]) {
         return Err(Error::new(
             "NATIVE_HISTORY_SCHEMA",
-            "prompt history event differs from the selected V2 schema",
+            "inbox history event differs from the selected V2 schema",
         ));
     }
-    let prompt = &data["prompt"];
-    if !exact_fields(prompt, &["text"], &["files", "agents"])
-        || !prompt["text"]
-            .as_str()
-            .is_some_and(|text| saved_text_matches(text, intent))
-        || !no_attachments(prompt)
-        || data["sessionID"] != session
-        || data["messageID"] != input_id
-        || data["delivery"].as_str() != Some(expected_delivery)
-    {
+    if data["sessionID"] != session || data["inboxID"] != input_id {
         return Err(Error::new(
             "NATIVE_INPUT_MISMATCH",
-            "durable prompt event differs from the exact saved session, text or delivery",
+            "durable inbox event differs from the exact saved session or input",
         ));
+    }
+    if event_type == "session.inbox.enqueued" {
+        let item = &data["item"];
+        let payload = &item["payload"];
+        if !exact_fields(item, &["type", "payload", "delivery"], &[])
+            || item["type"] != "user"
+            || item["delivery"].as_str() != Some(expected_delivery)
+            || !exact_fields(
+                payload,
+                &["text"],
+                &["files", "agents", "skills", "metadata"],
+            )
+            || !payload["text"]
+                .as_str()
+                .is_some_and(|text| saved_text_matches(text, intent))
+            || !no_attachments(payload)
+            || payload["metadata"]["eliot"] != intent.marker
+        {
+            return Err(Error::new(
+                "NATIVE_INPUT_MISMATCH",
+                "durable inbox item differs from the exact saved text, marker or delivery",
+            ));
+        }
     }
     Ok(())
 }

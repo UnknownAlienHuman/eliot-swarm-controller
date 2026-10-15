@@ -475,6 +475,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & cargo build --locked --package swarm-supervisor --bin swarm-supervisor --target-dir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo build --locked --package swarm-process --bin swarm-module-owner --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exeSuffix = if ($IsWindows) { '.exe' } else { '' }
+          $env:ELIOT_OPENCODE_TEST_SUPERVISOR = Join-Path $sharedTargetDir "debug/swarm-supervisor$exeSuffix"
+          $env:ELIOT_OPENCODE_TEST_OWNER_HELPER = Join-Path $sharedTargetDir "debug/swarm-module-owner$exeSuffix"
+          foreach ($fixtureBinary in @($env:ELIOT_OPENCODE_TEST_SUPERVISOR, $env:ELIOT_OPENCODE_TEST_OWNER_HELPER)) {
+            if (-not (Test-Path -LiteralPath $fixtureBinary -PathType Leaf)) {
+              throw "The OpenCode connected fixture binary was not built: $fixtureBinary"
+            }
+          }
           & cargo build --locked --package swarm-script-worker --bin swarm-script-worker --target-dir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $workerName = if ($IsWindows) { 'swarm-script-worker.exe' } else { 'swarm-script-worker' }
@@ -543,6 +553,7 @@ jobs:
           cd modules/opencode
           npm ci --ignore-scripts --no-audit --no-fund
           bun test native-mcp-proof.test.mjs
+          node --test native-inbox-contract.test.mjs
           node selftest.mjs
       - name: Build
         shell: pwsh

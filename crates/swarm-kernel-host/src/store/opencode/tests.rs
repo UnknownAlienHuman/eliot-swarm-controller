@@ -108,6 +108,13 @@ async fn select_module_route(
     artifact_id: &str,
 ) -> Value {
     let catalog = read(&owner.store, p, "module.catalog.get", json!({})).await;
+    let version = catalog["descriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["artifact"]["artifact_id"] == artifact_id)
+        .unwrap()["artifact"]["version"]
+        .clone();
     let selected = write(
         &owner.store,
         p,
@@ -116,7 +123,7 @@ async fn select_module_route(
             "route_alias":route_alias,
             "module_id":"eliot.opencode.v2",
             "artifact_id":artifact_id,
-            "version":"0.5.0",
+            "version":version,
             "expected_catalog_revision":catalog["catalog_revision"],
         }),
     )
@@ -208,8 +215,47 @@ async fn retained_attempt(store: &Store, attempt_id: &str) -> Value {
 }
 
 #[tokio::test]
+async fn opencode_open_supports_reviewed_artifact_versions_without_widening_unknown_versions() {
+    for (version, supported) in [("0.5.0", true), ("0.6.0", true), ("0.7.0", false)] {
+        let f = Fixture::new().await;
+        let mut descriptor = registered_opencode_descriptor();
+        descriptor["artifact"]["version"] = json!(version);
+        let (owner, _p, binding) = start_module_route(&f, descriptor, true).await;
+        let selector = binding["observation"]["module_contract_selector"].clone();
+        let observed = owner
+            .store
+            .run(move |db| {
+                crate::store::module_handshake::selected_native_command_supported(
+                    db,
+                    crate::config::OPENCODE_RUST_ARTIFACT_ID,
+                    Some(&selector),
+                    "agent.open",
+                    &json!({}),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(observed, Some(supported), "artifact {version}");
+        owner.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn loop_step_input_status_accepts_only_the_exact_selected_opencode_module_contract() {
-    let exact = registered_opencode_descriptor();
+    // This is historical readback for an artifact that admitted loop-step.
+    // The current descriptor no longer advertises that input surface.
+    let mut exact = registered_opencode_descriptor();
+    exact["artifact"]["version"] = json!("0.5.0");
+    exact["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("native.opencode.loop_step"));
+    exact["command_schemas"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "schema_id":"swarm.opencode_loop_step_command","version":"1"
+        }));
     let artifact_id = crate::config::OPENCODE_RUST_ARTIFACT_ID;
     assert_eq!(exact["artifact"]["artifact_id"], artifact_id);
     assert_eq!(exact["artifact"]["version"], "0.5.0");
