@@ -2957,11 +2957,15 @@ fn isolate_tools_launch_facts_failure(
     if failure.error.code != "INVALID_PARAMS" {
         return Ok(false);
     }
-    let Some(evidence) = failure.damage.clone() else {
-        return Ok(false);
-    };
-    launcher_native_mcp::quarantine_launch_damage_evidence(tx, operation_id, evidence, now_ms)?;
-    Ok(true)
+    if let Some(evidence) = failure.damage.clone() {
+        launcher_native_mcp::quarantine_launch_damage_evidence(tx, operation_id, evidence, now_ms)?;
+        return Ok(true);
+    }
+    if launcher_native_mcp::is_invalid_operation_id(operation_id) {
+        launcher_native_mcp::quarantine_invalid_operation_id(tx, operation_id, now_ms)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Retain a visible stale hold for one C8 subject, replacing only the
@@ -5050,6 +5054,152 @@ mod failure_event_tests {
             .unwrap();
         assert_eq!(quarantined, 1);
         tx.commit().unwrap();
+    }
+    /// A selected C8 candidate whose Operation ID contains an ASCII control
+    /// byte is rejected by the shared ingress guard before any damage context
+    /// can record evidence. The generic invalid-ID path must quarantine the
+    /// exact retained OperationRequest bytes, leave the bad row unchanged,
+    /// and still reach the next healthy candidate in the same bounded pass.
+    /// A second quiet pass must be write-stable.
+    #[test]
+    fn invalid_operation_id_is_quarantined_without_starving_the_next_launch() {
+        const CORRUPT_OPERATION: &str = "native-mcp-tools-corrupt-id\nbad";
+        const HEALTHY_OPERATION: &str = "native-mcp-tools-healthy-next";
+
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        for operation_id in [CORRUPT_OPERATION, HEALTHY_OPERATION] {
+            let effective = model::canonical(&json!({"launch_manifest":{
+                "state":"awaiting_native_mcp",
+                "runtime":{"dispatch_permitted":false},
+                "progress":{"task_dispatch":"not_started"},
+                "native_mcp_readback":{"state":"observed_partial"},
+            }}))
+            .unwrap();
+            db.execute(
+                "INSERT INTO operations(
+                     operation_id,caller_id,client_request_id,method,original_request_json,
+                     effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms
+                 ) VALUES(?1,'manager',?1,'swarm.launch',
+                          '{}',?2,'queued',1,1,1)",
+                params![operation_id, effective],
+            )
+            .unwrap();
+        }
+
+        let pre_bytes: String = db
+            .query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [CORRUPT_OPERATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(crate::store::launcher_native_mcp::is_invalid_operation_id(CORRUPT_OPERATION));
+        assert!(!crate::store::launcher_native_mcp::is_invalid_operation_id(HEALTHY_OPERATION));
+
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let mut waiting = new_tools_schedule(HEALTHY_OPERATION, "", 100);
+        waiting["state"] = json!("retry_wait");
+        waiting["next_retry_at_ms"] = json!(200);
+        set_meta(&tx, &supervisor_key(HEALTHY_OPERATION), &waiting).unwrap();
+        let outcome = claim_next_tools(&tx, 100, &Config::default()).unwrap();
+        assert!(
+            matches!(outcome, ToolsClaimOutcome::Idle(Some(200))),
+            "corrupt ID must not abort the next healthy launch"
+        );
+        let quarantine_count: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key LIKE 'launcher:v1:quarantine:native_mcp:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantine_count, 1);
+        let quarantine_key: String = tx
+            .query_row(
+                "SELECT key FROM meta WHERE key LIKE 'launcher:v1:quarantine:native_mcp:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let id_digest = model::digest(CORRUPT_OPERATION.as_bytes());
+        let source_digest = model::digest(pre_bytes.as_bytes());
+        let evidence = crate::store::automation_reconcile::QuarantineEvidence {
+            subject_identity: format!("launch-operation-digest:{id_digest}"),
+            source_pointer: Some(format!("operations-digest:{id_digest}")),
+            source_digest: Some(source_digest),
+        };
+        let expected_key = crate::store::automation_reconcile::quarantine_record_key(
+            crate::store::launcher_native_mcp::LAUNCHER_QUARANTINE_PREFIX,
+            &evidence,
+        )
+        .unwrap();
+        assert_eq!(quarantine_key, expected_key);
+        let retained: String = tx
+            .query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [CORRUPT_OPERATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, pre_bytes);
+        let cursor: String = tx
+            .query_row(
+                "SELECT value_json FROM meta WHERE key='launcher:native_mcp_tools:supervisor:v1:cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cursor.contains(HEALTHY_OPERATION));
+        tx.commit().unwrap();
+
+        let meta_count_before: i64 = db
+            .query_row("SELECT count(*) FROM meta", [], |row| row.get(0))
+            .unwrap();
+        let op_count_before: i64 = db
+            .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))
+            .unwrap();
+        db.execute(
+            "UPDATE meta SET value_json='\"\"' WHERE key='launcher:native_mcp_tools:supervisor:v1:cursor'",
+            [],
+        )
+        .unwrap();
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let outcome = claim_next_tools(&tx, 100, &Config::default()).unwrap();
+        assert!(
+            matches!(outcome, ToolsClaimOutcome::Idle(Some(200))),
+            "second pass must reach the same healthy deadline"
+        );
+        let quarantine_count: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key LIKE 'launcher:v1:quarantine:native_mcp:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantine_count, 1);
+        let retained: String = tx
+            .query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [CORRUPT_OPERATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, pre_bytes);
+        tx.commit().unwrap();
+        let meta_count_after: i64 = db
+            .query_row("SELECT count(*) FROM meta", [], |row| row.get(0))
+            .unwrap();
+        let op_count_after: i64 = db
+            .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(meta_count_after, meta_count_before);
+        assert_eq!(op_count_after, op_count_before);
     }
 }
 #[cfg(test)]

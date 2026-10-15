@@ -2117,6 +2117,19 @@ fn is_launch_record_damage(error: &Error) -> bool {
     )
 }
 
+/// True when an ingress-guard INVALID_PARAMS failure names an invalid Operation
+/// ID. It mirrors the shared ingress predicate in
+/// `current_mcp_launch_snapshot_for_tools` (empty, longer than 256 bytes, or
+/// containing an ASCII control byte) so a selected candidate rejected before
+/// any damage context can be recorded still quarantines its exact retained
+/// OperationRequest bytes and lets the bounded page scan continue. Any other
+/// INVALID_PARAMS with a valid ID stays loud and is not quarantined here.
+pub(super) fn is_invalid_operation_id(operation_id: &str) -> bool {
+    operation_id.is_empty()
+        || operation_id.len() > 256
+        || operation_id.bytes().any(|byte| byte.is_ascii_control())
+}
+
 pub(super) fn launcher_damage_evidence(
     operation_id: &str,
     source_pointer: &str,
@@ -2146,6 +2159,45 @@ pub(super) fn quarantine_launch_damage(
         model::digest(raw.as_bytes()),
         now_ms,
     )
+}
+
+/// Quarantine a selected candidate whose raw Operation ID itself fails the
+/// shared ingress predicate (empty, too long, or ASCII control). The exact
+/// retained OperationRequest bytes are typed-quarantined, but neither the
+/// subject identity nor the source pointer may carry the raw control bytes:
+/// both use the digest of the exact raw ID so the existing quarantine
+/// validator stays loud for real evidence problems. The damaged row is left
+/// untouched and the bounded scan continues.
+pub(super) fn quarantine_invalid_operation_id(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    now_ms: i64,
+) -> Result<String> {
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let raw = raw.ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_STORE",
+            "damaged launcher source disappeared before quarantine",
+        )
+    })?;
+    let id_digest = model::digest(operation_id.as_bytes());
+    let evidence = QuarantineEvidence {
+        subject_identity: format!("launch-operation-digest:{id_digest}"),
+        source_pointer: Some(format!("operations-digest:{id_digest}")),
+        source_digest: Some(model::digest(raw.as_bytes())),
+    };
+    let key = quarantine_record_key(LAUNCHER_QUARANTINE_PREFIX, &evidence)?;
+    if unchanged_launch_quarantine(tx, &key, &evidence)? {
+        return Ok(key);
+    }
+    persist_quarantine(tx, &key, LAUNCHER_RECORD_CORRUPT_CODE, evidence, now_ms)?;
+    Ok(key)
 }
 
 pub(super) fn quarantine_launch_damage_evidence(
