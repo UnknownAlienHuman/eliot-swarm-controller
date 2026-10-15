@@ -100,10 +100,12 @@ pub(super) fn live_reads(
     }
     let aliases_json = serde_json::to_string(aliases)
         .map_err(|_| Error::new("STORE_READ_FAILED", "route alias list is not encodable"))?;
-    // Scope by the exact Task -> Attempt -> binding chain in SQL. The guarded
-    // route extraction keeps malformed foreign route bytes from turning an
-    // authorized Manager read into a database error; foreign state_json is
-    // selected only after the ownership predicates exclude it.
+    // Scope by the exact current open Task revision -> Attempt -> binding
+    // chain in SQL. The owner remains the Attempt's exact Manager; current-GM
+    // or transfer-lineage authority does not broaden native evidence. The
+    // guarded route extraction keeps malformed foreign route bytes from
+    // turning an authorized Manager read into a database error; foreign
+    // state_json is selected only after the ownership predicates exclude it.
     let mut statement = conn.prepare(
         "SELECT b.binding_id,b.generation,b.module_artifact_id,b.route_json,b.state_json,b.released_at_ms,b.state
          FROM bindings AS b
@@ -114,6 +116,15 @@ pub(super) fn live_reads(
            AND b.state='ready'
            AND a.released_at_ms IS NULL
            AND a.owner_id=?2
+           AND t.state='open'
+           AND a.task_revision=t.revision
+           AND NOT EXISTS (
+                 SELECT 1
+                 FROM attempts AS other_attempt
+                 WHERE other_attempt.task_id=t.task_id
+                   AND other_attempt.released_at_ms IS NULL
+                   AND other_attempt.attempt_id<>a.attempt_id
+           )
            AND CASE WHEN json_valid(b.route_json)
                     THEN json_extract(b.route_json,'$.alias')
                END IN (SELECT value FROM json_each(?1))

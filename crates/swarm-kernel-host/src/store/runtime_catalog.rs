@@ -558,7 +558,7 @@ mod tests {
                 value["name"] == "agent.refresh" && value["status"] == "unsupported"
             })
         );
-        assert!(!projected.gaps.iter().any(|gap| gap == &""));
+        assert!(!projected.gaps.iter().any(|gap| gap.is_empty()));
     }
 
     #[test]
@@ -900,7 +900,7 @@ mod tests {
         assert_eq!(stale["routes"][0]["native_models"]["status"], "unknown");
         assert!(stale["routes"][0]["native_models"]["value"].is_null());
         db.execute(
-            "UPDATE bindings SET released_at_ms=2000 WHERE binding_id='binding-1'",
+            "UPDATE bindings SET state='closed',released_at_ms=2000 WHERE binding_id='binding-1'",
             [],
         )
         .unwrap();
@@ -934,10 +934,15 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);
-             CREATE TABLE tasks(task_id TEXT PRIMARY KEY);
+             CREATE TABLE tasks(
+                 task_id TEXT PRIMARY KEY,
+                 revision INTEGER NOT NULL,
+                 state TEXT NOT NULL
+             );
              CREATE TABLE attempts(
                  attempt_id TEXT PRIMARY KEY,
                  task_id TEXT NOT NULL,
+                 task_revision INTEGER NOT NULL,
                  owner_id TEXT NOT NULL,
                  binding_id TEXT NOT NULL,
                  binding_generation INTEGER NOT NULL,
@@ -984,11 +989,16 @@ mod tests {
             .unwrap()
         };
         db.execute_batch(
-            "INSERT INTO tasks(task_id) VALUES('task-a'),('task-b'),('task-corrupt');
-             INSERT INTO attempts(attempt_id,task_id,owner_id,binding_id,binding_generation,released_at_ms)
-                 VALUES('attempt-a','task-a','manager-a','binding-a',1,NULL),
-                       ('attempt-b','task-b','manager-b','binding-b',1,NULL),
-                       ('attempt-corrupt','task-corrupt','manager-corrupt','binding-corrupt',1,NULL);",
+            "INSERT INTO tasks(task_id,revision,state)
+                 VALUES('task-a',1,'open'),
+                       ('task-b',1,'open'),
+                       ('task-corrupt',1,'open'),
+                       ('task-stale',2,'open');
+             INSERT INTO attempts(attempt_id,task_id,task_revision,owner_id,binding_id,binding_generation,released_at_ms)
+                 VALUES('attempt-a','task-a',1,'manager-a','binding-a',1,NULL),
+                       ('attempt-b','task-b',1,'manager-b','binding-b',1,NULL),
+                       ('attempt-corrupt','task-corrupt',1,'manager-corrupt','binding-corrupt',1,NULL),
+                       ('attempt-stale','task-stale',1,'manager-a','binding-stale',1,NULL);",
         )
         .unwrap();
         db.execute(
@@ -999,6 +1009,11 @@ mod tests {
         db.execute(
             "INSERT INTO bindings(binding_id,generation,module_artifact_id,state,route_json,state_json,released_at_ms) VALUES(?1,1,'shared-artifact','ready',?2,?3,NULL)",
             params!["binding-b", route_json.clone(), state("model-b", "boot-b", 8)],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO bindings(binding_id,generation,module_artifact_id,state,route_json,state_json,released_at_ms) VALUES(?1,1,'shared-artifact','ready',?2,?3,NULL)",
+            params!["binding-stale", route_json.clone(), state("model-stale", "boot-stale", 9)],
         )
         .unwrap();
         db.execute(
@@ -1022,6 +1037,13 @@ mod tests {
         assert_eq!(
             result_a["routes"][0]["native_models"]["value"][0],
             "model-a"
+        );
+        assert_eq!(
+            result_a["routes"][0]["native_models"]["value"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
         assert_eq!(
             result_b["routes"][0]["native_models"]["value"][0],
