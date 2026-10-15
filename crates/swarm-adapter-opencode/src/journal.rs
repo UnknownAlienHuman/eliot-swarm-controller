@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -443,6 +443,60 @@ pub struct PendingItem {
     pub payload: Value,
 }
 
+fn validate_pending_item_slot(
+    outbox: &Path,
+    path: &Path,
+    item: &PendingItem,
+) -> Result<Option<String>> {
+    let Some(kind) = matches!(item.kind.as_str(), "outcome" | "result" | "observation")
+        .then_some(item.kind.as_str())
+    else {
+        return Err(Error::new("ADAPTER_OUTBOX", "unsupported pending item"));
+    };
+    if item.key.trim().is_empty()
+        || path != outbox.join(format!("{kind}-{}.json", operation_key(&item.key)))
+    {
+        return Err(Error::new(
+            "ADAPTER_OUTBOX",
+            "pending item identity differs from its deterministic slot",
+        ));
+    }
+    let identity_field = if kind == "observation" {
+        "event_id"
+    } else {
+        "operation_id"
+    };
+    if item.payload[identity_field].as_str() != Some(item.key.as_str()) {
+        return Err(Error::new(
+            "ADAPTER_OUTBOX",
+            "pending item payload identity differs from its deterministic slot",
+        ));
+    }
+    Ok(matches!(kind, "outcome" | "result").then(|| operation_key(&item.key)))
+}
+
+fn outbox_slot_identity(outbox: &Path, path: &Path) -> Option<(&'static str, String)> {
+    if path.parent() != Some(outbox) {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".json")?;
+    for kind in ["outcome", "result", "observation"] {
+        let Some(key) = stem.strip_prefix(&format!("{kind}-")) else {
+            continue;
+        };
+        if key.len() == 64
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && path == outbox.join(format!("{kind}-{key}.json"))
+        {
+            return Some((kind, key.to_owned()));
+        }
+    }
+    None
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootCheckpoint {
@@ -475,6 +529,7 @@ pub struct Journal {
     scan_listed: AtomicU64,
     scan_outbox: AtomicU64,
     scan_unresolved: AtomicU64,
+    scan_damaged: AtomicU64,
 }
 
 impl Journal {
@@ -574,6 +629,7 @@ impl Journal {
             scan_listed: AtomicU64::new(0),
             scan_outbox: AtomicU64::new(0),
             scan_unresolved: AtomicU64::new(0),
+            scan_damaged: AtomicU64::new(0),
         })
     }
 
@@ -790,8 +846,20 @@ impl Journal {
                 break;
             }
             let bytes = read_limited(&path, RECORD_LIMIT)?;
-            let item: PendingItem = serde_json::from_slice(&bytes)
-                .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
+            let value: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => {
+                    // The file remains the evidence. A syntactically damaged
+                    // item has no delivery identity we can safely replay.
+                    // Keep the retention index closed and continue with the
+                    // rest of this bounded delivery batch.
+                    self.hold_damaged_record(&path, &bytes)?;
+                    continue;
+                }
+            };
+            let item: PendingItem = serde_json::from_value(value)
+                .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item schema is invalid"))?;
+            validate_pending_item_slot(&self.outbox, &path, &item)?;
             items.push((path, item));
         }
         Ok(items)
@@ -805,6 +873,46 @@ impl Journal {
             outbox_entries_scanned: self.scan_outbox.load(Ordering::Relaxed),
             unresolved_found: self.scan_unresolved.load(Ordering::Relaxed),
         }
+    }
+
+    /// Number of malformed journal or outbox record encounters held this boot.
+    pub fn startup_damaged_record_observations(&self) -> u64 {
+        self.scan_damaged.load(Ordering::Relaxed)
+    }
+
+    fn hold_damaged_record(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        retention::mark_damaged(self)?;
+        self.scan_damaged.fetch_add(1, Ordering::Relaxed);
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("<invalid-name>");
+        eprintln!(
+            "OpenCode recovery is holding damaged record {name} (sha256={:x})",
+            Sha256::digest(bytes)
+        );
+        Ok(())
+    }
+
+    fn pending_file_is_malformed(&self, path: &Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => ensure_regular(path, "outbox item")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => {
+                return Err(Error::new(
+                    "ADAPTER_STATE",
+                    "outbox item cannot be inspected",
+                ));
+            }
+        }
+        let bytes = read_limited(path, RECORD_LIMIT)?;
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return Ok(true),
+        };
+        let _: PendingItem = serde_json::from_value(value)
+            .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item schema is invalid"))?;
+        Ok(false)
     }
 
     /// True once one accumulation cycle has classified every listed file.
@@ -921,7 +1029,7 @@ impl Journal {
     }
 
     pub fn recover_outbox(&self) -> Result<Vec<OperationRecoveryState>> {
-        self.recover_outbox_selection(None, None)
+        self.recover_outbox_selection(None, None, None, &BTreeSet::new())
     }
 
     /// The authenticated Store hello owns the current unresolved set. Read
@@ -958,21 +1066,26 @@ impl Journal {
             ));
         }
         let mut keys = BTreeSet::new();
+        let mut expected_operation_ids = BTreeMap::new();
         for operation in &manifest.unresolved_operations {
+            let key = operation_key(&operation.operation_id);
             if operation.operation_id.is_empty()
                 || operation.method.is_empty()
                 || !matches!(
                     operation.state.as_str(),
                     "sending" | "native_accepted" | "outcome_unknown"
                 )
-                || !keys.insert(operation_key(&operation.operation_id))
+                || !keys.insert(key.clone())
             {
                 return Err(Error::new(
                     "HOST_STARTUP_RECOVERY",
                     "unresolved operation identity is invalid",
                 ));
             }
+            expected_operation_ids.insert(key, operation.operation_id.clone());
         }
+        let manifest_keys = keys.clone();
+        let mut damaged_outbox_paths = BTreeSet::new();
         // A Store-applied delivery can still lack its local ACK. Its outbox
         // receipt, rather than a settled-history scan, supplies that address.
         for entry in fs::read_dir(&self.outbox)
@@ -982,24 +1095,72 @@ impl Journal {
                 .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox entry cannot be read"))?
                 .path();
             ensure_regular(&path, "outbox item")?;
-            let item: PendingItem = serde_json::from_slice(&read_limited(&path, RECORD_LIMIT)?)
-                .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
             self.scan_outbox.fetch_add(1, Ordering::Relaxed);
-            if matches!(item.kind.as_str(), "outcome" | "result") {
-                keys.insert(operation_key(&item.key));
+            let bytes = read_limited(&path, RECORD_LIMIT)?;
+            let value: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => {
+                    let Some((kind, key)) = outbox_slot_identity(&self.outbox, &path) else {
+                        return Err(Error::new("ADAPTER_OUTBOX", "outbox item is invalid"));
+                    };
+                    if kind == "observation" {
+                        self.hold_damaged_record(&path, &bytes)?;
+                        continue;
+                    }
+                    if !matches!(kind, "outcome" | "result") || !manifest_keys.contains(&key) {
+                        return Err(Error::new("ADAPTER_OUTBOX", "outbox item is invalid"));
+                    }
+                    self.hold_damaged_record(&path, &bytes)?;
+                    damaged_outbox_paths.insert(path);
+                    keys.insert(key);
+                    continue;
+                }
+            };
+            let item: PendingItem = serde_json::from_value(value)
+                .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item schema is invalid"))?;
+            if let Some(key) = validate_pending_item_slot(&self.outbox, &path, &item)? {
+                if let Some(expected) = expected_operation_ids.get(&key)
+                    && expected != &item.key
+                {
+                    return Err(Error::new(
+                        "ADAPTER_OUTBOX",
+                        "pending item identity conflicts with the selected Store projection",
+                    ));
+                }
+                expected_operation_ids
+                    .entry(key.clone())
+                    .or_insert_with(|| item.key.clone());
+                keys.insert(key);
             }
         }
         let mut seen = BTreeSet::new();
         let mut recovered = Vec::new();
         while !keys.is_empty() {
-            let window = std::mem::take(&mut keys)
-                .into_iter()
-                .filter(|key| seen.insert(key.clone()))
-                // Sending may have committed before any adapter intent. A
-                // missing local file is not a receipt permitting native replay.
-                .filter(|key| self.operations.join(format!("{key}.jsonl")).exists())
-                .collect::<Vec<_>>();
-            recovered.extend(self.recover_outbox_selection(Some(window), Some(&mut keys))?);
+            let mut window = Vec::new();
+            for key in std::mem::take(&mut keys) {
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                let path = self.operations.join(format!("{key}.jsonl"));
+                match fs::symlink_metadata(&path) {
+                    Ok(_) => window.push(key),
+                    // Sending may have committed before any adapter intent.
+                    // A missing local file is not a receipt permitting replay.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        return Err(Error::new(
+                            "ADAPTER_STATE",
+                            "selected operation journal cannot be inspected",
+                        ));
+                    }
+                }
+            }
+            recovered.extend(self.recover_outbox_selection(
+                Some(window),
+                Some(&mut keys),
+                Some(&mut expected_operation_ids),
+                &damaged_outbox_paths,
+            )?);
             keys.retain(|key| !seen.contains(key));
         }
         Ok(recovered)
@@ -1009,8 +1170,11 @@ impl Journal {
         &self,
         selected: Option<Vec<String>>,
         mut references: Option<&mut BTreeSet<String>>,
+        mut expected_operation_ids: Option<&mut BTreeMap<String, String>>,
+        damaged_outbox_paths: &BTreeSet<PathBuf>,
     ) -> Result<Vec<OperationRecoveryState>> {
         let store_selected = selected.is_some();
+        let mut held_outbox_paths = damaged_outbox_paths.clone();
         if !store_selected {
             retention::begin_recovery(self)?;
         }
@@ -1044,42 +1208,52 @@ impl Journal {
                 retention::mark_startup_classified(self, name)?;
             }
             let path = self.operations.join(format!("{name}.jsonl"));
-            if ensure_regular(&path, "operation journal").is_err() {
-                retention::mark_damaged(self)?;
-                if store_selected {
-                    return Err(Error::new(
-                        "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
-                        "selected operation journal cannot be inspected",
-                    ));
-                }
-                continue;
-            }
-            let observed_bytes = match read_limited(&path, HISTORY_LIMIT) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    retention::mark_damaged(self)?;
-                    if store_selected {
-                        return Err(Error::new(
-                            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
-                            "selected operation journal cannot be read",
-                        ));
-                    }
-                    continue;
-                }
-            };
+            ensure_regular(&path, "operation journal")?;
+            let observed_bytes = read_limited(&path, HISTORY_LIMIT)?;
             self.scan_bodies.fetch_add(1, Ordering::Relaxed);
             self.scan_bytes
                 .fetch_add(observed_bytes.len() as u64, Ordering::Relaxed);
-            let history = match read_operation_history_bytes(&observed_bytes, None) {
-                Ok(history) => history,
-                Err(error) if error.code == "ADAPTER_JOURNAL" => {
-                    retention::mark_damaged(self)?;
-                    if store_selected {
-                        return Err(error);
+            let expected_operation_id = expected_operation_ids
+                .as_deref()
+                .and_then(|identities| identities.get(name))
+                .map(String::as_str);
+            let history = match read_recovery_operation_history_bytes(
+                &observed_bytes,
+                expected_operation_id,
+            )? {
+                RecoveryHistoryRead::Valid(history) => history,
+                RecoveryHistoryRead::Damaged(partial_history) => {
+                    let known_operation_id = partial_history
+                        .intent
+                        .as_ref()
+                        .map(|intent| intent.operation_id.as_str())
+                        .or_else(|| {
+                            partial_history
+                                .outcome
+                                .as_ref()
+                                .and_then(|outcome| outcome["operation_id"].as_str())
+                        })
+                        .or_else(|| {
+                            partial_history
+                                .result_params
+                                .as_ref()
+                                .and_then(|params| params["operation_id"].as_str())
+                        });
+                    if known_operation_id.is_some() {
+                        let partial = summarize_retained_operation(
+                            path.clone(),
+                            &observed_bytes,
+                            &partial_history,
+                            &self.identity.binding_id,
+                            self.identity.generation,
+                            &self.identity.native_scope_key,
+                            true,
+                        )?;
+                        self.check_native_root_identity(&partial)?;
                     }
+                    self.hold_damaged_record(&path, &observed_bytes)?;
                     continue;
                 }
-                Err(error) => return Err(error),
             };
             let known_operation_id = history
                 .intent
@@ -1098,13 +1272,7 @@ impl Journal {
                         .and_then(|params| params["operation_id"].as_str())
                 });
             let pending_delivery = match known_operation_id {
-                Some(operation_id) => match self.operation_has_pending_delivery(operation_id) {
-                    Ok(pending) => pending,
-                    Err(_) => {
-                        retention::mark_damaged(self)?;
-                        true
-                    }
-                },
+                Some(operation_id) => self.operation_has_pending_delivery(operation_id)?,
                 None => {
                     retention::mark_damaged(self)?;
                     true
@@ -1124,6 +1292,12 @@ impl Journal {
                     // fails the window now instead of hiding until a later
                     // full scan that steady state never performs.
                     self.check_native_root_identity(&operation)?;
+                    if let Some(identities) = expected_operation_ids.as_deref_mut() {
+                        remember_expected_operation_id(identities, &operation.operation_id)?;
+                        for reference in &operation.references {
+                            remember_expected_operation_id(identities, reference)?;
+                        }
+                    }
                     if let Some(references) = references.as_deref_mut() {
                         references.extend(operation.references.iter().map(|id| operation_key(id)));
                     }
@@ -1175,34 +1349,50 @@ impl Journal {
                             continue;
                         }
                     }
-                    if self
-                        .write_pending(PendingItem {
+                    let held = if held_outbox_paths.contains(&pending_path) {
+                        true
+                    } else if self.pending_file_is_malformed(&pending_path)? {
+                        let bytes = read_limited(&pending_path, RECORD_LIMIT)?;
+                        self.hold_damaged_record(&pending_path, &bytes)?;
+                        held_outbox_paths.insert(pending_path.clone());
+                        true
+                    } else {
+                        false
+                    };
+                    if !held {
+                        self.write_pending(PendingItem {
                             kind: "outcome".into(),
                             key: operation_id.into(),
                             payload: outcome.clone(),
-                        })
-                        .is_err()
-                    {
-                        retention::mark_damaged(self)?;
-                        continue;
+                        })?;
                     }
                 }
                 match fs::symlink_metadata(&pending_path) {
                     Ok(_) => {
-                        ensure_regular(&pending_path, "outbox item")?;
-                        let bytes = read_limited(&pending_path, RECORD_LIMIT)?;
-                        let pending: PendingItem = serde_json::from_slice(&bytes)
-                            .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
-                        if self
-                            .validate_pending_outcome(&pending_path, &pending)
-                            .is_err()
+                        if !held_outbox_paths.contains(&pending_path)
+                            && self.pending_file_is_malformed(&pending_path)?
                         {
-                            retention::mark_damaged(self)?;
+                            let bytes = read_limited(&pending_path, RECORD_LIMIT)?;
+                            self.hold_damaged_record(&pending_path, &bytes)?;
+                            held_outbox_paths.insert(pending_path.clone());
+                        }
+                        if !held_outbox_paths.contains(&pending_path) {
+                            ensure_regular(&pending_path, "outbox item")?;
+                            let bytes = read_limited(&pending_path, RECORD_LIMIT)?;
+                            let pending: PendingItem =
+                                serde_json::from_slice(&bytes).map_err(|_| {
+                                    Error::new("ADAPTER_OUTBOX", "outbox item is invalid")
+                                })?;
+                            validate_pending_item_slot(&self.outbox, &pending_path, &pending)?;
+                            self.validate_pending_outcome(&pending_path, &pending)?;
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(_) => {
-                        retention::mark_damaged(self)?;
+                        return Err(Error::new(
+                            "ADAPTER_STATE",
+                            "pending outcome cannot be inspected",
+                        ));
                     }
                 }
             }
@@ -1219,11 +1409,23 @@ impl Journal {
                     retention::mark_damaged(self)?;
                     continue;
                 }
-                self.write_pending(PendingItem {
-                    kind: "result".into(),
-                    key: operation_id.into(),
-                    payload: params.clone(),
-                })?;
+                let pending_path = self
+                    .outbox
+                    .join(format!("result-{}.json", operation_key(operation_id)));
+                if !held_outbox_paths.contains(&pending_path)
+                    && self.pending_file_is_malformed(&pending_path)?
+                {
+                    let bytes = read_limited(&pending_path, RECORD_LIMIT)?;
+                    self.hold_damaged_record(&pending_path, &bytes)?;
+                    held_outbox_paths.insert(pending_path.clone());
+                }
+                if !held_outbox_paths.contains(&pending_path) {
+                    self.write_pending(PendingItem {
+                        kind: "result".into(),
+                        key: operation_id.into(),
+                        payload: params.clone(),
+                    })?;
+                }
             }
             if history.recovery_unknown() || history.torn_tail_evidence.is_some() {
                 let operation_id = history
@@ -2323,6 +2525,80 @@ fn read_operation_history_bytes(
     Ok(history)
 }
 
+enum RecoveryHistoryRead {
+    Valid(OperationHistory),
+    Damaged(OperationHistory),
+}
+
+/// Parse selected evidence without turning damaged bytes into invented
+/// history. Only framing or invalid JSON syntax is held; valid JSON with an
+/// invalid schema, identity, or semantics remains an error and fails closed.
+fn read_recovery_operation_history_bytes(
+    bytes: &[u8],
+    expected_operation_id: Option<&str>,
+) -> Result<RecoveryHistoryRead> {
+    let mut history = OperationHistory::default();
+    let mut observed_operation_id: Option<String> = None;
+    let mut malformed_record = false;
+    let mut validation_error = None;
+    let verdict = scan_jsonl(bytes, RECORD_LIMIT, |_, frame| {
+        let value: Value = match serde_json::from_slice(&frame[..frame.len() - 1]) {
+            Ok(value) => value,
+            Err(_) => {
+                malformed_record = true;
+                return Ok(());
+            }
+        };
+        let record: JournalRecord = match serde_json::from_value(value) {
+            Ok(record) => record,
+            Err(_) => {
+                let error = Error::new("ADAPTER_JOURNAL", "operation journal schema is invalid");
+                validation_error = Some(error.clone());
+                return Err(error);
+            }
+        };
+        match apply_operation_record(
+            &mut history,
+            &mut observed_operation_id,
+            expected_operation_id,
+            record,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                validation_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    })?;
+
+    if let Some(error) = validation_error {
+        return Err(error);
+    }
+
+    match verdict {
+        JsonlScanVerdict::Complete { .. } => {}
+        JsonlScanVerdict::TornLastFrame {
+            valid_bytes,
+            tail_digest,
+            tail_bytes,
+            ..
+        } => {
+            history.torn_tail_evidence = Some(TornTailEvidence {
+                valid_prefix_bytes: valid_bytes,
+                tail_sha256: tail_digest,
+                tail_bytes,
+            });
+        }
+        JsonlScanVerdict::Damaged { .. } => {
+            return Ok(RecoveryHistoryRead::Damaged(history));
+        }
+    }
+    if malformed_record {
+        return Ok(RecoveryHistoryRead::Damaged(history));
+    }
+    Ok(RecoveryHistoryRead::Valid(history))
+}
+
 fn acknowledged_outcome_record(operation_id: &str, digest: &str) -> JournalRecord {
     JournalRecord {
         version: 2,
@@ -2830,6 +3106,26 @@ fn append_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn operation_key(operation_id: &str) -> String {
     format!("{:x}", Sha256::digest(operation_id.as_bytes()))
+}
+
+fn remember_expected_operation_id(
+    expected: &mut BTreeMap<String, String>,
+    operation_id: &str,
+) -> Result<()> {
+    let key = operation_key(operation_id);
+    if expected
+        .get(&key)
+        .is_some_and(|previous| previous != operation_id)
+    {
+        return Err(Error::new(
+            "ADAPTER_JOURNAL",
+            "operation key resolves to conflicting identities",
+        ));
+    }
+    expected
+        .entry(key)
+        .or_insert_with(|| operation_id.to_owned());
+    Ok(())
 }
 
 pub fn digest_json(value: &Value) -> Result<String> {

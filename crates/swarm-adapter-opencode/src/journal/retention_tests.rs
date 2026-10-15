@@ -1667,7 +1667,7 @@ fn store_startup_recovers_cold_legacy_front_without_lifetime_census() {
 }
 
 #[test]
-fn store_startup_rejects_incomplete_foreign_and_damaged_front_without_deletion() {
+fn store_startup_rejects_incomplete_and_foreign_front_without_deletion() {
     let root = FixtureRoot::new();
     let journal =
         Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
@@ -1693,16 +1693,219 @@ fn store_startup_rejects_incomplete_foreign_and_damaged_front_without_deletion()
             "HOST_STARTUP_RECOVERY"
         );
     }
+    let mut overflow = manifest.clone();
+    overflow["unresolved_operations"] = json!(
+        (0..=4096)
+            .map(|index| json!({
+                "operation_id":format!("overflow-{index}"),
+                "method":"agent.reply",
+                "state":"outcome_unknown"
+            }))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        journal
+            .recover_store_startup(&overflow, "current-boot", None)
+            .unwrap_err()
+            .code,
+        "HOST_STARTUP_RECOVERY"
+    );
     assert_eq!(journal.startup_scan_counts().operation_bodies_parsed, 0);
-    let path = operation_path(&root.0, operation_id);
-    fs::write(&path, b"{not valid JSON}\n").unwrap();
-    assert!(
+    assert!(operation_path(&root.0, operation_id).exists());
+    assert!(!journal.startup_recovery_complete());
+}
+
+#[test]
+fn store_startup_holds_corrupt_selected_records_and_recovers_other_deliveries() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let native_root = expected_root_id(BINDING_ID, GENERATION);
+
+    let corrupt_journal_id = "store-front-corrupt-journal";
+    let mut corrupt_journal_intent = fixture_intent(corrupt_journal_id, "agent.reply");
+    corrupt_journal_intent.native_root_id = Some(native_root.clone());
+    journal.write_intent(&corrupt_journal_intent).unwrap();
+    let corrupt_journal_path = operation_path(&root.0, corrupt_journal_id);
+    let corrupt_journal_bytes = b"{selected journal damage}\n";
+    fs::write(&corrupt_journal_path, corrupt_journal_bytes).unwrap();
+
+    let corrupt_outbox_id = "store-front-corrupt-outbox";
+    let mut corrupt_outbox_intent = fixture_intent(corrupt_outbox_id, "agent.reply");
+    corrupt_outbox_intent.native_root_id = Some(native_root.clone());
+    journal.write_intent(&corrupt_outbox_intent).unwrap();
+    let corrupt_outbox_path = root
+        .0
+        .join("outbox")
+        .join(format!("outcome-{}.json", operation_key(corrupt_outbox_id)));
+    let corrupt_outbox_bytes = b"{selected outbox damage}";
+    fs::write(&corrupt_outbox_path, corrupt_outbox_bytes).unwrap();
+
+    let unresolved_id = "store-front-unrelated-unknown";
+    let mut unresolved_intent = fixture_intent(unresolved_id, "agent.reply");
+    unresolved_intent.native_root_id = Some(native_root.clone());
+    journal.write_intent(&unresolved_intent).unwrap();
+
+    let pending_id = "store-front-unrelated-pending";
+    let mut pending_intent = fixture_intent(pending_id, "agent.reply");
+    pending_intent.native_root_id = Some(native_root.clone());
+    journal.write_intent(&pending_intent).unwrap();
+    let pending_outcome = json!({
+        "operation_id":pending_id,
+        "outcome":"applied",
+        "native_scope_key":NATIVE_SCOPE,
+        "native_root_id":native_root,
+        "details":{}
+    });
+    journal.queue_outcome_value(&pending_outcome).unwrap();
+
+    let manifest = store_startup_manifest(
+        "current-boot",
+        Some(&expected_root_id(BINDING_ID, GENERATION)),
+        &[
+            (corrupt_journal_id, "agent.reply"),
+            (corrupt_outbox_id, "agent.reply"),
+            (unresolved_id, "agent.reply"),
+        ],
+    );
+    let recovered = journal
+        .recover_store_startup(
+            &manifest,
+            "current-boot",
+            Some(&expected_root_id(BINDING_ID, GENERATION)),
+        )
+        .unwrap();
+    let recovered_ids = recovered
+        .iter()
+        .filter_map(|state| state.operation_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        recovered_ids,
+        BTreeSet::from([corrupt_outbox_id, unresolved_id])
+    );
+    assert!(recovered.iter().all(|state| {
+        state.history.recovery_unknown() && !state.history.native_replay_permitted()
+    }));
+    assert_eq!(
+        fs::read(&corrupt_journal_path).unwrap(),
+        corrupt_journal_bytes
+    );
+    assert_eq!(
+        fs::read(&corrupt_outbox_path).unwrap(),
+        corrupt_outbox_bytes
+    );
+    assert_eq!(journal.startup_scan_counts().operations_listed, 0);
+
+    let pending_items = journal
+        .pending_items_excluding(&std::collections::HashSet::new())
+        .unwrap();
+    let (_, pending_item) = pending_items
+        .iter()
+        .find(|(_, item)| item.key == pending_id)
+        .expect("the unrelated valid pending delivery remains available");
+    journal
+        .validate_pending_outcome(
+            &root
+                .0
+                .join("outbox")
+                .join(format!("outcome-{}.json", operation_key(pending_id))),
+            pending_item,
+        )
+        .unwrap();
+    assert_eq!(journal.startup_damaged_record_observations(), 3);
+}
+
+#[test]
+fn store_startup_rejects_unclassifiable_outbox_identity_without_mutation() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let operation_id = "store-front-outbox-identity";
+    journal
+        .write_intent(&fixture_intent(operation_id, "agent.reply"))
+        .unwrap();
+    let path = root
+        .0
+        .join("outbox")
+        .join(format!("outcome-{}.json", operation_key(operation_id)));
+    let bytes = serde_json::to_vec(&PendingItem {
+        kind: "outcome".to_owned(),
+        key: "foreign-operation".to_owned(),
+        payload: json!({"operation_id":"foreign-operation","outcome":"applied"}),
+    })
+    .unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let manifest = store_startup_manifest("current-boot", None, &[(operation_id, "agent.reply")]);
+
+    assert_eq!(
         journal
             .recover_store_startup(&manifest, "current-boot", None)
-            .is_err()
+            .unwrap_err()
+            .code,
+        "ADAPTER_OUTBOX"
     );
-    assert_eq!(fs::read(&path).unwrap(), b"{not valid JSON}\n");
-    assert!(!journal.startup_recovery_complete());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn store_startup_keeps_decoded_journal_identity_and_root_mismatches_fail_closed() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let selected_id = "store-front-selected-identity";
+    let foreign_id = "store-front-foreign-identity";
+    let mut foreign_intent = fixture_intent(foreign_id, "agent.reply");
+    foreign_intent.native_root_id = Some(expected_root_id(BINDING_ID, GENERATION));
+    let identity_record = JournalRecord {
+        version: 2,
+        operation_id: foreign_id.to_owned(),
+        kind: "intent".to_owned(),
+        intent: Some(foreign_intent),
+        outcome: None,
+        outcome_sha256: None,
+        result_params: None,
+        result_sha256: None,
+    };
+    let identity_path = operation_path(&root.0, selected_id);
+    let mut identity_bytes = serde_json::to_vec(&identity_record).unwrap();
+    identity_bytes.push(b'\n');
+    fs::write(&identity_path, &identity_bytes).unwrap();
+    let identity_manifest =
+        store_startup_manifest("current-boot", None, &[(selected_id, "agent.reply")]);
+    assert_eq!(
+        journal
+            .recover_store_startup(&identity_manifest, "current-boot", None)
+            .unwrap_err()
+            .code,
+        "ADAPTER_JOURNAL"
+    );
+    assert_eq!(fs::read(&identity_path).unwrap(), identity_bytes);
+
+    let root_id = expected_root_id(BINDING_ID, GENERATION);
+    let root_mismatch_id = "store-front-damaged-root-mismatch";
+    let mut root_mismatch_intent = fixture_intent(root_mismatch_id, "agent.reply");
+    root_mismatch_intent.native_root_id = Some("ses_swarm_foreign-root".to_owned());
+    journal.write_intent(&root_mismatch_intent).unwrap();
+    let root_mismatch_path = operation_path(&root.0, root_mismatch_id);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&root_mismatch_path)
+        .unwrap();
+    file.write_all(b"{damaged suffix}\n").unwrap();
+    let root_mismatch_bytes = fs::read(&root_mismatch_path).unwrap();
+    let root_manifest = store_startup_manifest(
+        "current-boot",
+        Some(&root_id),
+        &[(root_mismatch_id, "agent.reply")],
+    );
+    assert_eq!(
+        journal
+            .recover_store_startup(&root_manifest, "current-boot", Some(&root_id))
+            .unwrap_err()
+            .code,
+        "NATIVE_IDENTITY_MISMATCH"
+    );
+    assert_eq!(fs::read(&root_mismatch_path).unwrap(), root_mismatch_bytes);
 }
 
 /// Steady state after convergence and drain: reopening reads only the

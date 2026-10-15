@@ -462,12 +462,13 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     }
                     let startup_scan = journal.startup_scan_counts();
                     eprintln!(
-                        "OpenCode startup recovery scan: operation_names={}, parsed_bodies={}, bytes={}, outbox_entries={}, unresolved={}",
+                        "OpenCode startup recovery scan: operation_names={}, parsed_bodies={}, bytes={}, outbox_entries={}, unresolved={}, damaged_record_observations={}",
                         startup_scan.operations_listed,
                         startup_scan.operation_bodies_parsed,
                         startup_scan.operation_bytes_read,
                         startup_scan.outbox_entries_scanned,
                         startup_scan.unresolved_found,
+                        journal.startup_damaged_record_observations(),
                     );
                     root_checked = true;
                 }
@@ -476,8 +477,9 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     retention_started = true;
                 }
             }
+            let damaged_record_observations = journal.startup_damaged_record_observations();
             if !recovery_report_queued
-                && !journal_recovery.is_empty()
+                && (!journal_recovery.is_empty() || damaged_record_observations > 0)
                 && matches!(step, StartupRecoveryStep::Complete | StartupRecoveryStep::Blocked)
             {
                 let entries = journal_recovery.iter().take(32).map(|recovered| json!({
@@ -499,6 +501,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                         "native_scope_key":scope,
                         "journal_recovery":{
                             "count":journal_recovery_count,
+                            "damaged_record_observations":damaged_record_observations,
                             "entries":entries,
                             "coverage":if journal.startup_recovery_complete() {"complete"} else {"partial"},
                             "native_replay_permitted":false,
