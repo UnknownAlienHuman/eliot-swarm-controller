@@ -772,6 +772,57 @@ function Test-JsonSemanticEquality {
     }
 }
 
+function Get-OpenCodeAdapterCatalogFailurePredicate {
+    param(
+        [AllowNull()][string] $Category,
+        [Parameter(Mandatory)] $RouteModel,
+        [Parameter(Mandatory)] $Contract,
+        [Parameter(Mandatory)][System.Collections.IDictionary] $OperationScope
+    )
+    if ($Category -cnotin @('model_absent', 'model_disabled', 'variant_absent')) { return $null }
+    if ((Get-OptionalField $RouteModel 'provider_id') -cne $Contract.expected_provider -or
+        (Get-OptionalField $RouteModel 'model_id') -cne $Contract.expected_model -or
+        (Get-OptionalField $RouteModel 'variant') -cne $Contract.expected_effort) { return $null }
+
+    $scope = [ordered]@{}
+    foreach ($name in @('task_id', 'attempt_id', 'parent_operation_id', 'open_operation_id', 'binding_id')) {
+        $value = Get-OptionalField $OperationScope $name
+        if ($value -isnot [string] -or $value.Length -gt 256 -or
+            $value -notmatch '^[A-Za-z0-9._:-]+$') { return $null }
+        $scope[$name] = $value
+    }
+    $generation = Get-OptionalField $OperationScope 'generation'
+    if (($generation -isnot [int] -and $generation -isnot [long]) -or $generation -le 0) { return $null }
+    $scope.generation = [long]$generation
+
+    $matchingModels = $null
+    $enabled = $null
+    $matchingVariants = $null
+    $predicate = switch ($Category) {
+        'model_absent' { $matchingModels = 0; 'exact_provider_model_pair_count_zero'; break }
+        'model_disabled' { $matchingModels = 1; $enabled = $false; 'exact_model_present_but_disabled'; break }
+        'variant_absent' { $matchingModels = 1; $enabled = $true; $matchingVariants = 0; 'exact_model_variant_count_zero'; break }
+    }
+    return [ordered]@{
+        schema_version = 1
+        evidence_source = 'native_adapter_catalog_classifier'
+        category = $Category
+        failed_predicate = $predicate
+        scope = $scope
+        requested_model = [ordered]@{
+            provider_id = [string]$RouteModel.provider_id
+            model_id = [string]$RouteModel.model_id
+            variant = [string]$RouteModel.variant
+        }
+        observed = [ordered]@{
+            matching_model_count = $matchingModels
+            selected_model_enabled = $enabled
+            matching_variant_count = $matchingVariants
+            catalog_body_retained = $false
+        }
+    }
+}
+
 function Get-TerminalOpenRejection {
     param(
         [AllowNull()] $Operation,
@@ -2680,11 +2731,16 @@ try {
             $failureFacts = New-ReadinessFailureFacts -Reason 'terminal_open_rejection' -TaskId $taskId -AttemptId $attemptId -ModuleId $contract.module_id -ArtifactId $contract.artifact_id -ArtifactVersion $contract.version -BindingId $bindingId -Generation $generation -Projection $lastReadinessProjection -LaunchPhase $lastLaunchPhase -DispatchCapabilityState $lastDispatchCapabilityState -ErrorCode $terminalOpen.error_code
             $failureFacts.catalog_failure_category = $terminalOpen.catalog_failure_category
             if ($Adapter -eq 'OpenCode') {
+                $operationScope = [ordered]@{
+                    task_id = $taskId; attempt_id = $attemptId; parent_operation_id = $parentOperationId
+                    open_operation_id = [string]$openOp.operation_id; binding_id = $bindingId; generation = $generation
+                }
+                $adapterCatalogPredicate = Get-OpenCodeAdapterCatalogFailurePredicate -Category $terminalOpen.catalog_failure_category -RouteModel $routeModel -Contract $contract -OperationScope $operationScope
+                if ($null -ne $adapterCatalogPredicate) {
+                    $failureFacts.adapter_catalog_failure_predicate = $adapterCatalogPredicate
+                }
                 try {
-                    $catalogDiagnostic = Get-OpenCodeSelectedCatalogEvidence -Route $route -RouteModel $routeModel -Contract $contract -Mode 'rejected_open_diagnostic' -OperationScope ([ordered]@{
-                        task_id = $taskId; attempt_id = $attemptId; parent_operation_id = $parentOperationId
-                        open_operation_id = [string]$openOp.operation_id; binding_id = $bindingId; generation = $generation
-                    })
+                    $catalogDiagnostic = Get-OpenCodeSelectedCatalogEvidence -Route $route -RouteModel $routeModel -Contract $contract -Mode 'rejected_open_diagnostic' -OperationScope $operationScope
                 }
                 catch {
                     $catalogDiagnostic = [ordered]@{

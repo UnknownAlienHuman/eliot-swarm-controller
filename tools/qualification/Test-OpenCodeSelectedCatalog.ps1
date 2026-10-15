@@ -12,6 +12,7 @@ if ($parseErrors.Count -gt 0) { throw "Harness parse failed: $($parseErrors[0].M
 $functionNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($name in @(
     'Get-OptionalField',
+    'Get-OpenCodeAdapterCatalogFailurePredicate',
     'Read-OpenCodeSelectedConnectionRecord',
     'Invoke-OpenCodeSelectedJsonGet',
     'Test-OpenCodeSelectedWorkspacePathMatch',
@@ -188,6 +189,24 @@ try {
         expected_effort = 'high'
     }
     $routeModel = [pscustomobject]@{ provider_id = 'kilo'; model_id = 'stepfun/step-5-preview-free'; variant = 'high' }
+    $adapterScope = [ordered]@{
+        task_id = 'fixture-task'; attempt_id = 'fixture-attempt'; parent_operation_id = 'fixture-parent'
+        open_operation_id = 'fixture-open'; binding_id = 'fixture-binding'; generation = 1
+    }
+    $adapterPredicate = Get-OpenCodeAdapterCatalogFailurePredicate -Category 'model_absent' -RouteModel $routeModel -Contract $contract -OperationScope $adapterScope
+    Assert-Fixture ($adapterPredicate.evidence_source -ceq 'native_adapter_catalog_classifier' -and $adapterPredicate.failed_predicate -ceq 'exact_provider_model_pair_count_zero' -and $adapterPredicate.observed.matching_model_count -eq 0 -and $adapterPredicate.observed.catalog_body_retained -eq $false) 'Adapter model_absent was not mapped to its exact bounded predicate.'
+    Assert-Fixture ($null -eq $adapterPredicate.observed.selected_model_enabled -and $null -eq $adapterPredicate.observed.matching_variant_count) 'A missing exact model was incorrectly reported as disabled or variant-missing.'
+    Assert-Fixture ($adapterPredicate.scope.binding_id -ceq 'fixture-binding' -and $adapterPredicate.scope.generation -eq 1 -and $adapterPredicate.requested_model.model_id -ceq 'stepfun/step-5-preview-free') 'Adapter predicate lost its exact binding generation or slash-qualified model tuple.'
+    $adapterPredicateJson = ConvertTo-Json -InputObject $adapterPredicate -Depth 12 -Compress
+    foreach ($privateMarker in @('connection_file', 'endpoint', 'password', 'credential', 'service_id')) {
+        Assert-Fixture (-not $adapterPredicateJson.Contains($privateMarker, [StringComparison]::OrdinalIgnoreCase)) 'Adapter predicate exposed private topology material.'
+    }
+    $disabledPredicate = Get-OpenCodeAdapterCatalogFailurePredicate -Category 'model_disabled' -RouteModel $routeModel -Contract $contract -OperationScope $adapterScope
+    Assert-Fixture ($disabledPredicate.observed.matching_model_count -eq 1 -and $disabledPredicate.observed.selected_model_enabled -eq $false) 'Adapter model_disabled was not mapped to its exact predicate.'
+    $variantPredicate = Get-OpenCodeAdapterCatalogFailurePredicate -Category 'variant_absent' -RouteModel $routeModel -Contract $contract -OperationScope $adapterScope
+    Assert-Fixture ($variantPredicate.observed.matching_model_count -eq 1 -and $variantPredicate.observed.selected_model_enabled -eq $true -and $variantPredicate.observed.matching_variant_count -eq 0) 'Adapter variant_absent was not mapped to its exact predicate.'
+    Assert-Fixture ($null -eq (Get-OpenCodeAdapterCatalogFailurePredicate -Category 'catalog_unavailable' -RouteModel $routeModel -Contract $contract -OperationScope $adapterScope)) 'Unavailable catalog was incorrectly converted into a model predicate.'
+    Assert-Fixture ($null -eq (Get-OpenCodeAdapterCatalogFailurePredicate -Category 'model_absent' -RouteModel ([pscustomobject]@{ provider_id = 'other'; model_id = 'model'; variant = 'low' }) -Contract $contract -OperationScope $adapterScope)) 'A tuple outside the frozen contract received adapter-predicate evidence.'
     $attachedRoute = [ordered]@{
         alias = 'selected-catalog-fixture'
         enabled = $true
