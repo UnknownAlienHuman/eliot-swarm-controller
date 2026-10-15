@@ -1068,6 +1068,9 @@ jobs:
               'plugin_package_path_config_roundtrips_through_source_validation'
             )
           } elseif ($env:QUALIFICATION -ceq 'focused-core-runtime') {
+            & cargo check --locked --package swarm-automation --all-targets --target-dir $targetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'Automation default-feature all-target compilation passed.'
             & cargo build --locked --package swarm-script-worker --bin swarm-script-worker --target-dir $targetDir
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $workerName = if ($IsWindows) { 'swarm-script-worker.exe' } else { 'swarm-script-worker' }
@@ -1094,6 +1097,18 @@ jobs:
               'store_source_worker_waits_for_durable_allow_and_runs_once_after_recovery'
             )) {
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            if ($IsWindows) {
+              foreach ($case in @(
+                'owner_worker_grandchild_requires_authoritative_job_departure',
+                'module_membership_job_open_uncertainty_retains_child_until_exact_family_departure'
+              )) {
+                Invoke-FocusedCohort -Package 'swarm-supervisor' -Filter $case -Expected 1 -ExpectedNames @($case)
+              }
+              $membershipCase = 'missing_or_denied_job_open_is_membership_unknown'
+              Invoke-FocusedCohort -Package 'swarm-process' -Filter $membershipCase -Expected 1 -ExpectedNames @($membershipCase)
+              $terminalCase = 'terminal_receipt_fallback_requires_valid_proof_and_child_exit'
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $terminalCase -Expected 1 -ExpectedNames @($terminalCase)
             }
             Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter 'adapter::acp::tests::pr44_command_acp_' -Expected 12 -ExpectedNames @(
               'pr44_command_acp_route_accepts_optional_effort_mode_and_rejects_malformed_values',
