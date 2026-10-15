@@ -1089,6 +1089,17 @@ jobs:
               'public_check_run_consumes_a_healthy_native_child_receipt',
               'probe_custody_keeps_nested_family_and_capture_until_exact_departure',
               'bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced',
+              'store_assembled_range_reads_reuse_bounded_source_proof',
+              'store_compacts_over_budget_assembly_proof_without_weakening_read_grants',
+              'oversized_proof_is_a_singleton_and_next_admission_evicts_it',
+              'store_assembled_grant_loop_is_distinct_bounded',
+              'store_assembled_parts_limit_one_on_32',
+              'store_assembled_unrelated_write_preserves_proof',
+              'store_assembled_warm_manifest_mutation_invalidates_record_and_proof',
+              'store_assembled_warm_producer_mutation_invalidates_proof',
+              'store_assembled_warm_revocation_and_tamper_negative',
+              'unowned_blocking_consult_reaches_current_manager_attention_once',
+              'scoped_manager_attention_isolates_and_surfaces_corrupt_consults',
               'r48_owner_lost_store_results_hold_intent_and_process_capacity',
               'r48_owner_stale_callbacks_keep_old_receipt_out_of_current_host_status',
               'pr71_a2_pid_unavailable_keeps_exact_child_custody',
@@ -1167,6 +1178,8 @@ jobs:
             )
             $descriptorCase = 'pr44_command_acp_descriptor_deactivates_configure_and_host_rejects_the_old_set'
             Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter $descriptorCase -Expected 1 -ExpectedNames @($descriptorCase)
+            $runtimeIpcCase = 'pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client'
+            Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter $runtimeIpcCase -Expected 1 -ExpectedNames @($runtimeIpcCase)
           } elseif ($env:QUALIFICATION -ceq 'focused-opencode-controls') {
             foreach ($case in @(
               'background_idle_session_is_the_documented_native_noop',
