@@ -2125,6 +2125,7 @@ dependencies = [
  "sha2",
  "swarm-client",
  "swarm-contracts",
+ "swarm-kernel-host",
  "swarm-process",
  "tokio",
  "tokio-util",

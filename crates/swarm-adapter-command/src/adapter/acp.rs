@@ -1001,6 +1001,7 @@ pub(super) async fn run(
             &owner,
             retained_session_id,
             retained_session_id,
+            false,
         )
         .await
         {
@@ -1107,7 +1108,7 @@ pub(super) async fn run(
                     )
                 })?;
             journal.record_command(&command)?;
-            if let Err(error) = super::validate_command(&command, &link) {
+            if let Err(error) = super::validate_command(&command, &link, retained_session_id) {
                 let mut outcome = rejected(&command, &error.code);
                 module_host::attach_receipt_identity(&mut outcome, &command, &owner.host.claim)?;
                 let hash = journal.save_outcome(&outcome)?;
@@ -1255,7 +1256,7 @@ pub(super) async fn run(
                                 let next = match link.client.next().await {
                                     Ok(value) => value,
                                     Err(error) if super::is_transport_uncertain(&error) => {
-                                        recovery.reconnect(&mut link).await.map_err(to_acp_error)?;
+                                        recovery.reconnect(&mut link, false).await.map_err(to_acp_error)?;
                                         continue;
                                     }
                                     Err(error) => return Err(to_acp_error(error)),
@@ -1298,7 +1299,8 @@ pub(super) async fn run(
                                     permission_wakeup: &permission_wakeup,
                                     observation_sequence: &observation_sequence,
                                 };
-                                if let Err(error) = super::validate_command(&command, context.link) {
+                                let expected_native_root_id = context.session.as_ref().map(|session| session.id.to_string());
+                                if let Err(error) = super::validate_command(&command, context.link, expected_native_root_id.as_deref()) {
                                     let outcome = context.session.as_ref().map_or_else(
                                         || rejected(&command, &error.code),
                                         |session| rejected_in_session(
@@ -1947,6 +1949,7 @@ async fn process_command(
                         json!({
                             "execution_shape":ACP_EXECUTION_SHAPE,
                             "completion_condition":"native_turn_completed",
+                            "execution_complete":true,
                             "task_completion":"unknown",
                             "native_session_id":session.id,
                             "native_stop_reason":format!("{:?}",response.stop_reason),
@@ -1964,7 +1967,7 @@ async fn process_command(
                             "native_stderr_error":stderr_error,
                             "protocol_capture_error":protocol_error,
                             "session_updates":updates,
-                            "task_dispatch_admission":admission,
+                            "dispatch_admission":admission,
                             "family_departure_claimed":false
                         }),
                     )
@@ -3336,7 +3339,7 @@ trait HostCommandSource {
 }
 
 impl ModuleLinkRecovery<'_> {
-    async fn reconnect(&self, link: &mut Link) -> Result<()> {
+    async fn reconnect(&self, link: &mut Link, native_ready: bool) -> Result<()> {
         note_module_ipc_disconnect(self.capture)?;
         let binding_id = link.binding_id.clone();
         let generation = link.generation;
@@ -3355,6 +3358,7 @@ impl ModuleLinkRecovery<'_> {
                 self.owner,
                 session_id.as_deref(),
                 session_id.as_deref(),
+                native_ready,
             )
             .await
             {
@@ -3390,7 +3394,7 @@ impl ModuleLinkRecovery<'_> {
             {
                 Ok(()) => return Ok(()),
                 Err(error) if super::is_transport_uncertain(&error) => {
-                    self.reconnect(link).await?;
+                    self.reconnect(link, false).await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -3413,7 +3417,7 @@ impl ModuleLinkRecovery<'_> {
             match link.client.outcome(serde_json::to_value(outcome)?).await {
                 Ok(ack) => return self.journal.acknowledge(&outcome.operation_id, hash, ack),
                 Err(error) if super::is_transport_uncertain(&error) => {
-                    self.reconnect(link).await?;
+                    self.reconnect(link, false).await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -3443,7 +3447,7 @@ impl HostCommandSource for OwnedModuleLinkSource<'_, '_, '_> {
     }
 
     fn reconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        Box::pin(self.recovery.reconnect(self.link))
+        Box::pin(self.recovery.reconnect(self.link, true))
     }
 }
 
@@ -3570,7 +3574,13 @@ async fn process_control_during_turn(
     control: RuntimeCommand,
 ) -> Result<()> {
     context.journal.record_command(&control)?;
-    let outcome = if let Err(error) = super::validate_command(&control, context.link) {
+    let expected_native_root_id = context
+        .session
+        .as_ref()
+        .map(|session| session.id.to_string());
+    let outcome = if let Err(error) =
+        super::validate_command(&control, context.link, expected_native_root_id.as_deref())
+    {
         rejected(&control, &error.code)
     } else {
         match control.method.as_str() {
@@ -4838,6 +4848,10 @@ fn to_acp_error(error: Error) -> agent_client_protocol::Error {
 fn invalid(message: &'static str) -> Error {
     Error::new("ADAPTER_EVIDENCE_INVALID", message)
 }
+
+#[cfg(test)]
+#[path = "acp/runtime_ipc_fixture.rs"]
+mod runtime_ipc_fixture;
 
 #[cfg(test)]
 mod tests {

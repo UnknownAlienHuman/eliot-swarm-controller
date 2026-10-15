@@ -253,7 +253,7 @@ pub async fn run() -> Result<()> {
                         "module command envelope is invalid",
                     )
                 })?;
-            validate_command(&command, &link)?;
+            validate_command(&command, &link, None)?;
             let (receipts, stop_bridge) =
                 process_command(&config, &owner, &store, &mut link, &credential, &command).await?;
             stop_after_observation |= stop_bridge;
@@ -1183,7 +1183,7 @@ async fn deliver_result_page(
 }
 
 async fn connect_module(config: &Config, credential: &Credential, owner: &Owner) -> Result<Link> {
-    connect_module_with_native_state(config, credential, owner, None, None).await
+    connect_module_with_native_state(config, credential, owner, None, None, false).await
 }
 
 async fn connect_module_with_native_state(
@@ -1192,6 +1192,7 @@ async fn connect_module_with_native_state(
     owner: &Owner,
     native_root_id: Option<&str>,
     native_scope_key: Option<&str>,
+    native_ready: bool,
 ) -> Result<Link> {
     if native_root_id.is_some() != native_scope_key.is_some() {
         return Err(Error::new(
@@ -1218,7 +1219,7 @@ async fn connect_module_with_native_state(
                 "module_artifact_id":owner.host.profile.artifact_id(),
                 "native_root_id":native_root_id,
                 "native_scope_key":native_scope_key,
-                "native_ready":false,
+                "native_ready":native_ready,
                 "managed_owner":owner.record
             }),
             Some(&owner.host.claim),
@@ -1334,11 +1335,22 @@ fn module_state(
     })
 }
 
-fn validate_command(command: &RuntimeCommand, link: &Link) -> Result<()> {
+// Store carries its binding native root on follow-up commands; accept it only
+// when it matches this consumer's exact retained ACP session.
+fn validate_command(
+    command: &RuntimeCommand,
+    link: &Link,
+    expected_native_root_id: Option<&str>,
+) -> Result<()> {
+    let native_root_matches = match (command.native_root_id.as_deref(), expected_native_root_id) {
+        (None, None) => true,
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => false,
+    };
     if command.binding_id != link.binding_id
         || command.generation != link.generation
         || command.route != link.route
-        || command.native_root_id.is_some()
+        || !native_root_matches
     {
         return Err(Error::new(
             "NATIVE_IDENTITY_MISMATCH",
@@ -1738,9 +1750,12 @@ fn reserved_argument(argument: &str) -> bool {
 }
 
 fn is_transport_uncertain(error: &Error) -> bool {
+    // A broken host pipe is reported as IO_ERROR by swarm-client. The request
+    // may have reached Store, so callers recover by reconnecting and reading
+    // or replaying only their exact idempotent receipt.
     matches!(
         error.code.as_str(),
-        "OUTCOME_UNKNOWN" | "DISCONNECTED" | "PROTOCOL_ERROR" | "HOST_UNAVAILABLE"
+        "OUTCOME_UNKNOWN" | "DISCONNECTED" | "PROTOCOL_ERROR" | "HOST_UNAVAILABLE" | "IO_ERROR"
     )
 }
 
