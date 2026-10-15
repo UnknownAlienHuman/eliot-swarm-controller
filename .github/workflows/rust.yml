@@ -645,6 +645,8 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "LIBCLANG_PATH=$libclangDir" -Encoding utf8
       - name: Run selected focused cohorts and reject empty or miscounted selections
         shell: pwsh
+        env:
+          ELIOT_FOCUSED_BUN_EXE: ${{ steps.focused-bun.outputs.bun-path }}
         run: |
           $targetDir = Join-Path $env:RUNNER_TEMP "eliot-$($env:QUALIFICATION)-target"
           function Confirm-FocusedSelection {
@@ -1007,7 +1009,7 @@ jobs:
               Invoke-FocusedCohort -Package 'swarm-process' -Filter $syncCase -Expected 1 -ExpectedNames @($syncCase)
             }
           } elseif ($env:QUALIFICATION -ceq 'focused-native-fixtures') {
-            $env:ELIOT_OPENCODE_BUN_EXE = '${{ steps.focused-bun.outputs.bun-path }}'
+            $env:ELIOT_OPENCODE_BUN_EXE = $env:ELIOT_FOCUSED_BUN_EXE
             if (-not (Test-Path -LiteralPath $env:ELIOT_OPENCODE_BUN_EXE -PathType Leaf)) {
               throw 'The deadline fixture requires the actual Bun runtime image.'
             }
