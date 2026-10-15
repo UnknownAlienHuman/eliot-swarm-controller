@@ -6481,6 +6481,18 @@ async fn build_normalized_result_page(
     }))
 }
 
+async fn drain_retired_then_exit(
+    config: &AdapterConfig,
+    context: &module_contract::ModuleRuntimeContext,
+    ipc: &IpcConfig,
+    journal: &mut Journal,
+) -> Result<(), AdapterError> {
+    let mut host = connect_host(config, context, ipc).await?;
+    let normalized_results = module_contract::normalized_result_enabled(&context.claim);
+    report_pending(&mut host, journal, normalized_results).await?;
+    Ok(())
+}
+
 async fn connect_host(
     config: &AdapterConfig,
     context: &module_contract::ModuleRuntimeContext,
@@ -6562,9 +6574,6 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
     }
     let context = module_contract::load_runtime_context()?;
     let mut journal = Journal::open(context.state_dir.clone(), context.worker.boot_id.clone())?;
-    if journal.state.native_retired {
-        return Ok(());
-    }
     let ipc: IpcConfig =
         serde_json::from_value(config.ipc.clone()).map_err(|_| AdapterError::Configuration)?;
     let mut credential_unavailable = false;
@@ -6584,6 +6593,10 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
     };
     let endpoint = config.endpoint.clone();
     let mut native: Option<NativeClient> = None;
+    if journal.state.native_retired {
+        drain_retired_then_exit(&config, &context, &ipc, &mut journal).await?;
+        return Ok(());
+    }
     loop {
         let mut host = match connect_host(&config, &context, &ipc).await {
             Ok(host) => host,
@@ -7345,6 +7358,7 @@ mod agent_shutdown_loopback_tests {
         drop(journal);
         let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned()).expect("reopen retired journal");
         assert!(reopened.state.native_retired);
+        assert!(!reopened.state.acknowledged_outcomes.contains("shutdown-applied-1"), "shutdown ACK stays pending for the startup drain");
         let again = shutdown_operation(&command, &mut reopened, &mut native, &claim).await;
         assert!(matches!(again.outcome, EffectOutcome::Applied));
         assert_eq!(closes.load(Ordering::SeqCst), 1);

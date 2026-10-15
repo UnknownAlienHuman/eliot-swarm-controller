@@ -766,6 +766,31 @@ impl OperationJournal {
         Ok(pending)
     }
 
+    pub fn has_terminal_shutdown(&self) -> Result<bool> {
+        for entry in fs::read_dir(&self.root).map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be listed"))? {
+            let entry = entry.map_err(|_| Error::new("ADAPTER_JOURNAL", "operation entry cannot be read"))?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            ensure_regular(&path)?;
+            let state = match self.read_path(&path, None) {
+                Ok(state) => state,
+                Err(error) if is_item_local_operation_damage(&error) => {
+                    self.note_deferred_damage()?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if state.method.as_deref() != Some("agent.shutdown") {
+                continue;
+            }
+            if state.outcome.as_ref().is_some_and(|outcome| matches!(outcome["details"]["diagnostic_code"].as_str(), Some("OWNED_TRANSPORT_RELEASED" | "SHUTDOWN_STOP_UNCERTAIN"))) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     pub fn has_task_dispatch_for_boot(&self, boot_id: &str) -> Result<bool> {
         let path = self.boot_marker_path(boot_id);
         if !path.exists() {

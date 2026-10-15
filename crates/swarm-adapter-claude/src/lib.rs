@@ -79,6 +79,10 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         config.generation,
         &config.native_options.scope_key(),
     )?;
+    if journal.has_terminal_shutdown()? {
+        flush_outbox(&mut link, &journal, &interactions).await?;
+        return Ok(());
+    }
     let bridge_path = sdk_harness::materialize(&config.sdk_harness_dir)?;
     let (frame_tx, mut frame_rx) = mpsc::channel::<HarnessFrame>(MAX_FRAMES);
     let mut harness: Option<NativeHarness> = None;
@@ -5508,6 +5512,20 @@ mod agent_shutdown_handler_tests {
         let _status = tokio::time::timeout(std::time::Duration::from_secs(10), holder.wait()).await.expect("holder observes stdin EOF").expect("holder exits");
         drop(journal);
         drop(interactions);
+        std::fs::remove_dir_all(&root).ok();
+    }
+    #[test]
+    fn startup_scan_finds_only_terminal_shutdown() {
+        let (root, _config, journal, _interactions) = shutdown_fixture("claude-shutdown-scan");
+        assert!(!journal.has_terminal_shutdown().expect("empty scan"));
+        for (id, code, terminal) in [("shutdown-scan-other", "agent.send", false), ("shutdown-scan-rejected", "SHUTDOWN_SCOPE_UNSUPPORTED", false), ("shutdown-scan-retired", "OWNED_TRANSPORT_RELEASED", true)] {
+            let receipt: swarm_contracts::runtime::ModuleReceiptIdentity = serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": "claude-agent-sdk-rust-controller.6", "version": "6", "build_id": null}, "protocol": {"major": 1, "minor": 0}, "binding_id": "fixture-binding", "binding_generation": 1, "operation_id": id, "input_sha256": "e".repeat(64)})).expect("scan receipt");
+            let method = if code == "agent.send" { "agent.send" } else { "agent.shutdown" };
+            journal.write_intent(id, &receipt, method, &serde_json::json!({})).expect("scan intent");
+            let outcome = RuntimeOutcome { operation_id: id.to_owned(), outcome: if terminal { EffectOutcome::Applied } else { EffectOutcome::Rejected }, native_scope_key: None, native_root_id: None, turn_id: None, native_input_id: None, details: serde_json::json!({"diagnostic_code": code}) };
+            journal.save_outcome(id, &outcome).expect("scan outcome");
+            assert_eq!(journal.has_terminal_shutdown().expect("terminal scan"), terminal);
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 }
