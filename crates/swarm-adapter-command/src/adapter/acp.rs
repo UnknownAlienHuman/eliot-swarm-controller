@@ -33,7 +33,7 @@ use tokio::{
     sync::{Notify, oneshot},
     time,
 };
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+use tokio_util::codec::{Decoder, FramedRead, FramedWrite, LinesCodec};
 
 use super::{Config, Link, Owner, is_sha256};
 use crate::{
@@ -128,6 +128,8 @@ struct Capture {
     updates: u64,
     history_updates: u64,
     history_replaying: bool,
+    current_mode_id: Option<String>,
+    current_mode_updates: u64,
     tool_events: Vec<Value>,
     agent_children: Vec<Value>,
     pending_requests: Vec<Value>,
@@ -168,8 +170,35 @@ struct ActiveSession {
     owner_operation_id: String,
     workspace: PathBuf,
     model_id: String,
+    requested_effort: Option<String>,
+    effective_effort: Option<String>,
+    requested_mode: Option<String>,
+    effective_mode: Option<String>,
     close_supported: bool,
     closed: bool,
+}
+
+struct SessionOpenContext<'a> {
+    connection: &'a ConnectionTo<Agent>,
+    journal: &'a AcpJournal,
+    command: &'a RuntimeCommand,
+    workspace: &'a Path,
+    owner: &'a Owner,
+    features: &'a AgentFeatures,
+    capture: &'a Arc<Mutex<Capture>>,
+}
+
+struct SessionRouteConfiguration {
+    model_id: String,
+    effort: Option<String>,
+    mode: Option<String>,
+}
+
+struct SelectConfigSetting<'a> {
+    field: &'a str,
+    option: &'a SessionConfigOption,
+    requested: &'a str,
+    current_options: &'a [SessionConfigOption],
 }
 
 struct CommandContext<'a> {
@@ -201,6 +230,8 @@ struct RestoreIdentity {
     session_id: SessionId,
     workspace: PathBuf,
     model_id: String,
+    requested_effort: Option<String>,
+    requested_mode: Option<String>,
     owner_operation_id: String,
 }
 
@@ -225,6 +256,47 @@ struct AgentFeatures {
     load_session_supported: bool,
     agent_info: Option<Value>,
     capabilities: Value,
+}
+
+struct AcpLineCodec {
+    lines: LinesCodec,
+}
+
+impl AcpLineCodec {
+    fn new(max_frame_bytes: usize) -> Self {
+        Self {
+            lines: LinesCodec::new_with_max_length(max_frame_bytes),
+        }
+    }
+}
+
+impl Decoder for AcpLineCodec {
+    type Item = String;
+    type Error = std::io::Error;
+
+    fn decode(
+        &mut self,
+        source: &mut tokio_util::bytes::BytesMut,
+    ) -> std::io::Result<Option<Self::Item>> {
+        self.lines
+            .decode(source)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+
+    fn decode_eof(
+        &mut self,
+        source: &mut tokio_util::bytes::BytesMut,
+    ) -> std::io::Result<Option<Self::Item>> {
+        if !source.is_empty() && !source.contains(&b'\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unterminated ACP line at EOF",
+            ));
+        }
+        self.lines
+            .decode_eof(source)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
 }
 
 #[derive(Clone)]
@@ -1038,11 +1110,8 @@ pub(super) async fn run(
                 ),
                 |error| std::io::Error::other(error.to_string()),
             );
-            let incoming = FramedRead::new(
-                child_stdout,
-                LinesCodec::new_with_max_length(MAX_ACP_FRAME_BYTES),
-            )
-            .map(|result| result.map_err(|error| std::io::Error::other(error.to_string())));
+            let incoming = FramedRead::new(child_stdout, AcpLineCodec::new(MAX_ACP_FRAME_BYTES))
+                .map(|result| result.map_err(|error| std::io::Error::other(error.to_string())));
             let transport = Lines::new(outgoing, incoming);
             let stderr_task = tokio::spawn(drain_native_stderr(child_stderr, Arc::clone(&capture)));
             let connection_capture = Arc::clone(&capture);
@@ -1411,6 +1480,10 @@ fn capture_session_notification(capture: &mut Capture, notification: &SessionNot
             MAX_CAPTURE_BYTES,
         );
     }
+    if let SessionUpdate::CurrentModeUpdate(update) = &notification.update {
+        capture.current_mode_id = Some(update.current_mode_id.to_string());
+        capture.current_mode_updates = capture.current_mode_updates.saturating_add(1);
+    }
     if let Some(event) = compact_tool_event(&notification.update) {
         retain_bounded_event(&mut capture.tool_events, event);
         if let Some(child) = native_agent_child(&notification.update) {
@@ -1546,15 +1619,23 @@ async fn process_command(
                         "ACP requires the admitted absolute workspace",
                     )
                 })?;
+                let route_configuration = SessionRouteConfiguration {
+                    model_id: context.model.to_owned(),
+                    effort: command_effort(&context.link.route).map(str::to_owned),
+                    mode: command_mode(&context.link.route).map(str::to_owned),
+                };
                 *context.session = Some(
                     open_session(
-                        context.connection,
-                        context.journal,
-                        command,
-                        workspace,
-                        context.model,
-                        context.owner,
-                        context.features,
+                        SessionOpenContext {
+                            connection: context.connection,
+                            journal: context.journal,
+                            command,
+                            workspace,
+                            owner: context.owner,
+                            features: context.features,
+                            capture: context.capture,
+                        },
+                        &route_configuration,
                     )
                     .await?,
                 );
@@ -1583,6 +1664,12 @@ async fn process_command(
                         "requested_model":context.model,
                         "effective_model":session.model_id,
                         "effective_model_status":"verified_by_session_config_readback",
+                        "requested_effort":session.requested_effort,
+                        "effective_effort":session.effective_effort,
+                        "effort_readback_status":if session.requested_effort.is_none() || session.effective_effort.is_some() {"verified_or_unselected"}else{"unknown"},
+                        "requested_mode":session.requested_mode,
+                        "effective_mode":session.effective_mode,
+                        "mode_readback_status":if session.requested_mode.is_none() || session.effective_mode.is_some() {"verified_or_unselected"}else{"unknown"},
                         "workspace":session.workspace,
                         "family_departure_claimed":false,
                         "task_completion":"unknown"
@@ -1941,6 +2028,10 @@ async fn process_command(
                 "native_scope_key":session.id,
                 "workspace":session.workspace,
                 "requested_model":session.model_id,
+                "requested_effort":session.requested_effort,
+                "effective_effort":session.effective_effort,
+                "requested_mode":session.requested_mode,
+                "effective_mode":session.effective_mode,
                 "effective_model":session.model_id,
                 "native_session_state":"closed",
                 "native_close_capability":"session/close",
@@ -2049,14 +2140,21 @@ async fn process_command(
     }
 }
 async fn open_session(
-    connection: &ConnectionTo<Agent>,
-    journal: &AcpJournal,
-    command: &RuntimeCommand,
-    workspace: &Path,
-    requested_model: &str,
-    owner: &Owner,
-    features: &AgentFeatures,
+    context: SessionOpenContext<'_>,
+    route: &SessionRouteConfiguration,
 ) -> Result<ActiveSession> {
+    let SessionOpenContext {
+        connection,
+        journal,
+        command,
+        workspace,
+        owner,
+        features,
+        capture,
+    } = context;
+    let requested_model = route.model_id.as_str();
+    let requested_effort = route.effort.as_deref();
+    let requested_mode = route.mode.as_deref();
     if !workspace.is_absolute() || !workspace.is_dir() {
         return Err(Error::new(
             "WORKSPACE_INVALID",
@@ -2078,6 +2176,8 @@ async fn open_session(
         json!({
             "workspace":workspace,
             "requested_model":requested_model,
+            "requested_effort":requested_effort,
+            "requested_mode":requested_mode,
             "load_session_fallback":false
         }),
     )?;
@@ -2092,6 +2192,29 @@ async fn open_session(
             )
         })?;
     let session_id = opened.session_id;
+    let mut options = opened.config_options.clone().unwrap_or_default();
+    let mut session = ActiveSession {
+        id: session_id.clone(),
+        owner_operation_id: command.operation_id.clone(),
+        workspace: workspace.to_path_buf(),
+        model_id: requested_model.to_owned(),
+        requested_effort: requested_effort.map(str::to_owned),
+        effective_effort: category_config_value(
+            &options,
+            &SessionConfigOptionCategory::ThoughtLevel,
+        ),
+        requested_mode: requested_mode.map(str::to_owned),
+        effective_mode: mode_current_value(opened.modes.as_ref()),
+        close_supported: false,
+        closed: false,
+    };
+    {
+        let mut capture = capture
+            .lock()
+            .map_err(|_| invalid("ACP capture lock is poisoned after session/new"))?;
+        capture.native_session_id = Some(session_id.to_string());
+        capture.current_mode_id = session.effective_mode.clone();
+    }
     let close_supported = features.close_supported
         && owner
             .host
@@ -2099,14 +2222,7 @@ async fn open_session(
             .capabilities
             .iter()
             .any(|capability| capability.as_str() == "native.command.close_session");
-    let session = ActiveSession {
-        id: session_id.clone(),
-        owner_operation_id: command.operation_id.clone(),
-        workspace: workspace.to_path_buf(),
-        model_id: requested_model.to_owned(),
-        close_supported,
-        closed: false,
-    };
+    session.close_supported = close_supported;
     journal
         .save_session(&json!({
             "schema_version":1,
@@ -2119,7 +2235,11 @@ async fn open_session(
             "native_scope_key":session.id,
             "workspace":session.workspace,
             "requested_model":requested_model,
+            "requested_effort":session.requested_effort,
+            "requested_mode":session.requested_mode,
             "effective_model":Value::Null,
+            "effective_effort":session.effective_effort,
+            "effective_mode":session.effective_mode,
             "native_session_state":"configuring",
             "native_close_capability":close_supported,
             "agent_info":features.agent_info,
@@ -2144,7 +2264,10 @@ async fn open_session(
                 "native_session_id":session.id,
                 "native_root_id":session.id,
                 "native_scope_key":session.id,
-                "workspace":session.workspace
+            "workspace":session.workspace,
+            "requested_model":requested_model,
+            "requested_effort":session.requested_effort,
+            "requested_mode":session.requested_mode
             }),
         )
         .map_err(|error| {
@@ -2156,7 +2279,6 @@ async fn open_session(
                 ),
             )
         })?;
-    let mut options = opened.config_options.clone().unwrap_or_default();
     if !model_value_available(&options, requested_model) {
         return Err(Error::new(
             "ACP_SESSION_OPEN_UNKNOWN",
@@ -2170,27 +2292,84 @@ async fn open_session(
                 "ACP model option identity is ambiguous; the retained session requires readback",
             )
         })?;
-        let configured = connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                option_id,
-                SessionConfigOptionValue::value_id(requested_model.to_owned()),
-            ))
-            .block_task()
-            .await
-            .map_err(|_| {
-                Error::new(
-                    "ACP_SESSION_OPEN_UNKNOWN",
-                    "ACP model configuration response is uncertain after session creation",
-                )
-            })?;
-        options = configured.config_options;
+        let option = config_option_by_id(&options, &option_id).ok_or_else(|| {
+            Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP model option ID is missing or ambiguous in the advertised configuration",
+            )
+        })?;
+        options = set_select_config_option(
+            connection,
+            journal,
+            command,
+            &session_id,
+            SelectConfigSetting {
+                field: "model",
+                option,
+                requested: requested_model,
+                current_options: &options,
+            },
+        )
+        .await?;
     }
     if !model_current_value_matches(&options, requested_model) {
         return Err(Error::new(
             "ACP_SESSION_OPEN_UNKNOWN",
             "ACP effective model did not match the requested model; the retained session requires readback",
         ));
+    }
+    if let Some(effort) = requested_effort {
+        let option = category_config_option(&options, &SessionConfigOptionCategory::ThoughtLevel)
+            .filter(|option| config_select_contains(option, effort))
+            .ok_or_else(|| {
+                Error::new(
+                    "CONFIGURATION_UNSUPPORTED",
+                    "ACP did not advertise one unambiguous thought_level option with the exact requested effort",
+                )
+            })?;
+        options = set_select_config_option(
+            connection,
+            journal,
+            command,
+            &session_id,
+            SelectConfigSetting {
+                field: "effort",
+                option,
+                requested: effort,
+                current_options: &options,
+            },
+        )
+        .await?;
+        if !category_config_value_matches(
+            &options,
+            &SessionConfigOptionCategory::ThoughtLevel,
+            effort,
+        ) {
+            return Err(Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP effort configuration did not read back the exact requested value",
+            ));
+        }
+    }
+    session.effective_effort =
+        category_config_value(&options, &SessionConfigOptionCategory::ThoughtLevel);
+
+    if let Some(mode) = requested_mode {
+        session.effective_mode = Some(
+            set_session_mode(
+                connection,
+                journal,
+                command,
+                &session_id,
+                mode,
+                opened.modes.as_ref(),
+                capture,
+            )
+            .await?,
+        );
+    }
+    if session.effective_mode.is_none() {
+        session.effective_mode = capture_mode_readback(capture)?.0;
     }
     let config_snapshot = session_config_options_snapshot(&options).map_err(|error| {
         Error::new(
@@ -2213,8 +2392,12 @@ async fn open_session(
             "native_scope_key":session.id,
             "workspace":session.workspace,
             "requested_model":requested_model,
+            "requested_effort":session.requested_effort,
+            "requested_mode":session.requested_mode,
             "effective_model":requested_model,
             "model_readback":requested_model,
+            "effective_effort":session.effective_effort,
+            "effective_mode":session.effective_mode,
             "config_options":config_snapshot,
             "native_session_state":"open",
             "native_close_capability":session.close_supported,
@@ -2232,6 +2415,169 @@ async fn open_session(
             )
         })?;
     Ok(session)
+}
+
+async fn set_select_config_option(
+    connection: &ConnectionTo<Agent>,
+    journal: &AcpJournal,
+    command: &RuntimeCommand,
+    session_id: &SessionId,
+    setting: SelectConfigSetting<'_>,
+) -> Result<Vec<SessionConfigOption>> {
+    let SelectConfigSetting {
+        field,
+        option,
+        requested,
+        current_options,
+    } = setting;
+    let config_id = option.id.to_string();
+    if !config_select_contains(option, requested) {
+        return Err(Error::new(
+            "CONFIGURATION_UNSUPPORTED",
+            "ACP configuration option did not advertise the exact requested value",
+        ));
+    }
+    if config_select_current(option).as_deref() == Some(requested) {
+        return Ok(current_options.to_vec());
+    }
+    let effect_id = format!("session/config-option/{field}");
+    journal.record_effect(
+        command,
+        &effect_id,
+        "intent",
+        json!({
+            "native_session_id":session_id,
+            "config_id":config_id,
+            "requested_value_id":requested
+        }),
+    )?;
+    let configured = connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            config_id.clone(),
+            SessionConfigOptionValue::value_id(requested.to_owned()),
+        ))
+        .block_task()
+        .await
+        .map_err(|_| {
+            Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP config-option setter response is uncertain after session creation",
+            )
+        })?;
+    let actual =
+        config_option_by_id(&configured.config_options, &config_id).and_then(config_select_current);
+    let verified = actual.as_deref() == Some(requested);
+    journal.record_effect(
+        command,
+        &effect_id,
+        "receipt",
+        json!({
+            "native_session_id":session_id,
+            "config_id":config_id,
+            "requested_value_id":requested,
+            "effective_value_id":actual,
+            "readback_verified":verified
+        }),
+    )?;
+    if !verified {
+        return Err(Error::new(
+            "ACP_SESSION_OPEN_UNKNOWN",
+            "ACP config-option setter did not read back the exact requested value",
+        ));
+    }
+    Ok(configured.config_options)
+}
+
+async fn set_session_mode(
+    connection: &ConnectionTo<Agent>,
+    journal: &AcpJournal,
+    command: &RuntimeCommand,
+    session_id: &SessionId,
+    requested_mode: &str,
+    advertised_modes: Option<&SessionModeState>,
+    capture: &Arc<Mutex<Capture>>,
+) -> Result<String> {
+    if !mode_value_available(advertised_modes, requested_mode) {
+        return Err(Error::new(
+            "CONFIGURATION_UNSUPPORTED",
+            "ACP did not advertise one unambiguous session mode with the exact requested value",
+        ));
+    }
+    if mode_current_value(advertised_modes).as_deref() == Some(requested_mode) {
+        return Ok(requested_mode.to_owned());
+    }
+    let (_, updates_before) = capture_mode_readback(capture)?;
+    journal.record_effect(
+        command,
+        "session/set-mode",
+        "intent",
+        json!({
+            "native_session_id":session_id,
+            "requested_mode_id":requested_mode
+        }),
+    )?;
+    connection
+        .send_request(SetSessionModeRequest::new(
+            session_id.clone(),
+            requested_mode.to_owned(),
+        ))
+        .block_task()
+        .await
+        .map_err(|_| {
+            Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP mode setter response is uncertain after session creation",
+            )
+        })?;
+    let mode_readback = time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (current, updates) = capture_mode_readback(capture)?;
+            if updates > updates_before && current.as_deref() == Some(requested_mode) {
+                return Ok::<_, Error>(current);
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            "ACP_SESSION_OPEN_UNKNOWN",
+            "ACP mode setter did not produce an exact current-mode update",
+        )
+    })??;
+    let effective_mode = mode_readback.ok_or_else(|| {
+        Error::new(
+            "ACP_SESSION_OPEN_UNKNOWN",
+            "ACP mode update omitted its current mode ID",
+        )
+    })?;
+    journal.record_effect(
+        command,
+        "session/set-mode",
+        "receipt",
+        json!({
+            "native_session_id":session_id,
+            "requested_mode_id":requested_mode,
+            "effective_mode_id":effective_mode,
+            "readback_verified":true
+        }),
+    )?;
+    Ok(effective_mode)
+}
+
+fn config_option_by_id<'a>(
+    options: &'a [SessionConfigOption],
+    requested_id: &str,
+) -> Option<&'a SessionConfigOption> {
+    let mut candidates = options
+        .iter()
+        .filter(|option| option.id.to_string() == requested_id);
+    let option = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(option)
 }
 
 fn validate_restore_identity(
@@ -2292,6 +2638,20 @@ fn validate_restore_identity(
             )
         })?
         .to_owned();
+    let requested_effort = command_effort(route).map(str::to_owned);
+    if saved["requested_effort"].as_str() != requested_effort.as_deref() {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "retained ACP session effort differs from the immutable binding route",
+        ));
+    }
+    let requested_mode = command_mode(route).map(str::to_owned);
+    if saved["requested_mode"].as_str() != requested_mode.as_deref() {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "retained ACP session mode differs from the immutable binding route",
+        ));
+    }
     let owner_operation_id = saved["operation_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
@@ -2302,6 +2662,8 @@ fn validate_restore_identity(
         session_id,
         workspace,
         model_id,
+        requested_effort,
+        requested_mode,
         owner_operation_id,
     })
 }
@@ -2346,6 +2708,52 @@ async fn load_retained_session(
     })
 }
 
+fn validate_restore_configuration(
+    options: &[SessionConfigOption],
+    modes: Option<&SessionModeState>,
+    observed_mode_id: Option<&str>,
+    requested_model: &str,
+    requested_effort: Option<&str>,
+    requested_mode: Option<&str>,
+    saved: &Value,
+) -> Result<(Option<String>, Option<String>)> {
+    if !model_current_value_matches(options, requested_model) {
+        return Err(Error::new(
+            "RECOVERY_REQUIRED",
+            "ACP session/load did not read back the retained exact model",
+        ));
+    }
+    let effective_effort =
+        category_config_value(options, &SessionConfigOptionCategory::ThoughtLevel);
+    if requested_effort.is_some_and(|requested| {
+        !category_config_value_matches(
+            options,
+            &SessionConfigOptionCategory::ThoughtLevel,
+            requested,
+        )
+    }) || saved["effective_effort"]
+        .as_str()
+        .is_some_and(|retained| effective_effort.as_deref() != Some(retained))
+    {
+        return Err(Error::new(
+            "RECOVERY_REQUIRED",
+            "ACP session/load did not read back the retained exact effort configuration",
+        ));
+    }
+    let effective_mode = mode_current_value(modes).or_else(|| observed_mode_id.map(str::to_owned));
+    if requested_mode.is_some_and(|requested| effective_mode.as_deref() != Some(requested))
+        || saved["effective_mode"]
+            .as_str()
+            .is_some_and(|retained| effective_mode.as_deref() != Some(retained))
+    {
+        return Err(Error::new(
+            "RECOVERY_REQUIRED",
+            "ACP session/load did not read back the retained exact mode",
+        ));
+    }
+    Ok((effective_effort, effective_mode))
+}
+
 async fn restore_session(
     context: SessionRestoreContext<'_>,
     command: &RuntimeCommand,
@@ -2364,6 +2772,8 @@ async fn restore_session(
         session_id,
         workspace,
         model_id,
+        requested_effort,
+        requested_mode,
         owner_operation_id,
     } = validate_restore_identity(
         &saved,
@@ -2392,12 +2802,16 @@ async fn restore_session(
         .map_err(|_| Error::new("RECOVERY_REQUIRED", "ACP history capture state unavailable"))?
         .history_updates;
     let config_options = loaded.config_options.unwrap_or_default();
-    if !model_current_value_matches(&config_options, &model_id) {
-        return Err(Error::new(
-            "RECOVERY_REQUIRED",
-            "ACP session/load did not read back the retained exact model",
-        ));
-    }
+    let observed_mode_id = capture_mode_readback(capture)?.0;
+    let (effective_effort, effective_mode) = validate_restore_configuration(
+        &config_options,
+        loaded.modes.as_ref(),
+        observed_mode_id.as_deref(),
+        &model_id,
+        requested_effort.as_deref(),
+        requested_mode.as_deref(),
+        &saved,
+    )?;
     let config_snapshot = session_config_options_snapshot(&config_options).map_err(|error| {
         Error::new(
             "RECOVERY_REQUIRED",
@@ -2416,6 +2830,8 @@ async fn restore_session(
             "native_root_id":session_id,
             "native_scope_key":session_id,
             "model_readback":model_id.clone(),
+            "effort_readback":effective_effort,
+            "mode_readback":effective_mode,
             "config_options":config_snapshot.clone(),
             "history_updates":history_updates,
             "native_replay":false
@@ -2433,6 +2849,10 @@ async fn restore_session(
         owner_operation_id,
         workspace,
         model_id,
+        requested_effort,
+        effective_effort,
+        requested_mode,
+        effective_mode,
         close_supported,
         closed: false,
     };
@@ -2442,9 +2862,14 @@ async fn restore_session(
     updated["agent_info"] = features.agent_info.clone().unwrap_or(Value::Null);
     updated["agent_capabilities"] = features.capabilities.clone();
     updated["model_readback"] = json!(session.model_id.clone());
+    updated["effective_effort"] = json!(session.effective_effort.clone());
+    updated["effective_mode"] = json!(session.effective_mode.clone());
     updated["config_options"] = config_snapshot;
     updated["family_departure_claimed"] = json!(false);
     journal.save_session(&updated)?;
+    if let Ok(mut capture) = capture.lock() {
+        capture.current_mode_id = session.effective_mode.clone();
+    }
     Ok(session)
 }
 
@@ -2871,38 +3296,33 @@ async fn cancel_pending_permissions(
         .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
-        let (pending_session_id, request_id, fingerprint) = {
-            let permissions = context
-                .permissions
-                .lock()
-                .map_err(|_| invalid("ACP permission broker lock is poisoned"))?;
-            let pending = permissions
-                .get(&key)
-                .ok_or_else(|| invalid("ACP pending permission disappeared during cancel"))?;
-            (
-                pending.session_id.clone(),
-                pending.request_id.clone(),
-                pending.fingerprint.clone(),
-            )
-        };
         let effect_id = permission_cancel_effect_id(&key);
-        context.journal.record_effect(
-            cancel_command,
-            &effect_id,
-            "intent",
-            json!({
-                "session_id":pending_session_id,
-                "request_id":request_id,
-                "fingerprint":fingerprint,
-                "response":"cancelled"
-            }),
+        let pending = claim_pending_permission(
+            context.permissions,
+            &key,
+            &session_id.to_string(),
+            |pending| {
+                context.journal.record_effect(
+                    cancel_command,
+                    &effect_id,
+                    "intent",
+                    json!({
+                        "session_id":pending.session_id,
+                        "request_id":pending.request_id,
+                        "fingerprint":pending.fingerprint,
+                        "response":"cancelled"
+                    }),
+                )
+            },
         )?;
-        let pending = context
-            .permissions
-            .lock()
-            .map_err(|_| invalid("ACP permission broker lock is poisoned"))?
-            .remove(&key)
-            .ok_or_else(|| invalid("ACP pending permission disappeared during cancel"))?;
+        let Some(pending) = pending else {
+            // A reply may have won the exact-request claim. The turn cancel still
+            // proceeds, but it cannot overwrite that already-claimed response.
+            continue;
+        };
+        let pending_session_id = pending.session_id.clone();
+        let request_id = pending.request_id.clone();
+        let fingerprint = pending.fingerprint.clone();
         pending
             .reply
             .send(RequestPermissionOutcome::Cancelled)
@@ -2957,6 +3377,28 @@ async fn cancel_pending_permissions(
             })?;
     }
     Ok(())
+}
+
+fn claim_pending_permission(
+    permissions: &PermissionBroker,
+    key: &str,
+    expected_session_id: &str,
+    persist_intent: impl FnOnce(&PendingPermission) -> Result<()>,
+) -> Result<Option<PendingPermission>> {
+    let mut permissions = permissions
+        .lock()
+        .map_err(|_| invalid("ACP permission broker lock is poisoned"))?;
+    let Some(pending) = permissions.get(key) else {
+        return Ok(None);
+    };
+    if pending.session_id != expected_session_id {
+        return Err(Error::new(
+            "NATIVE_REQUEST_CHANGED",
+            "ACP pending permission belongs to another session",
+        ));
+    }
+    persist_intent(pending)?;
+    Ok(permissions.remove(key))
 }
 
 // This private seam retains the exact native correlation tuple without
@@ -3066,28 +3508,36 @@ async fn reply_to_permission(
             })?
     };
     let selected_option = option_id.to_owned();
-    record_permission_reply_intent(
-        context.journal,
-        command,
-        &key,
-        session_id,
-        &request_id,
-        fingerprint,
-        &selected_option,
-        selected_kind,
-    )?;
-
-    let pending = context
-        .permissions
-        .lock()
-        .map_err(|_| invalid("ACP permission broker lock is poisoned"))?
-        .remove(&key)
-        .ok_or_else(|| {
-            Error::new(
-                "NATIVE_REQUEST_NOT_PENDING",
-                "exact ACP permission request was already answered",
-            )
-        })?;
+    let pending = claim_pending_permission(context.permissions, &key, session_id, |pending| {
+        if pending.request_id != request_id
+            || pending.fingerprint != fingerprint
+            || !pending
+                .options
+                .iter()
+                .any(|(id, kind, _)| id == option_id && *kind == selected_kind)
+        {
+            return Err(Error::new(
+                "NATIVE_REQUEST_CHANGED",
+                "ACP permission changed before its response was claimed",
+            ));
+        }
+        record_permission_reply_intent(
+            context.journal,
+            command,
+            &key,
+            session_id,
+            &request_id,
+            fingerprint,
+            &selected_option,
+            selected_kind,
+        )
+    })?
+    .ok_or_else(|| {
+        Error::new(
+            "NATIVE_REQUEST_NOT_PENDING",
+            "exact ACP permission request was already answered",
+        )
+    })?;
     let PendingPermission {
         reply,
         acknowledgement,
@@ -3298,6 +3748,10 @@ fn session_config_options_snapshot(options: &[SessionConfigOption]) -> Result<Va
     let mut snapshots = Vec::with_capacity(options.len());
     for option in options {
         let id = option.id.to_string();
+        let category = match &option.category {
+            Some(category) => serde_json::to_value(category)?,
+            None => Value::Null,
+        };
         let snapshot = match &option.kind {
             SessionConfigKind::Select(select) => {
                 let allowed_value_ids = match &select.options {
@@ -3314,6 +3768,7 @@ fn session_config_options_snapshot(options: &[SessionConfigOption]) -> Result<Va
                 };
                 json!({
                     "id":id,
+                    "category":category,
                     "kind":"select",
                     "allowed_value_ids":allowed_value_ids,
                     "current_value_id":select.current_value.to_string()
@@ -3321,6 +3776,7 @@ fn session_config_options_snapshot(options: &[SessionConfigOption]) -> Result<Va
             }
             SessionConfigKind::Boolean(boolean) => json!({
                 "id":id,
+                "category":category,
                 "kind":"boolean",
                 "current_value":boolean.current_value
             }),
@@ -3337,6 +3793,84 @@ fn session_config_options_snapshot(options: &[SessionConfigOption]) -> Result<Va
     Ok(snapshot)
 }
 
+fn config_select_contains(option: &SessionConfigOption, requested: &str) -> bool {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return false;
+    };
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(values) => values
+            .iter()
+            .any(|value| value.value.to_string() == requested),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .any(|value| value.value.to_string() == requested),
+        _ => false,
+    }
+}
+
+fn config_select_current(option: &SessionConfigOption) -> Option<String> {
+    match &option.kind {
+        SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
+        _ => None,
+    }
+}
+
+fn category_config_option<'a>(
+    options: &'a [SessionConfigOption],
+    category: &SessionConfigOptionCategory,
+) -> Option<&'a SessionConfigOption> {
+    let mut candidates = options.iter().filter(|option| {
+        option.category.as_ref() == Some(category)
+            && matches!(&option.kind, SessionConfigKind::Select(_))
+    });
+    let option = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(option)
+}
+
+fn category_config_value(
+    options: &[SessionConfigOption],
+    category: &SessionConfigOptionCategory,
+) -> Option<String> {
+    category_config_option(options, category).and_then(config_select_current)
+}
+
+fn category_config_value_matches(
+    options: &[SessionConfigOption],
+    category: &SessionConfigOptionCategory,
+    requested: &str,
+) -> bool {
+    category_config_option(options, category)
+        .is_some_and(|option| config_select_current(option).as_deref() == Some(requested))
+}
+
+fn mode_value_available(modes: Option<&SessionModeState>, requested: &str) -> bool {
+    modes.is_some_and(|modes| {
+        let mut matches = modes
+            .available_modes
+            .iter()
+            .filter(|mode| mode.id.to_string() == requested);
+        matches.next().is_some() && matches.next().is_none()
+    })
+}
+
+fn mode_current_value(modes: Option<&SessionModeState>) -> Option<String> {
+    modes.map(|modes| modes.current_mode_id.to_string())
+}
+
+fn capture_mode_readback(capture: &Arc<Mutex<Capture>>) -> Result<(Option<String>, u64)> {
+    let capture = capture
+        .lock()
+        .map_err(|_| invalid("ACP capture lock is poisoned during mode readback"))?;
+    Ok((
+        capture.current_mode_id.clone(),
+        capture.current_mode_updates,
+    ))
+}
+
 fn model_config_option<'a>(
     options: &'a [SessionConfigOption],
     requested: &str,
@@ -3350,19 +3884,7 @@ fn model_config_option<'a>(
         if !category_is_model_candidate {
             return false;
         }
-        let SessionConfigKind::Select(select) = &option.kind else {
-            return false;
-        };
-        match &select.options {
-            SessionConfigSelectOptions::Ungrouped(values) => values
-                .iter()
-                .any(|value| value.value.to_string() == requested),
-            SessionConfigSelectOptions::Grouped(groups) => groups
-                .iter()
-                .flat_map(|group| group.options.iter())
-                .any(|value| value.value.to_string() == requested),
-            _ => false,
-        }
+        config_select_contains(option, requested)
     });
     let option = candidates.next()?;
     if candidates.next().is_some() {
@@ -3380,10 +3902,8 @@ fn model_value_available(options: &[SessionConfigOption], requested: &str) -> bo
 }
 
 fn model_current_value_matches(options: &[SessionConfigOption], requested: &str) -> bool {
-    model_config_option(options, requested).is_some_and(|option| {
-        matches!(&option.kind, SessionConfigKind::Select(select)
-            if select.current_value.to_string() == requested)
-    })
+    model_config_option(options, requested)
+        .is_some_and(|option| config_select_current(option).as_deref() == Some(requested))
 }
 
 fn command_model(route: &Value) -> Option<&str> {
@@ -3392,17 +3912,31 @@ fn command_model(route: &Value) -> Option<&str> {
         .filter(|model| !model.trim().is_empty() && model.trim() == *model && model.len() <= 256)
 }
 
+fn command_effort(route: &Value) -> Option<&str> {
+    route["native_options"]["effort"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty() && value.trim() == *value && value.len() <= 64)
+}
+
+fn command_mode(route: &Value) -> Option<&str> {
+    route["native_options"]["mode"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty() && value.trim() == *value && value.len() <= 64)
+}
+
 fn validate_acp_route(route: &Value) -> Result<()> {
     let options = route["native_options"]
         .as_object()
         .ok_or_else(|| Error::new("CONFIGURATION_UNSUPPORTED", "ACP route options are missing"))?;
-    if options
-        .keys()
-        .any(|key| !matches!(key.as_str(), "workspaceRoot" | "modelId"))
-    {
+    if options.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "workspaceRoot" | "modelId" | "effort" | "mode"
+        )
+    }) {
         return Err(Error::new(
             "CONFIGURATION_UNSUPPORTED",
-            "Command ACP routes support workspaceRoot and modelId only; effort and mode are unavailable",
+            "Command ACP route contains an unsupported native option",
         ));
     }
     if options["workspaceRoot"]
@@ -3419,6 +3953,18 @@ fn validate_acp_route(route: &Value) -> Result<()> {
             "COMMAND_MODEL_REQUIRED",
             "Command ACP route requires an exact modelId",
         ));
+    }
+    for key in ["effort", "mode"] {
+        if options.contains_key(key)
+            && (options[key].as_str().is_none_or(|value| {
+                value.trim().is_empty() || value.trim() != value || value.len() > 64
+            }))
+        {
+            return Err(Error::new(
+                "CONFIGURATION_UNSUPPORTED",
+                "Command ACP effort and mode values must be exact non-empty strings",
+            ));
+        }
     }
     Ok(())
 }
@@ -3543,6 +4089,12 @@ fn acp_state(
             "requested_model":command_model(&link.route),
             "effective_model":session.and_then(|s|s["effective_model"].as_str()),
             "effective_model_status":if ready {"verified_by_session_config_readback"}else{"unknown"},
+            "requested_effort":command_effort(&link.route),
+            "effective_effort":session.and_then(|s|s["effective_effort"].as_str()),
+            "effort_readback_status":if ready && session.and_then(|s|s["effective_effort"].as_str()).is_some() {"verified_by_session_config_readback"}else{"unknown_or_unadvertised"},
+            "requested_mode":command_mode(&link.route),
+            "effective_mode":session.and_then(|s|s["effective_mode"].as_str()),
+            "mode_readback_status":if ready && session.and_then(|s|s["effective_mode"].as_str()).is_some() {"verified_by_session_new_or_mode_update"}else{"unknown_or_unadvertised"},
             "capabilities":{
                 "open":"native_acp_session_new_with_model_readback",
                 "task_dispatch":"exact_store_task_prompt_v1_acp_prompt",
@@ -3550,7 +4102,7 @@ fn acp_state(
                 "refresh":"exact_session_and_capture_readback",
                 "send":"next_turn_only",
                 "steer":"unavailable",
-                "configure":"unavailable",
+                "configure":"route_model_effort_mode_at_open; runtime_agent.configure_unavailable",
                 "reply":"exact_live_permission_fingerprint_and_one_time_native_option",
                 "close":if close_supported {"advertised_session_close_with_response"} else {"unavailable"},
                 "recover":"exact_session_load_if_advertised; no_prompt_replay",
@@ -3581,6 +4133,10 @@ fn session_state(session: Option<&ActiveSession>) -> Value {
             "native_session_state":if session.closed {"closed"} else {"open"},
             "workspace":session.workspace,
             "requested_model":session.model_id,
+            "requested_effort":session.requested_effort,
+            "effective_effort":session.effective_effort,
+            "requested_mode":session.requested_mode,
+            "effective_mode":session.effective_mode,
             "native_close_capability":session.close_supported,
             "family_departure_claimed":false
         }),
@@ -3790,10 +4346,11 @@ mod tests {
         schema::{
             ProtocolVersion,
             v1::{
-                AgentCapabilities, ContentBlock, ContentChunk, InitializeResponse,
-                LoadSessionResponse, SessionConfigOption, SessionConfigOptionCategory,
-                SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
-                TextContent,
+                AgentCapabilities, ContentBlock, ContentChunk, CurrentModeUpdate,
+                InitializeResponse, LoadSessionResponse, SessionConfigOption,
+                SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionMode,
+                SessionModeState, SessionNotification, SessionUpdate,
+                SetSessionConfigOptionResponse, SetSessionModeResponse, TextContent,
             },
         },
     };
@@ -3804,11 +4361,14 @@ mod tests {
         runtime::TaskDispatchContext,
         task_prompt::{TASK_PROMPT_SCHEMA_ID, TASK_PROMPT_SCHEMA_VERSION, TaskPromptEnvelopeV1},
     };
+    use tokio::io::AsyncWriteExt as _;
+    use tokio_util::codec::FramedRead;
     use uuid::Uuid;
 
     use super::{
-        AcpJournal, PreparedAcpDispatch, acp_prompt, add_family_custody_facts,
-        capture_session_notification, digest, load_retained_session, stop_direct_child,
+        AcpJournal, AcpLineCodec, MAX_ACP_FRAME_BYTES, PreparedAcpDispatch, SelectConfigSetting,
+        acp_prompt, add_family_custody_facts, capture_session_notification, digest,
+        load_retained_session, set_select_config_option, set_session_mode, stop_direct_child,
         validate_acp_route, validate_restore_identity,
     };
 
@@ -3965,24 +4525,76 @@ mod tests {
     }
 
     #[test]
-    fn pr44_command_acp_route_rejects_effort_and_mode_instead_of_ignoring_them() {
+    fn pr44_command_acp_route_accepts_optional_effort_mode_and_rejects_malformed_values() {
         let workspace = std::env::temp_dir().to_string_lossy().into_owned();
         let route = json!({"native_options":{"workspaceRoot":workspace,"modelId":"fixture-model"}});
         assert!(validate_acp_route(&route).is_ok());
 
+        let mut selected = route.clone();
+        selected["native_options"]["effort"] = json!("high");
+        selected["native_options"]["mode"] = json!("plan");
+        assert!(validate_acp_route(&selected).is_ok());
+
         let mut effort = route.clone();
-        effort["native_options"]["effort"] = json!("high");
+        effort["native_options"]["effort"] = json!(7);
         assert_eq!(
             validate_acp_route(&effort).unwrap_err().code,
             "CONFIGURATION_UNSUPPORTED"
         );
 
         let mut mode = route.clone();
-        mode["native_options"]["mode"] = json!("plan");
+        mode["native_options"]["mode"] = json!(" ");
         assert_eq!(
             validate_acp_route(&mode).unwrap_err().code,
             "CONFIGURATION_UNSUPPORTED"
         );
+
+        let mut unknown = route;
+        unknown["native_options"]["provider"] = json!("must-not-be-ignored");
+        assert_eq!(
+            validate_acp_route(&unknown).unwrap_err().code,
+            "CONFIGURATION_UNSUPPORTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr44_command_acp_line_framing_distinguishes_eof_and_rejects_bad_frames() {
+        async fn read_first(bytes: &[u8]) -> Option<std::io::Result<String>> {
+            let (mut writer, reader) = tokio::io::duplex(bytes.len().max(1));
+            writer
+                .write_all(bytes)
+                .await
+                .expect("fixture bytes fit the pipe");
+            drop(writer);
+            FramedRead::new(reader, AcpLineCodec::new(8)).next().await
+        }
+
+        assert!(read_first(b"").await.is_none());
+        assert_eq!(
+            read_first(b"{}\n")
+                .await
+                .expect("valid line has a frame")
+                .unwrap(),
+            "{}"
+        );
+        let unterminated = read_first(b"{}").await.expect("EOF reports partial frame");
+        assert_eq!(
+            unterminated.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(
+            read_first(b"123456789\n")
+                .await
+                .expect("oversized terminated frame errors")
+                .is_err()
+        );
+        assert!(
+            read_first(b"123456789")
+                .await
+                .expect("oversized unterminated frame errors")
+                .is_err()
+        );
+        assert_eq!(MAX_ACP_FRAME_BYTES, 1024 * 1024);
     }
 
     #[test]
@@ -3997,6 +4609,8 @@ mod tests {
         assert_eq!(identity.session_text, "session-retained");
         assert_eq!(identity.session_id.to_string(), "session-retained");
         assert_eq!(identity.model_id, "fixture-model");
+        assert_eq!(identity.requested_effort, None);
+        assert_eq!(identity.requested_mode, None);
 
         assert_error_code(
             validate_restore_identity(&saved, "other-binding", 1, &route, true),
@@ -4014,6 +4628,375 @@ mod tests {
         );
         assert_eq!(state.journal.read_session()?, Some(saved));
         assert_eq!(journal_effect_count(&state, &restore_command())?, 0);
+
+        let mut configured_saved = retained_session_fixture(&state);
+        configured_saved["requested_effort"] = json!("high");
+        configured_saved["requested_mode"] = json!("plan");
+        let mut configured_route = restore_route(&state);
+        configured_route["native_options"]["effort"] = json!("high");
+        configured_route["native_options"]["mode"] = json!("plan");
+        let configured = validate_restore_identity(
+            &configured_saved,
+            "binding-fixture",
+            1,
+            &configured_route,
+            true,
+        )?;
+        assert_eq!(configured.requested_effort.as_deref(), Some("high"));
+        assert_eq!(configured.requested_mode.as_deref(), Some("plan"));
+
+        configured_route["native_options"]["effort"] = json!("default");
+        assert_error_code(
+            validate_restore_identity(
+                &configured_saved,
+                "binding-fixture",
+                1,
+                &configured_route,
+                true,
+            ),
+            "NATIVE_IDENTITY_MISMATCH",
+        );
+        configured_route["native_options"]["effort"] = json!("high");
+        configured_route["native_options"]["mode"] = json!("default");
+        assert_error_code(
+            validate_restore_identity(
+                &configured_saved,
+                "binding-fixture",
+                1,
+                &configured_route,
+                true,
+            ),
+            "NATIVE_IDENTITY_MISMATCH",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pr44_command_acp_restore_readback_requires_selected_effort_and_mode() -> super::Result<()> {
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "model-a",
+                vec![SessionConfigSelectOption::new("model-a", "Model A")],
+            )
+            .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::select(
+                "effort",
+                "Effort",
+                "high",
+                vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("high", "High"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ];
+        let modes = super::SessionModeState::new(
+            "plan",
+            vec![
+                super::SessionMode::new("default", "Default"),
+                super::SessionMode::new("plan", "Plan"),
+            ],
+        );
+        let saved = json!({"effective_effort":"high","effective_mode":"plan"});
+        let readback = super::validate_restore_configuration(
+            &options,
+            Some(&modes),
+            None,
+            "model-a",
+            Some("high"),
+            Some("plan"),
+            &saved,
+        )?;
+        assert_eq!(readback.0.as_deref(), Some("high"));
+        assert_eq!(readback.1.as_deref(), Some("plan"));
+
+        assert_error_code(
+            super::validate_restore_configuration(
+                &options,
+                Some(&modes),
+                None,
+                "model-a",
+                Some("default"),
+                Some("plan"),
+                &saved,
+            ),
+            "RECOVERY_REQUIRED",
+        );
+        assert_error_code(
+            super::validate_restore_configuration(
+                &options,
+                Some(&modes),
+                None,
+                "model-a",
+                Some("high"),
+                Some("default"),
+                &saved,
+            ),
+            "RECOVERY_REQUIRED",
+        );
+
+        // Legacy receipts did not carry effort/mode fields; keep their model-only interpretation.
+        let old_receipt = json!({});
+        assert_eq!(
+            super::validate_restore_configuration(
+                &options,
+                None,
+                None,
+                "model-a",
+                None,
+                None,
+                &old_receipt,
+            )?,
+            (Some("high".to_owned()), None)
+        );
+        let mode_from_replay = super::validate_restore_configuration(
+            &options,
+            None,
+            Some("plan"),
+            "model-a",
+            None,
+            Some("plan"),
+            &saved,
+        )?;
+        assert_eq!(mode_from_replay.1.as_deref(), Some("plan"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_config_setters_require_exact_typed_readback() -> super::Result<()> {
+        let state = TestState::new()?;
+        let command = restore_command();
+        let session_id = SessionId::new("session-config-fixture");
+        let initial = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "model-a",
+                vec![
+                    SessionConfigSelectOption::new("model-a", "Model A"),
+                    SessionConfigSelectOption::new("model-b", "Model B"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::select(
+                "effort",
+                "Effort",
+                "default",
+                vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("high", "High"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ];
+        let (transport, mut peer) = Channel::duplex();
+        let client_journal = state.journal.clone();
+        let client_command = command.clone();
+        let client_session_id = session_id.clone();
+        let client = Client
+            .builder()
+            .connect_with(transport, async move |connection| {
+                let selected_model = set_select_config_option(
+                    &connection,
+                    &client_journal,
+                    &client_command,
+                    &client_session_id,
+                    SelectConfigSetting {
+                        field: "model",
+                        option: &initial[0],
+                        requested: "model-b",
+                        current_options: &initial,
+                    },
+                )
+                .await
+                .map_err(super::to_acp_error)?;
+                assert!(super::model_current_value_matches(
+                    &selected_model,
+                    "model-b"
+                ));
+                let effort = super::category_config_option(
+                    &selected_model,
+                    &SessionConfigOptionCategory::ThoughtLevel,
+                )
+                .expect("unique advertised effort option");
+                let selected_effort = set_select_config_option(
+                    &connection,
+                    &client_journal,
+                    &client_command,
+                    &client_session_id,
+                    SelectConfigSetting {
+                        field: "effort",
+                        option: effort,
+                        requested: "high",
+                        current_options: &selected_model,
+                    },
+                )
+                .await
+                .map_err(super::to_acp_error)?;
+                assert!(super::category_config_value_matches(
+                    &selected_effort,
+                    &SessionConfigOptionCategory::ThoughtLevel,
+                    "high"
+                ));
+                Ok::<(), agent_client_protocol::Error>(())
+            });
+        let peer = async move {
+            for (expected_id, expected_value, model_value, effort_value) in [
+                ("model", "model-b", "model-b", "default"),
+                ("effort", "high", "model-b", "high"),
+            ] {
+                let Some(TransportFrame::Single(RawJsonRpcMessage::Request(request))) =
+                    peer.rx.next().await
+                else {
+                    panic!("expected session/set_config_option request")
+                };
+                assert_eq!(request.method.as_ref(), "session/set_config_option");
+                let Some(RawJsonRpcParams::Object(params)) = request.params else {
+                    panic!("config-option request params are an object")
+                };
+                assert_eq!(params["sessionId"], "session-config-fixture");
+                assert_eq!(params["configId"], expected_id);
+                assert_eq!(params["value"], expected_value);
+                let options = vec![
+                    SessionConfigOption::select(
+                        "model",
+                        "Model",
+                        model_value,
+                        vec![
+                            SessionConfigSelectOption::new("model-a", "Model A"),
+                            SessionConfigSelectOption::new("model-b", "Model B"),
+                        ],
+                    )
+                    .category(SessionConfigOptionCategory::Model),
+                    SessionConfigOption::select(
+                        "effort",
+                        "Effort",
+                        effort_value,
+                        vec![
+                            SessionConfigSelectOption::new("default", "Default"),
+                            SessionConfigSelectOption::new("high", "High"),
+                        ],
+                    )
+                    .category(SessionConfigOptionCategory::ThoughtLevel),
+                ];
+                peer.tx
+                    .unbounded_send(TransportFrame::Single(RawJsonRpcMessage::response(
+                        request.id,
+                        Ok(
+                            serde_json::to_value(SetSessionConfigOptionResponse::new(options))
+                                .expect("config-option readback serializes"),
+                        ),
+                    )))
+                    .expect("config-option readback reaches the adapter");
+            }
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("config-option fixture timed out")
+        .expect("config-option fixture failed");
+        assert_eq!(journal_effect_count(&state, &command)?, 4);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_mode_setter_waits_for_current_mode_update() -> super::Result<()> {
+        let state = TestState::new()?;
+        let command = restore_command();
+        let session_id = SessionId::new("session-mode-fixture");
+        let modes = SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        );
+        let capture = Arc::new(Mutex::new(super::Capture {
+            native_session_id: Some(session_id.to_string()),
+            current_mode_id: Some("default".to_owned()),
+            ..super::Capture::default()
+        }));
+        let client_capture = Arc::clone(&capture);
+        let client_journal = state.journal.clone();
+        let client_command = command.clone();
+        let client_session_id = session_id.clone();
+        let peer_session_id = session_id.clone();
+        let notification_capture = Arc::clone(&capture);
+        let (transport, mut peer) = Channel::duplex();
+        let client = Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _connection| {
+                    if let Ok(mut capture) = notification_capture.lock() {
+                        capture_session_notification(&mut capture, &notification);
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(transport, async move |connection| {
+                let mode = set_session_mode(
+                    &connection,
+                    &client_journal,
+                    &client_command,
+                    &client_session_id,
+                    "plan",
+                    Some(&modes),
+                    &client_capture,
+                )
+                .await
+                .map_err(super::to_acp_error)?;
+                assert_eq!(mode, "plan");
+                Ok::<(), agent_client_protocol::Error>(())
+            });
+        let peer = async move {
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(request))) =
+                peer.rx.next().await
+            else {
+                panic!("expected session/set_mode request")
+            };
+            assert_eq!(request.method.as_ref(), "session/set_mode");
+            let Some(RawJsonRpcParams::Object(params)) = request.params else {
+                panic!("set-mode request params are an object")
+            };
+            assert_eq!(params["sessionId"], "session-mode-fixture");
+            assert_eq!(params["modeId"], "plan");
+            let notification = RawJsonRpcMessage::notification(
+                "session/update".to_owned(),
+                serde_json::to_value(SessionNotification::new(
+                    peer_session_id,
+                    SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("plan")),
+                ))
+                .expect("mode notification serializes"),
+            )
+            .expect("mode notification is valid JSON-RPC");
+            let response = RawJsonRpcMessage::response(
+                request.id,
+                Ok(serde_json::to_value(SetSessionModeResponse::new())
+                    .expect("mode response serializes")),
+            );
+            peer.tx
+                .unbounded_send(TransportFrame::Batch(
+                    TransportBatch::from_messages([notification, response])
+                        .expect("mode update and response batch is non-empty"),
+                ))
+                .expect("mode update reaches adapter before response handling");
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("mode fixture timed out")
+        .expect("mode fixture failed");
+        let capture = capture.lock().expect("capture lock remains usable");
+        assert_eq!(capture.current_mode_id.as_deref(), Some("plan"));
+        assert_eq!(capture.current_mode_updates, 1);
+        assert_eq!(journal_effect_count(&state, &command)?, 2);
         Ok(())
     }
 
@@ -4436,6 +5419,122 @@ mod tests {
     }
 
     #[test]
+    fn pr44_command_acp_cancel_and_reply_race_claims_one_response() -> super::Result<()> {
+        let state = TestState::new()?;
+        let request_id = json!("permission-race-request");
+        let key = serde_json::to_string(&request_id)?;
+        let fingerprint = digest(b"cancel-vs-reply fixture");
+        let permissions: super::PermissionBroker =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (reply_sender, _reply_receiver) = tokio::sync::oneshot::channel();
+        let (_ack_sender, acknowledgement) = tokio::sync::oneshot::channel();
+        permissions.lock().expect("permission broker lock").insert(
+            key.clone(),
+            super::PendingPermission {
+                session_id: "session-fixture".to_owned(),
+                request_id: request_id.clone(),
+                fingerprint: fingerprint.clone(),
+                options: vec![(
+                    "allow-once".to_owned(),
+                    super::PermissionOptionKind::AllowOnce,
+                    "allow once".to_owned(),
+                )],
+                reply: reply_sender,
+                acknowledgement,
+            },
+        );
+
+        let reply_command = permission_reply_command();
+        let mut cancel_command = permission_reply_command();
+        cancel_command.method = "native.command.cancel_turn".to_owned();
+        let reply_command_for_thread = reply_command.clone();
+        let cancel_command_for_thread = cancel_command.clone();
+        let reply_journal = state.journal.clone();
+        let cancel_journal = state.journal.clone();
+        let reply_key = key.clone();
+        let cancel_key = key.clone();
+        let reply_request_id = request_id.clone();
+        let cancel_request_id = request_id.clone();
+        let reply_fingerprint = fingerprint.clone();
+        let cancel_fingerprint = fingerprint.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let (reply_claim, cancel_claim) = std::thread::scope(|scope| {
+            let reply_barrier = Arc::clone(&barrier);
+            let cancel_barrier = Arc::clone(&barrier);
+            let reply_permissions = Arc::clone(&permissions);
+            let cancel_permissions = Arc::clone(&permissions);
+            let reply = scope.spawn(move || {
+                reply_barrier.wait();
+                super::claim_pending_permission(
+                    &reply_permissions,
+                    &reply_key,
+                    "session-fixture",
+                    |pending| {
+                        if pending.request_id != reply_request_id
+                            || pending.fingerprint != reply_fingerprint
+                        {
+                            return Err(super::invalid("reply race identity changed"));
+                        }
+                        super::record_permission_reply_intent(
+                            &reply_journal,
+                            &reply_command_for_thread,
+                            &reply_key,
+                            "session-fixture",
+                            &reply_request_id,
+                            &reply_fingerprint,
+                            "allow-once",
+                            super::PermissionOptionKind::AllowOnce,
+                        )
+                    },
+                )
+            });
+            let cancel = scope.spawn(move || {
+                cancel_barrier.wait();
+                super::claim_pending_permission(
+                    &cancel_permissions,
+                    &cancel_key,
+                    "session-fixture",
+                    |pending| {
+                        cancel_journal.record_effect(
+                            &cancel_command_for_thread,
+                            "permission-cancel-race",
+                            "intent",
+                            json!({
+                                "session_id":pending.session_id,
+                                "request_id":cancel_request_id,
+                                "fingerprint":cancel_fingerprint,
+                                "response":"cancelled"
+                            }),
+                        )
+                    },
+                )
+            });
+            barrier.wait();
+            (
+                reply.join().expect("reply claim thread joins"),
+                cancel.join().expect("cancel claim thread joins"),
+            )
+        });
+
+        let reply_claim = reply_claim?;
+        let cancel_claim = cancel_claim?;
+        assert_ne!(reply_claim.is_some(), cancel_claim.is_some());
+        assert!(
+            permissions
+                .lock()
+                .expect("permission broker lock")
+                .is_empty()
+        );
+        assert_eq!(
+            journal_effect_count(&state, &reply_command)?
+                + journal_effect_count(&state, &cancel_command)?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
     fn pr44_command_acp_config_option_snapshot_keeps_typed_values_and_resolves_model_id()
     -> super::Result<()> {
         let options: Vec<super::SessionConfigOption> = serde_json::from_value(json!([
@@ -4482,6 +5581,13 @@ mod tests {
         assert!(super::model_value_available(&options, "model-a"));
         assert!(super::model_current_value_matches(&options, "model-a"));
         assert!(!super::model_current_value_matches(&options, "model-b"));
+        assert!(super::category_config_value_matches(
+            &options,
+            &SessionConfigOptionCategory::ThoughtLevel,
+            "low"
+        ));
+        assert!(super::config_select_contains(&options[1], "high"));
+        assert!(!super::config_select_contains(&options[1], "max"));
         let untagged = vec![SessionConfigOption::select(
             "provider-specific-model-option",
             "Model",
@@ -4510,18 +5616,21 @@ mod tests {
                 "options":[
                     {
                         "id":"command-model-choice",
+                        "category":"model",
                         "kind":"select",
                         "allowed_value_ids":["model-a","model-b"],
                         "current_value_id":"model-a"
                     },
                     {
                         "id":"thought",
+                        "category":"thought_level",
                         "kind":"select",
                         "allowed_value_ids":["low","high"],
                         "current_value_id":"low"
                     },
                     {
                         "id":"fast-mode",
+                        "category":null,
                         "kind":"boolean",
                         "current_value":true
                     }

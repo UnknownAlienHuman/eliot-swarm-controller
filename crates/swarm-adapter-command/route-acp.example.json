@@ -6,6 +6,8 @@
   "workspace_option": "workspaceRoot",
   "native_options": {
     "workspaceRoot": "<ABSOLUTE_ADMITTED_WORKSPACE_PATH>",
-    "modelId": "<OPERATOR_SELECTED_ACP_MODEL_ID>"
+    "modelId": "<OPERATOR_SELECTED_ACP_MODEL_ID>",
+    "effort": "<OPTIONAL_ADVERTISED_EFFORT_ID>",
+    "mode": "<OPTIONAL_ADVERTISED_MODE_ID>"
   }
 }
