@@ -197,6 +197,22 @@ fn plan_inputs_for_attempt(
     })
 }
 
+#[cfg(test)]
+static PR61_CACHE_VERIFY_WORKER_PANIC_INPUT_FINGERPRINT: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn take_pr61_cache_verify_worker_panic(input_fingerprint: &str) -> bool {
+    let mut target = PR61_CACHE_VERIFY_WORKER_PANIC_INPUT_FINGERPRINT
+        .lock()
+        .expect("PR 61 cache verification panic target lock");
+    if target.as_deref() != Some(input_fingerprint) {
+        return false;
+    }
+    *target = None;
+    true
+}
+
 impl Store {
     /// Shared external/scheduled preflight. It snapshots trusted DB facts,
     /// verifies exact source bytes off the DB thread and resolves the immutable
@@ -375,6 +391,10 @@ impl Store {
                     let expected = prepared.clone();
                     let data_dir = self.data_dir.clone();
                     self.file_io(move |files| {
+                        #[cfg(test)]
+                        if take_pr61_cache_verify_worker_panic(&expected.input_fingerprint) {
+                            panic!("PR 61 cache verification artifact-worker panic fixture");
+                        }
                         verify_cache_candidate(&files, &data_dir, &expected, candidate)
                     })
                     .await
@@ -6825,6 +6845,149 @@ mod tests {
         let (cached_task, cached_attempt) =
             create_acceptance_attempt(&fixture, "cache-project", Some("v1"), None).await;
         let cached_source = source_snapshot(&fixture, &cached_task, &cached_attempt, content).await;
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let store = &fixture.owner.store;
+            let custody = &store.check_child_custody;
+            let cache_profile = fixture
+                .config
+                .checks
+                .profile("strict", "v1")
+                .expect("configured cache profile")
+                .clone();
+            let files = ArtifactFiles::new(&fixture.directory).unwrap();
+            let verified =
+                source::verified_content(&files, &fixture.directory, &cached_source).unwrap();
+            let cache_scope = inputs::ProbeCleanupScope::for_candidate(&cache_profile, &verified)
+                .expect("derive cache candidate scope");
+            let mut owner_profile = cache_profile.clone();
+            owner_profile.resource = "pr61-cache-worker-owner".into();
+            let owner_scope = inputs::ProbeCleanupScope::for_candidate(&owner_profile, &verified)
+                .expect("derive unrelated retained-owner scope");
+            assert!(!cache_scope.overlaps(&owner_scope));
+
+            let (owner, process_fixture) =
+                inputs::tests::pending_probe_custody_fixture(owner_scope.clone());
+            let helper_identity = process_fixture.helper_launch_identity().clone();
+            let target_identity = process_fixture.process_identity("target.identity.json");
+            let descendant_identity = process_fixture.process_identity("descendant.identity.json");
+            assert!(!install_probe_owner(store, owner).await);
+            assert!(
+                !process_fixture.process_departed(&helper_identity)
+                    && !process_fixture.process_departed(&target_identity)
+                    && !process_fixture.process_departed(&descendant_identity),
+                "the unrelated nested helper family is live before cache verification"
+            );
+
+            let control_snapshot =
+                probe_plan_snapshot(&fixture, &cached_attempt, &cached_source.artifact_id, "v1")
+                    .await;
+            let _control_probe =
+                inputs::override_probe_for_test(&cache_profile, test_version_probe);
+            let control = timeout(
+                Duration::from_secs(5),
+                store.resolve_check_plan_snapshot(Ok(control_snapshot)),
+            )
+            .await
+            .expect("the seeded cache candidate must verify within the fixture bound")
+            .unwrap();
+            assert!(control.result.is_ok());
+            assert!(
+                control.cache_hit.is_some(),
+                "the exact seeded cache origin is found"
+            );
+            assert_eq!(
+                control.cache_hit.as_ref().map(|hit| hit.check_id.as_str()),
+                Some(original_check.as_str())
+            );
+            let input_fingerprint = control.result.as_ref().unwrap().input_fingerprint.clone();
+            assert_eq!(store.check_child_custody_count().await, 1);
+            assert!(
+                !process_fixture.process_departed(&helper_identity)
+                    && !process_fixture.process_departed(&target_identity)
+                    && !process_fixture.process_departed(&descendant_identity),
+                "the live unrelated owner survives a successful cache verification"
+            );
+
+            let failure_snapshot =
+                probe_plan_snapshot(&fixture, &cached_attempt, &cached_source.artifact_id, "v1")
+                    .await;
+            let _failure_probe =
+                inputs::override_probe_for_test(&cache_profile, test_version_probe);
+            {
+                let mut target = PR61_CACHE_VERIFY_WORKER_PANIC_INPUT_FINGERPRINT
+                    .lock()
+                    .unwrap();
+                assert!(
+                    target.is_none(),
+                    "no cache-worker failure injection is active"
+                );
+                *target = Some(input_fingerprint);
+            }
+            let resolution = timeout(
+                Duration::from_secs(5),
+                store.resolve_check_plan_snapshot(Ok(failure_snapshot)),
+            )
+            .await
+            .expect("cache artifact-worker panic must remain a bounded preflight failure")
+            .unwrap();
+            assert!(resolution.result.is_ok());
+            assert!(
+                resolution.cache_hit.is_none(),
+                "a cache verification worker panic is conservatively treated as a miss"
+            );
+            assert!(
+                PR61_CACHE_VERIFY_WORKER_PANIC_INPUT_FINGERPRINT
+                    .lock()
+                    .unwrap()
+                    .is_none(),
+                "the exact cached plan reached the verification worker injection"
+            );
+            assert_eq!(
+                store.check_child_custody_count().await,
+                1,
+                "the resolver reservation unwinds while the unrelated owner remains"
+            );
+            {
+                let owners = custody.probe_cleanup_owners.lock().await;
+                assert_eq!(owners.len(), 1);
+                assert!(owners[0].is_pending());
+                assert_eq!(owners[0].scope(), Some(&owner_scope));
+            }
+            assert!(
+                !process_fixture.process_departed(&helper_identity)
+                    && !process_fixture.process_departed(&target_identity)
+                    && !process_fixture.process_departed(&descendant_identity),
+                "cache verification panic does not release the unrelated exact helper family"
+            );
+            let cache_reservation = custody
+                .reserve_probe_resolution(Some(&cache_scope.resource))
+                .await
+                .expect("the cache resource reservation is available after worker failure");
+            drop(cache_reservation);
+            assert!(
+                custody
+                    .reserve_probe_resolution(Some(&owner_scope.resource))
+                    .await
+                    .is_none(),
+                "the unrelated live owner continues to hold its own resource"
+            );
+
+            process_fixture.release_all();
+            reap_probe_owners_to(custody, 0).await;
+            assert!(process_fixture.process_departed(&helper_identity));
+            assert!(process_fixture.process_departed(&target_identity));
+            assert!(process_fixture.process_departed(&descendant_identity));
+            eprintln!(
+                "cache_verify_worker_panic_custody={{\"helper_pid\":{},\"target_pid\":{},\"descendant_pid\":{},\"cache_resource\":\"{}\",\"owner_resource\":\"{}\",\"reservation_released\":true,\"owner_retained_until_exact_departure\":true}}",
+                process_fixture.helper_pid(),
+                target_identity["pid"],
+                descendant_identity["pid"],
+                cache_scope.resource,
+                owner_scope.resource
+            );
+            drop(process_fixture);
+        }
         let cached = admit_check(&fixture, &cached_attempt, &cached_source, "v1").await;
         assert_eq!(cached["cached"], true);
         assert_eq!(cached["cached_from_check_id"], original_check);
