@@ -124,10 +124,14 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                             &mut native_control,
                         )?;
                         if action.retire_bridge {
-                            interactions.retire_bridge(&boot_id, &journal)?;
                             // Closing stdin ends this generation's Node owner;
                             // the parent still proves process-family departure.
-                            drop(harness.take());
+                            retire_owned_harness(
+                                &mut harness,
+                                &interactions,
+                                &boot_id,
+                                &journal,
+                            )?;
                             // Retire this adapter process instead of serving a
                             // dead bridge or reopening it in-process. The
                             // parent owner retains the process-family identity
@@ -408,6 +412,17 @@ struct DispatchAdmissionInvocation<'a> {
 struct FrameAction {
     reconnect: bool,
     retire_bridge: bool,
+}
+
+fn retire_owned_harness(
+    harness: &mut Option<NativeHarness>,
+    interactions: &InteractionJournal,
+    boot_id: &str,
+    journal: &OperationJournal,
+) -> Result<()> {
+    interactions.retire_bridge(boot_id, journal)?;
+    drop(harness.take());
+    Ok(())
 }
 
 struct UnknownResultInvocation<'a> {
@@ -3844,5 +3859,905 @@ mod failed_prepare_lifecycle_fixture {
         });
         assert!(validate_reply(&request, &projected_reply).is_ok());
         assert!(!projected_reply.to_string().contains("Use this key sk-"));
+    }
+}
+
+#[cfg(test)]
+mod module_family_replacement_fixture {
+    use super::{
+        HarnessFrame, InteractionJournal, NativeControl, NativeHarness, OperationJournal,
+        handle_frame, json, retire_owned_harness,
+    };
+    use crate::config::{AdapterConfig, NativeOptions};
+    use serde_json::Value;
+    use std::{
+        fs::{self, File},
+        io,
+        path::{Path, PathBuf},
+        process::{Child, Command, ExitStatus, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    use swarm_process::module_owner::{
+        ModuleOwnerPlan, ProtectedRef, ProtectedRefResolver, ResolvedLaunch,
+        apply_launch_environment, run_module_with_resolver,
+    };
+    use tokio::sync::mpsc;
+
+    const OWNER_TEST: &str = "module_family_replacement_fixture::module_owner_phase";
+    const HARNESS_TEST: &str = "module_family_replacement_fixture::native_harness_worker";
+
+    struct FixtureDirectory(PathBuf);
+
+    impl FixtureDirectory {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "swarm-claude-family-replacement-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&root).expect("create isolated Claude process-family fixture");
+            Self(root)
+        }
+    }
+
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct FixtureRelease(PathBuf);
+
+    impl FixtureRelease {
+        fn release(&self) {
+            let _ = fs::write(&self.0, b"release");
+            if let Some(root) = self.0.parent() {
+                let _ = fs::write(root.join("allow-terminal"), b"continue");
+            }
+        }
+    }
+
+    impl Drop for FixtureRelease {
+        fn drop(&mut self) {
+            self.release();
+            if let Some(root) = self.0.parent() {
+                let _ = fs::write(root.join("replace-now"), b"continue");
+                let _ = fs::write(root.join("finish-replacement"), b"continue");
+            }
+        }
+    }
+
+    struct FixtureResolver;
+
+    impl ProtectedRefResolver for FixtureResolver {
+        fn resolve(
+            &self,
+            plan: &ModuleOwnerPlan,
+            _owner_record: &Path,
+            _owner: &Value,
+        ) -> swarm_contracts::error::Result<ResolvedLaunch> {
+            Ok(ResolvedLaunch {
+                executable: plan.executable.clone(),
+                argv: plan.argv.clone(),
+                environment: plan.environment.clone(),
+            })
+        }
+    }
+
+    struct OwnerMembershipProbe {
+        #[cfg(windows)]
+        job: exact_job_probe::Job,
+        #[cfg(not(windows))]
+        owner_record: Value,
+    }
+
+    impl OwnerMembershipProbe {
+        fn open(owner_record: &Value) -> io::Result<Self> {
+            #[cfg(windows)]
+            {
+                let job_name = owner_record["process"]["job_name"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("module owner record has no Job name"))?;
+                Ok(Self {
+                    job: exact_job_probe::Job::open(job_name)?,
+                })
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(Self {
+                    owner_record: owner_record.clone(),
+                })
+            }
+        }
+
+        fn live_member(&self, pid: u32) -> io::Result<Option<bool>> {
+            #[cfg(windows)]
+            {
+                self.job.live_member(pid)
+            }
+            #[cfg(not(windows))]
+            {
+                let image = swarm_process::process_image_identity(pid)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let member =
+                    swarm_process::module_child_belongs_to_owner(&self.owner_record, &image)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                Ok(Some(member))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod exact_job_probe {
+        use std::{
+            ffi::{OsStr, c_void},
+            io,
+            os::windows::ffi::OsStrExt,
+        };
+
+        type Handle = *mut c_void;
+        const JOB_OBJECT_QUERY: u32 = 0x0004;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT: u32 = 258;
+        const WAIT_FAILED: u32 = u32::MAX;
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CloseHandle(handle: Handle) -> i32;
+            fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
+            fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> Handle;
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+            fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+        }
+
+        struct OwnedHandle(Handle);
+
+        impl Drop for OwnedHandle {
+            fn drop(&mut self) {
+                // SAFETY: this wrapper owns the live handle returned by a Win32 open call.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+
+        pub struct Job(OwnedHandle);
+
+        impl Job {
+            pub fn open(name: &str) -> io::Result<Self> {
+                let name: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
+                // SAFETY: name is nul-terminated UTF-16 and the returned handle is owned below.
+                let handle = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()) };
+                if handle.is_null() {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(Self(OwnedHandle(handle)))
+                }
+            }
+
+            pub fn live_member(&self, pid: u32) -> io::Result<Option<bool>> {
+                // SAFETY: these limited rights allow a live-state and Job-membership query.
+                let handle = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                        0,
+                        pid,
+                    )
+                };
+                if handle.is_null() {
+                    let error = io::Error::last_os_error();
+                    return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    };
+                }
+                let process = OwnedHandle(handle);
+                if !process_is_live(process.0)? {
+                    return Ok(None);
+                }
+                let mut member = 0;
+                // SAFETY: both handles remain open and member points to an initialized BOOL.
+                if unsafe { IsProcessInJob(process.0, self.0.0, &mut member) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if !process_is_live(process.0)? {
+                    return Ok(None);
+                }
+                Ok(Some(member != 0))
+            }
+        }
+
+        fn process_is_live(process: Handle) -> io::Result<bool> {
+            // SAFETY: process is an owned process handle and this is a zero-time wait.
+            match unsafe { WaitForSingleObject(process, 0) } {
+                WAIT_OBJECT_0 => Ok(false),
+                WAIT_TIMEOUT => Ok(true),
+                WAIT_FAILED => Err(io::Error::last_os_error()),
+                status => Err(io::Error::other(format!(
+                    "unexpected process wait status {status:#x}"
+                ))),
+            }
+        }
+
+        pub fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> io::Result<bool> {
+            // SAFETY: synchronization access is sufficient to wait for this fixture child.
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                let error = io::Error::last_os_error();
+                return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                    Ok(true)
+                } else {
+                    Err(error)
+                };
+            }
+            let process = OwnedHandle(handle);
+            let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+            // SAFETY: process is owned and the duration is bounded to a DWORD.
+            match unsafe { WaitForSingleObject(process.0, milliseconds) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                WAIT_FAILED => Err(io::Error::last_os_error()),
+                status => Err(io::Error::other(format!(
+                    "unexpected process wait status {status:#x}"
+                ))),
+            }
+        }
+    }
+
+    #[test]
+    fn run_owned_native_harness_family_blocks_replacement_until_departure() {
+        let fixture = FixtureDirectory::new();
+        let root = &fixture.0;
+        let release = FixtureRelease(root.join("release-descendant"));
+        let node = node_executable();
+        let retire_bridge = root.join("retire-bridge.mjs");
+        let replacement_bridge = root.join("replacement-bridge.mjs");
+        fs::write(&retire_bridge, bridge_source(true, root))
+            .expect("write retiring bridge fixture");
+        fs::write(&replacement_bridge, bridge_source(false, root))
+            .expect("write replacement bridge fixture");
+
+        let mut retiring_owner = spawn_owner_phase(root, &node, "retire");
+        let descendant_ready = wait_for_marker(
+            root.join("descendant-ready"),
+            &mut retiring_owner,
+            Duration::from_secs(15),
+        )
+        .expect("observe the real owned Node descendant");
+        let descendant_pid = fs::read_to_string(root.join("descendant-ready"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let owner_record = read_report(root.join("module-state").join("owner.json"));
+        let (membership_probe, membership_probe_error) = match owner_record.as_ref() {
+            Some(owner) => match OwnerMembershipProbe::open(owner) {
+                Ok(probe) => (Some(probe), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, Some("module owner record is unavailable".to_owned())),
+        };
+        let (descendant_member_before_node_exit, before_membership_error) =
+            observe_membership(membership_probe.as_ref(), descendant_pid);
+        let _ = fs::write(root.join("allow-terminal"), b"continue");
+        let node_departed = wait_for_marker(
+            root.join("retired-node-exited"),
+            &mut retiring_owner,
+            Duration::from_secs(15),
+        )
+        .expect("observe NativeHarness child-wait proof");
+        let retired_worker_pid = read_report(root.join("module-state").join("worker.json"))
+            .and_then(|worker| worker["process"]["pid"].as_u64())
+            .and_then(|pid| u32::try_from(pid).ok());
+        let retired_worker_departed = retired_worker_pid.is_some_and(|pid| {
+            wait_for_test_process_exit(pid, Duration::from_secs(5)).unwrap_or(false)
+        });
+        let owner_status_before_release =
+            observe_exit_or_alive(&mut retiring_owner, Duration::from_millis(750))
+                .expect("inspect the original module-owner process after its adapter exited");
+        let (descendant_member_at_replacement_probe, probe_membership_error) =
+            observe_membership(membership_probe.as_ref(), descendant_pid);
+        let owner_waits_for_family = descendant_ready
+            && node_departed
+            && retired_worker_departed
+            && owner_status_before_release.is_none();
+
+        let mut successor = (descendant_ready && node_departed && retired_worker_departed)
+            .then(|| spawn_owner_phase(root, &node, "successor"));
+        let successor_blocks_while_old_family_lives = successor
+            .as_mut()
+            .map(|child| {
+                wait_for_marker(
+                    root.join("successor-probe-result.json"),
+                    child,
+                    Duration::from_secs(10),
+                )
+                .expect("observe replacement probe")
+            })
+            .unwrap_or(false);
+        let successor_probe = fs::read(root.join("successor-probe-result.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let probe_did_not_start_a_worker = !root.join("probe-worker-started").exists();
+
+        release.release();
+        let retiring_owner_status = wait_for_exit(&mut retiring_owner, Duration::from_secs(20))
+            .expect("wait for the old owner after releasing its owned descendant");
+        let old_owner_completed = retiring_owner_status.is_some_and(|status| status.success())
+            && read_report(root.join("retire-owner-result.json"))
+                .is_some_and(|result| result["error_code"] == "MODULE_EXITED");
+
+        if successor.is_some() {
+            let _ = fs::write(root.join("replace-now"), b"continue");
+        }
+        if let Some(child) = successor.as_mut() {
+            let replacement_worker_started = wait_for_marker(
+                root.join("replacement-worker-started"),
+                child,
+                Duration::from_secs(10),
+            )
+            .expect("observe replacement worker launch");
+            if replacement_worker_started {
+                let _ = fs::write(root.join("finish-replacement"), b"continue");
+            }
+        }
+        let successor_status = successor
+            .as_mut()
+            .and_then(|child| wait_for_exit(child, Duration::from_secs(20)).ok().flatten());
+        let replacement_started_after_departure = successor_status
+            .is_some_and(|status| status.success())
+            && read_report(root.join("successor-replacement-result.json"))
+                .is_some_and(|result| result["error_code"] == "MODULE_EXITED")
+            && root.join("replacement-worker-started").is_file();
+
+        let first_boot = read_report(root.join("retire-owner-result.json"))
+            .and_then(|result| result["boot_id"].as_str().map(ToOwned::to_owned));
+        let replacement_boot = read_report(root.join("successor-replacement-result.json"))
+            .and_then(|result| result["boot_id"].as_str().map(ToOwned::to_owned));
+        let descendant_exit = fs::read_to_string(root.join("descendant-exit")).ok();
+
+        assert!(
+            descendant_ready,
+            "the Node-owned descendant must become live"
+        );
+        assert!(
+            node_departed,
+            "the NativeHarness must observe direct Node exit"
+        );
+        assert!(
+            retired_worker_departed,
+            "the Claude adapter fixture must exit after observing direct Node exit; worker_pid={retired_worker_pid:?}"
+        );
+        assert_eq!(
+            descendant_member_before_node_exit,
+            Some(true),
+            "the held Node descendant must belong to the exact owner Job before direct Node exit; pid={descendant_pid:?}, error={membership_probe_error:?}, observation_error={before_membership_error:?}"
+        );
+        assert_eq!(
+            descendant_member_at_replacement_probe,
+            Some(true),
+            "the same held descendant must remain live in the exact owner Job at the replacement probe; pid={descendant_pid:?}, before={descendant_member_before_node_exit:?}, error={probe_membership_error:?}, exit={descendant_exit:?}, owner_status={owner_status_before_release:?}"
+        );
+        assert!(
+            owner_waits_for_family,
+            "the shared module owner must remain alive after adapter and Node retirement while its exact Job still contains the held descendant; member_at_probe={descendant_member_at_replacement_probe:?}, owner_status={owner_status_before_release:?}, owner_stdout={}, owner_stderr={}",
+            fs::read_to_string(root.join("retire-owner.stdout")).unwrap_or_default(),
+            fs::read_to_string(root.join("retire-owner.stderr")).unwrap_or_default()
+        );
+        assert!(
+            successor_blocks_while_old_family_lives,
+            "successor probe did not report its blocked attempt; status={successor_status:?}, report={successor_probe:?}, stdout={}, stderr={}",
+            fs::read_to_string(root.join("successor-owner.stdout")).unwrap_or_default(),
+            fs::read_to_string(root.join("successor-owner.stderr")).unwrap_or_default()
+        );
+        assert_eq!(
+            successor_probe
+                .as_ref()
+                .and_then(|value| value["error_code"].as_str()),
+            Some("MODULE_OWNER_ACTIVE"),
+            "the next owner is truthfully blocked while the prior family is retained"
+        );
+        assert!(probe_did_not_start_a_worker);
+        assert!(old_owner_completed);
+        assert!(
+            replacement_started_after_departure,
+            "replacement phase failed after old-owner exit; successor_status={successor_status:?}, old_report={:?}, replacement_report={:?}, replacement_worker_started={}, successor_stdout={}, successor_stderr={}",
+            read_report(root.join("retire-owner-result.json")),
+            read_report(root.join("successor-replacement-result.json")),
+            root.join("replacement-worker-started").is_file(),
+            fs::read_to_string(root.join("successor-owner.stdout")).unwrap_or_default(),
+            fs::read_to_string(root.join("successor-owner.stderr")).unwrap_or_default()
+        );
+        assert!(first_boot.is_some());
+        assert!(replacement_boot.is_some());
+        assert_ne!(first_boot, replacement_boot);
+    }
+
+    #[test]
+    #[ignore = "spawned only by the connected process-family fixture"]
+    fn module_owner_phase() {
+        let mode = std::env::var("CLAUDE_LIFECYCLE_OWNER_MODE")
+            .expect("fixture owner mode is passed by its parent");
+        let root = PathBuf::from(
+            std::env::var_os("CLAUDE_LIFECYCLE_FIXTURE_ROOT")
+                .expect("fixture root is passed by its parent"),
+        );
+        let node = PathBuf::from(
+            std::env::var_os("CLAUDE_LIFECYCLE_NODE").expect("Node path is passed by its parent"),
+        );
+        let resolver = FixtureResolver;
+
+        match mode.as_str() {
+            "retire" => {
+                let boot_id = uuid::Uuid::new_v4().to_string();
+                let plan = owner_plan(&root, &node, "retire", &boot_id);
+                let error = run_module_with_resolver(plan, &resolver)
+                    .expect_err("retired adapter reports only after its family departs");
+                assert_eq!(error.code, "MODULE_EXITED");
+                assert!(error.to_string().contains("native group is empty"));
+                write_report(
+                    root.join("retire-owner-result.json"),
+                    json!({"boot_id":boot_id,"error_code":error.code}),
+                );
+            }
+            "successor" => {
+                let probe_boot = uuid::Uuid::new_v4().to_string();
+                let probe = owner_plan(&root, &node, "probe", &probe_boot);
+                let probe_report = match run_module_with_resolver(probe, &resolver) {
+                    Ok(status) => json!({
+                        "boot_id":probe_boot,
+                        "worker_started":root.join("probe-worker-started").is_file(),
+                        "status_success":status.success()
+                    }),
+                    Err(error) => json!({"boot_id":probe_boot,"error_code":error.code}),
+                };
+                write_report(root.join("successor-probe-result.json"), probe_report);
+                wait_for_path(&root.join("replace-now"), Duration::from_secs(25))
+                    .expect("replacement phase is released after old-owner departure");
+
+                let boot_id = uuid::Uuid::new_v4().to_string();
+                let replacement = owner_plan(&root, &node, "replacement", &boot_id);
+                let error = run_module_with_resolver(replacement, &resolver)
+                    .expect_err("replacement retires after its exact fixture family departs");
+                assert_eq!(error.code, "MODULE_EXITED");
+                assert!(error.to_string().contains("native group is empty"));
+                write_report(
+                    root.join("successor-replacement-result.json"),
+                    json!({"boot_id":boot_id,"error_code":error.code}),
+                );
+            }
+            other => panic!("unsupported fixture owner phase: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "spawned only by the connected process-family fixture"]
+    async fn native_harness_worker() {
+        let mode = std::env::var("CLAUDE_LIFECYCLE_WORKER_MODE")
+            .expect("fixture worker mode is passed by the module owner");
+        let root = PathBuf::from(
+            std::env::var_os("CLAUDE_LIFECYCLE_FIXTURE_ROOT")
+                .expect("fixture root is passed by the module owner"),
+        );
+        if mode == "probe" {
+            fs::write(root.join("probe-worker-started"), b"unexpected")
+                .expect("record an unexpected probe worker start");
+            return;
+        }
+        let node = PathBuf::from(
+            std::env::var_os("CLAUDE_LIFECYCLE_NODE")
+                .expect("Node path is passed by the module owner"),
+        );
+        let bridge = PathBuf::from(
+            std::env::var_os("CLAUDE_LIFECYCLE_BRIDGE")
+                .expect("bridge fixture path is passed by the module owner"),
+        );
+        let boot_id = std::env::var("CLAUDE_LIFECYCLE_BOOT_ID")
+            .expect("module boot id is passed by the module owner");
+        let mode_marker = match mode.as_str() {
+            "retire" => "retiring-worker-started",
+            "replacement" => "replacement-worker-started",
+            other => panic!("unsupported fixture worker mode: {other}"),
+        };
+        fs::write(root.join(mode_marker), b"started").expect("record fixture worker start");
+
+        let state_dir = root.join(format!("worker-state-{mode}"));
+        fs::create_dir_all(&state_dir).expect("create fixture adapter state");
+        let native_options = NativeOptions {
+            workspace_root: root.clone(),
+            sdk_runtime_root: root.clone(),
+            node_executable: node,
+            native_executable: None,
+            claude_config_dir: root.join("claude-config"),
+            model_id: "fixture-model".to_owned(),
+            permission_mode: None,
+            allow_dangerously_skip_permissions: false,
+        };
+        let config = AdapterConfig {
+            host_data_dir: root.clone(),
+            credential_file: root.join("fixture-credential.json"),
+            state_dir: state_dir.clone(),
+            sdk_harness_dir: root.join("sdk-harness"),
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_options: native_options.clone(),
+            ipc: serde_json::from_value(json!({})).expect("default IPC bounds"),
+        };
+        let journal = OperationJournal::open(
+            &state_dir,
+            &config.binding_id,
+            config.generation,
+            &native_options.scope_key(),
+            &"a".repeat(64),
+        )
+        .expect("open isolated fixture operation journal");
+        let interactions = InteractionJournal::open(
+            &state_dir,
+            &config.binding_id,
+            config.generation,
+            &native_options.scope_key(),
+        )
+        .expect("open isolated fixture interaction journal");
+
+        let (frame_tx, mut frame_rx) = mpsc::channel(8);
+        let mut harness = Some(
+            NativeHarness::spawn(native_options, bridge, frame_tx)
+                .expect("spawn the production Claude NativeHarness"),
+        );
+        harness
+            .as_mut()
+            .expect("harness exists before retirement")
+            .send(json!({"kind":"fixture_start"}))
+            .await
+            .expect("send one fixture start command");
+
+        let mut harness_alive = true;
+        let mut native_prepared = true;
+        let mut latest_state = json!({"fixture":true});
+        let mut session_root = Some("fixture-root".to_owned());
+        let mut native_control = NativeControl::default();
+        let mut retired = false;
+        let mut saw_terminal = false;
+        let mut saw_node_exit = false;
+        while !saw_node_exit {
+            let frame = tokio::time::timeout(Duration::from_secs(15), frame_rx.recv())
+                .await
+                .expect("NativeHarness emits its bounded terminal frame")
+                .expect("NativeHarness frame channel remains open until process exit");
+            let child_exited = matches!(&frame, HarnessFrame::Exited { .. });
+            if !retired {
+                saw_terminal |= matches!(
+                    &frame,
+                    HarnessFrame::Message(value) if value["kind"] == "harness_ended"
+                );
+                let action = handle_frame(
+                    frame,
+                    &config,
+                    &boot_id,
+                    &journal,
+                    &interactions,
+                    &mut harness_alive,
+                    &mut native_prepared,
+                    &mut latest_state,
+                    &mut session_root,
+                    &mut native_control,
+                )
+                .expect("apply Claude terminal-frame retirement policy");
+                if action.retire_bridge {
+                    assert!(!action.reconnect);
+                    retire_owned_harness(&mut harness, &interactions, &boot_id, &journal)
+                        .expect("retire callbacks and drop the Node stdin owner");
+                    retired = true;
+                }
+            }
+            saw_node_exit = child_exited;
+        }
+        assert!(saw_terminal, "fixture must take the terminal-frame path");
+        assert!(retired, "terminal frame retires the owned harness");
+        assert!(saw_node_exit, "direct Node exit is observed separately");
+        if mode == "retire" {
+            fs::write(root.join("retired-node-exited"), b"exited")
+                .expect("record the direct NativeHarness child-exit receipt");
+        }
+
+        // Match the production adapter's terminal error exit after run_owned
+        // returns SDK_HARNESS_RETIRED; the shared owner still retains descendants.
+        std::process::exit(2);
+    }
+
+    fn owner_plan(root: &Path, node: &Path, worker_mode: &str, boot_id: &str) -> ModuleOwnerPlan {
+        let current_exe = std::env::current_exe().expect("resolve fixture test executable");
+        let bridge = match worker_mode {
+            "retire" => root.join("retire-bridge.mjs"),
+            "replacement" => root.join("replacement-bridge.mjs"),
+            _ => root.join("probe-bridge.mjs"),
+        };
+        let environment = vec![
+            (
+                "CLAUDE_LIFECYCLE_FIXTURE_ROOT".to_owned(),
+                root.to_string_lossy().into_owned(),
+            ),
+            (
+                "CLAUDE_LIFECYCLE_NODE".to_owned(),
+                node.to_string_lossy().into_owned(),
+            ),
+            (
+                "CLAUDE_LIFECYCLE_WORKER_MODE".to_owned(),
+                worker_mode.to_owned(),
+            ),
+            (
+                "CLAUDE_LIFECYCLE_BRIDGE".to_owned(),
+                bridge.to_string_lossy().into_owned(),
+            ),
+            ("CLAUDE_LIFECYCLE_BOOT_ID".to_owned(), boot_id.to_owned()),
+        ];
+        ModuleOwnerPlan {
+            state_dir: root.join("module-state"),
+            executable: current_exe,
+            argv: vec![
+                "--exact".to_owned(),
+                HARNESS_TEST.to_owned(),
+                "--ignored".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            protected_refs: Vec::<ProtectedRef>::new(),
+            environment,
+            module: "claude".to_owned(),
+            binding: "fixture-binding".to_owned(),
+            generation: "1".to_owned(),
+            artifact_id: crate::config::ARTIFACT_ID.to_owned(),
+            artifact_version: crate::config::ARTIFACT_VERSION.to_owned(),
+            build_id: None,
+            protocol: "1.0".to_owned(),
+            module_contract: "{\"schema_version\":1}".to_owned(),
+            module_client_id: "fixture-client".to_owned(),
+            boot_id: boot_id.to_owned(),
+        }
+    }
+
+    fn spawn_owner_phase(root: &Path, node: &Path, mode: &str) -> Child {
+        let executable = std::env::current_exe().expect("resolve fixture test executable");
+        let mut command = Command::new(executable);
+        apply_launch_environment(&mut command);
+        command
+            .args(["--exact", OWNER_TEST, "--ignored", "--nocapture"])
+            .env("CLAUDE_LIFECYCLE_FIXTURE_ROOT", root)
+            .env("CLAUDE_LIFECYCLE_NODE", node)
+            .env("CLAUDE_LIFECYCLE_OWNER_MODE", mode);
+        let stdout = File::create(root.join(format!("{mode}-owner.stdout")))
+            .expect("create fixture stdout capture");
+        let stderr = File::create(root.join(format!("{mode}-owner.stderr")))
+            .expect("create fixture stderr capture");
+        command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("spawn isolated module-owner fixture process")
+    }
+
+    fn node_executable() -> PathBuf {
+        let output = Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .expect("Node.js is installed for the Claude harness fixture");
+        assert!(
+            output.status.success(),
+            "resolve the installed Node.js path"
+        );
+        PathBuf::from(
+            String::from_utf8(output.stdout)
+                .expect("Node path is UTF-8")
+                .trim(),
+        )
+    }
+
+    fn bridge_source(retain_descendant: bool, root: &Path) -> String {
+        let ready =
+            serde_json::to_string(&root.join("descendant-ready").to_string_lossy().into_owned())
+                .expect("encode the ready path as a JavaScript literal");
+        let release = serde_json::to_string(
+            &root
+                .join("release-descendant")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("encode the release path as a JavaScript literal");
+        let exit =
+            serde_json::to_string(&root.join("descendant-exit").to_string_lossy().into_owned())
+                .expect("encode the descendant exit path as a JavaScript literal");
+        let terminal_gate_name = if retain_descendant {
+            "allow-terminal"
+        } else {
+            "finish-replacement"
+        };
+        let terminal_gate =
+            serde_json::to_string(&root.join(terminal_gate_name).to_string_lossy().into_owned())
+                .expect("encode the terminal gate path as a JavaScript literal");
+        r#"
+import { spawn } from 'node:child_process';
+import { existsSync, writeFileSync } from 'node:fs';
+const retainDescendant = __RETAIN__;
+const readyPath = __READY__;
+const releasePath = __RELEASE__;
+const exitPath = __EXIT__;
+const terminalGatePath = __TERMINAL_GATE__;
+if (process.argv[2] === '--held-descendant') {
+  process.on('exit', (code) => writeFileSync(exitPath, String(code)));
+  writeFileSync(readyPath, String(process.pid));
+  const deadline = Date.now() + 120000;
+  const timer = setInterval(() => {
+    if (existsSync(releasePath) || Date.now() >= deadline) {
+      clearInterval(timer);
+      process.exit(0);
+    }
+  }, 10);
+} else {
+  let pending = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    pending += chunk;
+    const newline = pending.indexOf('\n');
+    if (newline < 0) return;
+    const command = JSON.parse(pending.slice(0, newline));
+    if (command.kind !== 'fixture_start') process.exit(4);
+    const terminal = () => process.stdout.write(JSON.stringify({ kind: 'harness_ended' }) + '\n');
+    if (!retainDescendant) {
+      const deadline = Date.now() + 10000;
+      const waitForReplacement = setInterval(() => {
+        if (existsSync(terminalGatePath)) {
+          clearInterval(waitForReplacement);
+          terminal();
+        } else if (Date.now() >= deadline) {
+          clearInterval(waitForReplacement);
+          process.exit(7);
+        }
+      }, 10);
+      return;
+    }
+    const child = spawn(process.execPath, [process.argv[1], '--held-descendant'], {
+      detached: true, stdio: 'ignore', windowsHide: true,
+    });
+    child.unref();
+    const deadline = Date.now() + 10000;
+    const waitForDescendant = setInterval(() => {
+      if (existsSync(readyPath)) {
+        clearInterval(waitForDescendant);
+        const waitForProof = setInterval(() => {
+          if (existsSync(terminalGatePath)) {
+            clearInterval(waitForProof);
+            terminal();
+          } else if (Date.now() >= deadline) {
+            clearInterval(waitForProof);
+            process.exit(6);
+          }
+        }, 10);
+      } else if (Date.now() >= deadline) {
+        clearInterval(waitForDescendant);
+        process.exit(5);
+      }
+    }, 10);
+  });
+  process.stdin.on('end', () => process.exit(0));
+}
+"#
+        .replace(
+            "__RETAIN__",
+            if retain_descendant { "true" } else { "false" },
+        )
+        .replace("__READY__", &ready)
+        .replace("__RELEASE__", &release)
+        .replace("__EXIT__", &exit)
+        .replace("__TERMINAL_GATE__", &terminal_gate)
+    }
+
+    fn wait_for_marker(path: PathBuf, child: &mut Child, timeout: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if path.is_file() {
+                return Ok(true);
+            }
+            if child.try_wait()?.is_some() {
+                return Ok(path.is_file());
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_path(path: &Path, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while !path.is_file() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture phase was not released",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn observe_membership(
+        probe: Option<&OwnerMembershipProbe>,
+        pid: Option<u32>,
+    ) -> (Option<bool>, Option<String>) {
+        match (probe, pid) {
+            (Some(probe), Some(pid)) => match probe.live_member(pid) {
+                Ok(member) => (member, None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            _ => (
+                None,
+                Some("owner Job probe or descendant PID is unavailable".to_owned()),
+            ),
+        }
+    }
+
+    fn wait_for_test_process_exit(pid: u32, timeout: Duration) -> io::Result<bool> {
+        #[cfg(windows)]
+        {
+            exact_job_probe::wait_for_process_exit(pid, timeout)
+        }
+        #[cfg(not(windows))]
+        {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match swarm_process::process_image_identity(pid) {
+                    Ok(_) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(_) => return Ok(false),
+                    Err(error) if error.code == "PROCESS_GONE" => return Ok(true),
+                    Err(error) => return Err(io::Error::other(error.to_string())),
+                }
+            }
+        }
+    }
+
+    fn observe_exit_or_alive(
+        child: &mut Child,
+        observation: Duration,
+    ) -> io::Result<Option<ExitStatus>> {
+        let deadline = Instant::now() + observation;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_exit(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                return child.wait().map(Some);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn write_report(path: PathBuf, report: Value) {
+        fs::write(
+            path,
+            serde_json::to_vec(&report).expect("encode fixture report"),
+        )
+        .expect("write fixture report");
+    }
+
+    fn read_report(path: PathBuf) -> Option<Value> {
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
     }
 }
