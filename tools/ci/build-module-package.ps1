@@ -233,6 +233,7 @@ function Get-KernelHostResourcePins([string] $PackageName, [object] $Coordinate)
     $pins = @(
         foreach ($entry in @($Coordinate['resource_files'])) {
             $sourcePath = [IO.Path]::GetFullPath((Join-Path $resourceRoot ([string]$entry['path'])))
+            Assert-NoReparseTraversal $sourcePath
             if (-not (Test-PathWithin $sourcePath $resourceRoot) -or
                 -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
                 throw "Pinned kernel resource is missing from the repository: $sourcePath"
@@ -251,6 +252,85 @@ function Get-KernelHostResourcePins([string] $PackageName, [object] $Coordinate)
         }
     )
     return $pins
+}
+
+function Get-KernelHostAdditionalResourceGroups([string] $PackageName, [object] $Coordinate) {
+    $rawGroups = $Coordinate['additional_resource_groups']
+    $groups = @()
+    if ($null -ne $rawGroups) { $groups = @($rawGroups) }
+    if ($PackageName -cne 'swarm-kernel-host') {
+        if ($groups.Count -gt 0) { throw "Package '$PackageName' cannot declare host additional resources." }
+        return @()
+    }
+    if ($groups.Count -ne 1) { throw 'The kernel host must declare exactly one Antigravity Node bridge resource group.' }
+    $group = $groups[0]
+    $expectedFiles = @(
+        @{ path = 'bridge.mjs'; role = 'retained_bridge_v3_entry' },
+        @{ path = 'bridge-v4.mjs'; role = 'bridge_v4_entry' },
+        @{ path = 'codec.mjs'; role = 'native_stream_codec' },
+        @{ path = 'control.mjs'; role = 'authenticated_host_control_client' },
+        @{ path = 'module-descriptor.template.json'; role = 'module_descriptor_template' },
+        @{ path = 'package.json'; role = 'node_package_manifest' },
+        @{ path = 'receipt-state.mjs'; role = 'local_receipt_state' }
+    )
+    if ($group -isnot [System.Collections.IDictionary] -or
+        [string]$group.coordinate -cne 'swarm-kernel-host-antigravity-node-bridge' -or
+        [string]$group.module_id -cne 'antigravity' -or
+        [string]$group.artifact_id -cne 'antigravity-cli-warm-bridge.4' -or
+        [string]$group.version -cne '4' -or
+        [string]$group.repository_relative_root -cne 'modules/antigravity' -or
+        [string]$group.installed_relative_root -cne 'resources/modules/antigravity' -or
+        $group.resource_files -isnot [array] -or
+        $group.resource_files.Count -ne $expectedFiles.Count) {
+        throw 'Kernel-host Antigravity Node resource coordinate drifted from the exact bridge.4 package policy.'
+    }
+    for ($index = 0; $index -lt $expectedFiles.Count; $index++) {
+        $entry = $group.resource_files[$index]
+        if ($entry -isnot [System.Collections.IDictionary] -or
+            [string]$entry.path -cne $expectedFiles[$index].path -or
+            [string]$entry.role -cne $expectedFiles[$index].role) {
+            throw "Kernel-host Antigravity Node resource file coordinate drifted at row $index."
+        }
+    }
+    $descriptorPath = Join-Path $repoRoot 'modules/antigravity/module-descriptor.template.json'
+    $descriptor = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json -AsHashtable
+    if ([string]$descriptor.module_id -cne [string]$group.module_id -or
+        [string]$descriptor.artifact.artifact_id -cne [string]$group.artifact_id -or
+        [string]$descriptor.artifact.version -cne [string]$group.version -or
+        $descriptor.enabled -ne $false) {
+        throw 'Kernel-host Antigravity resource policy differs from its disabled bridge.4 descriptor template.'
+    }
+    $sourceRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot ([string]$group.repository_relative_root)))
+    $pins = @(
+        foreach ($entry in $group.resource_files) {
+            $sourcePath = [IO.Path]::GetFullPath((Join-Path $sourceRoot ([string]$entry.path)))
+            Assert-NoReparseTraversal $sourcePath
+            if (-not (Test-PathWithin $sourcePath $sourceRoot) -or
+                -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                throw "Pinned Antigravity Node resource is missing from the repository: $sourcePath"
+            }
+            $item = Get-Item -LiteralPath $sourcePath -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -le 0) {
+                throw "Pinned Antigravity Node resource is not a regular non-empty file: $sourcePath"
+            }
+            [ordered]@{
+                path = [string]$entry.path
+                role = [string]$entry.role
+                file = [string]$group.installed_relative_root + '/' + [string]$entry.path
+                bytes = [long]$item.Length
+                source_sha256 = Get-Sha256 $sourcePath
+            }
+        }
+    )
+    return @([ordered]@{
+        coordinate = [string]$group.coordinate
+        module_id = [string]$group.module_id
+        artifact_id = [string]$group.artifact_id
+        version = [string]$group.version
+        repository_relative_root = [string]$group.repository_relative_root
+        installed_relative_root = [string]$group.installed_relative_root
+        files = @($pins)
+    })
 }
 
 if (-not (Test-Path -LiteralPath $rootManifest -PathType Leaf) -or
@@ -406,6 +486,7 @@ if ($actualBinTargets.Count -ne 1 -or $binTargets.Count -ne 1) {
 }
 $dependencyPins = Get-ResolvedDependencyPins $metadata $selected $repoRoot $lockFile
 $resourcePins = @(Get-KernelHostResourcePins $Package $selectedCoordinate)
+$additionalResourceGroups = @(Get-KernelHostAdditionalResourceGroups $Package $selectedCoordinate)
 $compatibility = $null
 if ($Package -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervisor')) {
     $kernelTarget = Get-KernelHostTarget $metadata $memberIds
@@ -496,6 +577,7 @@ $binaryOutputDir = Join-Path $outputPath 'bin'
 $resourceRows = @(
     foreach ($resource in $resourcePins) {
         $sourcePath = Join-Path (Join-Path $repoRoot 'modules/opencode') ([string]$resource.path)
+        Assert-NoReparseTraversal $sourcePath
         $stagedPath = Join-Path $outputPath ([string]$resource.file -replace '/', [IO.Path]::DirectorySeparatorChar)
         $stagedParent = Split-Path -Parent $stagedPath
         [void][IO.Directory]::CreateDirectory($stagedParent)
@@ -511,6 +593,41 @@ $resourceRows = @(
             bytes = (Get-Item -LiteralPath $stagedPath).Length
             source_sha256 = [string]$resource.source_sha256
             artifact_sha256 = $artifactHash
+        }
+    }
+)
+$additionalResourceRows = @(
+    foreach ($group in $additionalResourceGroups) {
+        $groupFiles = @(
+            foreach ($resource in @($group.files)) {
+                $sourcePath = Join-Path (Join-Path $repoRoot ([string]$group.repository_relative_root)) ([string]$resource.path)
+                Assert-NoReparseTraversal $sourcePath
+                $stagedPath = Join-Path $outputPath ([string]$resource.file -replace '/', [IO.Path]::DirectorySeparatorChar)
+                $stagedParent = Split-Path -Parent $stagedPath
+                [void][IO.Directory]::CreateDirectory($stagedParent)
+                Copy-Item -LiteralPath $sourcePath -Destination $stagedPath
+                $artifactHash = Get-Sha256 $stagedPath
+                if ($artifactHash -cne [string]$resource.source_sha256) {
+                    throw "Staged hash mismatch for pinned Antigravity Node resource '$($resource.path)'."
+                }
+                [ordered]@{
+                    path = [string]$resource.path
+                    role = [string]$resource.role
+                    file = [string]$resource.file
+                    bytes = (Get-Item -LiteralPath $stagedPath).Length
+                    source_sha256 = [string]$resource.source_sha256
+                    artifact_sha256 = $artifactHash
+                }
+            }
+        )
+        [ordered]@{
+            coordinate = [string]$group.coordinate
+            module_id = [string]$group.module_id
+            artifact_id = [string]$group.artifact_id
+            version = [string]$group.version
+            repository_relative_root = [string]$group.repository_relative_root
+            installed_relative_root = [string]$group.installed_relative_root
+            files = @($groupFiles)
         }
     }
 )
@@ -583,6 +700,7 @@ $buildManifest = [ordered]@{
             repository_relative_root = [string]$selectedCoordinate['resource_repository_relative_root']
             installed_relative_root = [string]$selectedCoordinate['resource_installed_relative_root']
             files = @($resourceRows)
+            additional_groups = @($additionalResourceRows)
             dependency_policy = [ordered]@{
                 node_modules = 'installer_generated_locked_closure'
                 manager = [string]$resourceDependencyInstall['manager']

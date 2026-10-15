@@ -9,7 +9,8 @@
 | Vendor SDK | None exists for this entrypoint; the bridge depends on Node builtins only (`package.json` has no dependencies) |
 | Native binary | The owner's installed `agy` executable, named explicitly in the local module config; the bridge installs and pins no binary |
 | Installed-version evidence | On 2026-10-14, the PATH-resolved `C:\Users\kleym\AppData\Local\agy\bin\agy.exe --version` returned `1.3.3` (SHA-256 `FBBFB3F15C7628252C5E12765683C688BA05EE122B853CADEB0BBFD4E13CA25B`). This identifies the executable only; the runtime matrix remains `installed_runtime_verified: false`, and bridge.3 warm-stream/live behavior remains unqualified. |
-| Bridge artifact | `antigravity-cli-warm-bridge.3` (committed; bounded fixtures; installed/live unqualified; new binding required) |
+| Retained bridge artifact | `antigravity-cli-warm-bridge.3` (`bridge.mjs`; source and legacy example retained) |
+| Manager-selectable bridge artifact | `antigravity-cli-warm-bridge.4` (`bridge-v4.mjs`; descriptor-backed `module.hello`; installed/live unqualified; new binding required) |
 | Executor version reporting | `null` — the native stream reports no version and no version readback is documented for this entrypoint |
 
 ## Local changes to the vendor surface

@@ -168,6 +168,25 @@
           "path": "package-lock.json",
           "role": "dependency_lock"
         }
+      ],
+      "additional_resource_groups": [
+        {
+          "coordinate": "swarm-kernel-host-antigravity-node-bridge",
+          "module_id": "antigravity",
+          "artifact_id": "antigravity-cli-warm-bridge.4",
+          "version": "4",
+          "repository_relative_root": "modules/antigravity",
+          "installed_relative_root": "resources/modules/antigravity",
+          "resource_files": [
+            { "path": "bridge.mjs", "role": "retained_bridge_v3_entry" },
+            { "path": "bridge-v4.mjs", "role": "bridge_v4_entry" },
+            { "path": "codec.mjs", "role": "native_stream_codec" },
+            { "path": "control.mjs", "role": "authenticated_host_control_client" },
+            { "path": "module-descriptor.template.json", "role": "module_descriptor_template" },
+            { "path": "package.json", "role": "node_package_manifest" },
+            { "path": "receipt-state.mjs", "role": "local_receipt_state" }
+          ]
+        }
       ]
     }
   ]

@@ -346,6 +346,115 @@ function Assert-AntigravityV5DescriptorContract {
     }
 }
 
+function Assert-AntigravityNodeV4DescriptorContract {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary] $Descriptor,
+        [Parameter(Mandatory = $true)][string] $SourceExecutable
+    )
+
+    if ($Descriptor.module_id -cne 'antigravity' -or
+        $Descriptor.artifact.artifact_id -cne 'antigravity-cli-warm-bridge.4') {
+        return
+    }
+    if ($Descriptor.artifact.version -cne '4' -or
+        $null -ne $Descriptor.config_schema -or
+        $Descriptor.launch.credential_ref -cne 'host.module-binding-credential' -or
+        $Descriptor.lifecycle -cne 'owned_service' -or
+        $Descriptor.activation -cne 'on_demand' -or
+        $Descriptor.protocol.minimum.major -ne 1 -or
+        $Descriptor.protocol.minimum.minor -ne 0 -or
+        $Descriptor.protocol.maximum.major -ne 1 -or
+        $Descriptor.protocol.maximum.minor -ne 0) {
+        throw 'Antigravity Node bridge artifact version 4 has an unsupported identity, launch, or protocol contract.'
+    }
+    $nodePath = Assert-AbsoluteExistingFile -Path $SourceExecutable -Label 'AntigravityNodeExecutable'
+    if ([System.IO.Path]::GetFileName($nodePath) -ine 'node.exe') {
+        throw 'Antigravity Node bridge artifact version 4 must install the supplied native node.exe executable.'
+    }
+    $nodeStartInfo = [Diagnostics.ProcessStartInfo]::new()
+    $nodeStartInfo.FileName = $nodePath
+    $nodeStartInfo.UseShellExecute = $false
+    $nodeStartInfo.CreateNoWindow = $true
+    $nodeStartInfo.RedirectStandardOutput = $true
+    $nodeStartInfo.RedirectStandardError = $true
+    $nodeStartInfo.ArgumentList.Add('--version')
+    $nodeProcess = [Diagnostics.Process]::new()
+    $nodeProcess.StartInfo = $nodeStartInfo
+    try {
+        if (-not $nodeProcess.Start()) { throw 'Antigravity Node version probe did not start.' }
+        $nodeStdout = $nodeProcess.StandardOutput.ReadToEndAsync()
+        $nodeStderr = $nodeProcess.StandardError.ReadToEndAsync()
+        if (-not $nodeProcess.WaitForExit(5000)) {
+            try { $nodeProcess.Kill() } catch { }
+            try { $nodeProcess.WaitForExit() } catch { }
+            throw 'Antigravity Node version probe exceeded its five-second bound.'
+        }
+        $nodeProcess.WaitForExit()
+        $nodeVersion = $nodeStdout.GetAwaiter().GetResult().Trim()
+        [void] $nodeStderr.GetAwaiter().GetResult()
+        $nodeVersionMatch = [regex]::Match($nodeVersion, '\Av(?<major>[0-9]+)\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\z')
+        if ($nodeProcess.ExitCode -ne 0 -or
+            -not $nodeVersionMatch.Success -or
+            [int]$nodeVersionMatch.Groups['major'].Value -lt 22) {
+            throw 'Antigravity Node bridge artifact version 4 requires Node.js 22 or newer.'
+        }
+    } finally { $nodeProcess.Dispose() }
+    $expectedCapabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.send/next_turn', 'task.dispatch')
+    $actualCapabilities = @($Descriptor.capabilities | ForEach-Object { [string]$_ })
+    if ($actualCapabilities.Count -ne $expectedCapabilities.Count) {
+        throw 'Antigravity Node bridge artifact version 4 has an unsupported capability set.'
+    }
+    for ($index = 0; $index -lt $expectedCapabilities.Count; $index++) {
+        if ($actualCapabilities[$index] -cne $expectedCapabilities[$index]) {
+            throw 'Antigravity Node bridge artifact version 4 capability set is not canonical.'
+        }
+    }
+    $expectedCommands = @('swarm.runtime_command@1', 'swarm.task_dispatch_context@1', 'swarm.task_prompt@1')
+    $actualCommands = @($Descriptor.command_schemas | ForEach-Object { '{0}@{1}' -f $_.schema_id, $_.version })
+    $expectedEvents = @('swarm.runtime_outcome@1', 'swarm.task_dispatch_admission@1')
+    $actualEvents = @($Descriptor.event_schemas | ForEach-Object { '{0}@{1}' -f $_.schema_id, $_.version })
+    if (($actualCommands -join ',') -cne ($expectedCommands -join ',') -or
+        ($actualEvents -join ',') -cne ($expectedEvents -join ',')) {
+        throw 'Antigravity Node bridge artifact version 4 requires the exact TaskPrompt and dispatch-admission schema sets.'
+    }
+    foreach ($schema in @($Descriptor.command_schemas) + @($Descriptor.event_schemas)) {
+        if ($null -ne $schema.sha256) {
+            throw 'Antigravity Node bridge artifact version 4 uses the unkeyed shared schema descriptors.'
+        }
+    }
+    $workspace = $Descriptor.workspace_option
+    if ($workspace -isnot [System.Collections.IDictionary] -or
+        $workspace.schema_version -ne 1 -or
+        $workspace.native_options_pointer -cne '/workspaceRoot' -or
+        $workspace.semantics -cne 'replace_with_admitted_absolute_workspace') {
+        throw 'Antigravity Node bridge artifact version 4 requires the exact admitted workspace option.'
+    }
+    $arguments = @($Descriptor.launch.argv)
+    if ($arguments.Count -ne 3 -or
+        $arguments[0].kind -cne 'literal' -or
+        $arguments[1].kind -cne 'literal' -or $arguments[1].value -cne '--config' -or
+        $arguments[2].kind -cne 'module_host_config_path' -or
+        $arguments[2].value.schema_version -ne 1) {
+        throw 'Antigravity Node bridge artifact version 4 requires its exact bridge/config launch argv.'
+    }
+    $bridgePath = Assert-AbsoluteExistingFile -Path ([string]$arguments[0].value) -Label 'AntigravityBridgeV4'
+    Assert-WithinRoot -Path $bridgePath -Root $script:NormalizedInstallRoot
+    $expectedBridgePath = [System.IO.Path]::GetFullPath((Join-Path $script:NormalizedInstallRoot 'resources/modules/antigravity/bridge-v4.mjs'))
+    if (-not $bridgePath.Equals($expectedBridgePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Antigravity Node bridge artifact version 4 must launch the installed bridge-v4.mjs resource.'
+    }
+    $environment = @($Descriptor.launch.environment)
+    if ($environment.Count -ne 1 -or
+        $environment[0].name -cne 'ELIOT_SWARM_CONFIG_COMMAND' -or
+        $environment[0].value.kind -cne 'literal') {
+        throw 'Antigravity Node bridge artifact version 4 requires one literal installed agy.exe path.'
+    }
+    $agyPath = Assert-AbsoluteExistingFile -Path ([string]$environment[0].value.value) -Label 'AntigravityExecutable'
+    if ([System.IO.Path]::GetFileName($agyPath) -ine 'agy.exe') {
+        throw 'Antigravity Node bridge artifact version 4 must launch the installed native agy.exe executable.'
+    }
+}
+
 function Assert-DescriptorTemplate {
     param([System.Collections.IDictionary] $Descriptor)
 
@@ -600,6 +709,7 @@ try {
 catch { throw "DescriptorTemplate is not valid JSON: $($_.Exception.Message)" }
 Assert-DescriptorTemplate -Descriptor $descriptor
 Assert-AntigravityV5DescriptorContract -Descriptor $descriptor
+Assert-AntigravityNodeV4DescriptorContract -Descriptor $descriptor -SourceExecutable $sourcePath
 
 $coordinate = [ordered]@{
     module_id = [string] $descriptor.module_id

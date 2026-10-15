@@ -7,13 +7,16 @@ stream entrypoint: one owned process per binding, launched as
 (`init` / `step_update` / `result`, discriminated by `event`) mapped by
 `codec.mjs`. There is no vendor SDK for this runtime and no shared server to
 attach to; the bridge owns the CLI process it starts and nothing else. The
-committed source is versioned as **`antigravity-cli-warm-bridge.3`** for new
-bindings, with bounded Windows/Linux fixture evidence in the
+`bridge.mjs` remains the immutable **`antigravity-cli-warm-bridge.3`** entrypoint.
+The manager-selectable, supervisor-managed Node artifact is
+**`antigravity-cli-warm-bridge.4`** in `bridge-v4.mjs`; it retains `.3` source
+and gives new bindings an exact descriptor-derived `module.hello` claim. The
+bounded Windows/Linux fixture evidence for `.3` is in the
 [EOF verification record](../../docs/remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
 Existing `.2` bindings and their historical Windows live observation retain
 their exact artifact identity. Installed/live Antigravity and Windows native
-launch for `.3` remain unqualified; syntax, fixtures and compilation do not
-attest model execution.
+launch for `.3` and `.4` remain unqualified; syntax, fixtures and compilation
+do not attest model execution.
 
 Protocol basis: the vendor's official headless documentation
 (<https://antigravity.google/docs/cli/headless/>, source AG-HEADLESS in
@@ -23,7 +26,30 @@ subagents documentation (AG-CHILDREN). The runtime matrix records
 rule applies — this document does not enable the module or grant
 capabilities, the runtime describes the actual entrypoint.
 
-## Ownership and setup
+## bridge.4 descriptor-backed setup
+
+The checked-in [`module-descriptor.template.json`](module-descriptor.template.json)
+and [`module-v4.example.json`](module-v4.example.json) are disabled by default.
+Install the Node executable and the tracked bridge resource closure through
+the existing module/package installers. Replace the descriptor template's
+installer paths with the installed `resources/modules/antigravity/bridge-v4.mjs`
+and the owner's absolute `agy.exe` path, then install it with
+`Install-ModuleArtifact.ps1`; the resulting install receipt pins the exact
+descriptor and Node executable. Configure the route as `runtime = 'module'`
+with artifact `antigravity-cli-warm-bridge.4`, then let the Manager select the
+registered descriptor before `agent.open`. The supervisor supplies its exact
+descriptor-derived `ELIOT_SWARM_MODULE_CONTRACT`; bridge.4 forwards it in
+`module.hello` and checks Store's negotiation before reading commands. A
+bootstrap failure after module imports emits only the bounded
+`NODE_BRIDGE_STARTUP_FAILED` worker diagnostic code; it does not write the
+exception text into the worker receipt.
+
+An empty `agent.open` may initialize one native warm stream. It sends no user
+event or Task prompt. The descriptor claim and empty initialization establish
+only the module integration prerequisite; Issue 140 still requires its
+separate live-turn and terminal-correlation evidence.
+
+## bridge.3 legacy entrypoint and setup
 
 The bridge owns one `agy` warm-stream connection. Host IPC exposes
 `module.hello/next/outcome/observe/result`; its credential is scoped to the

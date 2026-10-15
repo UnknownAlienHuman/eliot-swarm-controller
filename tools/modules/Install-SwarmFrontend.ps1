@@ -50,6 +50,25 @@ $packageMap = @{
             [ordered]@{ path = 'package.json'; role = 'dependency_manifest' },
             [ordered]@{ path = 'package-lock.json'; role = 'dependency_lock' }
         )
+        additional_resource_groups = @(
+            [ordered]@{
+                coordinate = 'swarm-kernel-host-antigravity-node-bridge'
+                module_id = 'antigravity'
+                artifact_id = 'antigravity-cli-warm-bridge.4'
+                version = '4'
+                repository_relative_root = 'modules/antigravity'
+                installed_relative_root = 'resources/modules/antigravity'
+                resource_files = @(
+                    [ordered]@{ path = 'bridge.mjs'; role = 'retained_bridge_v3_entry' },
+                    [ordered]@{ path = 'bridge-v4.mjs'; role = 'bridge_v4_entry' },
+                    [ordered]@{ path = 'codec.mjs'; role = 'native_stream_codec' },
+                    [ordered]@{ path = 'control.mjs'; role = 'authenticated_host_control_client' },
+                    [ordered]@{ path = 'module-descriptor.template.json'; role = 'module_descriptor_template' },
+                    [ordered]@{ path = 'package.json'; role = 'node_package_manifest' },
+                    [ordered]@{ path = 'receipt-state.mjs'; role = 'local_receipt_state' }
+                )
+            }
+        )
     }
     'swarm-mcp' = [ordered]@{
         manifest = 'crates/swarm-mcp/Cargo.toml'
@@ -124,6 +143,11 @@ function Get-ResourceSpecFiles([System.Collections.IDictionary] $Spec) {
     return @($Spec.resource_files)
 }
 
+function Get-AdditionalResourceSpecGroups([System.Collections.IDictionary] $Spec) {
+    if (-not $Spec.Contains('additional_resource_groups')) { return @() }
+    return @($Spec.additional_resource_groups)
+}
+
 function Assert-ResourceManifest(
     [object] $Manifest,
     [System.Collections.IDictionary] $Spec,
@@ -188,7 +212,71 @@ function Assert-ResourceManifest(
             throw "$Label kernel resource row $index has different source and artifact digests."
         }
     }
+    $expectedGroups = @(Get-AdditionalResourceSpecGroups $Spec)
+    $actualGroups = @($resources.additional_groups)
+    if ($actualGroups.Count -ne $expectedGroups.Count) {
+        throw "$Label has an incomplete additional resource group set."
+    }
+    for ($groupIndex = 0; $groupIndex -lt $expectedGroups.Count; $groupIndex++) {
+        $expectedGroup = $expectedGroups[$groupIndex]
+        $actualGroup = $actualGroups[$groupIndex]
+        if ($actualGroup -isnot [System.Collections.IDictionary] -or
+            [string]$actualGroup.coordinate -cne [string]$expectedGroup.coordinate -or
+            [string]$actualGroup.module_id -cne [string]$expectedGroup.module_id -or
+            [string]$actualGroup.artifact_id -cne [string]$expectedGroup.artifact_id -or
+            [string]$actualGroup.version -cne [string]$expectedGroup.version -or
+            [string]$actualGroup.repository_relative_root -cne [string]$expectedGroup.repository_relative_root -or
+            [string]$actualGroup.installed_relative_root -cne [string]$expectedGroup.installed_relative_root -or
+            $actualGroup.files -isnot [array]) {
+            throw "$Label additional resource group $groupIndex differs from the package policy."
+        }
+        $expectedGroupFiles = @($expectedGroup.resource_files)
+        $actualGroupFiles = @($actualGroup.files)
+        if ($actualGroupFiles.Count -ne $expectedGroupFiles.Count) {
+            throw "$Label additional resource group $groupIndex is incomplete."
+        }
+        for ($fileIndex = 0; $fileIndex -lt $expectedGroupFiles.Count; $fileIndex++) {
+            $row = $actualGroupFiles[$fileIndex]
+            $entry = $expectedGroupFiles[$fileIndex]
+            $expectedFile = [string]$expectedGroup.installed_relative_root + '/' + [string]$entry.path
+            if ($row -isnot [System.Collections.IDictionary] -or
+                [string]$row.path -cne [string]$entry.path -or
+                [string]$row.role -cne [string]$entry.role -or
+                [string]$row.file -cne $expectedFile -or
+                [long]$row.bytes -le 0) {
+                throw "$Label additional resource group $groupIndex file row $fileIndex differs from the package policy."
+            }
+            Assert-Hash $row.source_sha256 "$Label.resources.additional_groups[$groupIndex].files[$fileIndex].source_sha256"
+            Assert-Hash $row.artifact_sha256 "$Label.resources.additional_groups[$groupIndex].files[$fileIndex].artifact_sha256"
+            if ([string]$row.source_sha256 -cne [string]$row.artifact_sha256) {
+                throw "$Label additional resource group $groupIndex file row $fileIndex has different source and artifact digests."
+            }
+        }
+    }
     return $resources
+}
+
+function Assert-InstalledResourceRows(
+    [string] $ResourceRoot,
+    [string] $InstallRoot,
+    [object[]] $Rows,
+    [string] $Label
+) {
+    foreach ($row in $Rows) {
+        $path = [IO.Path]::GetFullPath((Join-Path $ResourceRoot ([string]$row.path)))
+        if (-not (Test-PathWithin $path $ResourceRoot) -or
+            -not (Test-PathWithin $path $InstallRoot) -or
+            -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$Label is missing pinned resource '$($row.path)'."
+        }
+        Assert-NoReparseTraversal $path
+        $item = Get-Item -LiteralPath $path -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            [long]$item.Length -ne [long]$row.bytes -or
+            (Get-Sha256 $path) -cne [string]$row.artifact_sha256) {
+            throw "$Label resource '$($row.path)' differs from its pinned digest or size."
+        }
+    }
 }
 
 function Assert-InstalledResourceFiles(
@@ -199,19 +287,10 @@ function Assert-InstalledResourceFiles(
 ) {
     if ($null -eq $Resources) { return }
     $resourceRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot ([string]$Spec.resource_installed_relative_root)))
-    foreach ($row in @($Resources.files)) {
-        $path = [IO.Path]::GetFullPath((Join-Path $resourceRoot ([string]$row.path)))
-        if (-not (Test-PathWithin $path $resourceRoot) -or -not (Test-PathWithin $path $InstallRoot) -or
-            -not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            throw "$Label is missing pinned kernel resource '$($row.path)'."
-        }
-        Assert-NoReparseTraversal $path
-        $item = Get-Item -LiteralPath $path -Force
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-            [long]$item.Length -ne [long]$row.bytes -or
-            (Get-Sha256 $path) -cne [string]$row.artifact_sha256) {
-            throw "$Label kernel resource '$($row.path)' differs from its pinned digest or size."
-        }
+    Assert-InstalledResourceRows -ResourceRoot $resourceRoot -InstallRoot $InstallRoot -Rows @($Resources.files) -Label $Label
+    foreach ($group in @($Resources.additional_groups)) {
+        $additionalRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot ([string]$group.installed_relative_root)))
+        Assert-InstalledResourceRows -ResourceRoot $additionalRoot -InstallRoot $InstallRoot -Rows @($group.files) -Label "$Label $($group.coordinate)"
     }
 }
 
@@ -846,6 +925,11 @@ function Get-InstalledFrontend(
         foreach ($entry in @(Get-ResourceSpecFiles $Spec)) {
             Join-Path (Join-Path $Root ([string]$Spec.resource_installed_relative_root)) ([string]$entry.path)
         }
+        foreach ($group in @(Get-AdditionalResourceSpecGroups $Spec)) {
+            foreach ($entry in @($group.resource_files)) {
+                Join-Path (Join-Path $Root ([string]$group.installed_relative_root)) ([string]$entry.path)
+            }
+        }
     )
     $paths = @($binaryPath, $buildPath, $receiptPath) + $resourcePaths
     $present = @($paths | Where-Object { Test-Path -LiteralPath $_ })
@@ -1087,6 +1171,21 @@ $receiptDestination = Join-Path $installRoot ([string]$selectedSpec.binary + '.i
 $resourceDestinationRoot = if ($null -ne $provenanceResources) {
     [IO.Path]::GetFullPath((Join-Path $installRoot ([string]$selectedSpec.resource_installed_relative_root)))
 } else { $null }
+$additionalResourceGroups = if ($null -ne $provenanceResources) {
+    @($provenanceResources.additional_groups)
+} else { @() }
+$additionalResourcePlans = @(
+    foreach ($group in $additionalResourceGroups) {
+        [ordered]@{
+            coordinate = [string]$group.coordinate
+            group = $group
+            destination = [IO.Path]::GetFullPath((Join-Path $installRoot ([string]$group.installed_relative_root)))
+            stage_root = $null
+            moved = $false
+            parent_created = $false
+        }
+    }
+)
 if ($packageName -ceq 'eliot-swarm-controller') {
     $gateway = $existing['swarm-gateway']
     if ($null -ne $gateway) {
@@ -1144,6 +1243,10 @@ if ($null -ne $existing[$packageName]) {
         $stageResourceRoot = if ($null -ne $provenanceResources) {
             Join-Path $installRoot ('.resources.' + $nonce + '.stage')
         } else { $null }
+        foreach ($plan in $additionalResourcePlans) {
+            $safeCoordinate = [string]$plan.coordinate -replace '[^A-Za-z0-9._-]', '_'
+            $plan.stage_root = Join-Path $installRoot ('.resources.' + $safeCoordinate + '.' + $nonce + '.stage')
+        }
         $resourceParent = if ($null -ne $resourceDestinationRoot) { Split-Path -Parent $resourceDestinationRoot } else { $null }
         $resourceParentCreated = $false
         $resourceMoved = $false
@@ -1170,6 +1273,20 @@ if ($null -ne $existing[$packageName]) {
                 }
                 Invoke-LockedNpmInstall $stageResourceRoot $npmTools $selectedSpec.resource_dependency_install
                 $dependencyClosure = New-DependencyClosureManifest $stageResourceRoot $npmTools $selectedSpec
+            }
+            foreach ($plan in $additionalResourcePlans) {
+                [void][IO.Directory]::CreateDirectory([string]$plan.stage_root)
+                foreach ($row in @($plan.group.files)) {
+                    $stageResourcePath = Join-Path ([string]$plan.stage_root) ([string]$row.path)
+                    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $stageResourcePath))
+                    $packageResourcePath = Join-Path $packagePath ([string]$row.file -replace '/', [IO.Path]::DirectorySeparatorChar)
+                    Copy-ToStage $packageResourcePath $stageResourcePath
+                    $stageResourceItem = Get-Item -LiteralPath $stageResourcePath -Force
+                    if ([long]$stageResourceItem.Length -ne [long]$row.bytes -or
+                        (Get-Sha256 $stageResourcePath) -cne [string]$row.artifact_sha256) {
+                        throw "Staged additional resource '$($row.path)' failed its pinned size or SHA-256 check."
+                    }
+                }
             }
             $packageManifestHash = [string]$provenance.source.package_manifest_sha256
             $workspaceManifestHash = if ($null -ne $provenance.source['workspace_cargo_toml_sha256']) {
@@ -1223,7 +1340,9 @@ if ($null -ne $existing[$packageName]) {
             }
             $installDestinations = @($binaryDestination, $buildDestination, $receiptDestination)
             if ($null -ne $resourceDestinationRoot) { $installDestinations += $resourceDestinationRoot }
+            foreach ($plan in $additionalResourcePlans) { $installDestinations += [string]$plan.destination }
             foreach ($destination in $installDestinations) {
+                Assert-NoReparseTraversal $destination
                 if (Test-Path -LiteralPath $destination) {
                     throw "Install destination appeared during create-only installation: $destination"
                 }
@@ -1235,12 +1354,25 @@ if ($null -ne $existing[$packageName]) {
             [IO.File]::Move($stageReceipt, $receiptDestination)
             $createdDestinations.Add($receiptDestination)
             if ($null -ne $resourceDestinationRoot) {
+                Assert-NoReparseTraversal $resourceParent
                 if (-not (Test-Path -LiteralPath $resourceParent -PathType Container)) {
                     [void][IO.Directory]::CreateDirectory($resourceParent)
                     $resourceParentCreated = $true
                 }
+                Assert-NoReparseTraversal $resourceParent
                 [IO.Directory]::Move($stageResourceRoot, $resourceDestinationRoot)
                 $resourceMoved = $true
+            }
+            foreach ($plan in $additionalResourcePlans) {
+                $additionalParent = Split-Path -Parent ([string]$plan.destination)
+                Assert-NoReparseTraversal $additionalParent
+                if (-not (Test-Path -LiteralPath $additionalParent -PathType Container)) {
+                    [void][IO.Directory]::CreateDirectory($additionalParent)
+                    $plan.parent_created = $true
+                }
+                Assert-NoReparseTraversal $additionalParent
+                [IO.Directory]::Move([string]$plan.stage_root, [string]$plan.destination)
+                $plan.moved = $true
             }
             foreach ($destination in $installDestinations) {
                 Assert-NoReparseTraversal $destination
@@ -1261,15 +1393,28 @@ if ($null -ne $existing[$packageName]) {
             $cleanupHashes[$binaryDestination] = $executableHash
             $cleanupHashes[$buildDestination] = $buildManifestHash
             $cleanupHashes[$receiptDestination] = $receiptHash
-            if ($resourceMoved -and $null -ne $resourceDestinationRoot) {
+            $movedAdditionalResources = @($additionalResourcePlans | Where-Object { $_.moved -eq $true })
+            if (($resourceMoved -and $null -ne $resourceDestinationRoot) -or $movedAdditionalResources.Count -gt 0) {
                 try {
-                    Assert-NoReparseTraversal $resourceDestinationRoot
-                    Assert-InstalledResourceFiles $installRoot $selectedSpec $provenanceResources 'Rollback resource check'
-                    Assert-DependencyClosure (Join-Path $installRoot ([string]$selectedSpec.resource_installed_relative_root)) $receipt.resources $provenanceResources $selectedSpec 'Rollback resource check'
-                    Remove-Item -LiteralPath $resourceDestinationRoot -Recurse -Force -Confirm:$false
-                    $resourceMoved = $false
+                    if ($resourceMoved -and $null -ne $resourceDestinationRoot) {
+                        Assert-NoReparseTraversal $resourceDestinationRoot
+                        Assert-InstalledResourceRows -ResourceRoot $resourceDestinationRoot -InstallRoot $installRoot -Rows @($provenanceResources.files) -Label 'Rollback kernel resource check'
+                        Assert-DependencyClosure $resourceDestinationRoot $receipt.resources $provenanceResources $selectedSpec 'Rollback kernel resource check'
+                    }
+                    foreach ($plan in $movedAdditionalResources) {
+                        Assert-NoReparseTraversal ([string]$plan.destination)
+                        Assert-InstalledResourceRows -ResourceRoot ([string]$plan.destination) -InstallRoot $installRoot -Rows @($plan.group.files) -Label "Rollback $($plan.coordinate) resource check"
+                    }
+                    if ($resourceMoved -and $null -ne $resourceDestinationRoot) {
+                        Remove-Item -LiteralPath $resourceDestinationRoot -Recurse -Force -Confirm:$false
+                        $resourceMoved = $false
+                    }
+                    foreach ($plan in $movedAdditionalResources) {
+                        Remove-Item -LiteralPath ([string]$plan.destination) -Recurse -Force -Confirm:$false
+                        $plan.moved = $false
+                    }
                 } catch {
-                    $cleanupFailures.Add("could not roll back resource root ${resourceDestinationRoot}: $($_.Exception.Message)")
+                    $cleanupFailures.Add("could not roll back pinned resource roots: $($_.Exception.Message)")
                 }
             }
             for ($index = $createdDestinations.Count - 1; $index -ge 0; $index--) {
@@ -1296,6 +1441,17 @@ if ($null -ne $existing[$packageName]) {
                     $cleanupFailures.Add("could not roll back resource parent ${resourceParent}: $($_.Exception.Message)")
                 }
             }
+            foreach ($plan in $additionalResourcePlans | Where-Object { $_.parent_created -eq $true }) {
+                $additionalParent = Split-Path -Parent ([string]$plan.destination)
+                try {
+                    if ((Test-Path -LiteralPath $additionalParent -PathType Container) -and
+                        @((Get-ChildItem -LiteralPath $additionalParent -Force)).Count -eq 0) {
+                        Remove-Item -LiteralPath $additionalParent -Force -Confirm:$false
+                    }
+                } catch {
+                    $cleanupFailures.Add("could not roll back additional resource parent ${additionalParent}: $($_.Exception.Message)")
+                }
+            }
             if ($cleanupFailures.Count -gt 0) {
                 throw "Create-only install failed: $($installFailure.Exception.Message) Rollback notes: $($cleanupFailures -join '; '). Inspect those exact paths before retrying."
             }
@@ -1306,6 +1462,11 @@ if ($null -ne $existing[$packageName]) {
             }
             if ($null -ne $stageResourceRoot -and (Test-Path -LiteralPath $stageResourceRoot)) {
                 Remove-Item -LiteralPath $stageResourceRoot -Recurse -Force -Confirm:$false
+            }
+            foreach ($plan in $additionalResourcePlans) {
+                if ($null -ne $plan.stage_root -and (Test-Path -LiteralPath ([string]$plan.stage_root))) {
+                    Remove-Item -LiteralPath ([string]$plan.stage_root) -Recurse -Force -Confirm:$false
+                }
             }
         }
     } else {
@@ -1323,6 +1484,7 @@ if ($null -ne $existing[$packageName]) {
     build_manifest_sha256 = $buildManifestHash
     install_receipt = [IO.Path]::GetFullPath($receiptDestination)
     resource_root = $resourceDestinationRoot
+    additional_resource_roots = @($additionalResourcePlans | ForEach-Object { [string]$_.destination })
     source_commit = [string]$provenance.source.commit
     source_tree = [string]$provenance.source.tree
 }
