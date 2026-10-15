@@ -28,9 +28,11 @@ PR #22's proposed reviewer core included `task.request_changes`, while its Parti
 
 ## 3. Whole Rust libraries
 
+These are optional reuse candidates, not claims of shipped dependencies or core-completion gates. Check the workspace manifests, lockfile and consumer path before describing a library as adopted.
+
 | Component | Maintained source | Take | ELIOT remains responsible for |
 |---|---|---|---|
-| Octocrab | [API](https://docs.rs/octocrab/latest/octocrab/), [builder](https://docs.rs/octocrab/latest/octocrab/struct.OctocrabBuilder.html) | Complete Rust GitHub client with narrow low-level endpoint access when needed. | Credentials, action rights, durable intent, shared rate pacing, retry/readback policy. |
+| Octocrab | [v0.54.4 API](https://docs.rs/octocrab/0.54.4/octocrab/), [manifest](https://github.com/XAMPPRocky/octocrab/blob/v0.54.4/Cargo.toml), [retry middleware](https://github.com/XAMPPRocky/octocrab/blob/v0.54.4/src/service/middleware/retry.rs) | **Proposed only, not adopted.** v0.54.4 was released 2026-10-13. At ELIOT `main@9add213`, no workspace `Cargo.toml`, `Cargo.lock` or Rust import consumes Octocrab. The current in-tree GitHub path is `GhCli` through installed `gh` in [`github/client.rs`](../../crates/swarm-kernel-host/src/github/client.rs). Issue #153 [comment 6169520482](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/153#issuecomment-6169520482) proposes Octocrab as an optional transport candidate for existing consumers; no dependency or consumer has landed. | Credentials, action rights, durable intent, shared rate pacing, retry/readback policy. |
 | Croner | [API](https://docs.rs/croner/latest/croner/) | Complete expression evaluator and supported timezone integration. | Manager enabled choice, due identity, overlap/catch-up and persistence. |
 | sysinfo | [API](https://docs.rs/sysinfo/latest/sysinfo/) | Shared selective process/resource observations. | Real process ownership and safe decisions; metrics do not authorize kill. |
 | notify | [API](https://docs.rs/notify/latest/notify/) | Platform file-change hints/fallback. | Exact readback, invalidation and source-health gaps. |
@@ -40,7 +42,7 @@ No old release, fixed CLI/model equality or callback-time package installation i
 
 ### Retry ownership
 
-**DOC, rechecked 2026-10-03:** Octocrab's builder documents retry-capable middleware and selectable transport behavior. This does not prove every endpoint/request is safe to resend.
+**DOC, source checked 2026-10-14 against Octocrab v0.54.4:** its retry middleware exposes `None`, `Simple`, and `HandleRateLimits`. `Simple` retries transport errors, 5xx responses and 429 responses; `HandleRateLimits` retries rate-limited 403/429 responses when its header rules permit and retries 5xx responses. These policies do not filter by HTTP method. `None` disables this middleware layer only; it does not establish that a separately configured lower transport has no retries. A retry-capable client therefore does not prove every endpoint/request is safe to resend.
 
 **DESIGN:** inspect the chosen library configuration and actual method before use. Safe reads may retry under a shared bounded policy; ambiguous non-idempotent writes must not be invisibly replayed by middleware underneath Store. One effect has one retry/readback owner. Do not replace the whole client with a second handwritten GitHub stack merely to control this boundary.
 
@@ -105,6 +107,8 @@ Previously inspected [scheduler/common.rs](https://github.com/aaif-goose/goose/b
 ## 9. Native and GitHub boundaries
 
 Native references: [Codex app-server](https://developers.openai.com/codex/app-server/), [Claude CLI](https://code.claude.com/docs/en/cli-reference), [Claude hooks](https://code.claude.com/docs/en/hooks), [Gemini CLI hooks](https://geminicli.com/docs/hooks/reference/), [OpenCode plugins](https://opencode.ai/docs/plugins/). These are integration references, not assertions of installed support. Read actual protocols from Rust and preserve exact native lifecycle ownership. Async after-hooks are not vetoes; wrapper exit is not proof native Goal/children stopped.
+
+**Codex owner correction, 2026-10-09:** the current product source path is the standalone Rust [`swarm-adapter-codex`](../../crates/swarm-adapter-codex/Cargo.toml) over the installed app-server and the owner's existing authentication, as recorded in [issue #9, comment 6072746953](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/9#issuecomment-6072746953). The vendored Python SDK under `modules/codex/vendor_bridge` remains intentional historical donor provenance and fixture material; its `ADOPT WHOLE` inventory entry describes that retained source, not the current product route. Preserve the provenance, and do not add a writable Python send surface, host route or reconnect authority. Rust source presence does not itself qualify live/native behavior.
 
 GitHub references:
 

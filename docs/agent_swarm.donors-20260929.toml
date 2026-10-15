@@ -49,28 +49,28 @@ role_qualified = false
 
 [[donors]]
 id = "codex-python-sdk"
-selection = "jsonl_sdk_donor_with_shared_transport_adaptation"
+selection = "historical_jsonl_sdk_source_and_fixture_provenance"
 adoption_class = "adopt"
-program_decision = "KEEP / ADOPT WHOLE (Documentation Program section 1A)"
-module = "runtime.codex"
+program_decision = "KEEP / ADOPT WHOLE historical vendored source for provenance and fixtures; this is not the current Codex product route"
+module = "Historical modules/codex/vendor_bridge source and fixtures; current product source route is crates/swarm-adapter-codex"
 repository = "https://github.com/openai/codex"
 revision = "18194bfd3534ca567d886eac454028dafaa68b6c"
 reviewed_pin = "18194bfd3534ca567d886eac454028dafaa68b6c (sdk/python source snapshot; package 0.0.0-dev)"
-installed_pin = "vendored source snapshot at the reviewed commit under modules/codex/vendor_bridge (package 0.0.0-dev; a dev snapshot, not installed from a registry)"
+installed_pin = "vendored source snapshot at the reviewed commit under modules/codex/vendor_bridge (package 0.0.0-dev; a dev snapshot, not installed from a registry; retained as historical donor provenance, not the current product route)"
 matching_binary_pin = "openai-codex-cli-bin==0.153.4 (the donor's own paired pin; server-side provenance only - the bridge installs no binary)"
 server_reported_version = "Separate runtime fact, not a pin: the version reported by the actual shared server (executor block in bridge output at attach time). No server-reported value is recorded as a pin in this inventory."
-qualification = "fixture_checked; read-only bridge slice with no controller route registered yet; live qualification points below remain open. The shared WebSocket adaptation overrides private SDK methods and must be requalified on every pin."
+qualification = "fixture_checked for the historical Python bridge only; this does not qualify the current Rust product route or make the Python bridge the current product path. The shared WebSocket adaptation overrides private SDK methods."
 source_units = ["sdk/python"]
 package = "openai-codex"
 manifest_version = "0.0.0-dev"
 published_artifact_version_verified = false
 license_declaration = "Apache-2.0; sdk/python/pyproject.toml"
-execution = "Pinned client is JSONL stdio; selected shared WebSocket proxy requires explicit transport adaptation in the Codex module. No plug-and-play claim."
+execution = "The pinned JSONL client and shared WebSocket adaptation are retained as historical donor source/provenance and fixtures. The current product source route is the standalone Rust app-server adapter; do not add a writable Python route."
 source_dependencies = ["pydantic>=2.12", "packaging>=26.2", "openai-codex-cli-bin==0.153.4"]
 retain = ["Generated models", "Reader/router implementation", "Fixtures/tests", "License"]
-local_glue = ["Module v1 facade", "Connection/profile identity", "Goal/family observation", "Exact runtime selection"]
-qualification_points = ["Owned stdio separately from shared daemon", "Existing auth/home", "Actual server version", "Concurrent requests and server requests", "Turn correlation", "Resume and goal"]
-do_not_copy = ["codex-rs/app-server-client into core: pulls core/app-server/executor dependency graph", "Legacy codex_as.py synchronous transport", "The SDK default approval handler: it accepts command/file requests, so ELIOT must always provide an explicit policy (Documentation Program section 1A)"]
+local_glue = ["Historical Module v1 facade", "Connection/profile identity", "Goal/family observation", "Exact runtime selection"]
+qualification_points = ["Historical Python bridge only; not qualification gates for the current Rust product route", "Owned stdio separately from shared daemon", "Existing auth/home", "Actual server version", "Concurrent requests and server requests", "Turn correlation", "Resume and goal"]
+do_not_copy = ["A new writable Python send surface, host route or reconnect authority", "codex-rs/app-server-client into core: pulls core/app-server/executor dependency graph", "Legacy codex_as.py synchronous transport", "The SDK default approval handler: it accepts command/file requests, so ELIOT must always provide an explicit policy (Documentation Program section 1A)"]
 notes = "codex_bin selects the launched executable; it does not remove the matching-binary package dependency. Do not install a dev version by invented registry version."
 source_reviewed = true
 installed = true
