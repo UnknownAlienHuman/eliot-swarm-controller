@@ -20,6 +20,24 @@ impl Drop for FixtureDirectory {
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+struct InterpreterRelease(PathBuf);
+
+#[cfg(any(windows, target_os = "linux"))]
+impl InterpreterRelease {
+    fn release(&self) -> std::io::Result<()> {
+        fs::write(&self.0, b"release")
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+impl Drop for InterpreterRelease {
+    fn drop(&mut self) {
+        // An assertion failure must not leave the fixture interpreter waiting.
+        let _ = self.release();
+    }
+}
+
 #[cfg(windows)]
 struct ScopedPsExecutionPolicy(Option<std::ffi::OsString>);
 
@@ -1102,11 +1120,15 @@ fn reconcile_scripts_retains_operation_and_source_worker_across_allow_durability
         let script_id = format!("pr67_reconcile_{}", uuid::Uuid::new_v4().simple());
         let marker_path = data_dir.join("reconcile-interpreter-started.txt");
         let marker_literal = marker_path.to_string_lossy().replace('\'', "''");
+        let release_path = data_dir.join("reconcile-interpreter-release.txt");
+        let release_literal = release_path.to_string_lossy().replace('\'', "''");
         // Exercise the valid null ScriptResult through terminal receipt readback.
         let script_bytes = r#"
 $invocation = [Console]::In.ReadToEnd() | ConvertFrom-Json
 [System.IO.File]::AppendAllText('__MARKER__', "started`n")
-Start-Sleep -Seconds 10
+while (-not [System.IO.File]::Exists('__RELEASE__')) {
+    Start-Sleep -Milliseconds 25
+}
 $result = [ordered]@{
     protocol_version = 1
     operation_id = $invocation.operation_id
@@ -1116,6 +1138,7 @@ $result = [ordered]@{
 [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress -Depth 8))
 "#
         .replace("__MARKER__", &marker_literal)
+        .replace("__RELEASE__", &release_literal)
         .into_bytes();
         let interpreter_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .map(|directory| directory.join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" }))
@@ -1249,6 +1272,7 @@ $result = [ordered]@{
             terminal_settlement_confirmed: false,
             armed: true,
         };
+        let interpreter_release = InterpreterRelease(release_path);
         assert_eq!(
             stored_state(&owner.store, &run_id, &operation_id).await.0,
             "queued"
@@ -1418,6 +1442,7 @@ $result = [ordered]@{
             "the same Store-owned source worker remains live during interpreter execution"
         );
 
+        interpreter_release.release().expect("release the exact fixture interpreter after live custody checks");
         let completion_deadline = Instant::now() + Duration::from_secs(15);
         while !completion_path.is_file() {
             assert!(Instant::now() < completion_deadline, "source worker completes");

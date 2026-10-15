@@ -1217,7 +1217,8 @@ jobs:
               throw 'Staged ScriptWorker differs from the binary built at the recorded source.'
             }
             Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "ScriptWorker SHA-256: $workerHash"
-            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'scripts_start_decision_tests' -Expected 3 -ExpectedNames @(
+            # The source-worker fixtures capture process-global execution policy.
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'scripts_start_decision_tests' -Expected 3 -TestThreads 1 -ExpectedNames @(
               'uncertain_allow_equal_retry_requires_durable_decision_identity',
               'store_source_worker_waits_for_durable_allow_and_runs_once_after_recovery',
               'reconcile_scripts_retains_operation_and_source_worker_across_allow_durability_unknown'
