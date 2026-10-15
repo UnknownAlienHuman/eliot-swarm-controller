@@ -21,7 +21,7 @@
   "config_schema": {
     "schema_id": "opencode-v2-native-options",
     "version": "4",
-    "sha256": "af37f50299991181463e7aecc2d742d28cc1f4d30ce61d349a6d517cab8fa99b"
+    "sha256": "112d277fe7774bef1c05d127a60f6fb8adfef0c6c3dab0e749eef0eb07267ed8"
   },
   "workspace_option": {
     "schema_version": 1,

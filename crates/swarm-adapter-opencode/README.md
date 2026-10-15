@@ -1,8 +1,8 @@
 # OpenCode V2 module adapter
 
-`eliot-opencode-v2.rust-http.1@0.7.0` is the standalone OpenCode adapter. Its descriptor uses `opencode-v2-native-options@4` (SHA-256 `af37f50299991181463e7aecc2d742d28cc1f4d30ce61d349a6d517cab8fa99b`) and protocol 1.0. It declares `swarm.task_prompt@1`; every selected `task.dispatch` requires the Store-produced immutable envelope and submits its exact prompt text to the OpenCode 2.0.7 inbox as flat `text` plus `metadata.eliot`. Admission checks the actual `SessionInbox.User` acknowledgement; later reconciliation reads `session.inbox.enqueued` and `session.inbox.delivered`. The acknowledgement has no admission or promotion sequence, so the adapter never invents one. A legacy public `promoted_sequence` may represent inbox delivery only; it is not execution evidence and does not set `execution_complete`. Artifact selection is explicit, disabled by default, and requires a trusted catalog entry.
+`eliot-opencode-v2.rust-http.1@0.7.0` is the standalone OpenCode adapter. Its descriptor uses `opencode-v2-native-options@4` (SHA-256 `112d277fe7774bef1c05d127a60f6fb8adfef0c6c3dab0e749eef0eb07267ed8`) and protocol 1.0. It declares `swarm.task_prompt@1`; every selected `task.dispatch` requires the Store-produced immutable envelope and submits its exact prompt text to the OpenCode 2.0.7 inbox as flat `text` plus `metadata.eliot`. Admission checks the actual `SessionInbox.User` acknowledgement; later reconciliation reads `session.inbox.enqueued` and `session.inbox.delivered`. The acknowledgement has no admission or promotion sequence, so the adapter never invents one. A legacy public `promoted_sequence` may represent inbox delivery only; it is not execution evidence and does not set `execution_complete`. Artifact selection is explicit, disabled by default, and requires a trusted catalog entry.
 
-Artifact 0.7.0 is an uninstalled source candidate for the 2.0.7 SSE/forms/permission wire and native service registration. Native-options schema 4 contains only external-attach values; it exposes no provider credentials or isolated-owner launch configuration. Provider accounts remain entirely native. Current qualification and remaining failures are recorded in [Implementation Status](../../docs/implementation-status.md); no full CI or successful native model execution is claimed.
+Artifact 0.7.0 is an uninstalled source candidate for the 2.0.7 SSE/forms/permission wire and native service registration. Native-options schema 4 requires only service, connection and directory; an explicit provider/model/variant trio is an optional caller-supplied invocation override with all-or-none validation, never defaulted by the controller. It exposes no provider credentials or isolated-owner launch configuration. Provider accounts remain entirely native. Current qualification and remaining failures are recorded in [Implementation Status](../../docs/implementation-status.md); no full CI or successful native model execution is claimed.
 
 The descriptor declares agent.open, task.dispatch, agent.send/next_turn, agent.reply, agent.background, agent.refresh, agent.reconcile, and agent.result, along with the four native.mcp.* commands. Unknown OpenCode-native methods stay unsupported. This artifact does not declare native.opencode.loop_step because no supported internal producer exists.
 
@@ -14,11 +14,11 @@ The descriptor opts into `swarm.native_mcp_command@2`. Native MCP observe comman
 
 ## Service lifecycle
 
-External attach uses the exact service ID, connection file, workspace, and provider/model/variant from the selected route. The observed OpenCode version is diagnostic data, not an admission gate. The adapter never starts, stops, adopts, or restarts an externally attached service.
+External attach uses the exact service ID, connection file and workspace from the selected route; the native harness supplies provider/model/variant defaults. An explicit caller-requested trio is passed through unchanged as an optional invocation override with all-or-none validation. The observed OpenCode version is diagnostic data, not an admission gate. The adapter never starts, stops, adopts, or restarts an externally attached service.
 
 A route can request a fresh owned service only with an explicit `fresh_owned_service` declaration. Store admission and the retained owner intent provide the exact task, binding, workspace, and nonce scope before private owner options reach the adapter. The adapter writes intent before launching the pinned child and does not replay or adopt an uncertain launch. A partial or invalid owner declaration fails closed rather than falling back to external attach.
 
-The example model is the exact selected route inclusionai/ling-3.1-flash: `providerID` is `inclusionai`, `id` is `ling-3.1-flash`, and `variant` must be copied exactly from the selected Manager route. Owner credentials are referenced only through an opaque protected `credential_ref`; examples contain no credential values or auth-file paths.
+Registration examples use native defaults with no model field. When a caller explicitly requests a model, the trio is the exact selected route (for example inclusionai/ling-3.1-flash): `providerID` is `inclusionai`, `id` is `ling-3.1-flash`, and `variant` must be copied exactly with no alias, default or controller registry. Owner credentials are referenced only through an opaque protected `credential_ref`; examples contain no credential values or auth-file paths.
 
 ## Native history and controls
 
@@ -34,8 +34,8 @@ Acknowledged non-source operation journals are eligible for bounded reclamation 
 
 ## Registration examples
 
-- `registration/route.example.json` shows external attach.
-- `registration/binding-launch-values.example.json` shows the route fields for external attach. The native connection record is read in place; no provider authorization is projected.
+- `registration/route.example.json` shows external attach with native defaults (no model override).
+- `registration/binding-launch-values.example.json` shows the route fields for external attach with native defaults. The native connection record is read in place; no provider authorization is projected.
 - `registration/select-route.request.example.json` selects artifact version `0.7.0`.
 
 The launch argument remains `--config <absolute-host-connection-config-path>`. That route-neutral file contains only host connection settings; descriptor-declared route values are supplied separately by the supervisor.

@@ -7,11 +7,6 @@
   "native_options": {
     "service_id": "<operator-stable-service-id>",
     "connection_file": "<absolute-path-to-existing-connection-record>",
-    "directory": "<absolute-workspace-path>",
-    "model": {
-      "id": "ling-3.1-flash",
-      "providerID": "inclusionai",
-      "variant": "<exact-selected-variant>"
-    }
+    "directory": "<absolute-workspace-path>"
   }
 }

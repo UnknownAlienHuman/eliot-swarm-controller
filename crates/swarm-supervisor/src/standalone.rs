@@ -52,7 +52,7 @@ const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER: &str = "2";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3: &str = "3";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V4: &str = "4";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V4: &str =
-    "af37f50299991181463e7aecc2d742d28cc1f4d30ce61d349a6d517cab8fa99b";
+    "112d277fe7774bef1c05d127a60f6fb8adfef0c6c3dab0e749eef0eb07267ed8";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_LEGACY: &str =
     "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER: &str =
@@ -523,6 +523,9 @@ fn open_code_route_config(
         })?;
     let has_owner_service = object.contains_key(OWNER_ROUTE_KEY);
     let has_owner_nonce = object.contains_key(OWNER_NONCE_KEY);
+    if schema_version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V4 {
+        return open_code_route_config_v4(object);
+    }
     // External schema-v3 routes have no caller-supplied version pin. Retained
     // v1/v2 routes keep theirs, and fresh-owner projections keep the version
     // derived from the retained owner contract for its explicit compatibility check.
@@ -721,6 +724,94 @@ fn open_code_route_config(
             ),
             ("OPENCODE_OWNER_PORT", owner.port.to_string()),
             ("OPENCODE_OWNER_MODEL_CATALOG", owner.model_catalog),
+        ] {
+            values.insert(key.to_owned(), LaunchValue::Literal(value));
+        }
+    }
+    let config = BindingLaunchConfig { values };
+    config.validate().map_err(module_error)?;
+    Ok(config)
+}
+
+/// Current v4 external projection. Only service, connection and directory are
+/// mandatory; the native harness supplies provider/model/variant defaults.
+/// An explicit caller override must be a complete `model` object with exactly
+/// id, providerID and variant; partial, malformed, owner or provider-auth
+/// fields are rejected with no auto-fill or global-config access.
+fn open_code_route_config_v4(
+    object: &serde_json::Map<String, Value>,
+) -> Result<BindingLaunchConfig> {
+    if object.contains_key(OWNER_ROUTE_KEY) || object.contains_key(OWNER_NONCE_KEY) {
+        return Err(Error::new(
+            "MODULE_CONFIG_SCHEMA_MISMATCH",
+            "fresh owned OpenCode values require the owner-native options schema",
+        ));
+    }
+    if object
+        .keys()
+        .any(|key| !["service_id", "connection_file", "directory", "model"].contains(&key.as_str()))
+        || (object.len() != 3 && object.len() != 4)
+    {
+        return Err(Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode route options contain an unknown or incomplete owner projection",
+        ));
+    }
+    let configured_service_id = required_config_string(&object["service_id"], "service_id", 128)?;
+    if !valid_service_id(&configured_service_id) {
+        return Err(Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode service_id is invalid",
+        ));
+    }
+    let configured_connection_file =
+        required_config_string(&object["connection_file"], "connection_file", 4096)?;
+    let directory = required_config_string(&object["directory"], "directory", 4096)?;
+    if !Path::new(&configured_connection_file).is_absolute() || !Path::new(&directory).is_absolute()
+    {
+        return Err(Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode connection_file and directory values must be absolute paths",
+        ));
+    }
+    let mut values = BTreeMap::from([
+        (
+            "OPENCODE_SERVICE_ID".to_owned(),
+            LaunchValue::Literal(configured_service_id),
+        ),
+        (
+            "OPENCODE_CONNECTION_FILE".to_owned(),
+            LaunchValue::Literal(configured_connection_file),
+        ),
+        (
+            "OPENCODE_DIRECTORY".to_owned(),
+            LaunchValue::Literal(directory),
+        ),
+    ]);
+    if let Some(model_value) = object.get("model") {
+        let model = model_value.as_object().ok_or_else(|| {
+            Error::new(
+                "MODULE_CONFIG_INVALID",
+                "OpenCode model options must be an object",
+            )
+        })?;
+        if model
+            .keys()
+            .any(|key| !["id", "providerID", "variant"].contains(&key.as_str()))
+            || model.len() != 3
+        {
+            return Err(Error::new(
+                "MODULE_CONFIG_INVALID",
+                "OpenCode model options must contain id, providerID, and variant only",
+            ));
+        }
+        let model_id = required_config_string(&model["id"], "model.id", 256)?;
+        let provider_id = required_config_string(&model["providerID"], "model.providerID", 256)?;
+        let variant = required_config_string(&model["variant"], "model.variant", 256)?;
+        for (key, value) in [
+            ("OPENCODE_MODEL_ID", model_id),
+            ("OPENCODE_PROVIDER_ID", provider_id),
+            ("OPENCODE_VARIANT", variant),
         ] {
             values.insert(key.to_owned(), LaunchValue::Literal(value));
         }
@@ -1939,6 +2030,15 @@ mod opencode_schema_projection_tests {
         options
     }
 
+    fn v4_defaults_options() -> Value {
+        let root = fixture_root();
+        json!({
+            "service_id": "opencode-external-fixture",
+            "connection_file": path_text(&root.join("external/connection.json")),
+            "directory": path_text(&root.join("workspace"))
+        })
+    }
+
     fn project(
         descriptor: &ModuleDescriptor,
         options: &Value,
@@ -1961,14 +2061,26 @@ mod opencode_schema_projection_tests {
     #[test]
     fn opencode_v4_projects_only_existing_service_values() {
         let descriptor = descriptor_for_schema("4");
-        let config = project(&descriptor, &v3_external_options()).unwrap();
-        assert_eq!(config.values.len(), 6);
+        let defaults = project(&descriptor, &v4_defaults_options()).unwrap();
+        assert_eq!(defaults.values.len(), 3);
+        assert!(defaults.values.contains_key("OPENCODE_SERVICE_ID"));
+        assert!(defaults.values.contains_key("OPENCODE_CONNECTION_FILE"));
+        assert!(defaults.values.contains_key("OPENCODE_DIRECTORY"));
         assert!(
-            !config
+            !defaults
                 .values
                 .keys()
                 .any(|key| key.starts_with("OPENCODE_OWNER_"))
         );
+        assert!(!defaults.values.contains_key("OPENCODE_MODEL_ID"));
+        assert!(!defaults.values.contains_key("OPENCODE_EXPECTED_VERSION"));
+
+        let explicit = project(&descriptor, &v3_external_options()).unwrap();
+        assert_eq!(explicit.values.len(), 6);
+        assert_eq!(literal(&explicit, "OPENCODE_MODEL_ID"), "openai/gpt-5");
+        assert_eq!(literal(&explicit, "OPENCODE_PROVIDER_ID"), "openai");
+        assert_eq!(literal(&explicit, "OPENCODE_VARIANT"), "high");
+
         assert_eq!(
             project(&descriptor, &owned_options(OWNER_NONCE))
                 .unwrap_err()
@@ -1980,6 +2092,85 @@ mod opencode_schema_projection_tests {
                 "../../swarm-adapter-opencode/registration/native-options.schema.json"
             )),
             super::OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V4
+        );
+    }
+
+    #[test]
+    fn opencode_v4_preserves_exact_explicit_model_trio() {
+        let descriptor = descriptor_for_schema("4");
+        let mut options = v4_defaults_options();
+        options["model"] = json!({
+            "id": "ling-3.1-flash",
+            "providerID": "inclusionai",
+            "variant": "exact-selected-variant"
+        });
+        let config = project(&descriptor, &options).unwrap();
+        assert_eq!(config.values.len(), 6);
+        assert_eq!(literal(&config, "OPENCODE_MODEL_ID"), "ling-3.1-flash");
+        assert_eq!(literal(&config, "OPENCODE_PROVIDER_ID"), "inclusionai");
+        assert_eq!(
+            literal(&config, "OPENCODE_VARIANT"),
+            "exact-selected-variant"
+        );
+        assert_eq!(
+            literal(&config, "OPENCODE_SERVICE_ID"),
+            options["service_id"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn opencode_v4_rejects_partial_malformed_and_owner_provider_auth() {
+        let descriptor = descriptor_for_schema("4");
+
+        let mut partial = v4_defaults_options();
+        partial["model"] = json!({"id": "openai/gpt-5", "providerID": "openai"});
+        assert_eq!(
+            project(&descriptor, &partial).unwrap_err().code,
+            "MODULE_CONFIG_INVALID"
+        );
+
+        let mut malformed = v4_defaults_options();
+        malformed["model"] = json!({
+            "id": "",
+            "providerID": "openai",
+            "variant": "high"
+        });
+        assert_eq!(
+            project(&descriptor, &malformed).unwrap_err().code,
+            "MODULE_CONFIG_INVALID"
+        );
+
+        let mut extra = v4_defaults_options();
+        extra["model"] = json!({
+            "id": "openai/gpt-5",
+            "providerID": "openai",
+            "variant": "high",
+            "extra": "nope"
+        });
+        assert_eq!(
+            project(&descriptor, &extra).unwrap_err().code,
+            "MODULE_CONFIG_INVALID"
+        );
+
+        let mut provider_auth = v4_defaults_options();
+        provider_auth["provider_auth"] = json!("secret");
+        assert_eq!(
+            project(&descriptor, &provider_auth).unwrap_err().code,
+            "MODULE_CONFIG_INVALID"
+        );
+
+        let mut versioned = v4_defaults_options();
+        versioned["expected_version"] = json!("2.0.7");
+        assert_eq!(
+            project(&descriptor, &versioned).unwrap_err().code,
+            "MODULE_CONFIG_INVALID"
+        );
+
+        assert_eq!(
+            project(&descriptor, &owned_options(OWNER_NONCE))
+                .unwrap_err()
+                .code,
+            "MODULE_CONFIG_SCHEMA_MISMATCH"
         );
     }
 

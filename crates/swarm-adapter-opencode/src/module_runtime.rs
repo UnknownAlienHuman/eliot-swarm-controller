@@ -18,7 +18,7 @@ use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_f
 
 const MAX_LAUNCH_VALUE_BYTES: usize = 64 * 1024;
 const NATIVE_OPTIONS_SCHEMA_SHA256: &str =
-    "af37f50299991181463e7aecc2d742d28cc1f4d30ce61d349a6d517cab8fa99b";
+    "112d277fe7774bef1c05d127a60f6fb8adfef0c6c3dab0e749eef0eb07267ed8";
 const NATIVE_OPTIONS_SCHEMA_VERSION: &str = "4";
 const CAPABILITIES: [&str; 12] = [
     "agent.background",
@@ -134,15 +134,15 @@ impl OwnedBootstrap {
         // The exact immutable route values arrive through descriptor-declared
         // config keys. The supervisor passes these as separate strings; it
         // does not construct vendor JSON or invent model aliases/defaults.
+        // The native harness supplies provider/model/variant defaults; an
+        // explicit caller override must arrive as a complete trio or not at
+        // all. A partial trio is a launch configuration error, never an
+        // auto-filled default.
         let native_options = NativeOptions {
             service_id: required_env("ELIOT_SWARM_CONFIG_OPENCODE_SERVICE_ID")?,
             connection_file: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_CONNECTION_FILE")?,
             directory: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_DIRECTORY")?,
-            model: crate::config::ModelRef {
-                id: required_env("ELIOT_SWARM_CONFIG_OPENCODE_MODEL_ID")?,
-                provider_id: required_env("ELIOT_SWARM_CONFIG_OPENCODE_PROVIDER_ID")?,
-                variant: required_env("ELIOT_SWARM_CONFIG_OPENCODE_VARIANT")?,
-            },
+            model: native_model_override()?,
         };
         let owned_native = owned_native_options(&native_options)?;
         let config = AdapterConfig {
@@ -209,6 +209,35 @@ fn owned_native_options(native: &NativeOptions) -> Result<Option<OwnedNativeOpti
         ));
     }
     Ok(Some(owner))
+}
+
+/// Native model override is strictly all-or-none. Absent trio means native
+/// harness defaults; a complete trio is preserved exactly; a partial trio is
+/// a launch error with no auto-fill from global config or defaults.
+fn native_model_override() -> Result<Option<crate::config::ModelRef>> {
+    let id = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_MODEL_ID")?;
+    let provider_id = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_PROVIDER_ID")?;
+    let variant = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_VARIANT")?;
+    combine_model_override(id, provider_id, variant)
+}
+
+fn combine_model_override(
+    id: Option<String>,
+    provider_id: Option<String>,
+    variant: Option<String>,
+) -> Result<Option<crate::config::ModelRef>> {
+    match (id, provider_id, variant) {
+        (None, None, None) => Ok(None),
+        (Some(id), Some(provider_id), Some(variant)) => Ok(Some(crate::config::ModelRef {
+            id,
+            provider_id,
+            variant,
+        })),
+        _ => Err(Error::new(
+            "MODULE_LAUNCH_CONFIG",
+            "native model override requires all of MODEL_ID, PROVIDER_ID and VARIANT or none",
+        )),
+    }
 }
 
 fn capabilities_match(claim: &ModuleContractClaim) -> bool {
@@ -400,5 +429,51 @@ mod schema_tests {
             .unwrap()
             .version = "2".into();
         assert!(!schema_set_matches(&wrong_other_version, &COMMAND_SCHEMAS));
+    }
+
+    #[test]
+    fn native_model_override_is_all_or_none_without_autofill() {
+        assert!(combine_model_override(None, None, None).unwrap().is_none());
+        let complete = combine_model_override(
+            Some("ling-3.1-flash".to_owned()),
+            Some("inclusionai".to_owned()),
+            Some("exact-variant".to_owned()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(complete.id, "ling-3.1-flash");
+        assert_eq!(complete.provider_id, "inclusionai");
+        assert_eq!(
+            combine_model_override(
+                Some("ling-3.1-flash".to_owned()),
+                None,
+                Some("exact-variant".to_owned()),
+            )
+            .unwrap_err()
+            .code,
+            "MODULE_LAUNCH_CONFIG"
+        );
+        assert!(combine_model_override(None, Some("inclusionai".to_owned()), None).is_err());
+    }
+
+    #[test]
+    fn shipped_v4_schema_digest_matches_module_constant() {
+        use sha2::{Digest, Sha256};
+        let bytes = include_bytes!("../registration/native-options.schema.json");
+        let digest = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(digest, NATIVE_OPTIONS_SCHEMA_SHA256);
+        let schema: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(
+            schema["required"],
+            serde_json::json!([
+                "OPENCODE_SERVICE_ID",
+                "OPENCODE_CONNECTION_FILE",
+                "OPENCODE_DIRECTORY"
+            ])
+        );
+        assert!(schema.get("dependentRequired").is_some());
     }
 }

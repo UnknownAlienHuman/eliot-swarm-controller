@@ -44,7 +44,8 @@ pub struct NativeOptions {
     pub service_id: String,
     pub connection_file: PathBuf,
     pub directory: PathBuf,
-    pub model: ModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
 }
 
 /// Exact native owner inputs for a fresh OpenCode service.
@@ -108,11 +109,18 @@ impl NativeOptions {
             || !self.connection_file.is_absolute()
             || !self.directory.is_absolute()
             || self.directory.to_str().is_none()
-            || !self.model.valid()
         {
             return Err(Error::new(
                 "CONFIG_ERROR",
-                "OpenCode requires absolute paths, a service ID and explicit provider/model/variant",
+                "OpenCode requires absolute paths and a service ID",
+            ));
+        }
+        if let Some(model) = &self.model
+            && !model.valid()
+        {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "OpenCode explicit model override must provide a valid provider/model/variant trio",
             ));
         }
         Ok(())
@@ -273,4 +281,65 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod native_options_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn base_options() -> NativeOptions {
+        NativeOptions {
+            service_id: "opencode-fixture".to_owned(),
+            connection_file: PathBuf::from("/tmp/eliot/connection.json"),
+            directory: PathBuf::from("/tmp/eliot/workspace"),
+            model: None,
+        }
+    }
+
+    fn valid_model() -> ModelRef {
+        ModelRef {
+            id: "ling-3.1-flash".to_owned(),
+            provider_id: "inclusionai".to_owned(),
+            variant: "exact-variant".to_owned(),
+        }
+    }
+
+    #[test]
+    fn native_defaults_validate_without_model_override() {
+        let options = base_options();
+        assert!(options.validate().is_ok());
+        let encoded = serde_json::to_value(&options).unwrap();
+        assert!(!encoded.as_object().unwrap().contains_key("model"));
+        let decoded: NativeOptions = serde_json::from_value(json_like_without_model()).unwrap();
+        assert_eq!(decoded.model, None);
+    }
+
+    fn json_like_without_model() -> serde_json::Value {
+        serde_json::json!({
+            "service_id": "opencode-fixture",
+            "connection_file": "/tmp/eliot/connection.json",
+            "directory": "/tmp/eliot/workspace"
+        })
+    }
+
+    #[test]
+    fn explicit_trio_is_preserved_and_validated() {
+        let mut options = base_options();
+        options.model = Some(valid_model());
+        assert!(options.validate().is_ok());
+        let encoded = serde_json::to_value(&options).unwrap();
+        assert_eq!(encoded["model"]["providerID"], "inclusionai");
+    }
+
+    #[test]
+    fn explicit_malformed_trio_is_rejected() {
+        let mut options = base_options();
+        options.model = Some(ModelRef {
+            id: String::new(),
+            provider_id: "inclusionai".to_owned(),
+            variant: "exact-variant".to_owned(),
+        });
+        assert!(options.validate().is_err());
+    }
 }

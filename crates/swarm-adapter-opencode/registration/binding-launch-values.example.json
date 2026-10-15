@@ -1,8 +1,5 @@
 {
   "OPENCODE_SERVICE_ID": "<operator-stable-service-id>",
   "OPENCODE_CONNECTION_FILE": "<absolute-path-to-existing-connection-record>",
-  "OPENCODE_DIRECTORY": "<absolute-workspace-path>",
-  "OPENCODE_MODEL_ID": "ling-3.1-flash",
-  "OPENCODE_PROVIDER_ID": "inclusionai",
-  "OPENCODE_VARIANT": "<exact-selected-variant>"
+  "OPENCODE_DIRECTORY": "<absolute-workspace-path>"
 }
