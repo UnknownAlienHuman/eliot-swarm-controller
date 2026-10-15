@@ -82,6 +82,9 @@ impl OwnedFixture {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.ready_path.is_file() {
             let observation = self.observe();
+            if self.ready_path.is_file() {
+                break;
+            }
             assert!(
                 observation.exit.is_none(),
                 "receipt fixture exited before publishing readiness"
@@ -450,7 +453,10 @@ fn owned_child_receipt_fixture() {
         "missing" => {}
         "invalid" => fs::write(dir.join("terminal.json"), b"{invalid")
             .expect("write malformed terminal receipt"),
-        "valid_hold" | "unknown" => write_terminal_fixture(&work, &ready["process"], &mode),
+        "valid_hold" | "unknown" | "direct_unknown" | "direct_not_started"
+        | "direct_wrong_code" => {
+            write_terminal_fixture(&work, &ready["process"], &mode);
+        }
         _ => panic!("unknown terminal receipt fixture mode"),
     }
     fs::write(&ready_path, b"ready").expect("signal receipt fixture readiness");
