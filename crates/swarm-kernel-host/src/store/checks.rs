@@ -3443,6 +3443,11 @@ struct ProbeResolutionReservation {
     scope: std::sync::OnceLock<inputs::ProbeCleanupScope>,
 }
 
+#[cfg(test)]
+pub(super) struct ProbeResolutionTestReservation {
+    _reservation: std::sync::Arc<ProbeResolutionReservation>,
+}
+
 impl CheckChildCustody {
     async fn lock(&self) -> tokio::sync::MutexGuard<'_, BTreeMap<String, CheckChildOwner>> {
         self.owners.lock().await
@@ -3491,6 +3496,18 @@ impl CheckChildCustody {
             owner.is_pending()
         });
         owners.iter().any(|owner| owner.conflicts_with(incoming))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn reserve_probe_resolution_for_fixture(
+        &self,
+        resource: &str,
+    ) -> Option<ProbeResolutionTestReservation> {
+        self.reserve_probe_resolution(Some(resource))
+            .await
+            .map(|reservation| ProbeResolutionTestReservation {
+                _reservation: reservation,
+            })
     }
 
     async fn reserve_probe_resolution(

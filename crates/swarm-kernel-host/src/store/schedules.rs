@@ -18,6 +18,7 @@ use tokio::sync::watch;
 const REGISTRY_KEY: &str = "schedule_registry:v1";
 const REGISTRY_VERSION: u32 = 1;
 const MAX_RETAINED_IDENTITIES: usize = scheduler::MAX_SCHEDULES;
+const PROBE_RETRY_MS: i64 = 250;
 const ACTIVE_OPERATION_STATES: &[&str] =
     &["queued", "sending", "native_accepted", "outcome_unknown"];
 
@@ -91,6 +92,13 @@ fn registry(db: &Connection) -> Result<Registry> {
 
 fn save_registry(db: &Connection, registry: &Registry) -> Result<()> {
     set_meta(db, REGISTRY_KEY, &json!(registry))
+}
+
+fn probe_retry_at_ms(state: Option<&ScheduleState>) -> Option<i64> {
+    let failure = state?.last_failure.as_ref()?;
+    (failure["code"] == "CHECK_PROBE_CLEANUP_PENDING")
+        .then(|| failure["retry_at_ms"].as_i64())
+        .flatten()
 }
 
 /// Digest only execution-defining fields. Toggling `enabled` is a pause/resume
@@ -320,6 +328,9 @@ pub(super) fn check_plan_request(
     if state.is_some_and(|state| state.definition_sha256 != digest) {
         return Ok(None);
     }
+    if probe_retry_at_ms(state).is_some_and(|retry| retry > now_ms) {
+        return Ok(None);
+    }
     let last_admitted = state.and_then(|state| state.last_admitted_slot);
     let Some(due) = scheduler::latest_due_slot(schedule, now_ms, last_admitted)? else {
         return Ok(None);
@@ -477,6 +488,13 @@ fn consider(
             return Ok((scheduler::next_due_at_ms(schedule, now_ms)?, false, false));
         }
 
+        if let Some(retry) = probe_retry_at_ms(Some(state))
+            && retry > now_ms
+        {
+            tx.rollback()?;
+            return Ok((Some(retry), false, false));
+        }
+
         let (facts, preflight_error) = input_facts(&tx, schedule, config)?;
         let fingerprint = model::digest(model::canonical(&facts)?.as_bytes());
         if state.failure_input_sha256.as_deref() == Some(&fingerprint) {
@@ -530,6 +548,24 @@ fn consider(
                 return Ok((Some(now_ms.saturating_add(250)), false, true));
             }
             if let Err(error) = &check_plan.result {
+                if error.code == "CHECK_PROBE_CLEANUP_PENDING" && error.secondary_codes.is_empty() {
+                    let retry_at_ms = now_ms.saturating_add(PROBE_RETRY_MS);
+                    state.last_observed_due_slot = Some(due.slot);
+                    state.last_failure = Some(json!({
+                        "slot":due.slot,
+                        "code":error.code,
+                        "message":error.message,
+                        "input_sha256":fingerprint,
+                        "retry_at_ms":retry_at_ms,
+                    }));
+                    // A live reservation or unidentified custodied probe is
+                    // not a stable input failure. Do not consume or suppress
+                    // this slot while another caller resolves the same input.
+                    state.failure_input_sha256 = None;
+                    save_registry(&tx, &registry)?;
+                    tx.commit()?;
+                    return Ok((Some(retry_at_ms), false, false));
+                }
                 // Suppression is keyed to the same DB-owned inputs that
                 // check_plan_request recomputes. A stable off-transaction
                 // resolver error must not be retried on every scheduler tick.
@@ -630,6 +666,8 @@ pub(crate) fn status(db: &Connection, schedules: &[ScheduleConfig], now_ms: i64)
             Some(due) => Some(due.due_at_ms),
             None => scheduler::next_due_at_ms(schedule, now_ms)?,
         };
+        let next_due_ms =
+            next_due_ms.map(|due| probe_retry_at_ms(state).map_or(due, |retry| due.max(retry)));
         let last_operation = state
             .map(|state| last_operation(db, state))
             .transpose()?
@@ -747,6 +785,12 @@ mod tests {
     use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
     async fn fixture() -> (PathBuf, StoreOwner, Arc<Config>, ScheduleConfig, i64) {
+        fixture_with_environment(BTreeMap::new()).await
+    }
+
+    async fn fixture_with_environment(
+        environment: BTreeMap<String, String>,
+    ) -> (PathBuf, StoreOwner, Arc<Config>, ScheduleConfig, i64) {
         let directory =
             std::env::temp_dir().join(format!("swarm-schedule-test-{}", model::new_id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -763,7 +807,7 @@ mod tests {
             args: Vec::new(),
             parser: Parser::ExitCode,
             resource: "checks".into(),
-            environment: BTreeMap::new(),
+            environment,
             inherit_env: Vec::new(),
             expected_targets: Vec::new(),
             fingerprint_env: Vec::new(),
@@ -962,6 +1006,124 @@ mod tests {
         assert_eq!(check_count, 1, "one slot starts at most one CheckRun");
         assert_eq!(recorded_slot, latest, "catch-up admits only latest slot");
         assert_eq!(status["items"][0]["last_operation"]["state"], "queued");
+        owner.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_reservation_contention_keeps_one_shot_eligible_after_release() {
+        use crate::checks::inputs;
+        fn version_fixture(
+            _: &std::path::Path,
+            _: &[String],
+            _: &BTreeMap<String, String>,
+            _: &std::path::Path,
+        ) -> Result<Vec<u8>> {
+            // This fixture tests Store admission and reservation disposition;
+            // its synthetic version is not native executable-version proof.
+            Ok(b"schedule-reservation-fixture@1".to_vec())
+        }
+        let environment = BTreeMap::from([("SCHEDULE_FIXTURE_ID".into(), model::new_id())]);
+        let (directory, owner, config, mut schedule, now) =
+            fixture_with_environment(environment).await;
+        schedule.period_ms = None;
+        let profile = &config.checks.profiles[0];
+        let _probe = inputs::override_probe_for_test(profile, version_fixture);
+        owner
+            .store
+            .run(|db| super::super::set_meta(db, "execution_mode", &json!({"new_work":"enabled"})))
+            .await
+            .unwrap();
+        let reservation = owner
+            .store
+            .check_child_custody
+            .reserve_probe_resolution_for_fixture(&profile.resource)
+            .await
+            .unwrap();
+        let retry = owner
+            .store
+            .consider_scheduled(schedule.clone(), now)
+            .await
+            .unwrap();
+        assert_eq!(retry, Some(now + PROBE_RETRY_MS));
+        let (state, operation_count, checks, projected) = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                move |db| {
+                    let state = registry(db)?.schedules[&schedule.schedule_id].clone();
+                    let operations = db.query_row(
+                        "SELECT count(*) FROM operations WHERE caller_id=?1",
+                        [INTERNAL_SCHEDULER_CLIENT_ID],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    let checks = db.query_row("SELECT count(*) FROM check_runs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
+                    Ok((state, operations, checks, status(db, &[schedule], now)?))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.last_considered_slot, None);
+        assert_eq!(state.last_admitted_slot, None);
+        assert_eq!(state.failure_input_sha256, None);
+        assert_eq!(
+            state.last_failure.as_ref().unwrap()["code"],
+            "CHECK_PROBE_CLEANUP_PENDING"
+        );
+        assert_eq!((operation_count, checks), (0, 0));
+        assert_eq!(projected["items"][0]["next_due_ms"], now + PROBE_RETRY_MS);
+        // A change wake before the retry deadline neither spins nor consumes
+        // the one-shot. The exact same resource remains reserved.
+        assert_eq!(
+            owner
+                .store
+                .consider_scheduled(schedule.clone(), now + 1)
+                .await
+                .unwrap(),
+            retry
+        );
+        assert!(
+            owner
+                .store
+                .check_child_custody
+                .reserve_probe_resolution_for_fixture(&profile.resource)
+                .await
+                .is_none()
+        );
+        drop(reservation);
+        let later = now + PROBE_RETRY_MS;
+        owner
+            .store
+            .consider_scheduled(schedule.clone(), later)
+            .await
+            .unwrap();
+        owner
+            .store
+            .consider_scheduled(schedule.clone(), later)
+            .await
+            .unwrap();
+        let (state, operations, checks) = owner
+            .store
+            .run(move |db| {
+                Ok((
+                    registry(db)?.schedules[&schedule.schedule_id].clone(),
+                    db.query_row(
+                        "SELECT count(*) FROM operations WHERE caller_id=?1",
+                        [INTERNAL_SCHEDULER_CLIENT_ID],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    db.query_row("SELECT count(*) FROM check_runs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((operations, checks), (1, 1));
+        assert_eq!(state.last_admitted_slot, Some(0));
+        assert!(state.last_failure.is_none());
         owner.close().await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
