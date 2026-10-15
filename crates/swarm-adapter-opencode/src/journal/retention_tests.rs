@@ -4,7 +4,10 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    time::Duration,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
 
 const BINDING_ID: &str = "fixture-binding";
 const GENERATION: i64 = 1;
@@ -24,6 +27,28 @@ impl FixtureRoot {
 impl Drop for FixtureRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct PreserveOnFailureRoot(PathBuf, bool);
+
+impl PreserveOnFailureRoot {
+    fn new() -> Self {
+        Self(
+            std::env::temp_dir().join(format!(
+                "swarm-opencode-native-startup-{}",
+                uuid::Uuid::new_v4()
+            )),
+            false,
+        )
+    }
+}
+
+impl Drop for PreserveOnFailureRoot {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -84,11 +109,22 @@ fn write_acknowledged_reply(journal: &Journal, operation_id: &str, resolved: Opt
 }
 
 fn write_legacy_acknowledged_reply(journal: &Journal, operation_id: &str) {
-    let intent = fixture_intent(operation_id, "agent.reply");
+    write_legacy_acknowledged_reply_for_scope(journal, operation_id, NATIVE_SCOPE, ROUTE_SHA256);
+}
+
+fn write_legacy_acknowledged_reply_for_scope(
+    journal: &Journal,
+    operation_id: &str,
+    native_scope: &str,
+    route_sha256: &str,
+) {
+    let mut intent = fixture_intent(operation_id, "agent.reply");
+    intent.native_scope_key = native_scope.to_owned();
+    intent.route_sha256 = route_sha256.to_owned();
     let outcome = json!({
         "operation_id":operation_id,
         "outcome":"applied",
-        "native_scope_key":NATIVE_SCOPE,
+        "native_scope_key":native_scope,
         "details":{}
     });
     let outcome_sha256 = digest_json(&outcome).unwrap();
@@ -136,6 +172,427 @@ fn write_legacy_acknowledged_reply(journal: &Journal, operation_id: &str) {
         bytes,
     )
     .unwrap();
+}
+
+#[derive(Clone)]
+struct StartupJournalProbe {
+    root: PathBuf,
+    native_scope: String,
+}
+
+impl StartupJournalProbe {
+    fn saved_cursor(&self) -> Option<serde_json::Value> {
+        serde_json::from_slice(&fs::read(self.root.join("retention-cursor.json")).ok()?).ok()
+    }
+
+    fn inventory_complete(&self) -> bool {
+        self.saved_cursor()
+            .is_some_and(|cursor| cursor["startup_complete"] == true)
+    }
+
+    fn legacy_migration_complete(&self) -> bool {
+        self.saved_cursor().is_some_and(|cursor| {
+            cursor["startup_complete"] == true && cursor["legacy_migration_version"] == 1
+        })
+    }
+}
+
+fn startup_fixture_contract() -> swarm_contracts::module_contract::ModuleContractClaim {
+    use swarm_contracts::{
+        module_catalog::{ModuleDescriptor, ProtocolVersion},
+        module_contract::ModuleContractClaim,
+    };
+
+    let mut descriptor: serde_json::Value =
+        serde_json::from_str(include_str!("../../registration/descriptor.template.json")).unwrap();
+    descriptor["launch"]["executable"] = json!(std::env::current_exe().unwrap());
+    let descriptor: ModuleDescriptor = serde_json::from_value(descriptor).unwrap();
+    ModuleContractClaim::from_descriptor(&descriptor, ProtocolVersion { major: 1, minor: 0 })
+        .unwrap()
+}
+
+fn startup_fixture_bootstrap(
+    root: &Path,
+    host_data_dir: &Path,
+    state_dir: &Path,
+    native_options: &crate::NativeOptions,
+    contract: &swarm_contracts::module_contract::ModuleContractClaim,
+    boot_id: &str,
+) -> crate::OwnedBootstrap {
+    crate::OwnedBootstrap {
+        config: crate::AdapterConfig {
+            schema_version: 1,
+            host_data_dir: host_data_dir.to_owned(),
+            credential_file: root.join("fixture-credential.json"),
+            state_dir: state_dir.to_owned(),
+            binding_id: BINDING_ID.to_owned(),
+            generation: GENERATION,
+            module_artifact_id: crate::ARTIFACT_ID.to_owned(),
+            native_options: native_options.clone(),
+            owned_native: None,
+            ipc: swarm_client::IpcConfig::default(),
+        },
+        credential: swarm_contracts::Credential {
+            client_id: "pr69-native-startup-fixture".to_owned(),
+            token: "fixture-token".to_owned(),
+        },
+        worker: swarm_process::module_owner::VerifiedModuleWorker {
+            owner_record: json!({
+                "token":"fixture-owner-token",
+                "process":{"pid":std::process::id()}
+            }),
+            boot_id: boot_id.to_owned(),
+            process_image_identity: json!({"fixture":"source-run-owned"}),
+        },
+        contract: contract.clone(),
+    }
+}
+
+fn startup_fixture_hello(
+    config: &crate::AdapterConfig,
+    claim: &serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "binding_id":config.binding_id,
+        "generation":config.generation,
+        "route":{
+            "runtime":crate::RUNTIME,
+            "module_artifact_id":crate::ARTIFACT_ID,
+            "workspace_option":"directory",
+            "native_options":serde_json::to_value(&config.native_options).unwrap()
+        },
+        "native_root_id":null,
+        "native_scope_key":null,
+        "module_contract_negotiation":{
+            "status":"negotiated",
+            "module_id":claim["module_id"],
+            "artifact":claim["artifact"],
+            "protocol":claim["protocol"],
+            "capabilities":claim["capabilities"],
+            "config_schema":claim["config_schema"],
+            "command_schemas":claim["command_schemas"],
+            "event_schemas":claim["event_schemas"],
+            "effects_authorized_by_descriptor":false
+        }
+    })
+}
+
+async fn serve_startup_fixture_connection(
+    stream: swarm_kernel_host::ipc::Stream,
+    hello: serde_json::Value,
+    probe: StartupJournalProbe,
+    events: mpsc::UnboundedSender<serde_json::Value>,
+) -> std::io::Result<()> {
+    let (read, mut write) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    let mut session_boot_id = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        let request: serde_json::Value =
+            serde_json::from_str(&line).map_err(std::io::Error::other)?;
+        let method = request["method"].as_str().unwrap_or_default();
+        let params = request["params"].clone();
+        if method == "module.hello" {
+            session_boot_id = params["boot_id"].as_str().unwrap_or_default().to_owned();
+        }
+        let inventory_complete = probe.inventory_complete();
+        let legacy_migration_complete = probe.legacy_migration_complete();
+        let result = match method {
+            "client.hello" => json!({
+                "client_id":params["client_id"],
+                "role":"module",
+                "protocol_version":1
+            }),
+            "module.hello" => hello.clone(),
+            "module.next" => json!({"command":null}),
+            "module.outcome" | "module.observe" | "module.result" => {
+                json!({"recorded":true})
+            }
+            _ => json!({"recorded":true}),
+        };
+        let response = json!({
+            "jsonrpc":"2.0",
+            "id":request["id"],
+            "result":result
+        });
+        write
+            .write_all(&serde_json::to_vec(&response).map_err(std::io::Error::other)?)
+            .await?;
+        write.write_all(b"\n").await?;
+        write.flush().await?;
+        if method != "client.hello" {
+            let _ = events.send(json!({
+                "method":method,
+                "boot_id":session_boot_id,
+                "params":params,
+                "inventory_complete":inventory_complete,
+                "legacy_migration_complete":legacy_migration_complete
+            }));
+        }
+    }
+}
+
+async fn serve_startup_fixture(
+    mut listener: swarm_kernel_host::ipc::Listener,
+    config: crate::AdapterConfig,
+    claim: serde_json::Value,
+    probe: StartupJournalProbe,
+    events: mpsc::UnboundedSender<serde_json::Value>,
+) -> std::io::Result<()> {
+    loop {
+        let stream = listener
+            .accept()
+            .await
+            .map_err(|_| std::io::Error::other("fixture IPC listener failed"))?;
+        serve_startup_fixture_connection(
+            stream,
+            startup_fixture_hello(&config, &claim),
+            probe.clone(),
+            events.clone(),
+        )
+        .await?;
+    }
+}
+
+async fn next_startup_fixture_event(
+    events: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(30), events.recv())
+        .await
+        .expect("source adapter startup fixture call arrived within 30 seconds")
+        .expect("source adapter startup fixture server remains connected")
+}
+
+async fn assert_startup_fixture_report(
+    events: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    journal: &StartupJournalProbe,
+    boot_id: &str,
+    unresolved_id: &str,
+    acknowledged_ids: &std::collections::BTreeSet<String>,
+    expect_complete_at_hello: bool,
+    minimum_incomplete_next_calls: usize,
+) -> usize {
+    let mut hello_seen = false;
+    let mut incomplete_next_calls = 0usize;
+    loop {
+        let event = next_startup_fixture_event(events).await;
+        let method = event["method"].as_str().unwrap_or_default();
+        let params = &event["params"];
+        let legacy_migration_complete = event["legacy_migration_complete"] == true;
+        match method {
+            "module.hello" if params["boot_id"] == boot_id => {
+                assert_eq!(
+                    legacy_migration_complete, expect_complete_at_hello,
+                    "hello observes the persisted migration state for this boot"
+                );
+                hello_seen = true;
+            }
+            "module.next" if !legacy_migration_complete => {
+                incomplete_next_calls += 1;
+            }
+            "module.outcome" => {
+                let operation_id = params["operation_id"].as_str().unwrap_or_default();
+                assert!(
+                    !acknowledged_ids.contains(operation_id),
+                    "ACKed history must not be replayed to the host"
+                );
+            }
+            "module.observe"
+                if params["state"]["boot_id"] == boot_id
+                    && params["state"]["journal_recovery"].is_object() =>
+            {
+                assert_eq!(event["inventory_complete"], true);
+                let recovery = &params["state"]["journal_recovery"];
+                assert_eq!(recovery["coverage"], "complete");
+                assert_eq!(recovery["native_replay_permitted"], false);
+                let entries = recovery["entries"].as_array().unwrap();
+                let operation_ids = entries
+                    .iter()
+                    .filter_map(|entry| entry["operation_id"].as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(
+                    operation_ids,
+                    std::collections::BTreeSet::from([unresolved_id])
+                );
+                assert!(hello_seen, "hello precedes recovery observation");
+                assert!(
+                    incomplete_next_calls >= minimum_incomplete_next_calls,
+                    "module.next service calls match the expected migration window behavior"
+                );
+                assert!(journal.inventory_complete());
+                return incomplete_next_calls;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn wait_for_startup_fixture_next(
+    events: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    boot_id: &str,
+) {
+    loop {
+        let event = next_startup_fixture_event(events).await;
+        if event["method"] == "module.next" && event["boot_id"] == boot_id {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+// Drives the source `run_owned` loop through local IPC framing; bootstrap and
+// host replies are fixture-owned, so this does not qualify supervisor launch.
+async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_recovers_exact_memo_after_restart()
+ {
+    let mut root = PreserveOnFailureRoot::new();
+    let host_data_dir = root.0.join("host-ipc");
+    fs::create_dir_all(&host_data_dir).unwrap();
+    let state_dir = root.0.join("adapter-state");
+    let native_options = crate::NativeOptions {
+        service_id: "pr69-startup-fixture".to_owned(),
+        connection_file: root.0.join("no-native-service-connection.json"),
+        directory: root.0.clone(),
+        model: crate::ModelRef {
+            id: "fixture-model".to_owned(),
+            provider_id: "fixture-provider".to_owned(),
+            variant: "fixture-variant".to_owned(),
+        },
+    };
+    let native_scope = native_options.scope_key();
+    let route_sha256 = digest_json(&serde_json::to_value(&native_options).unwrap()).unwrap();
+    let journal = Journal::open(
+        &state_dir,
+        BINDING_ID,
+        GENERATION,
+        &native_scope,
+        &route_sha256,
+    )
+    .unwrap();
+    let acknowledged_ids = (0..256)
+        .map(|index| format!("pr69-legacy-acked-{index:03}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    for operation_id in &acknowledged_ids {
+        write_legacy_acknowledged_reply_for_scope(
+            &journal,
+            operation_id,
+            &native_scope,
+            &route_sha256,
+        );
+    }
+    let unresolved_id = "pr69-unresolved-memo-exact";
+    let mut unresolved = fixture_intent(unresolved_id, "agent.reply");
+    unresolved.native_scope_key = native_scope.clone();
+    unresolved.route_sha256 = route_sha256.clone();
+    journal.write_intent(&unresolved).unwrap();
+    assert!(journal.startup_inventory_required().unwrap());
+    assert!(!journal.startup_recovery_complete());
+    drop(journal);
+
+    let _journal_capture = crate::startup_poll_tests::capture_next_startup_journal();
+
+    let claim = startup_fixture_contract();
+    let claim_value = serde_json::to_value(&claim).unwrap();
+    let probe = StartupJournalProbe {
+        root: state_dir.clone(),
+        native_scope,
+    };
+    let config = crate::AdapterConfig {
+        schema_version: 1,
+        host_data_dir: host_data_dir.clone(),
+        credential_file: root.0.join("fixture-credential.json"),
+        state_dir: state_dir.clone(),
+        binding_id: BINDING_ID.to_owned(),
+        generation: GENERATION,
+        module_artifact_id: crate::ARTIFACT_ID.to_owned(),
+        native_options: native_options.clone(),
+        owned_native: None,
+        ipc: swarm_client::IpcConfig::default(),
+    };
+    let listener = swarm_kernel_host::ipc::Listener::bind(&host_data_dir).unwrap();
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let server = tokio::spawn(serve_startup_fixture(
+        listener,
+        config.clone(),
+        claim_value,
+        probe.clone(),
+        events_tx,
+    ));
+
+    let first_boot_id = "pr69-native-startup-first-boot";
+    let first_run = tokio::spawn(crate::run_owned(startup_fixture_bootstrap(
+        &root.0,
+        &host_data_dir,
+        &state_dir,
+        &native_options,
+        &claim,
+        first_boot_id,
+    )));
+    let incomplete_next_calls = assert_startup_fixture_report(
+        &mut events_rx,
+        &probe,
+        first_boot_id,
+        unresolved_id,
+        &acknowledged_ids,
+        false,
+        2,
+    )
+    .await;
+    assert!(incomplete_next_calls >= 2);
+    wait_for_startup_fixture_next(&mut events_rx, first_boot_id).await;
+    first_run.abort();
+    assert!(first_run.await.unwrap_err().is_cancelled());
+
+    let captured_journal = crate::startup_poll_tests::take_captured_startup_journal()
+        .expect("capture the journal used by the source run_owned loop");
+    let mut retention_passes = 0usize;
+    loop {
+        let summary = captured_journal
+            .reclaim_acknowledged(BINDING_ID, GENERATION, &probe.native_scope)
+            .unwrap();
+        retention_passes += 1;
+        if summary.queue_drained {
+            break;
+        }
+        assert!(retention_passes < 16, "bounded retention queue drains");
+    }
+    assert!(retention_passes > 0);
+    let final_cursor: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir.join("retention-cursor.json")).unwrap())
+            .unwrap();
+    assert_eq!(final_cursor["legacy_migration_version"], 1);
+    drop(captured_journal);
+
+    let second_boot_id = "pr69-native-startup-restart-boot";
+    let second_run = tokio::spawn(crate::run_owned(startup_fixture_bootstrap(
+        &root.0,
+        &host_data_dir,
+        &state_dir,
+        &native_options,
+        &claim,
+        second_boot_id,
+    )));
+    assert_startup_fixture_report(
+        &mut events_rx,
+        &probe,
+        second_boot_id,
+        unresolved_id,
+        &acknowledged_ids,
+        true,
+        0,
+    )
+    .await;
+    wait_for_startup_fixture_next(&mut events_rx, second_boot_id).await;
+    second_run.abort();
+    assert!(second_run.await.unwrap_err().is_cancelled());
+
+    server.abort();
+    let _ = server.await;
+    root.1 = true;
 }
 
 fn write_acknowledged_reply_with_root(journal: &Journal, operation_id: &str, root_id: &str) {

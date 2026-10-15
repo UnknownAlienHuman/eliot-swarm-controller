@@ -172,6 +172,54 @@ impl StartupRecovery {
 #[cfg(test)]
 mod startup_poll_tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    static CAPTURE_NEXT_JOURNAL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static CAPTURED_JOURNAL: OnceLock<Mutex<Option<Arc<Journal>>>> = OnceLock::new();
+
+    fn captured_journal() -> &'static Mutex<Option<Arc<Journal>>> {
+        CAPTURED_JOURNAL.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(crate) struct StartupJournalCapture;
+
+    impl Drop for StartupJournalCapture {
+        fn drop(&mut self) {
+            CAPTURE_NEXT_JOURNAL.store(false, Ordering::Release);
+            if let Ok(mut captured) = captured_journal().lock() {
+                captured.take();
+            }
+        }
+    }
+
+    pub(crate) fn capture_next_startup_journal() -> StartupJournalCapture {
+        let captured = captured_journal()
+            .lock()
+            .expect("startup journal capture lock is available");
+        assert!(
+            captured.is_none(),
+            "no earlier startup journal remains captured"
+        );
+        assert!(
+            !CAPTURE_NEXT_JOURNAL.swap(true, Ordering::AcqRel),
+            "only one startup journal capture may be armed"
+        );
+        StartupJournalCapture
+    }
+
+    pub(crate) fn capture_startup_journal_if_armed(journal: &Arc<Journal>) {
+        if CAPTURE_NEXT_JOURNAL.swap(false, Ordering::AcqRel)
+            && let Ok(mut captured) = captured_journal().lock()
+        {
+            *captured = Some(Arc::clone(journal));
+        }
+    }
+
+    pub(crate) fn take_captured_startup_journal() -> Option<Arc<Journal>> {
+        CAPTURE_NEXT_JOURNAL.store(false, Ordering::Release);
+        captured_journal().lock().ok()?.take()
+    }
 
     #[tokio::test]
     async fn recovery_ticks_keep_an_inflight_module_next_available() {
@@ -238,6 +286,8 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         &config.native_options.scope_key(),
         &route_sha256,
     )?);
+    #[cfg(test)]
+    startup_poll_tests::capture_startup_journal_if_armed(&journal);
     // Before hello, visit at most one sparse durable-closure window. A cold
     // legacy name census starts on a blocking worker and never gates service
     // polling; exact requested-operation reads remain available meanwhile.
