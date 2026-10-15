@@ -631,7 +631,10 @@ pub(super) fn runtime_catalog_module_evidence(
                             .iter()
                             .map(ToString::to_string)
                             .collect(),
-                        gaps: vec!["descriptor_registration_does_not_prove_binary_installation_or_native_capability".to_owned()],
+                        gaps: vec![
+                            "descriptor_registration_does_not_prove_binary_installation_or_native_observation".to_owned(),
+                            "descriptor_capabilities_are_declared_contract_metadata_not_native_observations".to_owned(),
+                        ],
                     }
                 }
             }
@@ -660,6 +663,7 @@ pub(super) fn runtime_catalog_module_evidence(
                     .collect(),
                 gaps: vec![
                     "manager_has_not_selected_this_descriptor_for_future_bindings".to_owned(),
+                    "descriptor_capabilities_are_declared_contract_metadata_not_native_observations".to_owned(),
                 ],
             }
         } else {

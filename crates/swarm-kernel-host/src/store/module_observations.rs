@@ -14,7 +14,7 @@ use crate::{
     error::{Error, Result},
     model::{Principal, Role},
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 
 /// One live binding as retained in the Store. `native` is the
@@ -57,6 +57,8 @@ pub(super) struct ObservedNativeFacts {
     pub model_definition: Option<Value>,
     pub supported_capabilities: Vec<String>,
     pub unsupported_capabilities: Vec<String>,
+    pub supported_capabilities_observed: bool,
+    pub unsupported_capabilities_observed: bool,
     pub gaps: Vec<String>,
 }
 
@@ -83,61 +85,80 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
     seen
 }
 
-/// Read the live bindings that carry a native observation. This is one SELECT
-/// over the existing tables; it never opens or contacts a module. Every
-/// `SELECT_BINDINGS_COLUMNS` column is a stored fact, never a live read.
-pub(super) fn live_reads(conn: &Connection) -> Result<Vec<RetainedNativeRead>> {
-    // Production bindings carry released_at_ms as a column, not inside state_json.
-    // Minimal/test DBs without the table mean no live bindings, never an error.
-    let rows: Vec<(String, i64, String, String, String, Option<i64>)> = match conn.prepare(
-        "SELECT binding_id,generation,module_artifact_id,route_json,state_json,released_at_ms FROM bindings",
-    ) {
-        Ok(mut statement) => statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-        Err(_) => match conn.prepare(
-            "SELECT binding_id,generation,module_artifact_id,route_json,state_json FROM bindings",
-        ) {
-            Ok(mut fallback) => fallback
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        None,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-            Err(_) => return Ok(Vec::new()),
-        },
-    };
+/// Read the requesting Manager's live bindings that carry a native observation.
+/// SQL filters by route alias, live ready state and Task ownership BEFORE any
+/// state_json (foreign module bytes) is parsed in Rust. Only bindings linked
+/// to an unreleased attempt owned by the requesting Manager are returned;
+/// other Managers' bindings on a shared alias are never parsed.
+pub(super) fn live_reads(
+    conn: &Connection,
+    principal_client_id: &str,
+    aliases: &[String],
+) -> Result<Vec<RetainedNativeRead>> {
+    if aliases.is_empty() || bounded_text(Some(principal_client_id), 256).is_none() {
+        return Ok(Vec::new());
+    }
+    let aliases_json = serde_json::to_string(aliases)
+        .map_err(|_| Error::new("STORE_READ_FAILED", "route alias list is not encodable"))?;
+    // Scope by the exact Task -> Attempt -> binding chain in SQL. The guarded
+    // route extraction keeps malformed foreign route bytes from turning an
+    // authorized Manager read into a database error; foreign state_json is
+    // selected only after the ownership predicates exclude it.
+    let mut statement = conn.prepare(
+        "SELECT b.binding_id,b.generation,b.module_artifact_id,b.route_json,b.state_json,b.released_at_ms,b.state
+         FROM bindings AS b
+         JOIN attempts AS a
+           ON a.binding_id=b.binding_id AND a.binding_generation=b.generation
+         JOIN tasks AS t ON t.task_id=a.task_id
+         WHERE b.released_at_ms IS NULL
+           AND b.state='ready'
+           AND a.released_at_ms IS NULL
+           AND a.owner_id=?2
+           AND CASE WHEN json_valid(b.route_json)
+                    THEN json_extract(b.route_json,'$.alias')
+               END IN (SELECT value FROM json_each(?1))
+         ORDER BY b.generation DESC,b.binding_id ASC",
+    )?;
+    let rows = statement
+        .query_map(params![aliases_json, principal_client_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, i64, String, String, String, Option<i64>, String)>>>()?;
+    drop(statement);
     let mut reads = Vec::new();
-    for (binding_id, generation, module_artifact_id, route_json, state_json, released_at_ms) in rows {
+    for (
+        binding_id,
+        generation,
+        module_artifact_id,
+        route_json,
+        state_json,
+        released_at_ms,
+        binding_state,
+    ) in rows
+    {
+        if binding_state != "ready" || released_at_ms.is_some() {
+            continue;
+        }
         if bounded_text(Some(&binding_id), 256).is_none() || generation <= 0 {
             continue;
         }
-        let route: Value = serde_json::from_str(&route_json).unwrap_or(Value::Null);
-        let state: Value = serde_json::from_str(&state_json).unwrap_or(Value::Null);
+        let route: Value = serde_json::from_str(&route_json)
+            .map_err(|_| Error::new("STORE_READ_FAILED", "retained route JSON is malformed"))?;
+        let state: Value = serde_json::from_str(&state_json)
+            .map_err(|_| Error::new("STORE_READ_FAILED", "retained binding JSON is malformed"))?;
         let Some(route_alias) = bounded_text(route["alias"].as_str(), 128) else {
             continue;
         };
         let mut effective = Map::new();
-        for key in [
-            "effective_settings",
-            "effective_agent",
-            "effective_model",
-        ] {
+        for key in ["effective_settings", "effective_agent", "effective_model"] {
             let slot = &state[key];
             if slot.is_object() {
                 effective.insert(key.to_owned(), slot.clone());
@@ -200,7 +221,9 @@ pub(super) fn observation_is_current(read: &RetainedNativeRead) -> bool {
     {
         return false;
     }
-    if let Some(echoed) = native.get("event_id") && !echoed.is_null() {
+    if let Some(echoed) = native.get("event_id")
+        && !echoed.is_null()
+    {
         let Some(echoed) = bounded_text(echoed.as_str(), 512) else {
             return false;
         };
@@ -254,49 +277,60 @@ pub(super) fn route_facts(read: &RetainedNativeRead, route: &Route) -> ObservedN
     // are adapter vocabulary and are only surfaced with the live-binding fences above.
     let mut supported: Vec<String> = Vec::new();
     let mut unsupported: Vec<String> = Vec::new();
+    let mut supported_observed = false;
+    let mut unsupported_observed = false;
     if let Some(map) = native.get("capabilities").and_then(|v| v.as_object()) {
         for (name, state) in map {
-            let Some(name) = bounded_text(Some(name.as_str()), 64) else { continue };
+            let Some(name) = bounded_text(Some(name.as_str()), 64) else {
+                continue;
+            };
             match state.as_str() {
-                Some("implemented") => supported.push(name),
-                Some("unavailable") => unsupported.push(name),
+                Some("implemented") => {
+                    supported_observed = true;
+                    supported.push(name);
+                }
+                Some("unavailable") => {
+                    unsupported_observed = true;
+                    unsupported.push(name);
+                }
                 _ => continue,
             }
         }
     }
-    if supported.is_empty() && unsupported.is_empty() {
-        let capabilities = &describe["capabilities"];
-        for (key, slot) in [("supported", 0usize), ("unsupported", 1usize)] {
-            let names = capabilities[key]
-                .as_array()
-                .map(|names| {
-                    names
-                        .iter()
-                        .filter_map(|name| bounded_text(name.as_str(), 64))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if slot == 0 {
-                supported.extend(names);
-            } else {
-                unsupported.extend(names);
-            }
+    if let Some(capabilities) = describe.get("capabilities").and_then(Value::as_object) {
+        if let Some(names) = capabilities.get("supported").and_then(Value::as_array) {
+            supported_observed = true;
+            supported.extend(
+                names
+                    .iter()
+                    .filter_map(|name| bounded_text(name.as_str(), 64)),
+            );
+        }
+        if let Some(names) = capabilities.get("unsupported").and_then(Value::as_array) {
+            unsupported_observed = true;
+            unsupported.extend(
+                names
+                    .iter()
+                    .filter_map(|name| bounded_text(name.as_str(), 64)),
+            );
         }
     }
-    if supported.is_empty() {
+    if !supported_observed {
         facts
             .gaps
             .push("native_supported_capability_list_is_not_retained".to_owned());
     } else {
         facts.supported_capabilities = dedupe(supported);
     }
-    if unsupported.is_empty() {
+    if !unsupported_observed {
         facts
             .gaps
             .push("native_unsupported_capability_list_is_not_retained".to_owned());
     } else {
         facts.unsupported_capabilities = dedupe(unsupported);
     }
+    facts.supported_capabilities_observed = supported_observed;
+    facts.unsupported_capabilities_observed = unsupported_observed;
     let model_state = &read.effective["effective_model"];
     if model_state["complete"] == true && bounded_text(model_state["kind"].as_str(), 64).is_some() {
         let mut definition = Map::new();
@@ -317,15 +351,58 @@ pub(super) fn route_facts(read: &RetainedNativeRead, route: &Route) -> ObservedN
                     definition.insert("model".to_owned(), json!(model));
                 }
             }
-            Value::Object(_) => {
-                definition.insert("model".to_owned(), model_state["model"].clone());
+            Value::Object(map) => {
+                // Whitelist only the known model-reference fields so
+                // unrecognized auth/path/env keys can never leak into the catalog.
+                let id = map
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| bounded_text(Some(s), 256));
+                let provider = map
+                    .get("providerID")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| bounded_text(Some(s), 256));
+                let variant = match map.get("variant") {
+                    None | Some(Value::Null) => Some(None),
+                    Some(Value::String(s)) => bounded_text(Some(s.as_str()), 256).map(Some),
+                    _ => None,
+                };
+                match (id, provider, variant) {
+                    (Some(id), Some(provider), Some(variant)) => {
+                        definition.insert(
+                            "model".to_owned(),
+                            json!({"id": id, "providerID": provider, "variant": variant}),
+                        );
+                    }
+                    _ => {
+                        facts
+                            .gaps
+                            .push("native_model_reference_is_not_a_valid_known_shape".to_owned());
+                    }
+                }
             }
             Value::Null => {}
-            _ => {}
+            _ => {
+                facts
+                    .gaps
+                    .push("native_model_reference_is_not_a_valid_known_shape".to_owned());
+            }
         }
-        for key in ["enabled", "status", "definition_digest", "variant_digest", "observation_id", "observed_at_ms", "operation_id", "contract_revision"] {
+        for key in [
+            "enabled",
+            "status",
+            "definition_digest",
+            "variant_digest",
+            "observation_id",
+            "observed_at_ms",
+            "operation_id",
+            "contract_revision",
+        ] {
             let value = &model_state[key];
-            if value.is_boolean() || value.is_number() || bounded_text(value.as_str(), 256).is_some() {
+            if value.is_boolean()
+                || value.is_number()
+                || bounded_text(value.as_str(), 256).is_some()
+            {
                 definition.insert(key.to_owned(), value.clone());
             }
         }
@@ -352,7 +429,14 @@ pub(super) fn reads_for_manager(
             "retained native evidence is restricted to authenticated Manager identities",
         ));
     }
-    let reads = live_reads(conn)?;
+    if bounded_text(Some(principal.client_id.as_str()), 256).is_none() {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "manager identity is not a valid client reference",
+        ));
+    }
+    let aliases: Vec<String> = routes.iter().map(|route| route.alias.clone()).collect();
+    let reads = live_reads(conn, principal.client_id.as_str(), &aliases)?;
     let mut projected = Vec::new();
     for route in routes {
         let matching = reads
@@ -366,7 +450,7 @@ pub(super) fn reads_for_manager(
                 let mut facts = ObservedNativeFacts::default();
                 facts
                     .gaps
-                    .push("no_live_binding_is_retained_for_this_route".to_owned());
+                    .push("no_authorized_live_binding_is_retained_for_this_route".to_owned());
                 facts
             }
         };
@@ -377,8 +461,9 @@ pub(super) fn reads_for_manager(
 
 #[cfg(test)]
 mod tests {
-    use super::{RetainedNativeRead, observation_is_current, route_facts};
+    use super::{RetainedNativeRead, live_reads, observation_is_current, route_facts};
     use crate::config::Route;
+    use rusqlite::Connection;
 
     fn route(artifact: &str) -> Route {
         Route {
@@ -419,7 +504,7 @@ mod tests {
                 "effective_model":{
                     "kind":"opencode_session_model_v1",
                     "revision":"rev-1",
-                    "model":{"id":"model-id","providerID":"provider","variant":"variant"},
+                    "model":{"id":"model-id","providerID":"provider","variant":"variant","secret":"do-not-export"},
                     "enabled":true,
                     "status":"active",
                     "complete":true
@@ -438,9 +523,30 @@ mod tests {
         assert_eq!(facts.observed_model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(facts.requested_model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(facts.model_provider.as_deref(), Some("openai"));
-        assert!(facts.supported_capabilities.contains(&"task.dispatch".to_owned()));
-        assert!(facts.unsupported_capabilities.contains(&"agent.refresh".to_owned()));
+        assert!(
+            facts
+                .supported_capabilities
+                .contains(&"task.dispatch".to_owned())
+        );
+        assert!(
+            facts
+                .unsupported_capabilities
+                .contains(&"agent.refresh".to_owned())
+        );
         assert!(facts.model_definition.is_some());
+        assert_eq!(
+            facts.model_definition.as_ref().unwrap()["model"],
+            serde_json::json!({
+                "id":"model-id",
+                "providerID":"provider",
+                "variant":"variant"
+            })
+        );
+        assert!(
+            !serde_json::to_string(&facts.model_definition)
+                .unwrap()
+                .contains("secret")
+        );
         assert_eq!(facts.native_observation_id, Some(42));
         assert_eq!(facts.binding_id.as_deref(), Some("binding-1"));
         assert!(facts.gaps.is_empty());
@@ -467,7 +573,12 @@ mod tests {
         let facts = route_facts(&released, &route("eliot-codex.rust-headless.1"));
         assert!(facts.observed_model.is_none());
         assert!(facts.supported_capabilities.is_empty());
-        assert!(facts.gaps.iter().any(|gap| gap.contains("not_current_for_its_route")));
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("not_current_for_its_route"))
+        );
     }
 
     #[test]
@@ -485,7 +596,12 @@ mod tests {
         foreign_route.route_alias = "other".to_owned();
         let other = route_facts(&foreign_route, &route("eliot-codex.rust-headless.1"));
         assert!(other.observed_model.is_none());
-        assert!(other.gaps.iter().any(|gap| gap.contains("not_current_for_its_route")));
+        assert!(
+            other
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("not_current_for_its_route"))
+        );
     }
 
     #[test]
@@ -505,13 +621,36 @@ mod tests {
         let facts = route_facts(&read, &route("eliot-codex.rust-headless.1"));
         assert!(facts.supported_capabilities.is_empty());
         assert!(facts.unsupported_capabilities.is_empty());
-        assert!(facts
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("capability_list_is_not_retained")));
-        assert!(facts
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("model_definition_is_not_confirmed")));
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("capability_list_is_not_retained"))
+        );
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("model_definition_is_not_confirmed"))
+        );
+    }
+
+    #[test]
+    fn sql_schema_errors_are_not_silently_projected_as_empty_reads() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE bindings(
+                 binding_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 module_artifact_id TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 route_json TEXT NOT NULL,
+                 state_json TEXT NOT NULL,
+                 released_at_ms INTEGER
+             );",
+        )
+        .unwrap();
+        let error = live_reads(&db, "manager-a", &["codex".to_owned()]).unwrap_err();
+        assert_eq!(error.code, "STORE_ERROR");
     }
 }

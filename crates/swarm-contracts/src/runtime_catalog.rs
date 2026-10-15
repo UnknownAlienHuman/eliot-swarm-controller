@@ -21,6 +21,11 @@ pub struct Evidence<T> {
     pub status: EvidenceStatus,
     pub source: Option<String>,
     pub observed_at_ms: Option<i64>,
+    /// Coverage of the retained evidence, when the source reports it. A
+    /// native binding observation is partial because it covers one binding,
+    /// not the complete route or native catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<String>,
     pub value: Option<T>,
     pub gaps: Vec<String>,
 }
@@ -31,6 +36,7 @@ impl<T> Evidence<T> {
             status: EvidenceStatus::Unknown,
             source: None,
             observed_at_ms: None,
+            coverage: None,
             value: None,
             gaps: vec![gap.into()],
         }
@@ -41,6 +47,23 @@ impl<T> Evidence<T> {
             status: EvidenceStatus::Current,
             source: Some(source.into()),
             observed_at_ms: Some(observed_at_ms),
+            coverage: None,
+            value: Some(value),
+            gaps: Vec::new(),
+        }
+    }
+
+    pub fn current_with_coverage(
+        source: impl Into<String>,
+        observed_at_ms: i64,
+        coverage: impl Into<String>,
+        value: T,
+    ) -> Self {
+        Self {
+            status: EvidenceStatus::Current,
+            source: Some(source.into()),
+            observed_at_ms: Some(observed_at_ms),
+            coverage: Some(coverage.into()),
             value: Some(value),
             gaps: Vec::new(),
         }

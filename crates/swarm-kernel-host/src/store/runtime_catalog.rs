@@ -162,6 +162,9 @@ fn project_route(
         GAP_ACCOUNT_NOT_PROVED.to_owned(),
     ];
     gaps.extend(module_descriptor.gaps.iter().cloned());
+    if !module_descriptor.contract_capabilities.is_empty() {
+        gaps.push(GAP_DESCRIPTOR_DECLARED_NOT_NATIVE.to_owned());
+    }
     gaps.extend(option_gaps.iter().cloned());
     gaps.extend(observed.gaps.iter().cloned());
     gaps.extend(native_models.gaps.iter().cloned());
@@ -184,7 +187,8 @@ fn project_route(
         freshness: vec![
             "route_configuration_current_at_query_time".to_owned(),
             "module_descriptor_status_uses_current_store_registry_revision".to_owned(),
-            "native_evidence_is_current_while_its_live_binding_matches_the_retained_observation".to_owned(),
+            "native_evidence_is_current_while_its_live_binding_matches_the_retained_observation"
+                .to_owned(),
         ],
         gaps,
     }
@@ -194,14 +198,15 @@ const GAP_CONFIGURED_TARGET: &str =
     "configured_target_does_not_prove_native_catalog_membership_or_availability";
 const GAP_EVIDENCE_MANAGER_ONLY: &str =
     "retained_native_evidence_is_only_available_to_an_authenticated_manager";
-const GAP_INSTALLATION_NOT_PROVED: &str =
-    "installation_and_live_runtime_qualification_are_not_proved_by_route_configuration_or_descriptor_registration";
+const GAP_INSTALLATION_NOT_PROVED: &str = "installation_and_live_runtime_qualification_are_not_proved_by_route_configuration_or_descriptor_registration";
 const GAP_MODEL_CATALOG_NOT_RETAINED: &str =
     "native_model_catalog_and_alias_inventory_is_not_retained_for_this_route";
 const GAP_CAPABILITY_ONE_BINDING: &str =
     "native_model_capability_evidence_describes_one_live_binding_not_the_whole_catalog";
 const GAP_ACCOUNT_NOT_PROVED: &str =
     "provider_and_configured_model_identity_do_not_prove_an_account_capacity_group";
+const GAP_DESCRIPTOR_DECLARED_NOT_NATIVE: &str =
+    "descriptor_capabilities_are_declared_contract_metadata_not_native_observations";
 
 fn default_module_descriptor() -> ModuleDescriptorEvidence {
     ModuleDescriptorEvidence {
@@ -220,9 +225,15 @@ fn default_module_descriptor() -> ModuleDescriptorEvidence {
 fn observed_models(observed: &ObservedNativeFacts) -> Evidence<Vec<Value>> {
     match observed.observed_model.as_ref() {
         Some(model) => {
-            let mut evidence = Evidence::current(
+            let Some(observed_at_ms) = observed.observed_at_ms.filter(|value| *value > 0) else {
+                return Evidence::unknown(
+                    "native_model_observation_timestamp_is_not_retained_for_this_route",
+                );
+            };
+            let mut evidence = Evidence::current_with_coverage(
                 "retained_binding_native_describe_observation",
-                observed.observed_at_ms.unwrap_or_default(),
+                observed_at_ms,
+                "partial",
                 vec![Value::String(model.clone())],
             );
             match observed.requested_model.as_ref() {
@@ -244,25 +255,46 @@ fn observed_models(observed: &ObservedNativeFacts) -> Evidence<Vec<Value>> {
 
 /// Surface the capability names the live binding actually reported.
 fn observed_capabilities(observed: &ObservedNativeFacts) -> Evidence<Vec<Value>> {
-    let mut values = Vec::new();
-    let supported = observed.supported_capabilities.len();
-    for name in observed
-        .supported_capabilities
-        .iter()
-        .chain(observed.unsupported_capabilities.iter())
-    {
-        values.push(Value::String(name.clone()));
-    }
-    if supported == 0 {
+    if !observed.supported_capabilities_observed && !observed.unsupported_capabilities_observed {
         return Evidence::unknown(
             "no_current_retained_native_capability_list_is_available_for_this_route",
         );
     }
-    Evidence::current(
+    let Some(observed_at_ms) = observed.observed_at_ms.filter(|value| *value > 0) else {
+        return Evidence::unknown(
+            "native_capability_observation_timestamp_is_not_retained_for_this_route",
+        );
+    };
+    let mut values = Vec::new();
+    values.extend(
+        observed
+            .supported_capabilities
+            .iter()
+            .map(|name| json!({"name": name, "status": "supported"})),
+    );
+    values.extend(
+        observed
+            .unsupported_capabilities
+            .iter()
+            .map(|name| json!({"name": name, "status": "unsupported"})),
+    );
+    let mut evidence = Evidence::current_with_coverage(
         "retained_binding_native_describe_observation",
-        observed.observed_at_ms.unwrap_or_default(),
+        observed_at_ms,
+        "partial",
         values,
-    )
+    );
+    if !observed.supported_capabilities_observed {
+        evidence
+            .gaps
+            .push("native_supported_capability_list_is_not_retained".to_owned());
+    }
+    if !observed.unsupported_capabilities_observed {
+        evidence
+            .gaps
+            .push("native_unsupported_capability_list_is_not_retained".to_owned());
+    }
+    evidence
 }
 
 /// Account capacity grouping needs an observed account identity. The retained
@@ -270,26 +302,19 @@ fn observed_capabilities(observed: &ObservedNativeFacts) -> Evidence<Vec<Value>>
 /// identity, so grouping stays an explicit gap.
 fn observed_account_group(observed: &ObservedNativeFacts) -> Evidence<String> {
     let _ = observed;
-    Evidence::unknown(
-        "no_observed_account_identity_is_retained_for_this_route",
-    )
+    Evidence::unknown("no_observed_account_identity_is_retained_for_this_route")
 }
 
 /// A current live binding proves the configured artifact admitted on this route,
 /// not that any binary is installed. Installation stays an explicit gap.
-fn installation_evidence(
-    observed: &ObservedNativeFacts,
-    as_of_ms: i64,
-) -> Evidence<String> {
+fn installation_evidence(observed: &ObservedNativeFacts, as_of_ms: i64) -> Evidence<String> {
     if observed.binding_id.is_none() {
         return Evidence::unknown(
             "no_live_binding_is_retained_for_this_route_so_installation_is_unobserved",
         );
     }
     let _ = as_of_ms;
-    Evidence::unknown(
-        "a_live_binding_does_not_prove_a_native_binary_or_installed_descriptor",
-    )
+    Evidence::unknown("a_live_binding_does_not_prove_a_native_binary_or_installed_descriptor")
 }
 
 fn safe_native_options(route: &Route) -> (Map<String, Value>, Vec<String>) {
@@ -401,7 +426,6 @@ fn configured_model_target(route: &Route) -> Option<ConfiguredModelTarget> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{ObservedNativeFacts, project_route, read, safe_native_options};
@@ -490,6 +514,8 @@ mod tests {
             } else {
                 Vec::new()
             },
+            supported_capabilities_observed: with_model,
+            unsupported_capabilities_observed: with_model,
             gaps: Vec::new(),
         }
     }
@@ -501,8 +527,12 @@ mod tests {
             "eliot-codex.rust-headless.1",
             json!({"model":"gpt-5.6-luna","modelProvider":"openai","apiKey":"secret-value"}),
         );
-        let projected: RuntimeCatalogRoute =
-            project_route(&configured, &modules("built_in_route"), Some(&observed(true)), 100);
+        let projected: RuntimeCatalogRoute = project_route(
+            &configured,
+            &modules("built_in_route"),
+            Some(&observed(true)),
+            100,
+        );
         assert_eq!(projected.native_models.status, EvidenceStatus::Current);
         let models = projected.native_models.value.unwrap();
         assert_eq!(models[0], json!("gpt-5.6-luna"));
@@ -511,9 +541,23 @@ mod tests {
             Some("retained_binding_native_describe_observation")
         );
         assert_eq!(projected.native_models.observed_at_ms, Some(1_000));
-        assert_eq!(projected.native_capabilities.status, EvidenceStatus::Current);
+        assert_eq!(projected.native_models.coverage.as_deref(), Some("partial"));
+        assert_eq!(
+            projected.native_capabilities.status,
+            EvidenceStatus::Current
+        );
         let capabilities = projected.native_capabilities.value.unwrap();
         assert_eq!(capabilities.len(), 3);
+        assert!(
+            capabilities.iter().any(|value| {
+                value["name"] == "task.dispatch" && value["status"] == "supported"
+            })
+        );
+        assert!(
+            capabilities.iter().any(|value| {
+                value["name"] == "agent.refresh" && value["status"] == "unsupported"
+            })
+        );
         assert!(!projected.gaps.iter().any(|gap| gap == &""));
     }
 
@@ -528,19 +572,27 @@ mod tests {
             project_route(&configured, &modules("built_in_route"), None, 100);
         assert_eq!(projected.native_models.status, EvidenceStatus::Unknown);
         assert_eq!(projected.native_models.value, None);
-        assert_eq!(projected.native_capabilities.status, EvidenceStatus::Unknown);
+        assert_eq!(
+            projected.native_capabilities.status,
+            EvidenceStatus::Unknown
+        );
         assert_eq!(projected.installation.status, EvidenceStatus::Unknown);
-        assert_eq!(projected.account_capacity_group.status, EvidenceStatus::Unknown);
+        assert_eq!(
+            projected.account_capacity_group.status,
+            EvidenceStatus::Unknown
+        );
         assert!(
             projected
                 .gaps
                 .iter()
                 .any(|gap| gap.contains("only_available_to_an_authenticated_manager"))
         );
-        assert!(!projected
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("route_configuration_current")));
+        assert!(
+            !projected
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("route_configuration_current"))
+        );
     }
 
     #[test]
@@ -553,8 +605,12 @@ mod tests {
             "eliot-codex.rust-headless.1",
             json!({"model":"gpt-5.6-luna","modelProvider":"openai"}),
         );
-        let projected: RuntimeCatalogRoute =
-            project_route(&configured, &modules("built_in_route"), Some(&observed), 100);
+        let projected: RuntimeCatalogRoute = project_route(
+            &configured,
+            &modules("built_in_route"),
+            Some(&observed),
+            100,
+        );
         assert_eq!(projected.native_models.status, EvidenceStatus::Current);
         assert!(
             projected
@@ -564,6 +620,64 @@ mod tests {
                 .any(|gap| gap.contains("requested_model_differs"))
         );
     }
+
+    #[test]
+    fn unsupported_only_capability_observation_keeps_its_own_current_status() {
+        let mut observed = observed(true);
+        observed.supported_capabilities.clear();
+        observed.supported_capabilities_observed = false;
+        let configured = route(
+            "codex",
+            "eliot-codex.rust-headless.1",
+            json!({"model":"gpt-5.6-luna","modelProvider":"openai"}),
+        );
+        let projected = project_route(
+            &configured,
+            &modules("built_in_route"),
+            Some(&observed),
+            100,
+        );
+        assert_eq!(
+            projected.native_capabilities.status,
+            EvidenceStatus::Current
+        );
+        assert_eq!(
+            projected.native_capabilities.value.as_ref().unwrap()[0],
+            json!({"name":"agent.refresh","status":"unsupported"})
+        );
+        assert!(
+            projected
+                .native_capabilities
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("supported_capability_list_is_not_retained"))
+        );
+    }
+
+    #[test]
+    fn native_evidence_without_an_observation_timestamp_is_not_current_at_zero() {
+        let mut observed = observed(true);
+        observed.observed_at_ms = None;
+        let configured = route(
+            "codex",
+            "eliot-codex.rust-headless.1",
+            json!({"model":"gpt-5.6-luna","modelProvider":"openai"}),
+        );
+        let projected = project_route(
+            &configured,
+            &modules("built_in_route"),
+            Some(&observed),
+            100,
+        );
+        assert_eq!(projected.native_models.status, EvidenceStatus::Unknown);
+        assert_eq!(projected.native_models.observed_at_ms, None);
+        assert_eq!(
+            projected.native_capabilities.status,
+            EvidenceStatus::Unknown
+        );
+        assert_eq!(projected.native_capabilities.observed_at_ms, None);
+    }
+
     #[test]
     fn current_configured_model_does_not_claim_native_catalog_membership_or_leak_paths() {
         let configured = route(
@@ -583,12 +697,7 @@ mod tests {
         );
         assert!(!gaps.is_empty());
 
-        let projected = project_route(
-            &configured,
-            &modules("built_in_route"),
-            None,
-            100,
-        );
+        let projected = project_route(&configured, &modules("built_in_route"), None, 100);
         assert_eq!(
             projected.configured_model_target.status,
             EvidenceStatus::Current
@@ -642,8 +751,7 @@ mod tests {
     #[test]
     fn runtime_catalog_is_manager_scoped_and_keeps_missing_native_facts_unknown() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
-            .unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
         let mut config = Config::default();
         config.routes.push(route(
             "command",
@@ -690,20 +798,13 @@ mod tests {
             role: Role::Observer,
         };
         assert_eq!(
-            read(&db, &observer, &json!({}), &config)
-                .unwrap_err()
-                .code,
+            read(&db, &observer, &json!({}), &config).unwrap_err().code,
             "FORBIDDEN"
         );
         assert_eq!(
-            read(
-                &db,
-                &manager,
-                &json!({"task_id":"invented-task"}),
-                &config
-            )
-            .unwrap_err()
-            .code,
+            read(&db, &manager, &json!({"task_id":"invented-task"}), &config)
+                .unwrap_err()
+                .code,
             "INVALID_PARAMS"
         );
     }
@@ -756,23 +857,56 @@ mod tests {
         let route_json = crate::model::canonical(&json!({"alias":"catalog-route"})).unwrap();
         let state_json = crate::model::canonical(&state).unwrap();
         db.execute(
+            "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES('task-1','project-1',1,'open','{}',1000,1000)",
+            [],
+        )
+        .unwrap();
+        db.execute(
             "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) VALUES('binding-1',1,'lane-1','instance-1','eliot-codex.rust-headless.1','ready',NULL,NULL,?1,?2,1000)",
             params![route_json, state_json],
         ).unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,producers_json,created_at_ms,updated_at_ms) VALUES('attempt-1','task-1',1,'{}','catalog-manager','controller','binding-1',1,'running','[]',1000,1000)",
+            [],
+        )
+        .unwrap();
         db.execute(
             "INSERT INTO observations(observation_id,source_stream_id,source_event_key,binding_id,binding_generation,kind,payload_json,recorded_at_ms) VALUES(42,'module:codex-module','boot-1:7','binding-1',1,'runtime.state',?1,1000)",
             params![crate::model::canonical(&native).unwrap()],
         ).unwrap();
         let current = read(&db, &manager, &json!({}), &config).unwrap();
         assert_eq!(current["routes"][0]["native_models"]["status"], "current");
-        assert_eq!(current["routes"][0]["native_models"]["value"][0], "gpt-5.6-luna");
-        assert_eq!(current["routes"][0]["native_models"]["observed_at_ms"], 1000);
-        assert_eq!(current["routes"][0]["native_capabilities"]["status"], "current");
-        assert!(current["routes"][0]["native_capabilities"]["value"].as_array().unwrap().iter().any(|v| v == "task.dispatch"));
+        assert_eq!(
+            current["routes"][0]["native_models"]["value"][0],
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            current["routes"][0]["native_models"]["observed_at_ms"],
+            1000
+        );
+        assert_eq!(
+            current["routes"][0]["native_capabilities"]["status"],
+            "current"
+        );
+        assert!(
+            current["routes"][0]["native_capabilities"]["value"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["name"] == "task.dispatch" && v["status"] == "supported")
+        );
         db.execute("UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id','boot-2') WHERE binding_id='binding-1'", []).unwrap();
         let stale = read(&db, &manager, &json!({}), &config).unwrap();
         assert_eq!(stale["routes"][0]["native_models"]["status"], "unknown");
         assert!(stale["routes"][0]["native_models"]["value"].is_null());
+        db.execute(
+            "UPDATE bindings SET released_at_ms=2000 WHERE binding_id='binding-1'",
+            [],
+        )
+        .unwrap();
+        let released = read(&db, &manager, &json!({}), &config).unwrap();
+        assert_eq!(released["routes"][0]["native_models"]["status"], "unknown");
+        assert!(released["routes"][0]["native_models"]["value"].is_null());
         db.execute("UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id','boot-1') WHERE binding_id='binding-1'", []).unwrap();
         let mut foreign_config = Config::default();
         foreign_config.routes.push(route(
@@ -782,6 +916,120 @@ mod tests {
         ));
         let foreign = read(&db, &manager, &json!({}), &foreign_config).unwrap();
         assert_eq!(foreign["routes"][0]["native_models"]["status"], "unknown");
-        assert!(foreign["routes"][0]["gaps"].as_array().unwrap().iter().any(|g| g.as_str().unwrap().contains("does_not_match_configured_route") || g.as_str().unwrap().contains("no_live_binding")));
+        assert!(
+            foreign["routes"][0]["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|g| g
+                    .as_str()
+                    .unwrap()
+                    .contains("does_not_match_configured_route")
+                    || g.as_str().unwrap().contains("no_live_binding"))
+        );
+    }
+
+    #[test]
+    fn public_catalog_scopes_two_managers_on_one_alias_before_foreign_corrupt_json() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);
+             CREATE TABLE tasks(task_id TEXT PRIMARY KEY);
+             CREATE TABLE attempts(
+                 attempt_id TEXT PRIMARY KEY,
+                 task_id TEXT NOT NULL,
+                 owner_id TEXT NOT NULL,
+                 binding_id TEXT NOT NULL,
+                 binding_generation INTEGER NOT NULL,
+                 released_at_ms INTEGER
+             );
+             CREATE TABLE bindings(
+                 binding_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 module_artifact_id TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 route_json TEXT NOT NULL,
+                 state_json TEXT NOT NULL,
+                 released_at_ms INTEGER
+             );",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.routes.push(route(
+            "codex",
+            "shared-artifact",
+            json!({"model":"configured-model"}),
+        ));
+        let route_json = crate::model::canonical(&json!({"alias":"catalog-route"})).unwrap();
+        let state = |model: &str, boot: &str, sequence: i64| {
+            crate::model::canonical(&json!({
+                "bridge_boot_id":boot,
+                "native":{
+                    "boot_id":boot,
+                    "describe":{
+                        "requested_model":model,
+                        "effective_model":model,
+                        "effective_model_provider":"openai",
+                        "served_model_status":"observed"
+                    },
+                    "capabilities":{
+                        "agent.open":"implemented",
+                        "agent.refresh":"unavailable"
+                    }
+                },
+                "observed_at_ms":1000 + sequence,
+                "native_sequence":sequence,
+                "native_observation_id":sequence
+            }))
+            .unwrap()
+        };
+        db.execute_batch(
+            "INSERT INTO tasks(task_id) VALUES('task-a'),('task-b'),('task-corrupt');
+             INSERT INTO attempts(attempt_id,task_id,owner_id,binding_id,binding_generation,released_at_ms)
+                 VALUES('attempt-a','task-a','manager-a','binding-a',1,NULL),
+                       ('attempt-b','task-b','manager-b','binding-b',1,NULL),
+                       ('attempt-corrupt','task-corrupt','manager-corrupt','binding-corrupt',1,NULL);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO bindings(binding_id,generation,module_artifact_id,state,route_json,state_json,released_at_ms) VALUES(?1,1,'shared-artifact','ready',?2,?3,NULL)",
+            params!["binding-a", route_json.clone(), state("model-a", "boot-a", 7)],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO bindings(binding_id,generation,module_artifact_id,state,route_json,state_json,released_at_ms) VALUES(?1,1,'shared-artifact','ready',?2,?3,NULL)",
+            params!["binding-b", route_json.clone(), state("model-b", "boot-b", 8)],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO bindings(binding_id,generation,module_artifact_id,state,route_json,state_json,released_at_ms) VALUES('binding-corrupt',1,'shared-artifact','ready',?1,'{foreign-corrupt-json',NULL)",
+            params![route_json],
+        )
+        .unwrap();
+
+        let manager_a = Principal {
+            link_id: "catalog-manager-a-link".to_owned(),
+            client_id: "manager-a".to_owned(),
+            role: Role::Manager,
+        };
+        let manager_b = Principal {
+            link_id: "catalog-manager-b-link".to_owned(),
+            client_id: "manager-b".to_owned(),
+            role: Role::Manager,
+        };
+        let result_a = read(&db, &manager_a, &json!({}), &config).unwrap();
+        let result_b = read(&db, &manager_b, &json!({}), &config).unwrap();
+        assert_eq!(
+            result_a["routes"][0]["native_models"]["value"][0],
+            "model-a"
+        );
+        assert_eq!(
+            result_b["routes"][0]["native_models"]["value"][0],
+            "model-b"
+        );
+        assert_ne!(
+            result_a["routes"][0]["native_models"]["value"],
+            result_b["routes"][0]["native_models"]["value"]
+        );
     }
 }
