@@ -60,6 +60,7 @@ async fn publish_page_in_bridge(
     command: &Value,
     result_frame_uuid: &str,
     native_input_id: &str,
+    drop_result_ack_after_commit: bool,
 ) -> Result<Value> {
     let origin = &command["input"]["claude_result_origin"];
     let input = json!({
@@ -142,36 +143,73 @@ async fn publish_page_in_bridge(
         ));
     }
     let method = model::text(&request, "method")?.to_owned();
-    let payload = json!({"operation_id":request["operation_id"],"page":request["page"]});
-    let acknowledgement = match store.call(module.clone(), method, payload).await {
-        Ok(acknowledgement) => acknowledgement,
-        Err(error) => {
-            if let Ok(reply) = model::canonical(&json!({"type":"error","code":error.code})) {
-                let _ = writeln!(child_stdin, "{reply}");
-            }
-            drop(child_stdin);
-            let _ = child.0.wait();
-            let _ = stderr_reader.join();
-            return Err(error);
-        }
+    let result_ack = store
+        .call(module.clone(), method, request["args"].clone())
+        .await?;
+    let reply = if drop_result_ack_after_commit {
+        json!({"type":"drop_ack"})
+    } else {
+        json!({"type":"ack","acknowledgement":result_ack})
     };
-    let reply = model::canonical(&json!({"type":"ack","acknowledgement":acknowledgement}))?;
+    let reply = model::canonical(&reply)?;
     writeln!(child_stdin, "{reply}")
         .map_err(|error| Error::new("FIXTURE_NODE_STDIN", error.to_string()))?;
-    drop(child_stdin);
 
     let mut terminal_line = String::new();
+    let mut module_outcome_ack = None;
+    if drop_result_ack_after_commit {
+        let mut outcome_line = String::new();
+        let read = stdout
+            .read_line(&mut outcome_line)
+            .map_err(|error| Error::new("FIXTURE_NODE_STDOUT", error.to_string()))?;
+        if read == 0 {
+            return Err(Error::new(
+                "FIXTURE_NODE_RESULT_PAGE",
+                "Bridge.5 fixture exited instead of reporting its uncertain result outcome",
+            ));
+        }
+        let outcome_request: Value = serde_json::from_str(&outcome_line)
+            .map_err(|error| Error::new("FIXTURE_NODE_RESULT_PAGE", error.to_string()))?;
+        if outcome_request["type"] != "module.outcome"
+            || outcome_request["method"] != "module.outcome"
+        {
+            return Err(Error::new(
+                "FIXTURE_NODE_RESULT_PAGE",
+                "uncertain Bridge.5 result did not publish module.outcome",
+            ));
+        }
+        let outcome = outcome_request["args"].clone();
+        module_outcome_ack = Some(
+            store
+                .call(module.clone(), "module.outcome".to_owned(), outcome)
+                .await?,
+        );
+        let reply = model::canonical(&json!({"type":"ack","acknowledgement":module_outcome_ack}))?;
+        writeln!(child_stdin, "{reply}")
+            .map_err(|error| Error::new("FIXTURE_NODE_STDIN", error.to_string()))?;
+    }
     let read = stdout
         .read_line(&mut terminal_line)
         .map_err(|error| Error::new("FIXTURE_NODE_STDOUT", error.to_string()))?;
     if read == 0 {
         return Err(Error::new(
             "FIXTURE_NODE_RESULT_PAGE",
-            "Bridge.5 fixture exited before consuming the Store ACK",
+            "Bridge.5 fixture exited before reading the result publication receipt",
         ));
     }
     let terminal: Value = serde_json::from_str(&terminal_line)
         .map_err(|error| Error::new("FIXTURE_NODE_RESULT_PAGE", error.to_string()))?;
+    let expected_result_ack = if drop_result_ack_after_commit {
+        Value::Null
+    } else {
+        result_ack.clone()
+    };
+    let expected_outcome_ack = module_outcome_ack.clone().unwrap_or(Value::Null);
+    let expected_outcome_call_count = if drop_result_ack_after_commit {
+        1_u64
+    } else {
+        0_u64
+    };
     let status = child
         .0
         .wait()
@@ -183,19 +221,25 @@ async fn publish_page_in_bridge(
         return Err(Error::new("FIXTURE_NODE_RESULT_PAGE", stderr));
     }
     if terminal["type"] != "terminal"
-        || terminal["acknowledgement"] != acknowledgement
+        || terminal["result_ack"] != expected_result_ack
+        || terminal["module_outcome_ack"] != expected_outcome_ack
+        || terminal["result_call_count"] != 1
+        || terminal["outcome_call_count"] != expected_outcome_call_count
         || terminal["replay_call_count"] != 0
+        || terminal["attempt_count"] != 0
     {
         return Err(Error::new(
             "FIXTURE_NODE_RESULT_PAGE",
-            "Bridge.5 fixture did not retain the exact Store ACK or replay fence",
+            "Bridge.5 fixture did not converge its ACK state or replay fence",
         ));
     }
+    drop(child_stdin);
     Ok(json!({
-        "page":request["page"],
+        "page":request["args"]["page"],
         "execution":terminal["execution"],
-        "store_ack":acknowledgement,
-        "terminal":terminal
+        "result_ack":result_ack,
+        "module_outcome_ack":module_outcome_ack,
+        "terminal":terminal,
     }))
 }
 
@@ -531,6 +575,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
         &result_command,
         "sdk-result-frame-1",
         &input_id,
+        false,
     )
     .await?;
     let page = module_page["page"].clone();
@@ -542,9 +587,16 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
         page["source"]["target_module_receipt"],
         origin["target_module_receipt"]
     );
-    let result_ack = module_page["store_ack"].clone();
+    let result_ack = module_page["result_ack"].clone();
     assert_eq!(module_page["terminal"]["replay_call_count"], 0);
     assert_eq!(result_ack["recorded"], true);
+    assert_eq!(module_page["terminal"]["result_call_count"], 1);
+    assert_eq!(module_page["terminal"]["outcome_call_count"], 0);
+    assert_eq!(module_page["terminal"]["attempt_count"], 0);
+    assert_eq!(
+        module_page["terminal"]["journal_entry"]["outcome"],
+        "applied"
+    );
     let artifact_ref = model::text(&result_ack, "artifact_ref")?.to_owned();
 
     let operation_id_for_read = result_operation_id.clone();
@@ -586,6 +638,120 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
     assert_eq!(artifact_read["content"], RESULT_TEXT);
     assert_eq!(artifact_read["eof"], true);
 
+    let lost_result_request = json!({
+        "client_request_id":"bridge5-result-page-ack-lost",
+        "binding_id":BINDING_ID,
+        "generation":1,
+        "selector":{
+            "kind":"claude_assistant_result",
+            "input_operation_id":DISPATCH_OPERATION_ID,
+            "session_id":NATIVE_SESSION_ID
+        },
+        "offset_bytes":0,
+        "length_bytes":65_536
+    });
+    let queued_lost_result = owner
+        .store
+        .call(
+            caller.clone(),
+            "agent.result".to_owned(),
+            lost_result_request,
+        )
+        .await
+        .expect("admit a second read of the same retained SDK result");
+    let lost_result_operation_id = model::text(&queued_lost_result, "operation_id")?.to_owned();
+    let lost_result_delivery = owner
+        .store
+        .call(module.clone(), "module.next".to_owned(), json!({}))
+        .await
+        .expect("deliver the second result read to the same Bridge.5 boot");
+    let lost_result_command = lost_result_delivery["command"].clone();
+    assert_eq!(
+        lost_result_command["operation_id"],
+        lost_result_operation_id
+    );
+    assert_eq!(lost_result_command["method"], "agent.result");
+    let lost_page_exchange = publish_page_in_bridge(
+        &owner.store,
+        &module,
+        &lost_result_command,
+        "sdk-result-frame-1",
+        &input_id,
+        true,
+    )
+    .await?;
+    let lost_page = lost_page_exchange["page"].clone();
+    let lost_page_terminal = &lost_page_exchange["terminal"];
+    let lost_result_ack = lost_page_exchange["result_ack"].clone();
+    assert_eq!(lost_result_ack["recorded"], true);
+    assert_eq!(lost_page_terminal["result_ack"], Value::Null);
+    assert_eq!(
+        lost_page_terminal["result_failure"]["diagnostic_code"],
+        "CLAUDE_RESULT_ACK_UNKNOWN"
+    );
+    assert_eq!(lost_page_terminal["module_outcome"]["outcome"], "unknown");
+    assert_eq!(lost_page_terminal["result_call_count"], 1);
+    assert_eq!(lost_page_terminal["outcome_call_count"], 1);
+    assert_eq!(lost_page_terminal["replay_call_count"], 0);
+    assert_eq!(lost_page_terminal["attempt_count"], 0);
+    assert_eq!(lost_page_terminal["journal_entry"]["outcome"], "unknown");
+    let lost_outcome_ack = lost_page_exchange["module_outcome_ack"].clone();
+    assert_eq!(lost_outcome_ack["recorded"], true);
+    assert_eq!(lost_outcome_ack["superseded"], true);
+    assert_eq!(lost_outcome_ack["state"], "settled");
+
+    let lost_operation_id_for_read = lost_result_operation_id.clone();
+    let lost_operation = owner
+        .store
+        .run(move |db| super::operations::get_operation(db, &lost_operation_id_for_read))
+        .await
+        .expect("read back the result retained before its ACK was withheld");
+    assert_eq!(lost_operation["state"], "settled");
+    assert_eq!(lost_operation["result"]["outcome"], "applied");
+    assert_eq!(
+        lost_operation["result"]["details"]["artifact_ref"],
+        lost_result_ack["artifact_ref"]
+    );
+    let lost_artifact_ref = model::text(&lost_result_ack, "artifact_ref")?.to_owned();
+    let lost_artifact_read = owner
+        .store
+        .call(
+            caller.clone(),
+            "artifact.read".to_owned(),
+            json!({
+                "artifact_id":lost_artifact_ref,
+                "offset_bytes":0,
+                "length_bytes":RESULT_TEXT.len()
+            }),
+        )
+        .await
+        .expect("read the artifact retained before the page ACK was dropped");
+    assert_eq!(lost_artifact_read["content"], RESULT_TEXT);
+    assert_eq!(lost_artifact_read["eof"], true);
+
+    let dispatch_operation_id_after_lost_ack = DISPATCH_OPERATION_ID.to_owned();
+    let dispatch_after_lost_ack = owner
+        .store
+        .run(move |db| {
+            let operation =
+                super::operations::get_operation(db, &dispatch_operation_id_after_lost_ack)?;
+            let attempt = super::tasks::get_attempt(db, ATTEMPT_ID)?;
+            Ok((operation, attempt))
+        })
+        .await
+        .expect("verify the lost result ACK did not replay the native Task input");
+    assert_eq!(dispatch_after_lost_ack.0["result"]["outcome"], "applied");
+    assert_eq!(
+        dispatch_after_lost_ack.0["result"]["native_input_id"],
+        input_id
+    );
+    assert_eq!(
+        dispatch_after_lost_ack.1["producers"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
     let replacement_link = "bridge5-result-link-2";
     let replacement_boot = "bridge5-result-boot-2";
     owner
@@ -609,12 +775,12 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
         .call(
             replacement_module,
             "module.result".to_owned(),
-            json!({"operation_id":result_operation_id,"page":page}),
+            json!({"operation_id":lost_result_operation_id,"page":lost_page}),
         )
         .await
         .expect_err("a page from the replaced boot must not publish through the new link");
     assert_eq!(stale_page.code, "CLAUDE_RESULT_RETIRED_BOOT");
-    let operation_id_for_final_read = result_operation_id.clone();
+    let operation_id_for_final_read = lost_result_operation_id.clone();
     let final_operation = owner
         .store
         .run(move |db| super::operations::get_operation(db, &operation_id_for_final_read))
@@ -623,7 +789,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
     assert_eq!(final_operation["state"], "settled");
     assert_eq!(
         final_operation["result"]["details"]["artifact_ref"],
-        artifact_ref
+        lost_artifact_ref
     );
     Ok(())
 }

@@ -4,7 +4,7 @@ import { moduleReceipt } from './task-prompt.mjs';
 
 const MAX_RESULT_BYTES = 512_000;
 const MAX_PAGE_BYTES = 65_536;
-const MAX_RESULT_ATTEMPTS = 128;
+const MAX_UNCERTAIN_RESULT_ATTEMPTS = 128;
 const SHA256 = /^[0-9a-f]{64}$/;
 
 function fail(code, uncertain = false) {
@@ -167,6 +167,7 @@ export async function publishClaudeResultPage(
   identityContext,
   call,
   attempts,
+  resultJournal,
 ) {
   const page = buildClaudeResultPage(
     command,
@@ -175,17 +176,19 @@ export async function publishClaudeResultPage(
     moduleContract,
     identityContext,
   );
-  if (typeof call !== 'function' || !(attempts instanceof Map)) {
+  if (typeof call !== 'function' || !(attempts instanceof Map)
+      || !(resultJournal instanceof Map)) {
     throw fail('CLAUDE_RESULT_PUBLISHER_UNAVAILABLE');
   }
-  if (attempts.has(command.operation_id)) {
+  if (attempts.has(command.operation_id)
+      || resultJournal.get(command.operation_id)?.method === 'agent.result') {
     throw fail('CLAUDE_RESULT_PAGE_REPLAY_PREVENTED', true);
   }
-  if (attempts.size >= MAX_RESULT_ATTEMPTS) {
-    throw fail('CLAUDE_RESULT_ATTEMPT_CAPACITY');
+  if (attempts.size >= MAX_UNCERTAIN_RESULT_ATTEMPTS) {
+    throw fail('CLAUDE_RESULT_UNCERTAIN_CAPACITY');
   }
-  // The caller owns this boot-local map. Never evict an uncertain attempt:
-  // once marked, that Operation can never issue another module.result call.
+  // This caller-owned map holds only in-flight or ACK-uncertain Operations.
+  // Confirmed pages release the slot and converge into the existing journal.
   attempts.set(command.operation_id, true);
   let acknowledgement;
   try {
@@ -201,5 +204,35 @@ export async function publishClaudeResultPage(
       || !acknowledgement.artifact_ref.trim()) {
     throw fail('CLAUDE_RESULT_ACK_UNKNOWN', true);
   }
+  const origin = command.input.claude_result_origin;
+  resultJournal.delete(command.operation_id);
+  resultJournal.set(command.operation_id, {
+    method: 'agent.result',
+    outcome: 'applied',
+    completion_condition: 'result_page_recorded',
+    artifact_ref: acknowledgement.artifact_ref,
+    target_operation_id: origin.target_operation_id,
+    result_frame_uuid: page.source.result_frame_uuid,
+    bridge_boot_id: identityContext.bridgeBootId,
+  });
+  while (resultJournal.size > 128) resultJournal.delete(resultJournal.keys().next().value);
+  attempts.delete(command.operation_id);
   return { page, acknowledgement };
+}
+
+export function acknowledgeClaudeResultOutcome(
+  operationId,
+  journalEntry,
+  acknowledgement,
+  attempts,
+) {
+  if (!(attempts instanceof Map)
+      || journalEntry?.method !== 'agent.result'
+      || journalEntry.outcome !== 'unknown'
+      || acknowledgement?.recorded !== true
+      || acknowledgement.state !== 'settled'
+      || !(acknowledgement.superseded === true || acknowledgement.replayed === true)) {
+    return false;
+  }
+  return attempts.delete(operationId);
 }

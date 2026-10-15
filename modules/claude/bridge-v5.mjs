@@ -27,7 +27,9 @@ import {
   createStreamState, applySdkMessage, notePermissionRequest, noteStderr,
   noteStreamEnd, noteStreamFailure, resultSourceForInput, snapshot,
 } from './stream.mjs';
-import { publishClaudeResultPage } from './result-pages.mjs';
+import {
+  acknowledgeClaudeResultOutcome, publishClaudeResultPage,
+} from './result-pages.mjs';
 
 const SDK_VERSION = '0.3.287';
 const MODULE_ARTIFACT_ID = CLAUDE_TASK_PROMPT_ARTIFACT_ID;
@@ -210,7 +212,8 @@ async function publishResultPage(command) {
       || command.native_root_id !== sess.rootId) {
     throw codedError('NATIVE_SESSION_NOT_READY');
   }
-  if (sess.resultAttempts.has(command.operation_id)) {
+  if (sess.resultAttempts.has(command.operation_id)
+      || journal.get(command.operation_id)?.method === 'agent.result') {
     throw codedError('CLAUDE_RESULT_PAGE_REPLAY_PREVENTED', true);
   }
   const origin = command.input?.claude_result_origin;
@@ -220,7 +223,7 @@ async function publishResultPage(command) {
     origin?.native_session_id,
   );
   const link = control;
-  const { page, acknowledgement } = await publishClaudeResultPage(
+  await publishClaudeResultPage(
     command,
     source?.execution,
     source?.body,
@@ -232,16 +235,8 @@ async function publishResultPage(command) {
     },
     (method, input) => link.call(method, input),
     sess.resultAttempts,
+    journal,
   );
-  journal.set(command.operation_id, {
-    method: 'agent.result',
-    outcome: 'applied',
-    completion_condition: 'result_page_recorded',
-    artifact_ref: acknowledgement.artifact_ref,
-    target_operation_id: origin.target_operation_id,
-    result_frame_uuid: page.source.result_frame_uuid,
-    bridge_boot_id: bootId,
-  });
   while (journal.size > 128) journal.delete(journal.keys().next().value);
   changed();
 }
@@ -663,6 +658,7 @@ async function report(link = control) {
     if (ack?.recorded !== true) throw codedError('MODULE_OUTCOME_ACK_INVALID');
     // A native frame may have superseded this outcome while IPC awaited.
     if (outcomes.get(id) === outcome) {
+      acknowledgeClaudeResultOutcome(id, journal.get(id), ack, session?.resultAttempts);
       const acknowledgedIdentity = identityFromAcknowledgedOutcome(outcome);
       if (acknowledgedIdentity) {
         if (helloRetainedIdentity && !sameStoreIdentity(acknowledgedIdentity, helloRetainedIdentity)) {

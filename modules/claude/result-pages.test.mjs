@@ -3,7 +3,11 @@ import test from 'node:test';
 import {
   applySdkMessage, createStreamState, resultSourceForInput,
 } from './stream.mjs';
-import { buildClaudeResultPage, publishClaudeResultPage } from './result-pages.mjs';
+import {
+  acknowledgeClaudeResultOutcome,
+  buildClaudeResultPage,
+  publishClaudeResultPage,
+} from './result-pages.mjs';
 import { moduleReceipt, taskDispatchAdmission } from './task-prompt.mjs';
 
 const ARTIFACT_ID = 'claude-agent-sdk-0.3.287-bridge.5';
@@ -198,6 +202,7 @@ test('bridge.5 refuses ambiguous correlation, changed boot and unpageable result
 test('bridge.5 publishes once and retains the exact Store artifact ACK', async () => {
   const { command, execution } = fixture();
   const attempts = new Map();
+  const journal = new Map();
   let calls = 0;
   const published = await publishClaudeResultPage(
     command,
@@ -213,10 +218,13 @@ test('bridge.5 publishes once and retains the exact Store artifact ACK', async (
       return { recorded: true, artifact_ref: 'claude-result-artifact-1' };
     },
     attempts,
+    journal,
   );
 
   assert.equal(calls, 1);
+  assert.equal(attempts.size, 0);
   assert.equal(published.acknowledgement.artifact_ref, 'claude-result-artifact-1');
+  assert.equal(journal.get(command.operation_id).artifact_ref, 'claude-result-artifact-1');
   await assert.rejects(
     publishClaudeResultPage(
       command,
@@ -226,6 +234,7 @@ test('bridge.5 publishes once and retains the exact Store artifact ACK', async (
       IDENTITY,
       async () => { calls++; return published.acknowledgement; },
       attempts,
+      journal,
     ),
     error => error.diagnosticCode === 'CLAUDE_RESULT_PAGE_REPLAY_PREVENTED',
   );
@@ -235,6 +244,7 @@ test('bridge.5 publishes once and retains the exact Store artifact ACK', async (
 async function assertStoreAckUncertaintyDoesNotRetry(reply) {
   const { command, execution } = fixture();
   const attempts = new Map();
+  const journal = new Map();
   let calls = 0;
   const push = () => publishClaudeResultPage(
     command,
@@ -244,6 +254,7 @@ async function assertStoreAckUncertaintyDoesNotRetry(reply) {
     IDENTITY,
     async () => { calls++; return reply(); },
     attempts,
+    journal,
   );
   await assert.rejects(
     push(),
@@ -255,6 +266,8 @@ async function assertStoreAckUncertaintyDoesNotRetry(reply) {
     error => error.diagnosticCode === 'CLAUDE_RESULT_PAGE_REPLAY_PREVENTED',
   );
   assert.equal(calls, 1);
+  assert.equal(attempts.has(command.operation_id), true);
+  assert.equal(journal.has(command.operation_id), false);
 }
 
 test('bridge.5 maps a lost Store ACK to Unknown without another push', async () => {
@@ -265,4 +278,25 @@ test('bridge.5 maps a lost Store ACK to Unknown without another push', async () 
 
 test('bridge.5 maps a malformed Store ACK to Unknown without another push', async () => {
   await assertStoreAckUncertaintyDoesNotRetry(async () => ({ recorded: false }));
+});
+
+test('bridge.5 releases an uncertain attempt only after Store confirms it is superseded', () => {
+  const attempts = new Map([['result-op', true]]);
+  const journalEntry = { method: 'agent.result', outcome: 'unknown' };
+  assert.equal(acknowledgeClaudeResultOutcome(
+    'result-op',
+    journalEntry,
+    { recorded: true, superseded: true, state: 'settled' },
+    attempts,
+  ), true);
+  assert.equal(attempts.has('result-op'), false);
+
+  attempts.set('result-op', true);
+  assert.equal(acknowledgeClaudeResultOutcome(
+    'result-op',
+    journalEntry,
+    { recorded: true, state: 'outcome_unknown' },
+    attempts,
+  ), false);
+  assert.equal(attempts.has('result-op'), true);
 });

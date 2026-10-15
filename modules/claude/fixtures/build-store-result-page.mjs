@@ -3,7 +3,10 @@
 import { stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline';
 import { applySdkMessage, createStreamState, resultSourceForInput } from '../stream.mjs';
-import { publishClaudeResultPage } from '../result-pages.mjs';
+import {
+  acknowledgeClaudeResultOutcome, publishClaudeResultPage,
+} from '../result-pages.mjs';
+import { moduleReceipt } from '../task-prompt.mjs';
 
 const reader = createInterface({ input: stdin, crlfDelay: Infinity });
 const lines = reader[Symbol.asyncIterator]();
@@ -30,29 +33,74 @@ const resultSource = resultSourceForInput(
   origin.native_session_id,
 );
 const attempts = new Map();
+const journal = new Map();
+let resultCallCount = 0;
+let outcomeCallCount = 0;
 const callStore = async (method, args) => {
-  if (method !== 'module.result') throw new Error('FIXTURE_UNEXPECTED_STORE_METHOD');
-  stdout.write(`${JSON.stringify({ type: method, method, ...args })}\n`);
+  if (method === 'module.result') resultCallCount++;
+  else if (method === 'module.outcome') outcomeCallCount++;
+  else throw new Error('FIXTURE_UNEXPECTED_STORE_METHOD');
+  stdout.write(`${JSON.stringify({ type: method, method, args })}\n`);
   const replyLine = await lines.next();
   if (replyLine.done) throw new Error('FIXTURE_STORE_ACK_LOST');
   const reply = JSON.parse(replyLine.value);
+  if (reply.type === 'drop_ack' && method === 'module.result') {
+    throw new Error('FIXTURE_STORE_ACK_WITHHELD_AFTER_COMMIT');
+  }
   if (reply.type === 'error') throw new Error(`FIXTURE_STORE_REJECTED:${reply.code}`);
   if (reply.type !== 'ack') throw new Error('FIXTURE_STORE_ACK_INVALID');
   return reply.acknowledgement;
 };
-const published = await publishClaudeResultPage(
-  input.command,
-  resultSource?.execution,
-  resultSource?.body,
-  moduleContract,
-  {
-    bridgeBootId: origin.bridge_boot_id,
-    nativeRootId: origin.native_session_id,
-    nativeScopeKey: origin.native_scope_key,
-  },
-  callStore,
-  attempts,
-);
+
+let published = null;
+let resultFailure = null;
+let moduleOutcome = null;
+let moduleOutcomeAck = null;
+try {
+  published = await publishClaudeResultPage(
+    input.command,
+    resultSource?.execution,
+    resultSource?.body,
+    moduleContract,
+    {
+      bridgeBootId: origin.bridge_boot_id,
+      nativeRootId: origin.native_session_id,
+      nativeScopeKey: origin.native_scope_key,
+    },
+    callStore,
+    attempts,
+    journal,
+  );
+} catch (error) {
+  if (error?.diagnosticCode !== 'CLAUDE_RESULT_ACK_UNKNOWN'
+      || error.nativeAdmissionPossible !== true) throw error;
+  resultFailure = error;
+  moduleOutcome = {
+    operation_id: input.command.operation_id,
+    outcome: 'unknown',
+    native_root_id: origin.native_session_id,
+    native_scope_key: origin.native_scope_key,
+    details: {
+      module_receipt: moduleReceipt(input.command, moduleContract),
+      error_type: error.name,
+      diagnostic_code: error.diagnosticCode,
+    },
+  };
+  journal.set(input.command.operation_id, {
+    method: 'agent.result',
+    outcome: 'unknown',
+    completion_condition: null,
+    diagnostic_code: error.diagnosticCode,
+  });
+  moduleOutcomeAck = await callStore('module.outcome', moduleOutcome);
+  acknowledgeClaudeResultOutcome(
+    input.command.operation_id,
+    journal.get(input.command.operation_id),
+    moduleOutcomeAck,
+    attempts,
+  );
+}
+
 let replayCallCount = 0;
 try {
   await publishClaudeResultPage(
@@ -65,18 +113,29 @@ try {
       nativeRootId: origin.native_session_id,
       nativeScopeKey: origin.native_scope_key,
     },
-    async () => { replayCallCount++; return published.acknowledgement; },
+    async () => { replayCallCount++; return published?.acknowledgement; },
     attempts,
+    journal,
   );
   throw new Error('FIXTURE_RESULT_REPLAY_WAS_NOT_PREVENTED');
 } catch (error) {
   if (error?.diagnosticCode !== 'CLAUDE_RESULT_PAGE_REPLAY_PREVENTED') throw error;
 }
+
 stdout.write(`${JSON.stringify({
   type: 'terminal',
-  page: published.page,
-  execution: resultSource.execution,
-  acknowledgement: published.acknowledgement,
+  page: published?.page ?? null,
+  execution: resultSource?.execution ?? null,
+  result_ack: published?.acknowledgement ?? null,
+  result_failure: resultFailure
+    ? { diagnostic_code: resultFailure.diagnosticCode, native_admission_possible: resultFailure.nativeAdmissionPossible }
+    : null,
+  module_outcome: moduleOutcome,
+  module_outcome_ack: moduleOutcomeAck,
+  result_call_count: resultCallCount,
+  outcome_call_count: outcomeCallCount,
+  attempt_count: attempts.size,
+  journal_entry: journal.get(input.command.operation_id) ?? null,
   replay_call_count: replayCallCount,
 })}\n`);
 reader.close();
