@@ -241,7 +241,13 @@ pub(in crate::store) fn offline_mcp_packet_fixture(
 ) -> crate::error::Result<Value> {
     let fixture = packet_fixture();
     match proof {
-        Some(proof) => build_packet(&fixture.parent, &fixture.attempt, &fixture.binding, &proof),
+        Some(proof) => build_packet(
+            &fixture.parent,
+            &fixture.attempt,
+            &fixture.binding,
+            &proof,
+            SERVICE_ID,
+        ),
         None => Ok(fixture.proof),
     }
 }
@@ -304,6 +310,7 @@ fn packet_accepts_exact_server_scoped_participant_schemas_with_unknown_hooks() {
         &fixture.attempt,
         &fixture.binding,
         &fixture.proof,
+        SERVICE_ID,
     )
     .expect("accept the exact server-scoped Participant inventory");
 
@@ -317,6 +324,41 @@ fn packet_accepts_exact_server_scoped_participant_schemas_with_unknown_hooks() {
 }
 
 #[test]
+fn packet_uses_verified_per_launch_service_instead_of_configured_base_name() {
+    let fixture = packet_fixture();
+    assert_current_parent_tuple(&fixture);
+    let live_service_id = "fixture-native-mcp-service-826955d2099b96f4";
+    assert_eq!(
+        fixture.binding["route"]["owned_service"]["service_id"],
+        SERVICE_ID
+    );
+    let mut proof = fixture.proof;
+    proof["service"]["id"] = json!(live_service_id);
+    proof["capability"]["service_id"] = json!(live_service_id);
+
+    let packet = build_packet(
+        &fixture.parent,
+        &fixture.attempt,
+        &fixture.binding,
+        &proof,
+        live_service_id,
+    )
+    .expect("the current verified launch service is allowed to differ from its configured base");
+    assert_eq!(packet["capability"]["service_id"], live_service_id);
+
+    assert_capability_rejection(
+        build_packet(
+            &fixture.parent,
+            &fixture.attempt,
+            &fixture.binding,
+            &proof,
+            "another-verified-binding-service",
+        ),
+        "native provider/model differs from the explicit owned route",
+    );
+}
+
+#[test]
 fn packet_rejects_changed_core_tool_schema() {
     let fixture = packet_fixture();
     assert_current_parent_tuple(&fixture);
@@ -325,7 +367,13 @@ fn packet_rejects_changed_core_tool_schema() {
     refresh_synthetic_observation_digests(&mut proof);
 
     assert_capability_rejection(
-        build_packet(&fixture.parent, &fixture.attempt, &fixture.binding, &proof),
+        build_packet(
+            &fixture.parent,
+            &fixture.attempt,
+            &fixture.binding,
+            &proof,
+            SERVICE_ID,
+        ),
         "observed Participant tool schema differs from the canonical contract",
     );
 }
@@ -342,7 +390,13 @@ fn packet_rejects_missing_required_core_tool() {
     refresh_synthetic_observation_digests(&mut proof);
 
     assert_capability_rejection(
-        build_packet(&fixture.parent, &fixture.attempt, &fixture.binding, &proof),
+        build_packet(
+            &fixture.parent,
+            &fixture.attempt,
+            &fixture.binding,
+            &proof,
+            SERVICE_ID,
+        ),
         "required Participant tool is not observed",
     );
 }
@@ -360,7 +414,13 @@ fn packet_rejects_duplicate_server_scoped_tool() {
     refresh_synthetic_observation_digests(&mut proof);
 
     assert_capability_rejection(
-        build_packet(&fixture.parent, &fixture.attempt, &fixture.binding, &proof),
+        build_packet(
+            &fixture.parent,
+            &fixture.attempt,
+            &fixture.binding,
+            &proof,
+            SERVICE_ID,
+        ),
         "native inventory contains a duplicate or unscoped tool",
     );
 }
@@ -374,7 +434,13 @@ fn packet_rejects_tool_from_another_server() {
     refresh_synthetic_observation_digests(&mut proof);
 
     assert_capability_rejection(
-        build_packet(&fixture.parent, &fixture.attempt, &fixture.binding, &proof),
+        build_packet(
+            &fixture.parent,
+            &fixture.attempt,
+            &fixture.binding,
+            &proof,
+            SERVICE_ID,
+        ),
         "native inventory contains a duplicate or unscoped tool",
     );
 }
@@ -393,7 +459,13 @@ fn packet_rejects_server_prefixed_core_tool_name_without_mapping() {
     refresh_synthetic_observation_digests(&mut proof);
 
     assert_capability_rejection(
-        build_packet(&fixture.parent, &fixture.attempt, &fixture.binding, &proof),
+        build_packet(
+            &fixture.parent,
+            &fixture.attempt,
+            &fixture.binding,
+            &proof,
+            SERVICE_ID,
+        ),
         "required Participant tool is not observed",
     );
 }
@@ -406,7 +478,13 @@ fn packet_rejects_assignment_identity_mismatch() {
     proof["assignment"]["task_id"] = json!("another-task");
 
     assert_capability_rejection(
-        build_packet(&fixture.parent, &fixture.attempt, &fixture.binding, &proof),
+        build_packet(
+            &fixture.parent,
+            &fixture.attempt,
+            &fixture.binding,
+            &proof,
+            SERVICE_ID,
+        ),
         "native MCP proof is not current for this launch assignment",
     );
 }

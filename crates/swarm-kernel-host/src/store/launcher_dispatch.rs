@@ -92,7 +92,7 @@ pub(super) fn prepare_admission(
     let actor = super::launcher::dispatch_launch_actor(tx, &parent.operation_id, None)?;
     validate_dispatch_caller(tx, &actor, caller, attempt)?;
     let proof = require_current_dispatch_capability(tx, config, &parent.operation_id, None)?;
-    let packet = build_packet(&parent, attempt, binding, &proof)?;
+    let packet = build_current_packet(tx, config, &parent, attempt, binding, &proof)?;
     let packet_digest = digest_value(&packet)?;
     Ok(Some(LaunchDispatchAdmission {
         launch_operation_id: parent.operation_id,
@@ -309,7 +309,7 @@ pub(super) fn validate_before_effect(
         super::launcher::dispatch_launch_actor(tx, &parent.operation_id, Some(operation_id))?;
     let proof =
         require_current_dispatch_capability(tx, config, &parent.operation_id, Some(operation_id))?;
-    let current = build_packet(&parent, &attempt, binding, &proof)?;
+    let current = build_current_packet(tx, config, &parent, &attempt, binding, &proof)?;
     if model::canonical(&packet)? != model::canonical(&current)? {
         return Err(Error::new(
             "STALE_LAUNCH_DISPATCH_PACKET",
@@ -787,16 +787,39 @@ pub(super) fn require_current_dispatch_capability(
     antigravity_capability::require_current_session_proof(db, &binding)
 }
 
-fn build_packet(
+fn build_current_packet(
+    db: &Connection,
+    config: &Config,
     parent: &LaunchParent,
     attempt: &Value,
     binding: &Value,
     proof: &Value,
 ) -> Result<Value> {
     if proof["kind"] == antigravity_capability::ANTIGRAVITY_PROOF_KIND {
+        return build_packet(parent, attempt, binding, proof, "");
+    }
+    let owned = super::opencode::owned_service_for_binding(
+        db,
+        config,
+        model::text(binding, "binding_id")?,
+        model::positive(binding, "generation")?,
+    )?
+    .ok_or_else(|| stale_capability("current owned-service binding proof is missing"))?;
+    build_packet(parent, attempt, binding, proof, owned.service_id())
+}
+
+fn build_packet(
+    parent: &LaunchParent,
+    attempt: &Value,
+    binding: &Value,
+    proof: &Value,
+    owned_service_id: &str,
+) -> Result<Value> {
+    if proof["kind"] == antigravity_capability::ANTIGRAVITY_PROOF_KIND {
         return antigravity_capability::build_packet(parent, attempt, binding, proof);
     }
-    let capability_identity_digest = validate_capability_proof(parent, attempt, binding, proof)?;
+    let capability_identity_digest =
+        validate_capability_proof(parent, attempt, binding, proof, owned_service_id)?;
     let route_alias = launch_manifest_route_alias(&parent.manifest)?;
     let contracts = crate::mcp::participant_core_tool_contracts()?;
     let server_name = model::text(&proof["install"], "server_name")?;
@@ -993,6 +1016,7 @@ fn validate_capability_proof(
     attempt: &Value,
     binding: &Value,
     proof: &Value,
+    owned_service_id: &str,
 ) -> Result<String> {
     model::fields(
         proof,
@@ -1286,7 +1310,11 @@ fn validate_capability_proof(
         || model_ref["providerID"] != proof["model"]["provider_id"]
         || model_ref["id"] != proof["model"]["id"]
         || model_ref["variant"] != proof["model"]["variant"]
-        || owned["service_id"] != proof["service"]["id"]
+        // The configured ID is a base name. The verified binding owns the
+        // nonce-derived live service ID, which must match at both admission
+        // and the final pre-effect check.
+        || owned_service_id.is_empty()
+        || proof["service"]["id"].as_str() != Some(owned_service_id)
         || proof["service"]["version"] != "2.0.7"
     {
         return Err(stale_capability(
