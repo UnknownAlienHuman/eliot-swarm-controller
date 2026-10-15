@@ -237,7 +237,8 @@ pub(crate) enum ArtifactDomainIdentity {
 }
 
 const MAX_ASSEMBLY_READ_CACHE_ENTRIES: usize = 32;
-const MAX_ASSEMBLY_READ_CACHE_BYTES: usize = 16 * 1024 * 1024;
+// Resident-byte target; a single larger proof may be retained alone.
+const ASSEMBLY_READ_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const ASSEMBLY_CACHE_WATCHER_ACCOUNTING_BYTES_PER_DEPENDENCY: usize = 128;
 
 /// Immutable assembly proof shared by range/parts hotpaths. `sources` is the
@@ -477,15 +478,22 @@ fn insert_assembly_read_cache_entry(
     cache: &mut VecDeque<AssemblyReadCacheEntry>,
     entry: AssemblyReadCacheEntry,
 ) -> bool {
-    if entry.bytes > MAX_ASSEMBLY_READ_CACHE_BYTES {
-        return false;
+    if entry.bytes > ASSEMBLY_READ_CACHE_BUDGET_BYTES {
+        // The byte target is a cache policy, not an assembly admission rule.
+        // Keep one oversized proof alone so its source graph is not rebuilt on
+        // every range; any subsequent admission evicts it through normal LRU.
+        // With no assembly-size bound, this singleton can exceed the target by
+        // any amount, but it never co-resides with another cache entry.
+        cache.clear();
+        cache.push_back(entry);
+        return true;
     }
     let mut total_bytes = cache.iter().fold(0usize, |total, resident| {
         total.saturating_add(resident.bytes)
     });
     while !cache.is_empty()
         && (cache.len() >= MAX_ASSEMBLY_READ_CACHE_ENTRIES
-            || total_bytes.saturating_add(entry.bytes) > MAX_ASSEMBLY_READ_CACHE_BYTES)
+            || total_bytes.saturating_add(entry.bytes) > ASSEMBLY_READ_CACHE_BUDGET_BYTES)
     {
         let Some(removed) = cache.pop_front() else {
             return false;
@@ -515,9 +523,6 @@ fn cache_assembly_proof(
         entry.key.database_namespace != key.database_namespace
             || entry.key.artifact_id != key.artifact_id
     });
-    if bytes > MAX_ASSEMBLY_READ_CACHE_BYTES {
-        return Ok(());
-    }
     let guard = snapshot.guard();
     guard.watch(proof.cache_dependencies.iter().copied());
     let entry = AssemblyReadCacheEntry {
@@ -3005,7 +3010,7 @@ mod assembly_read_cache_budget_tests {
     }
 
     fn large_source_fixture() -> Vec<NativeResultSource> {
-        let count = MAX_ASSEMBLY_READ_CACHE_BYTES
+        let count = ASSEMBLY_READ_CACHE_BUDGET_BYTES
             .checked_div(size_of::<NativeResultSource>())
             .unwrap_or(0)
             .saturating_add(1);
@@ -3029,16 +3034,24 @@ mod assembly_read_cache_budget_tests {
     }
 
     #[test]
-    fn large_proof_is_not_resident_and_small_hot_entry_survives_fair_eviction() {
+    fn oversized_proof_is_a_singleton_and_next_admission_evicts_it() {
         let (_db, snapshots) = snapshots();
         let mut cache = VecDeque::new();
-        let half_budget = MAX_ASSEMBLY_READ_CACHE_BYTES / 2;
+        let half_budget = ASSEMBLY_READ_CACHE_BUDGET_BYTES / 2;
 
         let (cold, cold_guard) = cache_entry(&snapshots[0], Vec::new(), half_budget);
         let (hot, hot_guard) = cache_entry(&snapshots[1], Vec::new(), half_budget);
         assert!(insert_assembly_read_cache_entry(&mut cache, cold));
         assert!(insert_assembly_read_cache_entry(&mut cache, hot));
-        assert_eq!(resident_bytes(&cache), MAX_ASSEMBLY_READ_CACHE_BYTES);
+        assert_eq!(resident_bytes(&cache), ASSEMBLY_READ_CACHE_BUDGET_BYTES);
+
+        let (incoming, incoming_guard) = cache_entry(&snapshots[2], Vec::new(), half_budget);
+        assert!(insert_assembly_read_cache_entry(&mut cache, incoming));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(resident_bytes(&cache), ASSEMBLY_READ_CACHE_BUDGET_BYTES);
+        assert!(cold_guard.upgrade().is_none());
+        assert!(hot_guard.upgrade().is_some());
+        assert!(incoming_guard.upgrade().is_some());
 
         let large_sources = large_source_fixture();
         let large_proof = AssemblyProof {
@@ -3059,31 +3072,28 @@ mod assembly_read_cache_budget_tests {
         let large_key = assembly_read_cache_key(&large_record, &snapshots[3]).expect("large key");
         let large_bytes =
             estimated_assembly_read_cache_entry_bytes(&large_key, &large_record, &large_proof);
-        assert!(large_bytes > MAX_ASSEMBLY_READ_CACHE_BYTES);
+        assert!(large_bytes > ASSEMBLY_READ_CACHE_BUDGET_BYTES);
         let (large, large_guard) =
             cache_entry_with_proof(&snapshots[3], Arc::new(large_proof), large_bytes);
-        assert!(!insert_assembly_read_cache_entry(&mut cache, large));
-        assert_eq!(cache.len(), 2);
-        assert_eq!(resident_bytes(&cache), MAX_ASSEMBLY_READ_CACHE_BYTES);
-        assert!(large_guard.upgrade().is_none());
-        assert!(cold_guard.upgrade().is_some());
-        assert!(hot_guard.upgrade().is_some());
+        assert!(insert_assembly_read_cache_entry(&mut cache, large));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(resident_bytes(&cache), large_bytes);
+        assert!(large_guard.upgrade().is_some());
+        assert!(hot_guard.upgrade().is_none());
+        assert!(incoming_guard.upgrade().is_none());
 
-        let (incoming, _) = cache_entry(&snapshots[2], Vec::new(), half_budget);
-        assert!(insert_assembly_read_cache_entry(&mut cache, incoming));
-        assert_eq!(cache.len(), 2);
-        assert_eq!(resident_bytes(&cache), MAX_ASSEMBLY_READ_CACHE_BYTES);
+        let (small_after_large, _) = cache_entry(&snapshots[0], Vec::new(), half_budget);
+        assert!(insert_assembly_read_cache_entry(
+            &mut cache,
+            small_after_large
+        ));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(resident_bytes(&cache), half_budget);
+        assert!(large_guard.upgrade().is_none());
         assert!(
             cache
                 .iter()
-                .any(|entry| entry.key.artifact_id == "cache-hot")
+                .any(|entry| entry.key.artifact_id == "cache-cold")
         );
-        assert!(
-            cache
-                .iter()
-                .any(|entry| entry.key.artifact_id == "cache-incoming")
-        );
-        assert!(cold_guard.upgrade().is_none());
-        assert!(hot_guard.upgrade().is_some());
     }
 }
