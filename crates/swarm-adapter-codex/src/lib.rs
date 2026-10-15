@@ -9,6 +9,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     task::{Poll, Waker},
@@ -2412,6 +2413,7 @@ struct NativeServerIdentity {
     reported_version: String,
     reported_platform_family: String,
     reported_platform_os: String,
+    codex_home: String,
 }
 
 impl NativeServerIdentity {
@@ -2423,14 +2425,7 @@ impl NativeServerIdentity {
         let platform_family = initialize_text(&initialized.platform_family, 32)?;
         let platform_os = initialize_text(&initialized.platform_os, 32)?;
 
-        let absolute_home = match (platform_family, platform_os) {
-            ("windows", "windows") => is_absolute_windows_path(codex_home),
-            ("unix", "linux" | "macos") => codex_home.starts_with('/'),
-            _ => false,
-        };
-        if !absolute_home {
-            return None;
-        }
+        normalize_native_home_path(platform_family, platform_os, codex_home)?;
 
         // The installed response exposes userAgent, not MCP-style serverInfo.
         // Accept the CLI and Desktop product/version forms; trailing client
@@ -2442,7 +2437,38 @@ impl NativeServerIdentity {
             reported_version: reported_version.to_owned(),
             reported_platform_family: platform_family.to_owned(),
             reported_platform_os: platform_os.to_owned(),
+            codex_home: codex_home.to_owned(),
         })
+    }
+
+    fn native_scope_key(&self, endpoint: &Url) -> Option<String> {
+        if !is_local_app_server_endpoint(endpoint)
+            || self.reported_platform_family != env::consts::FAMILY
+            || self.reported_platform_os != env::consts::OS
+        {
+            return None;
+        }
+        let canonical_home = fs::canonicalize(&self.codex_home).ok()?;
+        if !canonical_home.is_dir() {
+            return None;
+        }
+        self.scope_key_for_home(canonical_home.to_str()?)
+    }
+
+    fn scope_key_for_home(&self, home: &str) -> Option<String> {
+        let codex_home = normalize_native_home_path(
+            &self.reported_platform_family,
+            &self.reported_platform_os,
+            home,
+        )?;
+        let identity = format!(
+            "codex-native-home-v1\0{}\0{}\0{}",
+            self.reported_platform_family, self.reported_platform_os, codex_home
+        );
+        Some(format!(
+            "codex-appserver-home:v1:{}",
+            digest_hex(identity.as_bytes())
+        ))
     }
 
     fn report(&self) -> Value {
@@ -2474,6 +2500,41 @@ fn initialize_text(value: &str, max_bytes: usize) -> Option<&str> {
 fn is_absolute_windows_path(path: &str) -> bool {
     let path = path.replace('/', "\\");
     strip_windows_namespace_prefix(&path).is_some_and(|path| is_absolute_windows_path_shape(&path))
+}
+
+fn normalize_native_home_path(
+    platform_family: &str,
+    platform_os: &str,
+    codex_home: &str,
+) -> Option<String> {
+    match (platform_family, platform_os) {
+        ("windows", "windows") if is_absolute_windows_path(codex_home) => {
+            normalize_windows_home_identity(codex_home)
+        }
+        ("unix", "linux" | "macos") => normalize_unix_path_identity(codex_home),
+        _ => None,
+    }
+}
+
+fn is_local_app_server_endpoint(endpoint: &Url) -> bool {
+    if !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = endpoint.host_str() else {
+        return false;
+    };
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    ip_host
+        .parse::<IpAddr>()
+        .map(|address| address.is_loopback())
+        .unwrap_or_else(|_| host.trim_end_matches('.').eq_ignore_ascii_case("localhost"))
 }
 
 fn is_absolute_windows_drive_path(path: &str) -> bool {
@@ -2514,8 +2575,7 @@ fn strip_windows_namespace_prefix(path: &str) -> Option<String> {
     None
 }
 
-#[cfg(windows)]
-fn normalize_windows_path_identity(path: &str) -> Option<String> {
+fn normalize_windows_home_identity(path: &str) -> Option<String> {
     let path = path.replace('/', "\\");
     let path = strip_windows_namespace_prefix(&path)?;
     if !is_absolute_windows_path_shape(&path) {
@@ -2531,6 +2591,11 @@ fn normalize_windows_path_identity(path: &str) -> Option<String> {
         normalized.pop();
     }
     Some(normalized)
+}
+
+#[cfg(windows)]
+fn normalize_windows_path_identity(path: &str) -> Option<String> {
+    normalize_windows_home_identity(path)
 }
 
 fn reported_codex_product_version(user_agent: &str) -> Option<(&str, &str)> {
@@ -2583,7 +2648,7 @@ struct NativeClient {
     demux: Arc<NativeRpcDemultiplexer>,
     events: NativeEventSink,
     reader_task: Option<tokio::task::JoinHandle<()>>,
-    endpoint_identity: String,
+    native_scope_key: Option<String>,
     server_identity: Option<NativeServerIdentity>,
 }
 
@@ -2794,12 +2859,6 @@ impl NativeClient {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(NativeError::EndpointInvalid);
         }
-        let mut safe = parsed.clone();
-        let _ = safe.set_username("");
-        let _ = safe.set_password(None);
-        safe.set_query(None);
-        safe.set_fragment(None);
-        let endpoint_identity = digest_hex(safe.as_str().as_bytes());
         let mut request = endpoint
             .into_client_request()
             .map_err(|_| NativeError::EndpointInvalid)?;
@@ -2838,7 +2897,7 @@ impl NativeClient {
             demux,
             events,
             reader_task: Some(reader_task),
-            endpoint_identity,
+            native_scope_key: None,
             server_identity: None,
         };
         let initialized = client
@@ -2855,10 +2914,16 @@ impl NativeClient {
             )
             .await?;
         client.server_identity = NativeServerIdentity::from_initialize_response(&initialized);
-        client
-            .events
-            .set_scope(client.scope_key())
-            .map_err(|_| NativeError::Protocol)?;
+        client.native_scope_key = client
+            .server_identity
+            .as_ref()
+            .and_then(|identity| identity.native_scope_key(&parsed));
+        if let Some(scope) = client.native_scope_key.clone() {
+            client
+                .events
+                .set_scope(scope)
+                .map_err(|_| NativeError::Protocol)?;
+        }
         client.notify("initialized", None).await?;
         if read_optional_account_state {
             // Optional subscription reads use this same authenticated connection.
@@ -2897,7 +2962,7 @@ impl NativeClient {
             demux,
             events,
             reader_task: None,
-            endpoint_identity: String::from("unavailable"),
+            native_scope_key: None,
             server_identity: None,
         }
     }
@@ -2926,25 +2991,12 @@ impl NativeClient {
         self.events.queue_event(NativeRpcEvent::NativeUsageChanged)
     }
 
-    fn scope_key(&self) -> String {
-        let (reported_product, reported_version) = self
-            .server_identity
-            .as_ref()
-            .map(|identity| {
-                (
-                    identity.reported_product.as_str(),
-                    identity.reported_version.as_str(),
-                )
-            })
-            .unwrap_or(("unknown-server", "unknown-version"));
-        format!(
-            "codex-appserver:{}:{}:{}",
-            self.endpoint_identity, reported_product, reported_version
-        )
+    fn scope_key(&self) -> Option<&str> {
+        self.native_scope_key.as_deref()
     }
 
     fn identity_is_known(&self) -> bool {
-        self.server_identity.is_some()
+        self.server_identity.is_some() && self.scope_key().is_some()
     }
 
     async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), NativeError> {
@@ -2980,6 +3032,7 @@ impl NativeClient {
             method,
             "initialize"
                 | "thread/start"
+                | "thread/resume"
                 | "thread/read"
                 | "thread/items/list"
                 | "thread/turns/list"
@@ -3212,12 +3265,39 @@ enum AssistantRead {
 }
 
 impl NativeClient {
+    async fn resume_thread(&mut self, thread_id: &str) -> Result<Value, NativeError> {
+        self.request(
+            "thread/resume",
+            json!({"threadId":thread_id,"excludeTurns":true}),
+        )
+        .await
+    }
+
     async fn read_thread(&mut self, thread_id: &str) -> Result<Value, NativeError> {
         self.request(
             "thread/read",
             json!({"threadId":thread_id,"includeTurns":false}),
         )
         .await
+    }
+
+    async fn thread_has_no_turns(&mut self, thread_id: &str) -> Result<bool, NativeError> {
+        let response = self
+            .request(
+                "thread/turns/list",
+                json!({"threadId":thread_id,"limit":1,"sortDirection":"desc"}),
+            )
+            .await?;
+        let turns = response
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(NativeError::Protocol)?;
+        let no_next_page = match response.get("nextCursor") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(cursor)) => cursor.is_empty(),
+            Some(_) => false,
+        };
+        Ok(turns.is_empty() && no_next_page)
     }
 
     async fn read_history(&mut self, thread_id: &str, client_id: &str) -> HistoryRead {
@@ -3596,17 +3676,20 @@ fn normalize_path(value: &str) -> Option<String> {
     }
     #[cfg(not(windows))]
     {
-        let path = Path::new(value);
-        if !path.is_absolute() {
-            return None;
-        }
-        let normalized = value.trim_end_matches('/');
-        Some(if normalized.is_empty() {
-            "/".to_owned()
-        } else {
-            normalized.to_owned()
-        })
+        normalize_unix_path_identity(value)
     }
+}
+
+fn normalize_unix_path_identity(value: &str) -> Option<String> {
+    if !value.starts_with('/') {
+        return None;
+    }
+    let normalized = value.trim_end_matches('/');
+    Some(if normalized.is_empty() {
+        "/".to_owned()
+    } else {
+        normalized.to_owned()
+    })
 }
 
 fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), &'static str> {
@@ -4668,7 +4751,7 @@ async fn reconcile_open(
             details,
         );
     };
-    if native.scope_key() != scope || !native.identity_is_known() {
+    if native.scope_key() != Some(scope) || !native.identity_is_known() {
         return outcome(
             operation_id,
             EffectOutcome::Unknown,
@@ -4677,6 +4760,42 @@ async fn reconcile_open(
             None,
             None,
             json!({"diagnostic_code":"NATIVE_SCOPE_CHANGED","native_replay":false}),
+        );
+    }
+    let resumed = match native.resume_thread(root).await {
+        Ok(response) => response,
+        Err(error) => {
+            let mut details = json!({
+                "diagnostic_code":error.diagnostic_code(),
+                "requested_model_provider":provider,
+                "requested_model":model,
+                "native_replay":false
+            });
+            with_native_failure_details(&mut details, &error, "thread_resume_reconciliation");
+            return outcome(
+                operation_id,
+                EffectOutcome::Unknown,
+                Some(root),
+                Some(scope),
+                None,
+                None,
+                details,
+            );
+        }
+    };
+    if resumed["thread"]["id"].as_str() != Some(root) {
+        return outcome(
+            operation_id,
+            EffectOutcome::Unknown,
+            Some(root),
+            Some(scope),
+            None,
+            None,
+            json!({
+                "diagnostic_code":"NATIVE_THREAD_IDENTITY_MISMATCH",
+                "native_thread_turns_readback":"not_run",
+                "native_replay":false
+            }),
         );
     }
     let thread = match native.read_thread(root).await {
@@ -4700,6 +4819,42 @@ async fn reconcile_open(
             );
         }
     };
+    match native.thread_has_no_turns(root).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return outcome(
+                operation_id,
+                EffectOutcome::Unknown,
+                Some(root),
+                Some(scope),
+                None,
+                None,
+                json!({
+                    "diagnostic_code":"NATIVE_THREAD_NOT_EMPTY",
+                    "native_thread_turns_readback":"not_empty",
+                    "native_replay":false
+                }),
+            );
+        }
+        Err(error) => {
+            let mut details = json!({
+                "diagnostic_code":error.diagnostic_code(),
+                "requested_model_provider":provider,
+                "requested_model":model,
+                "native_replay":false
+            });
+            with_native_failure_details(&mut details, &error, "thread_turn_readback_after_resume");
+            return outcome(
+                operation_id,
+                EffectOutcome::Unknown,
+                Some(root),
+                Some(scope),
+                None,
+                None,
+                details,
+            );
+        }
+    }
     let observed_cwd = thread["cwd"].as_str();
     let adoption = adopt_verified_root(journal, operation_id, scope, root, &thread);
     let exact = adoption.is_ok();
@@ -4709,6 +4864,7 @@ async fn reconcile_open(
         "native_replay": false,
         "requested_model_provider": provider,
         "requested_model": model,
+        "native_thread_turns_readback": "empty",
         "effective_model_provider": thread["modelProvider"],
         "effective_model": thread["model"],
         "effective_model_status": if exact { "thread_configuration_verified" } else { "unknown" },
@@ -4720,6 +4876,8 @@ async fn reconcile_open(
             "id": thread["id"],
             "model_provider": thread["modelProvider"],
             "model": thread["model"],
+            "reasoning_effort": thread["reasoningEffort"],
+            "reasoning_effort_is_turn_telemetry": false,
             "cwd": observed_cwd,
             "workspace_status": if observed_cwd.and_then(normalize_path) == normalize_path(workspace) { "workspace_exact" } else { "workspace_mismatch" },
         }
@@ -4965,7 +5123,10 @@ async fn open_operation(
             Some(&model),
         );
     }
-    let scope = native.scope_key();
+    let scope = native
+        .scope_key()
+        .expect("known native identity has a scope key")
+        .to_owned();
     let native_server_report = native
         .server_identity
         .as_ref()
@@ -5186,7 +5347,7 @@ async fn send_operation(
                 "GOAL_CONTINUATION_ADMISSION_INTENT_MISSING",
             );
         }
-        if journal.state.native_scope_key.as_deref() != Some(native.scope_key().as_str()) {
+        if journal.state.native_scope_key.as_deref() != native.scope_key() {
             return unknown_send(previous, &command.operation_id, "NATIVE_SCOPE_CHANGED");
         }
         return reconcile_send(native, previous, &command.operation_id).await;
@@ -5241,7 +5402,10 @@ async fn send_operation(
             Some(&model),
         );
     }
-    let scope = native.scope_key();
+    let scope = native
+        .scope_key()
+        .expect("known native identity has a scope key")
+        .to_owned();
     if journal.state.native_scope_key.as_deref() != Some(scope.as_str())
         || !native.identity_is_known()
     {
@@ -5508,7 +5672,7 @@ async fn reconcile_operation(
         let mut reconciled = None;
         if target_is_current {
             if !native.identity_is_known()
-                || journal.state.native_scope_key.as_deref() != Some(native.scope_key().as_str())
+                || journal.state.native_scope_key.as_deref() != native.scope_key()
             {
                 reconciled = Some(unknown_send(&target, target_id, "NATIVE_SCOPE_CHANGED"));
             } else {
@@ -6053,7 +6217,7 @@ async fn build_normalized_result_page(
     ) {
         return Err("CODEX_RESULT_NATIVE_SCOPE_CHANGED");
     }
-    if !native.identity_is_known() || native.scope_key() != native_scope_key {
+    if !native.identity_is_known() || native.scope_key() != Some(native_scope_key) {
         return Err("CODEX_RESULT_NATIVE_SCOPE_CHANGED");
     }
     let thread = native

@@ -1,5 +1,23 @@
-use super::NativeServerIdentity;
+use super::{NativeServerIdentity, Url};
 use serde_json::{Value, json};
+
+fn identity_for(
+    codex_home: &str,
+    user_agent: &str,
+    platform_family: &str,
+    platform_os: &str,
+) -> NativeServerIdentity {
+    let mut initialized: Value = serde_json::from_str(include_str!(
+        "../fixtures/codex-app-server-initialize-0.162.0-alpha.17.2.json"
+    ))
+    .expect("initialize fixture is valid JSON");
+    initialized["codexHome"] = json!(codex_home);
+    initialized["userAgent"] = json!(user_agent);
+    initialized["platformFamily"] = json!(platform_family);
+    initialized["platformOs"] = json!(platform_os);
+    NativeServerIdentity::from_initialize_response(&initialized)
+        .expect("initialize identity is supported")
+}
 
 #[test]
 fn codex_desktop_initialize_fixture_accepts_supported_contract_and_fails_closed() {
@@ -86,6 +104,181 @@ fn codex_desktop_initialize_fixture_accepts_supported_contract_and_fails_closed(
     assert!(!super::is_absolute_windows_path("//"));
     assert!(super::is_absolute_windows_path(r"C:\Users\fixture\.codex"));
     assert!(super::is_absolute_windows_path(r"\\server\share\codex"));
+}
+
+#[test]
+fn native_scope_key_uses_store_home_across_local_endpoint_aliases() {
+    let home = r"C:\SwarmFixture\codex-home";
+    let desktop = identity_for(
+        home,
+        "Codex Desktop/0.162.0-alpha.17.2 (Windows; x86_64)",
+        "windows",
+        "windows",
+    );
+    let cli = identity_for(
+        home,
+        "Codex CLI/0.163.0 (Windows; x86_64)",
+        "windows",
+        "windows",
+    );
+    let first_endpoint = Url::parse("ws://127.0.0.1:4500").unwrap();
+    let alias_endpoint = Url::parse("wss://localhost:4501/app-server").unwrap();
+    assert!(super::is_local_app_server_endpoint(&first_endpoint));
+    assert!(super::is_local_app_server_endpoint(&alias_endpoint));
+    let first_scope = desktop.scope_key_for_home(home).unwrap();
+    assert_eq!(first_scope, cli.scope_key_for_home(home).unwrap());
+
+    let independent_store = identity_for(
+        r"C:\SwarmFixture\other-codex-home",
+        "Codex Desktop/0.162.0-alpha.17.2 (Windows; x86_64)",
+        "windows",
+        "windows",
+    );
+    assert_ne!(
+        first_scope,
+        independent_store
+            .scope_key_for_home(&independent_store.codex_home)
+            .unwrap()
+    );
+}
+
+#[test]
+fn native_scope_key_normalizes_windows_unc_and_extended_path_aliases() {
+    let extended = identity_for(
+        r"\\?\UNC\Server\Share\CodexHome\",
+        "Codex Desktop/0.162.0-alpha.17.2 (Windows; x86_64)",
+        "windows",
+        "windows",
+    );
+    let plain = identity_for(
+        r"\\server\share\codexhome",
+        "Codex Desktop/0.162.0-alpha.17.2 (Windows; x86_64)",
+        "windows",
+        "windows",
+    );
+    assert_eq!(
+        extended.scope_key_for_home(&extended.codex_home),
+        plain.scope_key_for_home(&plain.codex_home)
+    );
+
+    let other_share = identity_for(
+        r"\\server\other-share\codexhome",
+        "Codex Desktop/0.162.0-alpha.17.2 (Windows; x86_64)",
+        "windows",
+        "windows",
+    );
+    assert_ne!(
+        extended.scope_key_for_home(&extended.codex_home),
+        other_share.scope_key_for_home(&other_share.codex_home)
+    );
+}
+
+#[test]
+fn native_scope_key_preserves_unix_home_case_and_rejects_remote_endpoint_identity() {
+    let mixed_case = identity_for(
+        "/home/SwarmFixture/.codex/",
+        "Codex Desktop/0.162.0-alpha.17.2 (Linux; x86_64)",
+        "unix",
+        "linux",
+    );
+    let same_store = identity_for(
+        "/home/SwarmFixture/.codex",
+        "Codex Desktop/0.162.0-alpha.17.2 (Linux; x86_64)",
+        "unix",
+        "linux",
+    );
+    let different_case = identity_for(
+        "/home/swarmfixture/.codex",
+        "Codex Desktop/0.162.0-alpha.17.2 (Linux; x86_64)",
+        "unix",
+        "linux",
+    );
+    let local_endpoint = Url::parse("ws://[::1]:4500").unwrap();
+    assert!(super::is_local_app_server_endpoint(&local_endpoint));
+    let scope = mixed_case
+        .scope_key_for_home(&mixed_case.codex_home)
+        .unwrap();
+    assert_eq!(
+        Some(scope.as_str()),
+        same_store
+            .scope_key_for_home(&same_store.codex_home)
+            .as_deref()
+    );
+    assert_ne!(
+        Some(scope.as_str()),
+        different_case
+            .scope_key_for_home(&different_case.codex_home)
+            .as_deref()
+    );
+
+    let remote_endpoint = Url::parse("wss://codex.example:4500").unwrap();
+    assert_eq!(None, mixed_case.native_scope_key(&remote_endpoint));
+    let query_endpoint = Url::parse("ws://localhost:4500?token=opaque").unwrap();
+    assert_eq!(None, mixed_case.native_scope_key(&query_endpoint));
+}
+
+#[test]
+fn native_scope_key_requires_a_local_directory_and_resolves_home_path_aliases() {
+    let directory = std::env::temp_dir().join(format!("swarm-codex-home-{}", uuid::Uuid::new_v4()));
+    let home = directory.join("store");
+    let child = directory.join("child");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir(&child).unwrap();
+    let home_text = home.to_str().unwrap();
+    let identity = identity_for(
+        home_text,
+        "Codex CLI/0.163.0 (fixture)",
+        std::env::consts::FAMILY,
+        std::env::consts::OS,
+    );
+    let alias = child.join("..").join("store");
+    let alias_identity = identity_for(
+        alias.to_str().unwrap(),
+        "Codex Desktop/0.162.0 (fixture)",
+        std::env::consts::FAMILY,
+        std::env::consts::OS,
+    );
+    let endpoint = Url::parse("ws://127.0.0.1:4500").unwrap();
+    let alias_endpoint = Url::parse("ws://localhost:4501/app-server").unwrap();
+    let scope = identity.native_scope_key(&endpoint).unwrap();
+    assert_eq!(
+        Some(scope.as_str()),
+        alias_identity.native_scope_key(&alias_endpoint).as_deref()
+    );
+    let missing = identity_for(
+        directory.join("missing").to_str().unwrap(),
+        "Codex CLI/0.163.0",
+        std::env::consts::FAMILY,
+        std::env::consts::OS,
+    );
+    assert!(missing.native_scope_key(&endpoint).is_none());
+    let file = directory.join("not-a-home");
+    std::fs::write(&file, b"fixture").unwrap();
+    let file_identity = identity_for(
+        file.to_str().unwrap(),
+        "Codex CLI/0.163.0",
+        std::env::consts::FAMILY,
+        std::env::consts::OS,
+    );
+    assert!(file_identity.native_scope_key(&endpoint).is_none());
+    assert!(
+        identity
+            .native_scope_key(&Url::parse("ws://remote.example:4500").unwrap())
+            .is_none()
+    );
+    let foreign_platform = if cfg!(windows) {
+        ("unix", "linux", "/")
+    } else {
+        ("windows", "windows", "C:\\")
+    };
+    let foreign = identity_for(
+        foreign_platform.2,
+        "Codex CLI/0.163.0",
+        foreign_platform.0,
+        foreign_platform.1,
+    );
+    assert!(foreign.native_scope_key(&endpoint).is_none());
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[cfg(windows)]

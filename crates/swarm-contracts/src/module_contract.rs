@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 pub const MODULE_PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const CODEX_RUST_CONTROLLER_ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "6";
+pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "8";
 pub const RUNTIME_COMMAND_SCHEMA_ID: &str = "swarm.runtime_command";
 pub const RUNTIME_OUTCOME_SCHEMA_ID: &str = "swarm.runtime_outcome";
 pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
@@ -316,12 +316,19 @@ impl ModuleContractTemplate {
     /// continuation admission and terminal evidence receipts.
     pub fn codex_rust_controller_v6() -> Result<Self, CatalogError> {
         let mut template = Self::codex_rust_controller_v5()?;
-        template.artifact.version =
-            ArtifactVersion::new(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION)?;
+        template.artifact.version = ArtifactVersion::new("6")?;
         template.event_schemas.extend([
             goal_continuation_admission_schema(),
             goal_terminal_evidence_schema(),
         ]);
+        Ok(template)
+    }
+
+    /// New immutable artifact version carrying the current Codex contract.
+    pub fn codex_rust_controller_v8() -> Result<Self, CatalogError> {
+        let mut template = Self::codex_rust_controller_v6()?;
+        template.artifact.version =
+            ArtifactVersion::new(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION)?;
         Ok(template)
     }
 
@@ -495,9 +502,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_goal_receipt_schemas_are_additive_in_current_descriptor_v6() {
+    fn codex_goal_receipt_schemas_are_additive_in_current_descriptor_v8() {
         let v5 = ModuleContractTemplate::codex_rust_controller_v5().unwrap();
         let v6 = ModuleContractTemplate::codex_rust_controller_v6().unwrap();
+        let v8 = ModuleContractTemplate::codex_rust_controller_v8().unwrap();
         let continuation = goal_continuation_admission_schema();
         let terminal = goal_terminal_evidence_schema();
 
@@ -505,13 +513,18 @@ mod tests {
             v6.artifact.artifact_id.as_str(),
             CODEX_RUST_CONTROLLER_ARTIFACT_ID
         );
+        assert_eq!(v6.artifact.version.as_str(), "6");
+        assert_eq!(v8.artifact.version.as_str(), "8");
         assert_eq!(
-            v6.artifact.version.as_str(),
+            v8.artifact.version.as_str(),
             CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
         );
+        assert_eq!(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION, "8");
         assert!(!v5.event_schemas.contains(&continuation));
         assert!(!v5.event_schemas.contains(&terminal));
         assert!(v6.event_schemas.contains(&continuation));
         assert!(v6.event_schemas.contains(&terminal));
+        assert!(v8.event_schemas.contains(&continuation));
+        assert!(v8.event_schemas.contains(&terminal));
     }
 }
