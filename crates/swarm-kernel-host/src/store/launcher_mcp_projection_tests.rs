@@ -104,7 +104,7 @@ fn actual_mcp_producer_roundtrips_through_store_consumer_and_admission() {
         "challenge":{"state":"observed","metadata":metadata},
         "tools_readback":retained_tools,
     });
-    let capability = super::validate_connection_record(&record, &facts, None, || Ok(None)).unwrap();
+    let capability = super::validate_connection_record(&record, &facts, None).unwrap();
     let packet = offline_mcp_packet_fixture(Some(capability)).unwrap();
     assert_eq!(packet["capability"]["session_context_state"], "unknown");
     assert_eq!(packet["capability"]["provider_request_state"], "unknown");
@@ -119,7 +119,7 @@ fn actual_mcp_producer_roundtrips_through_store_consumer_and_admission() {
     let mut evidence = record["tools_readback"].clone();
     evidence.as_object_mut().unwrap().remove("evidence_digest");
     record["tools_readback"]["evidence_digest"] = json!(digest_json(&evidence).unwrap());
-    assert!(super::validate_connection_record(&record, &facts, None, || Ok(None)).is_err());
+    assert!(super::validate_connection_record(&record, &facts, None).is_err());
 }
 
 fn challenge() -> Value {

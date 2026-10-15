@@ -57,7 +57,7 @@
       "type": "session.created",
       "durable": {
         "aggregateID": "ses_swarm_fixture",
-        "seq": 1,
+        "seq": 0,
         "version": 1
       },
       "data": {
@@ -137,5 +137,26 @@
     "agents": [],
     "skills": [],
     "type": "user"
+  },
+  "assistantMessage": {
+    "id": "msg_fixture_assistant",
+    "type": "assistant",
+    "agent": "build",
+    "model": {
+      "id": "fixture-model",
+      "providerID": "opencode",
+      "variant": "fixture-variant"
+    },
+    "time": {
+      "created": 124,
+      "completed": 125
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "Exact selected assistant body"
+      }
+    ],
+    "finish": "stop"
   }
 }

@@ -18,9 +18,10 @@ use swarm_contracts::{
 use swarm_kernel_host::{
     config::{Config as HostConfig, McpProfileConfig, McpToolProfile, Route},
     forge::ForgeProject,
-    platform::{load_credential, private_owned_directory, private_permissions},
+    platform::{load_credential, private_owned_directory},
     workspace::WorkspaceProjectConfig,
 };
+use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 
 type FixtureResult<T> = std::result::Result<T, String>;
 
@@ -32,6 +33,25 @@ const ROUTE_ALIAS: &str = "app320-connected-fixture";
 const PROJECT_ID: &str = "app320-owned-launch";
 const HOST_CHILD: &str = "app320_connected_consumer::app320_host_startup_child";
 const ADAPTER_CHILD: &str = "app320_connected_consumer::app320_owned_adapter_child";
+const FAKE_NATIVE_VERSION: &str = "2.0.7";
+
+#[derive(Clone)]
+struct ExternalNativeRegistration {
+    url: String,
+    pid: u32,
+    version: String,
+}
+
+struct ExternalNativeProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    registration_file: PathBuf,
+    observation_file: PathBuf,
+    stop_file: PathBuf,
+    pid: u32,
+    url: String,
+    version: String,
+}
 
 #[derive(serde::Serialize)]
 struct CaseEvidence {
@@ -40,23 +60,182 @@ struct CaseEvidence {
     binding_id: String,
     generation: i64,
     workspace_directory: PathBuf,
-    owner_nonce: String,
+    native_pid: u32,
+    native_url: String,
+    native_version: String,
     outcome: Value,
     operation_readback: Value,
     observed_outcomes: Vec<Value>,
     acknowledged_sha256: String,
     pending_count: usize,
-    key_posts: u64,
     root_posts: u64,
     connection_absent: bool,
-    child_released: bool,
+    native_listener_gone: bool,
+    external_process_alive_after_adapter_stop: bool,
+    native_stop_confirmed: bool,
     ipc_listener_gone: bool,
 }
 
-#[tokio::test]
-async fn app320_provider_auth_survives_real_store_outcome_ack_for_both_failures() {
-    run_case(false).await.unwrap();
-    run_case(true).await.unwrap();
+fn read_external_registration(path: &Path) -> FixtureResult<ExternalNativeRegistration> {
+    let value: Value =
+        serde_json::from_slice(&fs::read(path).map_err(display)?).map_err(display)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "external native registration is not an object".to_owned())?;
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| "external native registration omitted url".to_owned())?
+        .to_owned();
+    let parsed = reqwest::Url::parse(&url).map_err(display)?;
+    if parsed.scheme() != "http"
+        || !matches!(parsed.host_str(), Some("127.0.0.1") | Some("localhost"))
+        || parsed.port().is_none()
+    {
+        return Err("external native registration url is not a loopback HTTP endpoint".to_owned());
+    }
+    let pid = object
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "external native registration omitted a valid pid".to_owned())?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|version| {
+            !version.is_empty()
+                && version.len() <= 64
+                && !version.bytes().any(|byte| byte.is_ascii_control())
+        })
+        .ok_or_else(|| "external native registration omitted version".to_owned())?
+        .to_owned();
+    if let Some(password) = object.get("password")
+        && !password.is_string()
+    {
+        return Err("external native registration password is not a string".to_owned());
+    }
+    Ok(ExternalNativeRegistration { url, pid, version })
+}
+
+async fn spawn_external_native(
+    bun: &Path,
+    server_program: &Path,
+    state_root: &Path,
+    registration_file: &Path,
+    workspace_directory: &Path,
+) -> FixtureResult<ExternalNativeProcess> {
+    let password = format!("app299-native-{}", uuid::Uuid::new_v4().simple());
+    let mut child = TokioCommand::new(bun)
+        .arg(server_program)
+        .arg("--state-root")
+        .arg(state_root)
+        .arg("--registration-file")
+        .arg(registration_file)
+        .arg("--workspace-directory")
+        .arg(workspace_directory)
+        .arg("--port")
+        .arg("0")
+        .env("ELIOT_APP299_FAKE_HTTP_PASSWORD", password)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(false)
+        .spawn()
+        .map_err(display)?;
+    let pid = match child.id() {
+        Some(pid) => pid,
+        None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("external fake native process did not expose its pid".to_owned());
+        }
+    };
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("external fake native process stdin is unavailable".to_owned());
+        }
+    };
+    let registration_result = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(status) = child.try_wait().map_err(display)? {
+                return Err(format!(
+                    "external fake native process exited before registration: {status}"
+                ));
+            }
+            if let Ok(registration) = read_external_registration(registration_file)
+                && registration.pid == pid
+                && registration.version == FAKE_NATIVE_VERSION
+            {
+                break Ok::<_, String>(registration);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let registration = match registration_result {
+        Ok(Ok(registration)) => registration,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("external fake native process did not publish registration".to_owned());
+        }
+    };
+    Ok(ExternalNativeProcess {
+        child,
+        stdin: Some(stdin),
+        registration_file: registration_file.to_owned(),
+        observation_file: state_root.join("fixture-observation.json"),
+        stop_file: state_root.join("stop.json"),
+        pid,
+        url: registration.url,
+        version: registration.version,
+    })
+}
+
+async fn stop_external_native(native: &mut ExternalNativeProcess) -> FixtureResult<Value> {
+    drop(native.stdin.take());
+    let status = match tokio::time::timeout(Duration::from_secs(60), native.child.wait()).await {
+        Ok(status) => status.map_err(display)?,
+        Err(_) => {
+            // This is the exact fake child created by this fixture, not the
+            // user's registered service. Failure cleanup never proves success.
+            native.child.kill().await.map_err(display)?;
+            native.child.wait().await.map_err(display)?;
+            return Err(
+                "external fake native process required forced cleanup after EOF".to_owned(),
+            );
+        }
+    };
+    if !status.success() {
+        return Err(format!(
+            "external fake native process exited unsuccessfully: {status}"
+        ));
+    }
+    let stop: Value =
+        serde_json::from_slice(&fs::read(&native.stop_file).map_err(display)?).map_err(display)?;
+    let connection_absent = matches!(
+        fs::symlink_metadata(&native.registration_file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if !connection_absent
+        || stop["status"] != json!("stopped")
+        || stop["pid"] != json!(native.pid)
+        || stop["connection_absent"] != json!(true)
+        || stop["process_exit_code"] != json!(0)
+    {
+        return Err("external fake native stop receipt is not for the exact process".to_owned());
+    }
+    Ok(stop)
 }
 
 // These ignored helpers are subprocess roles, not independently qualifying tests.
@@ -185,7 +364,13 @@ async fn app320_owned_adapter_child() {
     let evidence = match &result {
         Ok(evidence) => serde_json::to_value(evidence).unwrap(),
         // Never print/store an arbitrary native error, credential or auth path.
-        Err(_) => json!({"fixture_failure":"APP320_OWNED_COMPOSITION_FAILED"}),
+        Err(_) => {
+            let phase = fs::read(evidence_path.with_file_name("adapter-startup-diagnostic.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .unwrap_or(Value::Null);
+            json!({"fixture_failure":"APP320_EXTERNAL_COMPOSITION_FAILED","phase":phase["phase"],"code":phase["code"]})
+        }
     };
     let mut output = fs::OpenOptions::new()
         .write(true)
@@ -203,15 +388,11 @@ async fn app320_owned_adapter_child() {
     );
 }
 
-async fn run_case(invalid_model_catalog: bool) -> FixtureResult<()> {
-    run_connected_case(invalid_model_catalog, false).await
-}
-
 pub(super) async fn run_app299_case() -> std::result::Result<(), String> {
-    run_connected_case(false, true).await
+    run_connected_case().await
 }
 
-async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> FixtureResult<()> {
+async fn run_connected_case() -> FixtureResult<()> {
     let scratch = unique_directory("eliot-app320-owned-connected")?;
     private_owned_directory(&scratch).map_err(display)?;
     let host_data_dir = scratch.join("host");
@@ -263,23 +444,9 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
         ],
     )?;
 
-    let auth_source = scratch.join("auth.json");
-    let provider_key = format!("app320-fixture-key-{}", uuid::Uuid::new_v4());
-    fs::write(
-        &auth_source,
-        serde_json::to_vec(&json!({
-            "openai":{"type":"api","key":provider_key}
-        }))
-        .map_err(display)?,
-    )
-    .map_err(display)?;
-    private_permissions(&auth_source, false).map_err(display)?;
     let bun_executable = configured_bun()?;
     let install_root = scratch.join("native-install");
-    let server_sha256 = write_installed_closure(
-        &install_root,
-        &test_server_source(invalid_model_catalog, app299_tasks),
-    )?;
+    let _ = write_installed_closure(&install_root, &test_server_source())?;
     let host_executable =
         install_root.join(format!("swarm-kernel-host{}", std::env::consts::EXE_SUFFIX));
     let supervisor = configured_binary("ELIOT_OPENCODE_TEST_SUPERVISOR")?;
@@ -290,14 +457,15 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
     )
     .map_err(display)?;
     let native_base = scratch.join("native-state");
+    fs::create_dir(&native_base).map_err(display)?;
+    private_owned_directory(&native_base).map_err(display)?;
+    let native_connection_file = native_base.join("connection.json");
     let evidence_file = scratch.join("case-evidence.json");
     let case_file = scratch.join("case.json");
 
     fs::write(
         &case_file,
         serde_json::to_vec(&json!({
-            "invalid_model_catalog":invalid_model_catalog,
-            "app299_tasks":app299_tasks,
             "evidence_file":evidence_file,
             "admission_file":scratch.join("admission-evidence.json"),
             "execute_file":scratch.join("execute-after-public-readback"),
@@ -343,49 +511,41 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
         runtime: RUNTIME.to_owned(),
         module_artifact_id: ARTIFACT_ID.to_owned(),
         enabled: true,
-        native_options: json!({"directory":repository}),
+        native_options: json!({
+            "service_id":format!("app299-{}", uuid::Uuid::new_v4().simple()),
+            "connection_file":native_connection_file,
+            "directory":repository,
+            "model":{
+                "id":"fixture-model",
+                "providerID":"openai",
+                "variant":"fixture-variant"
+            }
+        }),
         workspace_option: Some("directory".to_owned()),
         admission_policy: None,
-        owned_service: Some(
-            serde_json::from_value(json!({
-                "origin":"fresh_owned_service",
-                "service_id":format!("app320-{}", uuid::Uuid::new_v4().simple()),
-                "model":{"id":"fixture-model","providerID":"openai","variant":"fixture-variant"},
-                "model_catalog":"offline",
-                "credential_ref":"credential:app320-fixture",
-                "bun_executable":bun_executable,
-                "bun_sha256":sha256_file(&bun_executable)?,
-                "server_program":install_root.join("resources/modules/opencode/serve.mjs"),
-                "server_program_sha256":server_sha256,
-                "state_root":scratch.join("native-state"),
-                "port":0
-            }))
-            .map_err(display)?,
-        ),
+        owned_service: None,
     });
     config.module_supervisor.enabled = true;
-    config.module_supervisor.install_root = Some(install_root);
+    config.module_supervisor.install_root = Some(install_root.clone());
     config.module_supervisor.descriptor_files = vec![descriptor_file];
     config.module_supervisor.owner_helper_sha256 = Some(sha256_file(&owner_helper)?);
     config.module_supervisor.owner_helper = Some(owner_helper);
-    config
-        .module_supervisor
-        .protected_files
-        .insert("credential:app320-fixture".to_owned(), auth_source.clone());
-    let mut config_value = serde_json::to_value(&config).map_err(display)?;
-    // These local authorized path references are intentionally skip_serializing
-    // in Config. Retain them explicitly in the private fixture startup input,
-    // never in the descriptor, Store metadata, evidence or console output.
-    config_value["opencode_provider_auth_sources"] = json!({
-        "credential:app320-fixture":{"provider_id":"openai","auth_file":auth_source}
-    });
+    let config_value = serde_json::to_value(&config).map_err(display)?;
     let config_file = scratch.join("host-config.json");
     fs::write(
         &config_file,
         serde_json::to_vec(&config_value).map_err(display)?,
     )
     .map_err(display)?;
-    let mut host = tokio::process::Command::new(&host_executable)
+    let mut external_native = spawn_external_native(
+        &bun_executable,
+        &install_root.join("resources/modules/opencode/serve.mjs"),
+        &native_base,
+        &native_connection_file,
+        &repository,
+    )
+    .await?;
+    let mut host = match tokio::process::Command::new(&host_executable)
         .args(["--exact", HOST_CHILD, "--ignored", "--nocapture"])
         .env("ELIOT_APP320_HOST_CONFIG", &config_file)
         .stdin(Stdio::piped())
@@ -393,11 +553,23 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
         .stderr(Stdio::null())
         .kill_on_drop(false)
         .spawn()
-        .map_err(display)?;
-    let host_stdin = host
-        .stdin
-        .take()
-        .ok_or_else(|| "host child stdin is unavailable".to_owned())?;
+    {
+        Ok(host) => host,
+        Err(error) => {
+            let _ = stop_external_native(&mut external_native).await;
+            return Err(display(error));
+        }
+    };
+    let host_stdin = match host.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let _ = host.kill().await;
+            let _ = host.wait().await;
+            let _ = stop_external_native(&mut external_native).await;
+            return Err("host child stdin is unavailable".to_owned());
+        }
+    };
+    let mut app299_client = None;
     let execution = async {
         let operator = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -437,14 +609,12 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
         if !catalog["catalog_revision"].is_number() {
             return Err("actual catalog omitted its revision".to_owned());
         }
-        let mut app299_client = None;
-        let (task, launch_id, launch_readback, admission, app299_operation_id) =
-            if app299_tasks {
+        let (task, launch_id, launch_readback, admission) = {
                 // Use the supported launcher producer to establish exact Task/Attempt/lease provenance.
                 // The first child admission is the public launcher IPC operation, not an MCP agent_open.
                 let task = call_host(&host_data_dir, &operator, "task.create", json!({
                     "client_request_id":uuid::Uuid::new_v4().to_string(),"project_id":PROJECT_ID,
-                    "spec":{"objective":"Retain provider-auth proof after owned native failure",
+                    "spec":{"objective":"Create and acknowledge a native session",
                         "phase":"implementation","requirements":[{"id":"R1","statement":"Retain exact post-effect evidence"}],
                         "scope":{"initial_paths":["src/target.rs"]},"owner_policy_id":"owner-policy-v1"}
                 })).await?;
@@ -475,7 +645,8 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
                             break Ok::<_, String>(value);
                         }
                         if evidence_file.is_file() {
-                            return Err("APP299 adapter failed before launch-child readback".to_owned());
+                            let evidence: Value = serde_json::from_slice(&fs::read(&evidence_file).map_err(display)?).map_err(display)?;
+                            return Err(format!("APP299 adapter failed before launch-child readback; phase={},code={}", evidence["phase"].as_str().unwrap_or("unknown"), evidence["code"].as_str().unwrap_or("UNOBSERVED")));
                         }
                         if host.try_wait().map_err(display)?.is_some() {
                             return Err("host exited before APP299 launch-child admission".to_owned());
@@ -556,57 +727,7 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
                     launch_id,
                     launch_readback,
                     admission,
-                    Some(operation_id),
                 )
-            } else {
-                let task = call_host(&host_data_dir, &operator, "task.create", json!({
-                    "client_request_id":uuid::Uuid::new_v4().to_string(),"project_id":PROJECT_ID,
-                    "spec":{"objective":"Retain provider-auth proof after owned native failure",
-                        "phase":"implementation","requirements":[{"id":"R1","statement":"Retain exact post-effect evidence"}],
-                        "scope":{"initial_paths":["src/target.rs"]},"owner_policy_id":"owner-policy-v1"}
-                })).await?;
-                let mut request = json!({
-                    "task_id":task["task_id"],"expected_task_revision":1,"route":ROUTE_ALIAS,
-                    "agent_profile":"app320-agent","mcp_profile":"app320-participant","mcp_surface":"participant-core",
-                    "workspace_policy":"manager_owned_worktree","requested_model":null,"requested_effort":null,
-                    "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
-                    "stop_conditions":[],"purpose":"implementation"
-                });
-                let preview = call_host(&host_data_dir, &operator, "swarm.launch.preview", request.clone()).await?;
-                if !preview["hard_blocks"].as_array().is_some_and(Vec::is_empty) {
-                    return Err("real public owned launch preview reported a blocker".to_owned());
-                }
-                request["plan_digest"] = preview["plan_digest"].clone();
-                request["client_request_id"] = json!(uuid::Uuid::new_v4().to_string());
-                let launch = call_host(&host_data_dir, &operator, "swarm.launch", request).await?;
-                let launch_id = launch["operation_id"].as_str().ok_or_else(|| "public launch omitted its operation ID".to_owned())?;
-                // Read the immutable child association before its rejected ACK causes
-                // the launcher to replace progress with a terminal failure projection.
-                let admission = tokio::time::timeout(Duration::from_secs(90), async {
-                    loop {
-                        if let Ok(bytes) = fs::read(scratch.join("admission-evidence.json"))
-                            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-                        {
-                            break Ok::<_, String>(value);
-                        }
-                        if evidence_file.is_file() { return Err("owned adapter failed before public launch readback".to_owned()); }
-                        if host.try_wait().map_err(display)?.is_some() { return Err("host exited before admitted command readback".to_owned()); }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                }).await.map_err(|_| "real supervisor did not deliver its owned command".to_owned())??;
-                let launch_readback = call_host(&host_data_dir, &operator, "operation.get", json!({"operation_id":launch_id})).await?;
-                let command_readback = call_host(&host_data_dir, &operator, "operation.get", json!({"operation_id":admission["operation_id"]})).await?;
-                if command_readback["method"] != "agent.open" || command_readback["task_id"] != task["task_id"]
-                    || command_readback["attempt_id"] != launch_readback["attempt_id"]
-                    || !command_readback["attempt_id"].as_str().is_some_and(|id| !id.is_empty())
-                    || command_readback["prerequisite_operation_id"] != launch_id
-                    || command_readback["binding_id"] != admission["binding_id"]
-                    || command_readback["binding_generation"] != admission["generation"] {
-                    return Err("public launch did not retain this exact admitted agent.open/Task/Attempt/binding".to_owned());
-                }
-                fs::write(scratch.join("execute-after-public-readback"), b"continue\n").map_err(display)?;
-
-                (task, launch_id.to_owned(), launch_readback, admission, None)
         };
         let mut evidence = tokio::time::timeout(Duration::from_secs(180), async {
             loop {
@@ -630,146 +751,164 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
             json!({"operation_id":operation_id}),
         )
         .await?;
-        if let Some(expected_operation_id) = app299_operation_id.as_deref() {
-            if operation_id != expected_operation_id
-                || operation["method"] != json!("agent.open")
-                || operation["operation_id"] != json!(expected_operation_id)
-                || operation["binding_id"] != admission["binding_id"]
-                || operation["binding_generation"] != admission["generation"]
-                || operation["state"] != json!("settled")
-                || operation["result"]["outcome"] != json!("applied")
-                || admission["owner_nonce"] != evidence["owner_nonce"]
-                || evidence["outcome"]["outcome"] != json!("applied")
-                || evidence["outcome"]["details"]["completion_condition"]
-                    != json!("native_session_created")
-                || evidence["outcome"]["details"]["durable_origin"]
-                    != json!("exact_session_created_event")
-            {
-                return Err("public Operation, adapter outcome and module.next command do not share the APP299 identity".to_owned());
-            }
-            let completed = app299_client
-                .as_mut()
-                .ok_or_else(|| "public Tasks client was not retained through consumption".to_owned())?
-                .task_get(expected_operation_id)
-                .await?;
-            if completed["taskId"] != json!(expected_operation_id)
-                || completed["status"] != json!("completed")
-            {
-                return Err("MCP tasks/get did not project the acknowledged Operation as completed".to_owned());
-            }
-            let owner_nonce = evidence["owner_nonce"]
-                .as_str()
-                .ok_or_else(|| "adapter evidence omitted the native owner nonce".to_owned())?;
-            let native_state = native_base.join("launches").join(owner_nonce);
-            let observation: Value = serde_json::from_slice(
-                &fs::read(native_state.join("fixture-observation.json")).map_err(display)?,
-            )
-            .map_err(display)?;
-            let posted_session = &observation["root_create_request"];
-            let posted_session_id = posted_session["id"].as_str().unwrap_or_default();
-            let operation_marker = posted_session["metadata"]["eliot"]["operation"]
-                .as_str()
-                .unwrap_or_default();
-            let binding_marker = posted_session["metadata"]["eliot"]["binding"]
-                .as_str()
-                .unwrap_or_default();
-            let generation_marker = posted_session["metadata"]["eliot"]["generation"]
-                .as_i64()
-                .unwrap_or_default();
-            let post_count = observation["route_identities"]
-                .as_array()
-                .map(|routes| {
-                    routes
-                        .iter()
-                        .filter(|route| *route == "POST /api/session")
-                        .count()
-                })
-                .unwrap_or_default();
-            if evidence["root_posts"] != json!(1)
-                || observation["root_create_posts"] != json!(1)
-                || post_count != 1
-                || posted_session_id.is_empty()
-                || posted_session_id != evidence["outcome"]["native_root_id"]
-                || posted_session_id != observation["root_session_created_id"]
-                || operation_marker != expected_operation_id
-                || binding_marker != admission["binding_id"].as_str().unwrap_or_default()
-                || generation_marker != admission["generation"].as_i64().unwrap_or_default()
-            {
-                return Err("captured native POST/event identity or count differs from the retained Operation".to_owned());
-            }
-            let client = app299_client
-                .take()
-                .ok_or_else(|| "public Tasks client was not retained through completion".to_owned())?;
-            client.close().await;
-            evidence["tasks_get_readback"] = completed;
-            evidence["native_http_observation"] = observation;
-        } else {
-            if operation["method"] != json!("agent.open")
-                || operation["task_id"] != task["task_id"]
-                || operation["binding_id"] != evidence["binding_id"]
-                || operation["binding_generation"] != evidence["generation"]
-                || operation["attempt_id"] != launch_readback["attempt_id"]
-                || operation["prerequisite_operation_id"] != json!(launch_id)
-                || admission["operation_id"] != json!(operation_id)
-                || admission["owner_nonce"] != evidence["owner_nonce"]
-                || operation["state"] != json!("rejected")
-                || operation["result"]["outcome"] != json!("rejected")
-            {
-                return Err("public readback did not bind the rejected command to this exact owned launch".to_owned());
-            }
+        let expected_operation_id = admission["operation_id"].as_str().ok_or_else(|| "admission omitted exact command identity".to_owned())?;
+        if operation_id != expected_operation_id
+            || operation["method"] != json!("agent.open")
+            || operation["operation_id"] != json!(expected_operation_id)
+            || operation["binding_id"] != admission["binding_id"]
+            || operation["binding_generation"] != admission["generation"]
+            || operation["state"] != json!("settled")
+            || operation["result"]["outcome"] != json!("applied")
+            || operation["task_id"] != task["task_id"]
+            || operation["attempt_id"] != launch_readback["attempt_id"]
+            || operation["prerequisite_operation_id"] != json!(launch_id)
+            || admission["native_pid"] != evidence["native_pid"]
+            || evidence["outcome"]["outcome"] != json!("applied")
+            || evidence["outcome"]["details"]["completion_condition"]
+                != json!("native_session_created")
+            || evidence["outcome"]["details"]["durable_origin"]
+                != json!("exact_session_created_event")
+        {
+            return Err("public Operation, adapter outcome and module.next command do not share the APP299 identity".to_owned());
         }
+        let completed = app299_client
+            .as_mut()
+            .ok_or_else(|| "public Tasks client was not retained through consumption".to_owned())?
+            .task_get(expected_operation_id)
+            .await?;
+        if completed["taskId"] != json!(expected_operation_id)
+            || completed["status"] != json!("completed")
+        {
+            return Err("MCP tasks/get did not project the acknowledged Operation as completed".to_owned());
+        }
+        let client = app299_client
+            .take()
+            .ok_or_else(|| "public Tasks client was not retained through completion".to_owned())?;
+        client.close().await;
+        evidence["tasks_get_readback"] = completed;
         if operation["result"].get("details").is_some()
-            || operation["result"]["provider_auth"].is_object()
         {
             return Err("public operation.get exposed private outcome details".to_owned());
-        }
-        let public_bytes = serde_json::to_vec(&operation).map_err(display)?;
-        let evidence_bytes = serde_json::to_vec(&evidence).map_err(display)?;
-        for bytes in [&public_bytes, &evidence_bytes] {
-            if contains_bytes(bytes, provider_key.as_bytes())
-                || contains_bytes(bytes, auth_source.to_string_lossy().as_bytes())
-            {
-                return Err("provider secret or auth source path entered public/evidence output".to_owned());
-            }
         }
         evidence["operation_readback"] = operation;
         Ok((operator, evidence))
     }.await;
+    if let Some(client) = app299_client.take() {
+        client.close().await;
+    }
     // EOF is local to this host child; it invokes production graceful shutdown.
     drop(host_stdin);
-    let stopped = tokio::time::timeout(Duration::from_secs(60), host.wait()).await;
+    let mut stopped = tokio::time::timeout(Duration::from_secs(60), host.wait()).await;
+    let graceful_wait = matches!(&stopped, Ok(Ok(_)));
+    if !graceful_wait {
+        // Retain the original failure and stop only this fixture's exact
+        // child before withdrawing its fake native dependency.
+        let _ = host.kill().await;
+        stopped = tokio::time::timeout(Duration::from_secs(15), host.wait()).await;
+    }
     let host_gone = matches!(&stopped, Ok(Ok(_)));
     let host_ok = matches!(&stopped, Ok(Ok(status)) if status.success());
     let mut errors = Vec::new();
-    if !host_ok {
-        errors.push("public host child did not confirm successful graceful shutdown".to_owned());
+    if !host_ok || !graceful_wait {
+        let (state, code) = match &stopped {
+            Ok(Ok(status)) => ("exited", status.code()),
+            Ok(Err(_)) => ("wait_failed", None),
+            Err(_) => ("deadline_expired", None),
+        };
+        errors.push(format!(
+            "public host child did not confirm successful graceful shutdown; state={state},exit_code={code:?}; {}",
+            startup_diagnostic(&scratch)
+        ));
     }
+    let native_alive = external_native.child.try_wait().map_err(display)?.is_none()
+        && !endpoint_listener_gone(&external_native.url).await
+        && read_external_registration(&external_native.registration_file).is_ok_and(
+            |registration| {
+                registration.pid == external_native.pid
+                    && registration.url == external_native.url
+                    && registration.version == external_native.version
+            },
+        );
+    if !native_alive {
+        errors.push("controller stopped or replaced the external native service".to_owned());
+    }
+    let native_stop = if host_gone {
+        stop_external_native(&mut external_native).await
+    } else {
+        Err("host departure remains unknown; external dependency retained".to_owned())
+    };
     let mut case_ok = false;
     match execution {
         Ok((operator, mut evidence)) => {
-            let ipc_listener_gone = swarm_client::ModuleLink::connect(
+            let ipc_gone = swarm_client::ModuleLink::connect(
                 &host_data_dir,
                 &operator,
                 &swarm_client::IpcConfig::default(),
             )
             .await
             .is_err();
-            if !ipc_listener_gone {
+            if !ipc_gone {
                 errors.push("host IPC listener still accepts authenticated connections".to_owned());
             }
-            evidence["ipc_listener_gone"] = json!(ipc_listener_gone);
-            case_ok = evidence["child_released"] == true
-                && evidence["connection_absent"] == true
-                && ipc_listener_gone;
-            if !case_ok {
-                errors.push("owned child cleanup evidence is incomplete".to_owned());
+            let observation: Value = serde_json::from_slice(
+                &fs::read(&external_native.observation_file).map_err(display)?,
+            )
+            .map_err(display)?;
+            let posted = &observation["root_create_request"];
+            let expected_root = &evidence["outcome"]["native_root_id"];
+            let posts = observation["route_identities"].as_array().map(|routes| {
+                routes
+                    .iter()
+                    .filter(|route| **route == json!("POST /api/session"))
+                    .count()
+            });
+            if observation["root_create_posts"] != 1
+                || posts != Some(1)
+                || posted["id"] != *expected_root
+                || observation["root_session_created_id"] != *expected_root
+                || posted["metadata"]["eliot"]["operation"] != evidence["operation_id"]
+                || posted["metadata"]["eliot"]["binding"] != evidence["binding_id"]
+                || posted["metadata"]["eliot"]["generation"] != evidence["generation"]
+                || posted["location"]["directory"] != evidence["workspace_directory"]
+                || posted["model"]
+                    != json!({"id":"fixture-model","providerID":"openai","variant":"fixture-variant"})
+                || posted
+                    .get("parentID")
+                    .is_some_and(|parent| !parent.is_null())
+                || posted.get("fork").is_some_and(|fork| !fork.is_null())
+            {
+                errors.push(
+                    "native POST count/session identity differs from the retained Operation"
+                        .to_owned(),
+                );
+            }
+            if let Err(error) = &native_stop {
+                errors.push(error.clone());
+            }
+            let listener_gone = endpoint_listener_gone(&external_native.url).await;
+            case_ok = native_alive && native_stop.is_ok() && listener_gone && ipc_gone;
+            evidence["external_process_alive_after_adapter_stop"] = json!(native_alive);
+            evidence["native_stop_confirmed"] = json!(native_stop.is_ok());
+            evidence["native_listener_gone"] = json!(listener_gone);
+            evidence["native_http_observation"] = observation;
+            evidence["root_posts"] = json!(1);
+            evidence["connection_absent"] = json!(native_stop.is_ok());
+            evidence["ipc_listener_gone"] = json!(ipc_gone);
+            fs::write(
+                &evidence_file,
+                serde_json::to_vec(&evidence).map_err(display)?,
+            )
+            .map_err(display)?;
+        }
+        Err(error) => {
+            errors.push(error);
+            if let Err(stop_error) = native_stop {
+                errors.push(stop_error);
             }
         }
-        Err(error) => errors.push(error),
     }
     // Never remove custody/receipts after an unknown host/native teardown.
     if host_gone && case_ok && errors.is_empty() {
-        fs::remove_file(&auth_source).map_err(display)?;
         fs::remove_dir_all(&scratch).map_err(display)?;
         Ok(())
     } else {
@@ -884,28 +1023,37 @@ fn write_fixture_descriptor(
 }
 
 async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvidence> {
-    let invalid_model_catalog = case["invalid_model_catalog"]
-        .as_bool()
-        .ok_or_else(|| "case omitted its scenario".to_owned())?;
-    let app299_tasks = case["app299_tasks"].as_bool().unwrap_or(false);
-    let scenario = if app299_tasks {
-        "app299-public-tasks-exact-root-session"
-    } else if invalid_model_catalog {
-        "post-bootstrap-preflight-schema-rejection"
-    } else {
-        "post-bootstrap-root-create-http-409"
+    let phase_file = PathBuf::from(
+        case["evidence_file"]
+            .as_str()
+            .ok_or_else(|| "case omitted evidence path".to_owned())?,
+    )
+    .with_file_name("adapter-startup-diagnostic.json");
+    let stage = |phase: &str, code: Option<&str>| {
+        let safe_code = code.filter(|code| fixture_diagnostic_code(code));
+        let _ = fs::write(
+            &phase_file,
+            serde_json::to_vec(&json!({"phase":phase,"code":safe_code})).unwrap(),
+        );
     };
+    stage("bootstrap", None);
+    let scenario = "app299-public-tasks-exact-root-session";
     let OwnedBootstrap {
         config: adapter_config,
         credential,
         worker,
         contract: claim,
-    } = OwnedBootstrap::from_config_path(host_path).map_err(display)?;
+    } = OwnedBootstrap::from_config_path(host_path).map_err(|error| {
+        stage("bootstrap", Some(&error.code));
+        display(error)
+    })?;
+    stage("route_scope", None);
     let native_options = adapter_config.native_options.clone();
-    let owned_native = adapter_config
-        .owned_native
-        .clone()
-        .ok_or_else(|| "real demand omitted fresh owned authority".to_owned())?;
+    if adapter_config.owned_native.is_some() {
+        return Err(
+            "external attach demand unexpectedly carried fresh native ownership".to_owned(),
+        );
+    }
     let allowed_workspace_root = fs::canonicalize(
         case["workspace_root"]
             .as_str()
@@ -919,34 +1067,26 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
             .as_str()
             .ok_or_else(|| "case omitted native base".to_owned())?,
     );
+    let native_registration = read_external_registration(&native_options.connection_file)?;
     if !canonical_native_directory.starts_with(&allowed_workspace_root)
         || canonical_native_directory == allowed_workspace_root
+        || native_options.connection_file != native_base.join("connection.json")
         || native_options.model.id != "fixture-model"
         || native_options.model.provider_id != "openai"
         || native_options.model.variant != "fixture-variant"
-        || owned_native.state_root != native_base.join("launches").join(&owned_native.owner_nonce)
+        || native_registration.version != FAKE_NATIVE_VERSION
     {
         return Err(
-            "protected demand did not retain its exact admitted workspace/owner scope".to_owned(),
+            "protected demand did not retain its exact admitted external workspace/identity scope"
+                .to_owned(),
         );
     }
-    let auth_source = owned_native
-        .provider_auth
-        .as_ref()
-        .ok_or_else(|| "protected demand omitted auth source".to_owned())?
-        .source_file
-        .clone();
-    let source: Value =
-        serde_json::from_slice(&fs::read(&auth_source).map_err(display)?).map_err(display)?;
-    let provider_key = source["openai"]["key"]
-        .as_str()
-        .ok_or_else(|| "private synthetic auth source omitted its key".to_owned())?
-        .to_owned();
     let binding_id = adapter_config.binding_id.clone();
     let generation = adapter_config.generation;
     let journal_dir = adapter_config.state_dir.clone();
     let route_sha256 =
         digest_json(&serde_json::to_value(&native_options).map_err(display)?).map_err(display)?;
+    stage("journal", None);
     let journal = Journal::open(
         &journal_dir,
         &binding_id,
@@ -955,34 +1095,58 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
         &route_sha256,
     )
     .map_err(display)?;
-    let mut native_owner = NativeOwnerController::new(adapter_config.owned_native.clone());
+    // The command handler retains this parameter for its external-attach path.
+    // None is the explicit no-spawn/no-stop ownership fence.
+    let mut native_owner = NativeOwnerController::new(None);
     let observer = Arc::new(Mutex::new(Vec::<Value>::new()));
     let boot_id = worker.boot_id.clone();
     let owner = &worker.owner_record;
+    let (native_service, native_observation) = NativeClient::connect(&native_options)
+        .await
+        .map_err(display)?;
+    native_service
+        .probe_route(&native_options)
+        .await
+        .map_err(display)?;
+    if native_observation.pid != native_registration.pid
+        || native_observation.version != native_registration.version
+    {
+        return Err("native service differs from its registration before module hello".to_owned());
+    }
     let session = HostSession {
         config: &adapter_config,
         credential: &credential,
         journal: &journal,
         claim: &claim,
         boot_id: boot_id.clone(),
-        hello_base: json!({"boot_id":boot_id,"module_artifact_id":ARTIFACT_ID,"native_ready":false,
+        hello_base: json!({"boot_id":boot_id,"module_artifact_id":ARTIFACT_ID,"native_ready":true,
             "managed_owner":{"token":owner["token"],"process":owner["process"]}}),
         root_hint: Mutex::new(None),
         ipc_link: AsyncMutex::new(None),
         outcome_observer: Some(Arc::clone(&observer)),
         retention_retry_pending: AtomicBool::new(false),
     };
-    let execution = async {
-        session.hello_retry().await.map_err(display)?;
+    async {
+        stage("module_hello", None);
+        session.hello_retry().await.map_err(|error| {
+            stage("module_hello", Some(&error.code));
+            display(error)
+        })?;
+        stage("module_next", None);
         let command: RuntimeCommand = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let next = session.call("module.next", json!({})).await.map_err(display)?;
+                let next = session
+                    .call("module.next", json!({}))
+                    .await
+                    .map_err(display)?;
                 if let Some(command) = next.get("command").filter(|value| !value.is_null()) {
                     break serde_json::from_value(command.clone()).map_err(display);
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.map_err(|_| "actual module.next did not supply the admitted command".to_owned())??;
+        })
+        .await
+        .map_err(|_| "actual module.next did not supply the admitted command".to_owned())??;
         if command.method != "agent.open"
             || command.binding_id != binding_id
             || command.generation != generation
@@ -990,20 +1154,46 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
             || command.route["workspace_option"] != "directory"
             || command.route["native_options"]["directory"] != json!(native_options.directory)
         {
-            return Err("actual module.next command differs from protected owned demand".to_owned());
+            return Err(
+                "actual module.next command differs from protected owned demand".to_owned(),
+            );
         }
         verify_command_scope(&adapter_config, &command, &claim).map_err(display)?;
+        stage("command_scope", None);
         let operation_id = command.operation_id.clone();
-        let admission_path = PathBuf::from(case["admission_file"].as_str().ok_or_else(|| "case omitted admission handshake path".to_owned())?);
-        let execute_path = PathBuf::from(case["execute_file"].as_str().ok_or_else(|| "case omitted execute handshake path".to_owned())?);
-        fs::write(admission_path, serde_json::to_vec(&json!({
-            "operation_id":operation_id,"binding_id":binding_id,"generation":generation,
-            "owner_nonce":owned_native.owner_nonce,"workspace_directory":native_options.directory
-        })).map_err(display)?).map_err(display)?;
+        let admission_path = PathBuf::from(
+            case["admission_file"]
+                .as_str()
+                .ok_or_else(|| "case omitted admission handshake path".to_owned())?,
+        );
+        let execute_path = PathBuf::from(
+            case["execute_file"]
+                .as_str()
+                .ok_or_else(|| "case omitted execute handshake path".to_owned())?,
+        );
+        fs::write(
+            admission_path,
+            serde_json::to_vec(&json!({
+                "operation_id":operation_id,"binding_id":binding_id,"generation":generation,
+                "native_pid":native_registration.pid,
+                "native_url":native_registration.url,
+                "native_version":native_registration.version,
+                "workspace_directory":native_options.directory
+            }))
+            .map_err(display)?,
+        )
+        .map_err(display)?;
         tokio::time::timeout(Duration::from_secs(30), async {
-            while !execute_path.is_file() { tokio::time::sleep(Duration::from_millis(50)).await; }
-        }).await.map_err(|_| "parent did not confirm actual public admission readback".to_owned())?;
-        handle_command(&session, &command, &mut native_owner).await.map_err(display)?;
+            while !execute_path.is_file() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| "parent did not confirm actual public admission readback".to_owned())?;
+        stage("native_command", None);
+        handle_command(&session, &command, &mut native_owner)
+            .await
+            .map_err(display)?;
 
         let history = journal.load(&operation_id).map_err(display)?;
         let outcome = history
@@ -1011,100 +1201,24 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
             .clone()
             .ok_or_else(|| "Journal did not retain the RuntimeOutcome".to_owned())?;
         let expected_root = root_id(&binding_id, generation);
-        let expected_model_value = serde_json::to_value(&native_options.model).map_err(display)?;
-        let expected_model_digest = sha256(
-            crate::native::canonical_json(&expected_model_value)
-                .map_err(display)?
-                .as_bytes(),
-        );
-        let expected_connection_metadata_digest = sha256(
-            crate::native::canonical_json(&json!({"credential_id":"fixture-credential"}))
-                .map_err(display)?
-                .as_bytes(),
-        );
-        let ready = &outcome["details"]["owned_service_ready"];
-        let ready_pid = ready["process"]["pid"]
-            .as_u64()
-            .ok_or_else(|| format!("{scenario}: outcome omitted the actual owned child PID"))?;
-        let ready_birth_token = ready["process"]["birth_token"]
-            .as_str()
-            .ok_or_else(|| format!("{scenario}: outcome omitted the actual owner birth token"))?;
-        let ready_service_id = ready["service_id"]
-            .as_str()
-            .ok_or_else(|| format!("{scenario}: outcome omitted the actual service identity"))?;
-        let ready_service_version = ready["service_version"]
-            .as_str()
-            .ok_or_else(|| format!("{scenario}: outcome omitted the actual service version"))?;
-        let ready_owner_nonce = ready["owner_nonce"]
-            .as_str()
-            .ok_or_else(|| format!("{scenario}: outcome omitted the actual owner nonce"))?;
-        if ready_service_id != native_options.service_id.as_str()
-            || ready_owner_nonce != owned_native.owner_nonce.as_str()
-        {
-            return Err(format!("{scenario}: ready receipt differs from the admitted owned route"));
-        }
-        let expected_provider_auth = json!({
-            "status":"stored_unverified",
-            "provider_id":"openai",
-            "credential_ref":"credential:app320-fixture",
-            "model_digest":expected_model_digest,
-            "service_id":ready_service_id,
-            "service_version":ready_service_version,
-            "owner_nonce_digest":sha256(ready_owner_nonce.as_bytes()),
-            "process":{
-                "pid":ready_pid,
-                "birth_token":ready_birth_token
-            },
-            "integration_id":"openai",
-            "key_method":"key",
-            "connection_metadata_digest":expected_connection_metadata_digest
-        });
-        if app299_tasks {
-            if outcome["outcome"] != "applied"
-                || outcome["native_root_id"] != expected_root
-                || outcome["details"]["provider_auth"] != expected_provider_auth
-                || outcome["details"]["completion_condition"] != "native_session_created"
-                || outcome["details"]["durable_origin"] != "exact_session_created_event"
-                || outcome["details"]["native_replay"] != false
-                || outcome["details"]["owned_service_ready"]["owner_nonce"] != owned_native.owner_nonce
-            {
-                return Err("APP299 production outcome lacks the exact native root and provider-auth readback".to_owned());
-            }
-        } else if outcome["outcome"] != "rejected"
-            || outcome["details"]["provider_auth"] != expected_provider_auth
-            || outcome["details"]["owned_service_ready_only"] != true
-            || outcome["details"]["owned_service_ready"]["owner_nonce"] != owned_native.owner_nonce
+        let current_registration = read_external_registration(&native_options.connection_file)?;
+        if current_registration.pid != native_registration.pid
+            || current_registration.url != native_registration.url
+            || current_registration.version != native_registration.version
         {
             return Err(format!(
-                "{scenario}: Journal outcome changed or omitted fields from the exact provider-auth proof"
+                "{scenario}: external native registration identity changed during the command"
             ));
         }
-        if !app299_tasks {
-            if invalid_model_catalog {
-                if !outcome["native_root_id"].is_null()
-                    || outcome["details"]["diagnostic_code"] != "NATIVE_MODEL_SCHEMA"
-                    || outcome["details"]["native_replay"] != false
-                {
-                    return Err("preflight rejection changed its root or diagnostic semantics".to_owned());
-                }
-            } else if outcome["native_root_id"] != expected_root
-                || outcome["details"]["diagnostic_code"] != "NATIVE_REJECTED"
-                || outcome["details"]["native_http_failure"]["status"] != 409
-                || outcome["details"]["native_replay"] != false
-            {
-                return Err("root-create rejection lost its root or rejection semantics".to_owned());
-            }
-        }
-
-        let serialized_outcome = serde_json::to_vec(&outcome).map_err(display)?;
-        let journal_bytes = read_tree_bytes(&journal_dir)?;
-        let source_text = auth_source.to_string_lossy();
-        if contains_bytes(&serialized_outcome, provider_key.as_bytes())
-            || contains_bytes(&serialized_outcome, source_text.as_bytes())
-            || contains_bytes(&journal_bytes, provider_key.as_bytes())
-            || contains_bytes(&journal_bytes, source_text.as_bytes())
+        if outcome["outcome"] != "applied"
+            || outcome["native_root_id"] != expected_root
+            || outcome["details"]["completion_condition"] != "native_session_created"
+            || outcome["details"]["durable_origin"] != "exact_session_created_event"
+            || outcome["details"]["native_replay"] != false
         {
-            return Err("provider key or source path entered durable outcome evidence".to_owned());
+            return Err(format!(
+                "{scenario}: Journal outcome changed the exact root-session proof"
+            ));
         }
 
         let observed_outcomes = observer
@@ -1114,13 +1228,6 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
         if observed_outcomes.len() != 1 || observed_outcomes[0] != outcome {
             return Err("production HostSession did not send the exact outcome once".to_owned());
         }
-        let serialized_ipc = serde_json::to_vec(&observed_outcomes[0]).map_err(display)?;
-        if contains_bytes(&serialized_ipc, provider_key.as_bytes())
-            || contains_bytes(&serialized_ipc, source_text.as_bytes())
-        {
-            return Err("provider key or source path entered module.outcome IPC".to_owned());
-        }
-
         let acknowledged_sha256 = history
             .acknowledged_sha256
             .clone()
@@ -1139,96 +1246,23 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
             binding_id,
             generation,
             workspace_directory: native_options.directory.clone(),
-            owner_nonce: owned_native.owner_nonce.clone(),
+            native_pid: native_registration.pid,
+            native_url: native_registration.url,
+            native_version: native_registration.version,
             outcome,
             operation_readback: Value::Null,
             observed_outcomes,
             acknowledged_sha256,
             pending_count,
-            key_posts: 0,
             root_posts: 0,
             connection_absent: false,
-            child_released: false,
+            native_listener_gone: false,
+            external_process_alive_after_adapter_stop: false,
+            native_stop_confirmed: false,
             ipc_listener_gone: false,
         })
-    }.await;
-    let owner_stop = native_owner.shutdown().await.map_err(display);
-    let child_released = !native_owner.owns_child();
-    let native_state = &owned_native.state_root;
-    let connection_absent = matches!(fs::symlink_metadata(&native_options.connection_file), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
-    let service_observation = fs::read(native_state.join("fixture-observation.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    let stop_receipt = fs::read(native_state.join("stop.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    let mut errors = Vec::new();
-    if owner_stop.is_err() {
-        errors.push("native owner shutdown was not confirmed".to_owned());
     }
-    if !child_released {
-        errors.push("native owner still retains its exact child".to_owned());
-    }
-    match execution {
-        Ok(mut evidence) => {
-            let key_posts = service_observation
-                .as_ref()
-                .and_then(|value| value["provider_key_posts"].as_u64())
-                .unwrap_or_default();
-            let root_posts = service_observation
-                .as_ref()
-                .and_then(|value| value["root_create_posts"].as_u64())
-                .unwrap_or_default();
-            let expected_root_posts = u64::from(!invalid_model_catalog);
-            if key_posts != 1 || root_posts != expected_root_posts {
-                errors.push("native HTTP effect counts differ from the scenario".to_owned());
-            }
-            if !connection_absent
-                || stop_receipt.as_ref().is_none_or(|receipt| {
-                    receipt["status"] != "stopped"
-                        || receipt["owner_nonce"] != owned_native.owner_nonce
-                        || receipt["pid"].as_u64()
-                            != evidence.outcome["details"]["owned_service_ready"]["process"]["pid"]
-                                .as_u64()
-                        || receipt["connection_absent"] != true
-                        || receipt["process_exit_code"] != 0
-                        || receipt["provider_key_posts"] != 1
-                        || receipt["root_create_posts"] != expected_root_posts
-                })
-            {
-                errors
-                    .push("exact native stop receipt/connection cleanup is incomplete".to_owned());
-            }
-            if let Some(observation) = service_observation {
-                let endpoint = observation["endpoint"].as_str().unwrap_or_default();
-                if stop_receipt
-                    .as_ref()
-                    .is_none_or(|receipt| receipt["endpoint"] != endpoint)
-                {
-                    errors.push("native stop receipt names another endpoint".to_owned());
-                }
-                if !endpoint_listener_gone(endpoint).await {
-                    errors.push("native HTTP endpoint still accepts connections".to_owned());
-                }
-            } else {
-                errors.push("native HTTP count-only stop evidence is missing".to_owned());
-            }
-            evidence.key_posts = key_posts;
-            evidence.root_posts = root_posts;
-            evidence.connection_absent = connection_absent;
-            evidence.child_released = child_released;
-            // Parent checks authenticated IPC absence only after graceful host EOF.
-            if errors.is_empty() {
-                Ok(evidence)
-            } else {
-                Err(errors.join("; "))
-            }
-        }
-        Err(error) => {
-            errors.push(error);
-            Err(errors.join("; "))
-        }
-    }
+    .await
 }
 
 fn unique_directory(prefix: &str) -> FixtureResult<PathBuf> {
@@ -1436,222 +1470,77 @@ fn write_installed_closure(install_root: &Path, server_source: &str) -> FixtureR
     Ok(sha256(server_source.as_bytes()))
 }
 
-fn test_server_source(invalid_model_catalog: bool, app299_tasks: bool) -> String {
-    r#"import { createHash } from "node:crypto";
-import { createServer } from "node:http";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+fn test_server_source() -> String {
+    r#"import { createServer } from "node:http";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-
-const INVALID_MODEL_CATALOG = __APP320_INVALID_MODEL__;
-const APP299_SUCCESSFUL_ROOT = __APP299_SUCCESSFUL_ROOT__;
-const arg = (name) => {
-  const index = process.argv.indexOf(name);
-  return index >= 0 ? process.argv[index + 1] : undefined;
-};
-if (Bun.version !== "1.4.0") throw new Error("APP320 fixture requires Bun 1.4.0");
+const arg = (name) => { const i = process.argv.indexOf(name); return i < 0 ? undefined : process.argv[i + 1]; };
+if (Bun.version !== "1.4.0") throw new Error("fixture requires the selected Bun runtime");
 const stateRoot = path.resolve(arg("--state-root"));
-const passwordFile = path.resolve(arg("--password-file"));
-const ownerNonce = arg("--owner-nonce");
-const port = Number(arg("--port"));
+const connectionFile = path.resolve(arg("--registration-file"));
 const workspace = path.resolve(arg("--workspace-directory"));
-const connectionFile = path.join(stateRoot, "connection.json");
-const ownerFile = path.join(stateRoot, "owner.json");
-const stopFile = path.join(stateRoot, "stop.json");
+const password = process.env.ELIOT_APP299_FAKE_HTTP_PASSWORD;
 const observationFile = path.join(stateRoot, "fixture-observation.json");
-const password = (await readFile(passwordFile, "utf8")).replace(/[\r\n]+$/, "");
-let providerKeyPosts = 0;
+const stopFile = path.join(stateRoot, "stop.json");
+await mkdir(path.join(stateRoot, "tmp"), { recursive: true });
+let endpoint = "";
 let rootCreatePosts = 0;
 let rootCreateRequest = null;
 let rootSession = null;
 const routes = [];
-let endpoint = "";
-const expectedAuthorization = `Basic ${Buffer.from(`opencode:${password}`, "utf8").toString("base64")}`;
+const expectedAuthorization = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
+async function observe() {
+  await writeFile(observationFile, JSON.stringify({
+    root_create_posts: rootCreatePosts, root_create_request: rootCreateRequest,
+    root_session_created_id: rootSession?.id ?? null, route_identities: routes, endpoint
+  }), { mode: 0o600 });
+}
 const server = createServer(async (request, response) => {
   try {
-    const url = new URL(request.url, endpoint || "http://127.0.0.1");
+    const url = new URL(request.url, endpoint);
     routes.push(`${request.method} ${url.pathname}`);
-    if (request.headers.authorization !== expectedAuthorization) {
-      response.writeHead(401).end();
-      return;
-    }
+    if (request.headers.authorization !== expectedAuthorization) { response.writeHead(401).end(); return; }
     const directory = url.searchParams.get("location[directory]") || workspace;
-    const send = (status, value) => {
-      response.writeHead(status, { "content-type": "application/json" });
-      response.end(JSON.stringify(value));
-    };
-    if (request.method === "GET" && url.pathname === "/api/info") {
-      send(200, {
-        version: "2.0.7",
-        pid: process.pid,
-        urls: [endpoint],
-        paths: { tmp: path.join(stateRoot, "tmp") },
-      });
-      return;
-    }
-    if (request.method === "GET" && url.pathname === "/api/integration") {
-      send(200, {
-        location: { directory },
-        data: [{
-          id: "openai",
-          methods: [{ type: "key" }],
-          connections: providerKeyPosts === 0 ? [] : [{ type: "credential", id: "fixture-credential" }],
-        }],
-      });
-      return;
-    }
-    if (request.method === "GET" && url.pathname === "/api/model") {
-      send(200, {
-        location: { directory },
-        data: INVALID_MODEL_CATALOG
-          ? [{ id: "fixture-model", providerID: "openai", enabled: true, variants: { malformed: true } }]
-          : [{ id: "fixture-model", providerID: "openai", enabled: true, variants: [{ id: "fixture-variant" }] }],
-      });
-      return;
-    }
-    if (request.method === "GET" && url.pathname === "/api/location") {
-      send(200, { directory, project: { id: "app320-fixture-project" } });
-      return;
-    }
+    const send = (status, value) => { response.writeHead(status, { "content-type": "application/json" }); response.end(JSON.stringify(value)); };
+    if (request.method === "GET" && url.pathname === "/api/info") { send(200, { version: "2.0.7", pid: process.pid, urls: [endpoint], paths: { tmp: path.join(stateRoot, "tmp") } }); return; }
+    if (request.method === "GET" && url.pathname === "/api/location") { send(200, { directory, project: { id: "app299-fixture-project" } }); return; }
+    if (request.method === "GET" && url.pathname === "/api/model") { send(200, { location: { directory }, data: [{ id: "fixture-model", providerID: "openai", enabled: true, variants: [{ id: "fixture-variant" }] }] }); return; }
     if (request.method === "GET" && url.pathname.startsWith("/api/experimental/session/") && url.pathname.endsWith("/log")) {
       const root = url.pathname.split("/")[4];
-      if (!APP299_SUCCESSFUL_ROOT || !rootSession || root !== rootSession.id || url.searchParams.get("follow") !== "false") {
-        send(404, { message: "APP299 exact durable session log not found" });
-        return;
-      }
-      const createdEvent = {
-        id: "evt_app299_session_created",
-        type: "session.created",
-        aggregateID: rootSession.id,
-        data: {
-          sessionID: rootSession.id,
-          parentID: null,
-          metadata: rootSession.metadata,
-          model: rootSession.model
-        },
-        created: 1700000000,
-        durable: { aggregateID: rootSession.id, version: 1, seq: 1 }
-      };
-      const syncedEvent = { type: "log.synced", aggregateID: rootSession.id, seq: 1 };
+      if (!rootSession || root !== rootSession.id || url.searchParams.get("follow") !== "false") { send(404, {}); return; }
+      const event = { id: "evt_app299_created", type: "session.created", created: 1700000000,
+        durable: { aggregateID: root, version: 1, seq: 0 },
+        data: { sessionID: root, projectID: "global", location: rootSession.location, slug: "app299-fixture", version: "2.0.7", metadata: rootSession.metadata, model: rootSession.model } };
+      const after = url.searchParams.get("after");
       response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end("data: " + JSON.stringify(createdEvent) + "\n\n" +
-                   "data: " + JSON.stringify(syncedEvent) + "\n\n");
+      response.end((after === null ? `data: ${JSON.stringify(event)}\n\n` : "") + `data: ${JSON.stringify({ type: "log.synced", aggregateID: root, seq: 0 })}\n\n`);
       return;
     }
-    if (request.method === "POST" && url.pathname === "/api/integration/openai/connect/key") {
-      for await (const _chunk of request) { /* consume without retaining key bytes */ }
-      providerKeyPosts += 1;
-      send(200, null);
-      return;
-    }
+    if (request.method === "GET" && rootSession && url.pathname === `/api/session/${rootSession.id}`) { send(200, { data: rootSession }); return; }
     if (request.method === "POST" && url.pathname === "/api/session") {
-      const chunks = [];
-      for await (const chunk of request) { chunks.push(chunk); }
-      rootCreateRequest = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      rootCreatePosts += 1;
-      if (APP299_SUCCESSFUL_ROOT) {
-        rootSession = {
-          id: rootCreateRequest.id,
-          parentID: null,
-          fork: null,
-          location: rootCreateRequest.location,
-          model: rootCreateRequest.model,
-          metadata: rootCreateRequest.metadata
-        };
-        send(200, { data: rootSession });
-      } else {
-        send(409, { message: "APP320 fixture root creation rejected" });
-      }
-      return;
+      const chunks = []; for await (const chunk of request) chunks.push(chunk);
+      rootCreateRequest = JSON.parse(Buffer.concat(chunks).toString("utf8")); rootCreatePosts++;
+      rootSession = { id: rootCreateRequest.id, parentID: null, fork: null, location: rootCreateRequest.location, model: rootCreateRequest.model, metadata: rootCreateRequest.metadata };
+      await observe(); send(200, { data: rootSession }); return;
     }
-    for await (const _chunk of request) { /* drain unsupported request bodies */ }
-    send(404, { message: "APP320 fixture route not found" });
-  } catch {
-    if (!response.headersSent) response.writeHead(500);
-    response.end();
-  }
+    for await (const _chunk of request) {}
+    send(404, {});
+  } catch { if (!response.headersSent) response.writeHead(500); response.end(); }
 });
-server.keepAliveTimeout = 500;
-await new Promise((resolve, reject) => {
-  server.once("error", reject);
-  server.listen(port, "127.0.0.1", resolve);
-});
-const address = server.address();
-endpoint = `http://127.0.0.1:${address.port}`;
-const connection = {
-  schema_version: 1,
-  endpoint,
-  pid: process.pid,
-  username: "opencode",
-  password,
-};
-const connectionBytes = `${JSON.stringify(connection, null, 2)}\n`;
-const connectionSha256 = createHash("sha256").update(connectionBytes).digest("hex");
-await writeFile(connectionFile, connectionBytes, { mode: 0o600 });
-const owner = {
-  schema_version: 1,
-  status: "ready",
-  owner_nonce: ownerNonce,
-  runtime: "bun",
-  runtime_version: Bun.version,
-  native_server: "@opencode/server",
-  native_server_version: "2.0.7",
-  pid: process.pid,
-  native_reported_pid: process.pid,
-  endpoint,
-  state_root: stateRoot,
-  connection_file: connectionFile,
-  connection_sha256: connectionSha256,
-};
-await writeFile(ownerFile, `${JSON.stringify(owner, null, 2)}\n`, { mode: 0o600 });
+await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+endpoint = `http://127.0.0.1:${server.address().port}`;
+await writeFile(connectionFile, JSON.stringify({ url: endpoint, pid: process.pid, version: "2.0.7", password }), { mode: 0o600 });
 let stopping = false;
-function stopFromOwnerEnd() {
-  if (stopping) return;
-  stopping = true;
+process.stdin.once("end", () => {
+  if (stopping) return; stopping = true;
   server.close(async () => {
-    try {
-      server.closeAllConnections?.();
-      await unlink(connectionFile);
-      owner.status = "stopped";
-      owner.connection_absent = true;
-      owner.process_exit_code = 0;
-      await writeFile(ownerFile, `${JSON.stringify(owner, null, 2)}\n`, { mode: 0o600 });
-      const observation = {
-        schema_version: 1,
-        provider_key_posts: providerKeyPosts,
-        root_create_posts: rootCreatePosts,
-        root_create_request: rootCreateRequest,
-        root_session_created_id: rootSession ? rootSession.id : null,
-        route_identities: routes,
-        endpoint,
-      };
-      await writeFile(observationFile, `${JSON.stringify(observation, null, 2)}\n`, { mode: 0o600 });
-      await writeFile(stopFile, `${JSON.stringify({
-        schema_version: 1,
-        status: "stopped",
-        owner_nonce: ownerNonce,
-        pid: process.pid,
-        connection_absent: true,
-        process_exit_code: 0,
-        provider_key_posts: providerKeyPosts,
-        root_create_posts: rootCreatePosts,
-        endpoint,
-      }, null, 2)}\n`, { mode: 0o600 });
-    } catch {
-      process.exitCode = 1;
-    }
+    try { await observe(); await unlink(connectionFile); await writeFile(stopFile, JSON.stringify({ status: "stopped", pid: process.pid, connection_absent: true, process_exit_code: 0, endpoint }), { mode: 0o600 }); }
+    catch { process.exitCode = 1; }
   });
-  server.closeAllConnections?.();
-}
-process.stdin.once("end", stopFromOwnerEnd);
+  server.closeAllConnections();
+});
 process.stdin.resume();
-"#.replace(
-        "__APP320_INVALID_MODEL__",
-        if invalid_model_catalog { "true" } else { "false" },
-    )
-    .replace(
-        "__APP299_SUCCESSFUL_ROOT__",
-        if app299_tasks { "true" } else { "false" },
-    )
+"#.to_owned()
 }
 
 fn dependency_tree_digest(path: &str, bytes: u64, hash: &str) -> String {
@@ -1671,38 +1560,6 @@ fn sha256(bytes: &[u8]) -> String {
 
 fn sha256_file(path: &Path) -> FixtureResult<String> {
     fs::read(path).map(|bytes| sha256(&bytes)).map_err(display)
-}
-
-fn read_tree_bytes(root: &Path) -> FixtureResult<Vec<u8>> {
-    let mut files = Vec::new();
-    collect_files(root, &mut files)?;
-    files.sort();
-    let mut contents = Vec::new();
-    for path in files {
-        contents.extend(fs::read(&path).map_err(display)?);
-        contents.push(0);
-    }
-    Ok(contents)
-}
-
-fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> FixtureResult<()> {
-    for entry in fs::read_dir(root).map_err(display)? {
-        let path = entry.map_err(display)?.path();
-        let metadata = fs::symlink_metadata(&path).map_err(display)?;
-        if metadata.is_dir() {
-            collect_files(&path, files)?;
-        } else if metadata.is_file() {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
 }
 
 async fn endpoint_listener_gone(endpoint: &str) -> bool {

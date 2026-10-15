@@ -105,7 +105,6 @@ impl Fixture {
                     variant: "high".into(),
                 },
                 model_catalog: "offline".into(),
-                credential_ref: None,
                 bun_executable: self.directory.join("unused-bun"),
                 bun_sha256: "a".repeat(64),
                 server_program_sha256: model::digest(&std::fs::read(&server_program).unwrap()),

@@ -4,7 +4,7 @@
 use crate::{
     config::NativeOptions,
     journal::{OperationIntent, digest_json},
-    native::{NativeClient, canonical_json},
+    native::NativeClient,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -136,7 +136,7 @@ pub async fn prepare_reply(
     let id_prefix = if request.kind == "question" {
         "frm_"
     } else {
-        "per_"
+        "per"
     };
     validate_id(&request.request_id, id_prefix)?;
     native
@@ -180,7 +180,11 @@ pub async fn prepare_reply(
                 )
             } else {
                 let (_eliot_answers, native_answer) =
-                    crate::native_forms::question_answers_to_native(&request.body, found, question_count)?;
+                    crate::native_forms::question_answers_to_native(
+                        &request.body,
+                        found,
+                        question_count,
+                    )?;
                 (
                     "reply",
                     format!(
@@ -311,8 +315,9 @@ pub async fn reconcile_reply(
     let detail = load_form_detail(native, &saved.session_id, &saved.request_id)
         .await
         .map_err(|_| evidence_unavailable("exact native form detail is absent"))?;
-    let info_fp = form_info_fingerprint(&detail)
-        .map_err(|_| evidence_unavailable("native form detail differs from the exact saved request"))?;
+    let info_fp = form_info_fingerprint(&detail).map_err(|_| {
+        evidence_unavailable("native form detail differs from the exact saved request")
+    })?;
     if info_fp != saved.request_fingerprint {
         return Err(evidence_unavailable(
             "native asked event differs from the exact saved request fingerprint",
@@ -353,28 +358,27 @@ pub async fn reconcile_reply(
     }
 }
 
-async fn load_form_detail(
-    native: &NativeClient,
-    session_id: &str,
-    form_id: &str,
-) -> Result<Value> {
+async fn load_form_detail(native: &NativeClient, session_id: &str, form_id: &str) -> Result<Value> {
     validate_id(session_id, "ses_")?;
     validate_id(form_id, "frm_")?;
     let raw = native
-        .control_get(
-            &format!("/api/session/{session_id}/form/{form_id}"),
-            &[],
-        )
+        .control_get(&format!("/api/session/{session_id}/form/{form_id}"), &[])
         .await
         .map_err(|_| evidence_unavailable("exact native form detail is absent"))?;
     let envelope: DataEnvelope<Value> = serde_json::from_value(raw)
         .map_err(|_| evidence_unavailable("native form detail has an invalid schema"))?;
     let detail = envelope.data;
+    NativeClient::validate_form_detail(&detail)
+        .map_err(|_| evidence_unavailable("native form detail has an invalid schema"))?;
     if detail.get("id").and_then(Value::as_str) != Some(form_id) {
-        return Err(evidence_unavailable("native form detail names another request"));
+        return Err(evidence_unavailable(
+            "native form detail names another request",
+        ));
     }
     if detail.get("sessionID").and_then(Value::as_str) != Some(session_id) {
-        return Err(evidence_unavailable("native form detail names another session"));
+        return Err(evidence_unavailable(
+            "native form detail names another session",
+        ));
     }
     let _ = crate::native_forms::validate_question_form(&form_info_only(&detail)?)?;
     Ok(detail)
@@ -405,7 +409,7 @@ fn validate_saved_reply_identity(saved: &SavedReplyIdentity) -> Result<()> {
     let prefix = if saved.kind == "question" {
         "frm_"
     } else if saved.kind == "permission" {
-        "per_"
+        "per"
     } else {
         return Err(evidence_unavailable("saved reply kind is unsupported"));
     };
@@ -493,7 +497,9 @@ pub async fn read_interaction_page(
         .verify_control_scope(command, options, session_id)
         .await?;
 
-    let raw = native.session_log_page(session_id, after_sequence, HISTORY_PAGE_LIMIT).await?;
+    let raw = native
+        .session_log_page(session_id, after_sequence, HISTORY_PAGE_LIMIT)
+        .await?;
     let page: SessionLogPage = serde_json::from_value(raw)
         .map_err(|_| schema_error("durable session log page has an unknown or invalid schema"))?;
     if page.data.len() > HISTORY_PAGE_LIMIT
@@ -513,15 +519,12 @@ pub async fn read_interaction_page(
         ));
     }
 
-    let mut expected = after_sequence.saturating_add(1);
     let mut through = after_sequence;
-    let mut gap = false;
     let mut events = Vec::with_capacity(page.data.len());
     let mut seen = std::collections::BTreeMap::<u64, (String, String)>::new();
     for event in &page.data {
         let id = text(event, "id", 256)?;
-        validate_id(id, "evt_")
-            .map_err(|_| schema_error("durable event ID is invalid"))?;
+        validate_id(id, "evt_").map_err(|_| schema_error("durable event ID is invalid"))?;
         let kind = text(event, "type", 128)?;
         if kind == "log.synced" {
             return Err(schema_error(
@@ -557,18 +560,13 @@ pub async fn read_interaction_page(
             continue;
         }
         seen.insert(sequence, (id.to_owned(), digest));
-        if sequence <= after_sequence {
+        if sequence <= through {
             return Err(schema_error(
-                "session log returned an event before the exclusive cursor",
+                "session log returned an event before its advancing cursor",
             ));
-        }
-        if sequence != expected {
-            gap = true;
-            break;
         }
         events.push(json!({"event_id":id,"type":kind,"sequence":sequence,"version":version}));
         through = sequence;
-        expected = sequence.saturating_add(1);
     }
     if page.has_more && through <= after_sequence {
         return Err(schema_error(
@@ -578,9 +576,7 @@ pub async fn read_interaction_page(
 
     let questions = read_pending_projection(native, session_id, "question").await?;
     let permissions = read_pending_projection(native, session_id, "permission").await?;
-    let coverage = if gap {
-        "gap"
-    } else if page.has_more {
+    let coverage = if page.has_more {
         "partial"
     } else {
         "complete_to_cursor"
@@ -681,25 +677,30 @@ async fn load_pending(native: &NativeClient, session_id: &str, kind: &str) -> Re
         ));
     }
     let mut request_ids = BTreeSet::new();
-    for item in &envelope.data {
-        let id = text(item, "id", 256)?;
-        validate_id(id, if kind == "question" { "frm_" } else { "per_" })?;
+    let mut selected = Vec::new();
+    for item in envelope.data {
+        // Validate before filtering: malformed native data cannot disappear
+        // as an empty question list. Valid auth/elicitation forms are not
+        // coding questions, including the SDK's global-owner carve-out.
+        if kind == "question" {
+            NativeClient::validate_form_info(&item)
+                .map_err(|_| schema_error("pending native form has an invalid schema"))?;
+        }
+        let id = text(&item, "id", 256)?.to_owned();
+        validate_id(&id, if kind == "question" { "frm_" } else { "per" })?;
         if !request_ids.insert(id) {
             return Err(schema_error(
                 "pending interaction list contains duplicate request IDs",
             ));
         }
-        if text(item, "sessionID", 256)? != session_id {
+        let unrelated_form = kind == "question" && item["metadata"]["kind"] != "question";
+        let owner = text(&item, "sessionID", 256)?;
+        if owner != session_id && !(unrelated_form && owner == "global") {
             return Err(schema_error(
                 "pending interaction belongs to another session",
             ));
         }
-        if kind == "question" {
-            crate::native_forms::validate_question_form(item)?;
-        } else {
-            validate_permission_request(item)?;
-        }
-        if serde_json::to_vec(item)
+        if serde_json::to_vec(&item)
             .map_err(|_| schema_error("pending interaction cannot be represented as JSON"))?
             .len()
             > MAX_INTERACTION_BYTES
@@ -709,8 +710,17 @@ async fn load_pending(native: &NativeClient, session_id: &str, kind: &str) -> Re
                 "pending interaction exceeds its bound",
             ));
         }
+        if unrelated_form {
+            continue;
+        }
+        if kind == "question" {
+            crate::native_forms::validate_question_form(&item)?;
+        } else {
+            validate_permission_request(&item)?;
+        }
+        selected.push(item);
     }
-    Ok(envelope.data)
+    Ok(selected)
 }
 
 fn project_permission(item: &Value, session_id: &str) -> Result<Value> {
@@ -871,7 +881,7 @@ fn bounded_text_value(value: &Value, maximum: usize) -> Result<String> {
 
 fn validate_id(value: &str, prefix: &str) -> Result<()> {
     if !value.starts_with(prefix)
-        || value.len() <= prefix.len()
+        || value.len() < prefix.len()
         || value.len() > 256
         || !value
             .bytes()

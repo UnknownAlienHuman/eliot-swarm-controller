@@ -7,7 +7,7 @@ use serde::{
     Deserialize,
     de::{DeserializeOwned, IgnoredAny},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     future::Future,
     io::Read,
@@ -34,16 +34,41 @@ struct NativeRpcErrorEnvelope {
     _data: Option<IgnoredAny>,
 }
 
-// This is an ELIOT connection record, not a guessed version of service.json.
-// An operator may update it when the externally owned service changes address.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ConnectionRecord {
+struct ExplicitConnectionRecord {
     schema_version: u32,
     endpoint: String,
     pid: u32,
     username: String,
     password: String,
+}
+
+/// OpenCode's own local-service registration (`@opencode/client/service`).
+/// The optional password protects HTTP access to the existing service; it is
+/// not a provider credential. Provider accounts remain entirely native.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredConnectionRecord {
+    id: Option<String>,
+    version: Option<String>,
+    url: String,
+    pid: u32,
+    password: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ConnectionSource {
+    Explicit(ExplicitConnectionRecord),
+    Registered(RegisteredConnectionRecord),
+}
+
+struct ConnectionRecord {
+    endpoint: String,
+    pid: u32,
+    auth: Option<(String, String)>,
+    registered_version: Option<String>,
 }
 
 #[derive(Clone)]
@@ -122,19 +147,64 @@ fn record(path: &Path) -> Result<ConnectionRecord> {
             "connection record exceeds limit",
         ));
     }
-    let record: ConnectionRecord = serde_json::from_slice(&bytes)
+    decode_connection_record(&bytes)
+}
+
+fn decode_connection_record(bytes: &[u8]) -> Result<ConnectionRecord> {
+    let source: ConnectionSource = serde_json::from_slice(bytes)
         .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "invalid connection record schema"))?;
-    if record.schema_version != 1
-        || record.pid == 0
-        || record.username.is_empty()
-        || record.username.contains(':')
-        || record.password.is_empty()
-    {
-        return Err(Error::new(
+    let invalid = || {
+        Error::new(
             "NATIVE_CONNECTION_FILE",
-            "explicit PID and Basic authentication are required",
-        ));
+            "invalid native service registration",
+        )
+    };
+    let record = match source {
+        ConnectionSource::Explicit(record) => {
+            if record.schema_version != 1
+                || record.username.is_empty()
+                || record.username.contains(':')
+                || record.password.is_empty()
+            {
+                return Err(invalid());
+            }
+            ConnectionRecord {
+                endpoint: record.endpoint,
+                pid: record.pid,
+                auth: Some((record.username, record.password)),
+                registered_version: None,
+            }
+        }
+        ConnectionSource::Registered(record) => {
+            if record
+                .id
+                .as_ref()
+                .into_iter()
+                .chain(record.version.as_ref())
+                .any(|text| {
+                    text.is_empty() || text.len() > 256 || text.chars().any(char::is_control)
+                })
+                || record
+                    .password
+                    .as_ref()
+                    .is_some_and(|password| password.is_empty())
+            {
+                return Err(invalid());
+            }
+            ConnectionRecord {
+                endpoint: record.url,
+                pid: record.pid,
+                auth: record
+                    .password
+                    .map(|password| ("opencode".into(), password)),
+                registered_version: record.version,
+            }
+        }
+    };
+    if record.pid == 0 {
+        return Err(invalid());
     }
+    endpoint(&record.endpoint)?;
     Ok(record)
 }
 
@@ -178,16 +248,6 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn valid_provider_id(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && value.len() <= 256
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
 fn normalized_image_sha256(value: &str) -> Option<String> {
     let digest = value.strip_prefix("sha256:").unwrap_or(value);
     valid_sha256(digest).then(|| format!("sha256:{digest}"))
@@ -214,14 +274,26 @@ fn require_owned_process_image(
 
 fn authenticated_service(record: ConnectionRecord, expected_version: String) -> Result<Service> {
     let endpoint = endpoint(&record.endpoint)?;
-    let mut auth = header::HeaderValue::from_str(&format!(
-        "Basic {}",
-        STANDARD.encode(format!("{}:{}", record.username, record.password))
-    ))
-    .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "invalid authentication value"))?;
-    auth.set_sensitive(true);
+    if record
+        .registered_version
+        .as_ref()
+        .is_some_and(|version| version != &expected_version)
+    {
+        return Err(Error::new(
+            "NATIVE_INSTANCE_CHANGED",
+            "native registration version differs from the selected service",
+        ));
+    }
     let mut headers = header::HeaderMap::new();
-    headers.insert(header::AUTHORIZATION, auth);
+    if let Some((username, password)) = record.auth {
+        let mut auth = header::HeaderValue::from_str(&format!(
+            "Basic {}",
+            STANDARD.encode(format!("{username}:{password}"))
+        ))
+        .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "invalid authentication value"))?;
+        auth.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, auth);
+    }
     headers.insert(
         header::ACCEPT,
         header::HeaderValue::from_static("application/json"),
@@ -396,80 +468,6 @@ impl Service {
     /// (e.g. `session.background`): never invent a body shape.
     pub(super) async fn post_no_body(&self, path: &str) -> Result<Value> {
         self.request(Method::POST, path, &[], None).await
-    }
-    pub(super) async fn post_integration_key(
-        &self,
-        integration_id: &str,
-        key: &str,
-        directory: &str,
-    ) -> Result<()> {
-        if !valid_provider_id(integration_id) {
-            return Err(Error::new(
-                "NATIVE_PROVIDER_ID_INVALID",
-                "selected provider ID is not one safe integration path segment",
-            ));
-        }
-        if key.is_empty() {
-            return Err(Error::invalid("provider integration key is empty"));
-        }
-        if directory.is_empty() || directory.len() > 4096 {
-            return Err(Error::invalid("provider integration workspace is invalid"));
-        }
-        if self.owned_process.is_none() {
-            return Err(Error::new(
-                "NATIVE_OWNED_PROCESS_MISMATCH",
-                "provider integration key requires a verified owned service",
-            ));
-        }
-        self.with_owned_process_check(self.post_integration_key_unchecked(
-            integration_id,
-            key,
-            directory,
-        ))
-        .await
-    }
-    async fn post_integration_key_unchecked(
-        &self,
-        integration_id: &str,
-        key: &str,
-        directory: &str,
-    ) -> Result<()> {
-        let mut url = self
-            .endpoint
-            .join(&format!("/api/integration/{integration_id}/connect/key"))
-            .map_err(|_| Error::new("NATIVE_ENDPOINT", "invalid provider integration route"))?;
-        // OpenCode 2.0.7's LocationMiddleware defaults an omitted directory to
-        // the server's process.cwd(). Bind this mutation to the same explicit
-        // workspace used by the surrounding integration readbacks.
-        url.query_pairs_mut()
-            .append_pair("location[directory]", directory);
-        if url.origin() != self.endpoint.origin() {
-            return Err(Error::new(
-                "NATIVE_ENDPOINT",
-                "cross-origin native request refused",
-            ));
-        }
-        let response = self
-            .client
-            .post(url)
-            .timeout(REQUEST_TIMEOUT)
-            .json(&json!({"key": key}))
-            .send()
-            .await
-            .map_err(|_| transport_error(true))?;
-        let status = response.status();
-        if status != reqwest::StatusCode::NO_CONTENT {
-            let code = if matches!(
-                status.as_u16(),
-                400 | 401 | 403 | 404 | 405 | 409 | 413 | 422
-            ) {
-                "NATIVE_REJECTED"
-            } else {
-                "NATIVE_OUTCOME_UNKNOWN"
-            };
-            return Err(Error::new(code, format!("HTTP {}", status.as_u16())));
-        }
-        Ok(())
     }
     pub(super) async fn put(&self, path: &str, body: Value) -> Result<Value> {
         self.request(Method::PUT, path, &[], Some(body)).await
@@ -811,44 +809,6 @@ fn transport_error(effect: bool) -> Error {
         },
         "native transport failed; no automatic mutation replay",
     )
-}
-
-#[cfg(test)]
-mod provider_path_tests {
-    use super::*;
-    use tokio::net::TcpListener;
-
-    #[tokio::test]
-    async fn built_in_key_mutation_rejects_navigation_before_process_or_http_checks() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let service = Service {
-            client: Client::builder()
-                .no_proxy()
-                .retry(reqwest::retry::never())
-                .build()
-                .unwrap(),
-            endpoint: Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap(),
-            pid: std::process::id(),
-            version: "2.0.7".into(),
-            owned_process: None,
-        };
-        for provider_id in [".", ".."] {
-            let error = service
-                .post_integration_key(provider_id, "fixture-key", "workspace")
-                .await
-                .unwrap_err();
-            assert_eq!(error.code, "NATIVE_PROVIDER_ID_INVALID");
-        }
-        // An ordinary dotted ID passes the segment guard and reaches the
-        // existing owned-process requirement; that requirement stays intact.
-        let error = service
-            .post_integration_key("provider.v1", "fixture-key", "workspace")
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "NATIVE_OWNED_PROCESS_MISMATCH");
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(listener.poll_accept(&mut context).is_pending());
-    }
 }
 
 #[cfg(test)]

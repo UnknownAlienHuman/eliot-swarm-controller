@@ -1,6 +1,11 @@
 # Implementation status
 
 ## Current state
+### Native authorization correction (2026-10-15)
+
+The controller uses the already authorized native OpenCode service. Provider credential sources, key bootstrap and provider-auth proof gates are removed. Direct connection accepts the native service registration in place; controller IPC/MCP credentials remain independent. Fresh isolated SDK service starts are retired, with historical custody/readback retained. Earlier entries below describing provider authorization or isolated-owner qualification are historical, not the current supported launch contract.
+
+The installed OpenCode CLI 2.0.28 successfully discovered the existing native service and read `/api/info`: server 2.0.7, PID 72148. This is connection-health evidence only. It does not establish model execution, productive native workflow, a full CI pass or installed qualification of the 0.7 adapter candidate. The SDK 2.0.7 log starts at sequence 0 and filters other durable buses sharing aggregate sequence numbers; gaps and a later scoped sync watermark are native semantics. Issue #153 and the broader project remain **PARTIAL_PROGRESS**.
 
 ### Current source and completion map
 

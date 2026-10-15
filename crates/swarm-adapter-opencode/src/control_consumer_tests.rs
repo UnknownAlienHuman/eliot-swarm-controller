@@ -293,54 +293,33 @@ fn sha256_json(value: &Value) -> String {
 }
 
 fn native_question(root: &str, id: &str) -> Value {
-    json!({
-        "id":id,
-        "sessionID":root,
-        "title":"Questions",
-        "metadata":{"kind":"question","tool":{"messageID":"msg_fixture","id":"tool_fixture"}},
-        "fields":[{
-            "key":"q0",
-            "title":"Choice",
-            "description":"Choose one",
-            "type":"string",
-            "options":[{"value":"yes","label":"yes","description":"Accept"}],
-            "custom":true
-        }]
-    })
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../modules/opencode/fixtures/native-controls-2.0.7.json"
+    ))
+    .unwrap();
+    let mut question = fixture["question"].clone();
+    question["id"] = json!(id);
+    question["sessionID"] = json!(root);
+    question
 }
 
 fn native_permission(root: &str, id: &str) -> Value {
     json!({"id":id,"sessionID":root,"action":"shell","resources":["fixture"]})
 }
 
-fn durable_event(root: &str, id: &str, event_type: &str, sequence: u64, data: Value) -> Value {
-    json!({
-        "id":id,
-        "type":event_type,
-        "version":1,
-        "created":sequence as f64,
-        "durable":{"aggregateID":root,"seq":sequence,"version":1},
-        "data":data
-    })
-}
-
 fn root_created_event(state: &NativeState) -> Value {
-    durable_event(
-        &state.root,
-        "evt_pr43_root_created",
-        "session.created",
-        1,
-        json!({
-            "sessionID":state.root,
-            "parentID":null,
-            "model":{
-                "id":state.model.id,
-                "providerID":state.model.provider_id,
-                "variant":state.model.variant
-            },
-            "metadata":{"eliot":{"binding":state.binding_id,"generation":state.generation}}
-        }),
-    )
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../modules/opencode/fixtures/native-inbox-2.0.7.json"
+    ))
+    .unwrap();
+    let mut event = fixture["events"]["rootCreated"].clone();
+    event["durable"]["aggregateID"] = json!(state.root);
+    event["data"]["sessionID"] = json!(state.root);
+    event["data"]["location"]["directory"] = json!(state.directory);
+    event["data"]["model"] = serde_json::to_value(&state.model).unwrap();
+    event["data"]["metadata"] =
+        json!({"eliot":{"binding":state.binding_id,"generation":state.generation}});
+    event
 }
 
 #[tokio::test]
@@ -363,10 +342,17 @@ async fn question_answered_detail_proves_exact_form_reply() {
     let saved = fixture.journal.load(target_id).unwrap();
     assert_eq!(saved.outcome.as_ref().unwrap()["outcome"], "unknown");
     let intent = saved.intent.unwrap();
-    let (native, _) = NativeClient::connect(&fixture.config.native_options).await.unwrap();
-    native_interactions::reconcile_reply(&native, &command, &fixture.config.native_options, &intent)
+    let (native, _) = NativeClient::connect(&fixture.config.native_options)
         .await
         .unwrap();
+    native_interactions::reconcile_reply(
+        &native,
+        &command,
+        &fixture.config.native_options,
+        &intent,
+    )
+    .await
+    .unwrap();
     drop(host);
     fixture.close().await;
 }
@@ -391,10 +377,17 @@ async fn question_cancelled_detail_proves_exact_form_reject() {
     let saved = fixture.journal.load(target_id).unwrap();
     assert_eq!(saved.outcome.as_ref().unwrap()["outcome"], "unknown");
     let intent = saved.intent.unwrap();
-    let (native, _) = NativeClient::connect(&fixture.config.native_options).await.unwrap();
-    native_interactions::reconcile_reply(&native, &command, &fixture.config.native_options, &intent)
+    let (native, _) = NativeClient::connect(&fixture.config.native_options)
         .await
         .unwrap();
+    native_interactions::reconcile_reply(
+        &native,
+        &command,
+        &fixture.config.native_options,
+        &intent,
+    )
+    .await
+    .unwrap();
     drop(host);
     fixture.close().await;
 }
@@ -428,8 +421,14 @@ async fn unknown_schema_state_never_fabricates_form_or_history_proof() {
         json!({"answers":[["no"]]}),
     );
     let command = fixture.command("pr43-question-stale", "agent.reply", input, None);
-    let (native, _) = NativeClient::connect(&fixture.config.native_options).await.unwrap();
-    assert!(native_interactions::prepare_reply(&native, &command, &fixture.config.native_options).await.is_err());
+    let (native, _) = NativeClient::connect(&fixture.config.native_options)
+        .await
+        .unwrap();
+    assert!(
+        native_interactions::prepare_reply(&native, &command, &fixture.config.native_options)
+            .await
+            .is_err()
+    );
     let foreign = json!({
         "id":"frm_foreign",
         "sessionID":fixture.root(),
@@ -452,8 +451,17 @@ async fn unknown_schema_state_never_fabricates_form_or_history_proof() {
         &foreign,
         json!({"answers":[["yes"]]}),
     );
-    let foreign_command = fixture.command("pr43-question-foreign", "agent.reply", foreign_input, None);
-    assert!(native_interactions::prepare_reply(&native, &foreign_command, &fixture.config.native_options).await.is_err());
+    let foreign_command =
+        fixture.command("pr43-question-foreign", "agent.reply", foreign_input, None);
+    assert!(
+        native_interactions::prepare_reply(
+            &native,
+            &foreign_command,
+            &fixture.config.native_options
+        )
+        .await
+        .is_err()
+    );
     drop(host);
     fixture.close().await;
 }
@@ -495,8 +503,14 @@ async fn question_reply_and_reject_cross_native_and_outcome_ack() {
     execute(&host, &reject).await.unwrap();
 
     let requests = fixture.native.requests();
-    let posts = requests.iter().filter(|request| request.method == "POST").collect::<Vec<_>>();
-    let deletes = requests.iter().filter(|request| request.method == "DELETE").collect::<Vec<_>>();
+    let posts = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .collect::<Vec<_>>();
+    let deletes = requests
+        .iter()
+        .filter(|request| request.method == "DELETE")
+        .collect::<Vec<_>>();
     assert_eq!(posts.len(), 1);
     assert_eq!(deletes.len(), 1);
     assert_eq!(
@@ -527,8 +541,14 @@ async fn question_reply_and_reject_cross_native_and_outcome_ack() {
             .count(),
         2
     );
-    assert!(fixture.native.requests().iter().all(|request|
-        !request.path.contains("/question/") && !request.path.contains("/history")));
+    assert!(
+        fixture
+            .native
+            .requests()
+            .iter()
+            .all(|request| !request.path.contains("/question/")
+                && !request.path.contains("/history"))
+    );
     drop(host);
     fixture.close().await;
 }
@@ -538,7 +558,7 @@ async fn permission_reject_cascade_reaches_native_and_outcome_ack() {
     let fixture = ControlFixture::new(NativeMode::PermissionCascade, 1).await;
     let host = fixture.host();
     host.hello_retry().await.unwrap();
-    let target_request = native_permission(fixture.root(), "per_primary");
+    let target_request = native_permission(fixture.root(), "percustom");
     let input = reply_input(
         &fixture.config.binding_id,
         fixture.config.generation,
@@ -554,7 +574,7 @@ async fn permission_reject_cascade_reaches_native_and_outcome_ack() {
     assert_eq!(outcome["outcome"], "applied");
     assert_eq!(
         outcome["details"]["affected_request_ids"],
-        json!(["per_primary", "per_secondary"])
+        json!(["per_secondary", "percustom"])
     );
     let posts = fixture
         .native
@@ -565,10 +585,7 @@ async fn permission_reject_cascade_reaches_native_and_outcome_ack() {
     assert_eq!(posts.len(), 1);
     assert_eq!(
         posts[0].path,
-        format!(
-            "/api/session/{}/permission/per_primary/reply",
-            fixture.root()
-        )
+        format!("/api/session/{}/permission/percustom/reply", fixture.root())
     );
     assert_eq!(posts[0].body, json!({"decision":"reject"}));
     let calls = fixture.rpc.calls();
@@ -577,7 +594,7 @@ async fn permission_reject_cascade_reaches_native_and_outcome_ack() {
             && call.recorded == Some(true)
             && call.params["operation_id"] == target_id
             && call.params["details"]["affected_request_ids"]
-                == json!(["per_primary", "per_secondary"])
+                == json!(["per_secondary", "percustom"])
     }));
     drop(host);
     fixture.close().await;
@@ -588,7 +605,7 @@ async fn ambiguous_permission_post_stays_unknown_without_replay() {
     let fixture = ControlFixture::new(NativeMode::PermissionCascadeUncertain, 1).await;
     let host = fixture.host();
     host.hello_retry().await.unwrap();
-    let target_request = native_permission(fixture.root(), "per_primary");
+    let target_request = native_permission(fixture.root(), "percustom");
     let input = reply_input(
         &fixture.config.binding_id,
         fixture.config.generation,
@@ -633,10 +650,7 @@ async fn ambiguous_permission_post_stays_unknown_without_replay() {
     assert_eq!(posts.len(), 1);
     assert_eq!(
         posts[0].path,
-        format!(
-            "/api/session/{}/permission/per_primary/reply",
-            fixture.root()
-        )
+        format!("/api/session/{}/permission/percustom/reply", fixture.root())
     );
     assert_eq!(posts[0].body, json!({"decision":"reject"}));
     drop(host);
@@ -648,7 +662,7 @@ async fn permission_always_is_never_authorized() {
     let fixture = ControlFixture::new(NativeMode::PermissionCascade, 1).await;
     let host = fixture.host();
     host.hello_retry().await.unwrap();
-    let target_request = native_permission(fixture.root(), "per_primary");
+    let target_request = native_permission(fixture.root(), "percustom");
     let input = reply_input(
         &fixture.config.binding_id,
         fixture.config.generation,
@@ -658,13 +672,20 @@ async fn permission_always_is_never_authorized() {
         json!({"decision":"always"}),
     );
     let command = fixture.command("pr43-permission-always", "agent.reply", input, None);
-    let (native, _) = NativeClient::connect(&fixture.config.native_options).await.unwrap();
+    let (native, _) = NativeClient::connect(&fixture.config.native_options)
+        .await
+        .unwrap();
     let err = native_interactions::prepare_reply(&native, &command, &fixture.config.native_options)
         .await
         .unwrap_err();
     assert_eq!(err.code, "INVALID_NATIVE_INTERACTION");
-    assert!(fixture.native.requests().iter().all(|request|
-        !["POST", "PUT", "DELETE", "PATCH"].contains(&request.method.as_str())));
+    assert!(
+        fixture
+            .native
+            .requests()
+            .iter()
+            .all(|request| !["POST", "PUT", "DELETE", "PATCH"].contains(&request.method.as_str()))
+    );
     drop(host);
     fixture.close().await;
 }
@@ -735,44 +756,156 @@ async fn serve_native_request(stream: TcpStream, state: Arc<NativeState>) -> io:
     } else {
         serde_json::from_slice(&body_bytes).unwrap_or(Value::Null)
     };
-    let fixture_path = target.split('?').next().unwrap_or_default().to_owned();
-    let fixture_query = target.split('?').nth(1).unwrap_or_default().to_owned();
-    let fixture_query_value = |name: &str| -> Option<String> {
-        fixture_query.split('&').find_map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            if key == name {
-                Some(value.to_owned())
-            } else {
-                None
-            }
-        })
+    let path = target.split('?').next().unwrap_or_default().to_owned();
+    state.requests.lock().unwrap().push(NativeRequest {
+        method: method.clone(),
+        path: path.clone(),
+        body: body.clone(),
+    });
+    let Some(response) = native_response(&state, &method, &target, &path, body) else {
+        return Ok(());
     };
-    if method == "GET" && fixture_path == format!("/api/session/{}/form", state.root) {
+    let status_text = match response.status {
+        200 => "OK",
+        204 => "No Content",
+        404 => "Not Found",
+        _ => "Fixture Response",
+    };
+    let header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status,
+        status_text,
+        response.content_type,
+        response.body.len()
+    );
+    reader.get_mut().write_all(header.as_bytes()).await?;
+    reader.get_mut().write_all(&response.body).await?;
+    reader.get_mut().flush().await
+}
+
+struct NativeResponse {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+fn json_response(status: u16, value: Value) -> Option<NativeResponse> {
+    Some(NativeResponse {
+        status,
+        content_type: "application/json",
+        body: serde_json::to_vec(&value).unwrap(),
+    })
+}
+
+fn native_response(
+    state: &NativeState,
+    method: &str,
+    target: &str,
+    path: &str,
+    _body: Value,
+) -> Option<NativeResponse> {
+    let location = json!({
+        "directory":state.directory,
+        "project":{"id":"pr43-fixture-project"}
+    });
+    let session = json!({
+        "id":state.root,
+        "parentID":null,
+        "fork":null,
+        "location":{"directory":state.directory},
+        "model":{
+            "id":state.model.id,
+            "providerID":state.model.provider_id,
+            "variant":state.model.variant
+        },
+        "metadata":{"eliot":{"binding":state.binding_id,"generation":state.generation}}
+    });
+    if method == "GET" && path == "/api/info" {
+        return json_response(
+            200,
+            json!({
+                "version":"2.0.7",
+                "pid":43117,
+                "urls":["http://127.0.0.1/"],
+                "paths":{"tmp":"/tmp/pr43-fixture"}
+            }),
+        );
+    }
+    if method == "GET" && path == "/api/location" {
+        return json_response(200, location);
+    }
+    if method == "GET" && path == "/api/model" {
+        return json_response(
+            200,
+            json!({
+                "location":{"directory":state.directory},
+                "data":[{
+                    "id":state.model.id,
+                    "providerID":state.model.provider_id,
+                    "enabled":true,
+                    "variants":[{"id":state.model.variant}]
+                }]
+            }),
+        );
+    }
+    if method == "GET" && path == format!("/api/session/{}", state.root) {
+        return json_response(200, json!({"data":session}));
+    }
+    if method == "GET" && path == format!("/api/experimental/session/{}/log", state.root) {
+        let renamed = json!({"id":"evt_pr43_renamed","type":"session.renamed","created":123,
+            "durable":{"aggregateID":state.root,"version":1,"seq":1},
+            "data":{"sessionID":state.root,"title":"fixture-refresh"}});
+        let after = reqwest::Url::parse(&format!("http://fixture{target}"))
+            .unwrap()
+            .query_pairs()
+            .find_map(|(key, value)| (key == "after").then(|| value.parse::<u64>().unwrap()));
+        let mut body = [root_created_event(state), renamed]
+            .into_iter()
+            .filter(|event| {
+                after.is_none_or(|after| event["durable"]["seq"].as_u64().unwrap() > after)
+            })
+            .map(|event| format!("event: message\ndata: {event}\n\n"))
+            .collect::<String>();
+        let sync = json!({"type":"log.synced","aggregateID":state.root,"seq":1});
+        body.push_str(&format!("event: message\ndata: {sync}\n\n"));
+        return Some(NativeResponse {
+            status: 200,
+            content_type: "text/event-stream; charset=utf-8",
+            body: body.into_bytes(),
+        });
+    }
+    if method == "GET" && path == format!("/api/session/{}/form", state.root) {
         let questions = match state.mode {
             NativeMode::Questions => vec![
+                serde_json::from_str::<Value>(include_str!(
+                    "../../../modules/opencode/fixtures/native-controls-2.0.7.json"
+                ))
+                .unwrap()["authForm"]
+                    .clone(),
                 native_question(&state.root, "frm_reply"),
                 native_question(&state.root, "frm_reject"),
             ],
             NativeMode::Refresh => vec![native_question(&state.root, "frm_refresh")],
             NativeMode::PermissionCascade | NativeMode::PermissionCascadeUncertain => Vec::new(),
             NativeMode::QuestionDetailAnswered => vec![native_question(&state.root, "frm_proven")],
-            NativeMode::QuestionDetailCancelled => vec![native_question(&state.root, "frm_cancelled")],
-            _ => Vec::new(),
+            NativeMode::QuestionDetailCancelled => {
+                vec![native_question(&state.root, "frm_cancelled")]
+            }
         };
         return json_response(200, json!({"data":questions}));
     }
     if method == "GET"
-        && fixture_path.starts_with(&format!("/api/session/{}/form/", state.root))
-        && !fixture_path.ends_with("/reply")
+        && path.starts_with(&format!("/api/session/{}/form/", state.root))
+        && !path.ends_with("/reply")
     {
-        let form_id = fixture_path.rsplit('/').next().unwrap_or_default();
+        let form_id = path.rsplit('/').next().unwrap_or_default();
         let known = match state.mode {
             NativeMode::QuestionDetailAnswered => native_question(&state.root, form_id),
             NativeMode::QuestionDetailCancelled => native_question(&state.root, form_id),
             _ => Value::Null,
         };
         if known.is_null() {
-            return json_response(404, json!({"error":"form not found","path":fixture_path}));
+            return json_response(404, json!({"error":"form not found","path":path}));
         }
         let status = match state.mode {
             NativeMode::QuestionDetailAnswered => "answered",
@@ -789,11 +922,10 @@ async fn serve_native_request(stream: TcpStream, state: Arc<NativeState>) -> io:
         }
         return json_response(200, json!({"data":detail}));
     }
-    if method == "GET" && fixture_path == format!("/api/session/{}/permission", state.root) {
+    if method == "GET" && path == format!("/api/session/{}/permission", state.root) {
         let permission_reject_posted = state.requests.lock().unwrap().iter().any(|request| {
             request.method == "POST"
-                && request.path
-                    == format!("/api/session/{}/permission/per_primary/reply", state.root)
+                && request.path == format!("/api/session/{}/permission/percustom/reply", state.root)
         });
         let permissions = if matches!(
             state.mode,
@@ -801,7 +933,7 @@ async fn serve_native_request(stream: TcpStream, state: Arc<NativeState>) -> io:
         ) && !permission_reject_posted
         {
             vec![
-                native_permission(&state.root, "per_primary"),
+                native_permission(&state.root, "percustom"),
                 native_permission(&state.root, "per_secondary"),
             ]
         } else {
@@ -809,39 +941,40 @@ async fn serve_native_request(stream: TcpStream, state: Arc<NativeState>) -> io:
         };
         return json_response(200, json!({"data":permissions}));
     }
-    if method == "GET" && fixture_path == format!("/api/session/{}/permission/per_primary", state.root) {
+    if method == "GET" && path == format!("/api/session/{}/permission/percustom", state.root) {
         return json_response(
             200,
-            json!({"data":native_permission(&state.root, "per_primary")}),
+            json!({"data":native_permission(&state.root, "percustom")}),
         );
     }
-    if method == "GET" && fixture_path == format!("/api/session/{}/log", state.root) {
+    if method == "GET" && path == format!("/api/session/{}/log", state.root) {
         return json_response(
             404,
-            json!({"error":"stale history route is gone","path":fixture_path}),
+            json!({"error":"stale history route is gone","path":path}),
         );
     }
-    if matches!(state.mode, NativeMode::QuestionDetailAnswered | NativeMode::QuestionDetailCancelled)
-        && ((method == "POST" && fixture_path.ends_with("/reply")) || method == "DELETE")
+    if matches!(
+        state.mode,
+        NativeMode::QuestionDetailAnswered | NativeMode::QuestionDetailCancelled
+    ) && ((method == "POST" && path.ends_with("/reply")) || method == "DELETE")
     {
         return json_response(500, json!({"error":"reply committed before lost response"}));
     }
-    if method == "POST" && fixture_path == format!("/api/session/{}/form/frm_reply/reply", state.root) {
+    if method == "POST" && path == format!("/api/session/{}/form/frm_reply/reply", state.root) {
         return Some(NativeResponse {
             status: 204,
             content_type: "application/json",
             body: Vec::new(),
         });
     }
-    if method == "DELETE" && fixture_path == format!("/api/session/{}/form/frm_reject", state.root) {
+    if method == "DELETE" && path == format!("/api/session/{}/form/frm_reject", state.root) {
         return Some(NativeResponse {
             status: 204,
             content_type: "application/json",
             body: Vec::new(),
         });
     }
-    if method == "POST"
-        && fixture_path == format!("/api/session/{}/permission/per_primary/reply", state.root)
+    if method == "POST" && path == format!("/api/session/{}/permission/percustom/reply", state.root)
     {
         if matches!(state.mode, NativeMode::PermissionCascadeUncertain) {
             return json_response(500, json!({"error":"reply committed before lost response"}));
@@ -852,20 +985,23 @@ async fn serve_native_request(stream: TcpStream, state: Arc<NativeState>) -> io:
             body: Vec::new(),
         });
     }
-    if method == "POST" && fixture_path.contains("/question/") {
+    if method == "POST" && path.contains("/question/") {
         return json_response(
             404,
-            json!({"error":"stale question route is gone","path":fixture_path}),
+            json!({"error":"stale question route is gone","path":path}),
         );
     }
-    if method == "GET" && fixture_path.contains("/history") {
+    if method == "GET" && path.contains("/history") {
         return json_response(
             404,
-            json!({"error":"stale history route is gone","path":fixture_path}),
+            json!({"error":"stale history route is gone","path":path}),
         );
     }
-    let _ = fixture_query_value;
-
+    json_response(
+        404,
+        json!({"error":"unhandled native fixture route","path":path}),
+    )
+}
 async fn serve_module_rpc<S>(
     stream: S,
     config: AdapterConfig,

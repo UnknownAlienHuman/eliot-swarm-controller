@@ -102,6 +102,17 @@ impl NativeOwnerController {
             }
             return Ok(Some(receipt));
         }
+        if config.origin == "fresh_owned_service" {
+            return Err(OwnerStartFailure {
+                error: Box::new(Error::new(
+                    "NATIVE_HARNESS_REQUIRED",
+                    "connect to an already-running native OpenCode service",
+                )),
+                effect_attempted: false,
+                details: json!({"native_effect":"not_attempted"}),
+                native_owner: None,
+            });
+        }
         let (owner, receipt) = match NativeOwner::start(&config, options).await {
             Ok(started) => started,
             Err(mut failure) => {

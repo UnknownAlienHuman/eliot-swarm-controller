@@ -29,15 +29,15 @@ const MAX_NATIVE_ERROR_BODY: usize = 8 * 1024;
 const MAX_CONNECTION_FILE: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOG_EVENTS: usize = 8192;
-const MAX_MESSAGE_PAGE: usize = 50;
-const MAX_MESSAGE_PAGES: usize = 32;
-const MAX_MESSAGE_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const SESSION_HISTORY_PAGE_LIMIT: usize = 100;
 const SESSION_HISTORY_MAX_PAGES: usize = 32;
 const SESSION_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MODEL_CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+#[path = "native/session_log.rs"]
+mod session_log;
 
 #[cfg(test)]
 #[path = "native/inbox_tests.rs"]
@@ -86,12 +86,39 @@ impl PreflightOpenFailure {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ConnectionRecord {
+struct ExplicitConnectionRecord {
     schema_version: u32,
     endpoint: String,
     pid: u32,
     username: String,
     password: String,
+}
+
+/// OpenCode's own local-service registration (`@opencode/client/service`).
+/// The optional password protects HTTP access to the existing service; it is
+/// not a provider credential. Provider accounts remain entirely native.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredConnectionRecord {
+    id: Option<String>,
+    version: Option<String>,
+    url: String,
+    pid: u32,
+    password: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ConnectionSource {
+    Explicit(ExplicitConnectionRecord),
+    Registered(RegisteredConnectionRecord),
+}
+
+struct ConnectionRecord {
+    endpoint: String,
+    pid: u32,
+    auth: Option<(String, String)>,
+    registered_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,25 +168,10 @@ pub struct AssistantResultEvidence {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MessagePage {
-    data: Vec<Value>,
-    cursor: MessageCursor,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SessionHistoryPage {
     data: Vec<Value>,
     #[serde(rename = "hasMore")]
     has_more: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MessageCursor {
-    next: Option<String>,
-    #[serde(rename = "previous")]
-    _previous: Option<String>,
 }
 
 pub struct NativeClient {
@@ -176,14 +188,16 @@ impl NativeClient {
             .await
             .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "connection reader stopped"))??;
         let endpoint = checked_endpoint(&record.endpoint)?;
-        let mut auth = header::HeaderValue::from_str(&format!(
-            "Basic {}",
-            STANDARD.encode(format!("{}:{}", record.username, record.password))
-        ))
-        .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "invalid authentication value"))?;
-        auth.set_sensitive(true);
         let mut headers = header::HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, auth);
+        if let Some((username, password)) = record.auth {
+            let mut auth = header::HeaderValue::from_str(&format!(
+                "Basic {}",
+                STANDARD.encode(format!("{username}:{password}"))
+            ))
+            .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "invalid authentication value"))?;
+            auth.set_sensitive(true);
+            headers.insert(header::AUTHORIZATION, auth);
+        }
         headers.insert(
             header::ACCEPT,
             header::HeaderValue::from_static("application/json"),
@@ -216,6 +230,10 @@ impl NativeClient {
         let info: ServerInfo = serde_json::from_value(service.get("/api/info", &[]).await?)
             .map_err(|_| Error::new("NATIVE_SCHEMA_ERROR", "native info response is invalid"))?;
         if info.pid != service.pid
+            || record
+                .registered_version
+                .as_ref()
+                .is_some_and(|version| version != &info.version)
             || info.version.trim().is_empty()
             || info.version.len() > 256
             || info.version.chars().any(char::is_control)
@@ -240,61 +258,6 @@ impl NativeClient {
     pub async fn probe_route(&self, options: &NativeOptions) -> Result<()> {
         self.location(options).await?;
         self.check_route_model_available(options).await
-    }
-
-    /// Read the provider integration projection for one exact workspace. The
-    /// caller validates the returned shape before making any mutation.
-    pub async fn provider_integration(&self, directory: &str) -> Result<Value> {
-        self.get(
-            "/api/integration",
-            &[("location[directory]", directory.to_owned())],
-        )
-        .await
-    }
-
-    /// Perform the one provider API-key POST. The shared request path maps a
-    /// deterministic HTTP rejection to `NATIVE_REJECTED` and every transport
-    /// ambiguity to `NATIVE_OUTCOME_UNKNOWN`.
-    pub async fn post_provider_key(
-        &self,
-        provider_id: &str,
-        key: &str,
-        directory: &str,
-    ) -> Result<()> {
-        if !valid_provider_id(provider_id) {
-            return Err(Error::new(
-                "NATIVE_PROVIDER_ID_INVALID",
-                "selected provider ID is not one safe integration path segment",
-            ));
-        }
-        if key.is_empty() || directory.is_empty() || directory.len() > 4096 {
-            return Err(Error::invalid("provider integration input is invalid"));
-        }
-        let body = json!({"key":key});
-        let path = format!("/api/integration/{provider_id}/connect/key");
-        let value = self
-            .request(
-                Method::POST,
-                &path,
-                &[("location[directory]", directory.to_owned())],
-                Some(&body),
-            )
-            .await?;
-        if !value.is_null() {
-            return Err(Error::new(
-                "NATIVE_SCHEMA_ERROR",
-                "provider key response was not empty",
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    pub fn version(&self) -> &str {
-        &self.version
     }
 
     pub async fn preflight_open(
@@ -597,12 +560,6 @@ impl NativeClient {
             )
         })?;
         let mut after = after_sequence.unwrap_or(0);
-        let mut expected = after.checked_add(1).ok_or_else(|| {
-            Error::new(
-                "NATIVE_HISTORY_CURSOR",
-                "native history cursor is exhausted",
-            )
-        })?;
         let mut pages = 0usize;
         let mut scanned_bytes = 0usize;
         let mut seen = BTreeMap::<u64, (String, String)>::new();
@@ -612,13 +569,7 @@ impl NativeClient {
         while pages < SESSION_HISTORY_MAX_PAGES {
             pages += 1;
             let raw = self
-                .get(
-                    &format!("/api/session/{session}/history"),
-                    &[
-                        ("after", after.to_string()),
-                        ("limit", SESSION_HISTORY_PAGE_LIMIT.to_string()),
-                    ],
-                )
+                .session_log_page(session, after, SESSION_HISTORY_PAGE_LIMIT)
                 .await?;
             scanned_bytes = scanned_bytes.saturating_add(canonical_json(&raw)?.len());
             if scanned_bytes > SESSION_HISTORY_MAX_BYTES {
@@ -643,7 +594,6 @@ impl NativeClient {
             }
 
             let page_start = after;
-            let mut gap_after_evidence = false;
             for event in &page.data {
                 let event_id = required_text(event, "id")?;
                 valid_id(event_id, "evt")?;
@@ -697,19 +647,6 @@ impl NativeClient {
                         "exclusive history cursor returned an earlier event",
                     ));
                 }
-                if sequence != expected {
-                    // A matching durable admission already proves this input;
-                    // a later history gap only prevents adding later evidence.
-                    if evidence.admitted_sequence.is_some() || evidence.prompted_sequence.is_some()
-                    {
-                        gap_after_evidence = true;
-                        break;
-                    }
-                    return Err(Error::new(
-                        "NATIVE_HISTORY_GAP",
-                        "durable session history does not cover the required sequence interval",
-                    ));
-                }
                 seen.insert(sequence, (event_id.to_owned(), event_digest));
                 let data = event
                     .get("data")
@@ -755,16 +692,7 @@ impl NativeClient {
                         }
                     }
                 }
-                expected = sequence.checked_add(1).ok_or_else(|| {
-                    Error::new(
-                        "NATIVE_HISTORY_CURSOR",
-                        "native history sequence is exhausted",
-                    )
-                })?;
                 after = sequence;
-            }
-            if gap_after_evidence {
-                break;
             }
             if page.has_more {
                 if after <= page_start {
@@ -878,10 +806,10 @@ impl NativeClient {
         }
 
         let first = self
-            .scan_assistant_result(root, input, assistant_message_id, intent)
+            .read_selected_assistant_result(root, input, assistant_message_id, intent)
             .await?;
         let second = self
-            .scan_assistant_result(root, input, assistant_message_id, intent)
+            .read_selected_assistant_result(root, input, assistant_message_id, intent)
             .await?;
         if first.message != second.message || first.parent_id != second.parent_id {
             return Err(Error::new(
@@ -892,124 +820,49 @@ impl NativeClient {
         Ok(first)
     }
 
-    async fn scan_assistant_result(
+    async fn read_selected_assistant_result(
         &self,
         session: &str,
         input_id: &str,
         assistant_id: &str,
         intent: &OperationIntent,
     ) -> Result<AssistantResultEvidence> {
-        let mut cursor: Option<String> = None;
-        let mut cursors = BTreeSet::new();
-        let mut ids = BTreeSet::new();
-        let mut scanned_bytes = 0usize;
-        let mut input_message: Option<Value> = None;
-        let mut assistant_message: Option<Value> = None;
-
-        for _ in 0..MAX_MESSAGE_PAGES {
-            let mut query = vec![("limit", MAX_MESSAGE_PAGE.to_string())];
-            if let Some(cursor) = &cursor {
-                query.push(("cursor", cursor.clone()));
-            } else {
-                query.push(("order", "desc".to_owned()));
-            }
-            let raw = self
-                .get(&format!("/api/session/{session}/message"), &query)
-                .await?;
-            scanned_bytes = scanned_bytes.saturating_add(canonical_json(&raw)?.len());
-            if scanned_bytes > MAX_MESSAGE_SCAN_BYTES {
-                return Err(Error::new(
-                    "NATIVE_MESSAGE_SCAN_LIMIT",
-                    "native assistant message projection exceeds its read bound",
-                ));
-            }
-            let page: MessagePage = serde_json::from_value(raw).map_err(|_| {
-                Error::new(
-                    "NATIVE_MESSAGE_SCHEMA",
-                    "native assistant message page is outside the pinned contract",
-                )
-            })?;
-            if page.data.len() > MAX_MESSAGE_PAGE
-                || (page.data.is_empty() && page.cursor.next.is_some())
-            {
-                return Err(Error::new(
-                    "NATIVE_MESSAGE_SCHEMA",
-                    "native assistant message page has an invalid bound",
-                ));
-            }
-            for message in page.data {
-                let id = message.get("id").and_then(Value::as_str).ok_or_else(|| {
-                    Error::new(
-                        "NATIVE_MESSAGE_SCHEMA",
-                        "native message lacks its exact identity",
-                    )
-                })?;
-                valid_id(id, "msg_")?;
-                if !ids.insert(id.to_owned()) {
-                    return Err(Error::new(
-                        "NATIVE_MESSAGE_AMBIGUOUS",
-                        "native message projection repeated an ID",
-                    ));
-                }
-                if id == input_id {
-                    if !saved_message_matches(&message, session, input_id, intent) {
-                        return Err(Error::new(
-                            "NATIVE_INPUT_MISMATCH",
-                            "native user message differs from the exact admitted input",
-                        ));
-                    }
-                    input_message = Some(message.clone());
-                }
-                if id == assistant_id {
-                    validate_assistant_parent(&message, session, input_id)?;
-                    if assistant_message.replace(message).is_some() {
-                        return Err(Error::new(
-                            "NATIVE_MESSAGE_AMBIGUOUS",
-                            "native assistant projection contains more than one selected ID",
-                        ));
-                    }
-                }
-            }
-            match page.cursor.next {
-                None => {
-                    // `cursor` names the page request, not unfinished work.
-                    // Clear a prior-page cursor when this page proves EOF so a
-                    // completed multi-page scan is not reported as limit exhaustion.
-                    cursor = None;
-                    break;
-                }
-                Some(next)
-                    if !next.is_empty() && next.len() <= 4096 && cursors.insert(next.clone()) =>
-                {
-                    cursor = Some(next);
-                }
-                Some(_) => {
-                    return Err(Error::new(
-                        "NATIVE_MESSAGE_CURSOR",
-                        "native assistant message cursor repeated or is invalid",
-                    ));
-                }
-            }
-        }
-
-        if cursor.is_some() {
-            return Err(Error::new(
-                "NATIVE_MESSAGE_SCAN_LIMIT",
-                "native assistant message projection exceeded its page bound",
-            ));
-        }
-        if input_message.is_none() {
-            return Err(Error::new(
-                "NATIVE_INPUT_NOT_OBSERVED",
-                "exact admitted native user message was not observed",
-            ));
-        }
-        let message = assistant_message.ok_or_else(|| {
+        // 2.0.7 exposes exact-message GETs, not a message-list endpoint.
+        // The selector never derives an assistant from order or timestamps.
+        let input_response = self
+            .get(&format!("/api/session/{session}/message/{input_id}"), &[])
+            .await?;
+        let input = input_response.get("data").ok_or_else(|| {
             Error::new(
-                "NATIVE_ASSISTANT_RESULT_NOT_OBSERVED",
-                "selected native assistant message was not observed",
+                "NATIVE_MESSAGE_SCHEMA",
+                "native input projection lacks data",
             )
         })?;
+        if !saved_message_matches(input, session, input_id, intent) {
+            return Err(Error::new(
+                "NATIVE_INPUT_MISMATCH",
+                "native user projection differs from the saved input",
+            ));
+        }
+        let response = self
+            .get(
+                &format!("/api/session/{session}/message/{assistant_id}"),
+                &[],
+            )
+            .await?;
+        let message = response.get("data").cloned().ok_or_else(|| {
+            Error::new(
+                "NATIVE_MESSAGE_SCHEMA",
+                "native assistant projection lacks data",
+            )
+        })?;
+        if message["id"] != assistant_id {
+            return Err(Error::new(
+                "NATIVE_MESSAGE_SCHEMA",
+                "native assistant projection has another identity",
+            ));
+        }
+        validate_assistant_parent(&message, session, input_id)?;
         let encoded = canonical_json(&message)?.into_bytes();
         Ok(AssistantResultEvidence {
             message_id: assistant_id.to_owned(),
@@ -1019,7 +872,6 @@ impl NativeClient {
             message,
         })
     }
-
     async fn verify_binding_model(
         &self,
         root: &str,
@@ -1374,6 +1226,12 @@ impl NativeClient {
                     "native log reported a stream failure",
                 ));
             }
+            if event.event != "message" {
+                return Err(Error::new(
+                    "NATIVE_LOG_SCHEMA",
+                    "native log frame is not a message",
+                ));
+            }
             if synced {
                 return Err(Error::new(
                     "NATIVE_LOG_AFTER_WATERMARK",
@@ -1390,14 +1248,9 @@ impl NativeClient {
                         "native log watermark names another session",
                     ));
                 }
-                let watermark = value
-                    .get("seq")
-                    .and_then(Value::as_u64)
-                    .filter(|n| *n <= 9_007_199_254_740_991)
-                    .ok_or_else(|| {
-                        Error::new("NATIVE_LOG_SEQUENCE", "native log watermark is invalid")
-                    })?;
-                if last_sequence.is_none_or(|n| watermark < n) {
+                if last_sequence
+                    .is_none_or(|last| !session_log::log_sync_matches(&value, root, last))
+                {
                     return Err(Error::new(
                         "NATIVE_LOG_WATERMARK_REGRESSED",
                         "native log watermark does not cover root creation",
@@ -1406,6 +1259,7 @@ impl NativeClient {
                 synced = true;
                 continue;
             }
+            session_log::validate_durable_event(&value)?;
             count += 1;
             if count > MAX_LOG_EVENTS {
                 return Err(Error::new(
@@ -1449,7 +1303,7 @@ impl NativeClient {
             if last_sequence.is_some_and(|last| sequence <= last) {
                 return Err(Error::new(
                     "NATIVE_LOG_ORDER",
-                    "native durable event order regressed",
+                    "native durable event sequence did not advance",
                 ));
             }
             last_sequence = Some(sequence);
@@ -1631,6 +1485,10 @@ impl NativeClient {
 
     pub(crate) async fn control_post_empty(&self, path: &str) -> Result<Value> {
         self.request(Method::POST, path, &[], None).await
+    }
+
+    pub(crate) async fn control_delete(&self, path: &str) -> Result<Value> {
+        self.request(Method::DELETE, path, &[], None).await
     }
 
     pub async fn verify_mcp_service(&self) -> Result<()> {
@@ -2282,19 +2140,64 @@ fn read_connection_record(path: &Path) -> Result<ConnectionRecord> {
             "connection record exceeds its limit",
         ));
     }
-    let record: ConnectionRecord = serde_json::from_slice(&bytes)
+    decode_connection_record(&bytes)
+}
+
+fn decode_connection_record(bytes: &[u8]) -> Result<ConnectionRecord> {
+    let source: ConnectionSource = serde_json::from_slice(bytes)
         .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "invalid connection record schema"))?;
-    if record.schema_version != 1
-        || record.pid == 0
-        || record.username.is_empty()
-        || record.username.contains(':')
-        || record.password.is_empty()
-    {
-        return Err(Error::new(
+    let invalid = || {
+        Error::new(
             "NATIVE_CONNECTION_FILE",
-            "explicit service PID and Basic authentication are required",
-        ));
+            "invalid native service registration",
+        )
+    };
+    let record = match source {
+        ConnectionSource::Explicit(record) => {
+            if record.schema_version != 1
+                || record.username.is_empty()
+                || record.username.contains(':')
+                || record.password.is_empty()
+            {
+                return Err(invalid());
+            }
+            ConnectionRecord {
+                endpoint: record.endpoint,
+                pid: record.pid,
+                auth: Some((record.username, record.password)),
+                registered_version: None,
+            }
+        }
+        ConnectionSource::Registered(record) => {
+            if record
+                .id
+                .as_ref()
+                .into_iter()
+                .chain(record.version.as_ref())
+                .any(|text| {
+                    text.is_empty() || text.len() > 256 || text.chars().any(char::is_control)
+                })
+                || record
+                    .password
+                    .as_ref()
+                    .is_some_and(|password| password.is_empty())
+            {
+                return Err(invalid());
+            }
+            ConnectionRecord {
+                endpoint: record.url,
+                pid: record.pid,
+                auth: record
+                    .password
+                    .map(|password| ("opencode".into(), password)),
+                registered_version: record.version,
+            }
+        }
+    };
+    if record.pid == 0 {
+        return Err(invalid());
     }
+    checked_endpoint(&record.endpoint)?;
     Ok(record)
 }
 
@@ -2331,16 +2234,6 @@ fn valid_id(value: &str, prefix: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn valid_provider_id(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && value.len() <= 256
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 pub fn root_id(binding: &str, generation: i64) -> String {
@@ -2545,134 +2438,8 @@ mod catalog_readiness_tests {
         }
     }
 
-    async fn provider_key_fixture() -> (NativeClient, TcpListener) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let client = NativeClient {
-            client: Client::builder()
-                .no_proxy()
-                .retry(reqwest::retry::never())
-                .build()
-                .unwrap(),
-            endpoint,
-            pid: std::process::id(),
-            version: "2.0.7".into(),
-        };
-        (client, listener)
-    }
-
-    fn provider_key_options(provider_id: &str) -> NativeOptions {
-        let directory = std::env::current_dir().unwrap();
-        NativeOptions {
-            service_id: "provider-key-fixture".into(),
-            connection_file: directory.join("unused-connection.json"),
-            directory: directory.clone(),
-            model: ModelRef {
-                id: "fixture-model".into(),
-                provider_id: provider_id.into(),
-                variant: "fixture-variant".into(),
-            },
-        }
-    }
-
-    fn assert_no_provider_key_request(listener: &TcpListener) {
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(listener.poll_accept(&mut context).is_pending());
-    }
-
     #[tokio::test]
-    async fn provider_key_rejects_exact_dot_segments_before_http_dispatch() {
-        let (client, listener) = provider_key_fixture().await;
-        for provider_id in [".", ".."] {
-            let error = client
-                .post_provider_key(provider_id, "fixture-key", "workspace")
-                .await
-                .unwrap_err();
-            assert_eq!(error.code, "NATIVE_PROVIDER_ID_INVALID");
-            assert_eq!(
-                error.message,
-                "selected provider ID is not one safe integration path segment"
-            );
-        }
-        assert_no_provider_key_request(&listener);
-    }
-
-    #[tokio::test]
-    async fn provider_key_posts_once_to_the_exact_dotted_provider_endpoint() {
-        let (client, listener) = provider_key_fixture().await;
-        let listener = std::sync::Arc::new(listener);
-        let server_listener = std::sync::Arc::clone(&listener);
-        let server = tokio::spawn(async move {
-            let (mut stream, _) =
-                tokio::time::timeout(Duration::from_secs(3), server_listener.accept())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                let count = stream.read(&mut buffer).await.unwrap();
-                assert!(count > 0 && request.len() + count <= 8192);
-                request.extend_from_slice(&buffer[..count]);
-            }
-            let header_end = request
-                .windows(4)
-                .position(|bytes| bytes == b"\r\n\r\n")
-                .unwrap()
-                + 4;
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let mut request_line = headers.lines().next().unwrap().split_whitespace();
-            assert_eq!(request_line.next(), Some("POST"));
-            let target = request_line.next().unwrap();
-            assert_eq!(
-                target.split('?').next(),
-                Some("/api/integration/provider.v1/connect/key")
-            );
-            assert_eq!(request_line.next(), Some("HTTP/1.1"));
-            assert!(target.contains("workspace"));
-
-            let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull";
-            stream.write_all(response).await.unwrap();
-        });
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            client.post_provider_key("provider.v1", "fixture-key", "workspace"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        server.await.unwrap();
-        // One accepted connection is the full effect budget; no retry or
-        // second mutation may be queued after the successful response.
-        assert_no_provider_key_request(&listener);
-    }
-
-    #[tokio::test]
-    async fn standalone_bootstrap_rejects_navigation_before_reading_auth_source() {
-        for provider_id in [".", ".."] {
-            let (client, listener) = provider_key_fixture().await;
-            let options = provider_key_options(provider_id);
-            let auth = crate::provider_auth::ProviderAuthOptions {
-                source_file: std::env::temp_dir()
-                    .join(format!("app325-auth-fixture-{}", std::process::id()))
-                    .join("auth.json"),
-                credential_ref: None,
-            };
-            let error = crate::provider_auth::bootstrap_once(&client, &options, &auth)
-                .await
-                .unwrap_err();
-            assert_eq!(error.code, "OWNED_PROVIDER_AUTH");
-            assert_eq!(
-                error.message,
-                "provider authorization does not match the OpenCode route"
-            );
-            assert_no_provider_key_request(&listener);
-        }
-    }
-
-    #[tokio::test]
-    async fn exact_permission_reply_reconcile_uses_native_gets_without_reply_post() {
+    async fn ambiguous_permission_reply_reconcile_stays_unknown_without_native_post() {
         use crate::config::ModelRef;
         use crate::journal::OperationIntent;
         use swarm_contracts::runtime::{ModuleReceiptIdentity, RuntimeCommand};
@@ -2716,7 +2483,7 @@ mod catalog_readiness_tests {
             "resources":[]
         });
         let request_fingerprint = sha256(canonical_json(&asked_data).unwrap().as_bytes());
-        let reply_payload_sha256 = digest_json(&json!({"reply":"once"})).unwrap();
+        let reply_payload_sha256 = digest_json(&json!({"decision":"once"})).unwrap();
         let saved_identity = json!({
             "kind":"permission",
             "action":"once",
@@ -2727,42 +2494,16 @@ mod catalog_readiness_tests {
             "effect_payload_sha256":reply_payload_sha256,
             "feedback_present":false
         });
-        let event = |id: &str, event_type: &str, sequence: u64, data: Value| {
-            json!({
-                "id":id,
-                "type":event_type,
-                "created":sequence as f64,
-                "durable":{"aggregateID":root,"seq":sequence,"version":1},
-                "data":data
-            })
-        };
-        let root_event = event(
-            "evt_reg09_root",
-            "session.created",
-            1,
-            json!({
-                "sessionID":root,
-                "parentID":null,
-                "model":model_value,
-                "metadata":{"eliot":{"binding":binding_id,"generation":1}}
-            }),
-        );
-        let asked_event = event(
-            "evt_reg09_permission_asked",
-            "permission.v2.asked",
-            2,
-            asked_data,
-        );
-        let replied_event = event(
-            "evt_reg09_permission_replied",
-            "permission.v2.replied",
-            3,
-            json!({"sessionID":root,"requestID":request_id,"reply":"once"}),
-        );
-        let history = json!({
-            "data":[root_event.clone(),asked_event,replied_event],
-            "hasMore":false
-        });
+        let wire_fixture: Value = serde_json::from_str(include_str!(
+            "../../../modules/opencode/fixtures/native-inbox-2.0.7.json"
+        ))
+        .unwrap();
+        let mut root_event = wire_fixture["events"]["rootCreated"].clone();
+        root_event["durable"]["aggregateID"] = json!(root);
+        root_event["data"]["sessionID"] = json!(root);
+        root_event["data"]["location"]["directory"] = json!(directory);
+        root_event["data"]["model"] = model_value.clone();
+        root_event["data"]["metadata"] = json!({"eliot":{"binding":binding_id,"generation":1}});
         let log_event = |data: &Value| format!("event: message\ndata: {}\n\n", data);
         let log_body = format!(
             "{}{}",
@@ -2773,14 +2514,14 @@ mod catalog_readiness_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         let session_path = format!("/api/session/{root}");
-        let history_path = format!("/api/session/{root}/history");
+
         let log_path = format!("/api/experimental/session/{root}/log");
         let model_id = options.model.id.clone();
         let model_provider = options.model.provider_id.clone();
         let model_variant = options.model.variant.clone();
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -2819,8 +2560,6 @@ mod catalog_readiness_tests {
                     ("application/json", serde_json::to_vec(&catalog).unwrap())
                 } else if path == log_path.as_str() {
                     ("text/event-stream", log_body.as_bytes().to_vec())
-                } else if path == history_path.as_str() {
-                    ("application/json", serde_json::to_vec(&history).unwrap())
                 } else {
                     panic!("unexpected native request: {request_line}");
                 };
@@ -2889,11 +2628,13 @@ mod catalog_readiness_tests {
             target_input_sha256: Some("c".repeat(64)),
         };
 
-        crate::native_interactions::reconcile_reply(&native, &command, &options, &intent)
-            .await
-            .unwrap();
+        let error =
+            crate::native_interactions::reconcile_reply(&native, &command, &options, &intent)
+                .await
+                .unwrap_err();
+        assert_eq!(error.code, "NATIVE_EVIDENCE_UNAVAILABLE");
         let requests = server.await.unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 4);
         assert!(requests.iter().all(|(method, _)| method == "GET"));
         assert!(!requests.iter().any(|(method, path)| {
             method == "POST" && path.ends_with("/permission/per_reg09/reply")

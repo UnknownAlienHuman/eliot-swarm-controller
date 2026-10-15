@@ -3,10 +3,7 @@ use crate::error::{Error, Result};
 pub use crate::module_supervisor_config::{ModuleRouteConfigMapper, ModuleSupervisorConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 pub use swarm_contracts::mcp_frontend::{McpConfig, McpProfileConfig, McpToolProfile};
 
 const MAX_GATEWAY_BODY_BYTES: usize = 1_048_576;
@@ -785,7 +782,6 @@ mod owned_opencode_route_validation_tests {
                 variant: "high".to_owned(),
             },
             model_catalog: "refresh".to_owned(),
-            credential_ref: None,
             bun_executable: std::env::temp_dir().join("fixture-bun.exe"),
             bun_sha256: "a".repeat(64),
             server_program: std::env::temp_dir().join("fixture-serve.mjs"),

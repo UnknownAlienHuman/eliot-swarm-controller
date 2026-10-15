@@ -188,9 +188,6 @@ impl OwnedServiceRoute {
     pub(crate) fn service_id(&self) -> &str {
         &self.service_id
     }
-    pub(crate) fn model_ref(&self) -> &ModelRef {
-        &self.model
-    }
     pub(crate) fn version(&self) -> &str {
         VERSION
     }
@@ -276,10 +273,36 @@ impl PreparedOwnedService {
 }
 
 pub(crate) fn prepare_owned_service(
-    _route: &OwnedServiceRoute,
-    _intent: &OwnedServiceIntent,
+    route: &OwnedServiceRoute,
+    intent: &OwnedServiceIntent,
 ) -> Result<PreparedOwnedService> {
-    Err(native_harness_required())
+    if route.origin == OwnedServiceOrigin::FreshOwnedService {
+        return Err(native_harness_required());
+    }
+    route.verify_files()?;
+    validate_directory_components(&route.state_root)?;
+    match fs::symlink_metadata(&route.state_root) {
+        Ok(_) => {
+            return Err(Error::new(
+                "OWNED_SERVICE_STATE_EXISTS",
+                "fresh owned service state already exists; uncertain launches are never replayed",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(config_error(
+                "fresh owned service state cannot be safely inspected",
+            ));
+        }
+    }
+    let plugin = mcp_plugin::prepare_plugin_config(route, intent)?;
+    let config_digest = plugin.config_digest().to_owned();
+    Ok(PreparedOwnedService {
+        route: route.clone(),
+        plugin,
+        config_digest,
+        intent: intent.clone(),
+    })
 }
 
 /// Single-use in-process permit built from the exact Store admission. Store
@@ -295,10 +318,29 @@ pub(crate) struct OwnedServiceStartPermit {
 
 impl OwnedServiceStartPermit {
     pub(crate) fn from_store_admission(
-        _intent: &OwnedServiceIntent,
-        _prepared: &PreparedOwnedService,
+        intent: &OwnedServiceIntent,
+        prepared: &PreparedOwnedService,
     ) -> Result<Self> {
-        Err(native_harness_required())
+        let route_digest = prepared.route.route_digest()?;
+        if intent.owner_nonce() != prepared.route.owner_nonce()
+            || intent.route_digest() != route_digest
+            || intent.scope_digest() != prepared.intent.scope_digest()
+            || prepared.intent.owner_nonce() != intent.owner_nonce()
+            || prepared.intent.route_digest() != intent.route_digest()
+            || prepared.intent.scope_digest() != intent.scope_digest()
+            || prepared.plugin.owner_nonce() != intent.owner_nonce()
+        {
+            return Err(scope_error(
+                "start permit does not match the exact Store-owned route",
+            ));
+        }
+        Ok(Self {
+            owner_nonce: intent.owner_nonce().to_owned(),
+            route_digest,
+            config_digest: prepared.config_digest.clone(),
+            scope_digest: intent.scope_digest().to_owned(),
+            consumed: false,
+        })
     }
 }
 
@@ -422,11 +464,11 @@ impl OwnedServiceReadback {
         route: &OwnedServiceRoute,
         intent: &OwnedServiceIntent,
     ) -> Result<Self> {
-        Self::from_route_value(value, route, intent.owner_nonce(), true)
+        Self::from_route_value(value, route, intent.owner_nonce())
     }
 
     pub(crate) fn from_retained_value(value: &Value, route: &OwnedServiceRoute) -> Result<Self> {
-        Self::from_route_value(value, route, route.owner_nonce(), true)
+        Self::from_route_value(value, route, route.owner_nonce())
     }
 
     fn from_private_value(
@@ -434,14 +476,13 @@ impl OwnedServiceReadback {
         route: &OwnedServiceRoute,
         owner_nonce: &str,
     ) -> Result<Self> {
-        Self::from_route_value(value, route, owner_nonce, false)
+        Self::from_route_value(value, route, owner_nonce)
     }
 
     fn from_route_value(
         value: &Value,
         route: &OwnedServiceRoute,
         owner_nonce: &str,
-        _legacy: bool,
     ) -> Result<Self> {
         let object = value
             .as_object()
@@ -632,14 +673,78 @@ impl OwnedServiceHandle {
 /// Start one foreground helper only after Store has durably authorized the
 /// effect. The helper enters the non-killing process Job before spawning Bun.
 pub(crate) async fn start_foreground(
-    _prepared: PreparedOwnedService,
-    _permit: OwnedServiceStartPermit,
+    prepared: PreparedOwnedService,
+    mut permit: OwnedServiceStartPermit,
 ) -> std::result::Result<OwnedServiceHandle, OwnedServiceStartFailure> {
-    Err(start_failure(
-        native_harness_required(),
-        OwnedServiceStartStage::PreSpawn,
-        None,
-    ))
+    if prepared.route.origin == OwnedServiceOrigin::FreshOwnedService {
+        return Err(start_failure(
+            native_harness_required(),
+            OwnedServiceStartStage::PreSpawn,
+            None,
+        ));
+    }
+    if permit.consumed
+        || permit.owner_nonce != prepared.route.owner_nonce()
+        || permit.route_digest != prepared.intent.route_digest()
+        || permit.config_digest != prepared.config_digest
+        || permit.scope_digest != prepared.intent.scope_digest()
+    {
+        return Err(start_failure(
+            scope_error("owned-service start permit is stale or mismatched"),
+            OwnedServiceStartStage::PermitValidation,
+            None,
+        ));
+    }
+    permit.consumed = true;
+    let startup_deadline = match SharedDeadline::after(START_TIMEOUT) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            return Err(start_failure(error, OwnedServiceStartStage::PreSpawn, None));
+        }
+    };
+    if prepared.route.verify_files().is_err() {
+        return Err(pre_spawn_failure(&prepared.route, &permit, false));
+    }
+    let plan_path = match materialize_launch(&prepared, startup_deadline) {
+        Ok(plan_path) => plan_path,
+        Err(failure) => {
+            return Err(pre_spawn_failure(
+                &prepared.route,
+                &permit,
+                failure.state_root_created,
+            ));
+        }
+    };
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(_) => {
+            return Err(pre_spawn_failure(&prepared.route, &permit, true));
+        }
+    };
+    match startup_deadline.expired() {
+        Ok(false) => {}
+        Ok(true) => return Err(pre_spawn_failure(&prepared.route, &permit, true)),
+        Err(error) => {
+            return Err(start_failure(error, OwnedServiceStartStage::PreSpawn, None));
+        }
+    }
+    let child = AsyncCommand::new(executable)
+        .arg("owned-opencode-service")
+        .arg("--file")
+        .arg(&plan_path)
+        .env_clear()
+        .envs(safe_helper_environment())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(false)
+        .spawn()
+        .map_err(|error| {
+            // An OS spawn error is still an attempted effect. The process may
+            // have started even when the parent could not observe its handle.
+            start_failure(error.into(), OwnedServiceStartStage::HelperSpawn, None)
+        })?;
+    complete_foreground_start(prepared, child, startup_deadline).await
 }
 
 fn start_failure(
@@ -1054,7 +1159,7 @@ pub(crate) async fn readback_retained(
 ) -> Result<OwnedServiceHandle> {
     route.verify_files()?;
     let owner_nonce = route.owner_nonce();
-    let expected = OwnedServiceReadback::from_route_value(stored_proof, route, owner_nonce, true)?;
+    let expected = OwnedServiceReadback::from_route_value(stored_proof, route, owner_nonce)?;
     let private_readback = read_owned_files(route)?
         .ok_or_else(|| readback_error("retained owned service owner is unavailable"))?;
     let checked = OwnedServiceReadback::from_private_value(
@@ -1116,7 +1221,6 @@ struct HelperPlan {
     version: String,
     model: ModelRef,
     model_catalog: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     bun_executable: PathBuf,
     bun_sha256: String,
     server_program: PathBuf,
@@ -2666,7 +2770,6 @@ pub(crate) fn observe_departure(
             stored_proof,
             route,
             route.owner_nonce(),
-            false,
         )?)
     };
     let Some(observation) = read_process_observation(
@@ -2853,7 +2956,6 @@ fn validate_plan(plan: &HelperPlan, plan_path: &Path) -> Result<()> {
         || plan.service_id.len() > 128
         || plan.model_catalog != "offline" && plan.model_catalog != "refresh"
         || !plan.model.valid()
-        || plan
         || !is_sha256(&plan.route_digest)
         || !is_sha256(&plan.config_digest)
         || !is_sha256(&plan.module_sha256)
@@ -3595,7 +3697,17 @@ mod deadline_contract_tests {
             origin: OwnedServiceOrigin::FreshOwnedService,
         })
         .unwrap();
-        prepare_owned_service(&route, &intent).unwrap()
+        let rejected = prepare_owned_service(&route, &intent).err().unwrap();
+        assert_eq!(rejected.code, "OWNED_SERVICE_NATIVE_HARNESS_REQUIRED");
+        // These children represent retained historical custody, not a new
+        // controller launch. Build their internal fixture without admitting it.
+        let plugin = mcp_plugin::prepare_plugin_config(&route, &intent).unwrap();
+        PreparedOwnedService {
+            config_digest: plugin.config_digest().to_owned(),
+            route,
+            plugin,
+            intent,
+        }
     }
 
     fn inert_route_for_stop_error() -> OwnedServiceRoute {

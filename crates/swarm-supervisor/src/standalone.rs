@@ -50,6 +50,9 @@ const OPENCODE_NATIVE_OPTIONS_SCHEMA_ID: &str = "opencode-v2-native-options";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_LEGACY: &str = "1";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER: &str = "2";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3: &str = "3";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V4: &str = "4";
+const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V4: &str =
+    "af37f50299991181463e7aecc2d742d28cc1f4d30ce61d349a6d517cab8fa99b";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_LEGACY: &str =
     "d597be6bae80dc82535b658b5daaf3037a09976e5704d799a6715a673a62f662";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER: &str =
@@ -448,8 +451,6 @@ struct OwnedRouteConfig {
     service_id: String,
     model: OwnedRouteModel,
     model_catalog: String,
-    #[serde(default)]
-    credential_ref: Option<String>,
     bun_executable: PathBuf,
     bun_sha256: String,
     server_program: PathBuf,
@@ -466,11 +467,17 @@ fn opencode_schema_supported(descriptor: &ModuleDescriptor) -> bool {
             schema.schema_id == OPENCODE_NATIVE_OPTIONS_SCHEMA_ID
                 && schema.sha256.as_ref().is_some_and(|digest| {
                     (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_LEGACY
+                        && matches!(descriptor.artifact.version.as_str(), "0.1.0" | "0.2.0")
                         && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_LEGACY)
                         || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_OWNER
+                            && descriptor.artifact.version.as_str() == "0.3.0"
                             && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_OWNER)
                         || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3
+                            && matches!(descriptor.artifact.version.as_str(), "0.5.0" | "0.6.0")
                             && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V3)
+                        || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V4
+                            && descriptor.artifact.version.as_str() == "0.7.0"
+                            && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V4)
                 })
         })
 }
@@ -490,7 +497,7 @@ fn opencode_owner_schema(descriptor: &ModuleDescriptor) -> bool {
 fn open_code_route_config(
     descriptor: &ModuleDescriptor,
     options: &Value,
-    protected_files: &BTreeMap<ProtectedRef, PathBuf>,
+    _protected_files: &BTreeMap<ProtectedRef, PathBuf>,
 ) -> Result<BindingLaunchConfig> {
     if !opencode_schema_supported(descriptor) {
         return Err(Error::new(
@@ -519,8 +526,11 @@ fn open_code_route_config(
     // External schema-v3 routes have no caller-supplied version pin. Retained
     // v1/v2 routes keep theirs, and fresh-owner projections keep the version
     // derived from the retained owner contract for its explicit compatibility check.
-    let carries_expected_version =
-        has_owner_service || schema_version != OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3;
+    let carries_expected_version = has_owner_service
+        || !matches!(
+            schema_version,
+            OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3 | OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V4
+        );
     let base_allowed: &[&str] = if carries_expected_version {
         &[
             "service_id",
@@ -568,6 +578,12 @@ fn open_code_route_config(
         ));
     }
     let configured_service_id = required_config_string(&object["service_id"], "service_id", 128)?;
+    if !valid_service_id(&configured_service_id) {
+        return Err(Error::new(
+            "MODULE_CONFIG_INVALID",
+            "OpenCode service_id is invalid",
+        ));
+    }
     let configured_connection_file =
         required_config_string(&object["connection_file"], "connection_file", 4096)?;
     let expected_version = if carries_expected_version {
@@ -619,7 +635,10 @@ fn open_code_route_config(
     ]);
 
     // Schema v3 intentionally removes expected_version from launch config.
-    if schema_version != OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3 {
+    if !matches!(
+        schema_version,
+        OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V3 | OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V4
+    ) {
         let expected_version = expected_version.as_ref().ok_or_else(|| {
             Error::new(
                 "MODULE_CONFIG_INVALID",
@@ -705,37 +724,6 @@ fn open_code_route_config(
         ] {
             values.insert(key.to_owned(), LaunchValue::Literal(value));
         }
-        if let Some(credential_ref) = owner.credential_ref {
-            if !valid_provider_id(&provider_id) || !valid_credential_ref(&credential_ref) {
-                return Err(Error::new(
-                    "MODULE_CONFIG_INVALID",
-                    "owned OpenCode credential reference is not valid for the selected provider",
-                ));
-            }
-            let reference = ProtectedRef::new(credential_ref.clone()).map_err(|error| {
-                Error::new("MODULE_CONFIG_PROVIDER_AUTH_UNAVAILABLE", error.to_string())
-            })?;
-            let source = protected_files.get(&reference).ok_or_else(|| {
-                Error::new(
-                    "MODULE_CONFIG_PROVIDER_AUTH_UNAVAILABLE",
-                    "owned OpenCode provider auth reference has no configured host path",
-                )
-            })?;
-            if !absolute_plain_path(source) {
-                return Err(Error::new(
-                    "MODULE_CONFIG_PROVIDER_AUTH_UNAVAILABLE",
-                    "owned OpenCode provider auth source path is not an absolute plain path",
-                ));
-            }
-            values.insert(
-                "OPENCODE_OWNER_PROVIDER_AUTH_FILE".to_owned(),
-                LaunchValue::Protected(reference),
-            );
-            values.insert(
-                "OPENCODE_OWNER_PROVIDER_CREDENTIAL_REF".to_owned(),
-                LaunchValue::Literal(credential_ref),
-            );
-        }
     }
     let config = BindingLaunchConfig { values };
     config.validate().map_err(module_error)?;
@@ -769,14 +757,6 @@ fn valid_provider_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn valid_credential_ref(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn absolute_plain_path(path: &Path) -> bool {
@@ -1880,6 +1860,7 @@ mod opencode_schema_projection_tests {
                 "0.5.0",
                 "070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e",
             ),
+            "4" => ("0.7.0", super::OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V4),
             _ => panic!("unsupported test schema version"),
         };
         let mut descriptor: Value = serde_json::from_str(include_str!(
@@ -1975,6 +1956,31 @@ mod opencode_schema_projection_tests {
             LaunchValue::Literal(value) => value,
             other => panic!("{key} was not projected as a literal: {other:?}"),
         }
+    }
+
+    #[test]
+    fn opencode_v4_projects_only_existing_service_values() {
+        let descriptor = descriptor_for_schema("4");
+        let config = project(&descriptor, &v3_external_options()).unwrap();
+        assert_eq!(config.values.len(), 6);
+        assert!(
+            !config
+                .values
+                .keys()
+                .any(|key| key.starts_with("OPENCODE_OWNER_"))
+        );
+        assert_eq!(
+            project(&descriptor, &owned_options(OWNER_NONCE))
+                .unwrap_err()
+                .code,
+            "MODULE_CONFIG_SCHEMA_MISMATCH"
+        );
+        assert_eq!(
+            sha256_hex(include_bytes!(
+                "../../swarm-adapter-opencode/registration/native-options.schema.json"
+            )),
+            super::OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V4
+        );
     }
 
     #[test]

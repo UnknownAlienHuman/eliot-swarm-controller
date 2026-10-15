@@ -636,71 +636,15 @@ Keep #22's small eager cores. Config get/preview/apply/explain/transfer and deta
 
 For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
 
-## 11. Fresh-owned OpenCode service
+## 11. Existing native OpenCode service
 
-This host/operator route is separate from a manager-owned automation definition. A route declaration is not a launch request: Store starts the service only after an exact Manager/Operator admission for the opening binding, Task revision, Attempt, and held workspace lease. Use the explicit fresh-owned origin and the exact OpenCode V2 runtime/artifact.
+OpenCode owns its provider accounts, authorization, configuration and model loop. The controller connects to the already running, already authorized native service through direct HTTP. It never reads a provider `auth.json`, copies provider keys, calls provider login/connection APIs, or asks a manager for provider credentials. Provider/model/variant selection comes from that native service's catalog.
 
-~~~toml
-[[routes]]
-alias = "opencode-owned"
-runtime = "opencode_v2"
-module_artifact_id = "eliot-opencode-v2.http.2"
-enabled = true
-native_options = {}
+Set `routes.native_options.connection_file` to the native service registration used by the installed client. The official `@opencode/client/service` registration contains `url`, `pid` and optional `version`, `id` and local HTTP `password`. This local service-access record is distinct from provider authorization. The controller reads it in place and checks the loopback endpoint, live PID and declared version; it never rewrites the record or starts, replaces or repairs the service. The legacy explicit ELIOT connection-record format remains readable for existing installations.
 
-[routes.owned_service]
-origin = "fresh_owned_service"
-service_id = "opencode-owned"
-model = { id = "approved-model-id", providerID = "approved-provider", variant = "approved-variant" }
-model_catalog = "offline"
-bun_executable = "C:/approved/runtime/bun.exe"
-bun_sha256 = "<64 hexadecimal characters: SHA-256 of the Bun executable>"
-server_program = "C:/approved/repo/modules/opencode/serve.mjs"
-server_program_sha256 = "<64 hexadecimal characters: SHA-256 of the pinned serve.mjs>"
-state_root = "C:/approved/private-state/opencode"
-port = 0
-~~~
+The former `opencode_provider_auth_sources` and owned-service provider `credential_ref` mapping are removed. Fresh isolated SDK service starts are retired. Existing owner/process receipts remain available for bounded historical readback and departure fencing; uncertain ownership is retained, never converted into a new launch or a force-kill. Controller IPC/MCP credentials remain a separate authorization boundary.
 
-This is a schema example only. Replace the generic paths and hashes with approved values. The Bun path must identify a canonical regular file with the supplied matching SHA-256; the running Bun version is checked as 1.4.0. The server program must be the canonical repository-pinned modules/opencode/serve.mjs at the build's compile-time repository root, and its configured SHA-256 must match. The existing state_root must be a canonical, non-reparse directory with access restricted to the service owner. Port 0 requests an OS-selected loopback port; the actual bound endpoint and process identity are read back.
-
-The owned service uses repository-pinned @opencode/server 2.0.7. This differs from the separately installed global OpenCode 2.0.22; this route does not reuse the global installation's profile, databases, credentials, or receipts. The private config contains one plugin-directory entry for the pinned package directory. Its exact index.mjs wrapper re-exports native-mcp-proof.mjs; the server's 2.0.7 input is the singular plugin tuple [package-directory, options]. Configuration/index preparation and source hashes do not prove that the native server loaded the plugin or exposed callable tools.
-
-model_catalog accepts offline or refresh. offline disables the bundled snapshot and fetching. refresh uses the bundled snapshot and fetches public Models.dev metadata. Neither choice authenticates a provider or executes a model call. Historical provider receipts remain historical and separately scoped; they are not proof for this new service. All local model/inference execution remains deferred, including PR24/Kilo.
-
-### Explicit hosted-provider credential source
-
-An owned `opencode-go` route can name a host-only credential source. Add
-`credential_ref = "hosted-bunny"` inside its `routes.owned_service` table and
-configure the matching source in the original controller configuration:
-
-~~~toml
-[opencode_provider_auth_sources.hosted-bunny]
-provider_id = "opencode-go"
-auth_file = "C:/approved/user-data/opencode/auth.json"
-~~~
-
-The model's `providerID` must be `opencode-go`; keep its exact approved model
-ID and variant. The source must be an absolute `auth.json` file containing the
-selected provider's `type = "api"` entry. The host reads that entry before the
-startup boundary and sends the key once to the newly owned service's native
-integration endpoint. It does not copy another profile or use an ambient auth
-source. The source registry is omitted from serialized Config and generated
-participant configurations; the original host configuration remains the source
-of that mapping.
-
-The retained proof says `stored_unverified`: native credential metadata was
-observed for the exact service process and model. It does not establish key
-validity or model execution. Uncertain startup is read back without another
-credential POST. A route without `credential_ref` keeps the existing startup
-behavior and receives no provider credential.
-
-Each admitted launch receives its own retained owner nonce and private state directory under state_root/launches/<owner_nonce>. Do not copy global OpenCode state into it or manually reuse a nonce directory. The controller embeds a dedicated helper child and keeps its stdin open while the service is owned. Closing that stdin sends EOF as the graceful-stop signal; the helper must exit successfully and produce exact owner/stop receipts. Do not substitute a kill or launch retry.
-
-Before spawn, Store reserves one durable start. A proven pre-helper-spawn NoEffect is recorded only after an exact empty-unknown compare-and-swap. If spawn was attempted or the result is uncertain, the disposition remains outcome_unknown and must not be replayed; recovery is readback-only. Operation readers accept only the two exact negative-proof shapes with NULL process fields, and reserved cancellation writes a canonical bounded negative proof. A retained service that cannot be proved stays fenced.
-
-Workspace cancellation/release remains blocked while the start is outcome_unknown or service_observed, even if the Task revision, Attempt, or current Manager changes. Bounded reconciliation reconstructs the original route and workspace from immutable launch/lease provenance, then requires matching clean server-stop receipts, the exact Bun PID birth/image to be absent, and a matching helper-family stop receipt proving no children remain. Only an exact durable compare-and-swap marks service_departed and removes this service-specific fence; it does not claim a general OS workspace lock.
-
-For current retained-run and qualification evidence, see [Implementation Status](../implementation-status.md). The execution and no-replay rules above remain normative.
+See the [OpenCode module configuration](../../modules/opencode/README.md#explicit-configuration) for the route shape and [Implementation Status](../implementation-status.md) for the actual verification boundary.
 
 ### Windows Git metadata path admission
 

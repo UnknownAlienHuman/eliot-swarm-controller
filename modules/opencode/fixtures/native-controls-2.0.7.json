@@ -1,0 +1,16 @@
+{
+  "question": {
+    "id": "frm_fixture",
+    "sessionID": "ses_swarm_fixture",
+    "title": "Questions",
+    "metadata": {"kind": "question", "tool": {"messageID": "msg_fixture", "id": "tool_fixture"}},
+    "fields": [{
+      "key": "q0", "title": "Choice", "description": "Choose one", "type": "string",
+      "options": [{"value": "yes", "label": "yes", "description": "Accept"}], "custom": true
+    }]
+  },
+  "permission": {"id": "per_fixture", "sessionID": "ses_swarm_fixture", "action": "shell", "resources": ["fixture"]},
+  "formReply": {"answer": {"q0": "yes"}},
+  "permissionReply": {"decision": "reject"},
+  "authForm": {"id": "frm_auth", "sessionID": "global", "title": "Authorization", "fields": [{"key": "auth", "type": "external", "url": "https://example.invalid/auth"}]}
+}

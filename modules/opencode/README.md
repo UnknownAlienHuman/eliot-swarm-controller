@@ -22,7 +22,7 @@ module_artifact_id = 'eliot-opencode-v2.http.2'
 enabled = false
 [routes.native_options]
 service_id = 'my-local-opencode-store'
-connection_file = 'C:\SwarmPrivate\opencode-connection.json'
+connection_file = 'C:\Users\YourUser\.local\state\opencode\service.json'
 expected_version = 'REPLACE_WITH_EXACT_INSTALLED_VERSION'
 directory = 'C:\Projects\YourRepository'
 [routes.native_options.model]
@@ -31,89 +31,11 @@ providerID = 'REPLACE_WITH_NATIVE_PROVIDER_ID'
 variant = 'REPLACE_WITH_EXACT_VARIANT'
 ```
 
-The connection file is **ELIOT's own explicit record**, not an invented interpretation of OpenCode's `service.json`. Populate it from the service owner's known configuration. It is a bounded regular JSON file; links and pipes are rejected. Store it outside source control and restrict its OS permissions to the intended user.
+`connection_file` may point directly at the native OpenCode service registration used by the installed client. Its official `@opencode/client/service` contract is `url`, `pid`, optional `version` and `id`, and optional local HTTP `password`. The controller reads that existing record in place. It checks the loopback origin, live PID and declared version, disables redirects/proxies/retries, and keeps service-access headers in memory. It neither reads provider credential files nor connects, logs in or changes a provider account. Provider authorization and registered accounts remain native.
 
-```json
-{
-  "schema_version": 1,
-  "endpoint": "http://127.0.0.1:12345",
-  "pid": 1234,
-  "username": "REPLACE_WITH_CONFIGURED_BASIC_USER",
-  "password": "REPLACE_WITH_CONFIGURED_BASIC_PASSWORD"
-}
-```
+For an ordinary installation the native SDK uses `$XDG_STATE_HOME/opencode/service.json`, defaulting to `$HOME/.local/state/opencode/service.json`; native channels and explicit configuration can select a different registration. Use the registration for the intended native instance. Do not create a new provider profile or copy account keys. The older explicit ELIOT connection record remains supported for existing configured services.
 
-Port, PID and credentials above are placeholders, not defaults. Credentials are read into the HTTP client, not copied into bindings, operations, Task text or diagnostic errors. Only loopback HTTP origins are accepted; redirects, proxies, URL credentials and automatic HTTP retries are disabled. `/api/info` must match the recorded PID and selected version. This is a same-user trusted-service boundary, **not** an OS sandbox or cryptographic proof that a process with a recycled PID has the same identity. The stable `service_id` must name the same native store across an operator-managed restart.
-
-No native connection occurs merely to list routes or read host status. After explicit `agent.open` admission, the host attaches its built-in worker. No `client.register` module token or `module-run` process is needed for this adapter; those are Muse bridge setup steps. Existing controller credentials and request IDs still apply. Read an operation's result before using its returned binding/generation.
-
-## Optional pinned service owner
-
-The adapter above still attaches to an already-running service. For an explicitly operator-managed local installation, `serve.mjs` composes the official `@opencode/server` **2.0.7** library with its pinned Effect/Node platform packages and runs it under **Bun 1.4.0**. It binds authenticated HTTP only to `127.0.0.1`, enables native `events.persist`, and puts the database, XDG roots, config, temporary files, owner record and connection record below one explicit private state directory. Give that directory and its password file restrictive OS permissions before launch; the launcher refuses reparse paths and does not copy global configuration, provider credentials, history or databases. It writes the generated connection record for the controller at `connection.json`; treat that file as a secret.
-
-For an installed package, prepare the resource bundle with the same package installer
-that creates the host executable's receipt. Supply the exact Node and npm files and
-their versions; the installer runs the locked `npm ci` in a private staging tree,
-records every dependency file and tool hash, and publishes the resource directory
-only after verification. The host checks that receipt and the complete dependency
-tree before it uses the installed `serve.mjs`. It never installs dependencies when
-starting the service.
-
-Install the matching `swarm-supervisor` package into the same install root first;
-the kernel host package requires that verified sibling. Use a new install root for
-each immutable package set.
-
-```powershell
-& '<repo-root>\tools\modules\Install-SwarmFrontend.ps1' `
-  -PackageDirectory '<verified-swarm-kernel-host-package>' `
-  -InstallDirectory '<root-with-verified-swarm-supervisor>' `
-  -NodeExecutable '<absolute-path-to-pinned-node.exe>' `
-  -NpmCliScript '<absolute-path-to-pinned-npm-cli.js>' `
-  -ExpectedNodeVersion '<exact-node-version>' `
-  -ExpectedNpmVersion '<exact-npm-version>'
-& '<absolute-path-to-bun-1.4.0.exe>' '<install-root>\resources\modules\opencode\serve.mjs' `
-  --state-root '<absolute-private-state-directory>' `
-  --password-file '<absolute-private-state-directory>\server.password' `
-  --port 12345 `
-  --model-catalog refresh
-```
-
-The installer does not activate a route or start Bun. Treat the install receipt's
-resource-closure digest as package-integrity evidence; it is not native-service,
-provider, model, or inference qualification.
-
-The repository source tree is a separate development-only path. In a debug build,
-opt into it explicitly, install locked dependencies in the source tree, and use that
-source `serve.mjs` path. An invalid installed bundle is always an error and never
-falls back to the source tree.
-
-```powershell
-$env:ELIOT_OPENCODE_SOURCE_RESOURCES = '1'
-npm ci --ignore-scripts
-& '<absolute-path-to-bun-1.4.0.exe>' .\serve.mjs `
-  --state-root '<absolute-private-state-directory>' `
-  --password-file '<absolute-private-state-directory>\server.password' `
-  --port 12345 `
-  --model-catalog offline
-```
-
-`refresh` is the live default: OpenCode loads its bundled model snapshot and enables its public Models.dev metadata refresh. That refresh is metadata traffic only; this option does not request inference or qualify provider credentials. The explicit `--model-catalog offline` mode disables both snapshot and fetch for deterministic, credential-free persistence checks. The smoke command below uses only that offline mode, creates a model-free session, verifies the exact durable `session.created` event before and after restarting the owned service, checks the SQLite row read-only, and requires clean observed process exits. It is a source-tree development check, not installed-package qualification:
-
-```powershell
-node .\selftest.mjs --bun '<absolute-path-to-bun-1.4.0.exe>'
-```
-
-Provider connection APIs are location-scoped. Use the same explicit
-`location[directory]` query pointing at the private workspace for
-`GET /api/integration`, the exact integration GET, credential connection and
-catalog reads. The list GET waits for native plugin activation; verify the
-exact integration and its key method before connecting an authorized key with
-`POST /api/integration/<exact-id>/connect/key`. Omitting the location selects
-the native process working directory and can return 404 even when the
-integration exists in the intended workspace. Keep keys and connection headers
-out of saved/public diagnostics.
-
-A successful smoke verifies service startup and event persistence only. Before any model request, read back the exact provider, model ID and variant from the running native catalog; a bundled snapshot's contents do not qualify a route. Keep the OpenCode version check, catalog identity and actual inference qualification as separate evidence. Stop the owner with Ctrl+C or its explicitly supervised stdin EOF. Before restart, the launcher requires matching owner/receipt schema, nonce, exact PID and state paths; both records must report `runtime_disposed=true` and listener closure, the connection record must be absent, and a non-destructive liveness probe must find the recorded PID gone. The smoke supervisor observes the exact child exit and checks its code against the receipt. A recorded exit-code field alone is not proof that the owner process exited. An active or unconfirmed owner is never killed or overwritten. Preserve the database directory across normal service restarts.
+The isolated `serve.mjs` owner is retired for new controller starts. Retained owner/process receipts continue to support read-only reconciliation and departure fencing. A missing or changed native service remains unavailable; the adapter does not restart, replace or downgrade it.
 
 ## Durable session configuration
 

@@ -18,8 +18,8 @@ use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_f
 
 const MAX_LAUNCH_VALUE_BYTES: usize = 64 * 1024;
 const NATIVE_OPTIONS_SCHEMA_SHA256: &str =
-    "070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e";
-const NATIVE_OPTIONS_SCHEMA_VERSION: &str = "3";
+    "af37f50299991181463e7aecc2d742d28cc1f4d30ce61d349a6d517cab8fa99b";
+const NATIVE_OPTIONS_SCHEMA_VERSION: &str = "4";
 const CAPABILITIES: [&str; 12] = [
     "agent.background",
     "agent.open",

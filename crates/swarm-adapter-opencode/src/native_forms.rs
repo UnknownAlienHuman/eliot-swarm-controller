@@ -33,7 +33,11 @@ pub const MAX_INTERACTION_BYTES: usize = 32 * 1024;
 /// value!=label, custom!=true, key order break) is a schema error so the
 /// caller treats the id as not-pending-as-question instead of coercing it.
 pub fn validate_question_form(item: &Value) -> Result<usize> {
-    exact_fields(item, &["id", "sessionID", "title", "metadata", "fields"], &[])?;
+    exact_fields(
+        item,
+        &["id", "sessionID", "title", "metadata", "fields"],
+        &[],
+    )?;
     let id = text(item, "id", 256)?;
     if !is_frm(id) {
         return Err(schema_error("native form ID is not a current frm_ form"));
@@ -131,11 +135,7 @@ pub fn validate_question_form(item: &Value) -> Result<usize> {
 /// observation. Tool id is surfaced as call_id for backwards compat
 /// with swarm.opencode_interaction_observation@1 (root owns metadata);
 /// native validation already enforces id (not callID).
-pub fn project_question_form(
-    item: &Value,
-    session_id: &str,
-    fingerprint: &str,
-) -> Result<Value> {
+pub fn project_question_form(item: &Value, session_id: &str, fingerprint: &str) -> Result<Value> {
     let _ = validate_question_form(item)?;
     let fields = item["fields"]
         .as_array()
@@ -275,7 +275,9 @@ fn exact_fields(value: &Value, required: &[&str], optional: &[&str]) -> Result<(
             .keys()
             .any(|f| !required.contains(&f.as_str()) && !optional.contains(&f.as_str()))
     {
-        return Err(schema_error("native interaction has missing or unknown fields"));
+        return Err(schema_error(
+            "native interaction has missing or unknown fields",
+        ));
     }
     Ok(())
 }
@@ -298,16 +300,20 @@ fn bounded_text(value: Option<&Value>, maximum: usize) -> Result<String> {
 
 fn is_frm(value: &str) -> bool {
     value.starts_with("frm_")
-        && value.len() > 4
+        && value.len() >= 4
         && value.len() <= 256
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
 fn is_ses(value: &str) -> bool {
     value.starts_with("ses_")
-        && value.len() > 4
+        && value.len() >= 4
         && value.len() <= 256
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
 fn invalid(message: &'static str) -> Error {

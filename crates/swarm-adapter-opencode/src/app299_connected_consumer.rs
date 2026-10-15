@@ -61,22 +61,32 @@ impl PublicTasksClient {
             next_id: 0,
             server,
         };
-        let initialized = client
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion":"2025-11-25",
-                    "capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},
-                    "clientInfo":{"name":"app299-connected-consumer","version":"1"}
-                }),
-            )
-            .await?;
-        if initialized["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"] != json!({}) {
-            return Err(
-                "public facade did not advertise the negotiated Tasks extension".to_owned(),
-            );
+        let initialized = async {
+            let initialized = client
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion":"2025-11-25",
+                        "capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},
+                        "clientInfo":{"name":"app299-connected-consumer","version":"1"}
+                    }),
+                )
+                .await?;
+            if initialized["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"]
+                != json!({})
+            {
+                return Err(
+                    "public facade did not advertise the negotiated Tasks extension".to_owned(),
+                );
+            }
+            client.notify("notifications/initialized").await?;
+            Ok::<(), String>(())
         }
-        client.notify("notifications/initialized").await?;
+        .await;
+        if let Err(error) = initialized {
+            client.close().await;
+            return Err(error);
+        }
         Ok(client)
     }
 
@@ -176,7 +186,14 @@ impl PublicTasksClient {
         }
     }
 
-    pub(super) async fn close(self) {
+    pub(super) async fn close(mut self) {
+        self.server.abort();
+        let _ = (&mut self.server).await;
+    }
+}
+
+impl Drop for PublicTasksClient {
+    fn drop(&mut self) {
         self.server.abort();
     }
 }

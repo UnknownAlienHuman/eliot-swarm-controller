@@ -535,7 +535,6 @@ fn module_open_scope() -> OpeningScope {
                 variant: "high".into(),
             },
             model_catalog: "refresh".into(),
-            credential_ref: None,
             bun_executable: root.join("bun.exe"),
             bun_sha256: "a".repeat(64),
             server_program,
