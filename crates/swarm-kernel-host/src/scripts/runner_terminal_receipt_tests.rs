@@ -28,6 +28,7 @@ impl OwnedFixture {
         let root =
             std::env::temp_dir().join(format!("script-terminal-receipt-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create isolated terminal receipt fixture");
+        let root = fs::canonicalize(&root).expect("canonicalize isolated terminal receipt fixture");
         let work = fixture_work(&root);
         let (receipt_path, work_digest) = publish_fixture_work(&work);
         let ready_path = root.join("fixture.ready");
