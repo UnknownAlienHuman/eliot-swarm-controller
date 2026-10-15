@@ -3402,23 +3402,33 @@ impl Store {
             let end = list.len().min(after.saturating_add(limit as usize));
             let mut visible_parts = Vec::with_capacity(end - after);
             for part in &list[after..end] {
-                let page_id = part
-                    .get("artifact_ref")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        Error::new("ARTIFACT_DAMAGED", "part has no artifact reference")
-                    })?;
-                let offset_bytes = part
-                    .get("offset_bytes")
-                    .and_then(Value::as_u64)
+                let (artifact_ref, offset, length, digest) = if let Some(fields) = part.as_array() {
+                    if fields.len() != 4 {
+                        return Err(Error::new(
+                            "ARTIFACT_DAMAGED",
+                            "compact part entry has unknown or missing fields",
+                        ));
+                    }
+                    (&fields[0], &fields[1], &fields[2], &fields[3])
+                } else {
+                    (
+                        &part["artifact_ref"],
+                        &part["offset_bytes"],
+                        &part["byte_length"],
+                        &part["sha256"],
+                    )
+                };
+                let page_id = artifact_ref.as_str().ok_or_else(|| {
+                    Error::new("ARTIFACT_DAMAGED", "part has no artifact reference")
+                })?;
+                let offset_bytes = offset
+                    .as_u64()
                     .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part offset is malformed"))?;
-                let byte_length = part
-                    .get("byte_length")
-                    .and_then(Value::as_u64)
+                let byte_length = length
+                    .as_u64()
                     .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part length is malformed"))?;
-                let sha256 = part
-                    .get("sha256")
-                    .and_then(Value::as_str)
+                let sha256 = digest
+                    .as_str()
                     .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part digest is malformed"))?;
                 #[cfg(test)]
                 object_scope::count_assembly_window_query_loads(&artifact.artifact_id, 1);

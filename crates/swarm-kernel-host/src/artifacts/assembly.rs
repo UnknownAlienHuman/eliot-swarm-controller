@@ -272,6 +272,32 @@ fn assembly_part_cache_entry_estimate(key: &AssemblyPartCacheKey, capacity: usiz
 }
 
 fn decode_cached_result_part(value: &Value) -> Result<CachedResultPart> {
+    if let Some(fields) = value.as_array() {
+        if fields.len() != 4 {
+            return Err(Error::new(
+                "ARTIFACT_DAMAGED",
+                "compact part entry has unknown or missing fields",
+            ));
+        }
+        fields[0]
+            .as_str()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part reference is malformed"))?;
+        let offset_bytes = fields[1]
+            .as_u64()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part offset is malformed"))?;
+        let byte_length = fields[2]
+            .as_u64()
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part length is malformed"))?;
+        let sha256 = fields[3]
+            .as_str()
+            .and_then(parse_sha256)
+            .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part digest is malformed"))?;
+        return Ok(CachedResultPart {
+            offset_bytes,
+            byte_length,
+            sha256,
+        });
+    }
     let fields = value
         .as_object()
         .ok_or_else(|| Error::new("ARTIFACT_DAMAGED", "part entry is malformed"))?;

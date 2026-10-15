@@ -606,8 +606,8 @@ fn assembled_record_cache_is_scoped_to_connection_and_reopen() {
             .unwrap();
         let proof = Arc::new(AssemblyProof {
             sources: Arc::new(vec![NativeResultSource {
-                producer_operation_id: "cache-scope-producer".to_owned(),
-                target_operation_id: "cache-scope-target".to_owned(),
+                producer_operation_id: Arc::new("cache-scope-producer".to_owned()),
+                target_operation_id: Arc::new("cache-scope-target".to_owned()),
                 task_identity: None,
                 producer_operation_rowid: 0,
                 target_operation_rowid: 0,
@@ -1707,14 +1707,36 @@ mod connected_store {
         payload: &[u8],
         range: std::ops::Range<usize>,
     ) -> String {
+        let selector = json!({
+            "kind":"scope_fixture_result",
+            "input_operation_id":target["operation_id"],
+        });
+        publish_page_with_selector(f, descriptor, binding, module, payload, range, selector).await
+    }
+
+    async fn publish_page_with_selector(
+        f: &Fixture,
+        descriptor: &ModuleDescriptor,
+        binding: &Value,
+        module: &Principal,
+        payload: &[u8],
+        range: std::ops::Range<usize>,
+        selector: Value,
+    ) -> String {
         let offset = range.start;
         let end = range.end;
         let store = &f.owner.store;
-        let result = write(store, &f.manager_a, "agent.result", json!({
-            "binding_id":binding["binding_id"],"generation":binding["generation"],
-            "selector":{"kind":"scope_fixture_result","input_operation_id":target["operation_id"]},
-            "offset_bytes":offset,"length_bytes":end-offset,
-        })).await;
+        let result = write(
+            store,
+            &f.manager_a,
+            "agent.result",
+            json!({
+                "binding_id":binding["binding_id"],"generation":binding["generation"],
+                "selector":selector,
+                "offset_bytes":offset,"length_bytes":end-offset,
+            }),
+        )
+        .await;
         let command = next_command(store, module, &result).await;
         let origin: NormalizedResultOriginContext =
             serde_json::from_value(command.input["normalized_result_origin"].clone()).unwrap();
@@ -2043,6 +2065,74 @@ mod connected_store {
         }
     }
 
+    async fn seed_historical_page_with_large_generic_identity(
+        fixture: &Fixture,
+        binding: &Value,
+        target: &Value,
+        padding_entries: usize,
+    ) -> String {
+        let page_id = format!("result-{}", model::digest(model::new_id().as_bytes()));
+        let page_bytes = b"r";
+        let page_digest = model::digest(page_bytes);
+        let mut source = json!({"kind":"scope_fixture_historical_source"});
+        source["legacy_identity_padding"] =
+            Value::Array((0..padding_entries).map(|_| json!({})).collect());
+        let metadata = json!({
+            "operation_id":target["operation_id"],
+            "binding_id":binding["binding_id"],
+            "generation":binding["generation"],
+            "binding_generation":binding["generation"],
+            "offset_bytes":0,
+            "byte_length":page_bytes.len(),
+            "total_bytes":page_bytes.len(),
+            "eof":true,
+            "media_type":"text/plain",
+            "page_sha256":page_digest,
+            "source":source,
+            "selector":{"kind":"scope_fixture_result","input_operation_id":target["operation_id"]},
+            "native_scope_key":"scope-fixture-namespace",
+            "native_root_id":"scope-fixture-root",
+        });
+        let relative_path = format!("artifacts/{page_id}.bin");
+        std::fs::write(fixture.directory.join(&relative_path), page_bytes).unwrap();
+
+        let dispatch_id = target["operation_id"].as_str().unwrap().to_owned();
+        let stored_page_id = page_id.clone();
+        let stored_path = relative_path.clone();
+        let stored_digest = page_digest.clone();
+        fixture
+            .owner
+            .store
+            .run_fixture(move |db| {
+                let result_json: String = db.query_row(
+                    "SELECT result_json FROM operations WHERE operation_id=?1",
+                    [&dispatch_id],
+                    |row| row.get(0),
+                )?;
+                let mut result: Value = serde_json::from_str(&result_json)?;
+                result["details"]["artifact_refs"] = json!([stored_page_id.clone()]);
+                db.execute(
+                    "UPDATE operations SET result_json=?2 WHERE operation_id=?1",
+                    params![dispatch_id, model::canonical(&result)?],
+                )?;
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'native_result_page',?3,?4,?5,?6)",
+                    params![
+                        stored_page_id,
+                        stored_path,
+                        page_bytes.len() as i64,
+                        stored_digest,
+                        model::now_ms()?,
+                        model::canonical(&metadata)?,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        page_id
+    }
+
     async fn measure_repeated_assembled_ranges(page_count: usize) -> (u64, u64, u64, u64) {
         let setup = setup_read_cost_pages(page_count).await;
         let store = &setup.fixture.owner.store;
@@ -2336,6 +2426,122 @@ mod connected_store {
         let large = measure_repeated_assembled_ranges(32).await;
         assert_eq!(small, (2, 4, 0, 64));
         assert_eq!(large, (32, 64, 0, 64));
+    }
+
+    #[tokio::test]
+    async fn store_compacts_over_budget_assembly_proof_without_weakening_read_grants() {
+        let fixture = start().await;
+        let descriptor = fixture_descriptor();
+        let (binding, module) = open_fixture_module(&fixture, &descriptor).await;
+        let target = dispatch_fixture(
+            &fixture,
+            &descriptor,
+            &binding,
+            &module,
+            "large-historical-proof",
+        )
+        .await;
+        let page_ref =
+            seed_historical_page_with_large_generic_identity(&fixture, &binding, &target, 18_000)
+                .await;
+        let store = &fixture.owner.store;
+        let assembly = write(
+            store,
+            &fixture.operator,
+            "artifact.assemble",
+            json!({
+                "page_refs":[page_ref.clone()],
+                "expected_sha256":model::digest(b"r"),
+            }),
+        )
+        .await;
+        let assembly_operation_id = assembly["operation_id"].as_str().unwrap().to_owned();
+        let assembly_result_json = store
+            .run_fixture(move |db| {
+                let result: String = db.query_row(
+                    "SELECT result_json FROM operations WHERE operation_id=?1",
+                    [&assembly_operation_id],
+                    |row| row.get(0),
+                )?;
+                Ok(result)
+            })
+            .await
+            .unwrap();
+        let assembly_result: Value = serde_json::from_str(&assembly_result_json).unwrap();
+        assert_eq!(assembly_result["outcome"], "applied", "{assembly_result}");
+        let assembled_id = format!(
+            "assembled-{}",
+            model::digest(assembly["operation_id"].as_str().unwrap().as_bytes())
+        );
+
+        reset_assembly_source_load_counts(&assembled_id);
+        let cold = call(
+            store,
+            &fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(cold["byte_length"], 1);
+        let cold_counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(cold_counts.cache_compactions, 1);
+        assert!(cold_counts.original_cache_candidate_bytes > 16 * 1024 * 1024);
+        assert!(cold_counts.compact_cache_candidate_bytes <= 16 * 1024 * 1024);
+        assert_eq!(cold_counts.source_artifact_point_loads, 1);
+        assert_eq!(cold_counts.producer_target_operation_point_loads, 2);
+
+        reset_assembly_source_load_counts(&assembled_id);
+        let warm = call(
+            store,
+            &fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(warm["byte_length"], 1);
+        let warm_counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(warm_counts.source_artifact_point_loads, 0);
+        assert_eq!(warm_counts.producer_target_operation_point_loads, 0);
+        assert_eq!(warm_counts.immutable_proof_cache_hits, 1);
+        assert_eq!(warm_counts.current_scope_grant_checks, 1);
+
+        let parts = call(
+            store,
+            &fixture.manager_a,
+            "artifact.parts",
+            json!({"artifact_id":assembled_id,"after":0,"limit":1}),
+        )
+        .await;
+        assert_eq!(parts["part_count"], 1);
+        assert_eq!(parts["parts"][0]["artifact_ref"], page_ref);
+
+        reset_assembly_source_load_counts(&assembled_id);
+        denied(
+            store,
+            &fixture.manager_b,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+            "FORBIDDEN",
+        )
+        .await;
+        let denied_counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(denied_counts.immutable_proof_cache_hits, 1);
+        assert_eq!(denied_counts.current_scope_grant_checks, 1);
+        assert_eq!(denied_counts.source_artifact_point_loads, 0);
+
+        fixture.close().await;
     }
 
     #[tokio::test]

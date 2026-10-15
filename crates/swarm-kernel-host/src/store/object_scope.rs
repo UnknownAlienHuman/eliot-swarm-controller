@@ -212,9 +212,9 @@ pub(crate) struct OperationRow {
 /// page-local byte ranges removed.
 #[derive(Debug, Clone)]
 pub(crate) struct NativeResultSource {
-    pub(crate) producer_operation_id: String,
-    pub(crate) target_operation_id: String,
-    pub(crate) task_identity: Option<TaskGraphIdentity>,
+    pub(crate) producer_operation_id: Arc<String>,
+    pub(crate) target_operation_id: Arc<String>,
+    pub(crate) task_identity: Option<Arc<TaskGraphIdentity>>,
     pub(crate) producer_operation_rowid: i64,
     pub(crate) target_operation_rowid: i64,
 }
@@ -249,7 +249,7 @@ const ASSEMBLY_CACHE_WATCHER_ACCOUNTING_BYTES_PER_DEPENDENCY: usize = 128;
 #[derive(Debug, Clone)]
 pub(crate) struct AssemblyProof {
     pub(crate) sources: Arc<Vec<NativeResultSource>>,
-    pub(crate) distinct_tasks: Arc<Vec<Option<TaskGraphIdentity>>>,
+    pub(crate) distinct_tasks: Arc<Vec<Option<Arc<TaskGraphIdentity>>>>,
     cache_dependencies: Arc<Vec<super::results::AssemblyCacheRow>>,
 }
 
@@ -302,8 +302,10 @@ fn assembly_read_cache_key(
     })
 }
 
-fn distinct_tasks_for_sources(sources: &[NativeResultSource]) -> Vec<Option<TaskGraphIdentity>> {
-    let mut seen: HashSet<Option<TaskGraphIdentity>> = HashSet::new();
+fn distinct_tasks_for_sources(
+    sources: &[NativeResultSource],
+) -> Vec<Option<Arc<TaskGraphIdentity>>> {
+    let mut seen: HashSet<Option<Arc<TaskGraphIdentity>>> = HashSet::new();
     let mut distinct = Vec::new();
     for source in sources {
         if seen.insert(source.task_identity.clone()) {
@@ -311,6 +313,32 @@ fn distinct_tasks_for_sources(sources: &[NativeResultSource]) -> Vec<Option<Task
         }
     }
     distinct
+}
+
+fn intern_assembly_sources(mut sources: Vec<NativeResultSource>) -> Vec<NativeResultSource> {
+    let mut operation_ids: HashMap<Arc<String>, Arc<String>> = HashMap::new();
+    let mut task_identities: HashMap<Arc<TaskGraphIdentity>, Arc<TaskGraphIdentity>> =
+        HashMap::new();
+    for source in &mut sources {
+        for operation_id in [
+            &mut source.producer_operation_id,
+            &mut source.target_operation_id,
+        ] {
+            if let Some(shared) = operation_ids.get(operation_id) {
+                *operation_id = Arc::clone(shared);
+            } else {
+                operation_ids.insert(Arc::clone(operation_id), Arc::clone(operation_id));
+            }
+        }
+        if let Some(identity) = &mut source.task_identity {
+            if let Some(shared) = task_identities.get(identity) {
+                *identity = Arc::clone(shared);
+            } else {
+                task_identities.insert(Arc::clone(identity), Arc::clone(identity));
+            }
+        }
+    }
+    sources
 }
 
 fn cached_assembly_entry(
@@ -367,40 +395,37 @@ pub(super) fn assembly_read_cache_epoch(
 }
 
 fn estimated_source_proof_bytes(sources: &[NativeResultSource], capacity: usize) -> usize {
-    sources.iter().fold(
-        size_of::<Vec<NativeResultSource>>()
-            .saturating_add(capacity.saturating_mul(size_of::<NativeResultSource>())),
-        |total, source| {
-            total
-                .saturating_add(source.producer_operation_id.capacity())
-                .saturating_add(source.target_operation_id.capacity())
-                .saturating_add(source.task_identity.as_ref().map_or(0, |identity| {
-                    identity
-                        .project_id
-                        .capacity()
-                        .saturating_add(identity.task_id.capacity())
-                        .saturating_add(identity.attempt_id.as_ref().map_or(0, String::capacity))
-                        .saturating_add(identity.binding_id.as_ref().map_or(0, String::capacity))
-                }))
-        },
-    )
+    let mut total = size_of::<Vec<NativeResultSource>>()
+        .saturating_add(capacity.saturating_mul(size_of::<NativeResultSource>()));
+    let mut operation_ids: HashSet<Arc<String>> = HashSet::new();
+    let mut task_identities: HashSet<Arc<TaskGraphIdentity>> = HashSet::new();
+    for source in sources {
+        for operation_id in [&source.producer_operation_id, &source.target_operation_id] {
+            if operation_ids.insert(Arc::clone(operation_id)) {
+                total = total
+                    .saturating_add(size_of::<String>())
+                    .saturating_add(2 * size_of::<usize>())
+                    .saturating_add(operation_id.capacity());
+            }
+        }
+        if let Some(identity) = &source.task_identity
+            && task_identities.insert(Arc::clone(identity))
+        {
+            total = total
+                .saturating_add(size_of::<TaskGraphIdentity>())
+                .saturating_add(2 * size_of::<usize>())
+                .saturating_add(identity.project_id.capacity())
+                .saturating_add(identity.task_id.capacity())
+                .saturating_add(identity.attempt_id.as_ref().map_or(0, String::capacity))
+                .saturating_add(identity.binding_id.as_ref().map_or(0, String::capacity));
+        }
+    }
+    total
 }
 
-fn estimated_distinct_tasks_bytes(tasks: &[Option<TaskGraphIdentity>], capacity: usize) -> usize {
-    tasks.iter().fold(
-        size_of::<Vec<Option<TaskGraphIdentity>>>()
-            .saturating_add(capacity.saturating_mul(size_of::<Option<TaskGraphIdentity>>())),
-        |total, task| {
-            total.saturating_add(task.as_ref().map_or(0, |identity| {
-                identity
-                    .project_id
-                    .capacity()
-                    .saturating_add(identity.task_id.capacity())
-                    .saturating_add(identity.attempt_id.as_ref().map_or(0, String::capacity))
-                    .saturating_add(identity.binding_id.as_ref().map_or(0, String::capacity))
-            }))
-        },
-    )
+fn estimated_distinct_tasks_bytes(capacity: usize) -> usize {
+    size_of::<Vec<Option<Arc<TaskGraphIdentity>>>>()
+        .saturating_add(capacity.saturating_mul(size_of::<Option<Arc<TaskGraphIdentity>>>()))
 }
 
 fn estimated_assembly_read_cache_entry_bytes(
@@ -420,7 +445,6 @@ fn estimated_assembly_read_cache_entry_bytes(
             proof.sources.capacity(),
         ))
         .saturating_add(estimated_distinct_tasks_bytes(
-            &proof.distinct_tasks,
             proof.distinct_tasks.capacity(),
         ))
         .saturating_add(size_of::<Vec<super::results::AssemblyCacheRow>>())
@@ -478,7 +502,11 @@ fn cache_assembly_proof(
     snapshot: &super::results::AssemblyReadCacheSnapshot,
 ) -> Result<()> {
     let key = assembly_read_cache_key(record, snapshot)?;
-    let bytes = estimated_assembly_read_cache_entry_bytes(&key, record, &proof);
+    let _original_bytes = estimated_assembly_read_cache_entry_bytes(&key, record, &proof);
+    let cached_record = Arc::new(compact_cached_assembly_record(record)?);
+    let bytes = estimated_assembly_read_cache_entry_bytes(&key, &cached_record, &proof);
+    #[cfg(test)]
+    count_assembly_cache_compaction(&record.artifact_id, _original_bytes, bytes);
     let mut cache = match assembly_read_cache().lock() {
         Ok(cache) => cache,
         Err(_) => return Ok(()),
@@ -495,7 +523,7 @@ fn cache_assembly_proof(
     let entry = AssemblyReadCacheEntry {
         key,
         guard,
-        record: Arc::clone(record),
+        record: cached_record,
         proof,
         bytes,
     };
@@ -540,6 +568,52 @@ fn estimated_artifact_record_bytes(record: &ArtifactRecord) -> usize {
         .saturating_add(value_bytes(&record.metadata))
 }
 
+fn compact_cached_assembly_record(record: &ArtifactRecord) -> Result<ArtifactRecord> {
+    let parts = record.metadata["parts"]
+        .as_array()
+        .ok_or_else(|| identity_damaged("assembled result has no retained part manifest"))?;
+    let mut compact_parts = Vec::with_capacity(parts.len());
+    for part in parts {
+        let artifact_ref = part
+            .get("artifact_ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| identity_damaged("assembly part reference is malformed"))?;
+        let offset_bytes = part
+            .get("offset_bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| identity_damaged("assembly part offset is malformed"))?;
+        let byte_length = part
+            .get("byte_length")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| identity_damaged("assembly part length is malformed"))?;
+        let sha256 = part
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| identity_damaged("assembly part digest is malformed"))?;
+        compact_parts.push(json!([artifact_ref, offset_bytes, byte_length, sha256]));
+    }
+
+    Ok(ArtifactRecord {
+        kind: record.kind.clone(),
+        artifact_id: record.artifact_id.clone(),
+        relative_path: record.relative_path.clone(),
+        byte_length: record.byte_length,
+        content_digest: record.content_digest.clone(),
+        // Identity was fully validated before cache admission and remains
+        // represented by the shared proof. Retain only fields needed by warm
+        // authorization, range verification, and public metadata projection.
+        metadata: json!({
+            "assembly_operation_id":record.metadata["assembly_operation_id"],
+            "coverage":record.metadata["coverage"],
+            "byte_length":record.metadata["byte_length"],
+            "sha256":record.metadata["sha256"],
+            "part_count":record.metadata["part_count"],
+            "expected_sha256":record.metadata["expected_sha256"],
+            "parts":compact_parts,
+        }),
+    })
+}
+
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AssemblySourceLoadCounts {
@@ -555,6 +629,9 @@ pub(crate) struct AssemblySourceLoadCounts {
     pub(crate) part_manifest_string_bytes_copied: u64,
     pub(crate) cache_validation_query_loads: u64,
     pub(crate) provenance_point_query_loads: u64,
+    pub(crate) original_cache_candidate_bytes: u64,
+    pub(crate) compact_cache_candidate_bytes: u64,
+    pub(crate) cache_compactions: u64,
 }
 
 #[cfg(test)]
@@ -579,6 +656,19 @@ pub(crate) fn assembly_source_load_counts(artifact_id: &str) -> AssemblySourceLo
         .ok()
         .and_then(|counts| counts.get(artifact_id).copied())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn count_assembly_cache_compaction(artifact_id: &str, original_bytes: usize, compact_bytes: usize) {
+    if let Ok(mut counts) = ASSEMBLY_SOURCE_LOAD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        let counts = counts.entry(artifact_id.to_owned()).or_default();
+        counts.original_cache_candidate_bytes = u64::try_from(original_bytes).unwrap_or(u64::MAX);
+        counts.compact_cache_candidate_bytes = u64::try_from(compact_bytes).unwrap_or(u64::MAX);
+        counts.cache_compactions += 1;
+    }
 }
 
 #[cfg(test)]
@@ -1990,13 +2080,16 @@ fn assembly_identity(record: &ArtifactRecord) -> Result<Value> {
     let mut identity = json!({
         "binding_id":metadata["binding_id"],
         "generation":binding_generation(metadata)?,
-        "binding_generation":binding_generation(metadata)?,
         "selector":selector,
         "source":source,
         "media_type":metadata["media_type"],
         "total_bytes":metadata["total_bytes"],
     });
-    if !special {
+    if special {
+        // The persisted special-source identity includes both generation names;
+        // the generic identity emitted by ArtifactFiles::identity does not.
+        identity["binding_generation"] = json!(binding_generation(metadata)?);
+    } else {
         identity["native_scope_key"] = metadata["native_scope_key"].clone();
         identity["native_root_id"] = metadata["native_root_id"].clone();
     }
@@ -2259,9 +2352,9 @@ fn native_page_source(
         count_assembly_source_loads(assembly_id, 0, 0, 1, 0, 0);
     }
     Ok(NativeResultSource {
-        producer_operation_id: producer_id,
-        target_operation_id: target_id,
-        task_identity,
+        producer_operation_id: Arc::new(producer_id),
+        target_operation_id: Arc::new(target_id),
+        task_identity: task_identity.map(Arc::new),
         producer_operation_rowid: producer.rowid,
         target_operation_rowid: target.rowid,
     })
@@ -2403,7 +2496,10 @@ fn assembled_result_sources(
             "assembled page manifest does not cover the retained result length",
         ));
     }
+    let sources = intern_assembly_sources(sources);
     let distinct = distinct_tasks_for_sources(&sources);
+    let mut seen_dependencies = HashSet::new();
+    cache_dependencies.retain(|dependency| seen_dependencies.insert(*dependency));
     let proof = Arc::new(AssemblyProof {
         sources: Arc::new(sources),
         distinct_tasks: Arc::new(distinct),
@@ -2548,7 +2644,7 @@ fn native_source_grant(
         db,
         principal,
         &source.producer_operation_id,
-        source.task_identity.as_ref(),
+        source.task_identity.as_deref(),
         ArtifactReadBasis::ExactResultOperationCaller,
         requested,
     )? {
@@ -2558,7 +2654,7 @@ fn native_source_grant(
         db,
         principal,
         &source.target_operation_id,
-        source.task_identity.as_ref(),
+        source.task_identity.as_deref(),
         ArtifactReadBasis::ExactResultOperationCaller,
         requested,
     )
@@ -2658,7 +2754,7 @@ fn resolve_artifact_read_inner(
             if record.kind == "native_result" {
                 count_grant_loop_iterations(&record.artifact_id, proof.distinct_tasks.len() as u64);
             }
-            let mut task_grants: HashMap<TaskGraphIdentity, Option<ArtifactReadGrant>> =
+            let mut task_grants: HashMap<Arc<TaskGraphIdentity>, Option<ArtifactReadGrant>> =
                 HashMap::new();
             let mut needs_fallback = false;
             let mut fast_minimum = requested;
@@ -2669,7 +2765,8 @@ fn resolve_artifact_read_inner(
                     if record.kind == "native_result" {
                         count_assembly_source_loads(&record.artifact_id, 0, 0, 0, 0, 1);
                     }
-                    let grant = task_read_artifact_grant(db, principal, identity, requested)?;
+                    let grant =
+                        task_read_artifact_grant(db, principal, identity.as_ref(), requested)?;
                     if let Some(g) = grant.as_ref() {
                         fast_minimum = fast_minimum.min(g.level);
                         if fast_basis.is_none() {
@@ -2715,7 +2812,7 @@ fn resolve_artifact_read_inner(
                         }
                         task_grants.insert(
                             identity.clone(),
-                            task_read_artifact_grant(db, principal, identity, requested)?,
+                            task_read_artifact_grant(db, principal, identity.as_ref(), requested)?,
                         );
                     }
                     task_grants.get(identity).copied().flatten()
@@ -2912,10 +3009,12 @@ mod assembly_read_cache_budget_tests {
             .checked_div(size_of::<NativeResultSource>())
             .unwrap_or(0)
             .saturating_add(1);
+        let producer_operation_id = Arc::new("shared-producer".to_owned());
+        let target_operation_id = Arc::new("shared-target".to_owned());
         (0..count)
             .map(|index| NativeResultSource {
-                producer_operation_id: format!("producer-{index}"),
-                target_operation_id: "shared-target".to_owned(),
+                producer_operation_id: Arc::clone(&producer_operation_id),
+                target_operation_id: Arc::clone(&target_operation_id),
                 task_identity: None,
                 producer_operation_rowid: index as i64,
                 target_operation_rowid: 1,
