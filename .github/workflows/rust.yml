@@ -1100,9 +1100,10 @@ jobs:
             )) {
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
             }
-            Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter 'control_consumer_tests' -Expected 3 -ExpectedNames @(
+            Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter 'control_consumer_tests' -Expected 4 -ExpectedNames @(
               'question_reply_and_reject_cross_native_and_outcome_ack',
               'permission_reject_cascade_reaches_native_and_outcome_ack',
+              'full_permission_reject_history_settles_unknown_once_and_records_applied_ack',
               'refresh_cursor_is_published_only_after_recorded_observation_ack'
             )
           } elseif ($env:QUALIFICATION -ceq 'focused-workspace-git') {
