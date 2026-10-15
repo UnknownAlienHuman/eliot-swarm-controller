@@ -2393,14 +2393,197 @@ fn turn_error_http_status(turn: &Value) -> Option<u64> {
 type NativeSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type NativeWriter = Arc<AsyncMutex<SplitSink<NativeSocket, Message>>>;
 
+/// The installed App Server initialize response fields used for the native DTO.
+/// Unknown fields remain forward-compatible; these four fields are required.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeInitializeResponse {
+    user_agent: String,
+    codex_home: String,
+    platform_family: String,
+    platform_os: String,
+}
+
+/// The product and version reported by the Codex App Server initialize response.
+/// This is peer-reported protocol evidence, not executable attestation or a server capability list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeServerIdentity {
+    reported_product: String,
+    reported_version: String,
+    reported_platform_family: String,
+    reported_platform_os: String,
+}
+
+impl NativeServerIdentity {
+    fn from_initialize_response(initialized: &Value) -> Option<Self> {
+        let initialized: NativeInitializeResponse =
+            serde_json::from_value(initialized.clone()).ok()?;
+        let user_agent = initialize_text(&initialized.user_agent, 1024)?;
+        let codex_home = initialize_text(&initialized.codex_home, 32_768)?;
+        let platform_family = initialize_text(&initialized.platform_family, 32)?;
+        let platform_os = initialize_text(&initialized.platform_os, 32)?;
+
+        let absolute_home = match (platform_family, platform_os) {
+            ("windows", "windows") => is_absolute_windows_path(codex_home),
+            ("unix", "linux" | "macos") => codex_home.starts_with('/'),
+            _ => false,
+        };
+        if !absolute_home {
+            return None;
+        }
+
+        // The installed response exposes userAgent, not MCP-style serverInfo.
+        // Accept the CLI and Desktop product/version forms; trailing client
+        // metadata is not identity evidence and clientInfo is never consulted.
+        let (reported_product, reported_version) = reported_codex_product_version(user_agent)?;
+
+        Some(Self {
+            reported_product: reported_product.to_owned(),
+            reported_version: reported_version.to_owned(),
+            reported_platform_family: platform_family.to_owned(),
+            reported_platform_os: platform_os.to_owned(),
+        })
+    }
+
+    fn report(&self) -> Value {
+        json!({
+            "source": "initialize.userAgent Codex product/version prefix",
+            "reported_product": self.reported_product.as_str(),
+            "reported_version": self.reported_version.as_str(),
+            "reported_platform_family": self.reported_platform_family.as_str(),
+            "reported_platform_os": self.reported_platform_os.as_str(),
+            "peer_report_only": true,
+            "process_attestation": false,
+            "server_capabilities": "not_reported_by_initialize_response",
+            "client_declared_capabilities": {"experimentalApi": false}
+        })
+    }
+}
+
+fn initialize_text(value: &str, max_bytes: usize) -> Option<&str> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn is_absolute_windows_path(path: &str) -> bool {
+    let path = path.replace('/', "\\");
+    strip_windows_namespace_prefix(&path).is_some_and(|path| is_absolute_windows_path_shape(&path))
+}
+
+fn is_absolute_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+fn is_absolute_windows_path_shape(path: &str) -> bool {
+    if is_absolute_windows_drive_path(path) {
+        return true;
+    }
+    if path.starts_with(r"\\.\") {
+        return false;
+    }
+    let Some(unc_path) = path.strip_prefix(r"\\") else {
+        return false;
+    };
+    let mut components = unc_path.split('\\');
+    matches!(
+        (components.next(), components.next()),
+        (Some(server), Some(share)) if !server.is_empty() && !share.is_empty()
+    )
+}
+
+fn strip_windows_namespace_prefix(path: &str) -> Option<String> {
+    let Some(path) = path.strip_prefix(r"\\?\") else {
+        return (!path.starts_with(r"\\.\")).then(|| path.to_owned());
+    };
+    if path
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\"))
+    {
+        return Some(format!(r"\\{}", &path[4..]));
+    }
+    if is_absolute_windows_drive_path(path) {
+        return Some(path.to_owned());
+    }
+    None
+}
+
+fn normalize_windows_path_identity(path: &str) -> Option<String> {
+    let path = path.replace('/', "\\");
+    let path = strip_windows_namespace_prefix(&path)?;
+    if !is_absolute_windows_path_shape(&path) {
+        return None;
+    }
+    let mut normalized = path.to_lowercase();
+    let minimum_length = if is_absolute_windows_drive_path(&normalized) {
+        3
+    } else {
+        0
+    };
+    while normalized.len() > minimum_length && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    Some(normalized)
+}
+
+fn reported_codex_product_version(user_agent: &str) -> Option<(&str, &str)> {
+    for product in ["Codex CLI", "Codex Desktop"] {
+        let Some(version_and_metadata) = user_agent
+            .strip_prefix(product)
+            .and_then(|value| value.strip_prefix('/'))
+        else {
+            continue;
+        };
+        let version = version_and_metadata.split_ascii_whitespace().next()?;
+        if !is_reported_codex_version(version) {
+            return None;
+        }
+        return Some((product, version));
+    }
+    None
+}
+
+fn is_reported_codex_version(version: &str) -> bool {
+    if version.is_empty() || version.len() > 128 || !version.is_ascii() {
+        return false;
+    }
+    let suffix_start = version.find(['-', '+']);
+    let (core, suffix) = match suffix_start {
+        Some(index) => (&version[..index], Some(&version[index + 1..])),
+        None => (version, None),
+    };
+    let components: Vec<_> = core.split('.').collect();
+    if components.len() != 3
+        || components
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    match suffix {
+        None => true,
+        Some(value) => {
+            !value.is_empty()
+                && value.split(['.', '-', '+']).all(|part| {
+                    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+        }
+    }
+}
+
 struct NativeClient {
     writer: Option<NativeWriter>,
     demux: Arc<NativeRpcDemultiplexer>,
     events: NativeEventSink,
     reader_task: Option<tokio::task::JoinHandle<()>>,
     endpoint_identity: String,
-    server_name: String,
-    server_version: String,
+    server_identity: Option<NativeServerIdentity>,
 }
 
 struct NativeRpcDemultiplexer {
@@ -2582,6 +2765,24 @@ impl NativeClient {
         credential_unavailable: bool,
         events: NativeEventSink,
     ) -> Result<Self, NativeError> {
+        Self::attach_inner(endpoint, bearer, credential_unavailable, events, true).await
+    }
+
+    #[cfg(test)]
+    async fn attach_for_existing_thread_readback(
+        endpoint: &str,
+        events: NativeEventSink,
+    ) -> Result<Self, NativeError> {
+        Self::attach_inner(endpoint, None, false, events, false).await
+    }
+
+    async fn attach_inner(
+        endpoint: &str,
+        bearer: Option<&str>,
+        credential_unavailable: bool,
+        events: NativeEventSink,
+        read_optional_account_state: bool,
+    ) -> Result<Self, NativeError> {
         if credential_unavailable {
             return Err(NativeError::CredentialUnavailable);
         }
@@ -2637,8 +2838,7 @@ impl NativeClient {
             events,
             reader_task: Some(reader_task),
             endpoint_identity,
-            server_name: "unknown-server".into(),
-            server_version: "unknown-version".into(),
+            server_identity: None,
         };
         let initialized = client
             .request(
@@ -2653,45 +2853,38 @@ impl NativeClient {
                 }),
             )
             .await?;
-        client.server_name = initialized["serverInfo"]["name"]
-            .as_str()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or("unknown-server")
-            .to_owned();
-        client.server_version = initialized["serverInfo"]["version"]
-            .as_str()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or("unknown-version")
-            .to_owned();
+        client.server_identity = NativeServerIdentity::from_initialize_response(&initialized);
         client
             .events
             .set_scope(client.scope_key())
             .map_err(|_| NativeError::Protocol)?;
         client.notify("initialized", None).await?;
-        // Optional subscription reads use this same authenticated connection.
-        // Unsupported reads do not prevent ordinary native session work.
-        let _ = client
-            .request("account/read", json!({"refreshToken":false}))
-            .await;
-        let before = client
-            .events
-            .usage
-            .lock()
-            .map_err(|_| NativeError::Protocol)?
-            .revision();
-        let limits = client
-            .request("account/rateLimits/read", json!({}))
-            .await
-            .map_err(|error| error.rpc_code() == Some(-32601));
-        client
-            .events
-            .usage
-            .lock()
-            .map_err(|_| NativeError::Protocol)?
-            .full_read(before, limits);
-        client
-            .events
-            .queue_event(NativeRpcEvent::NativeUsageChanged)?;
+        if read_optional_account_state {
+            // Optional subscription reads use this same authenticated connection.
+            // Unsupported reads do not prevent ordinary native session work.
+            let _ = client
+                .request("account/read", json!({"refreshToken":false}))
+                .await;
+            let before = client
+                .events
+                .usage
+                .lock()
+                .map_err(|_| NativeError::Protocol)?
+                .revision();
+            let limits = client
+                .request("account/rateLimits/read", json!({}))
+                .await
+                .map_err(|error| error.rpc_code() == Some(-32601));
+            client
+                .events
+                .usage
+                .lock()
+                .map_err(|_| NativeError::Protocol)?
+                .full_read(before, limits);
+            client
+                .events
+                .queue_event(NativeRpcEvent::NativeUsageChanged)?;
+        }
         Ok(client)
     }
 
@@ -2704,8 +2897,7 @@ impl NativeClient {
             events,
             reader_task: None,
             endpoint_identity: String::from("unavailable"),
-            server_name: String::from("unknown-server"),
-            server_version: String::from("unknown-version"),
+            server_identity: None,
         }
     }
 
@@ -2734,14 +2926,24 @@ impl NativeClient {
     }
 
     fn scope_key(&self) -> String {
+        let (reported_product, reported_version) = self
+            .server_identity
+            .as_ref()
+            .map(|identity| {
+                (
+                    identity.reported_product.as_str(),
+                    identity.reported_version.as_str(),
+                )
+            })
+            .unwrap_or(("unknown-server", "unknown-version"));
         format!(
             "codex-appserver:{}:{}:{}",
-            self.endpoint_identity, self.server_name, self.server_version
+            self.endpoint_identity, reported_product, reported_version
         )
     }
 
     fn identity_is_known(&self) -> bool {
-        self.server_name != "unknown-server" && self.server_version != "unknown-version"
+        self.server_identity.is_some()
     }
 
     async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), NativeError> {
@@ -3387,18 +3589,16 @@ fn reconcile_continuation_admission(
 }
 
 fn normalize_path(value: &str) -> Option<String> {
-    let path = Path::new(value);
-    if !path.is_absolute() {
-        return None;
+    #[cfg(windows)]
+    {
+        normalize_windows_path_identity(value)
     }
-    if cfg!(windows) {
-        Some(
-            path.to_string_lossy()
-                .replace('/', "\\")
-                .trim_end_matches('\\')
-                .to_lowercase(),
-        )
-    } else {
+    #[cfg(not(windows))]
+    {
+        let path = Path::new(value);
+        if !path.is_absolute() {
+            return None;
+        }
         let normalized = value.trim_end_matches('/');
         Some(if normalized.is_empty() {
             "/".to_owned()
@@ -4765,6 +4965,11 @@ async fn open_operation(
         );
     }
     let scope = native.scope_key();
+    let native_server_report = native
+        .server_identity
+        .as_ref()
+        .map(NativeServerIdentity::report)
+        .unwrap_or(Value::Null);
     let mut record = OperationRecord::intent("agent.open", "open");
     record.input_sha256 = command.input_sha256.clone();
     record.native_scope_key = Some(scope.clone());
@@ -4784,6 +4989,9 @@ async fn open_operation(
         .operations
         .insert(command.operation_id.clone(), record);
     if journal.save().is_err() {
+        let mut details =
+            json!({"diagnostic_code":"CHECKPOINT_WRITE_FAILED","native_replay":false});
+        details["native_server_report"] = native_server_report.clone();
         return outcome(
             &command.operation_id,
             EffectOutcome::Rejected,
@@ -4791,7 +4999,7 @@ async fn open_operation(
             None,
             None,
             None,
-            json!({"diagnostic_code":"CHECKPOINT_WRITE_FAILED","native_replay":false}),
+            details,
         );
     }
     let response = native
@@ -4818,6 +5026,7 @@ async fn open_operation(
             with_native_failure_details(&mut details, &error, "thread_start_after_effect_marker");
             details["requested_model_provider"] = json!(provider);
             details["requested_model"] = json!(model);
+            details["native_server_report"] = native_server_report.clone();
             return outcome(
                 &command.operation_id,
                 EffectOutcome::Unknown,
@@ -4835,6 +5044,7 @@ async fn open_operation(
         let mut details = base_details(&journal.state);
         details["diagnostic_code"] = json!("THREAD_START_IDENTITY_MISSING");
         details["native_replay"] = json!(false);
+        details["native_server_report"] = native_server_report.clone();
         return outcome(
             &command.operation_id,
             EffectOutcome::Unknown,
@@ -4851,6 +5061,9 @@ async fn open_operation(
         record.native_root_id = Some(thread_id.to_owned());
     }
     if journal.save().is_err() {
+        let mut details =
+            json!({"diagnostic_code":"CHECKPOINT_WRITE_FAILED","native_replay":false});
+        details["native_server_report"] = native_server_report.clone();
         return outcome(
             &command.operation_id,
             EffectOutcome::Unknown,
@@ -4858,7 +5071,7 @@ async fn open_operation(
             Some(&scope),
             None,
             None,
-            json!({"diagnostic_code":"CHECKPOINT_WRITE_FAILED","native_replay":false}),
+            details,
         );
     }
     let readback = match native.read_thread(thread_id).await {
@@ -4868,6 +5081,7 @@ async fn open_operation(
             details["diagnostic_code"] = json!(error.diagnostic_code());
             details["native_replay"] = json!(false);
             with_native_failure_details(&mut details, &error, "thread_read_after_start");
+            details["native_server_report"] = native_server_report.clone();
             return outcome(
                 &command.operation_id,
                 EffectOutcome::Unknown,
@@ -4894,8 +5108,11 @@ async fn open_operation(
         "model_provider": readback["modelProvider"],
         "model": readback["model"],
         "cwd": readback["cwd"],
+        "reasoning_effort": readback["reasoningEffort"],
+        "reasoning_effort_is_turn_telemetry": false,
         "workspace_status": if readback["cwd"].as_str().and_then(normalize_path) == normalize_path(&workspace) { "workspace_exact" } else { "workspace_mismatch" },
     });
+    details["native_server_report"] = native_server_report;
     if let Some(code) = adoption_error {
         details["diagnostic_code"] = json!(code);
         return outcome(
@@ -6655,3 +6872,7 @@ mod reg34_reg35_checkpoint_integrity_tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 }
+
+#[cfg(test)]
+#[path = "native_identity_tests.rs"]
+mod native_identity_tests;
