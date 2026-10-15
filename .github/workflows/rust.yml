@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery, focused-proof-gaps, focused-retention-delivery]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery, focused-proof-gaps, focused-retention-delivery, focused-retention-tail, focused-native-fixtures]
 permissions:
   contents: read
 jobs:
@@ -677,13 +677,15 @@ jobs:
               [int]$Expected = 0,
               [string[]]$ExpectedNames = @(),
               [switch]$Release,
-              [string]$TestTarget = ''
+              [string]$TestTarget = '',
+              [int]$TestThreads = 0
             )
             $selected = @(Confirm-FocusedSelection -Package $Package -Filter $Filter -Expected $Expected -ExpectedNames $ExpectedNames -Release:$Release -TestTarget $TestTarget)
             $runArguments = @('test', '--locked', '--package', $Package, '--target-dir', $targetDir)
             if ($Release) { $runArguments += '--release' }
             if ($TestTarget) { $runArguments += @('--test', $TestTarget) } else { $runArguments += '--lib' }
             $runArguments += @($Filter, '--', '--nocapture')
+            if ($TestThreads -gt 0) { $runArguments += @('--test-threads', [string]$TestThreads) }
             & cargo @runArguments
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $selectedNames = @($selected | ForEach-Object { $_ -replace ': test$', '' })
@@ -973,6 +975,63 @@ jobs:
               'acknowledged_removal_reports_parent_barrier_failure_and_is_idempotent'
             }
             Invoke-FocusedCohort -Package 'swarm-process' -Filter $removalCase -Expected 1 -ExpectedNames @($removalCase)
+          } elseif ($env:QUALIFICATION -ceq 'focused-retention-tail') {
+            $connectedCase = 'run_owned_keeps_module_service_live_through_256_legacy_records_and_recovers_exact_memo_after_restart'
+            Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter $connectedCase -Expected 1 -ExpectedNames @($connectedCase)
+            if (-not $IsWindows) {
+              foreach ($case in @(
+                'retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_target',
+                'retention_keeps_unknown_removal_across_empty_pass_and_reopen',
+                'opencode_root_checkpoint_is_durable_before_source_delete_crash_boundary',
+                'opencode_cursor_publication_failure_keeps_acknowledged_source_before_delete',
+                'opencode_journal_change_between_classification_and_delete_is_retained',
+                'opencode_cleanup_failure_preserves_store_ack_and_never_authorizes_replay',
+                'retention_v3_complete_cursor_migrates_to_versioned_sparse_startup_barrier'
+              )) {
+                Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter $case -Expected 1 -ExpectedNames @($case)
+              }
+              foreach ($case in @(
+                'claude_current_boot_dispatch_compacts_before_delete_and_reads_anchor_directly',
+                'legacy_migration_is_bounded_resumable_and_append_safe',
+                'recovery_windows_advance_while_one_module_next_stays_pending'
+              )) {
+                Invoke-FocusedCohort -Package 'swarm-adapter-claude' -Filter $case -Expected 1 -ExpectedNames @($case)
+              }
+              $syncCase = 'acknowledged_removal_reports_parent_barrier_failure_and_is_idempotent'
+              Invoke-FocusedCohort -Package 'swarm-process' -Filter $syncCase -Expected 1 -ExpectedNames @($syncCase)
+            }
+          } elseif ($env:QUALIFICATION -ceq 'focused-native-fixtures') {
+            if (-not $IsWindows) {
+              & cargo build --locked --package swarm-kernel-host --bin swarm-kernel-host --target-dir $targetDir
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              $env:ELIOT_ZED_TEST_HOST_EXECUTABLE = Join-Path (Join-Path $targetDir 'debug') 'swarm-kernel-host'
+              if (-not (Test-Path -LiteralPath $env:ELIOT_ZED_TEST_HOST_EXECUTABLE -PathType Leaf)) {
+                throw 'The Zed fixture requires the actual source-built kernel host.'
+              }
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'runtime::zed::tests::unix::' -Expected 10 -TestThreads 1 -ExpectedNames @(
+                'resolve_program_uses_path_and_rejects_missing',
+                'describe_reports_batch_only_capabilities',
+                'completed_run_publishes_all_native_outputs',
+                'large_transcript_is_published_in_pages_without_truncation',
+                'native_error_timeout_and_interrupted_are_facts_not_controller_errors',
+                'early_failure_without_result_is_classified_by_exit_only',
+                'contradictory_native_evidence_is_rejected',
+                'hung_binary_is_terminated_at_the_host_deadline',
+                'run_identity_cannot_be_reused',
+                'terminal_receipt_binds_artifacts_to_exact_operation_and_frozen_prompt'
+              )
+            }
+            foreach ($case in @(
+              'materialized_start_deadline_is_shared_with_helper_before_spawn',
+              'expired_start_budget_rejects_ready_readback_and_keeps_child_observable',
+              'blocked_stop_request_write_expires_within_shared_budget_and_retains_child'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'plugin_package_path_tests' -Expected 2 -ExpectedNames @(
+              'plugin_package_path_projects_verbatim_drive_and_unc_paths',
+              'plugin_package_path_config_roundtrips_through_source_validation'
+            )
           } elseif ($env:QUALIFICATION -ceq 'focused-workspace-git') {
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace' -Expected 1 -ExpectedNames @('work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace')
             if ($IsWindows) {

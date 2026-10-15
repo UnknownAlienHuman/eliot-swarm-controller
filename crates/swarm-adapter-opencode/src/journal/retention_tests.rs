@@ -395,8 +395,10 @@ async fn next_startup_fixture_event(
 }
 
 async fn assert_startup_fixture_report(
-    events: &mut mpsc::UnboundedReceiver<serde_json::Value>,
-    server: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    connection: (
+        &mut mpsc::UnboundedReceiver<serde_json::Value>,
+        &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    ),
     journal: &StartupJournalProbe,
     boot_id: &str,
     unresolved_id: &str,
@@ -404,6 +406,7 @@ async fn assert_startup_fixture_report(
     expect_complete_at_hello: bool,
     minimum_incomplete_next_calls: usize,
 ) -> usize {
+    let (events, server) = connection;
     let mut hello_seen = false;
     let mut incomplete_next_calls = 0usize;
     loop {
@@ -562,8 +565,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
         first_boot_id,
     )));
     let incomplete_next_calls = assert_startup_fixture_report(
-        &mut events_rx,
-        &mut server,
+        (&mut events_rx, &mut server),
         &probe,
         first_boot_id,
         unresolved_id,
@@ -607,8 +609,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
         second_boot_id,
     )));
     assert_startup_fixture_report(
-        &mut events_rx,
-        &mut server,
+        (&mut events_rx, &mut server),
         &probe,
         second_boot_id,
         unresolved_id,
