@@ -40,9 +40,9 @@ with artifact `antigravity-cli-warm-bridge.4`, then let the Manager select the
 registered descriptor before `agent.open`. The supervisor supplies its exact
 descriptor-derived `ELIOT_SWARM_MODULE_CONTRACT`; bridge.4 forwards it in
 `module.hello` and checks Store's negotiation before reading commands. A
-bootstrap failure after module imports emits only the bounded
-`NODE_BRIDGE_STARTUP_FAILED` worker diagnostic code; it does not write the
-exception text into the worker receipt.
+bootstrap failure after module imports emits only a bounded uppercase worker
+diagnostic code; raw exception text is discarded. The supervisor boot id and
+owner Job token are separate identities and are forwarded separately.
 
 An empty `agent.open` may initialize one native warm stream. It sends no user
 event or Task prompt. The descriptor claim and empty initialization establish

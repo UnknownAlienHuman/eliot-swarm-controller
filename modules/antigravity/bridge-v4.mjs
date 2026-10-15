@@ -130,8 +130,9 @@ if (isBridgeEntrypoint) {
       || typeof managedOwner.token !== 'string' || !managedOwner.token.trim()) {
     throw new Error('INVALID_MODULE_OWNER_RECORD');
   }
+  // The module supervisor's boot id scopes this worker attempt. The owner
+  // token independently names the process Job; module.hello carries both.
   bootId = requiredEnv('ELIOT_SWARM_MODULE_BOOT_ID');
-  if (managedOwner.token !== bootId) throw new Error('MODULE_BOOT_ID_MISMATCH');
   credential = await readJsonFile(credentialFile);
   const clientId = requiredEnv('ELIOT_SWARM_MODULE_CLIENT_ID');
   if (!isRecord(credential) || credential.client_id !== clientId
@@ -179,8 +180,12 @@ if (isBridgeEntrypoint) {
     moduleArtifactId: moduleContract.artifact.artifact_id,
     maxFrameBytes: host.ipc?.max_frame_bytes ?? 1_048_576,
   };
-  } catch {
-    try { writeSync(2, '{"error_code":"NODE_BRIDGE_STARTUP_FAILED"}\n'); } catch {}
+  } catch (error) {
+    const message = typeof error?.message === 'string' ? error.message : '';
+    const diagnosticCode = /^[A-Z][A-Z0-9_]{0,63}$/.test(message)
+      ? message
+      : 'NODE_BRIDGE_STARTUP_FAILED';
+    try { writeSync(2, JSON.stringify({ error_code: diagnosticCode }) + '\n'); } catch {}
     process.exit(1);
   }
 }
