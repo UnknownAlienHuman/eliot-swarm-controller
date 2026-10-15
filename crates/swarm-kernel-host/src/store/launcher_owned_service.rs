@@ -17,7 +17,7 @@ use crate::{
                 OwnedServiceHandle, OwnedServiceIntent, OwnedServiceOrigin, OwnedServiceReadback,
                 OwnedServiceRoute, OwnedServiceSeed, OwnedServiceStartFailure,
                 OwnedServiceStartPermit, OwnedServiceStartStage, prepare_owned_service,
-                prepare_owned_service_with_provider_auth, start_foreground,
+                start_foreground,
             },
         },
     },
@@ -438,19 +438,7 @@ impl Store {
 
         // Preparation is effect-free. It may read pinned source files but does
         // not create files, contact OpenCode, or admit native work.
-        let prepared = match admission.route.credential_ref() {
-            Some(credential_ref) => {
-                let auth_source = self
-                    .config
-                    .opencode_provider_auth_source(credential_ref, admission.route.model_ref())?;
-                prepare_owned_service_with_provider_auth(
-                    &admission.route,
-                    &admission.intent,
-                    auth_source.as_deref(),
-                )?
-            }
-            None => prepare_owned_service(&admission.route, &admission.intent)?,
-        };
+        let prepared = prepare_owned_service(&admission.route, &admission.intent)?;
         if *stopping.borrow() {
             return Err(shutdown_error());
         }
@@ -570,18 +558,9 @@ impl Store {
                 helper_stdin,
             }) => {
                 let error_code = safe_start_error_code(&error.code);
-                let request_diagnostic = safe_native_request_diagnostic(stage, &error);
                 let row = admission.row.clone();
                 let persist = self
-                    .run(move |db| {
-                        persist_start_failure_diagnostic(
-                            db,
-                            &row,
-                            stage,
-                            error_code,
-                            request_diagnostic,
-                        )
-                    })
+                    .run(move |db| persist_start_failure_diagnostic(db, &row, stage, error_code))
                     .await;
                 // This EOF is the existing graceful helper stop. Keep it behind
                 // the durable diagnostic so the next run can identify the
@@ -1367,9 +1346,6 @@ pub(crate) fn retain_module_owned_service_ready(
         "route_digest".to_owned(),
         Value::String(row.route_digest.clone()),
     );
-    if let Some(provider_auth) = outcome.details.get("provider_auth") {
-        proof_fields.insert("provider_auth".to_owned(), provider_auth.clone());
-    }
     let checked = OwnedServiceReadback::from_retained_value(&proof, &route)?;
     let canonical = model::canonical(&proof)?;
     if canonical.len() > MAX_PROOF_BYTES
@@ -1829,57 +1805,11 @@ fn safe_start_error_code(code: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
-enum SafeNativeRequestPhase {
-    ProviderKeyPost,
-}
-
-impl SafeNativeRequestPhase {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ProviderKeyPost => "provider_key_post",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct SafeNativeRequestDiagnostic {
-    phase: SafeNativeRequestPhase,
-    http_status: Option<u16>,
-}
-
-fn safe_native_request_diagnostic(
-    stage: OwnedServiceStartStage,
-    error: &Error,
-) -> Option<SafeNativeRequestDiagnostic> {
-    // During bootstrap, NATIVE_REJECTED can only come from the one key POST:
-    // the surrounding integration reads classify HTTP failures as NATIVE_READ_FAILED.
-    if stage.as_str() != "bootstrap" || error.code != "NATIVE_REJECTED" {
-        return None;
-    }
-
-    // HTTP helpers deliberately retain only this fixed message for rejected
-    // statuses. Parse a narrow allowlist; never persist Error.message itself.
-    let http_status = error.message.strip_prefix("HTTP ").and_then(|value| {
-        if value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        let status = value.parse::<u16>().ok()?;
-        matches!(status, 400 | 401 | 403 | 404 | 405 | 409 | 413 | 422).then_some(status)
-    });
-
-    Some(SafeNativeRequestDiagnostic {
-        phase: SafeNativeRequestPhase::ProviderKeyPost,
-        http_status,
-    })
-}
-
 fn persist_start_failure_diagnostic(
     db: &mut Connection,
     row: &OwnedStartRow,
     stage: OwnedServiceStartStage,
     error_code: String,
-    request_diagnostic: Option<SafeNativeRequestDiagnostic>,
 ) -> Result<()> {
     let stage = stage.as_str();
     if !matches!(
@@ -1892,9 +1822,6 @@ fn persist_start_failure_diagnostic(
             | "from_route"
             | "connect_owned"
             | "route_verify"
-            | "provider_scope"
-            | "bootstrap"
-            | "provider_proof"
     ) || safe_start_error_code(&error_code) != error_code
     {
         return Err(corrupt("owned service startup diagnostic is malformed"));
@@ -1905,8 +1832,6 @@ fn persist_start_failure_diagnostic(
         "stage": stage,
         "error_code": error_code,
         "native_effect": "unknown",
-        "request_phase": request_diagnostic.map(|detail| detail.phase.as_str()),
-        "http_status": request_diagnostic.and_then(|detail| detail.http_status),
     });
     let canonical = model::canonical(&diagnostic)?;
     if canonical.len() > MAX_START_FAILURE_DIAGNOSTIC_BYTES {
@@ -2339,8 +2264,6 @@ fn validate_readback_proof_fields(
     row: &OwnedStartRow,
     route: &OwnedServiceRoute,
 ) -> Result<()> {
-    // Runtime validation also binds an optional provider proof to this exact
-    // route, model and process. Its presence is mandatory only for auth routes.
     OwnedServiceReadback::from_retained_value(proof, route)?;
     let canonical = model::canonical(proof)?;
     let fields = proof
@@ -2366,10 +2289,10 @@ fn validate_readback_proof_fields(
         "dispatch_permitted",
     ];
     if canonical.len() > MAX_PROOF_BYTES
-        || fields.len() != expected_fields.len() + usize::from(fields.contains_key("provider_auth"))
+        || fields.len() != expected_fields.len()
         || fields
             .keys()
-            .any(|key| !expected_fields.contains(&key.as_str()) && key != "provider_auth")
+            .any(|key| !expected_fields.contains(&key.as_str()))
         || expected_fields.iter().any(|key| !fields.contains_key(*key))
         || proof["schema_version"] != 1
         || proof["status"] != "ready"
@@ -3502,7 +3425,6 @@ mod owned_service_cleanup_tests {
             &row,
             OwnedServiceStartStage::ReadyReceipt,
             primary.code.clone(),
-            None,
         );
         assert_eq!(persistence.as_ref().unwrap_err().code, "STORE_ERROR");
         let error = preserve_start_failure_diagnostic_error(primary.clone(), persistence);
@@ -3527,7 +3449,6 @@ mod owned_service_cleanup_tests {
             &row,
             OwnedServiceStartStage::ReadyReceipt,
             primary.code.clone(),
-            None,
         );
         assert!(persistence.is_ok());
         let persisted = preserve_start_failure_diagnostic_error(primary.clone(), persistence);

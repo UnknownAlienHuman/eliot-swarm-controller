@@ -1069,7 +1069,6 @@ fn validate_capability_proof(
             "provider_request_digest",
             "dispatch_permitted",
             "model_consumed",
-            "provider_auth",
         ],
     )?;
     model::fields(
@@ -1288,7 +1287,7 @@ fn validate_capability_proof(
         }
     }
     model::text(&proof["model"], "id").map_err(|_| stale_capability("C8 model is missing"))?;
-    let model_provider = model::text(&proof["model"], "provider_id")
+    model::text(&proof["model"], "provider_id")
         .map_err(|_| stale_capability("C8 provider is missing"))?;
     model::text(&proof["model"], "variant")
         .map_err(|_| stale_capability("C8 variant is missing"))?;
@@ -1307,32 +1306,6 @@ fn validate_capability_proof(
     let owned = binding["route"]["owned_service"]
         .as_object()
         .ok_or_else(|| stale_capability("launch binding has no explicit owned-service route"))?;
-    let provider_auth = match owned.get("credential_ref").and_then(Value::as_str) {
-        Some(credential_ref) if !credential_ref.is_empty() => {
-            let auth = proof
-                .get("provider_auth")
-                .ok_or_else(|| stale_capability("owned provider credential proof is missing"))?;
-            model::fields(auth, &["status", "proof_digest"])?;
-            if auth["status"] != "stored_unverified"
-                || !valid_digest(auth["proof_digest"].as_str().unwrap_or_default())
-                || model_provider != "opencode-go"
-            {
-                return Err(stale_capability(
-                    "owned provider credential proof is not the exact retained unverified scope",
-                ));
-            }
-            Some(auth["proof_digest"].as_str().unwrap_or_default())
-        }
-        Some(_) => return Err(stale_capability("owned credential reference is malformed")),
-        None => {
-            if proof.get("provider_auth").is_some() {
-                return Err(stale_capability(
-                    "provider credential proof is present for an uncredentialed route",
-                ));
-            }
-            None
-        }
-    };
     let model_ref = &owned["model"];
     if !model_ref.is_object()
         || model_ref["providerID"] != proof["model"]["provider_id"]
@@ -1350,14 +1323,6 @@ fn validate_capability_proof(
         ));
     }
     let c8_identity = model::text(capability, "identity_digest")?;
-    if let Some(provider_auth_digest) = provider_auth {
-        // Keep provider-auth evidence private while binding it into the
-        // existing prompt identity digest; the packet has no credential field.
-        return digest_value(&json!({
-            "c8_identity_digest":c8_identity,
-            "provider_auth_proof_digest":provider_auth_digest,
-        }));
-    }
     Ok(c8_identity.to_owned())
 }
 

@@ -66,7 +66,6 @@ pub(crate) struct OwnedServiceExpectation {
     executable_sha256: String,
     identity_digest: String,
     proof_digest: String,
-    provider_auth_required: bool,
 }
 
 impl OwnedServiceExpectation {
@@ -78,7 +77,6 @@ impl OwnedServiceExpectation {
             executable_sha256: model::digest(b"offline-fixture-image"),
             identity_digest: format!("sha256:{}", model::digest(b"offline-fixture-owner")),
             proof_digest: model::digest(b"offline-fixture-proof"),
-            provider_auth_required: false,
         }
     }
 
@@ -96,10 +94,6 @@ impl OwnedServiceExpectation {
 
     pub(crate) fn proof_digest(&self) -> &str {
         &self.proof_digest
-    }
-
-    pub(crate) fn provider_auth_required(&self) -> bool {
-        self.provider_auth_required
     }
 
     fn identity_digest(&self) -> &str {
@@ -1406,7 +1400,6 @@ fn validate_launch_snapshot_with_damage_context(
                 executable_sha256,
                 identity_digest,
                 proof_digest: binding.proof_digest().to_owned(),
-                provider_auth_required: binding.route().credential_ref().is_some(),
             };
             (options, Some(expected))
         }

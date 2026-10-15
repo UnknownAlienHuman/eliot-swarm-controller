@@ -2259,19 +2259,16 @@ pub(crate) fn require_current_connection(
             "exact acknowledged native MCP proof is not retained",
         )
     })?;
-    validate_connection_record(&record, &facts, dispatch_operation_id, || {
-        validated_provider_auth_projection(db, &snapshot, owned_service)
-    })
+    validate_current_owned_service_receipt(db, &snapshot, owned_service)?;
+    validate_connection_record(&record, &facts, dispatch_operation_id)
 }
 
-// Keep the current Store snapshot and provider-auth reads in the caller.
 // This is the same complete payload consumer for live admission and the
 // offline producer/consumer/admission fixture; it has no public entrypoint.
 fn validate_connection_record(
     record: &Value,
     facts: &LaunchFacts,
     dispatch_operation_id: Option<&str>,
-    provider_auth: impl FnOnce() -> Result<Option<Value>>,
 ) -> Result<Value> {
     let identity_digest = &facts.identity_digest;
     let assignment = &facts.assignment;
@@ -2506,7 +2503,6 @@ fn validate_connection_record(
             "native MCP proof does not match the current owned-service process",
         ));
     }
-    let provider_auth = provider_auth()?;
     let service_process_identity_digest = digest_json(&json!({
         "process_id":owned_service.process_id(),
         "process_birth_token":owned_service.process_birth_token(),
@@ -2517,7 +2513,7 @@ fn validate_connection_record(
         "provider_id":facts.options.model.provider_id,
         "variant":facts.options.model.variant,
     });
-    let mut projection = json!({
+    let projection = json!({
         "schema_version":1,
         "kind":"launcher_native_mcp_dispatch_capability",
         "launch_operation_id":facts.operation_id,
@@ -2574,64 +2570,7 @@ fn validate_connection_record(
         "dispatch_permitted":false,
         "model_consumed":"unknown",
     });
-    if let Some(provider_auth) = provider_auth {
-        projection["provider_auth"] = provider_auth;
-    }
     Ok(projection)
-}
-
-fn validated_provider_auth_projection(
-    db: &Connection,
-    snapshot: &launcher_native_mcp::NativeMcpLaunchSnapshot,
-    owned_service: &launcher_native_mcp::OwnedServiceExpectation,
-) -> Result<Option<Value>> {
-    let (launch_operation_id, state, proof_json): (String, String, String) = db.query_row(
-        "SELECT launch_operation_id,state,proof_json FROM owned_service_starts \
-         WHERE binding_id=?1 AND binding_generation=?2",
-        params![snapshot.binding_id(), snapshot.binding_generation()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    if launch_operation_id != snapshot.launch_operation_id() || state != "service_observed" {
-        return Err(Error::new(
-            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
-            "current owned-service receipt changed during capability validation",
-        ));
-    }
-    let proof: Value = serde_json::from_str(&proof_json)
-        .map_err(|_| record_error("retained owned-service proof is invalid JSON"))?;
-    let proof_digest = model::digest(model::canonical(&proof)?.as_bytes());
-    if proof_digest != owned_service.proof_digest() {
-        return Err(Error::new(
-            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
-            "current owned-service receipt differs from its validated binding proof",
-        ));
-    }
-    match (
-        owned_service.provider_auth_required(),
-        proof.get("provider_auth"),
-    ) {
-        (true, Some(provider_auth)) if provider_auth.is_object() => {
-            if provider_auth["status"] != "stored_unverified" {
-                return Err(Error::new(
-                    "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
-                    "owned-service provider-auth proof is not in its validated state",
-                ));
-            }
-            Ok(Some(json!({
-                "status":"stored_unverified",
-                "proof_digest":digest_json(provider_auth)?,
-            })))
-        }
-        (true, _) => Err(Error::new(
-            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
-            "current owned route requires retained provider-auth proof",
-        )),
-        (false, None) => Ok(None),
-        (false, Some(_)) => Err(Error::new(
-            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
-            "retained provider-auth proof is not permitted by the current owned route",
-        )),
-    }
 }
 
 fn digest_json(value: &Value) -> Result<String> {
@@ -5414,4 +5353,33 @@ mod muse_grant_contract_tests {
         let absent = super::muse_connection_readback(&db, "op-muse-missing-1");
         assert_eq!(absent["state"], "unavailable");
     }
+}
+
+fn validate_current_owned_service_receipt(
+    db: &Connection,
+    snapshot: &launcher_native_mcp::NativeMcpLaunchSnapshot,
+    owned_service: &launcher_native_mcp::OwnedServiceExpectation,
+) -> Result<()> {
+    let (launch_operation_id, state, proof_json): (String, String, String) = db.query_row(
+        "SELECT launch_operation_id,state,proof_json FROM owned_service_starts \
+         WHERE binding_id=?1 AND binding_generation=?2",
+        params![snapshot.binding_id(), snapshot.binding_generation()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if launch_operation_id != snapshot.launch_operation_id() || state != "service_observed" {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "current owned-service receipt changed during capability validation",
+        ));
+    }
+    let proof: Value = serde_json::from_str(&proof_json)
+        .map_err(|_| record_error("retained owned-service proof is invalid JSON"))?;
+    let proof_digest = model::digest(model::canonical(&proof)?.as_bytes());
+    if proof_digest != owned_service.proof_digest() {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "current owned-service receipt differs from its validated binding proof",
+        ));
+    }
+    Ok(())
 }
