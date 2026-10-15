@@ -1,4 +1,5 @@
 use super::*;
+use base64::Engine as _;
 use std::{
     fs,
     path::PathBuf,
@@ -138,7 +139,15 @@ impl Drop for OwnedFixture {
 
 fn fixture_work(root: &std::path::Path) -> Work {
     let mut work = durable_authority_tests::fixture_work(root, None);
+    let script_source = b"Write-Output 'terminal receipt fixture'\n";
+    work.bundle.files = vec![manifest::BundleFile {
+        path: work.bundle.entrypoint.clone(),
+        sha256: model::digest(script_source),
+        byte_length: script_source.len() as u64,
+        content_base64: base64::engine::general_purpose::STANDARD.encode(script_source),
+    }];
     let bundle_bytes = model::canonical(&json!(work.bundle)).expect("canonical fixture bundle");
+    work.bundle_record.relative_path = format!("artifacts/{}.bin", work.bundle_record.artifact_id);
     work.bundle_record.byte_length = bundle_bytes.len() as u64;
     work.bundle_record.content_digest = model::digest(bundle_bytes.as_bytes());
     work.bundle_record.metadata = json!({
@@ -147,6 +156,8 @@ fn fixture_work(root: &std::path::Path) -> Work {
         "bundle_sha256":work.bundle_record.content_digest,
         "interpreter_sha256":work.interpreter.sha256,
     });
+    work.environment_sha256 = environment_sha256(&work.environment)
+        .expect("hash terminal receipt fixture environment");
     validate_work(&work).expect("fixture Work matches the retained completion contract");
     work
 }
