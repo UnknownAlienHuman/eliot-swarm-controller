@@ -6486,6 +6486,30 @@ mod tests {
         Ok(output.stdout)
     }
 
+    static PR61_STORE_RESOLVER_TEST_PROBE_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+
+    fn pr61_store_resolver_test_version_probe(
+        program: &Path,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<Vec<u8>> {
+        let call = PR61_STORE_RESOLVER_TEST_PROBE_STARTED.fetch_add(1, Ordering::SeqCst) + 1;
+        let started = std::time::Instant::now();
+        eprintln!(
+            "pr61_store_resolver_test_probe_started={{\"call\":{call},\"program\":{:?},\"args\":{:?}}}",
+            program, args
+        );
+        let result = test_version_probe(program, args, env, cwd);
+        let completed = PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.fetch_add(1, Ordering::SeqCst) + 1;
+        eprintln!(
+            "pr61_store_resolver_test_probe_completed={{\"call\":{call},\"completed\":{completed},\"elapsed_ms\":{}}}",
+            started.elapsed().as_millis()
+        );
+        result
+    }
+
     async fn resolve_for_test(
         store: &Store,
         principal: Principal,
@@ -6872,6 +6896,17 @@ mod tests {
                 .profile("strict", "v1")
                 .expect("configured cache profile")
                 .clone();
+            let original_input_fingerprint = fixture
+                .owner
+                .store
+                .run({
+                    let root = fixture.directory.clone();
+                    let check_id = original_check.clone();
+                    move |db| Ok(work(db, &check_id, root)?.input_fingerprint)
+                })
+                .await
+                .unwrap()
+                .expect("completed original CheckRun retains its exact cache fingerprint");
             let files = ArtifactFiles::new(&fixture.directory).unwrap();
             let verified =
                 source::verified_content(&files, &fixture.directory, &cached_source).unwrap();
@@ -6896,41 +6931,44 @@ mod tests {
                 "the unrelated nested helper family is live before cache verification"
             );
 
-            let control_snapshot =
-                probe_plan_snapshot(&fixture, &cached_attempt, &cached_source.artifact_id, "v1")
-                    .await;
-            let _control_probe =
-                inputs::override_probe_for_test(&cache_profile, test_version_probe);
-            let control = timeout(
-                Duration::from_secs(5),
-                store.resolve_check_plan_snapshot(Ok(control_snapshot)),
-            )
-            .await
-            .expect("the seeded cache candidate must verify within the fixture bound")
-            .unwrap();
-            assert!(control.result.is_ok());
-            assert!(
-                control.cache_hit.is_some(),
-                "the exact seeded cache origin is found"
-            );
-            assert_eq!(
-                control.cache_hit.as_ref().map(|hit| hit.check_id.as_str()),
-                Some(original_check.as_str())
-            );
-            let input_fingerprint = control.result.as_ref().unwrap().input_fingerprint.clone();
             assert_eq!(store.check_child_custody_count().await, 1);
             assert!(
                 !process_fixture.process_departed(&helper_identity)
                     && !process_fixture.process_departed(&target_identity)
                     && !process_fixture.process_departed(&descendant_identity),
-                "the live unrelated owner survives a successful cache verification"
+                "the live unrelated owner survives before injected cache verification"
             );
 
             let failure_snapshot =
                 probe_plan_snapshot(&fixture, &cached_attempt, &cached_source.artifact_id, "v1")
                     .await;
-            let _failure_probe =
-                inputs::override_probe_for_test(&cache_profile, test_version_probe);
+            assert_eq!(
+                (
+                    failure_snapshot.profile.profile_id.as_str(),
+                    failure_snapshot.profile.profile_revision.as_str()
+                ),
+                (
+                    cache_profile.profile_id.as_str(),
+                    cache_profile.profile_revision.as_str()
+                ),
+                "the cache failure snapshot uses the same exact test probe override key"
+            );
+            let failure_probe_started_before =
+                PR61_STORE_RESOLVER_TEST_PROBE_STARTED.load(Ordering::SeqCst);
+            let failure_probe_completed_before =
+                PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.load(Ordering::SeqCst);
+            let failure_resolver_started = std::time::Instant::now();
+            eprintln!(
+                "pr61_cache_failure_override={{\"profile_id\":{:?},\"profile_revision\":{:?},\"resource\":{:?},\"seed_check_id\":{:?}}}",
+                failure_snapshot.profile.profile_id,
+                failure_snapshot.profile.profile_revision,
+                failure_snapshot.profile.resource,
+                original_check
+            );
+            let _failure_probe = inputs::override_probe_for_test(
+                &failure_snapshot.profile,
+                pr61_store_resolver_test_version_probe,
+            );
             {
                 let mut target = PR61_CACHE_VERIFY_WORKER_PANIC_INPUT_FINGERPRINT
                     .lock()
@@ -6939,15 +6977,41 @@ mod tests {
                     target.is_none(),
                     "no cache-worker failure injection is active"
                 );
-                *target = Some(input_fingerprint);
+                *target = Some(original_input_fingerprint.clone());
             }
-            let resolution = timeout(
+            let resolution = match timeout(
                 Duration::from_secs(5),
                 store.resolve_check_plan_snapshot(Ok(failure_snapshot)),
             )
             .await
-            .expect("cache artifact-worker panic must remain a bounded preflight failure")
-            .unwrap();
+            {
+                Ok(result) => result.unwrap(),
+                Err(error) => panic!(
+                    "cache artifact-worker panic must remain a bounded preflight failure: {error:?}; resolver_elapsed_ms={}; exact_test_override_probe_calls={{started:{},completed:{}}}",
+                    failure_resolver_started.elapsed().as_millis(),
+                    PR61_STORE_RESOLVER_TEST_PROBE_STARTED.load(Ordering::SeqCst)
+                        - failure_probe_started_before,
+                    PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.load(Ordering::SeqCst)
+                        - failure_probe_completed_before
+                ),
+            };
+            assert_eq!(
+                PR61_STORE_RESOLVER_TEST_PROBE_STARTED.load(Ordering::SeqCst)
+                    - failure_probe_started_before,
+                1,
+                "the cache failure resolver consumed its exact test probe override"
+            );
+            assert_eq!(
+                PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.load(Ordering::SeqCst)
+                    - failure_probe_completed_before,
+                1,
+                "the cache failure resolver test probe completed before artifact verification"
+            );
+            eprintln!(
+                "pr61_cache_failure_resolver_completed={{\"elapsed_ms\":{},\"cache_hit\":{}}}",
+                failure_resolver_started.elapsed().as_millis(),
+                resolution.cache_hit.is_some()
+            );
             assert!(resolution.result.is_ok());
             assert!(
                 resolution.cache_hit.is_none(),
