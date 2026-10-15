@@ -10,7 +10,7 @@
     "executable": "<INSTALLER_ABSOLUTE_ADAPTER_PATH>",
     "argv": [
       {"kind": "literal", "value": "--config"},
-      {"kind": "module_host_config_path", "schema_version": 1}
+      {"kind": "module_host_config_path", "value": {"schema_version": 1}}
     ],
     "environment": [],
     "credential_ref": "host.module-binding-credential",

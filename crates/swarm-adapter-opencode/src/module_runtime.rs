@@ -50,6 +50,27 @@ const EVENT_SCHEMAS: [(&str, &str); 4] = [
     ("swarm.task_dispatch_admission", "1"),
 ];
 
+#[cfg(test)]
+mod descriptor_bootstrap_tests {
+    use swarm_contracts::module_catalog::ModuleDescriptor;
+
+    #[test]
+    fn shipped_descriptor_uses_the_typed_host_config_argument() {
+        let descriptor: ModuleDescriptor =
+            serde_json::from_str(include_str!("../registration/descriptor.template.json"))
+                .expect("the shipped descriptor decodes through the production launch DTO");
+        assert!(!descriptor.enabled);
+        assert_eq!(descriptor.launch.argv.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&descriptor.launch.argv[1]).unwrap(),
+            serde_json::json!({
+                "kind":"module_host_config_path",
+                "value":{"schema_version":1}
+            })
+        );
+    }
+}
+
 pub struct OwnedBootstrap {
     pub config: AdapterConfig,
     pub credential: Credential,
