@@ -348,20 +348,40 @@ fn observe_native(
     stderr_sync: File,
     evidence: &mut WorkerEvidence,
 ) -> Result<()> {
+    observe_native_with_wait_observer(
+        plan,
+        group,
+        child,
+        stdout_sync,
+        stderr_sync,
+        evidence,
+        |child| child.try_wait(),
+    )
+}
+
+fn observe_native_with_wait_observer(
+    plan: &BatchWorkerPlan,
+    group: &swarm_process::Group,
+    child: &mut std::process::Child,
+    stdout_sync: File,
+    stderr_sync: File,
+    evidence: &mut WorkerEvidence,
+    mut observe_child: impl FnMut(&mut std::process::Child) -> std::io::Result<Option<ExitStatus>>,
+) -> Result<()> {
     let execution_deadline = Instant::now()
         + Duration::from_secs(plan.timeout_seconds.saturating_add(HOST_GRACE_SECONDS));
     let mut family_drain_started = None;
     let mut termination_started = None;
     let mut last_termination_request = None;
+    let mut last_direct_termination_request = None;
     let mut termination_attempts = 0u8;
     let mut direct_status: Option<ExitStatus> = None;
-    let mut direct_observation_failed = false;
     let mut cancel_observed = false;
     let mut containment_lost = false;
     let mut containment_loss_started = None;
 
     loop {
-        match child.try_wait() {
+        match observe_child(child) {
             Ok(Some(status)) => {
                 if direct_status.is_none() {
                     direct_status = Some(status);
@@ -370,7 +390,6 @@ fn observe_native(
             }
             Ok(None) => {}
             Err(error) => {
-                direct_observation_failed = true;
                 evidence.direct_exit = "observation_unknown".to_owned();
                 evidence.direct_exit_error = Some(error.to_string());
             }
@@ -385,7 +404,9 @@ fn observe_native(
                 true
             }
             Ok(false) => {
-                evidence.family_departure = "observed_active".to_owned();
+                if !containment_lost {
+                    evidence.family_departure = "observed_active".to_owned();
+                }
                 false
             }
             Err(error) => {
@@ -398,8 +419,9 @@ fn observe_native(
         // The child can exit between the first wait observation and the
         // Group scan. Re-read this exact Child before treating an empty Group
         // as containment loss; absence of a process is not an exit receipt.
-        if family_empty && direct_status.is_none() && !direct_observation_failed {
-            match child.try_wait() {
+        // An earlier wait error still needs a fresh exact-child observation.
+        if family_empty && direct_status.is_none() && !containment_lost {
+            match observe_child(child) {
                 Ok(Some(status)) => {
                     direct_status = Some(status);
                     record_exit(status, evidence);
@@ -426,40 +448,26 @@ fn observe_native(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    direct_observation_failed = true;
                     evidence.direct_exit = "observation_unknown".to_owned();
                     evidence.direct_exit_error = Some(error.to_string());
                 }
             }
         }
 
-        if family_empty
-            && direct_status.is_none()
-            && !direct_observation_failed
-            && !containment_lost
-        {
+        if family_empty && direct_status.is_none() && !containment_lost {
             containment_lost = true;
             containment_loss_started = Some(Instant::now());
             evidence.family_departure = "observation_unknown".to_owned();
             evidence.family_error = Some(
-                "owned Group reported empty while the exact native child remained active"
+                "owned Group reported empty while exact native-child exit remained unobserved"
                     .to_owned(),
             );
             evidence.cleanup = "cleanup_pending".to_owned();
             evidence.failure = Some(json!({
                 "code": "BATCH_NATIVE_CONTAINMENT_LOST",
-                "message": "the exact native child was outside its worker Group; family departure cannot be claimed"
+                "message": "the owned Group was empty without an exact native-child exit receipt; family departure cannot be claimed"
             }));
-            match child.kill() {
-                Ok(()) => {
-                    evidence.termination_requests = evidence.termination_requests.saturating_add(1);
-                }
-                Err(error) => {
-                    evidence.family_error = Some(format!(
-                        "owned Group was empty with native child active; exact-child termination failed: {error}"
-                    ));
-                }
-            }
+            request_direct_child_termination(child, evidence, &mut last_direct_termination_request);
         }
 
         if family_empty && direct_status.is_some() && !containment_lost {
@@ -472,13 +480,16 @@ fn observe_native(
             };
             break;
         }
-        if family_empty && direct_observation_failed && !containment_lost {
-            evidence.cleanup = if group.disarm().is_ok() {
-                "family_empty_direct_exit_unknown".to_owned()
-            } else {
-                "cleanup_pending".to_owned()
-            };
+        if family_empty && direct_status.is_some() && containment_lost {
+            evidence.cleanup = "cleanup_pending".to_owned();
             break;
+        }
+        if containment_lost
+            && direct_status.is_none()
+            && last_direct_termination_request
+                .is_some_and(|last| last.elapsed() >= WORKER_TERMINATION_RETRY)
+        {
+            request_direct_child_termination(child, evidence, &mut last_direct_termination_request);
         }
 
         let cancel_path = plan.output_dir.join(CANCEL_FILE);
@@ -559,12 +570,16 @@ fn observe_native(
             && termination_started.is_some_and(|started| {
                 started.elapsed() >= Duration::from_secs(CLEANUP_GRACE_SECONDS)
             })
+            && direct_status.is_some()
         {
             evidence.cleanup = "cleanup_pending".to_owned();
             break;
         }
+        // The cleanup grace bounds descendant draining after the exact Child
+        // has an exit receipt. It cannot release an unobserved Child handle.
         if containment_loss_started
             .is_some_and(|started| started.elapsed() >= Duration::from_secs(CLEANUP_GRACE_SECONDS))
+            && direct_status.is_some()
         {
             break;
         }
@@ -579,7 +594,15 @@ fn observe_native(
                 &mut termination_attempts,
             );
         }
-        persist_state(&plan.output_dir, evidence)?;
+        if let Err(error) = persist_state(&plan.output_dir, evidence) {
+            if containment_lost && direct_status.is_none() {
+                evidence.family_error = Some(format!(
+                    "exact native child remains unobserved while worker state persistence failed: {error}"
+                ));
+            } else {
+                return Err(error);
+            }
+        }
         std::thread::sleep(POLL_INTERVAL);
     }
 
@@ -593,7 +616,9 @@ fn observe_native(
         });
     }
     if !family_empty {
-        evidence.family_departure = "observed_active".to_owned();
+        if !containment_lost {
+            evidence.family_departure = "observed_active".to_owned();
+        }
         evidence.cleanup = "cleanup_pending".to_owned();
     }
     evidence.capture = "draining".to_owned();
@@ -613,6 +638,24 @@ fn observe_native(
         .to_owned();
     }
     Ok(())
+}
+
+fn request_direct_child_termination(
+    child: &mut std::process::Child,
+    evidence: &mut WorkerEvidence,
+    last_request: &mut Option<Instant>,
+) {
+    *last_request = Some(Instant::now());
+    match child.kill() {
+        Ok(()) => {
+            evidence.termination_requests = evidence.termination_requests.saturating_add(1);
+        }
+        Err(error) => {
+            evidence.family_error = Some(format!(
+                "owned Group was empty while exact native-child exit was unobserved; exact-child termination failed: {error}"
+            ));
+        }
+    }
 }
 
 fn record_exit(status: ExitStatus, evidence: &mut WorkerEvidence) {
@@ -810,4 +853,334 @@ fn persist_result(output_dir: &Path, evidence: &WorkerEvidence) -> Result<()> {
     let value = serde_json::to_value(evidence)
         .map_err(|error| Error::new("BATCH_WORKER_RESULT_INVALID", error.to_string()))?;
     write_json_new(&output_dir.join(RESULT_FILE), &value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::zed::BatchIntent;
+    use serde_json::json;
+
+    const FIXTURE_ROOT_ENV: &str = "ELIOT_ZED_WAIT_UNCERTAINTY_ROOT";
+    const NATIVE_READY_ENV: &str = "ELIOT_ZED_WAIT_UNCERTAINTY_NATIVE_READY";
+    const COMPLETE_FILE: &str = "fixture-complete.json";
+    const READBACK_FILE: &str = "direct-child-readback.json";
+
+    struct FixtureDirectory(PathBuf);
+
+    impl FixtureDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("eliot-zed-wait-uncertainty-{}", model::new_id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct TestProcess(std::process::Child);
+
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn ignored_test_name(suffix: &str) -> String {
+        let executable = std::env::current_exe().unwrap();
+        let listing = Command::new(executable).arg("--list").output().unwrap();
+        assert!(listing.status.success());
+        let suffix = format!("::{suffix}");
+        String::from_utf8(listing.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                let (name, _) = line.split_once(": ")?;
+                name.ends_with(suffix.as_str()).then(|| name.to_owned())
+            })
+            .expect("fixture test is listed by the current test binary")
+    }
+
+    fn spawn_ignored_test(
+        suffix: &str,
+        environment: Option<(&str, &std::ffi::OsStr)>,
+    ) -> TestProcess {
+        let executable = std::env::current_exe().unwrap();
+        let name = ignored_test_name(suffix);
+        let mut command = Command::new(executable);
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(name)
+            .arg("--nocapture")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some((key, value)) = environment {
+            command.env(key, value);
+        }
+        TestProcess(command.spawn().unwrap())
+    }
+
+    fn read_fixture_json(path: &Path) -> Value {
+        read_json_bounded(path, MAX_CONTROL_BYTES).unwrap()
+    }
+
+    #[test]
+    fn empty_group_wait_error_holds_child_until_exit_readback() {
+        let root = FixtureDirectory::new();
+        let mut worker = spawn_ignored_test(
+            "wait_uncertainty_worker_fixture",
+            Some((FIXTURE_ROOT_ENV, root.0.as_os_str())),
+        );
+        let complete_path = root.0.join(COMPLETE_FILE);
+        let deadline = Instant::now() + Duration::from_secs(CLEANUP_GRACE_SECONDS + 12);
+        while !complete_path.is_file() {
+            if let Some(status) = worker.0.try_wait().unwrap() {
+                panic!("isolated fixture exited before its completion receipt: {status}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "isolated fixture exceeded its deadline"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let _ = worker.0.wait().unwrap();
+
+        assert_eq!(
+            read_fixture_json(&complete_path)["result_written_after_child_readback"],
+            true
+        );
+        let readback = read_fixture_json(&root.0.join(READBACK_FILE));
+        assert_eq!(readback["observed"], true);
+        assert!(
+            readback["elapsed_ms"].as_u64().unwrap()
+                >= Duration::from_secs(CLEANUP_GRACE_SECONDS).as_millis() as u64
+        );
+        let result = read_fixture_json(&root.0.join("worker-output").join(RESULT_FILE));
+        assert_eq!(result["direct_exit"], "observed");
+        assert_eq!(result["family_departure"], "observation_unknown");
+        assert_eq!(result["cleanup"], "cleanup_pending");
+        assert_eq!(result["failure"]["code"], "BATCH_NATIVE_CONTAINMENT_LOST");
+        assert_eq!(result["capture"], "incomplete");
+        assert_eq!(result["stdout"]["complete"], false);
+    }
+
+    #[test]
+    #[ignore = "spawned as an isolated process-group fixture"]
+    fn wait_uncertainty_worker_fixture() {
+        let root = PathBuf::from(
+            std::env::var_os(FIXTURE_ROOT_ENV).expect("fixture root is supplied by parent test"),
+        );
+        let output_dir = root.join("worker-output");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let native_ready = root.join("native-child-ready");
+        let native_name = ignored_test_name("wait_uncertainty_native_child_fixture");
+        let mut native_child = TestProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--ignored")
+                .arg("--exact")
+                .arg(native_name)
+                .arg("--nocapture")
+                .env(NATIVE_READY_ENV, &native_ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        while !native_ready.is_file() {
+            assert!(
+                native_child.0.try_wait().unwrap().is_none(),
+                "real native child exited before its ready receipt"
+            );
+            assert!(
+                Instant::now() < ready_deadline,
+                "native fixture did not start"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let native_pid = native_child.0.id();
+        assert!(native_child.0.try_wait().unwrap().is_none());
+
+        // Creating the real child before entering the owned Group makes its
+        // inventory empty while this exact Child still has no exit receipt.
+        let group = swarm_process::Group::enter(&model::new_id()).unwrap();
+        assert!(group.children_empty().unwrap());
+
+        let stdout_path = output_dir.join("stdout.log");
+        let stderr_path = output_dir.join("stderr.log");
+        File::create(&stdout_path).unwrap();
+        File::create(&stderr_path).unwrap();
+        let (_, stdout_sync) = open_capture(&stdout_path).unwrap();
+        let (_, stderr_sync) = open_capture(&stderr_path).unwrap();
+
+        let operation_id = model::new_id();
+        let run_id = model::new_id();
+        let plan = BatchWorkerPlan {
+            version: 1,
+            operation_id: operation_id.clone(),
+            run_id: run_id.clone(),
+            intent: BatchIntent {
+                version: 1,
+                operation_id: operation_id.clone(),
+                run_id: run_id.clone(),
+                binding_id: "wait-uncertainty-fixture".to_owned(),
+                generation: 1,
+                route_sha256: model::digest(b"fixture-route"),
+                prompt_sha256: model::digest(b"fixture-prompt"),
+                prompt_bytes: 14,
+                task_snapshot_sha256: model::digest(b"fixture-task"),
+                task_prompt_proof: None,
+            },
+            executable: std::env::current_exe().unwrap(),
+            workdir: std::env::current_dir().unwrap(),
+            model: "fixture/real-child".to_owned(),
+            timeout_seconds: 3_600,
+            env_keys: Vec::new(),
+            instruction: "controlled direct-child wait observation fixture".to_owned(),
+            output_dir: output_dir.clone(),
+        };
+        let mut evidence = WorkerEvidence {
+            version: 1,
+            operation_id,
+            run_id,
+            plan_sha256: model::digest(b"fixture-plan"),
+            worker_pid: std::process::id(),
+            worker_identity: group.identity.clone(),
+            launch_state: "spawned".to_owned(),
+            launch_error: None,
+            native_pid: Some(native_pid),
+            native_identity: None,
+            native_identity_error: None,
+            direct_exit: "pending".to_owned(),
+            exit_code: None,
+            signal: None,
+            direct_exit_error: None,
+            family_departure: "observed_active".to_owned(),
+            family_error: None,
+            capture: "in_progress".to_owned(),
+            capture_error: None,
+            stdout: None,
+            stderr: None,
+            cleanup: "not_started".to_owned(),
+            termination_requests: 0,
+            host_termination_requested: false,
+            family_termination_requested: false,
+            parent_termination_requested: false,
+            failure: None,
+        };
+        persist_state(&output_dir, &evidence).unwrap();
+
+        let result_path = output_dir.join(RESULT_FILE);
+        let state_path = output_dir.join(STATE_FILE);
+        let readback_path = root.join(READBACK_FILE);
+        let mut wait_calls = 0u32;
+        let mut fault_at = None;
+        observe_native_with_wait_observer(
+            &plan,
+            &group,
+            &mut native_child.0,
+            stdout_sync,
+            stderr_sync,
+            &mut evidence,
+            |child| {
+                wait_calls += 1;
+                assert_eq!(child.id(), native_pid);
+                if wait_calls == 1 {
+                    assert!(group.children_empty().unwrap());
+                    let status = child.try_wait()?;
+                    assert!(status.is_none(), "fixture child must still be live");
+                    return Ok(status);
+                }
+                if wait_calls == 2 {
+                    assert!(!result_path.exists());
+                    fault_at = Some(Instant::now());
+                    return Err(std::io::Error::other(
+                        "controlled exact-child wait observation failure",
+                    ));
+                }
+
+                let loss_elapsed = fault_at
+                    .as_ref()
+                    .expect("wait error preceded containment loss")
+                    .elapsed();
+                assert!(group.children_empty().unwrap());
+                if loss_elapsed < Duration::from_secs(CLEANUP_GRACE_SECONDS + 1) {
+                    let state = read_fixture_json(&state_path);
+                    assert_eq!(state["direct_exit"], "observation_unknown");
+                    assert_eq!(state["family_departure"], "observation_unknown");
+                    assert_eq!(state["cleanup"], "cleanup_pending");
+                    assert_eq!(state["capture"], "in_progress");
+                    assert_eq!(state["failure"]["code"], "BATCH_NATIVE_CONTAINMENT_LOST");
+                    assert!(state["termination_requests"].as_u64().unwrap() >= 1);
+                    assert!(state["stdout"].is_null());
+                    assert!(!result_path.exists());
+                    return Err(std::io::Error::other(
+                        "holding exact-child readback until after cleanup grace",
+                    ));
+                }
+
+                let status = child.try_wait()?;
+                if let Some(status) = status {
+                    assert!(loss_elapsed >= Duration::from_secs(CLEANUP_GRACE_SECONDS));
+                    assert!(
+                        !result_path.exists(),
+                        "worker result must wait for the exact Child exit receipt"
+                    );
+                    write_json_new(
+                        &readback_path,
+                        &json!({
+                            "native_pid": native_pid,
+                            "observed": true,
+                            "exit_code": status.code(),
+                            "elapsed_ms": loss_elapsed.as_millis() as u64
+                        }),
+                    )
+                    .unwrap();
+                }
+                Ok(status)
+            },
+        )
+        .unwrap();
+
+        assert!(
+            readback_path.is_file(),
+            "actual Child wait receipt is required"
+        );
+        assert!(!result_path.exists());
+        persist_result(&output_dir, &evidence).unwrap();
+        let result = read_fixture_json(&result_path);
+        assert_eq!(result["direct_exit"], "observed");
+        assert_eq!(result["family_departure"], "observation_unknown");
+        assert_eq!(result["cleanup"], "cleanup_pending");
+        assert_eq!(result["failure"]["code"], "BATCH_NATIVE_CONTAINMENT_LOST");
+        assert_eq!(result["capture"], "incomplete");
+        assert_eq!(result["stdout"]["complete"], false);
+        write_json_new(
+            &root.join(COMPLETE_FILE),
+            &json!({"result_written_after_child_readback":true}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawned as the real direct-child fixture"]
+    fn wait_uncertainty_native_child_fixture() {
+        let ready = PathBuf::from(
+            std::env::var_os(NATIVE_READY_ENV).expect("ready path is supplied by worker fixture"),
+        );
+        fs::write(ready, b"ready").unwrap();
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
 }
