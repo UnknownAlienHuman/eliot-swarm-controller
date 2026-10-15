@@ -92,27 +92,24 @@ enum StartupRecoveryStep {
 
 struct StartupRecovery {
     inventory: Option<tokio::task::JoinHandle<Result<()>>>,
+    inventory_started: bool,
     blocked: bool,
 }
 
 impl StartupRecovery {
-    fn start(journal: Arc<Journal>) -> Result<Self> {
-        let inventory = if journal.startup_inventory_required()? {
-            Some(tokio::task::spawn_blocking(move || {
-                journal.prepare_startup_inventory()
-            }))
-        } else {
-            None
-        };
-        Ok(Self {
-            inventory,
+    fn start() -> Self {
+        // The authenticated Store projection recovers the current front
+        // before any legacy directory census is scheduled.
+        Self {
+            inventory: None,
+            inventory_started: false,
             blocked: false,
-        })
+        }
     }
 
     async fn advance(
         &mut self,
-        journal: &Journal,
+        journal: &Arc<Journal>,
         recovery_sample: &mut Vec<journal::OperationRecoveryState>,
         recovery_count: &mut usize,
     ) -> StartupRecoveryStep {
@@ -121,6 +118,23 @@ impl StartupRecovery {
         }
         if journal.startup_recovery_complete() {
             return StartupRecoveryStep::Complete;
+        }
+        if !self.inventory_started {
+            self.inventory_started = true;
+            match journal.startup_inventory_required() {
+                Ok(true) => {
+                    let journal = journal.clone();
+                    self.inventory = Some(tokio::task::spawn_blocking(move || {
+                        journal.prepare_startup_inventory()
+                    }));
+                    return StartupRecoveryStep::WaitingForInventory;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    self.blocked = true;
+                    return StartupRecoveryStep::Blocked;
+                }
+            }
         }
         if let Some(inventory) = self.inventory.as_ref()
             && !inventory.is_finished()
@@ -306,12 +320,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     )?);
     #[cfg(test)]
     startup_poll_tests::capture_startup_journal_if_armed(&journal, &config.state_dir);
-    // Before hello, visit at most one sparse durable-closure window. A cold
-    // legacy name census starts on a blocking worker and never gates service
-    // polling; exact requested-operation reads remain available meanwhile.
-    let mut journal_recovery = journal.recover_outbox_before_hello()?;
-    let mut journal_recovery_count = journal_recovery.len();
-    let mut startup_recovery = StartupRecovery::start(journal.clone())?;
+    let mut startup_recovery = StartupRecovery::start();
     let mut native_owner = native_owner::NativeOwnerController::new(config.owned_native.clone());
 
     // The verified owner and boot identity come from the per-scope helper.
@@ -319,11 +328,8 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     // native owner with its own pinned image and state-root receipts.
     let boot_id = worker.boot_id.clone();
     let scope = config.native_options.scope_key();
-    let root_hint = if journal.startup_recovery_complete() {
-        journal.native_root_for_hello(&config.binding_id, config.generation, &scope)?
-    } else {
-        None
-    };
+    let root_hint =
+        journal.native_root_checkpoint_for_hello(&config.binding_id, config.generation, &scope)?;
 
     let native_probe = match NativeClient::connect(&config.native_options).await {
         Ok((service, info)) => match service.probe_route(&config.native_options).await {
@@ -353,7 +359,10 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         retention_retry_pending: AtomicBool::new(false),
     };
     let run_result = async {
-        host.hello_retry().await?;
+        let store_recovery = host.hello_retry().await?;
+        let store_front_complete = store_recovery.is_some();
+        let mut journal_recovery = store_recovery.unwrap_or_default();
+        let mut journal_recovery_count = journal_recovery.len();
         if let Some(probe) = native_probe {
             let event_id = uuid::Uuid::new_v4().to_string();
             let observation = json!({
@@ -378,7 +387,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         );
         recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut module_next = Box::pin(host.call("module.next", json!({})));
-        let mut root_checked = false;
+        let mut root_checked = store_front_complete;
         let mut retention_started = false;
         let mut recovery_report_queued = false;
         let ctrl_c = tokio::signal::ctrl_c();
@@ -2621,7 +2630,12 @@ impl<'a> HostSession<'a> {
         self.set_root_hint(root)
     }
 
-    async fn open_link(&self) -> Result<swarm_client::ModuleLink> {
+    async fn open_link(
+        &self,
+    ) -> Result<(
+        swarm_client::ModuleLink,
+        Option<Vec<journal::OperationRecoveryState>>,
+    )> {
         let mut link = module_link::connect(
             &self.config.host_data_dir,
             self.credential,
@@ -2642,25 +2656,33 @@ impl<'a> HostSession<'a> {
             self.config.generation,
             &self.config.native_options.scope_key(),
         )?;
-        if let Some(root) = verify_hello(
+        let root = verify_hello(
             self.config,
             self.claim,
             &self.config.native_options.scope_key(),
             expected_checkpoint.as_deref(),
             &response,
-        )? {
+        )?;
+        let recovery = response
+            .get("startup_recovery")
+            .map(|projection| {
+                self.journal
+                    .recover_store_startup(projection, &self.boot_id, root.as_deref())
+            })
+            .transpose()?;
+        if let Some(root) = root {
             self.save_store_root(&root)?;
         }
-        Ok(link)
+        Ok((link, recovery))
     }
 
-    async fn hello_retry(&self) -> Result<()> {
+    async fn hello_retry(&self) -> Result<Option<Vec<journal::OperationRecoveryState>>> {
         let mut last_error = Error::new("HOST_UNAVAILABLE", "module hello was not acknowledged");
         for (attempt, backoff_ms) in ACK_BACKOFF_MS.into_iter().enumerate() {
             match self.open_link().await {
-                Ok(link) => {
+                Ok((link, recovery)) => {
                     *self.ipc_link.lock().await = Some(link);
-                    return Ok(());
+                    return Ok(recovery);
                 }
                 Err(error) => last_error = error,
             }
@@ -2687,7 +2709,8 @@ impl<'a> HostSession<'a> {
         }
         let mut saved = self.ipc_link.lock().await;
         if saved.is_none() {
-            *saved = Some(self.open_link().await?);
+            let (link, _) = self.open_link().await?;
+            *saved = Some(link);
         }
         let link = saved
             .as_mut()

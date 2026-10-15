@@ -178,6 +178,7 @@ fn write_legacy_acknowledged_reply_for_scope(
 struct StartupJournalProbe {
     root: PathBuf,
     native_scope: String,
+    store_unresolved: Option<String>,
 }
 
 impl StartupJournalProbe {
@@ -307,7 +308,20 @@ async fn serve_startup_fixture_connection(
                 "role":"module",
                 "protocol_version":1
             }),
-            "module.hello" => hello.clone(),
+            "module.hello" => {
+                let mut response = hello.clone();
+                if let Some(operation_id) = probe.store_unresolved.as_deref() {
+                    let root = expected_root_id(BINDING_ID, GENERATION);
+                    response["native_root_id"] = json!(root);
+                    response["native_scope_key"] = json!(probe.native_scope);
+                    response["startup_recovery"] = store_startup_manifest(
+                        &session_boot_id,
+                        Some(&root),
+                        &[(operation_id, "agent.reply")],
+                    );
+                }
+                response
+            }
             "module.next" => json!({"command":null}),
             "module.outcome" | "module.observe" | "module.result" => {
                 json!({"recorded":true})
@@ -532,6 +546,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
     let probe = StartupJournalProbe {
         root: state_dir.clone(),
         native_scope,
+        store_unresolved: None,
     };
     let config = crate::AdapterConfig {
         schema_version: 1,
@@ -1465,6 +1480,229 @@ fn cold_legacy_before_hello_is_bounded_and_append_resumes() {
     assert!(!journal.load(torn_id).unwrap().native_replay_permitted());
     assert_eq!(fs::read(&torn_path).unwrap(), torn_bytes);
     assert!(!journal.load(appended_id).unwrap().native_replay_permitted());
+}
+
+fn store_startup_manifest(boot_id: &str, root: Option<&str>, operations: &[(&str, &str)]) -> Value {
+    json!({
+        "schema_version":1,
+        "binding_id":BINDING_ID,
+        "generation":GENERATION,
+        "worker_boot_id":boot_id,
+        "native_root_id":root,
+        "complete":true,
+        "unresolved_operations":operations.iter().map(|(id, method)| json!({
+            "operation_id":id,"method":method,"state":"outcome_unknown"
+        })).collect::<Vec<_>>()
+    })
+}
+
+#[tokio::test]
+async fn store_startup_connected_hello_recovers_current_root_and_exact_unresolved_before_census() {
+    let root = FixtureRoot::new();
+    let host_data_dir = root.0.join("host-ipc");
+    fs::create_dir_all(&host_data_dir).unwrap();
+    let state_dir = root.0.join("adapter-state");
+    let native_options = crate::NativeOptions {
+        service_id: "store-front-connected".to_owned(),
+        connection_file: root.0.join("no-native-service.json"),
+        directory: root.0.clone(),
+        model: crate::ModelRef {
+            id: "fixture".to_owned(),
+            provider_id: "fixture".to_owned(),
+            variant: "fixture".to_owned(),
+        },
+    };
+    let native_scope = native_options.scope_key();
+    let route_sha256 = digest_json(&serde_json::to_value(&native_options).unwrap()).unwrap();
+    let journal = Journal::open(
+        &state_dir,
+        BINDING_ID,
+        GENERATION,
+        &native_scope,
+        &route_sha256,
+    )
+    .unwrap();
+    for index in 0..256 {
+        write_legacy_acknowledged_reply_for_scope(
+            &journal,
+            &format!("connected-front-old-{index:03}"),
+            &native_scope,
+            &route_sha256,
+        );
+    }
+    let unresolved_id = "connected-front-exact-unknown";
+    let mut intent = fixture_intent(unresolved_id, "agent.reply");
+    intent.native_scope_key = native_scope.clone();
+    intent.route_sha256 = route_sha256.clone();
+    journal.write_intent(&intent).unwrap();
+    drop(journal);
+    let journal = Journal::open(
+        &state_dir,
+        BINDING_ID,
+        GENERATION,
+        &native_scope,
+        &route_sha256,
+    )
+    .unwrap();
+    let contract = startup_fixture_contract();
+    let bootstrap = startup_fixture_bootstrap(
+        &root.0,
+        &host_data_dir,
+        &state_dir,
+        &native_options,
+        &contract,
+        "connected-front-boot",
+    );
+    let listener = swarm_kernel_host::ipc::Listener::bind(&host_data_dir).unwrap();
+    let (send, _receive) = mpsc::unbounded_channel();
+    let server = tokio::spawn(serve_startup_fixture(
+        listener,
+        bootstrap.config.clone(),
+        serde_json::to_value(&contract).unwrap(),
+        StartupJournalProbe {
+            root: state_dir.clone(),
+            native_scope: native_scope.clone(),
+            store_unresolved: Some(unresolved_id.to_owned()),
+        },
+        send,
+    ));
+    let host = crate::HostSession {
+        config: &bootstrap.config,
+        credential: &bootstrap.credential,
+        journal: &journal,
+        claim: &contract,
+        boot_id: "connected-front-boot".to_owned(),
+        hello_base: json!({"boot_id":"connected-front-boot","module_artifact_id":crate::ARTIFACT_ID}),
+        root_hint: std::sync::Mutex::new(None),
+        ipc_link: tokio::sync::Mutex::new(None),
+        outcome_observer: None,
+        retention_retry_pending: std::sync::atomic::AtomicBool::new(false),
+    };
+    let recovered = host.hello_retry().await.unwrap().unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].operation_id.as_deref(), Some(unresolved_id));
+    assert!(!recovered[0].history.native_replay_permitted());
+    let expected = expected_root_id(BINDING_ID, GENERATION);
+    assert_eq!(
+        host.root_hint().unwrap().as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        journal
+            .native_root_checkpoint_for_hello(BINDING_ID, GENERATION, &native_scope)
+            .unwrap()
+            .as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(journal.startup_scan_counts().operations_listed, 0);
+    assert_eq!(journal.startup_scan_counts().operation_bodies_parsed, 1);
+    assert!(!journal.startup_recovery_complete());
+    server.abort();
+    let _ = server.await;
+}
+
+#[test]
+fn store_startup_recovers_cold_legacy_front_without_lifetime_census() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    for index in 0..256 {
+        write_legacy_acknowledged_reply(&journal, &format!("store-front-old-{index:03}"));
+    }
+    let unresolved_id = "store-front-unresolved";
+    let target_id = "store-front-referenced";
+    write_legacy_acknowledged_reply(&journal, target_id);
+    let mut unresolved = fixture_intent(unresolved_id, "agent.reconcile");
+    unresolved.reconcile_target_operation_id = Some(target_id.to_owned());
+    journal.write_intent(&unresolved).unwrap();
+    let pending_id = "store-front-applied-lost-ack";
+    journal
+        .write_intent(&fixture_intent(pending_id, "agent.reply"))
+        .unwrap();
+    journal.queue_outcome_value(&json!({
+        "operation_id":pending_id,"outcome":"applied","native_scope_key":NATIVE_SCOPE,"details":{}
+    })).unwrap();
+    let orphan = journal.operations.join("unmanifested-damaged.jsonl");
+    fs::write(&orphan, b"invalid retained orphan").unwrap();
+    drop(journal);
+
+    // Repeat a crash before legacy reclamation. Neither first cold startup
+    // nor the restart may reclassify the 256 ACKed historical bodies.
+    for boot_id in ["store-front-boot-1", "store-front-boot-2"] {
+        let journal =
+            Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+        let manifest = store_startup_manifest(boot_id, None, &[(unresolved_id, "agent.reconcile")]);
+        let recovered = journal
+            .recover_store_startup(&manifest, boot_id, None)
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].operation_id.as_deref(), Some(unresolved_id));
+        assert!(!recovered[0].history.native_replay_permitted());
+        let counts = journal.startup_scan_counts();
+        assert_eq!(counts.operations_listed, 0);
+        assert_eq!(counts.operation_bodies_parsed, 3);
+        assert_eq!(counts.outbox_entries_scanned, 1);
+        assert!(
+            journal
+                .pending_items()
+                .unwrap()
+                .iter()
+                .any(|(_, item)| item.key == pending_id)
+        );
+        assert!(
+            !journal.startup_recovery_complete(),
+            "Store absence never proves deletion safety"
+        );
+        assert_eq!(
+            journal
+                .reclaim_acknowledged(BINDING_ID, GENERATION, NATIVE_SCOPE)
+                .unwrap_err()
+                .code,
+            "ADAPTER_RETENTION_STATE"
+        );
+        assert!(operation_path(&root.0, target_id).exists());
+        assert!(orphan.exists());
+        assert!(operation_path(&root.0, "store-front-old-000").exists());
+    }
+}
+
+#[test]
+fn store_startup_rejects_incomplete_foreign_and_damaged_front_without_deletion() {
+    let root = FixtureRoot::new();
+    let journal =
+        Journal::open(&root.0, BINDING_ID, GENERATION, NATIVE_SCOPE, ROUTE_SHA256).unwrap();
+    let operation_id = "store-front-damaged";
+    journal
+        .write_intent(&fixture_intent(operation_id, "agent.reply"))
+        .unwrap();
+    let manifest = store_startup_manifest("current-boot", None, &[(operation_id, "agent.reply")]);
+    for (field, value) in [
+        ("complete", json!(false)),
+        ("worker_boot_id", json!("stale-boot")),
+        ("binding_id", json!("foreign-binding")),
+        ("generation", json!(2)),
+        ("native_root_id", json!("foreign-root")),
+    ] {
+        let mut invalid = manifest.clone();
+        invalid[field] = value;
+        assert_eq!(
+            journal
+                .recover_store_startup(&invalid, "current-boot", None)
+                .unwrap_err()
+                .code,
+            "HOST_STARTUP_RECOVERY"
+        );
+    }
+    assert_eq!(journal.startup_scan_counts().operation_bodies_parsed, 0);
+    let path = operation_path(&root.0, operation_id);
+    fs::write(&path, b"{not valid JSON}\n").unwrap();
+    assert!(
+        journal
+            .recover_store_startup(&manifest, "current-boot", None)
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"{not valid JSON}\n");
+    assert!(!journal.startup_recovery_complete());
 }
 
 /// Steady state after convergence and drain: reopening reads only the

@@ -189,6 +189,26 @@ pub struct OperationRecoveryState {
     pub history: OperationHistory,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreStartupRecovery {
+    schema_version: u32,
+    binding_id: String,
+    generation: i64,
+    worker_boot_id: String,
+    native_root_id: Option<String>,
+    complete: bool,
+    unresolved_operations: Vec<StoreUnresolvedOperation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreUnresolvedOperation {
+    operation_id: String,
+    method: String,
+    state: String,
+}
+
 #[derive(Debug, Default)]
 pub struct RetentionSummary {
     /// Files removed from the namespace during this pass. Durability is
@@ -805,6 +825,7 @@ impl Journal {
     /// Use only the already-durable sparse closure before hello. A cold or
     /// invalidated legacy inventory is deliberately left for bounded recovery
     /// after hello, so discovering old names cannot delay the handshake.
+    #[cfg(test)]
     pub fn recover_outbox_before_hello(&self) -> Result<Vec<OperationRecoveryState>> {
         if !retention::durable_startup_complete(self)?
             || retention::legacy_migration_version(self)? < 1
@@ -900,14 +921,108 @@ impl Journal {
     }
 
     pub fn recover_outbox(&self) -> Result<Vec<OperationRecoveryState>> {
-        retention::begin_recovery(self)?;
+        self.recover_outbox_selection(None, None)
+    }
+
+    /// The authenticated Store hello owns the current unresolved set. Read
+    /// only those journals, pending deliveries and their exact references;
+    /// legacy classification remains separate and cannot gain deletion
+    /// authority from an operation's absence in this projection.
+    pub fn recover_store_startup(
+        &self,
+        projection: &Value,
+        boot_id: &str,
+        root: Option<&str>,
+    ) -> Result<Vec<OperationRecoveryState>> {
+        let manifest: StoreStartupRecovery =
+            serde_json::from_value(projection.clone()).map_err(|_| {
+                Error::new(
+                    "HOST_STARTUP_RECOVERY",
+                    "startup recovery projection is invalid",
+                )
+            })?;
+        if manifest.schema_version != 1
+            || manifest.binding_id != self.identity.binding_id
+            || manifest.generation != self.identity.generation
+            || manifest.worker_boot_id != boot_id
+            || manifest.native_root_id.as_deref() != root
+            || !manifest.complete
+            || manifest.unresolved_operations.len() > 4096
+            || root.is_some_and(|value| {
+                value != expected_root_id(&self.identity.binding_id, self.identity.generation)
+            })
+        {
+            return Err(Error::new(
+                "HOST_STARTUP_RECOVERY",
+                "startup recovery projection is incomplete or belongs to another owner",
+            ));
+        }
+        let mut keys = BTreeSet::new();
+        for operation in &manifest.unresolved_operations {
+            if operation.operation_id.is_empty()
+                || operation.method.is_empty()
+                || !matches!(
+                    operation.state.as_str(),
+                    "sending" | "native_accepted" | "outcome_unknown"
+                )
+                || !keys.insert(operation_key(&operation.operation_id))
+            {
+                return Err(Error::new(
+                    "HOST_STARTUP_RECOVERY",
+                    "unresolved operation identity is invalid",
+                ));
+            }
+        }
+        // A Store-applied delivery can still lack its local ACK. Its outbox
+        // receipt, rather than a settled-history scan, supplies that address.
+        for entry in fs::read_dir(&self.outbox)
+            .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox cannot be read"))?
+        {
+            let path = entry
+                .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox entry cannot be read"))?
+                .path();
+            ensure_regular(&path, "outbox item")?;
+            let item: PendingItem = serde_json::from_slice(&read_limited(&path, RECORD_LIMIT)?)
+                .map_err(|_| Error::new("ADAPTER_OUTBOX", "outbox item is invalid"))?;
+            self.scan_outbox.fetch_add(1, Ordering::Relaxed);
+            if matches!(item.kind.as_str(), "outcome" | "result") {
+                keys.insert(operation_key(&item.key));
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut recovered = Vec::new();
+        while !keys.is_empty() {
+            let window = std::mem::take(&mut keys)
+                .into_iter()
+                .filter(|key| seen.insert(key.clone()))
+                // Sending may have committed before any adapter intent. A
+                // missing local file is not a receipt permitting native replay.
+                .filter(|key| self.operations.join(format!("{key}.jsonl")).exists())
+                .collect::<Vec<_>>();
+            recovered.extend(self.recover_outbox_selection(Some(window), Some(&mut keys))?);
+            keys.retain(|key| !seen.contains(key));
+        }
+        Ok(recovered)
+    }
+
+    fn recover_outbox_selection(
+        &self,
+        selected: Option<Vec<String>>,
+        mut references: Option<&mut BTreeSet<String>>,
+    ) -> Result<Vec<OperationRecoveryState>> {
+        let store_selected = selected.is_some();
+        if !store_selected {
+            retention::begin_recovery(self)?;
+        }
         let mut recovery_states = Vec::new();
         // Steady state serves the durable closure with targeted reads only:
         // no directory enumeration once one legacy convergence completed.
         // The windowed listing below runs solely while converging history.
         let window: Vec<String>;
         let mut legacy_inventory = false;
-        if !retention::startup_inventory_required(self)? {
+        if let Some(selected) = selected {
+            window = selected;
+        } else if !retention::startup_inventory_required(self)? {
             window = self.steady_recovery_window()?;
         } else {
             if !retention::has_cached_startup_names(self)? {
@@ -931,12 +1046,24 @@ impl Journal {
             let path = self.operations.join(format!("{name}.jsonl"));
             if ensure_regular(&path, "operation journal").is_err() {
                 retention::mark_damaged(self)?;
+                if store_selected {
+                    return Err(Error::new(
+                        "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
+                        "selected operation journal cannot be inspected",
+                    ));
+                }
                 continue;
             }
             let observed_bytes = match read_limited(&path, HISTORY_LIMIT) {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     retention::mark_damaged(self)?;
+                    if store_selected {
+                        return Err(Error::new(
+                            "ADAPTER_JOURNAL_RECOVERY_UNKNOWN",
+                            "selected operation journal cannot be read",
+                        ));
+                    }
                     continue;
                 }
             };
@@ -947,6 +1074,9 @@ impl Journal {
                 Ok(history) => history,
                 Err(error) if error.code == "ADAPTER_JOURNAL" => {
                     retention::mark_damaged(self)?;
+                    if store_selected {
+                        return Err(error);
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -994,12 +1124,20 @@ impl Journal {
                     // fails the window now instead of hiding until a later
                     // full scan that steady state never performs.
                     self.check_native_root_identity(&operation)?;
+                    if let Some(references) = references.as_deref_mut() {
+                        references.extend(operation.references.iter().map(|id| operation_key(id)));
+                    }
                     retention::register_operation(self, operation)?;
                     if legacy_inventory {
                         retention::mark_steady_visited(self, name)?;
                     }
                 }
-                Err(_) => retention::mark_damaged(self)?,
+                Err(error) => {
+                    retention::mark_damaged(self)?;
+                    if store_selected {
+                        return Err(error);
+                    }
+                }
             }
             if let (Some(outcome), Some(digest)) =
                 (history.outcome.as_ref(), history.outcome_sha256.as_ref())
@@ -1120,6 +1258,11 @@ impl Journal {
                 });
                 self.scan_unresolved.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if store_selected {
+            // Do not mark the retention census complete: unknown/orphan and
+            // settled result-source files require their own local proof.
+            return Ok(recovery_states);
         }
         if legacy_inventory {
             // One durable cursor write per bounded pass, not per file: a crash

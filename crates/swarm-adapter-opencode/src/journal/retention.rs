@@ -928,6 +928,7 @@ pub(super) fn durable_startup_complete(journal: &Journal) -> Result<bool> {
     Ok(lock_index(journal)?.startup_complete)
 }
 
+#[cfg(test)]
 pub(super) fn legacy_reclamation_pending(journal: &Journal) -> Result<bool> {
     Ok(lock_index(journal)?.legacy_reclamation_pending)
 }
@@ -940,6 +941,7 @@ pub(super) fn startup_inventory_required(journal: &Journal) -> Result<bool> {
             && !index.legacy_scan_complete_this_handle))
 }
 
+#[cfg(test)]
 pub(super) fn legacy_migration_version(journal: &Journal) -> Result<u32> {
     Ok(lock_index(journal)?.legacy_migration_version)
 }
