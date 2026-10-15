@@ -10,6 +10,8 @@ Evidence labels follow the repository documentation contract: **CODE** is source
 
 ## D1–D5 source reconciliation
 
+After the linked snapshot, [b248a8a](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/b248a8a322fdf74b3eb0bafbfc1c3b8de10bc057) added activation for sealed v1 entries with missing or non-object `scope`. The selector skips exact quarantines and checks later matching damaged entries. Six Store regressions and host all-target Clippy passed locally; the new case verifies both exact quarantines and ten subsequent dormant observations with unchanged marker bytes and no writes. This is a concrete v1 schema repair, not a universal damaged-schema oracle or a change to OpenCode's fail-closed recovery boundaries.
+
 | Finding | Disposition at the linked source snapshot | Qualification boundary |
 | --- | --- | --- |
 | D1 — qualification-fault test gate | **CODE: fixed.** Both `qualification-admit` test modules are gated by `qualification-faults` in [`swarm-automation/src/lib.rs`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/8601e7e5902e703473d0ac4e919e5f884a1b4582/crates/swarm-automation/src/lib.rs#L989-L1135). | The direct package all-target compile is compile evidence. The manual full qualification remains separate and was skipped in the cited runs below. |

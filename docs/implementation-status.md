@@ -8,6 +8,8 @@
 
 #### Issue #153 source reconciliation
 
+Later source delta [b248a8a](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/b248a8a322fdf74b3eb0bafbfc1c3b8de10bc057) activates the existing Automation isolator for sealed v1 entries whose `scope` is missing or is not an object. It continues past an exact quarantine to find later damaged entries. Six local Store regressions and host all-target Clippy passed, including two damaged entries followed by ten dormant, write-stable observations. This covers that concrete v1 schema class; the snapshot below retains its earlier scope and does not claim universal schema detection.
+
 **Issue-specific snapshot:** source at [8601e7e](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/8601e7e5902e703473d0ac4e919e5f884a1b4582). The overall implementation map above retains its earlier `ec464291` baseline; this overlay is a bounded recheck, not a rolling claim about later `main`. Issue #153 remains open. See the [Issue #153 closeout map](remediation/2026-10-15/ISSUE-153-CLOSEOUT.md) for original P1–P5, all 17 remainder PRs, exact public CI scopes, and owner residuals.
 
 | Finding | Current main source/document state | Qualification boundary |
