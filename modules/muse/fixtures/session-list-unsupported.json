@@ -1,0 +1,12 @@
+{
+  "native_method": "session/list",
+  "native_error": {
+    "code": -32601,
+    "data": { "kind": "methodNotFound" }
+  },
+  "expected": {
+    "diagnostic": "NATIVE_SESSION_LIST_UNSUPPORTED",
+    "operation_outcome": "rejected",
+    "no_requests": ["turn/start", "session/read", "session/resume"]
+  }
+}
