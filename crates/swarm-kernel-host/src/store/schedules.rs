@@ -491,8 +491,23 @@ fn consider(
         if let Some(retry) = probe_retry_at_ms(Some(state))
             && retry > now_ms
         {
-            tx.rollback()?;
-            return Ok((Some(retry), false, false));
+            // A concurrent same-slot sibling may have installed this retry
+            // gate after this caller resolved successfully. A successful
+            // plan for this same slot proves the probe reservation was free
+            // at resolve time and must still admit exactly once; otherwise
+            // the gate would block the only successful admission and leave
+            // both callers Ok with no receipt. Absent or failed plans keep
+            // the retry without consuming the slot.
+            let gate_slot = state
+                .last_failure
+                .as_ref()
+                .and_then(|failure| failure["slot"].as_i64());
+            let has_successful_plan_for_slot = gate_slot == Some(due.slot)
+                && check_plan.as_ref().is_some_and(|plan| plan.result.is_ok());
+            if !has_successful_plan_for_slot {
+                tx.rollback()?;
+                return Ok((Some(retry), false, false));
+            }
         }
 
         let (facts, preflight_error) = input_facts(&tx, schedule, config)?;
