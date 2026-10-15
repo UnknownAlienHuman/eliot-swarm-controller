@@ -944,7 +944,27 @@ function Get-InstalledFrontend(
     # forced to carry current group files here.
     $identityPaths = @($binaryPath, $buildPath, $receiptPath)
     $identityPresent = @($identityPaths | Where-Object { Test-Path -LiteralPath $_ })
-    if ($identityPresent.Count -eq 0) { return $null }
+    if ($identityPresent.Count -eq 0) {
+        # Preserve the original partial-install detection: known resource files
+        # without any identity sidecar are an orphaned install, not an absent one.
+        # Only EXISTING spec-known paths are examined, so a legitimate legacy host
+        # (complete identity, no additional groups) is unaffected here.
+        $specResourcePaths = @(
+            foreach ($entry in @(Get-ResourceSpecFiles $Spec)) {
+                Join-Path (Join-Path $Root ([string]$Spec.resource_installed_relative_root)) ([string]$entry.path)
+            }
+            foreach ($group in @(Get-AdditionalResourceSpecGroups $Spec)) {
+                foreach ($entry in @($group.resource_files)) {
+                    Join-Path (Join-Path $Root ([string]$group.installed_relative_root)) ([string]$entry.path)
+                }
+            }
+        )
+        $orphans = @($specResourcePaths | Where-Object { Test-Path -LiteralPath $_ })
+        if ($orphans.Count -gt 0) {
+            throw "Installed frontend '$Name' is incomplete; missing $($identityPaths -join ', '). Found orphaned resource files without package identity: $($orphans -join ', '). Use a new empty install directory or restore the exact package files before installing another frontend."
+        }
+        return $null
+    }
     if ($identityPresent.Count -ne $identityPaths.Count) {
         $missing = @($identityPaths | Where-Object { -not (Test-Path -LiteralPath $_) })
         if ($Name -ceq 'swarm-gateway' -and $RequestedPackage -ceq 'eliot-swarm-controller') {

@@ -177,6 +177,13 @@ try {
     $bad = New-HostFixture (Join-Path $work 'badver') -WithAntigravity
     $bad.manifest.resources.additional_groups[0].version = '5'
     Expect-Throw { Assert-ResourceManifest $bad.manifest $spec 'Build manifest' } '*differs from the package policy*' 'wrong group version rejected on new-package gate'
+    $orphanRoot = Join-Path $work 'orphan'
+    Write-Ascii (Join-Path $orphanRoot 'resources/modules/opencode/serve.mjs') 'orphan'
+    Write-Ascii (Join-Path $orphanRoot 'resources/modules/antigravity/bridge.mjs') 'orphan'
+    Expect-Throw { Get-InstalledFrontend 'swarm-kernel-host' $orphanRoot $spec 'swarm-mcp' } '*incomplete*orphaned resource files*' 'orphaned resource files without identity rejected'
+    $emptyRoot = Join-Path $work 'empty'
+    [void][IO.Directory]::CreateDirectory($emptyRoot)
+    Assert-True ($null -eq (Get-InstalledFrontend 'swarm-kernel-host' $emptyRoot $spec 'swarm-mcp')) 'empty root still inventories as absent'
 } finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -Confirm:$false }
 }
