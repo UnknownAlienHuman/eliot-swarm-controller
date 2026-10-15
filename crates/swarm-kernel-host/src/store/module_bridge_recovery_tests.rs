@@ -319,7 +319,7 @@ fn zed_command_intake_preserves_idle_errors_and_taken_operation_state() {
 }
 
 #[test]
-fn task_prompt_dispatch_context_survives_store_restart_and_worker_replacement() {
+fn module_hello_startup_recovery_projects_unknown_after_worker_replacement() {
     let (path, before, after) = durable_prompt_store();
     let initial_command = initial_prompt_command(&path, &before);
 
@@ -330,7 +330,20 @@ fn task_prompt_dispatch_context_survives_store_restart_and_worker_replacement() 
     let old_owner = json!({"pid":431,"birth_token":"prompt-owner-before"});
     let transition =
         replace_prompt_worker(&mut db, &after, "prompt-boot-before", &old_owner).unwrap();
-    assert_eq!(transition["recovery_required"], true);
+    assert!(transition["recovery_required"].as_bool().unwrap());
+    let recovery = &transition["startup_recovery"];
+    assert_eq!(recovery["schema_version"], 1);
+    assert_eq!(recovery["binding_id"], PROMPT_RECOVERY_BINDING);
+    assert_eq!(recovery["generation"], 1);
+    assert_eq!(recovery["worker_boot_id"], "prompt-boot-after");
+    assert!(recovery["native_root_id"].is_null());
+    assert!(recovery["complete"].as_bool().unwrap());
+    let unresolved = recovery["unresolved_operations"].as_array().unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0]["operation_id"], PROMPT_RECOVERY_OPERATION);
+    assert_eq!(unresolved[0]["method"], "task.dispatch");
+    assert_eq!(unresolved[0]["state"], "outcome_unknown");
+    assert_eq!(unresolved[0].as_object().unwrap().len(), 3);
 
     let no_replay = runtime::next(&mut db, &after).unwrap();
     assert!(no_replay["command"].is_null());

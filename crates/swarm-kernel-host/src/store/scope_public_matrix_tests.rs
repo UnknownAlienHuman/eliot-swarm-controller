@@ -1414,6 +1414,187 @@ mod connected_store {
         (open, module)
     }
 
+    #[tokio::test]
+    async fn public_store_module_hello_startup_recovery_is_scoped_and_bounded() {
+        let f = start().await;
+        let descriptor = fixture_descriptor();
+        let (open, module) = open_fixture_module(&f, &descriptor).await;
+        let store = &f.owner.store;
+        let binding_id = open["binding_id"].as_str().unwrap().to_owned();
+        let caller_id = f.manager_a.client_id.clone();
+
+        let seed_binding = binding_id.clone();
+        let seed_caller = caller_id.clone();
+        store
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "INSERT INTO operations(
+                         operation_id,caller_id,client_request_id,method,
+                         original_request_json,effective_request_json,
+                         binding_id,binding_generation,state,due_at_ms,
+                         created_at_ms,updated_at_ms
+                     ) VALUES(?1,?2,?3,'agent.send','{}','{}',?4,1,'sending',1,1,1)",
+                    params![
+                        "hello-recovery-sending",
+                        seed_caller,
+                        "hello-recovery-sending-request",
+                        seed_binding,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO operations(
+                         operation_id,caller_id,client_request_id,method,
+                         original_request_json,effective_request_json,
+                         binding_id,binding_generation,state,due_at_ms,
+                         created_at_ms,updated_at_ms
+                     ) VALUES(?1,?2,?3,'agent.result','{}','{}',?4,1,'outcome_unknown',1,2,2)",
+                    params![
+                        "hello-recovery-unknown",
+                        seed_caller,
+                        "hello-recovery-unknown-request",
+                        seed_binding,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO operations(
+                         operation_id,caller_id,client_request_id,method,
+                         original_request_json,effective_request_json,
+                         binding_id,binding_generation,state,result_json,due_at_ms,
+                         settled_at_ms,created_at_ms,updated_at_ms
+                     ) VALUES(?1,?2,?3,'agent.send','{}','{}',?4,1,'settled','{}',1,3,3,3)",
+                    params![
+                        "hello-recovery-settled-history",
+                        seed_caller,
+                        "hello-recovery-settled-request",
+                        seed_binding,
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let hello_params = || {
+            json!({
+                "boot_id":"scope-page-boot",
+                "module_artifact_id":ARTIFACT_ID,
+                "module_contract":ModuleContractClaim::from_descriptor(
+                    &descriptor,
+                    MODULE_PROTOCOL_V1,
+                ).unwrap(),
+            })
+        };
+        let hello = call(store, &module, "module.hello", hello_params()).await;
+        let recovery = &hello["startup_recovery"];
+        assert_eq!(recovery["schema_version"], 1);
+        assert_eq!(recovery["binding_id"], binding_id);
+        assert_eq!(recovery["generation"], 1);
+        assert_eq!(recovery["worker_boot_id"], "scope-page-boot");
+        assert_eq!(recovery["native_root_id"], "scope-fixture-root");
+        assert!(recovery["complete"].as_bool().unwrap());
+        let unresolved = recovery["unresolved_operations"].as_array().unwrap();
+        assert_eq!(unresolved.len(), 2);
+        assert!(unresolved.iter().any(|operation| {
+            operation["operation_id"] == "hello-recovery-sending"
+                && operation["method"] == "agent.send"
+                && operation["state"] == "sending"
+        }));
+        assert!(unresolved.iter().any(|operation| {
+            operation["operation_id"] == "hello-recovery-unknown"
+                && operation["method"] == "agent.result"
+                && operation["state"] == "outcome_unknown"
+        }));
+        assert!(
+            !unresolved
+                .iter()
+                .any(|operation| { operation["operation_id"] == "hello-recovery-settled-history" })
+        );
+        let expected_operation_fields = BTreeSet::from(["operation_id", "method", "state"]);
+        for operation in unresolved {
+            let fields = operation
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(fields, expected_operation_fields);
+        }
+
+        let wrong_binding = store
+            .call(
+                module.clone(),
+                "module.hello".into(),
+                json!({
+                    "boot_id":"scope-page-boot",
+                    "module_artifact_id":ARTIFACT_ID,
+                    "module_contract":ModuleContractClaim::from_descriptor(
+                        &descriptor,
+                        MODULE_PROTOCOL_V1,
+                    ).unwrap(),
+                    "binding_id":"another-binding",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_binding.code, "INVALID_PARAMS");
+
+        let wrong_boot = store
+            .call(
+                module.clone(),
+                "module.hello".into(),
+                json!({
+                    "boot_id":"unverified-new-boot",
+                    "module_artifact_id":ARTIFACT_ID,
+                    "module_contract":ModuleContractClaim::from_descriptor(
+                        &descriptor,
+                        MODULE_PROTOCOL_V1,
+                    ).unwrap(),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_boot.code, "RECOVERY_REQUIRED");
+
+        let overflow_binding = binding_id.clone();
+        let overflow_caller = caller_id;
+        store
+            .run(move |db| {
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                {
+                    let mut insert = tx.prepare(
+                        "INSERT INTO operations(
+                             operation_id,caller_id,client_request_id,method,
+                             original_request_json,effective_request_json,
+                             binding_id,binding_generation,state,due_at_ms,
+                             created_at_ms,updated_at_ms
+                         ) VALUES(?1,?2,?3,'agent.result','{}','{}',?4,1,
+                                  'outcome_unknown',1,4,4)",
+                    )?;
+                    for index in 0..4095 {
+                        insert.execute(params![
+                            format!("hello-recovery-overflow-{index:04}"),
+                            overflow_caller,
+                            format!("hello-recovery-overflow-request-{index:04}"),
+                            overflow_binding,
+                        ])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let overflow = store
+            .call(module, "module.hello".into(), hello_params())
+            .await
+            .unwrap_err();
+        assert_eq!(overflow.code, "MODULE_READBACK_UNRESOLVED_OVERFLOW");
+
+        f.close().await;
+    }
+
     async fn dispatch_fixture(
         f: &Fixture,
         descriptor: &ModuleDescriptor,

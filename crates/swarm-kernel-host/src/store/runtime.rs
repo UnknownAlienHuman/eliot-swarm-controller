@@ -1033,7 +1033,15 @@ fn hello_internal(
         b["route"].clone()
     };
     tx.execute("UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id',?3,'$.module_link_id',?4,'$.connection','connected','$.connected_at_ms',?5),state=CASE WHEN state='reconciling' AND ?6 AND COALESCE(json_extract(state_json,'$.recovery_required'),0)=0 AND (native_root_id IS NOT NULL OR ?7 OR ?8) THEN 'ready' ELSE state END WHERE binding_id=?1 AND generation=?2", params![id,generation,boot,p.link_id,model::now_ms()?,v["native_ready"]==true,sessionless_batch,prepared_rootless_resume])?;
-    let result = json!({"binding_id":id,"generation":generation,"route":reply_route,"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"recovery_required":(recovered && needs_recovery) || b["observation"]["recovery_required"]==true,"module_contract_negotiation":module_contract_negotiation});
+    let startup_recovery = super::module_demand::startup_recovery_projection(
+        &tx,
+        &id,
+        generation,
+        &p.client_id,
+        &p.link_id,
+        boot,
+    )?;
+    let result = json!({"binding_id":id,"generation":generation,"route":reply_route,"host_epoch":meta(&tx,"host_epoch")?,"native_root_id":b["native_root_id"],"native_scope_key":b["native_scope_key"],"recovery_required":(recovered && needs_recovery) || b["observation"]["recovery_required"]==true,"module_contract_negotiation":module_contract_negotiation,"startup_recovery":startup_recovery});
     tx.commit()?;
     Ok(result)
 }

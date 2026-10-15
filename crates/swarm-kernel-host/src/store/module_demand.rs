@@ -99,6 +99,32 @@ pub(crate) struct ModuleScopeReadback {
     pub(crate) module_hello_boot_id: Option<String>,
 }
 
+/// Private Store projection returned only by the authenticated module.hello.
+/// It binds the bounded unresolved Operation set to the Store-owned binding
+/// root and the exact module link/worker boot accepted by that hello.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartupRecoveryProjection {
+    pub(crate) schema_version: u32,
+    pub(crate) binding_id: String,
+    pub(crate) generation: u64,
+    pub(crate) worker_boot_id: String,
+    pub(crate) native_root_id: Option<String>,
+    pub(crate) complete: bool,
+    pub(crate) unresolved_operations: Vec<StartupRecoveryOperation>,
+}
+
+/// Minimal unresolved status returned inside the authenticated hello scope.
+/// The enclosing projection carries binding/generation; no request or result
+/// material crosses this private module-link response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartupRecoveryOperation {
+    pub(crate) operation_id: String,
+    pub(crate) method: String,
+    pub(crate) state: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModuleDemandCursor {
@@ -303,6 +329,71 @@ fn scoped_operation_readback_in_snapshot(
     }
 
     Ok(rows)
+}
+
+/// Build the hello projection from the same Store transaction that accepted
+/// the module link and worker boot. Overflow, stale scope, malformed native
+/// identity, and unknown Operation state are errors; a partial set is never
+/// represented as complete.
+pub(super) fn startup_recovery_projection(
+    db: &Connection,
+    binding_id: &str,
+    generation: i64,
+    module_client_id: &str,
+    module_link_id: &str,
+    worker_boot_id: &str,
+) -> Result<StartupRecoveryProjection> {
+    if generation <= 0 {
+        return Err(Error::new(
+            "MODULE_READBACK_SCOPE_INVALID",
+            "module startup recovery requires a positive binding generation",
+        ));
+    }
+    let binding = operations::get_binding(db, binding_id, generation)?;
+    if !binding["released_at_ms"].is_null()
+        || binding["observation"]["module_client_id"] != module_client_id
+        || binding["observation"]["module_link_id"] != module_link_id
+        || binding["observation"]["bridge_boot_id"] != worker_boot_id
+    {
+        return Err(Error::new(
+            "STALE_LINK",
+            "module startup recovery no longer matches the accepted binding link and boot",
+        ));
+    }
+    let native_root_id = binding["native_root_id"].as_str().map(ToOwned::to_owned);
+    let native_scope_key = binding["native_scope_key"].as_str();
+    if native_root_id.is_some() != native_scope_key.is_some() {
+        return Err(Error::new(
+            "MODULE_READBACK_NATIVE_IDENTITY_INCOMPLETE",
+            "binding retains only one half of its native identity",
+        ));
+    }
+
+    // This uses the existing (binding_id, binding_generation, state) index and
+    // the same transaction snapshot as module.hello. It returns an error above
+    // the bound rather than a truncated vector.
+    let unresolved_operations = scoped_operation_readback_in_snapshot(db, binding_id, generation)?
+        .into_iter()
+        .map(|operation| StartupRecoveryOperation {
+            operation_id: operation.operation_id,
+            method: operation.method,
+            state: operation.state,
+        })
+        .collect();
+    Ok(StartupRecoveryProjection {
+        schema_version: 1,
+        binding_id: binding_id.to_owned(),
+        generation: u64::try_from(generation).map_err(|_| {
+            Error::new(
+                "MODULE_READBACK_SCOPE_INVALID",
+                "module startup recovery binding generation is out of range",
+            )
+        })?,
+        worker_boot_id: worker_boot_id.to_owned(),
+        native_root_id,
+        complete: true,
+        unresolved_operations,
+    })
 }
 
 fn unknown_operation_state(
@@ -988,6 +1079,42 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    fn startup_projection_db() -> Connection {
+        let db = operations_db();
+        db.execute_batch(
+            "CREATE TABLE bindings(
+                 binding_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 lane_id TEXT NOT NULL,
+                 module_instance_id TEXT NOT NULL,
+                 module_artifact_id TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 native_scope_key TEXT,
+                 native_root_id TEXT,
+                 route_json TEXT NOT NULL,
+                 state_json TEXT NOT NULL,
+                 released_at_ms INTEGER,
+                 PRIMARY KEY(binding_id,generation)
+             ) STRICT;",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO bindings(
+                 binding_id,generation,lane_id,module_instance_id,module_artifact_id,
+                 state,native_scope_key,native_root_id,route_json,state_json,released_at_ms
+             ) VALUES('binding-a',1,'lane-a','module-a','artifact-a','ready',
+                     'scope-a','root-a','{}',?1,NULL)",
+            [model::canonical(&json!({
+                "module_client_id":"client-a",
+                "module_link_id":"link-a",
+                "bridge_boot_id":"boot-a"
+            }))
+            .unwrap()],
+        )
+        .unwrap();
+        db
+    }
+
     #[test]
     fn owned_intent_preparation_stays_within_the_bounded_operation_page() {
         let db = Connection::open_in_memory().unwrap();
@@ -1144,6 +1271,86 @@ mod tests {
 
         let error = scoped_operation_readback(&db, "binding-a", 1).unwrap_err();
         assert_eq!(error.code, "MODULE_READBACK_UNRESOLVED_OVERFLOW");
+    }
+
+    #[test]
+    fn startup_recovery_projection_is_exact_fenced_and_fails_closed() {
+        let db = startup_projection_db();
+        insert_many(&db, "terminal", 5000, "binding-a", 1, "settled");
+        insert_many(&db, "active", 2, "binding-a", 1, "sending");
+        insert_operation(
+            &db,
+            "active-unknown",
+            "binding-a",
+            1,
+            "outcome_unknown",
+            6000,
+        );
+        insert_operation(
+            &db,
+            "foreign-binding",
+            "binding-b",
+            1,
+            "outcome_unknown",
+            6001,
+        );
+        insert_operation(
+            &db,
+            "foreign-generation",
+            "binding-a",
+            2,
+            "native_accepted",
+            6002,
+        );
+
+        let projection =
+            startup_recovery_projection(&db, "binding-a", 1, "client-a", "link-a", "boot-a")
+                .unwrap();
+        assert_eq!(projection.schema_version, 1);
+        assert_eq!(projection.binding_id, "binding-a");
+        assert_eq!(projection.generation, 1);
+        assert_eq!(projection.worker_boot_id, "boot-a");
+        assert_eq!(projection.native_root_id.as_deref(), Some("root-a"));
+        assert!(projection.complete);
+        assert_eq!(projection.unresolved_operations.len(), 3);
+        assert!(
+            projection
+                .unresolved_operations
+                .iter()
+                .all(|operation| UNRESOLVED_OPERATION_STATES.contains(&operation.state.as_str()))
+        );
+        assert!(
+            !projection
+                .unresolved_operations
+                .iter()
+                .any(|operation| operation.state == "settled")
+        );
+
+        let stale_boot =
+            startup_recovery_projection(&db, "binding-a", 1, "client-a", "link-a", "boot-b")
+                .unwrap_err();
+        assert_eq!(stale_boot.code, "STALE_LINK");
+        let stale_link =
+            startup_recovery_projection(&db, "binding-a", 1, "client-a", "link-b", "boot-a")
+                .unwrap_err();
+        assert_eq!(stale_link.code, "STALE_LINK");
+        assert!(
+            startup_recovery_projection(&db, "binding-b", 1, "client-a", "link-a", "boot-a",)
+                .is_err()
+        );
+
+        insert_many(
+            &db,
+            "overflow",
+            MAX_SCOPE_UNRESOLVED_OPERATIONS - 2,
+            "binding-a",
+            1,
+            "outcome_unknown",
+        );
+        let overflow =
+            startup_recovery_projection(&db, "binding-a", 1, "client-a", "link-a", "boot-a")
+                .unwrap_err();
+        assert_eq!(overflow.code, "MODULE_READBACK_UNRESOLVED_OVERFLOW");
     }
 
     #[test]
