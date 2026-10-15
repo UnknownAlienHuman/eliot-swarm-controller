@@ -1029,12 +1029,14 @@ pub(super) fn selected_native_command_supported(
     let is_opencode_artifact = retained.module_id.as_str() == "eliot.opencode.v2"
         && retained.artifact.artifact_id.as_str() == "eliot-opencode-v2.rust-http.1";
     let opencode_reply_schema_supported = !is_opencode_artifact
-        || (matches!(retained.artifact.version.as_str(), "0.5.0" | "0.6.0")
-            && retained.command_schemas.iter().any(|schema| {
-                schema.schema_id == "swarm.opencode_reply_command"
-                    && schema.version == "1"
-                    && schema.sha256.is_none()
-            }));
+        || (matches!(
+            retained.artifact.version.as_str(),
+            "0.5.0" | "0.6.0" | "0.7.0"
+        ) && retained.command_schemas.iter().any(|schema| {
+            schema.schema_id == "swarm.opencode_reply_command"
+                && schema.version == "1"
+                && schema.sha256.is_none()
+        }));
     Ok(Some(
         capability_supported
             && schema_supported

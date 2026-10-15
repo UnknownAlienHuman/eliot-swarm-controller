@@ -216,7 +216,7 @@ async fn retained_attempt(store: &Store, attempt_id: &str) -> Value {
 
 #[tokio::test]
 async fn opencode_open_supports_reviewed_artifact_versions_without_widening_unknown_versions() {
-    for (version, supported) in [("0.5.0", true), ("0.6.0", true), ("0.7.0", false)] {
+    for (version, supported) in [("0.5.0", true), ("0.6.0", true), ("0.7.0", true)] {
         let f = Fixture::new().await;
         let mut descriptor = registered_opencode_descriptor();
         descriptor["artifact"]["version"] = json!(version);

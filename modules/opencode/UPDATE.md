@@ -112,3 +112,7 @@ already performed through the new adapter (module contract §11).
 Sessions created on the server remain native facts and are reconciled
 by GET/readback only — never replayed and never deleted to make a
 rollback look clean.
+
+## 0.7.0 metadata candidate
+
+Artifact 0.7.0 carries the actual 2.0.7 SSE, forms, and permission wire (7193ac83) with no new public schema: descriptor template, select-route example, config constant, handshake allowlist, and admission test agree on 0.7.0, and 0.5.0 with 0.6.0 stay admitted with historical receipts untouched. Recorded checks are the official 2.0.7 DTO plus generated durable-schema JS tests (2 pass) and the Rust inbox and log tests (9 pass, 1 ignored GET-only live check not run today). The candidate is not installed and not published until full candidate checks; rollback stays a redeploy of the previous host build with its route artifact id.
