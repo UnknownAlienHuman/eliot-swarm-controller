@@ -114,6 +114,9 @@ pub struct RuntimeCatalogRoute {
     pub installation: Evidence<String>,
     pub native_models: Evidence<Vec<Value>>,
     pub native_capabilities: Evidence<Vec<Value>>,
+    /// Adapter declaration metadata kept separate from native capability
+    /// readback. A current declaration does not prove native support.
+    pub declared_capabilities: Evidence<Vec<Value>>,
     pub trust: Evidence<String>,
     pub account_capacity_group: Evidence<String>,
     pub freshness: Vec<String>,

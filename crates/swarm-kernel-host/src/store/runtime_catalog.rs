@@ -153,6 +153,7 @@ fn project_route(
     };
     let native_models = observed_models(observed);
     let native_capabilities = observed_capabilities(observed);
+    let declared_capability_evidence = declared_capabilities(observed);
     let account_capacity_group = observed_account_group(observed);
     let installation = installation_evidence(observed, as_of_ms);
     let mut gaps = vec![
@@ -169,6 +170,7 @@ fn project_route(
     gaps.extend(observed.gaps.iter().cloned());
     gaps.extend(native_models.gaps.iter().cloned());
     gaps.extend(native_capabilities.gaps.iter().cloned());
+    gaps.extend(declared_capability_evidence.gaps.iter().cloned());
     gaps.extend(account_capacity_group.gaps.iter().cloned());
     gaps.extend(installation.gaps.iter().cloned());
     RuntimeCatalogRoute {
@@ -182,6 +184,7 @@ fn project_route(
         installation,
         native_models,
         native_capabilities,
+        declared_capabilities: declared_capability_evidence,
         trust,
         account_capacity_group,
         freshness: vec![
@@ -253,46 +256,59 @@ fn observed_models(observed: &ObservedNativeFacts) -> Evidence<Vec<Value>> {
     }
 }
 
-/// Surface the capability names the live binding actually reported.
-fn observed_capabilities(observed: &ObservedNativeFacts) -> Evidence<Vec<Value>> {
-    if !observed.supported_capabilities_observed && !observed.unsupported_capabilities_observed {
+/// Native capability readback has no current producer in this route. Adapter
+/// declarations are projected separately by `declared_capabilities`.
+fn observed_capabilities(_observed: &ObservedNativeFacts) -> Evidence<Vec<Value>> {
+    Evidence::unknown("no_current_retained_native_capability_readback_is_available_for_this_route")
+}
+
+/// Preserve adapter-declared capability metadata separately from native
+/// capability readback. The current Codex producer emits static declarations;
+/// they do not establish that the native service supports those methods.
+fn declared_capabilities(observed: &ObservedNativeFacts) -> Evidence<Vec<Value>> {
+    if !observed.declared_supported_capabilities_observed
+        && !observed.declared_unsupported_capabilities_observed
+    {
         return Evidence::unknown(
-            "no_current_retained_native_capability_list_is_available_for_this_route",
+            "no_current_retained_adapter_capability_declaration_is_available_for_this_route",
         );
     }
     let Some(observed_at_ms) = observed.observed_at_ms.filter(|value| *value > 0) else {
         return Evidence::unknown(
-            "native_capability_observation_timestamp_is_not_retained_for_this_route",
+            "adapter_capability_declaration_timestamp_is_not_retained_for_this_route",
         );
     };
     let mut values = Vec::new();
     values.extend(
         observed
-            .supported_capabilities
+            .declared_supported_capabilities
             .iter()
-            .map(|name| json!({"name": name, "status": "supported"})),
+            .map(|name| json!({"name": name, "status": "declared_supported"})),
     );
     values.extend(
         observed
-            .unsupported_capabilities
+            .declared_unsupported_capabilities
             .iter()
-            .map(|name| json!({"name": name, "status": "unsupported"})),
+            .map(|name| json!({"name": name, "status": "declared_unsupported"})),
     );
     let mut evidence = Evidence::current_with_coverage(
-        "retained_binding_native_describe_observation",
+        "retained_adapter_capability_declaration",
         observed_at_ms,
         "partial",
         values,
     );
-    if !observed.supported_capabilities_observed {
+    evidence
+        .gaps
+        .push("adapter_declared_capabilities_are_not_native_observations".to_owned());
+    if !observed.declared_supported_capabilities_observed {
         evidence
             .gaps
-            .push("native_supported_capability_list_is_not_retained".to_owned());
+            .push("adapter_declared_supported_capabilities_are_not_retained".to_owned());
     }
-    if !observed.unsupported_capabilities_observed {
+    if !observed.declared_unsupported_capabilities_observed {
         evidence
             .gaps
-            .push("native_unsupported_capability_list_is_not_retained".to_owned());
+            .push("adapter_declared_unsupported_capabilities_are_not_retained".to_owned());
     }
     evidence
 }
@@ -504,18 +520,18 @@ mod tests {
             } else {
                 None
             },
-            supported_capabilities: if with_model {
+            declared_supported_capabilities: if with_model {
                 vec!["agent.open".to_owned(), "task.dispatch".to_owned()]
             } else {
                 Vec::new()
             },
-            unsupported_capabilities: if with_model {
+            declared_unsupported_capabilities: if with_model {
                 vec!["agent.refresh".to_owned()]
             } else {
                 Vec::new()
             },
-            supported_capabilities_observed: with_model,
-            unsupported_capabilities_observed: with_model,
+            declared_supported_capabilities_observed: with_model,
+            declared_unsupported_capabilities_observed: with_model,
             gaps: Vec::new(),
         }
     }
@@ -544,19 +560,19 @@ mod tests {
         assert_eq!(projected.native_models.coverage.as_deref(), Some("partial"));
         assert_eq!(
             projected.native_capabilities.status,
-            EvidenceStatus::Current
+            EvidenceStatus::Unknown
         );
-        let capabilities = projected.native_capabilities.value.unwrap();
+        let capabilities = projected.declared_capabilities.value.unwrap();
         assert_eq!(capabilities.len(), 3);
-        assert!(
-            capabilities.iter().any(|value| {
-                value["name"] == "task.dispatch" && value["status"] == "supported"
-            })
-        );
-        assert!(
-            capabilities.iter().any(|value| {
-                value["name"] == "agent.refresh" && value["status"] == "unsupported"
-            })
+        assert!(capabilities.iter().any(|value| {
+            value["name"] == "task.dispatch" && value["status"] == "declared_supported"
+        }));
+        assert!(capabilities.iter().any(|value| {
+            value["name"] == "agent.refresh" && value["status"] == "declared_unsupported"
+        }));
+        assert_eq!(
+            projected.declared_capabilities.source.as_deref(),
+            Some("retained_adapter_capability_declaration")
         );
         assert!(!projected.gaps.iter().any(|gap| gap.is_empty()));
     }
@@ -622,10 +638,10 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_only_capability_observation_keeps_its_own_current_status() {
+    fn unsupported_only_adapter_declaration_stays_separate_from_native_readback() {
         let mut observed = observed(true);
-        observed.supported_capabilities.clear();
-        observed.supported_capabilities_observed = false;
+        observed.declared_supported_capabilities.clear();
+        observed.declared_supported_capabilities_observed = false;
         let configured = route(
             "codex",
             "eliot-codex.rust-headless.1",
@@ -639,18 +655,18 @@ mod tests {
         );
         assert_eq!(
             projected.native_capabilities.status,
-            EvidenceStatus::Current
+            EvidenceStatus::Unknown
         );
         assert_eq!(
-            projected.native_capabilities.value.as_ref().unwrap()[0],
-            json!({"name":"agent.refresh","status":"unsupported"})
+            projected.declared_capabilities.value.as_ref().unwrap()[0],
+            json!({"name":"agent.refresh","status":"declared_unsupported"})
         );
         assert!(
             projected
-                .native_capabilities
+                .declared_capabilities
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("supported_capability_list_is_not_retained"))
+                .any(|gap| gap.contains("declared_supported_capabilities_are_not_retained"))
         );
     }
 
@@ -676,6 +692,11 @@ mod tests {
             EvidenceStatus::Unknown
         );
         assert_eq!(projected.native_capabilities.observed_at_ms, None);
+        assert_eq!(
+            projected.declared_capabilities.status,
+            EvidenceStatus::Unknown
+        );
+        assert_eq!(projected.declared_capabilities.observed_at_ms, None);
     }
 
     #[test]
@@ -829,12 +850,11 @@ mod tests {
                 "requested_model":"gpt-5.6-luna",
                 "effective_model":"gpt-5.6-luna",
                 "effective_model_provider":"openai",
-                "served_model_status":"unknown"
-            },
-            "capabilities":{
-                "agent.open":"implemented",
-                "task.dispatch":"implemented",
-                "agent.refresh":"unavailable"
+                "served_model_status":"unknown",
+                "capabilities":{
+                    "supported":["agent.open","task.dispatch"],
+                    "unsupported":["agent.refresh"]
+                }
             }
         });
         let state = json!({
@@ -886,14 +906,19 @@ mod tests {
         );
         assert_eq!(
             current["routes"][0]["native_capabilities"]["status"],
+            "unknown"
+        );
+        assert!(current["routes"][0]["native_capabilities"]["value"].is_null());
+        assert_eq!(
+            current["routes"][0]["declared_capabilities"]["status"],
             "current"
         );
         assert!(
-            current["routes"][0]["native_capabilities"]["value"]
+            current["routes"][0]["declared_capabilities"]["value"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|v| v["name"] == "task.dispatch" && v["status"] == "supported")
+                .any(|v| { v["name"] == "task.dispatch" && v["status"] == "declared_supported" })
         );
         db.execute("UPDATE bindings SET state_json=json_set(state_json,'$.bridge_boot_id','boot-2') WHERE binding_id='binding-1'", []).unwrap();
         let stale = read(&db, &manager, &json!({}), &config).unwrap();
@@ -975,11 +1000,11 @@ mod tests {
                         "requested_model":model,
                         "effective_model":model,
                         "effective_model_provider":"openai",
-                        "served_model_status":"observed"
-                    },
-                    "capabilities":{
-                        "agent.open":"implemented",
-                        "agent.refresh":"unavailable"
+                        "served_model_status":"observed",
+                        "capabilities":{
+                            "supported":["agent.open"],
+                            "unsupported":["agent.refresh"]
+                        }
                     }
                 },
                 "observed_at_ms":1000 + sequence,
@@ -1037,6 +1062,24 @@ mod tests {
         assert_eq!(
             result_a["routes"][0]["native_models"]["value"][0],
             "model-a"
+        );
+        assert_eq!(
+            result_a["routes"][0]["native_capabilities"]["status"],
+            "unknown"
+        );
+        assert!(result_a["routes"][0]["native_capabilities"]["value"].is_null());
+        assert_eq!(
+            result_a["routes"][0]["declared_capabilities"]["status"],
+            "current"
+        );
+        assert!(
+            result_a["routes"][0]["declared_capabilities"]["value"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| {
+                    value["name"] == "agent.open" && value["status"] == "declared_supported"
+                })
         );
         assert_eq!(
             result_a["routes"][0]["native_models"]["value"]

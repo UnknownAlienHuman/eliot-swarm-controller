@@ -55,10 +55,12 @@ pub(super) struct ObservedNativeFacts {
     pub model_provider: Option<String>,
     pub model_status: Option<String>,
     pub model_definition: Option<Value>,
-    pub supported_capabilities: Vec<String>,
-    pub unsupported_capabilities: Vec<String>,
-    pub supported_capabilities_observed: bool,
-    pub unsupported_capabilities_observed: bool,
+    // No current producer supplies native capability readback. These fields
+    // retain adapter-declared implementation metadata under a separate label.
+    pub declared_supported_capabilities: Vec<String>,
+    pub declared_unsupported_capabilities: Vec<String>,
+    pub declared_supported_capabilities_observed: bool,
+    pub declared_unsupported_capabilities_observed: bool,
     pub gaps: Vec<String>,
 }
 
@@ -282,14 +284,15 @@ pub(super) fn route_facts(read: &RetainedNativeRead, route: &Route) -> ObservedN
     facts.observed_model = bounded_text(describe["effective_model"].as_str(), 256);
     facts.model_provider = bounded_text(describe["effective_model_provider"].as_str(), 256);
     facts.model_status = bounded_text(describe["served_model_status"].as_str(), 64);
-    // Codex modules retain capabilities as a top-level map
-    // (capability -> "implemented" / "unavailable"); other adapters may
-    // retain describe.capabilities.supported/unsupported arrays. Both shapes
-    // are adapter vocabulary and are only surfaced with the live-binding fences above.
-    let mut supported: Vec<String> = Vec::new();
-    let mut unsupported: Vec<String> = Vec::new();
-    let mut supported_observed = false;
-    let mut unsupported_observed = false;
+    // Adapter describe payloads carry declared implementation metadata. The
+    // Codex producer emits static supported/unsupported arrays; another
+    // adapter shape uses a capability -> implemented/unavailable map. Neither
+    // shape is a native capability probe, so retain it separately and leave
+    // native capability readback unknown.
+    let mut declared_supported: Vec<String> = Vec::new();
+    let mut declared_unsupported: Vec<String> = Vec::new();
+    let mut declared_supported_observed = false;
+    let mut declared_unsupported_observed = false;
     if let Some(map) = native.get("capabilities").and_then(|v| v.as_object()) {
         for (name, state) in map {
             let Some(name) = bounded_text(Some(name.as_str()), 64) else {
@@ -297,12 +300,12 @@ pub(super) fn route_facts(read: &RetainedNativeRead, route: &Route) -> ObservedN
             };
             match state.as_str() {
                 Some("implemented") => {
-                    supported_observed = true;
-                    supported.push(name);
+                    declared_supported_observed = true;
+                    declared_supported.push(name);
                 }
                 Some("unavailable") => {
-                    unsupported_observed = true;
-                    unsupported.push(name);
+                    declared_unsupported_observed = true;
+                    declared_unsupported.push(name);
                 }
                 _ => continue,
             }
@@ -310,38 +313,35 @@ pub(super) fn route_facts(read: &RetainedNativeRead, route: &Route) -> ObservedN
     }
     if let Some(capabilities) = describe.get("capabilities").and_then(Value::as_object) {
         if let Some(names) = capabilities.get("supported").and_then(Value::as_array) {
-            supported_observed = true;
-            supported.extend(
+            declared_supported_observed = true;
+            declared_supported.extend(
                 names
                     .iter()
                     .filter_map(|name| bounded_text(name.as_str(), 64)),
             );
         }
         if let Some(names) = capabilities.get("unsupported").and_then(Value::as_array) {
-            unsupported_observed = true;
-            unsupported.extend(
+            declared_unsupported_observed = true;
+            declared_unsupported.extend(
                 names
                     .iter()
                     .filter_map(|name| bounded_text(name.as_str(), 64)),
             );
         }
     }
-    if !supported_observed {
+    if declared_supported_observed || declared_unsupported_observed {
         facts
             .gaps
-            .push("native_supported_capability_list_is_not_retained".to_owned());
+            .push("adapter_declared_capabilities_are_not_native_observations".to_owned());
     } else {
-        facts.supported_capabilities = dedupe(supported);
-    }
-    if !unsupported_observed {
         facts
             .gaps
-            .push("native_unsupported_capability_list_is_not_retained".to_owned());
-    } else {
-        facts.unsupported_capabilities = dedupe(unsupported);
+            .push("adapter_declared_capability_lists_are_not_retained".to_owned());
     }
-    facts.supported_capabilities_observed = supported_observed;
-    facts.unsupported_capabilities_observed = unsupported_observed;
+    facts.declared_supported_capabilities = dedupe(declared_supported);
+    facts.declared_unsupported_capabilities = dedupe(declared_unsupported);
+    facts.declared_supported_capabilities_observed = declared_supported_observed;
+    facts.declared_unsupported_capabilities_observed = declared_unsupported_observed;
     let model_state = &read.effective["effective_model"];
     if model_state["complete"] == true && bounded_text(model_state["kind"].as_str(), 64).is_some() {
         let mut definition = Map::new();
@@ -529,19 +529,19 @@ mod tests {
     }
 
     #[test]
-    fn current_retained_observation_projects_the_observed_model_and_capabilities() {
+    fn current_retained_observation_projects_the_observed_model_and_declared_capabilities() {
         let facts = route_facts(&read(false, 7), &route("eliot-codex.rust-headless.1"));
         assert_eq!(facts.observed_model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(facts.requested_model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(facts.model_provider.as_deref(), Some("openai"));
         assert!(
             facts
-                .supported_capabilities
+                .declared_supported_capabilities
                 .contains(&"task.dispatch".to_owned())
         );
         assert!(
             facts
-                .unsupported_capabilities
+                .declared_unsupported_capabilities
                 .contains(&"agent.refresh".to_owned())
         );
         assert!(facts.model_definition.is_some());
@@ -560,7 +560,12 @@ mod tests {
         );
         assert_eq!(facts.native_observation_id, Some(42));
         assert_eq!(facts.binding_id.as_deref(), Some("binding-1"));
-        assert!(facts.gaps.is_empty());
+        assert!(
+            facts
+                .gaps
+                .iter()
+                .any(|gap| gap == "adapter_declared_capabilities_are_not_native_observations")
+        );
     }
 
     #[test]
@@ -583,7 +588,7 @@ mod tests {
         released.released = true;
         let facts = route_facts(&released, &route("eliot-codex.rust-headless.1"));
         assert!(facts.observed_model.is_none());
-        assert!(facts.supported_capabilities.is_empty());
+        assert!(facts.declared_supported_capabilities.is_empty());
         assert!(
             facts
                 .gaps
@@ -630,13 +635,13 @@ mod tests {
         }
         read.effective = serde_json::json!({});
         let facts = route_facts(&read, &route("eliot-codex.rust-headless.1"));
-        assert!(facts.supported_capabilities.is_empty());
-        assert!(facts.unsupported_capabilities.is_empty());
+        assert!(facts.declared_supported_capabilities.is_empty());
+        assert!(facts.declared_unsupported_capabilities.is_empty());
         assert!(
             facts
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("capability_list_is_not_retained"))
+                .any(|gap| gap.contains("adapter_declared_capability_lists_are_not_retained"))
         );
         assert!(
             facts
