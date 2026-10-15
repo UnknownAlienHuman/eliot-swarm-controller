@@ -7,7 +7,7 @@
 
 ## 0. Authority
 
-This document resolves the explicit owner-decision issues opened by the Documentation Program. It is subordinate to the product architecture and module contract on runtime invariants, but it is the single accepted edition for workflow-policy choices that those contracts intentionally left to the owner.
+This document resolves the explicit owner-decision issues opened by the Documentation Program. It is subordinate to the product architecture and module contract on runtime invariants, and preserves the frozen v1 owner-policy section below. The accepted edition identifiers for new Attempts are listed in [Task policy](task-policy.md); v2 is separately frozen in [owner-policy-v2.md](owner-policy-v2.md).
 
 Older field briefs and incident logs remain evidence. They do not override this edition by date, file mtime, branch name or generated TASK text.
 

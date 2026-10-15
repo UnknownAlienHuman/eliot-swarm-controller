@@ -2,6 +2,36 @@
 
 ## Current state
 
+### Current source and completion map
+
+**Source baseline:** [main at 6cd5b1bcda21b4c26d160de98f5b47afce25401a](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/6cd5b1bcda21b4c26d160de98f5b47afce25401a), including merged documentation-only [PR #24](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/24). The project remains **PARTIAL_PROGRESS**. The [README capability matrix](../README.md#capability-and-qualification-matrix) is the per-component artifact and evidence view; its states do not transfer between artifact generations or evidence classes.
+
+#### Issue #153 source reconciliation
+
+| Finding | Current main source/document state | Qualification boundary |
+| --- | --- | --- |
+| D1 — qualification-fault test gate | The swarm-automation qualification-admit tests are gated by qualification-faults in [lib.rs](../crates/swarm-automation/src/lib.rs). | Source state only. This documentation change did not run cargo check --workspace --all-targets or the manual full qualification. |
+| D2 — artifact matrix, example routes, policy editions | README rows name Claude bridge.5, Command glue.5, Zed eval-cli.2, and both accepted owner-policy IDs; the [example routes](../config/controller.example.toml) select Claude bridge.5 and Command glue.5. The v1 policy section remains frozen in [owner-decisions.md](owner-decisions.md); [task-policy.md](task-policy.md) describes v1 and v2. | The retired-ID/default mismatch from the audit baseline is corrected. The README and example do not qualify native execution. |
+| D3/D5 — #150, #146, #148 and #149 | [#150](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/150), [#146](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/146), [#148](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/148) and [#149](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/149) are closed as source repairs. Current main contains the cached-Operation lookup in [acceptance.rs](../crates/swarm-kernel-host/src/store/acceptance.rs), fair launch reconciliation in [store/mod.rs](../crates/swarm-kernel-host/src/store/mod.rs), cached artifact-source validation in [object_scope.rs](../crates/swarm-kernel-host/src/store/object_scope.rs), and persisted OpenCode removal uncertainty in [retention.rs](../crates/swarm-adapter-opencode/src/journal/retention.rs). | The historical defect reports are not current-source findings. Closure of those source defects does not establish fresh current-head or native qualification. |
+| D4 — damaged-record isolation | Current source has JSON-validity guards in [legacy_worker_demand.rs](../crates/swarm-kernel-host/src/store/legacy_worker_demand.rs), typed launcher quarantine in [launcher_native_mcp.rs](../crates/swarm-kernel-host/src/store/launcher_native_mcp.rs), and OpenCode startup recovery that holds in Blocked on a recovery error in [lib.rs](../crates/swarm-adapter-opencode/src/lib.rs). | Do not repeat the older audit's blanket path claims or claim universal isolation. The full cross-reconciler and damaged-outbox matrix is not qualified by this source check. |
+
+#### Remaining required core gates
+
+The eight currently open remainder PRs are drafts based on 40591a2: [#61](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/61), [#42](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/42), [#71](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/71), [#69](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/69), [#67](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/67), [#44](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/44), [#64](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/64) and [#43](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/43). Their remaining-case descriptions are pointers, not current-main proof; reconcile each against the source at the accepted candidate before implementation or closure.
+
+| Gate | Remaining core acceptance work | Current boundary |
+| --- | --- | --- |
+| CheckRunner custody and one terminal CheckRun | #61 retains the actual independent-probe overlap and scope=None hold gaps, plus a decision on whether a separate cache-verification-error unwind is required; #71 requires one fresh harmless connected CheckRun through exact result readback and resource release or cleanup_pending, with no replay. | Source fixes and historical focused receipts are narrower than integrated cross-platform qualification. |
+| ScriptRun start and adapter-journal recovery | #67 requires durable Allow/Deny race and restart readback before execution; #69 requires bounded startup recovery and exact reclamation crash-boundary evidence. | Preserve the shared file-custody seam owned by #65; do not infer that age or a digest closes recovery uncertainty. |
+| Connected native adapter contracts | #42 covers Claude family retirement, exact result ACK and live callback semantics; #43 covers the selected OpenCode loop-step caller and live service boundary; #44 covers advertised ACP configuration/readback and restore/family behavior; #64 covers provider-condition ordering, root limits and caller parity. | The [README matrix](../README.md#capability-and-qualification-matrix) retains per-artifact fixture/live states. Current-artifact native qualification is **NOT_RUN in this documentation pass**; earlier observations remain scoped to their recorded artifacts and runs. |
+| Whole local core delivery | The existing [O1–O11 delivery blocks](#remaining-delivery-blocks) remain the scope map for manager ownership, durable intake, launch, adapters, Git/GitHub, hooks, scripts, schedules/goals and integrated qualification. | These work areas remain **PARTIAL_PROGRESS**; no offline receipt or source-only status marks the full local cycle accepted. |
+
+#### Optional and external qualification
+
+[PR #24](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/24) is a merged documentation/design package only. The optional local-model/Kilo/WSL2 program is not a core-delivery prerequisite; installation and native Kilo, vLLM, WSL, GPU and model qualification are **NOT_RUN**. The optional [Remote Gateway](gateway.md) has source implementation, while live HTTP, Cloudflare/OAuth and external-client qualification remain pending as stated in the README matrix.
+
+This documentation update ran no code tests, native qualification, installation or model calls. It changes no qualification status; all historical checks remain scoped to their recorded source revisions.
+
 ### Issue #99 cross-Task coordination and index coverage — 2026-10-14
 
 The existing host watch reconciler now advances a versioned coordination
@@ -42,9 +72,9 @@ grant still belongs to its reviewed subject: a reviewer can coordinate across
 Tasks through the same current contract/scope relations without broadening
 the sponsored-review grant or creating a cross-Task review authority.
 
-### Gates and docs alignment -- 2026-10-14 (this candidate, unqualified)
+### Gates and docs alignment — 2026-10-14 (historical candidate snapshot; unqualified)
 
-This candidate only gates the swarm-automation qualification-admit test module behind qualification-faults (crates/swarm-automation/src/lib.rs) and aligns the README capability matrix and example config with the shipped descriptors (Claude bridge.5 per modules/claude/module-descriptor.template.json, Command glue.5 per modules/command/module-descriptor-glue.5.template.json, Zed eval-cli.2 per crates/swarm-kernel-host/src/runtime/zed.rs ARTIFACT_ID, owner-policy v1+v2 per crates/swarm-kernel-host/src/policy.rs and docs/task-policy.md). Production boundaries are unchanged; faults stay off by default and ordinary tests are not suppressed. Project status remains PARTIAL_PROGRESS: source and fixture evidence only, not native or model qualification. Current main c698638 already contains the #149 retention-durability fix (12d7fd7) and the #150 cached-source acceptance closure (219d2f3, c0b50e1, c698638); this candidate does not requalify them and does not repeat D3. The frozen v1 section in docs/owner-decisions.md (digest 786df3cd) and the frozen v2 text in docs/owner-policy-v2.md (digest a3490caa) are preserved.
+The candidate snapshot gated the swarm-automation qualification-admit test module behind qualification-faults (crates/swarm-automation/src/lib.rs) and aligns the README capability matrix and example config with the shipped descriptors (Claude bridge.5 per modules/claude/module-descriptor.template.json, Command glue.5 per modules/command/module-descriptor-glue.5.template.json, Zed eval-cli.2 per crates/swarm-kernel-host/src/runtime/zed.rs ARTIFACT_ID, owner-policy v1+v2 per crates/swarm-kernel-host/src/policy.rs and docs/task-policy.md). Production boundaries are unchanged; faults stay off by default and ordinary tests are not suppressed. Project status remains PARTIAL_PROGRESS: source and fixture evidence only, not native or model qualification. At the time of this candidate snapshot, main was c698638 and already contained the #149 retention-durability fix (12d7fd7) and the #150 cached-source acceptance closure (219d2f3, c0b50e1, c698638). This dated evidence is not a current-head qualification; the current source and completion map is at the top of this file. The frozen v1 section in docs/owner-decisions.md (digest 786df3cd) and the frozen v2 text in docs/owner-policy-v2.md (digest a3490caa) are preserved.
 
 ### Optional worker isolation and supervisor restart — 2026-10-10
 
