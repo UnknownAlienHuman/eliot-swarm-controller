@@ -11,6 +11,37 @@ one run measured, under the conditions stated below, and no more.
 
 ## Scenario
 
+### Local Windows execution, 15 October 2026
+
+The existing harness ran once against the clean `350b4cbdbb3c2cf4f4da88dc9d8bf881d7833c80`
+release package. The measured kernel image SHA-256 was
+`efe9f060ce5b14607110857d9b91d96290578395364b786bfa4e7b732216292a`.
+The [result record](qualification/2026-10-15-c11-controller-only.json) retains the
+measurements, software versions, invocation parameters and raw-result digest;
+local filesystem paths and the machine hostname are omitted. This is a local
+execution record, not an independent CI or final-head qualification.
+
+| Measurement | Result |
+| --- | --- |
+| Registered / connected controller clients | 200 / 200 |
+| Senders / consumers | 32 / 168 |
+| Accepted sends / errors | 3,167 / 0 |
+| Window including sender drain | 24.883 s |
+| Durable event admissions | 127.3 events/s |
+| Verification drain | Exactly 3,167 matching events |
+| Loaded `host.status` p95 | 1.512 ms |
+| Host / driver CPU | 25.640625 s / 0.86 s |
+| Host peak working set | 55,812,096 bytes |
+| Host exit | 0, owned stdin EOF |
+| Native agents measured | 0 |
+
+No build process was observed during the baseline or load. Six baseline CPU
+samples averaged 31.735%; these are environment observations, with no added CPU
+percentage gate. The 1,000-events/s target was **not met**. The harness integrity
+checks passed, but Issue #11 remains open for the throughput target and its
+separate requirement to qualify 200 real native agents. This run establishes
+neither a native population result nor a whole-project pass.
+
 `tools/host-load.py` (Python 3 standard library only) starts one real
 `swarm-kernel-host host` process on a fresh temporary data directory and drives
 it over its local IPC — newline-delimited JSON-RPC 2.0 on the Unix socket or the
