@@ -493,7 +493,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
     assert!(!journal.startup_recovery_complete());
     drop(journal);
 
-    let _journal_capture = crate::startup_poll_tests::capture_next_startup_journal();
+    let _journal_capture = crate::startup_poll_tests::capture_next_startup_journal(&state_dir);
 
     let claim = startup_fixture_contract();
     let claim_value = serde_json::to_value(&claim).unwrap();

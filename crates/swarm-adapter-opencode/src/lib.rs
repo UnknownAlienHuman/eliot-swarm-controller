@@ -176,6 +176,7 @@ mod startup_poll_tests {
 
     static CAPTURE_NEXT_JOURNAL: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static CAPTURE_EXPECTED_STATE_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
     static CAPTURED_JOURNAL: OnceLock<Mutex<Option<Arc<Journal>>>> = OnceLock::new();
 
     fn captured_journal() -> &'static Mutex<Option<Arc<Journal>>> {
@@ -187,13 +188,18 @@ mod startup_poll_tests {
     impl Drop for StartupJournalCapture {
         fn drop(&mut self) {
             CAPTURE_NEXT_JOURNAL.store(false, Ordering::Release);
+            if let Ok(mut expected) = CAPTURE_EXPECTED_STATE_DIR.lock() {
+                expected.take();
+            }
             if let Ok(mut captured) = captured_journal().lock() {
                 captured.take();
             }
         }
     }
 
-    pub(crate) fn capture_next_startup_journal() -> StartupJournalCapture {
+    pub(crate) fn capture_next_startup_journal(
+        state_dir: &std::path::Path,
+    ) -> StartupJournalCapture {
         let captured = captured_journal()
             .lock()
             .expect("startup journal capture lock is available");
@@ -201,6 +207,7 @@ mod startup_poll_tests {
             captured.is_none(),
             "no earlier startup journal remains captured"
         );
+        *CAPTURE_EXPECTED_STATE_DIR.lock().unwrap() = Some(state_dir.to_path_buf());
         assert!(
             !CAPTURE_NEXT_JOURNAL.swap(true, Ordering::AcqRel),
             "only one startup journal capture may be armed"
@@ -208,8 +215,16 @@ mod startup_poll_tests {
         StartupJournalCapture
     }
 
-    pub(crate) fn capture_startup_journal_if_armed(journal: &Arc<Journal>) {
-        if CAPTURE_NEXT_JOURNAL.swap(false, Ordering::AcqRel)
+    pub(crate) fn capture_startup_journal_if_armed(
+        journal: &Arc<Journal>,
+        state_dir: &std::path::Path,
+    ) {
+        let matching = CAPTURE_EXPECTED_STATE_DIR
+            .lock()
+            .ok()
+            .is_some_and(|expected| expected.as_deref() == Some(state_dir));
+        if matching
+            && CAPTURE_NEXT_JOURNAL.swap(false, Ordering::AcqRel)
             && let Ok(mut captured) = captured_journal().lock()
         {
             *captured = Some(Arc::clone(journal));
@@ -218,6 +233,7 @@ mod startup_poll_tests {
 
     pub(crate) fn take_captured_startup_journal() -> Option<Arc<Journal>> {
         CAPTURE_NEXT_JOURNAL.store(false, Ordering::Release);
+        CAPTURE_EXPECTED_STATE_DIR.lock().ok()?.take();
         captured_journal().lock().ok()?.take()
     }
 
@@ -287,7 +303,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         &route_sha256,
     )?);
     #[cfg(test)]
-    startup_poll_tests::capture_startup_journal_if_armed(&journal);
+    startup_poll_tests::capture_startup_journal_if_armed(&journal, &config.state_dir);
     // Before hello, visit at most one sparse durable-closure window. A cold
     // legacy name census starts on a blocking worker and never gates service
     // polling; exact requested-operation reads remain available meanwhile.
