@@ -620,7 +620,10 @@ async fn cron_quarantine_reaches_store_outcome_while_goal_reminder_progresses() 
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-struct SchedulerFixtureChild(std::process::Child);
+struct SchedulerFixtureChild(
+    std::process::Child,
+    #[cfg(windows)] Option<swarm_process::Group>,
+);
 
 impl SchedulerFixtureChild {
     fn spawn(config_path: &std::path::Path, ready_path: &std::path::Path) -> Self {
@@ -636,6 +639,9 @@ impl SchedulerFixtureChild {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        #[cfg(windows)]
+        let mut owner = Self(child, None);
+        #[cfg(not(windows))]
         let mut owner = Self(child);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !ready_path.exists() {
@@ -649,6 +655,25 @@ impl SchedulerFixtureChild {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        #[cfg(windows)]
+        {
+            let config = swarm_automation::read_worker_config_file(config_path).unwrap();
+            let launched = swarm_process::spawned_identity(owner.0.id()).unwrap();
+            let identity = swarm_automation::service_owner_group_identity(
+                &launched,
+                &config.service_owner_token,
+            )
+            .unwrap();
+            owner.1 = Some(
+                swarm_automation::retain_service_owner_family(
+                    &identity,
+                    &config.service_owner_token,
+                )
+                .expect(
+                    "retain the ready fixture service's exact Job through child wait and finish",
+                ),
+            );
+        }
         owner
     }
 }
@@ -658,41 +683,6 @@ impl Drop for SchedulerFixtureChild {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-#[cfg(windows)]
-struct SchedulerFamilyHold {
-    handle: windows_sys::Win32::Foundation::HANDLE,
-}
-
-// SAFETY: query-only Job handle, never signaled, always closed on Drop.
-#[cfg(windows)]
-unsafe impl Send for SchedulerFamilyHold {}
-
-#[cfg(windows)]
-impl Drop for SchedulerFamilyHold {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.handle);
-        }
-    }
-}
-
-/// Retain the exact scheduler service Job through child exit so Windows
-/// departure proof stays observable. Returns None when the named Job is not
-/// yet visible; the caller then lets finish report truthful PROOF_UNAVAILABLE.
-#[cfg(windows)]
-fn retain_scheduler_family(token: &str) -> Option<SchedulerFamilyHold> {
-    use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
-    const JOB_QUERY_ACCESS: u32 = 0x0004;
-    let name = format!(r"Global\EliotSwarmService-AutomationScheduler-{token}");
-    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-    // SAFETY: nul-terminated UTF-16, query-only handle always closed.
-    let handle = unsafe { OpenJobObjectW(JOB_QUERY_ACCESS, 0, wide.as_ptr()) };
-    if handle.is_null() {
-        return None;
-    }
-    Some(SchedulerFamilyHold { handle })
 }
 
 #[test]
@@ -1295,14 +1285,6 @@ async fn r48_owner_lost_store_results_hold_intent_and_process_capacity() {
     assert_eq!(blocked.code, "AUTOMATION_SERVICE_OWNER_RETAINED");
     assert_eq!(child_launch_calls, 1);
     assert!(child.0.try_wait().unwrap().is_none());
-    // Retain the exact service Job through exit so finish observes empty;
-    // missing Job still reports PROOF_UNAVAILABLE, exact identity unchanged.
-    #[cfg(windows)]
-    let _scheduler_hold = store
-        .scheduler_owner_token()
-        .ok()
-        .and_then(|token| retain_scheduler_family(token));
-
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     store
@@ -1402,6 +1384,9 @@ async fn r48_owner_stale_callbacks_keep_old_receipt_out_of_current_host_status()
         .abandon_exited_automation_scheduler_worker(old_scope, old_launch_id, old_identity)
         .await
         .unwrap();
+    // Finish proved this old family empty. Release its observation handle
+    // before the next fixture worker creates the same service-token Job.
+    drop(old_child);
 
     let ready_path = directory.join("r48-current-scheduler-owner-ready");
     let (scope, launch_id, mut child) =

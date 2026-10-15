@@ -32,7 +32,7 @@ const PROBE_STDERR_LIMIT: usize = 64 * 1024;
 const PROBE_REQUEST_LIMIT: usize = 1024 * 1024;
 const PROBE_RESPONSE_LIMIT: usize = PROBE_STDOUT_LIMIT + PROBE_STDERR_LIMIT + 1024;
 const PROBE_CLEANUP_GRACE: Duration = Duration::from_secs(5);
-const PROBE_CLEANUP_RETRY: Duration = Duration::from_millis(250);
+pub(crate) const PROBE_CLEANUP_RETRY: Duration = Duration::from_millis(250);
 const PROBE_MAX_CLEANUP_REQUESTS: u8 = 3;
 const PROBE_CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const PROBE_HELPER_WAIT_GRACE: Duration = Duration::from_secs(45);
@@ -354,6 +354,8 @@ pub(crate) fn pending_probe_cleanup_owner_for_test(
             family_token: None,
             #[cfg(windows)]
             family_query: None,
+            #[cfg(windows)]
+            next_family_cancel: None,
             exit_status: None,
             status_observation_failed: false,
             capture_setup_failed: true,
@@ -388,6 +390,8 @@ struct ProbeHelperCustody {
     family_token: Option<String>,
     #[cfg(windows)]
     family_query: Option<Group>,
+    #[cfg(windows)]
+    next_family_cancel: Option<Instant>,
     exit_status: Option<ExitStatus>,
     status_observation_failed: bool,
     capture_setup_failed: bool,
@@ -418,6 +422,8 @@ impl ProbeHelperCustody {
         self.load_family_identity();
         #[cfg(windows)]
         self.retain_family_query();
+        #[cfg(windows)]
+        self.cancel_orphaned_family();
         if self
             .capture
             .as_ref()
@@ -547,6 +553,28 @@ impl ProbeHelperCustody {
         {
             self.family_query = Group::open_check_query(identity, token).ok();
         }
+    }
+
+    #[cfg(windows)]
+    fn cancel_orphaned_family(&mut self) {
+        if self.exit_status.is_none()
+            || self
+                .next_family_cancel
+                .is_some_and(|next| Instant::now() < next)
+        {
+            return;
+        }
+        let Some(query) = self.family_query.as_ref() else {
+            return;
+        };
+        if !query.family_empty().is_ok_and(|empty| !empty) {
+            return;
+        }
+        self.next_family_cancel = Some(Instant::now() + PROBE_CLEANUP_RETRY);
+        // The helper's exact Child has exited. Keep its Job observable while
+        // cancelling only members verified in that same transient check Job;
+        // otherwise this handle could suppress KILL_ON_JOB_CLOSE forever.
+        let _ = query.cancel_children();
     }
 
     fn family_departed_once(&self) -> bool {
@@ -1329,6 +1357,8 @@ fn command_output_with_cleanup(
         family_token: None,
         #[cfg(windows)]
         family_query: None,
+        #[cfg(windows)]
+        next_family_cancel: None,
         exit_status: None,
         status_observation_failed: false,
         capture_setup_failed: false,
@@ -3531,6 +3561,8 @@ pub(crate) mod tests {
             family_token: None,
             #[cfg(windows)]
             family_query: None,
+            #[cfg(windows)]
+            next_family_cancel: None,
             exit_status: None,
             status_observation_failed: false,
             capture_setup_failed: false,
@@ -3594,6 +3626,57 @@ pub(crate) mod tests {
             );
         }
         (owner, fixture)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_custody_reaps_nested_family_after_helper_exit() {
+        let profile = profile(false);
+        let candidate = source(
+            &model::digest(b"probe-lost-helper-candidate"),
+            "probe-lost-helper-candidate",
+        );
+        let scope = ProbeCleanupScope::for_candidate(&profile, &candidate)
+            .expect("derive lost-helper cleanup scope");
+        let (mut owner, fixture) = pending_probe_custody_fixture(scope);
+        let target = fixture.process_identity("target.identity.json");
+        let descendant = fixture.process_identity("descendant.identity.json");
+        assert!(owner.custody.family_query.is_some());
+        owner
+            .custody
+            .child
+            .kill()
+            .expect("lose the exact owned helper");
+        let helper_exit = owner
+            .custody
+            .child
+            .wait()
+            .expect("observe exact helper exit");
+        assert!(!helper_exit.success());
+        assert!(
+            !fixture.process_departed(&target) && !fixture.process_departed(&descendant),
+            "retained query handles keep the undisarmed Job live after helper loss"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while owner.is_pending() && Instant::now() < deadline {
+            owner.poll();
+            if owner.is_pending() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(!owner.is_pending(), "lost-helper cleanup must converge");
+        assert!(owner.custody.family_departed_proven);
+        assert!(fixture.process_departed(&target));
+        assert!(fixture.process_departed(&descendant));
+        assert_eq!(owner.custody.response_group_empty, None);
+        assert_eq!(owner.custody.exit_status.as_ref(), Some(&helper_exit));
+        assert!(
+            !owner.custody.exit_status.as_ref().unwrap().success(),
+            "family cleanup never changes the failed helper's observed status"
+        );
+        drop(owner);
+        drop(fixture);
     }
 
     #[cfg(any(windows, target_os = "linux"))]

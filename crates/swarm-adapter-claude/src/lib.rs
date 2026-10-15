@@ -4356,6 +4356,25 @@ mod module_family_replacement_fixture {
         );
         let boot_id = std::env::var("CLAUDE_LIFECYCLE_BOOT_ID")
             .expect("module boot id is passed by the module owner");
+        // Keep this real worker alive until the production owner has published
+        // its identity. The replacement's terminal gate must not race the
+        // owner's image/birth read with a fixture-only fast process exit.
+        let identity_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let recorded =
+                read_report(root.join("module-state").join("worker.json")).is_some_and(|worker| {
+                    worker["boot_id"] == boot_id
+                        && worker["process"]["pid"].as_u64() == Some(u64::from(std::process::id()))
+                });
+            if recorded {
+                break;
+            }
+            assert!(
+                Instant::now() < identity_deadline,
+                "the real owner must publish this worker's exact identity before fixture readiness"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         let mode_marker = match mode.as_str() {
             "retire" => "retiring-worker-started",
             "replacement" => "replacement-worker-started",
@@ -4617,7 +4636,7 @@ if (process.argv[2] === '--held-descendant') {
       return;
     }
     const child = spawn(process.execPath, [process.argv[1], '--held-descendant'], {
-      detached: true, stdio: 'ignore', windowsHide: true,
+      detached: process.platform === 'win32', stdio: 'ignore', windowsHide: true,
     });
     child.unref();
     const deadline = Date.now() + 10000;

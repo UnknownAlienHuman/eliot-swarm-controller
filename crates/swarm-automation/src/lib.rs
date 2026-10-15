@@ -342,10 +342,10 @@ pub fn service_owner_group_identity(
     }
 }
 
-pub fn service_owner_family_empty(
+fn service_owner_observation_identity(
     identity: &serde_json::Value,
     service_owner_token: &str,
-) -> swarm_contracts::error::Result<bool> {
+) -> swarm_contracts::error::Result<serde_json::Value> {
     if !is_service_owner_token(service_owner_token)
         || identity["purpose"] != "automation_scheduler"
         || !service_owner_group_identity_shape(identity)
@@ -354,18 +354,36 @@ pub fn service_owner_family_empty(
             "scheduler owner family identity is invalid",
         ));
     }
+    let identity = identity.clone();
     #[cfg(windows)]
-    {
-        let mut identity = identity.clone();
+    let identity = {
+        let mut identity = identity;
         identity["job_name"] = serde_json::json!(format!(
             "Global\\EliotSwarmService-AutomationScheduler-{service_owner_token}"
         ));
-        swarm_process::departed_empty(&identity, service_owner_token)
-    }
-    #[cfg(not(windows))]
-    {
-        swarm_process::departed_empty(identity, service_owner_token)
-    }
+        identity
+    };
+    Ok(identity)
+}
+
+pub fn service_owner_family_empty(
+    identity: &serde_json::Value,
+    service_owner_token: &str,
+) -> swarm_contracts::error::Result<bool> {
+    let identity = service_owner_observation_identity(identity, service_owner_token)?;
+    swarm_process::departed_empty(&identity, service_owner_token)
+}
+
+/// Keep the exact service Job query alive through child exit and Store finish.
+/// The closed wire DTO and token retain the same validation as departure;
+/// this observer cannot terminate service members or change Job limits.
+#[cfg(windows)]
+pub fn retain_service_owner_family(
+    identity: &serde_json::Value,
+    service_owner_token: &str,
+) -> swarm_contracts::error::Result<swarm_process::Group> {
+    let identity = service_owner_observation_identity(identity, service_owner_token)?;
+    swarm_process::Group::open_scheduler_query(&identity, service_owner_token)
 }
 
 /// Validate the closed, platform-specific automation-scheduler owner identity.

@@ -22,41 +22,6 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
-#[cfg(windows)]
-struct SchedulerFamilyHold {
-    handle: windows_sys::Win32::Foundation::HANDLE,
-}
-
-// SAFETY: query-only Job handle, never signaled, always closed on Drop.
-#[cfg(windows)]
-unsafe impl Send for SchedulerFamilyHold {}
-
-#[cfg(windows)]
-impl Drop for SchedulerFamilyHold {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.handle);
-        }
-    }
-}
-
-/// Retain the exact scheduler service Job through child exit so Windows
-/// departure proof stays observable. Returns None when the named Job is not
-/// yet visible; the caller then lets finish report truthful PROOF_UNAVAILABLE.
-#[cfg(windows)]
-fn retain_scheduler_family(token: &str) -> Option<SchedulerFamilyHold> {
-    use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
-    const JOB_QUERY_ACCESS: u32 = 0x0004;
-    let name = format!(r"Global\EliotSwarmService-AutomationScheduler-{token}");
-    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-    // SAFETY: nul-terminated UTF-16, query-only handle always closed.
-    let handle = unsafe { OpenJobObjectW(JOB_QUERY_ACCESS, 0, wide.as_ptr()) };
-    if handle.is_null() {
-        return None;
-    }
-    Some(SchedulerFamilyHold { handle })
-}
-
 /// The single hidden qualification flag the Store-owned launch can propagate.
 ///
 /// The flag is only recognized when this crate was built with the
@@ -450,6 +415,13 @@ async fn run_automation_scheduler_worker(
             .await?;
         return Err(error);
     }
+    // Readiness proves that this service has entered its exact Job. Keep that
+    // Job observable across activation uncertainty, child exit and finish.
+    #[cfg(windows)]
+    let _scheduler_hold = store
+        .scheduler_owner_token()
+        .ok()
+        .and_then(|token| swarm_automation::retain_service_owner_family(&identity, token).ok());
     if let Err(error) = store
         .activate_automation_scheduler_worker(scope.clone(), launch_id.clone(), identity.clone())
         .await
@@ -464,13 +436,6 @@ async fn run_automation_scheduler_worker(
             .await;
         return Err(error);
     }
-    // Retain the exact service Job through exit so finish observes ActiveProcesses==0
-    // instead of a vanished name; missing Job still reports PROOF_UNAVAILABLE truthfully.
-    #[cfg(windows)]
-    let _scheduler_hold = store
-        .scheduler_owner_token()
-        .ok()
-        .and_then(|token| retain_scheduler_family(token));
     tokio::select! {
         status = child.wait() => {
             let status = status.map_err(|_| Error::new(

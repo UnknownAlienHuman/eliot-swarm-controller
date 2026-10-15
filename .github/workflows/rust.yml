@@ -1087,6 +1087,8 @@ jobs:
             foreach ($case in @(
               'reusable_admission_requires_current_accepted_original_process_and_intact_outputs',
               'public_check_run_consumes_a_healthy_native_child_receipt',
+              'probe_custody_keeps_nested_family_and_capture_until_exact_departure',
+              'bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced',
               'r48_owner_lost_store_results_hold_intent_and_process_capacity',
               'r48_owner_stale_callbacks_keep_old_receipt_out_of_current_host_status',
               'pr71_a2_pid_unavailable_keeps_exact_child_custody',
@@ -1108,10 +1110,44 @@ jobs:
               }
               $membershipCase = 'missing_or_denied_job_open_is_membership_unknown'
               Invoke-FocusedCohort -Package 'swarm-process' -Filter $membershipCase -Expected 1 -ExpectedNames @($membershipCase)
-              $terminalCase = 'terminal_receipt_fallback_requires_valid_proof_and_child_exit'
-              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $terminalCase -Expected 1 -ExpectedNames @($terminalCase)
+              foreach ($case in @(
+                'terminal_receipt_fallback_requires_valid_proof_and_child_exit',
+                'probe_custody_reaps_nested_family_after_helper_exit',
+                'pending_git_owner_reaps_family_after_helper_exit'
+              )) {
+                Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+              }
             }
-            Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter 'adapter::acp::tests::pr44_command_acp_' -Expected 12 -ExpectedNames @(
+            foreach ($case in @(
+              'pending_git_owner_keeps_live_descendant_and_pipe_until_exact_departure',
+              'real_git_capture_records_direct_exit_live_descendant_and_family_departure',
+              'real_git_capture_reports_truncated_bytes_from_the_child_pipe'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter 'store_startup_' -Expected 8 -ExpectedNames @(
+              'store_startup_recovers_cold_legacy_front_without_lifetime_census',
+              'store_startup_connected_hello_recovers_current_root_and_exact_unresolved_before_census',
+              'store_startup_rejects_incomplete_and_foreign_front_without_deletion',
+              'store_startup_rejects_oversized_complete_selected_journal_frame',
+              'store_startup_rejects_oversized_selected_journal_torn_tail',
+              'store_startup_holds_corrupt_selected_records_and_recovers_other_deliveries',
+              'store_startup_rejects_unclassifiable_outbox_identity_without_mutation',
+              'store_startup_keeps_decoded_journal_identity_and_root_mismatches_fail_closed'
+            )
+            Invoke-FocusedCohort -Package 'swarm-adapter-claude' -Filter 'legacy_question_reply' -Expected 4 -ExpectedNames @(
+              'reading_legacy_question_reply_removes_raw_keys_and_preserves_ack_identity',
+              'schema_two_partial_migration_scrubs_legacy_question_reply_only',
+              'legacy_question_reply_migration_scrubs_payload_and_preserves_effect_evidence',
+              'legacy_question_reply_migration_preserves_torn_tail_and_outcome_identity'
+            )
+            foreach ($case in @(
+              'reading_legacy_raw_permission_record_rewrites_only_safe_projection',
+              'run_owned_native_harness_family_blocks_replacement_until_departure'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-adapter-claude' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter 'adapter::acp::tests::pr44_command_acp_' -Expected 15 -ExpectedNames @(
               'pr44_command_acp_route_accepts_optional_effort_mode_and_rejects_malformed_values',
               'pr44_command_acp_line_framing_distinguishes_eof_and_rejects_bad_frames',
               'pr44_command_acp_restore_identity_requires_exact_binding_workspace_and_model_before_effects',
@@ -1123,7 +1159,10 @@ jobs:
               'pr44_command_acp_restore_routes_pre_response_history_to_the_retained_session',
               'pr44_command_acp_restore_failure_does_not_fallback_or_replay',
               'pr44_command_acp_cancel_and_reply_race_claims_one_response',
-              'pr44_command_acp_config_option_snapshot_keeps_typed_values_and_resolves_model_id'
+              'pr44_command_acp_config_option_snapshot_keeps_typed_values_and_resolves_model_id',
+              'pr44_command_acp_unknown_dispatch_reconciles_same_operation_without_native_replay',
+              'pr44_command_acp_host_ipc_recovery_retains_prompt_and_client',
+              'pr44_command_acp_close_settles_its_pending_permission_once'
             )
             $descriptorCase = 'pr44_command_acp_descriptor_deactivates_configure_and_host_rejects_the_old_set'
             Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter $descriptorCase -Expected 1 -ExpectedNames @($descriptorCase)

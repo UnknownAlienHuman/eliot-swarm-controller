@@ -344,8 +344,20 @@ mod os {
             Self::open_named_query(identity, token)
         }
 
-        /// Keep the exact probe helper's Job observable after its last
-        /// process exits; closing this query handle never requests termination.
+        /// Retain the exact scheduler service Job without changing limits or
+        /// granting cancellation authority over a declared service family.
+        pub fn open_scheduler_query(identity: &Value, token: &str) -> Result<Self> {
+            if identity["purpose"] != "automation_scheduler" {
+                return Err(Error::new(
+                    "CHECK_RECOVERY_UNSUPPORTED",
+                    "an automation scheduler Job is required for retained family observation",
+                ));
+            }
+            Self::open_named_query(identity, token)
+        }
+
+        /// Keep the exact probe helper's Job observable after its last process
+        /// exits, including explicit cancellation of orphaned check members.
         pub fn open_check_query(identity: &Value, token: &str) -> Result<Self> {
             if identity["purpose"] != "check" {
                 return Err(Error::new(
@@ -353,7 +365,12 @@ mod os {
                     "a check owner Job is required for retained probe observation",
                 ));
             }
-            Self::open_named_query(identity, token)
+            let mut group = Self::open_named_query(identity, token)?;
+            // Check helpers own transient command families. If the helper
+            // exits before disarming, this retained handle must not pin live
+            // descendants without preserving the existing cancellation path.
+            group.non_killing_owner = false;
+            Ok(group)
         }
 
         fn open_named_query(identity: &Value, token: &str) -> Result<Self> {

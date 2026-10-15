@@ -1982,6 +1982,8 @@ where
         #[cfg(windows)]
         family_query: None,
         #[cfg(windows)]
+        next_family_cancel: None,
+        #[cfg(windows)]
         response_group_empty: None,
         exit_status: None,
         status_observation_failed: false,
@@ -2094,6 +2096,8 @@ struct GitHelperCustody {
     #[cfg(windows)]
     family_query: Option<platform::process_group::Group>,
     #[cfg(windows)]
+    next_family_cancel: Option<Instant>,
+    #[cfg(windows)]
     response_group_empty: Option<bool>,
     exit_status: Option<ExitStatus>,
     status_observation_failed: bool,
@@ -2152,6 +2156,8 @@ impl GitHelperCustody {
         self.load_family_identity();
         #[cfg(windows)]
         self.retain_family_query();
+        #[cfg(windows)]
+        self.cancel_orphaned_family();
         #[cfg(windows)]
         if self
             .capture
@@ -2253,6 +2259,28 @@ impl GitHelperCustody {
             self.family_query =
                 platform::process_group::Group::open_check_query(identity, token).ok();
         }
+    }
+
+    #[cfg(windows)]
+    fn cancel_orphaned_family(&mut self) {
+        if self.exit_status.is_none()
+            || self
+                .next_family_cancel
+                .is_some_and(|next| Instant::now() < next)
+        {
+            return;
+        }
+        let Some(query) = self.family_query.as_ref() else {
+            return;
+        };
+        if !query.family_empty().is_ok_and(|empty| !empty) {
+            return;
+        }
+        self.next_family_cancel = Some(Instant::now() + crate::checks::inputs::PROBE_CLEANUP_RETRY);
+        // This helper's direct Child is gone. Retain its exact Job while
+        // cancelling only verified orphan members; a live helper remains
+        // responsible for its own bounded command and capture cleanup.
+        let _ = query.cancel_children();
     }
 
     #[cfg(windows)]
@@ -3985,9 +4013,7 @@ mod tests {
             .is_ok_and(|current| current.as_ref() == Some(identity))
     }
 
-    #[test]
-    fn pending_git_owner_keeps_live_descendant_and_pipe_until_exact_departure() {
-        let repository = TestRepository::new(None);
+    fn pending_descendant_git_probe(repository: &TestRepository) -> GitCleanupOwner {
         let program = std::env::current_exe().expect("test executable path");
         let args = vec![
             "--exact".to_owned(),
@@ -4020,12 +4046,18 @@ mod tests {
             Ok(_) => panic!("the bounded foreground phase must remain incomplete"),
         };
         assert_eq!(foreground_error.code, "HOOK_GIT_CLEANUP_PENDING");
-        let mut owner = match owner {
+        let owner = match owner {
             Some(owner) => owner,
             None => panic!("retain the exact live helper custody"),
         };
         assert!(owner.is_pending());
+        owner
+    }
 
+    #[test]
+    fn pending_git_owner_keeps_live_descendant_and_pipe_until_exact_departure() {
+        let repository = TestRepository::new(None);
+        let mut owner = pending_descendant_git_probe(&repository);
         let marker = repository.repository_path.join("probe-retained-descendant");
         let marker_deadline = Instant::now() + Duration::from_secs(5);
         while !marker.exists() && Instant::now() < marker_deadline {
@@ -4128,6 +4160,56 @@ mod tests {
             !evidence_dir.exists(),
             "completed custody removes its files"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_git_owner_reaps_family_after_helper_exit() {
+        let repository = TestRepository::new(None);
+        let mut owner = pending_descendant_git_probe(&repository);
+        let marker = repository.repository_path.join("probe-retained-descendant");
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while (!marker.exists() || owner.custody.family_query.is_none())
+            && Instant::now() < ready_deadline
+        {
+            owner.poll();
+            thread::sleep(GIT_POLL_INTERVAL);
+        }
+        let descendant: Value =
+            serde_json::from_slice(&fs::read(marker).expect("read real descendant identity"))
+                .expect("decode real descendant identity");
+        assert!(owner.custody.family_query.is_some());
+        assert!(process_identity_is_current(&descendant));
+        owner
+            .custody
+            .child
+            .kill()
+            .expect("lose the owned Git helper");
+        let helper_exit = owner
+            .custody
+            .child
+            .wait()
+            .expect("observe exact helper exit");
+        assert!(!helper_exit.success());
+        assert!(
+            process_identity_is_current(&descendant),
+            "the retained Job pins its live member after helper exit"
+        );
+        let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+        while owner.is_pending() && Instant::now() < cleanup_deadline {
+            owner.poll();
+            thread::sleep(GIT_POLL_INTERVAL);
+        }
+        assert!(!owner.is_pending());
+        assert!(owner.custody.family_departed_proven);
+        assert!(!process_identity_is_current(&descendant));
+        assert_eq!(owner.custody.exit_status.as_ref(), Some(&helper_exit));
+        assert_eq!(owner.custody.response_group_empty, None);
+        let error = match owner.into_outcome() {
+            Err(error) => error,
+            Ok(_) => panic!("helper loss cannot become a successful Git result"),
+        };
+        assert_eq!(error.code, "HOOK_GIT_HELPER_FAILED");
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
