@@ -7167,9 +7167,11 @@ fn consult(
             }),
         );
     }
-    if field_matches_by_owner.len() > 1
-        || field_matches_by_owner.values().any(|facts| facts.len() > 1)
-    {
+    // CodeUnderstandingProof: one exact owner keeps its addressed ask even when its
+    // retained field facts diverge; only distinct owners are ambiguity with no sends.
+    // Doc: docs/swarm-launcher-assignment-context.md 11.2 Resolution; the sibling
+    // branch above preserves answered_from_card for one owner with one fact.
+    if field_matches_by_owner.len() > 1 {
         let candidates = field_matches_by_owner
             .values()
             .flat_map(|facts| facts.values().copied())

@@ -295,6 +295,56 @@ async fn publish_matching_contract_card(
         .unwrap();
 }
 
+async fn ensure_consult_scope(
+    owner: &StoreOwner,
+    manager: &Principal,
+    participant: &Principal,
+    subject: &ReviewSubject,
+    request_id: &str,
+    path: &str,
+) {
+    // CodeUnderstandingProof: an accepted read_review scope on both ends gives
+    // the sender a peer relation to the card owner (accepted_scope_relation),
+    // which consult_matching_cards requires before matching cards.
+    // read_review scopes coexist without overrides and exact paths keep the
+    // overlap known. Doc: swarm-launcher-assignment-context.md 11.2.
+    let proposed = owner
+        .store
+        .call(
+            participant.clone(),
+            "code.scope.propose".into(),
+            json!({
+                "client_request_id": format!("{request_id}-propose"),
+                "task_id": subject.task_id.clone(),
+                "task_revision": 1,
+                "attempt_id": subject.attempt_id.clone(),
+                "mode": "read_review",
+                "paths": [path],
+                "symbols": [],
+                "interfaces": [],
+                "baseline_candidate_ref": "advisory-consult-baseline",
+                "reason": "shared read boundary for one exact consultation",
+            }),
+        )
+        .await
+        .unwrap();
+    owner
+        .store
+        .call(
+            manager.clone(),
+            "code.scope.accept".into(),
+            json!({
+                "client_request_id": format!("{request_id}-accept"),
+                "scope_intent_id": proposed["scope_intent_id"],
+                "expected_state_revision": proposed["state_revision"],
+                "proposal_digest": proposed["digest"],
+                "reason": "admit shared read boundary for one exact consultation",
+            }),
+        )
+        .await
+        .unwrap();
+}
+
 fn scope_probe_request(request: &Value, phase: &str) -> Value {
     let mut probe = request.clone();
     if let Some(request_id) = probe
@@ -477,7 +527,7 @@ async fn open_coordination_fixture_thread(
 #[tokio::test]
 async fn coordination_consult_single_remote_owner_two_matching_field_cards_routes_one_addressed_ask()
  {
-    let (owner, directory, _, sender, remote_owner) =
+    let (owner, directory, subject, sender, remote_owner) =
         start_inbox_participants("consult-one-owner-two-facts").await;
     let target_path = "src/consult-one-owner-two-facts.rs";
     publish_matching_work_card(
@@ -495,7 +545,26 @@ async fn coordination_consult_single_remote_owner_two_matching_field_cards_route
         target_path,
     )
     .await;
-
+    // Shared read boundaries so the sender consult reaches the exact owner.
+    let manager = principal("review-owner-v2", Role::Manager);
+    ensure_consult_scope(
+        &owner,
+        &manager,
+        &remote_owner,
+        &subject,
+        "consult-one-owner-scope-owner",
+        target_path,
+    )
+    .await;
+    ensure_consult_scope(
+        &owner,
+        &manager,
+        &sender,
+        &subject,
+        "consult-one-owner-scope-sender",
+        target_path,
+    )
+    .await;
     let consulted = owner
         .store
         .call(
@@ -565,7 +634,35 @@ async fn coordination_consult_multiple_distinct_field_owners_reports_unique_cand
         target_path,
     )
     .await;
-
+    // Shared read boundaries so the sender consult reaches both exact owners.
+    let manager = principal("review-owner-v2", Role::Manager);
+    ensure_consult_scope(
+        &owner,
+        &manager,
+        &first_owner,
+        &subject,
+        "consult-two-owners-scope-first",
+        target_path,
+    )
+    .await;
+    ensure_consult_scope(
+        &owner,
+        &manager,
+        &second_owner,
+        &subject,
+        "consult-two-owners-scope-second",
+        target_path,
+    )
+    .await;
+    ensure_consult_scope(
+        &owner,
+        &manager,
+        &sender,
+        &subject,
+        "consult-two-owners-scope-sender",
+        target_path,
+    )
+    .await;
     let consulted = owner
         .store
         .call(
@@ -1331,6 +1428,27 @@ async fn coordination_inbox_rejects_consult_body_mismatch_before_damaged_index()
         )
         .await
         .unwrap();
+    // Shared read boundaries so the sender consult reaches the exact owner.
+    let manager = principal("review-owner-v2", Role::Manager);
+    ensure_consult_scope(
+        &owner,
+        &manager,
+        &recipient,
+        &subject,
+        "inbox-consult-scope-owner",
+        "consult-owner.rs",
+    )
+    .await;
+    ensure_consult_scope(
+        &owner,
+        &manager,
+        &sender,
+        &subject,
+        "inbox-consult-scope-sender",
+        "consult-owner.rs",
+    )
+    .await;
+
     let consulted = owner
         .store
         .call(
