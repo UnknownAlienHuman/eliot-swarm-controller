@@ -2495,6 +2495,27 @@ mod connected_store {
         assert_eq!(cold_counts.producer_target_operation_point_loads, 2);
 
         reset_assembly_source_load_counts(&assembled_id);
+        super::super::evict_assembly_cache_before_next_proof_lookup(&assembled_id);
+        let recovered = call(
+            store,
+            &fixture.manager_a,
+            "artifact.read",
+            json!({
+                "artifact_id":assembled_id,
+                "offset_bytes":0,
+                "length_bytes":crate::artifacts::MAX_PAGE_BYTES,
+            }),
+        )
+        .await;
+        assert_eq!(recovered["byte_length"], 1);
+        let recovered_counts = assembly_source_load_counts(&assembled_id);
+        assert_eq!(recovered_counts.assembled_manifest_decodes, 1);
+        assert_eq!(recovered_counts.source_artifact_point_loads, 1);
+        assert_eq!(recovered_counts.producer_target_operation_point_loads, 2);
+        assert_eq!(recovered_counts.immutable_proof_cache_hits, 0);
+        assert_eq!(recovered_counts.current_scope_grant_checks, 1);
+
+        reset_assembly_source_load_counts(&assembled_id);
         let warm = call(
             store,
             &fixture.manager_a,

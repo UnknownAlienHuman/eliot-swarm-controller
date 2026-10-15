@@ -277,8 +277,32 @@ struct AssemblyReadCacheEntry {
 
 static ASSEMBLY_READ_CACHE: OnceLock<Mutex<VecDeque<AssemblyReadCacheEntry>>> = OnceLock::new();
 
+#[cfg(test)]
+static EVICT_BEFORE_ASSEMBLY_PROOF_LOOKUP: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
 fn assembly_read_cache() -> &'static Mutex<VecDeque<AssemblyReadCacheEntry>> {
     ASSEMBLY_READ_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn evict_assembly_cache_before_next_proof_lookup(artifact_id: &str) {
+    if let Ok(mut armed) = EVICT_BEFORE_ASSEMBLY_PROOF_LOOKUP
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+    {
+        armed.insert(artifact_id.to_owned());
+    }
+}
+
+#[cfg(test)]
+fn evict_assembly_cache_if_armed(artifact_id: &str) {
+    let evict = EVICT_BEFORE_ASSEMBLY_PROOF_LOOKUP
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .is_ok_and(|mut armed| armed.remove(artifact_id));
+    if evict && let Ok(mut cache) = assembly_read_cache().lock() {
+        cache.clear();
+    }
 }
 
 fn assembly_read_cache_key(
@@ -364,6 +388,8 @@ fn cached_assembly_proof(
     snapshot: &super::results::AssemblyReadCacheSnapshot,
 ) -> Result<Option<Arc<AssemblyProof>>> {
     let key = assembly_read_cache_key(record, snapshot)?;
+    #[cfg(test)]
+    evict_assembly_cache_if_armed(&record.artifact_id);
     let Ok(mut cache) = assembly_read_cache().lock() else {
         return Ok(None);
     };
@@ -614,6 +640,7 @@ fn compact_cached_assembly_record(record: &ArtifactRecord) -> Result<ArtifactRec
             "sha256":record.metadata["sha256"],
             "part_count":record.metadata["part_count"],
             "expected_sha256":record.metadata["expected_sha256"],
+            "_assembly_read_cache_compact":true,
             "parts":compact_parts,
         }),
     })
@@ -2378,6 +2405,22 @@ fn assembled_result_sources(
         count_assembly_source_loads(&record.artifact_id, 0, 0, 0, 1, 0);
         return Ok(proof);
     }
+    let reloaded_record = if record.metadata["_assembly_read_cache_compact"] == true {
+        let snapshot = snapshot.ok_or_else(|| {
+            identity_damaged("compact assembly record has no paired proof snapshot")
+        })?;
+        let (full_record, rowid) = super::results::get_with_rowid(db, &record.artifact_id)?;
+        if rowid != snapshot.artifact_rowid {
+            return Err(identity_damaged(
+                "assembled artifact row changed while recovering an evicted cache proof",
+            ));
+        }
+        Some(Arc::new(full_record))
+    } else {
+        None
+    };
+    let record = reloaded_record.as_deref().unwrap_or(record);
+    let shared_record = reloaded_record.as_ref().or(shared_record);
     let operation_id = bounded_text(&record.metadata, "assembly_operation_id")
         .ok_or_else(|| identity_damaged("assembled result has no exact assembly Operation"))?;
     #[cfg(test)]
