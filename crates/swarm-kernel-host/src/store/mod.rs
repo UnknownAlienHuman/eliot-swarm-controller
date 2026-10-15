@@ -93,6 +93,7 @@ mod results;
 mod review_disposition;
 mod reviews;
 mod runtime;
+mod runtime_catalog;
 mod schedule_run_now;
 #[cfg(test)]
 mod schedule_run_now_tests;
@@ -5346,6 +5347,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                         | "automation.config.get"
                         | "automation.config.preview"
                         | "automation.config.explain"
+                        | "runtime.catalog"
                 )
                 && !method.starts_with("coordination.")
                 && !method.starts_with("code.scope.")
@@ -5412,6 +5414,7 @@ fn read(db: &Connection, p: &Principal, method: &str, v: &Value, config: &Config
         "bus.events.page" => bus_kernel::read(db, p, method, v, config),
         "review.get" | "review.list" | "swarm.review.context" => reviews::read(db, p, method, v),
         "automation.config.get" => automation::get(db, p, v),
+        "runtime.catalog" => runtime_catalog::read(db, p, v, config),
         "automation.config.preview" => automation::preview(db, p, v),
         "automation.config.explain" => automation::explain(db, p, v),
         "logging.get" => {

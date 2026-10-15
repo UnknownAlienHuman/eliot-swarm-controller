@@ -129,7 +129,7 @@ const fn mutation(
 /// classification plus the CLI's
 /// request-ID treatment (`agent.result` and `host.mode` are mutations).
 pub static TOOLS: &[(bool, ToolSpec)] = &TOOL_ITEMS;
-static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
+static TOOL_ITEMS: [(bool, ToolSpec); 160] = [
     // Read-only methods.
     read(
         "swarm.tools.search",
@@ -587,6 +587,12 @@ static TOOL_ITEMS: [(bool, ToolSpec); 159] = [
     read(
         "route.list",
         "Configured routes; not live qualification.",
+        &[],
+        &[],
+    ),
+    read(
+        "runtime.catalog",
+        "Read the current Manager-scoped runtime catalog: configured routes and safe native options, the caller's exact registered module selections, configured MCP profile/surface names, and retained native model/capability evidence. Missing or stale native evidence stays an explicit gap; this read never probes, launches, dispatches, or calls a model.",
         &[],
         &[],
     ),
@@ -4260,6 +4266,12 @@ pub fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
         return true;
     }
 
+    if method == "runtime.catalog"
+        && matches!(profile, McpToolProfile::Manager | McpToolProfile::Gm)
+    {
+        return true;
+    }
+
     match profile {
         McpToolProfile::Observer => false,
         McpToolProfile::Reviewer => method == "task.request_changes",
@@ -4756,6 +4768,30 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["routes", "routing", "configuration"],
         &["local route configuration"],
         "Configured routes only; no provider discovery."
+    ),
+    entry!(
+        "runtime.catalog",
+        Administration,
+        MANAGER_ONLY_AUDIENCES,
+        Searchable,
+        "Read the current Manager-scoped route, module, profile, native-model and capability catalog with evidence freshness and explicit gaps.",
+        "Use before selecting documented route/profile/surface values for Manager configuration; configured targets remain distinct from native catalog observations and runtime authorization.",
+        &[
+            "runtime",
+            "route",
+            "model",
+            "native options",
+            "capability",
+            "trust",
+            "account",
+            "freshness",
+            "catalog"
+        ],
+        &[
+            "current Store configuration",
+            "retained registered module catalog"
+        ],
+        "Read-only, identity-scoped metadata; unknown evidence remains a gap, and discovery does not grant launch or dispatch rights."
     ),
     entry!(
         "module.catalog.get",
@@ -7567,6 +7603,45 @@ pub fn launch_profile_surface(
         "deferred_groups": suggested.deferred_groups,
         "manual_tools": suggested.exact_manual_methods,
     }))
+}
+
+#[cfg(test)]
+mod runtime_catalog_contract_tests {
+    use super::{
+        exposes_method, find_tool_spec, input_schema, metadata_for, validate_registry_metadata,
+    };
+    use crate::{mcp_frontend::McpToolProfile, method_policy};
+    use serde_json::Value;
+
+    #[test]
+    fn runtime_catalog_is_registered_as_a_read_only_manager_tool_with_closed_empty_input() {
+        validate_registry_metadata().expect("MCP tool and metadata registries are complete");
+        let (read_only, spec) = find_tool_spec("runtime.catalog").expect("tool is registered");
+        assert!(*read_only);
+        assert_eq!(method_policy::read_only("runtime.catalog"), Some(true));
+        assert!(method_policy::is_mcp_method("runtime.catalog"));
+        assert!(!method_policy::participant_allowed("runtime.catalog"));
+        let schema: Value = serde_json::to_value(input_schema(spec, *read_only, false).as_ref())
+            .expect("empty read input schema serializes");
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(
+            schema["properties"]
+                .as_object()
+                .is_some_and(|fields| fields.is_empty())
+        );
+        assert!(metadata_for("runtime.catalog").is_some());
+        assert!(exposes_method(McpToolProfile::Manager, "runtime.catalog"));
+        assert!(exposes_method(McpToolProfile::Gm, "runtime.catalog"));
+        assert!(exposes_method(McpToolProfile::Full, "runtime.catalog"));
+        for profile in [
+            McpToolProfile::Observer,
+            McpToolProfile::Reviewer,
+            McpToolProfile::Participant,
+            McpToolProfile::AssignedReviewer,
+        ] {
+            assert!(!exposes_method(profile, "runtime.catalog"));
+        }
+    }
 }
 
 #[cfg(test)]

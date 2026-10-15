@@ -373,6 +373,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         participant: ParticipantAccess::None,
     },
     MethodPolicy {
+        method: "runtime.catalog",
+        class: MethodClass::ReadOnly,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "module.catalog.get",
         class: MethodClass::ReadOnly,
         mcp: true,

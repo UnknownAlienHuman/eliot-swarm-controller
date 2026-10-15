@@ -18,6 +18,7 @@ pub mod native_usage;
 pub mod provider_condition;
 pub mod rpc;
 pub mod runtime;
+pub mod runtime_catalog;
 /// Exact Store-owned prompt text projection selected by an immutable descriptor.
 pub mod task_prompt;
 

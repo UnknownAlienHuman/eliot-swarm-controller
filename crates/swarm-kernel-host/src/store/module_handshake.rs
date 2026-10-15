@@ -23,6 +23,7 @@ use swarm_contracts::module_command::{capability_satisfies, classify_runtime_com
 use swarm_contracts::module_contract::{
     MODULE_PROTOCOL_V1, ModuleContractClaim, native_mcp_command_schema,
 };
+use swarm_contracts::runtime_catalog::ModuleDescriptorEvidence;
 
 const REGISTRY_KEY: &str = "module_catalog:trusted_descriptors:v1";
 const REGISTRY_SCHEMA_VERSION: u16 = 1;
@@ -563,6 +564,120 @@ fn public_descriptor(entry: &RegisteredDescriptor) -> Value {
         "enabled":descriptor.enabled,
         "restart":descriptor.restart,
     })
+}
+
+/// Read only the exact registered descriptor/selection metadata needed by the
+/// runtime catalog. Registration proves a trusted contract record, not that a
+/// binary is currently installed or running.
+pub(super) fn runtime_catalog_module_evidence(
+    principal: &Principal,
+    routes: &[crate::config::Route],
+    db: &Connection,
+) -> Result<(u64, BTreeMap<String, ModuleDescriptorEvidence>)> {
+    if !matches!(principal.role, Role::Manager | Role::Operator) {
+        return Err(Error::new("FORBIDDEN", "runtime catalog is Manager-only"));
+    }
+    if principal.role == Role::Operator {
+        super::require_local_operator(db, &principal.client_id)?;
+    }
+    let registry = load_registry(db)?;
+    let selections = registry
+        .selections
+        .get(&principal.client_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut result = BTreeMap::new();
+    for route in routes {
+        let selection = selections.get(&route.alias);
+        let builtin =
+            crate::config::is_selectorless_builtin_route(&route.runtime, &route.module_artifact_id);
+        let registered_for_route = registry.descriptors.iter().find(|entry| {
+            entry.descriptor.artifact.artifact_id.as_str() == route.module_artifact_id
+        });
+        let evidence = if let Some(selection) = selection {
+            let selected = registry.descriptors.iter().find(|entry| {
+                entry.registered_revision == selection.registered_revision
+                    && entry.descriptor.module_id == selection.module_id
+                    && entry.descriptor.artifact == selection.artifact
+            });
+            let selected =
+                if builtin || selection.artifact.artifact_id.as_str() != route.module_artifact_id {
+                    None
+                } else {
+                    selected
+                };
+            match selected {
+                None => ModuleDescriptorEvidence {
+                    status: "stale_selection".to_owned(),
+                    module_id: Some(selection.module_id.to_string()),
+                    artifact_id: Some(selection.artifact.artifact_id.to_string()),
+                    registered_revision: Some(selection.registered_revision),
+                    selected_revision: Some(selection.selected_revision),
+                    contract_capabilities: Vec::new(),
+                    gaps: vec![
+                        "manager_selection_does_not_match_current_configured_route".to_owned(),
+                    ],
+                },
+                Some(selected) => {
+                    let descriptor = &selected.descriptor;
+                    ModuleDescriptorEvidence {
+                        status: "registered_and_selected".to_owned(),
+                        module_id: Some(descriptor.module_id.to_string()),
+                        artifact_id: Some(descriptor.artifact.artifact_id.to_string()),
+                        registered_revision: Some(selection.registered_revision),
+                        selected_revision: Some(selection.selected_revision),
+                        contract_capabilities: descriptor
+                            .capabilities
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        gaps: vec!["descriptor_registration_does_not_prove_binary_installation_or_native_capability".to_owned()],
+                    }
+                }
+            }
+        } else if builtin {
+            ModuleDescriptorEvidence {
+                status: "built_in_route".to_owned(),
+                module_id: None,
+                artifact_id: None,
+                registered_revision: None,
+                selected_revision: None,
+                contract_capabilities: Vec::new(),
+                gaps: Vec::new(),
+            }
+        } else if let Some(entry) = registered_for_route {
+            ModuleDescriptorEvidence {
+                status: "registered_but_not_selected".to_owned(),
+                module_id: Some(entry.descriptor.module_id.to_string()),
+                artifact_id: Some(entry.descriptor.artifact.artifact_id.to_string()),
+                registered_revision: Some(entry.registered_revision),
+                selected_revision: None,
+                contract_capabilities: entry
+                    .descriptor
+                    .capabilities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                gaps: vec![
+                    "manager_has_not_selected_this_descriptor_for_future_bindings".to_owned(),
+                ],
+            }
+        } else {
+            ModuleDescriptorEvidence {
+                status: "descriptor_unavailable".to_owned(),
+                module_id: None,
+                artifact_id: None,
+                registered_revision: None,
+                selected_revision: None,
+                contract_capabilities: Vec::new(),
+                gaps: vec![
+                    "no_exact_trusted_descriptor_is_retained_for_configured_route".to_owned(),
+                ],
+            }
+        };
+        result.insert(route.alias.clone(), evidence);
+    }
+    Ok((registry.revision, result))
 }
 
 pub(super) fn read_catalog(
@@ -1504,6 +1619,81 @@ mod tests {
             .code,
             "MODULE_CATALOG_CORRUPT"
         );
+    }
+
+    #[test]
+    fn runtime_catalog_module_evidence_is_current_owner_scoped_and_stale_on_route_change() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        let mut trusted = descriptor();
+        trusted
+            .capabilities
+            .insert(CapabilityId::new("module.fixture.observe").unwrap());
+        register_trusted_descriptor(&tx, trusted.clone()).unwrap();
+        let mut registry = load_registry(&tx).unwrap();
+        let registered_revision = registry.descriptors[0].registered_revision;
+        registry.selections.insert(
+            "catalog-owner".to_owned(),
+            BTreeMap::from([(
+                "catalog-route".to_owned(),
+                RouteSelection {
+                    schema_version: 1,
+                    module_id: trusted.module_id.clone(),
+                    artifact: trusted.artifact.clone(),
+                    registered_revision,
+                    selected_revision: registry.revision,
+                },
+            )]),
+        );
+        save_registry(&tx, &registry).unwrap();
+        tx.commit().unwrap();
+
+        let route = Route {
+            alias: "catalog-route".to_owned(),
+            runtime: "module".to_owned(),
+            module_artifact_id: "example-artifact".to_owned(),
+            enabled: true,
+            native_options: json!({}),
+            workspace_option: None,
+            owned_service: None,
+            admission_policy: None,
+        };
+        let owner = Principal {
+            link_id: "catalog-owner-link".to_owned(),
+            client_id: "catalog-owner".to_owned(),
+            role: Role::Manager,
+        };
+        let (revision, current) =
+            runtime_catalog_module_evidence(&owner, std::slice::from_ref(&route), &db).unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(current["catalog-route"].status, "registered_and_selected");
+        assert_eq!(
+            current["catalog-route"].contract_capabilities,
+            vec!["module.fixture.observe"]
+        );
+
+        let other_manager = Principal {
+            client_id: "other-manager".to_owned(),
+            ..owner.clone()
+        };
+        let (_, other) =
+            runtime_catalog_module_evidence(&other_manager, std::slice::from_ref(&route), &db)
+                .unwrap();
+        assert_eq!(other["catalog-route"].status, "registered_but_not_selected");
+
+        let mut changed_route = route.clone();
+        changed_route.module_artifact_id = "changed-artifact".to_owned();
+        let (_, stale) = runtime_catalog_module_evidence(&owner, &[changed_route], &db).unwrap();
+        assert_eq!(stale["catalog-route"].status, "stale_selection");
+        assert!(stale["catalog-route"].contract_capabilities.is_empty());
+
+        let mut unknown_route = route;
+        unknown_route.alias = "unknown-route".to_owned();
+        unknown_route.module_artifact_id = "unregistered-artifact".to_owned();
+        let (_, unknown) = runtime_catalog_module_evidence(&owner, &[unknown_route], &db).unwrap();
+        assert_eq!(unknown["unknown-route"].status, "descriptor_unavailable");
     }
 
     #[test]
