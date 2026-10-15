@@ -1384,7 +1384,17 @@ impl Journal {
                                     Error::new("ADAPTER_OUTBOX", "outbox item is invalid")
                                 })?;
                             validate_pending_item_slot(&self.outbox, &pending_path, &pending)?;
-                            self.validate_pending_outcome(&pending_path, &pending)?;
+                            if history.torn_tail_evidence.is_some() {
+                                // Keep the outbox receipt available for the
+                                // exact torn-tail repair performed immediately
+                                // before delivery. The repair re-reads this
+                                // payload and its digest against the durable
+                                // prefix; recovery must not turn that verified
+                                // deferred path into a native replay.
+                                retention::mark_damaged(self)?;
+                            } else {
+                                self.validate_pending_outcome(&pending_path, &pending)?;
+                            }
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

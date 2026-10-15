@@ -3244,7 +3244,7 @@ mod outbox_recovery_tests {
             generation: 1,
             native_scope_key: "fixture-scope".to_owned(),
             native_root_id: None,
-            native_input_id: Some("native-input".to_owned()),
+            native_input_id: Some(input_id(operation_id)),
             prompt_sha256: Some(format!("sha256:{}", "d".repeat(64))),
             prompt_bytes: Some(12),
             reconcile_target_operation_id: None,
@@ -3492,12 +3492,10 @@ mod outbox_recovery_tests {
         )
         .unwrap();
         journal.recover_outbox().unwrap();
-        assert_eq!(
-            journal
-                .native_root_for_hello("fixture-binding", 1, "fixture-scope")
-                .unwrap(),
-            None
-        );
+        let recovery_error = journal
+            .native_root_for_hello("fixture-binding", 1, "fixture-scope")
+            .unwrap_err();
+        assert_eq!(recovery_error.code, "ADAPTER_STARTUP_RECOVERY_INCOMPLETE");
 
         let mut host_deliveries = Vec::new();
         let mut native_effect_calls = 0;
@@ -3608,7 +3606,7 @@ mod outbox_recovery_tests {
 
     fn fixture_target_intent(operation_id: &str) -> OperationIntent {
         let mut intent = fixture_effect_intent(operation_id);
-        intent.native_root_id = Some("fixture-root".to_owned());
+        intent.native_root_id = Some(root_id(&intent.binding_id, intent.generation));
         intent
     }
 
@@ -3657,7 +3655,7 @@ mod outbox_recovery_tests {
     fn fixture_reconcile_intent(operation_id: &str, target_id: &str) -> OperationIntent {
         let mut intent = fixture_effect_intent(operation_id);
         intent.method = "agent.reconcile".to_owned();
-        intent.native_root_id = Some("fixture-root".to_owned());
+        intent.native_root_id = Some(root_id(&intent.binding_id, intent.generation));
         intent.native_input_id = None;
         intent.prompt_sha256 = None;
         intent.prompt_bytes = None;
