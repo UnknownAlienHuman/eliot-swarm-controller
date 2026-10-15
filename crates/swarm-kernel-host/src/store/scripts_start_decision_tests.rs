@@ -277,16 +277,11 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
 
     let marker_path = data_dir.join("source-worker-started.txt");
     let marker_for_script = marker_path.to_string_lossy().replace('\'', "''");
-    let result_json = serde_json::to_string(&json!({
-        "protocol_version":1,
-        "operation_id":work.operation_id.clone(),
-        "run_id":work.run_id.clone(),
-        "result":Value::Null,
-        "effects":[],
-    }))
-    .expect("serialize the exact ScriptResult protocol receipt");
+    // The same immutable bundle serves multiple Runs. Echo the invocation
+    // received by this interpreter, rather than pinning the first Run's IDs
+    // into the bundle and making an Allow-winning second Run invalid.
     let script_bytes = format!(
-        "[System.IO.File]::AppendAllText('{marker_for_script}', \"started`n\")\nStart-Sleep -Seconds 2\n[Console]::Out.WriteLine('{result_json}')\n"
+        "$invocation = [Console]::In.ReadToEnd() | ConvertFrom-Json\n[System.IO.File]::AppendAllText('{marker_for_script}', \"started`n\")\nStart-Sleep -Seconds 2\n$result = @{{protocol_version=1;operation_id=$invocation.operation_id;run_id=$invocation.run_id;result=$null;effects=@()}}\n[Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 8 -Compress))\n"
     )
     .into_bytes();
     work.bundle.files = vec![crate::scripts::manifest::BundleFile {
@@ -632,10 +627,8 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
     }
     cleanup.disarm();
 
-    // The same pinned source worker must honor a retained Deny as well. The
-    // competing Allow publisher is already live, then released after Deny has
-    // won so this second race phase is deterministic without hand-written
-    // decision bytes.
+    // The same pinned source worker consumes whichever initial decision wins
+    // the concurrent Allow/Deny publication on this second Run.
     let mut denied_work = work.clone();
     denied_work.run_id = uuid::Uuid::new_v4().to_string();
     denied_work.operation_id = uuid::Uuid::new_v4().to_string();
@@ -643,7 +636,7 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
     denied_work.invocation.run_id = denied_work.run_id.clone();
     denied_work.invocation.operation_id = denied_work.operation_id.clone();
     let (denied_receipt, denied_work_digest) = crate::scripts::runner::write_work(&denied_work)
-        .expect("write the second immutable Work receipt for the Deny winner");
+        .expect("write the second immutable Work receipt for the decision race");
     assert!(denied_receipt.is_file());
     let denied_run_dir = crate::scripts::runner::directory(&data_dir, &denied_work.run_id).unwrap();
     let mut denied_cleanup = SourceWorkerCleanup {
@@ -891,7 +884,10 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
         .collect::<Vec<_>>();
     assert!(marker_lines.iter().all(|line| line == "started"));
     if allow_won {
-        assert_eq!(completion["state"], "completed");
+        assert_eq!(
+            completion["state"], "completed",
+            "Allow-winning completion: {completion}"
+        );
         assert_eq!(completion["exit_code"], 0);
         assert!(completion["error_code"].is_null());
         assert!(denied_run_dir.join("execution-plan.json").is_file());
