@@ -70,11 +70,28 @@ async fn register_integration_participant(
     client_id: &str,
     participation_basis: Value,
 ) -> Principal {
+    register_integration_participant_as(
+        owner,
+        "review-owner-v2",
+        subject,
+        client_id,
+        participation_basis,
+    )
+    .await
+}
+
+async fn register_integration_participant_as(
+    owner: &StoreOwner,
+    manager_id: &str,
+    subject: &ReviewSubject,
+    client_id: &str,
+    participation_basis: Value,
+) -> Principal {
     let token = format!("{}{}", model::new_id(), model::new_id());
     owner
         .store
         .call(
-            principal("review-owner-v2", Role::Manager),
+            principal(manager_id, Role::Manager),
             "coordination.participant.register".into(),
             json!({
                 "client_request_id":format!("register-{client_id}"),
@@ -96,6 +113,33 @@ async fn register_integration_participant(
         })
         .await
         .unwrap()
+}
+
+async fn damage_retained_consult_result(
+    store: &Store,
+    operation_id: &str,
+    subject: &ReviewSubject,
+    invalid_json: &str,
+) {
+    let operation_id = operation_id.to_owned();
+    let task_id = subject.task_id.clone();
+    let attempt_id = subject.attempt_id.clone();
+    let invalid_json = invalid_json.to_owned();
+    store
+        .run(move |db| {
+            // The fixture has already created and settled a real consult. Bypass
+            // its retained-JSON CHECK only for this deliberate corruption.
+            db.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+            let changed = db.execute(
+                "UPDATE operations SET result_json=?1 WHERE operation_id=?2 AND task_id=?3 AND attempt_id=?4",
+                params![invalid_json, operation_id, task_id, attempt_id],
+            )?;
+            db.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+            assert_eq!(changed, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
 }
 
 async fn publish_producer_contract_card(
@@ -493,6 +537,153 @@ async fn participation_basis_change_invalidates_cell_material_identity() {
             .len(),
         1
     );
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn scoped_manager_attention_isolates_and_surfaces_corrupt_consults() {
+    let (owner, directory, subject, _) =
+        start_integration_fixture("issue99-scoped-consult-attention-corruption").await;
+    let foreign_subject = seed_subject(
+        &owner.store,
+        "issue99-scoped-consult-attention-foreign",
+        "unrelated-manager",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    attach_ready_repair_binding(&owner.store, &subject).await;
+    let caller = register_integration_participant(
+        &owner,
+        &subject,
+        "issue99-scoped-consult-attention-caller",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let foreign_caller = register_integration_participant_as(
+        &owner,
+        "unrelated-manager",
+        &foreign_subject,
+        "issue99-scoped-consult-attention-foreign-caller",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+
+    let request = |request_id: &str, target: &str| {
+        json!({
+            "client_request_id":request_id,
+            "target":{"contract_key":target},
+            "field":"interfaces",
+            "question_kind":"contract_shape",
+            "question":"Who owns this exact integration contract?",
+            "why_needed":"The missing owner blocks this Task.",
+            "expected_answer":"one_fact",
+            "blocking":true,
+            "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+            "evidence_refs":[],
+        })
+    };
+    let own_consult = owner
+        .store
+        .call(
+            caller,
+            "coordination.consult".into(),
+            request(
+                "issue99-scoped-consult-attention-own",
+                "issue99-scoped-consult-attention-own-selector",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(own_consult["status"], "unowned");
+    let foreign_consult = owner
+        .store
+        .call(
+            foreign_caller,
+            "coordination.consult".into(),
+            request(
+                "issue99-scoped-consult-attention-foreign",
+                "issue99-scoped-consult-attention-foreign-selector",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign_consult["status"], "unowned");
+
+    let foreign_operation_id = foreign_consult["manager_attention"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let damaged_foreign_json = "{\"private\":\"DO_NOT_LEAK_FOREIGN_CONSULT_BYTES\"";
+    damage_retained_consult_result(
+        &owner.store,
+        &foreign_operation_id,
+        &foreign_subject,
+        damaged_foreign_json,
+    )
+    .await;
+
+    let manager = principal("review-owner-v2", Role::Manager);
+    let inspect = owner
+        .store
+        .call(
+            manager.clone(),
+            "swarm.agent.inspect".into(),
+            json!({"attempt_id":subject.attempt_id}),
+        )
+        .await
+        .unwrap();
+    let scoped_attention = &inspect["runtime"]["attention"]["binding_manager_attention"];
+    let scoped_items = scoped_attention["items"].as_array().unwrap();
+    assert!(scoped_items.iter().any(|item| {
+        item["kind"] == "unowned_blocking_consult"
+            && item["address"]["operation_id"] == own_consult["manager_attention"]["operation_id"]
+    }));
+    assert!(scoped_items.iter().all(|item| {
+        item["address"]["operation_id"] != foreign_consult["manager_attention"]["operation_id"]
+    }));
+
+    let own_operation_id = own_consult["manager_attention"]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let damaged_own_json = "{\"private\":\"DO_NOT_LEAK_OWN_CONSULT_BYTES\"";
+    damage_retained_consult_result(&owner.store, &own_operation_id, &subject, damaged_own_json)
+        .await;
+
+    let damaged_inspect = owner
+        .store
+        .call(
+            manager,
+            "swarm.agent.inspect".into(),
+            json!({"attempt_id":subject.attempt_id}),
+        )
+        .await
+        .unwrap();
+    let damaged_attention = &damaged_inspect["runtime"]["attention"]["binding_manager_attention"];
+    let gaps = damaged_attention["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| {
+            item["kind"] == "coordination_consult_data_gap"
+                && item["address"]["operation_id"]
+                    == own_consult["manager_attention"]["operation_id"]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["address"]["task_id"], subject.task_id);
+    assert_eq!(gaps[0]["address"]["task_revision"], 1);
+    assert_eq!(gaps[0]["address"]["attempt_id"], subject.attempt_id);
+    assert_eq!(gaps[0]["address"]["projection_status"], "unknown");
+    assert_eq!(gaps[0]["gap"]["status"], "unknown");
+    assert_eq!(gaps[0]["gap"]["reason"], "consult_result_json_invalid");
+    assert_eq!(gaps[0]["suggested_action"]["method"], "operation.get");
+    let projected_json = serde_json::to_string(&damaged_attention).unwrap();
+    assert!(!projected_json.contains("DO_NOT_LEAK_OWN_CONSULT_BYTES"));
+    assert!(!projected_json.contains("DO_NOT_LEAK_FOREIGN_CONSULT_BYTES"));
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
