@@ -752,6 +752,185 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
         Some(1)
     );
 
+    let stale_attempt_request = json!({
+        "client_request_id":"bridge5-result-stale-attempt",
+        "binding_id":BINDING_ID,
+        "generation":1,
+        "selector":{
+            "kind":"claude_assistant_result",
+            "input_operation_id":DISPATCH_OPERATION_ID,
+            "session_id":NATIVE_SESSION_ID
+        },
+        "offset_bytes":0,
+        "length_bytes":65_536
+    });
+    let queued_stale_attempt = owner
+        .store
+        .call(
+            caller.clone(),
+            "agent.result".to_owned(),
+            stale_attempt_request,
+        )
+        .await
+        .expect("admit result while its Task Attempt is current");
+    let stale_attempt_operation_id = model::text(&queued_stale_attempt, "operation_id")?.to_owned();
+    let stale_attempt_delivery = owner
+        .store
+        .call(module.clone(), "module.next".to_owned(), json!({}))
+        .await
+        .expect("deliver result before Task reassignment");
+    let stale_attempt_command = stale_attempt_delivery["command"].clone();
+    let mut stale_attempt_page_value = lost_page.clone();
+    stale_attempt_page_value["source"]["result_operation_id"] = json!(stale_attempt_operation_id);
+    stale_attempt_page_value["source"]["result_input_sha256"] =
+        stale_attempt_command["input_sha256"].clone();
+    stale_attempt_page_value["source"]["result_module_receipt"]["operation_id"] =
+        json!(stale_attempt_operation_id);
+    stale_attempt_page_value["source"]["result_module_receipt"]["input_sha256"] =
+        stale_attempt_command["input_sha256"].clone();
+    let stale_attempt_page: crate::artifacts::ResultPage =
+        serde_json::from_value(stale_attempt_page_value)?;
+    let stale_attempt_source = stale_attempt_page.source.clone();
+    let operation_for_preflight = stale_attempt_operation_id.clone();
+    let module_for_preflight = module.clone();
+    let preflight = owner
+        .store
+        .run_fixture(move |db| {
+            super::results::prepare(
+                db,
+                &module_for_preflight,
+                &operation_for_preflight,
+                &stale_attempt_source,
+            )
+        })
+        .await
+        .expect("prepare the page while the sealed Attempt is still current");
+    let page_bytes = stale_attempt_page.decode()?;
+    let mut artifact_metadata = preflight;
+    if let Some(fields) = stale_attempt_page.metadata().as_object() {
+        for (key, value) in fields {
+            artifact_metadata[key] = value.clone();
+        }
+    }
+    let stale_attempt_artifact = crate::artifacts::ArtifactFiles::record(
+        &stale_attempt_operation_id,
+        &page_bytes,
+        artifact_metadata,
+    );
+
+    let reassignment_id = "bridge5-result-reassigned-attempt";
+    let reassignment_id_for_store = reassignment_id.to_owned();
+    owner
+        .store
+        .run_fixture(move |db| {
+            let (snapshot, owner_id): (String, String) = db.query_row(
+                "SELECT task_snapshot_json,owner_id FROM attempts WHERE attempt_id=?1",
+                [ATTEMPT_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            db.execute(
+                "UPDATE attempts SET state='superseded',released_at_ms=2,updated_at_ms=2 WHERE attempt_id=?1 AND released_at_ms IS NULL",
+                [ATTEMPT_ID],
+            )?;
+            db.execute(
+                "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,start_operation_id,binding_id,binding_generation,state,producers_json,created_at_ms,updated_at_ms) \
+                 VALUES(?1,?2,1,?3,?4,'controller',NULL,?5,1,'reserved','[]',2,2)",
+                params![
+                    reassignment_id_for_store,
+                    TASK_ID,
+                    snapshot,
+                    owner_id,
+                    BINDING_ID
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("reassign the open Task to a different live Attempt");
+
+    let operation_for_stale_prepare = stale_attempt_operation_id.clone();
+    let module_for_stale_prepare = module.clone();
+    let stale_prepare = owner
+        .store
+        .run_fixture(move |db| {
+            super::results::prepare(
+                db,
+                &module_for_stale_prepare,
+                &operation_for_stale_prepare,
+                &stale_attempt_page.source,
+            )
+        })
+        .await
+        .expect_err("preflight must reject a result for the reassigned Attempt");
+    assert_eq!(stale_prepare.code, "RESULT_TARGET_SCOPE_INVALID");
+
+    let artifact_for_commit = stale_attempt_artifact.clone();
+    let module_for_commit = module.clone();
+    let stale_commit = owner
+        .store
+        .run_fixture(move |db| super::results::record(db, &module_for_commit, &artifact_for_commit))
+        .await
+        .expect_err("commit must repeat the current-Attempt check after page preflight");
+    assert_eq!(stale_commit.code, "RESULT_TARGET_SCOPE_INVALID");
+
+    let stale_operation_id_for_read = stale_attempt_operation_id.clone();
+    let stale_artifact_id_for_read = stale_attempt_artifact.artifact_id.clone();
+    let (stale_operation, stale_effective, registered_artifact_count, current_task) = owner
+        .store
+        .run_fixture(move |db| {
+            let operation = super::operations::get_operation(db, &stale_operation_id_for_read)?;
+            let effective_raw: String = db.query_row(
+                "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                [&stale_operation_id_for_read],
+                |row| row.get(0),
+            )?;
+            let effective: Value = serde_json::from_str(&effective_raw)?;
+            let count: i64 = db.query_row(
+                "SELECT count(*) FROM artifacts WHERE artifact_id=?1",
+                [&stale_artifact_id_for_read],
+                |row| row.get(0),
+            )?;
+            let task = super::tasks::get_task(db, TASK_ID)?;
+            Ok((operation, effective, count, task))
+        })
+        .await
+        .expect("read back stale result Operation and current Task");
+    assert_eq!(stale_operation["state"], "sending");
+    assert_eq!(
+        stale_effective["claude_result_origin"]["target_attempt_id"],
+        ATTEMPT_ID
+    );
+    assert_eq!(registered_artifact_count, 0);
+    assert_eq!(current_task["current_attempt_id"], reassignment_id);
+
+    let historical_artifact = owner
+        .store
+        .call(
+            caller.clone(),
+            "artifact.read".to_owned(),
+            json!({
+                "artifact_id":lost_artifact_ref,
+                "offset_bytes":0,
+                "length_bytes":RESULT_TEXT.len()
+            }),
+        )
+        .await
+        .expect("retain readback for the already committed historical result");
+    assert_eq!(historical_artifact["content"], RESULT_TEXT);
+    assert_eq!(historical_artifact["eof"], true);
+    let historical_replay = owner
+        .store
+        .call(
+            module.clone(),
+            "module.result".to_owned(),
+            json!({"operation_id":lost_result_operation_id.clone(),"page":lost_page.clone()}),
+        )
+        .await
+        .expect("allow only the exact replay of an already registered historical page");
+    assert_eq!(historical_replay["recorded"], true);
+    assert_eq!(historical_replay["replayed"], true);
+    assert_eq!(historical_replay["artifact_ref"], lost_artifact_ref);
+
     let replacement_link = "bridge5-result-link-2";
     let replacement_boot = "bridge5-result-boot-2";
     owner

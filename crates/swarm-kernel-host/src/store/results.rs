@@ -602,6 +602,35 @@ pub(super) fn load_claude_result_origin(
             "sealed Claude result origin differs from the retained Task Attempt identity",
         ));
     }
+    // A settled Operation may only take the exact immutable replay path below;
+    // do not revoke that historical receipt when a Task later moves on. New
+    // page registration is fenced again on both prepare and transaction commit.
+    if operation["state"] != "settled" {
+        let target_task_id = model::text(&origin, "target_task_id")?;
+        let target_attempt_id = model::text(&origin, "target_attempt_id")?;
+        let target_task = super::tasks::get_task(db, target_task_id)?;
+        let target_attempt = super::tasks::get_attempt(db, target_attempt_id)?;
+        if target_attempt["attempt_id"] != target_attempt_id
+            || target_attempt["task_id"] != target_task_id
+            || target_attempt["binding_id"] != binding_id
+            || target_attempt["binding_generation"] != generation
+            || target_attempt["start_operation_id"] != target_operation_id
+            || !target_attempt["released_at_ms"].is_null()
+            || !matches!(
+                target_attempt["state"].as_str(),
+                Some("reserved" | "running")
+            )
+            || target_task["state"] != "open"
+            || target_task["revision"] != origin["target_task_revision"]
+            || target_attempt["task_revision"] != origin["target_task_revision"]
+            || target_task["current_attempt_id"] != target_attempt_id
+        {
+            return Err(Error::new(
+                "RESULT_TARGET_SCOPE_INVALID",
+                "Claude result target no longer belongs to the current open Task Attempt",
+            ));
+        }
+    }
     let target_outcome: RuntimeOutcome =
         serde_json::from_value(target["result"].clone()).map_err(|_| {
             Error::new(
