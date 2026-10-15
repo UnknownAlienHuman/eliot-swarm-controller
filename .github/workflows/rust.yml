@@ -446,6 +446,24 @@ jobs:
             $libclangDir = $libclang.DirectoryName
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "LIBCLANG_PATH=$libclangDir" -Encoding utf8
+      - name: Pinned OpenCode test Bun
+        id: opencode-bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.0'
+      - name: Export exact Bun runtime for OpenCode Rust fixtures
+        shell: pwsh
+        env:
+          BUN_PATH: ${{ steps.opencode-bun.outputs.bun-path }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BUN_PATH) -or -not (Test-Path -LiteralPath $env:BUN_PATH -PathType Leaf)) {
+            throw 'The pinned Bun action did not provide a usable Bun 1.4.0 executable.'
+          }
+          $version = (& $env:BUN_PATH --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -cne '1.4.0') {
+            throw "The OpenCode fixture Bun runtime must be exactly 1.4.0; got '$version'."
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "ELIOT_OPENCODE_TEST_BUN=$env:BUN_PATH" -Encoding utf8
       - name: Format, lint, and test all owned workspace packages from metadata
         shell: pwsh
         run: |
@@ -517,11 +535,6 @@ jobs:
           python -m pip install --disable-pip-version-check -r modules/codex/requirements.txt
           python modules/codex/verify_vendor.py
           python modules/codex/test_bridge.py
-      - name: Pinned OpenCode owner runtime
-        id: opencode-bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
-        with:
-          bun-version: '1.4.0'
       - name: OpenCode durable owner smoke (offline, no model calls)
         shell: bash
         env:
