@@ -213,9 +213,8 @@ async function pump(sess) {
     emit({ kind: 'diagnostic', code: diagnostic(error, 'SDK_STREAM_FAILURE') });
   }
   sess.ended = true;
-  for (const pending of [...sess.pendingInteractions.values()]) {
-    retireInteraction(sess, pending, 'SDK_STREAM_ENDED');
-  }
+  sess.pendingToolGuards.clear();
+  retireSessionInteractions(sess, 'SDK_STREAM_ENDED');
   emit({ kind: 'harness_ended', diagnostic_code: 'SDK_STREAM_ENDED' });
 }
 
@@ -297,6 +296,7 @@ async function prepare(command) {
     generation: command.generation,
     nativeRootId: null,
     pendingInteractions: new Map(),
+    pendingToolGuards: new Map(),
     ended: false,
   };
   const options = {
@@ -306,6 +306,10 @@ async function prepare(command) {
     forwardSubagentText: true,
     canUseTool: (toolName, toolInput, toolOptions) => requestInteraction(sess, toolName, toolInput, toolOptions),
     hooks: {
+      // The callback is only a fallback for unresolved permission checks.
+      // Ask at the native PreToolUse boundary so configured allow rules and
+      // permission modes cannot silently bypass the controller decision.
+      PreToolUse: [{ hooks: [input => preToolUseGuard(sess, input)] }],
       SubagentStart: [{ hooks: [captureSubagentHook('subagent_started')] }],
       SubagentStop: [{ hooks: [captureSubagentHook('subagent_stopped')] }],
     },
@@ -406,12 +410,44 @@ function validateInteractionReply(request, reply) {
   });
 }
 
-function sdkCallbackResult(request, reply) {
+function sdkCallbackResult(request, reply, toolUseID) {
   if (request.kind === 'permission' && reply.decision === 'deny') {
-    return { behavior: 'deny', message: reply.message };
+    return { behavior: 'deny', message: reply.message, toolUseID };
   }
   const updatedInput = reply.updated_input === undefined ? request.input : reply.updated_input;
-  return { behavior: 'allow', updatedInput };
+  return { behavior: 'allow', updatedInput, toolUseID };
+}
+
+function preToolUseGuard(sess, hookInput) {
+  const deny = () => ({
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: 'ELIOT could not validate this exact tool request.',
+    },
+  });
+  if (!sess || sess.ended || !hookInput || hookInput.hook_event_name !== 'PreToolUse') return deny();
+  const toolName = boundedSdkText(hookInput.tool_name, 256);
+  const toolUseID = boundedSdkText(hookInput.tool_use_id, 256);
+  if (toolName === null || toolUseID === null
+      || !hookInput.tool_input || typeof hookInput.tool_input !== 'object'
+      || Array.isArray(hookInput.tool_input)) return deny();
+  let input;
+  try { input = JSON.parse(JSON.stringify(hookInput.tool_input)); }
+  catch { return deny(); }
+  const digest = sha256(canonicalJson({ tool_name: toolName, tool_use_id: toolUseID, input }));
+  const previous = sess.pendingToolGuards.get(toolUseID);
+  if ((previous !== undefined && previous !== digest) || sess.pendingToolGuards.size >= 64) return deny();
+  sess.pendingToolGuards.set(toolUseID, digest);
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'ask',
+      permissionDecisionReason: 'ELIOT requires an exact one-shot permission decision.',
+    },
+  };
 }
 
 function retireInteraction(sess, pending, diagnosticCode) {
@@ -430,49 +466,82 @@ function retireInteraction(sess, pending, diagnosticCode) {
   pending.resolve({
     behavior: 'deny',
     message: 'This Claude SDK callback was cancelled before a matching user reply arrived.',
+    toolUseID: pending.toolUseID,
   });
 }
 
+function retireSessionInteractions(sess, diagnosticCode) {
+  sess.pendingToolGuards.clear();
+  for (const pending of [...sess.pendingInteractions.values()]) {
+    retireInteraction(sess, pending, diagnosticCode);
+  }
+}
+
 function requestInteraction(sess, toolNameValue, inputValue, callbackOptions) {
+  const requestID = boundedSdkText(callbackOptions?.requestId, 128);
+  const toolUseID = boundedSdkText(callbackOptions?.toolUseID, 256);
+  const signal = callbackOptions?.signal;
+  const deny = message => ({
+    behavior: 'deny',
+    message,
+    ...(toolUseID ? { toolUseID } : {}),
+  });
   if (!sess || sess.ended) {
-    return Promise.resolve({ behavior: 'deny', message: 'The Claude SDK session is no longer active.' });
+    return Promise.resolve(deny('The Claude SDK session is no longer active.'));
+  }
+  if (requestID === null || toolUseID === null
+      || !signal || typeof signal.addEventListener !== 'function'
+      || typeof signal.removeEventListener !== 'function') {
+    emit({ kind: 'diagnostic', code: 'INTERACTION_CALLBACK_IDENTITY_UNAVAILABLE' });
+    return Promise.resolve(deny('The Claude SDK callback identity is unavailable.'));
   }
   const toolName = boundedSdkText(toolNameValue, 256);
   if (toolName === null || !inputValue || typeof inputValue !== 'object' || Array.isArray(inputValue)) {
-    return Promise.resolve({ behavior: 'deny', message: 'The Claude SDK callback request is malformed.' });
+    return Promise.resolve(deny('The Claude SDK callback request is malformed.'));
   }
   if (sess.nativeRootId === null) {
     emit({ kind: 'diagnostic', code: 'INTERACTION_ROOT_UNAVAILABLE' });
-    return Promise.resolve({ behavior: 'deny', message: 'The native Claude session identity is not available.' });
+    return Promise.resolve(deny('The native Claude session identity is not available.'));
   }
   if (sess.pendingInteractions.size >= MAX_PENDING_INTERACTIONS) {
     emit({ kind: 'diagnostic', code: 'INTERACTION_CAPACITY' });
-    return Promise.resolve({ behavior: 'deny', message: 'Too many Claude SDK callbacks are awaiting user input.' });
+    return Promise.resolve(deny('Too many Claude SDK callbacks are awaiting user input.'));
   }
   let input;
   try { input = JSON.parse(JSON.stringify(inputValue)); }
   catch {
-    return Promise.resolve({ behavior: 'deny', message: 'The Claude SDK callback input is not JSON-safe.' });
+    return Promise.resolve(deny('The Claude SDK callback input is not JSON-safe.'));
   }
   const requestBytes = Buffer.byteLength(canonicalJson(input), 'utf8');
   if (requestBytes > MAX_INTERACTION_REQUEST_BYTES) {
     emit({ kind: 'diagnostic', code: 'INTERACTION_REQUEST_BOUNDARY' });
-    return Promise.resolve({ behavior: 'deny', message: 'The Claude SDK callback request exceeds its size boundary.' });
+    return Promise.resolve(deny('The Claude SDK callback request exceeds its size boundary.'));
   }
-  const signal = callbackOptions?.signal;
-  if (signal?.aborted) {
-    return Promise.resolve({ behavior: 'deny', message: 'The Claude SDK callback was cancelled.' });
+  if (signal.aborted) return Promise.resolve(deny('The Claude SDK callback was cancelled.'));
+  const guardDigest = sess.pendingToolGuards.get(toolUseID);
+  const callbackDigest = sha256(canonicalJson({ tool_name: toolName, tool_use_id: toolUseID, input }));
+  if (guardDigest !== callbackDigest) {
+    sess.pendingToolGuards.delete(toolUseID);
+    emit({ kind: 'diagnostic', code: 'PRETOOLUSE_GUARD_MISMATCH' });
+    return Promise.resolve(deny('The Claude SDK tool request did not pass the matching PreToolUse guard.'));
+  }
+  sess.pendingToolGuards.delete(toolUseID);
+  if (sess.pendingInteractions.has(requestID)) {
+    emit({ kind: 'diagnostic', code: 'INTERACTION_REQUEST_ID_REUSED' });
+    return Promise.resolve(deny('The Claude SDK callback request identity was already used.'));
   }
   const request = {
     schema_version: 1,
-    request_id: randomUUID(),
+    // Use the SDK's control_request UUID. The callback resolver stays local;
+    // the Store sees only this exact identity, digest, kind and bounded input.
+    request_id: requestID,
     kind: toolName === 'AskUserQuestion' ? 'question' : 'permission',
     tool_name: toolName,
     input,
   };
   request.request_sha256 = sha256(canonicalJson(request));
   return new Promise(resolve => {
-    const pending = { request, resolve, signal, abort: null };
+    const pending = { request, resolve, signal, toolUseID, abort: null };
     pending.abort = () => retireInteraction(sess, pending, 'SDK_CALLBACK_ABORTED');
     sess.pendingInteractions.set(request.request_id, pending);
     emit({
@@ -508,7 +577,7 @@ function handleControlReply(command) {
   }
   sess.pendingInteractions.delete(command.request_id);
   pending.signal?.removeEventListener('abort', pending.abort);
-  pending.resolve(sdkCallbackResult(pending.request, command.reply));
+  pending.resolve(sdkCallbackResult(pending.request, command.reply, pending.toolUseID));
   emit({
     kind: 'interaction_reply_ack',
     operation_id: command.operation_id,
@@ -582,6 +651,7 @@ async function handle(line) {
     } else if (command.kind === 'stop') {
       stopping = true;
       if (session && !session.ended) {
+        retireSessionInteractions(session, 'BRIDGE_STOPPED');
         session.input.close();
         try { session.query?.close(); } catch { /* the SDK stream may already be closed */ }
         try { session.preparedQuery?.close(); } catch { /* warm process may already be closed */ }
@@ -607,6 +677,7 @@ for await (const line of lines) {
   await handle(line);
 }
 if (session && !session.ended) {
+  retireSessionInteractions(session, 'BRIDGE_INPUT_CLOSED');
   session.input.close();
   try { session.query?.close(); } catch { /* stream already closed */ }
   try { session.preparedQuery?.close(); } catch { /* warm process already closed */ }

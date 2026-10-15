@@ -47,7 +47,8 @@ Readiness words follow the module contract: `implemented`, `documented`, `observ
 | configure (model/effort) | unavailable | No setter is wired; a route cannot claim an applied model/effort |
 | goal | unavailable | No native goal verb is exposed by this artifact |
 | steer | unavailable | Streaming input has no expected-turn correction in this mapping |
-| reply (tool permission answers) | unavailable | See permission behavior below |
+| live permission/question reply | implemented | PreToolUse, canUseTool and agent.reply form a boot/session/request/digest-fenced one-shot callback path; its resolver remains in the live bridge |
+| durable defer | unavailable | SDK 0.3.287 declares defer and resume, but its TypeScript no-new-prompt resume input is unspecified here |
 | result pages (`agent.result`) | unavailable | No pinned native item paging in this slice |
 | recover | unavailable | See recovery boundary below |
 
@@ -70,7 +71,9 @@ The mapper (`stream.mjs`) is pure and shared by the live path and the fixture se
 
 ## Permission behavior
 
-When the route omits `permissionMode`, `bridge.mjs` leaves SDK `Options.permissionMode` unset; this is not an explicit `permissionMode = 'default'`. The pinned SDK 0.3.287 selects `permissions.defaultMode` from the settings it loads, or otherwise starts in `'auto'` where that is the default and `'default'` where auto mode is unavailable. `system/init.permissionMode` is the observed session mode. An explicit route value `'default'` selects the SDK's documented manual-approval path through `canUseTool`; this bridge records and denies each request it receives because `agent.reply` is unavailable. With an omitted option, whether requests reach `canUseTool` depends on the resolved mode and native settings; in `'auto'`, the SDK classifier decides calls when it can and uses `canUseTool` when it cannot decide. Native-side denials remain visible through `system/permission_denied` advisories and the authoritative `result.permission_denials`.
+When the route omits `permissionMode`, `bridge-v5.mjs` leaves SDK `Options.permissionMode` unset; this is not an explicit `permissionMode = 'default'`. `system/init.permissionMode` remains the observed native mode. The bridge registers a `PreToolUse` hook that asks for a controller decision and requires its tool ID/input digest to match before `canUseTool` can publish a pending request. The unresolved callback projects a bounded redacted request, then `agent.reply` validates the exact bridge boot, session, request ID, digest, kind and typed answer before resolving the original Promise once. Allow, deny and `AskUserQuestion` answers preserve the SDK result shape. A callback ACK means only that the callback Promise was settled; it does not claim tool or task completion. Abort, stream end and bridge retirement settle the callback as denied/lost, and a late reply is rejected. Universal `PreToolUse` coverage on the installed 0.3.287 runtime remains unknown until an exact-runtime run; older upstream bypass reports do not establish 0.3.287 behavior.
+
+SDK 0.3.287 declares `PreToolUse` defer, session persistence and resume, but the TypeScript query surface does not document how to resume the deferred tool without supplying a new user prompt. This artifact therefore keeps durable defer and resume unavailable. It never serializes a JavaScript resolver or substitutes a fresh prompt.
 
 ## Recovery boundary
 
@@ -89,4 +92,4 @@ EOF or a lost response before matching input-UUID admission remains unknown and 
 
 ## Implementation and remaining work
 
-First C08 slice for Claude: describe/open/next-turn send/snapshot over the pinned Agent SDK with fixture-verified stream mapping and explicit initial model selection. Remaining, as separate slices: attach/resume qualification on the installed runtime, configure (model/effort) with native readback, goal surface, permission replies, result pages, recorded-session recovery, then the Command and Antigravity adapters. Do not mark C08 complete from this slice.
+First C08 slice for Claude: describe/open/next-turn send/snapshot and live permission/question reply over the pinned Agent SDK, with fixture-verified stream mapping and explicit initial model selection. Remaining, as separate slices: attach/resume qualification on the installed runtime, durable defer after an exact no-new-prompt resume contract, configure (model/effort) with native readback, goal surface, result pages, recorded-session recovery, then the Command and Antigravity adapters. Do not mark C08 complete from this slice.

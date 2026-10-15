@@ -9,7 +9,8 @@ mod sdk_harness;
 pub use config::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, NativeOptions, RUNTIME};
 pub use module_runtime::OwnedBootstrap;
 
-use interactions::{InteractionJournal, InteractionKind, validate_reply};
+use atlas_redact::redact_auto;
+use interactions::{InteractionJournal, InteractionKind, InteractionRequest, validate_reply};
 use journal::{OperationJournal, digest_bytes, digest_json};
 use native_state::{NativeControl, safe_family_resource_links};
 use sdk_harness::{HarnessFrame, NativeHarness};
@@ -47,7 +48,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     } = bootstrap;
     host_config.validate()?;
     let boot_id = worker.boot_id.clone();
-    let (mut link, native_options) = open_link(LinkInvocation {
+    let (mut link, native_options, mut recovery_required) = open_link(LinkInvocation {
         host_config: &host_config,
         expected_options: None,
         credential: &credential,
@@ -138,7 +139,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                             ));
                         }
                         if action.reconnect {
-                            link = open_link(LinkInvocation {
+                            let (reconnected, _, recovery) = open_link(LinkInvocation {
                                 host_config: &host_config,
                                 expected_options: Some(&config.native_options),
                                 credential: &credential,
@@ -147,7 +148,9 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                                 boot_id: &boot_id,
                                 native_ready: harness_alive,
                                 native_root: session_root.as_deref(),
-                            }).await?.0;
+                            }).await?;
+                            link = reconnected;
+                            recovery_required = recovery;
                         }
                     }
                     None => frames_closed = true,
@@ -196,6 +199,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                         harness: &mut harness,
                         frame_tx: &frame_tx,
                         boot_id: &boot_id,
+                        recovery_required,
                         harness_alive: &mut harness_alive,
                         native_prepared,
                         latest_state: &latest_state,
@@ -204,7 +208,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                         bridge_path: &bridge_path,
                         command: &command,
                     }).await? {
-                        link = open_link(LinkInvocation {
+                        let (reconnected, _, recovery) = open_link(LinkInvocation {
                             host_config: &host_config,
                             expected_options: Some(&config.native_options),
                             credential: &credential,
@@ -213,7 +217,9 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                             boot_id: &boot_id,
                             native_ready: harness_alive,
                             native_root: session_root.as_deref(),
-                        }).await?.0;
+                        }).await?;
+                        link = reconnected;
+                        recovery_required = recovery;
                     }
                 } else {
                     sleep(Duration::from_millis(IDLE_POLL_MS)).await;
@@ -353,6 +359,7 @@ struct CommandInvocation<'a> {
     harness: &'a mut Option<NativeHarness>,
     frame_tx: &'a mpsc::Sender<HarnessFrame>,
     boot_id: &'a str,
+    recovery_required: bool,
     harness_alive: &'a mut bool,
     native_prepared: bool,
     latest_state: &'a Value,
@@ -418,7 +425,7 @@ struct UnknownResultInvocation<'a> {
     reconnect: bool,
 }
 
-async fn open_link(invocation: LinkInvocation<'_>) -> Result<(ModuleLink, NativeOptions)> {
+async fn open_link(invocation: LinkInvocation<'_>) -> Result<(ModuleLink, NativeOptions, bool)> {
     let LinkInvocation {
         host_config,
         expected_options,
@@ -449,7 +456,7 @@ async fn open_link(invocation: LinkInvocation<'_>) -> Result<(ModuleLink, Native
     }
     let response = link.hello(params, Some(claim)).await?;
     let native_options = verify_hello(host_config, claim, &response, expected_options)?;
-    Ok((link, native_options))
+    Ok((link, native_options, response["recovery_required"] == true))
 }
 
 async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
@@ -462,6 +469,7 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
         harness,
         frame_tx,
         boot_id,
+        recovery_required,
         harness_alive,
         native_prepared,
         latest_state,
@@ -481,6 +489,15 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
             ));
         }
         if saved.outcome.is_none() {
+            if command.method == "agent.result" {
+                // Result-page delivery is non-replayable once its exact intent
+                // exists. Preserve the result relation and classify the prior
+                // Store ACK as Unknown instead of writing a second intent.
+                let _ = settle_result_intent_without_replay(
+                    config, journal, command, &receipt, boot_id,
+                )?;
+                return Ok(false);
+            }
             let outcome = unknown_outcome(
                 command,
                 &receipt,
@@ -491,6 +508,18 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
             journal.save_outcome(&command.operation_id, &outcome)?;
         }
         return Ok(false);
+    }
+    if recovery_required && !matches!(command.method.as_str(), "agent.reconcile" | "agent.refresh")
+    {
+        return queue_rejected(
+            config,
+            claim,
+            journal,
+            command,
+            &receipt,
+            "NATIVE_RECOVERY_REQUIRED",
+            native_root_id,
+        );
     }
 
     match command.method.as_str() {
@@ -1037,13 +1066,26 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
             );
         }
     };
-    let reply = &command.input["reply"];
+    let reply = match normalize_redacted_interaction_reply(&request, &command.input["reply"]) {
+        Ok(reply) => reply,
+        Err(_) => {
+            return queue_rejected(
+                config,
+                claim,
+                journal,
+                command,
+                receipt,
+                "INTERACTION_REPLY_MISMATCH",
+                Some(native_root_id),
+            );
+        }
+    };
     if request.bridge_boot_id != boot_id
         || request.native_root_id != native_root_id
         || request.native_scope_key != config.native_options.scope_key()
         || command.input["interaction_kind"] != request.kind.as_str()
         || command.input["request_sha256"] != request.request_sha256
-        || validate_reply(&request, reply).is_err()
+        || validate_reply(&request, &reply).is_err()
     {
         return queue_rejected(
             config,
@@ -1055,7 +1097,7 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
             Some(native_root_id),
         );
     }
-    let reply_sha256 = digest_json(reply)?;
+    let reply_sha256 = digest_json(&reply)?;
     let native_intent = json!({
         "interaction_request_id":request.request_id,
         "interaction_kind":request.kind.as_str(),
@@ -1079,7 +1121,7 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
     if let Err(error) = interactions.begin_reply(
         &request.request_id,
         &command.operation_id,
-        reply,
+        &reply,
         &reply_sha256,
     ) {
         let saved = journal.get(&command.operation_id)?.ok_or_else(|| {
@@ -1094,7 +1136,7 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
             let _ = interactions.mark_uncertain_reply(
                 &request.request_id,
                 &command.operation_id,
-                reply,
+                &reply,
                 &reply_sha256,
             );
             unknown_outcome_from_saved(
@@ -1158,6 +1200,11 @@ async fn handle_result(invocation: ResultInvocation<'_>) -> Result<bool> {
         command,
     } = invocation;
     let receipt = receipt::for_command(claim, command)?;
+    if let Some(reconnect) =
+        settle_result_intent_without_replay(config, journal, command, &receipt, boot_id)?
+    {
+        return Ok(reconnect);
+    }
     let selector = &command.input["selector"];
     let valid_selector = selector.as_object().is_some_and(|fields| {
         fields.len() == 3
@@ -1631,6 +1678,64 @@ fn save_result_unknown(invocation: UnknownResultInvocation<'_>) -> Result<bool> 
     save_result_unknown_with_intent(invocation, &intent)
 }
 
+/// A retained result intent means page publication may already have reached
+/// Store, even when this process has no ACK or terminal outcome. Resolve that
+/// uncertainty from the exact marker before reading or publishing another
+/// page. This also fences a result command delivered to a replacement boot:
+/// the old Operation is settled Unknown under its original intent, never
+/// replayed through the replacement link.
+fn settle_result_intent_without_replay(
+    config: &AdapterConfig,
+    journal: &OperationJournal,
+    command: &RuntimeCommand,
+    receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+    boot_id: &str,
+) -> Result<Option<bool>> {
+    let Some(saved) = journal.get(&command.operation_id)? else {
+        return Ok(None);
+    };
+    if saved.outcome.is_some() {
+        // The retained terminal outcome, including a previous Applied ACK, is
+        // immutable. The normal outbox path will deliver it if still needed.
+        return Ok(Some(false));
+    }
+    let saved_intent = saved.intent.as_ref().ok_or_else(|| {
+        Error::new(
+            "ADAPTER_INTENT_MISSING",
+            "retained result operation has no exact intent",
+        )
+    })?;
+    let exact_request = saved.receipt.as_ref() == Some(receipt)
+        && saved.method.as_deref() == Some(command.method.as_str());
+    let same_boot = saved_intent["bridge_boot_id"].as_str() == Some(boot_id);
+    let code = if !exact_request {
+        "CLAUDE_RESULT_INTENT_CONFLICT"
+    } else if same_boot {
+        "MODULE_RESULT_REPLAY_PREVENTED"
+    } else {
+        "CLAUDE_RESULT_RETIRED_BOOT_REPLAY"
+    };
+    let native = &saved_intent["native"];
+    let target_operation_id = native["result_target_operation_id"].clone();
+    let target_input_id = native["native_input_id"].clone();
+    let target_receipt = target_operation_id
+        .as_str()
+        .map(|operation_id| journal.get(operation_id))
+        .transpose()?
+        .flatten()
+        .and_then(|target| target.receipt);
+    let mut outcome = unknown_outcome_from_saved(&command.operation_id, &saved, code, config)?;
+    annotate_result_unknown(
+        &mut outcome,
+        target_operation_id,
+        target_input_id,
+        target_receipt.as_ref(),
+        !exact_request,
+    )?;
+    journal.save_outcome(&command.operation_id, &outcome)?;
+    Ok(Some(false))
+}
+
 fn save_result_unknown_with_intent(
     invocation: UnknownResultInvocation<'_>,
     intent: &Value,
@@ -1819,6 +1924,138 @@ fn encode_base64(bytes: &[u8]) -> String {
 
 // This protocol handler keeps the existing borrowed runtime state explicit.
 #[allow(clippy::too_many_arguments)]
+fn redact_interaction_input(input: &Value) -> Result<Value> {
+    let raw = serde_json::to_string(input)?;
+    let redacted = redact_auto(&raw);
+    let safe_input: Value = serde_json::from_str(&redacted.text).map_err(|_| {
+        Error::new(
+            "SDK_INTERACTION_REDACTION",
+            "redacted interaction input is not valid JSON",
+        )
+    })?;
+    if !safe_input.is_object() {
+        return Err(Error::new(
+            "SDK_INTERACTION_REDACTION",
+            "redacted interaction input changed its object shape",
+        ));
+    }
+    Ok(safe_input)
+}
+
+fn normalize_redacted_interaction_reply(
+    request: &InteractionRequest,
+    reply: &Value,
+) -> Result<Value> {
+    if request.kind != InteractionKind::Question {
+        return Ok(reply.clone());
+    }
+    let original_questions = request.input["questions"]
+        .as_array()
+        .ok_or_else(|| Error::new("INTERACTION_REPLY_SCHEMA", "question request is malformed"))?;
+    let visible_questions = redact_interaction_input(&request.input)?["questions"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| {
+            Error::new(
+                "INTERACTION_REPLY_SCHEMA",
+                "redacted questions are malformed",
+            )
+        })?;
+    let Some(provided_questions) = reply["updated_input"]["questions"].as_array() else {
+        return Err(Error::new(
+            "INTERACTION_REPLY_SCHEMA",
+            "question reply lacks its displayed question list",
+        ));
+    };
+    let Some(provided_answers) = reply["updated_input"]["answers"].as_object() else {
+        return Err(Error::new(
+            "INTERACTION_REPLY_SCHEMA",
+            "question reply lacks its answer map",
+        ));
+    };
+    if visible_questions.len() != original_questions.len()
+        || provided_questions != &visible_questions
+        || provided_answers.len() != visible_questions.len()
+    {
+        return Err(Error::new(
+            "INTERACTION_REPLY_SCHEMA",
+            "question reply differs from its redacted pending projection",
+        ));
+    }
+    let mut answers = serde_json::Map::new();
+    let mut seen_displayed = std::collections::HashSet::new();
+    let mut seen_original = std::collections::HashSet::new();
+    for (visible, original) in visible_questions.iter().zip(original_questions) {
+        let displayed = visible["question"].as_str().ok_or_else(|| {
+            Error::new("INTERACTION_REPLY_SCHEMA", "displayed question is invalid")
+        })?;
+        let original = original["question"]
+            .as_str()
+            .ok_or_else(|| Error::new("INTERACTION_REPLY_SCHEMA", "native question is invalid"))?;
+        if !seen_displayed.insert(displayed.to_owned())
+            || !seen_original.insert(original.to_owned())
+        {
+            return Err(Error::new(
+                "INTERACTION_REPLY_SCHEMA",
+                "question identity is ambiguous after redaction",
+            ));
+        }
+        let answer = provided_answers.get(displayed).ok_or_else(|| {
+            Error::new(
+                "INTERACTION_REPLY_SCHEMA",
+                "question answer does not name a displayed question",
+            )
+        })?;
+        answers.insert(original.to_owned(), answer.clone());
+    }
+    let mut normalized = reply.clone();
+    normalized["updated_input"]["questions"] = json!(original_questions);
+    normalized["updated_input"]["answers"] = Value::Object(answers);
+    Ok(normalized)
+}
+
+fn redact_pending_interactions(mut pending: Value) -> Result<Value> {
+    let entries = pending.as_array_mut().ok_or_else(|| {
+        Error::new(
+            "SDK_INTERACTION_SCHEMA",
+            "pending interaction snapshot is not an array",
+        )
+    })?;
+    for entry in entries {
+        let request = entry
+            .get_mut("request")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                Error::new(
+                    "SDK_INTERACTION_SCHEMA",
+                    "pending interaction snapshot lacks its request",
+                )
+            })?;
+        let input = request.get("input").ok_or_else(|| {
+            Error::new(
+                "SDK_INTERACTION_SCHEMA",
+                "pending interaction snapshot lacks its input",
+            )
+        })?;
+        let raw = serde_json::to_string(input)?;
+        let safe_input = redact_interaction_input(input)?;
+        request.insert("input".to_owned(), safe_input);
+        request.insert("input_redacted".to_owned(), json!(true));
+        request.insert("input_bytes".to_owned(), json!(raw.len()));
+    }
+    if serde_json::to_vec(&pending)?.len() > MAX_NATIVE_COMMAND_BYTES {
+        return Err(Error::new(
+            "SDK_INTERACTION_BOUNDARY",
+            "redacted pending interaction snapshot exceeds its boundary",
+        ));
+    }
+    Ok(pending)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The readback keeps exact binding, boot, session, harness, journal, and interaction identities explicit."
+)]
 fn handle_refresh(
     config: &AdapterConfig,
     claim: &ModuleContractClaim,
@@ -1882,8 +2119,9 @@ fn handle_refresh(
     let native_observation = if observation_matches {
         let mut observation = compact_refresh_observation(latest_state);
         observation["bridge_alive"] = json!(true);
-        observation["pending_interactions"] =
-            interactions.pending_snapshot(boot_id, requested_session)?;
+        observation["pending_interactions"] = redact_pending_interactions(
+            interactions.pending_snapshot(boot_id, requested_session)?,
+        )?;
         observation
     } else {
         Value::Null
@@ -1893,6 +2131,12 @@ fn handle_refresh(
         "readback":"local_sdk_observation_cache",
         "native_observation_available":observation_matches,
         "pending_interactions_available":observation_matches,
+        "interaction_capabilities":{
+            "live_callback":"implemented",
+            "pretool_use_guard":"implemented",
+            "pretool_use_runtime_coverage":"unknown",
+            "durable_defer":"unavailable"
+        },
         "bridge_alive":harness_alive,
         "native_observation":native_observation,
         "native_session_id":requested_session,
@@ -3458,6 +3702,173 @@ mod failed_prepare_lifecycle_fixture {
                 .outcome
                 .unwrap()["outcome"],
             "unknown"
+        );
+    }
+
+    #[test]
+    fn retained_result_intent_becomes_unknown_without_page_replay() {
+        let (_directory, config, journal, _interactions) = fixture_context();
+        let target_receipt = fixture_receipt("result-target");
+        let scope = config.native_options.scope_key();
+        let target_intent = json!({
+            "receipt":target_receipt,
+            "method":"task.dispatch",
+            "binding_id":"fixture-binding",
+            "generation":1,
+            "input_sha256":"a".repeat(64),
+            "native":{
+                "native_scope_key":scope,
+                "native_root_id":"fixture-root",
+                "user_message_uuid":"fixture-input",
+                "native_payload_sha256":"d".repeat(64),
+                "native_payload_bytes":8
+            },
+            "bridge_boot_id":"fixture-boot",
+            "native_scope_key":scope,
+            "replay_permitted":false
+        });
+        journal
+            .write_intent(
+                "result-target",
+                &target_receipt,
+                "task.dispatch",
+                &target_intent,
+            )
+            .expect("write the exact target dispatch intent");
+
+        let result_operation_id = "retired-result-operation";
+        let receipt = fixture_receipt(result_operation_id);
+        let intent = json!({
+            "receipt":receipt,
+            "method":"agent.result",
+            "binding_id":"fixture-binding",
+            "generation":1,
+            "input_sha256":"a".repeat(64),
+            "native":{
+                "result_target_operation_id":"result-target",
+                "native_root_id":"fixture-root",
+                "native_scope_key":config.native_options.scope_key(),
+                "native_input_id":"fixture-input",
+                "result_frame_uuid":"fixture-result-frame",
+                "result_sha256":"b".repeat(64),
+                "result_bytes":8,
+                "native_payload_sha256":"c".repeat(64),
+                "native_payload_bytes":8
+            },
+            "bridge_boot_id":"retired-boot",
+            "native_scope_key":config.native_options.scope_key(),
+            "native_root_id":"fixture-root",
+            "replay_permitted":false
+        });
+        journal
+            .write_intent(result_operation_id, &receipt, "agent.result", &intent)
+            .expect("persist one result intent before the simulated lost ACK");
+
+        let command = RuntimeCommand {
+            operation_id: result_operation_id.to_owned(),
+            method: "agent.result".to_owned(),
+            created_at_ms: 1,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_root_id: Some("fixture-root".to_owned()),
+            route: json!({}),
+            input: json!({"selector":{"kind":"claude_assistant_result","input_operation_id":"result-target","session_id":"fixture-root"},"offset_bytes":0,"length_bytes":8}),
+            input_sha256: Some(receipt.input_sha256.clone()),
+            target_input_sha256: Some("d".repeat(64)),
+        };
+        let handled = settle_result_intent_without_replay(
+            &config,
+            &journal,
+            &command,
+            &receipt,
+            "replacement-boot",
+        )
+        .expect("classify the retained result attempt");
+        assert_eq!(handled, Some(false), "the page transport is bypassed");
+
+        let saved = journal
+            .get(result_operation_id)
+            .expect("read result operation")
+            .expect("retained result intent remains");
+        assert_eq!(saved.intent.as_ref(), Some(&intent));
+        let outcome = saved
+            .outcome
+            .expect("retained result becomes terminal Unknown");
+        assert_eq!(outcome["outcome"], "unknown");
+        assert_eq!(
+            outcome["details"]["diagnostic_code"],
+            "CLAUDE_RESULT_RETIRED_BOOT_REPLAY"
+        );
+        assert_eq!(outcome["details"]["target_operation_id"], "result-target");
+        assert_eq!(
+            outcome["details"]["target_module_receipt"],
+            serde_json::to_value(target_receipt).expect("serialize the exact target receipt")
+        );
+        assert_eq!(outcome["details"]["native_replay"], false);
+        assert_ne!(
+            outcome["details"]["diagnostic_code"], "ADAPTER_INTENT_EXISTS",
+            "the existing marker is settled instead of being written twice"
+        );
+    }
+
+    #[test]
+    fn question_reply_restores_redacted_display_keys_to_native_questions() {
+        let question_text = "Use this key sk-ant-api03-1234567890abcdefghijklmnop for the test?";
+        let request = InteractionRequest {
+            schema_version: 1,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_scope_key: "claude:fixture".to_owned(),
+            bridge_boot_id: "fixture-boot".to_owned(),
+            native_root_id: "fixture-root".to_owned(),
+            request_id: "sdk-request-id".to_owned(),
+            kind: InteractionKind::Question,
+            tool_name: "AskUserQuestion".to_owned(),
+            input: json!({
+                "questions":[{
+                    "question":question_text,
+                    "header":"Choice",
+                    "options":[
+                        {"label":"Keep","description":"Continue."},
+                        {"label":"Stop","description":"Do not continue."}
+                    ],
+                    "multiSelect":false
+                }]
+            }),
+            request_sha256: "a".repeat(64),
+        };
+        let visible_input =
+            redact_interaction_input(&request.input).expect("redact the pending question");
+        assert!(
+            !visible_input
+                .to_string()
+                .contains("sk-ant-api03-1234567890abcdefghijklmnop"),
+            "the Store-facing request must not retain the key-shaped string"
+        );
+        let visible_question = visible_input["questions"][0]["question"]
+            .as_str()
+            .expect("redacted question remains addressable");
+        let redacted_reply = json!({
+            "type":"question",
+            "updated_input":{
+                "questions":visible_input["questions"],
+                "answers":{visible_question:"Keep"}
+            }
+        });
+
+        let normalized = normalize_redacted_interaction_reply(&request, &redacted_reply)
+            .expect("map the displayed question back to its retained native text");
+        assert_eq!(
+            normalized["updated_input"]["questions"],
+            request.input["questions"]
+        );
+        assert_eq!(
+            normalized["updated_input"]["answers"][question_text],
+            "Keep"
+        );
+        assert!(
+            validate_reply(&request, &normalized).is_ok(),
+            "the SDK receives its exact original question and official answers map"
         );
     }
 }

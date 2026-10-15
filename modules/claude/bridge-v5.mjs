@@ -3,7 +3,7 @@
 // SDK. Host IPC reconnect never closes the SDK query or repeats input.
 // Artifact scope (bridge.5): Store TaskPrompt v1 bytes are submitted unchanged
 // and normalized admission is emitted only after the matching native UUID echo.
-// Attach/resume/configure/goal/reply/steer/result pages remain unavailable.
+// Attach/resume/configure/goal/steer/result pages remain unavailable.
 import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -21,6 +21,7 @@ import {
   CLAUDE_TASK_PROMPT_ARTIFACT_ID, taskDispatchAdmission, taskPromptFor,
   enqueueTaskPrompt, moduleReceipt,
 } from './task-prompt.mjs';
+import { createInteractionManager } from './interactions.mjs';
 import { loadModuleBootstrap, verifyModuleHello, verifyModuleCommand } from './module-bootstrap-v5.mjs';
 import {
   createStreamState, applySdkMessage, notePermissionRequest, noteStderr,
@@ -42,11 +43,14 @@ const CAPABILITIES = {
   configure_effort: 'unavailable',
   goal: 'unavailable',
   steer: 'unavailable',
-  reply: 'unavailable',
+  reply: 'implemented',
+  live_permission_callback: 'implemented',
+  pretool_use_guard: 'implemented',
+  pretool_use_runtime_coverage: 'unknown',
+  durable_defer: 'unavailable',
   result_pages: 'unavailable',
   recover: 'unavailable',
 };
-const DENY_MESSAGE = 'Denied by the swarm Claude bridge: tool permission replies (agent.reply) are unavailable in this module artifact, so no tool use is approved implicitly. The request was recorded in the module observation.';
 const DEFERRED = Symbol('deferred-outcome');
 const RETIRE_AFTER_UNKNOWN = ['SDK_STARTUP_UNKNOWN', 'FIRST_NATIVE_QUERY_UNKNOWN'];
 
@@ -129,6 +133,7 @@ let connected = false;
 let stopping = false;
 let session = null; // { state, input, query, preparedQuery, rootId, scopeKey, pendingSends, ended }
 let configuredModel = null;
+let recoveryRequired = false;
 let revision = 0;
 let lastSentRevision = -1;
 const outcomes = new Map(); // operation_id -> RuntimeOutcome awaiting host report
@@ -244,12 +249,18 @@ function observation() {
     bridge_boot_id: bootId,
     native_scope_key: session?.scopeKey ?? null,
   }));
+  stateSnapshot.pending_interactions = session?.interactions?.snapshot() ?? [];
+  stateSnapshot.interaction_events = session?.interactions?.events() ?? [];
+  stateSnapshot.interaction_event_count = session?.interactions?.eventCount() ?? 0;
+  stateSnapshot.interaction_events_truncated = session?.interactions?.eventsTruncated() ?? false;
   const result = {
     ...stateSnapshot,
     describe: describeFacts(state, requestedModel),
     native_root_id: session?.identityAdopted ? session.rootId : null,
     native_scope_key: session?.identityAdopted ? session.scopeKey : null,
     boot_id: bootId,
+    native_process_family_status: 'unknown',
+    family_departure_proven: false,
   };
   if (Buffer.byteLength(JSON.stringify(result)) > 700000) {
     // Keep the newest evidence and say so; never discard outcomes instead.
@@ -307,6 +318,7 @@ function settleSends(sess, msg) {
 
 function finishSession(sess) {
   sess.ended = true;
+  sess.interactions?.retire('SDK_STREAM_ENDED');
   if (sess.openWait) {
     const failure = sess.state.init_failure;
     const error = codedError('INIT_FAILURE', failure?.subtype === 'error_during_execution' ? false : true);
@@ -381,8 +393,19 @@ async function startNative(command) {
   const sess = {
     state, input, query: null, preparedQuery: null, rootId: null, scopeKey: nativeScopeKey(),
     requestedModel, pendingSends: new Map(), ended: false, firstDispatchStarted: false,
-    identityAdopted: false,
+    identityAdopted: false, interactions: null,
   };
+  sess.interactions = createInteractionManager({
+    bindingId: bootstrap.bindingId,
+    generation: bootstrap.generation,
+    bridgeBootId: bootId,
+    getNativeIdentity: () => ({
+      rootId: sess.identityAdopted ? sess.rootId : null,
+      scopeKey: sess.scopeKey,
+    }),
+    secretValues: [credential.token],
+    onChanged: changed,
+  });
   const options = {
     cwd,
     ...modelOption,
@@ -394,14 +417,12 @@ async function startNative(command) {
     ...(firstQueryControl.spawnClaudeCodeProcess
       ? { spawnClaudeCodeProcess: firstQueryControl.spawnClaudeCodeProcess }
       : {}),
-    canUseTool: (toolName, _toolInput, toolOptions) => {
+    canUseTool: (toolName, toolInput, toolOptions) => {
       notePermissionRequest(state, { tool_name: toolName, tool_use_id: toolOptions.toolUseID });
-      changed();
-      return Promise.resolve({
-        behavior: 'deny',
-        message: DENY_MESSAGE,
-        ...(typeof toolOptions.toolUseID === 'string' ? { toolUseID: toolOptions.toolUseID } : {}),
-      });
+      return sess.interactions.canUseTool(toolName, toolInput, toolOptions);
+    },
+    hooks: {
+      PreToolUse: [{ hooks: [input => sess.interactions.preToolUse(input)] }],
     },
     stderr: chunk => { noteStderr(state, chunk); changed(); },
   };
@@ -512,6 +533,9 @@ function sendNative(command) {
 async function execute(command) {
   active.add(command.operation_id);
   try {
+    if (recoveryRequired && !['agent.reconcile', 'agent.refresh'].includes(command.method)) {
+      throw codedError('NATIVE_RECOVERY_REQUIRED');
+    }
     let result;
     if (command.method === 'agent.open') {
       result = await startNative(command);
@@ -522,11 +546,18 @@ async function execute(command) {
       if (!sess || sess.ended || !sess.rootId || !sess.identityAdopted) throw codedError('NATIVE_SESSION_NOT_READY');
       const target = command.input?.session_id === undefined ? sess.rootId : required(command.input, 'session_id');
       if (target !== sess.rootId && !sess.state.children.has(target)) throw codedError('UNKNOWN_SESSION');
+      const nativeSnapshot = snapshot(sess.state, sess.requestedModel);
+      nativeSnapshot.pending_interactions = sess.interactions.snapshot();
+      nativeSnapshot.interaction_events = sess.interactions.events();
+      nativeSnapshot.interaction_event_count = sess.interactions.eventCount();
+      nativeSnapshot.interaction_events_truncated = sess.interactions.eventsTruncated();
+      nativeSnapshot.native_process_family_status = 'unknown';
+      nativeSnapshot.family_departure_proven = false;
       result = {
         details: {
           completion_condition: 'native_read_completed',
           target,
-          snapshot: snapshot(sess.state, sess.requestedModel),
+          snapshot: nativeSnapshot,
         },
       };
     } else if (command.method === 'agent.reconcile') {
@@ -537,7 +568,22 @@ async function execute(command) {
     } else if (command.method === 'agent.configure') {
       throw capabilityError(command.input?.settings?.model !== undefined ? 'configure_model' : 'configure_effort');
     } else if (command.method === 'agent.goal') throw capabilityError('goal');
-    else if (command.method === 'agent.reply') throw capabilityError('reply');
+    else if (command.method === 'agent.reply') {
+      const acknowledgement = session?.interactions?.reply(command);
+      if (!acknowledgement) throw codedError('INTERACTION_REPLY_NOT_PENDING');
+      result = {
+        native_root_id: acknowledgement.native_root_id,
+        native_scope_key: acknowledgement.native_scope_key,
+        details: {
+          completion_condition: 'callback_reply_acknowledged',
+          callback_reply_acknowledged: true,
+          ...acknowledgement,
+          execution_complete: false,
+          task_completion: 'unknown',
+          native_replay: false,
+        },
+      };
+    }
     else if (command.method === 'agent.recover') throw capabilityError('recover');
     else if (command.method === 'agent.result') throw capabilityError('result_pages');
     else throw codedError('UNSUPPORTED_OPERATION');
@@ -608,6 +654,7 @@ async function stop() {
   clearInterval(interval);
   // Only explicit termination of this SDK owner closes the native query.
   if (session && !session.ended) {
+    session.interactions?.retire('BRIDGE_STOPPED');
     session.input.close();
     try { session.query?.close(); } catch { /* stream already over */ }
     try { session.preparedQuery?.close(); } catch { /* warm process already ended */ }
@@ -636,6 +683,7 @@ while (!stopping) {
     });
     verifyModuleHello(hello, bootstrap);
     helloRetainedIdentity = identityFromHello(hello);
+    recoveryRequired = hello.recovery_required === true;
     if (storeRetainedIdentity && !sameStoreIdentity(storeRetainedIdentity, helloRetainedIdentity)) {
       throw codedError('STORE_RETAINED_IDENTITY_MISMATCH');
     }
@@ -668,9 +716,18 @@ while (!stopping) {
         }
         // Serialize native admission, not whole model turns. Read-only
         // refresh/reconcile bypass the queue like replies do for Muse.
-        if (['agent.refresh', 'agent.reconcile'].includes(command.method)) void execute(command);
-        else admissionTail = admissionTail.then(() => execute(command));
-        await admissionTail.catch(() => {});
+        if (['agent.refresh', 'agent.reconcile', 'agent.reply'].includes(command.method)) {
+          void execute(command).catch(error => {
+            console.error(JSON.stringify({
+              component: 'claude-bridge',
+              code: error.code ?? error.message,
+              operation_id: command.operation_id,
+            }));
+          });
+        } else {
+          admissionTail = admissionTail.then(() => execute(command));
+          await admissionTail.catch(() => {});
+        }
       }
     }
   } catch (error) {

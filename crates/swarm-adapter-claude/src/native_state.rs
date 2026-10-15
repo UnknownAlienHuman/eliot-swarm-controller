@@ -78,6 +78,12 @@ impl NativeControl {
             "bridge_boot_id":boot_id,
             "native_scope_key":config.native_options.scope_key(),
             "root_id":session_root,
+            "interaction_capabilities":{
+                "live_callback":"implemented",
+                "pretool_use_guard":"implemented",
+                "pretool_use_runtime_coverage":"unknown",
+                "durable_defer":"unavailable"
+            },
             "state":{
                 "init_session_id":self.init_session_id,
                 "effective_model":self.init_model,

@@ -104,7 +104,7 @@ export async function loadModuleBootstrap(configFile, env = process.env) {
       || required(env, 'ELIOT_SWARM_MODULE_PROTOCOL') !== '1.0'
       || moduleContract.config_schema !== null
       || !isDeepStrictEqual(moduleContract.capabilities, [
-        'agent.open', 'agent.reconcile', 'agent.refresh', 'agent.send/next_turn', 'task.dispatch',
+        'agent.open', 'agent.reconcile', 'agent.refresh', 'agent.reply', 'agent.send/next_turn', 'task.dispatch',
       ])
       || !schemaList(moduleContract.command_schemas, [
         'swarm.runtime_command', 'swarm.task_dispatch_context', 'swarm.task_prompt',
