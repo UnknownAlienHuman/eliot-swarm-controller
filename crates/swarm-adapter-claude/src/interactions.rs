@@ -5,6 +5,7 @@
 //! bridge; this journal never authorizes replay after an uncertain delivery.
 
 use crate::journal::{OperationJournal, digest_bytes, digest_json, is_item_local_operation_damage};
+use atlas_redact::redact_auto;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -55,16 +56,20 @@ pub struct InteractionRequest {
     pub kind: InteractionKind,
     pub tool_name: String,
     pub input: Value,
+    #[serde(default)]
+    pub input_sha256: String,
     pub request_sha256: String,
 }
 
 pub struct InteractionRequestEvidence<'a> {
+    pub schema_version: u32,
     pub bridge_boot_id: &'a str,
     pub native_root_id: &'a str,
     pub request_id: &'a str,
     pub kind: InteractionKind,
     pub tool_name: &'a str,
     pub input: &'a Value,
+    pub input_sha256: &'a str,
     pub request_sha256: &'a str,
 }
 
@@ -286,16 +291,18 @@ impl InteractionJournal {
         evidence: InteractionRequestEvidence<'_>,
     ) -> Result<InteractionRequest> {
         let InteractionRequestEvidence {
+            schema_version,
             bridge_boot_id,
             native_root_id,
             request_id,
             kind,
             tool_name,
             input,
+            input_sha256,
             request_sha256,
         } = evidence;
-        let mut request = InteractionRequest {
-            schema_version: 1,
+        let request = InteractionRequest {
+            schema_version,
             binding_id: self.binding_id.clone(),
             generation: self.generation,
             native_scope_key: self.native_scope_key.clone(),
@@ -305,15 +312,9 @@ impl InteractionJournal {
             kind,
             tool_name: tool_name.to_owned(),
             input: input.clone(),
-            request_sha256: String::new(),
+            input_sha256: input_sha256.to_owned(),
+            request_sha256: request_sha256.to_owned(),
         };
-        request.request_sha256 = digest_json(&request_payload(&request)?)?;
-        if request.request_sha256 != request_sha256 {
-            return Err(Error::new(
-                "SDK_INTERACTION_DIGEST_MISMATCH",
-                "Claude callback digest differs from its exact typed request",
-            ));
-        }
         validate_request(&request)?;
         let path = self.path(request_id)?;
         let tombstone_path = self.tombstone_path(request_id)?;
@@ -1813,7 +1814,8 @@ impl InteractionJournal {
                     "callback state file cannot be read",
                 )
             })?;
-        let record: InteractionRecord = serde_json::from_slice(&bytes).map_err(|_| {
+        drop(file);
+        let mut record: InteractionRecord = serde_json::from_slice(&bytes).map_err(|_| {
             Error::new(
                 "ADAPTER_INTERACTION_JOURNAL",
                 "callback state record is malformed",
@@ -1821,7 +1823,7 @@ impl InteractionJournal {
         })?;
         let file_id = path.file_stem().and_then(|value| value.to_str());
         if record.schema_version != 1
-            || record.request.schema_version != 1
+            || !matches!(record.request.schema_version, 1 | 2)
             || file_id != Some(digest_bytes(record.request.request_id.as_bytes()).as_str())
             || record.request.binding_id != self.binding_id
             || record.request.generation != self.generation
@@ -1846,6 +1848,10 @@ impl InteractionJournal {
                 "ADAPTER_INTERACTION_JOURNAL",
                 "callback state has inconsistent reply evidence",
             ));
+        }
+        if record.request.schema_version == 1 {
+            redact_legacy_request(&mut record.request)?;
+            self.replace(path, &record)?;
         }
         Ok(record)
     }
@@ -2074,7 +2080,7 @@ fn remove_interaction_file(path: &Path) -> Result<()> {
     })
 }
 
-fn request_payload(request: &InteractionRequest) -> Result<Value> {
+fn legacy_request_payload(request: &InteractionRequest) -> Result<Value> {
     Ok(json!({
         "schema_version":request.schema_version,
         "request_id":request.request_id,
@@ -2086,8 +2092,19 @@ fn request_payload(request: &InteractionRequest) -> Result<Value> {
 
 fn validate_request(request: &InteractionRequest) -> Result<()> {
     let input_bytes = serde_json::to_vec(&request.input)?.len();
-    let digest = digest_json(&request_payload(request)?)?;
-    if request.schema_version != 1
+    let integrity_valid = match request.schema_version {
+        1 => {
+            request.input_sha256.is_empty()
+                && digest_json(&legacy_request_payload(request)?)? == request.request_sha256
+        }
+        2 => {
+            valid_sha256(&request.input_sha256)
+                && digest_json(&request.input)? == request.input_sha256
+                && valid_sha256(&request.request_sha256)
+        }
+        _ => false,
+    };
+    if request.schema_version != 1 && request.schema_version != 2
         || !valid_identity(&request.binding_id, 256)
         || request.generation < 1
         || !valid_identity(&request.native_scope_key, 512)
@@ -2100,8 +2117,7 @@ fn validate_request(request: &InteractionRequest) -> Result<()> {
         || (request.kind == InteractionKind::Question && request.tool_name != "AskUserQuestion")
         || (request.kind == InteractionKind::Permission && request.tool_name == "AskUserQuestion")
         || (request.kind == InteractionKind::Question && !valid_question_input(&request.input))
-        || !valid_sha256(&request.request_sha256)
-        || request.request_sha256 != digest
+        || !integrity_valid
     {
         return Err(Error::new(
             "SDK_INTERACTION_SCHEMA",
@@ -2109,6 +2125,63 @@ fn validate_request(request: &InteractionRequest) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(super) fn redact_interaction_input(input: &Value) -> Result<Value> {
+    let raw = serde_json::to_string(input)?;
+    let redacted = redact_auto(&raw);
+    let safe_input: Value = serde_json::from_str(&redacted.text).map_err(|_| {
+        Error::new(
+            "SDK_INTERACTION_REDACTION",
+            "redacted interaction input is not valid JSON",
+        )
+    })?;
+    if !safe_input.is_object() {
+        return Err(Error::new(
+            "SDK_INTERACTION_REDACTION",
+            "redacted interaction input changed its object shape",
+        ));
+    }
+    Ok(safe_input)
+}
+
+fn redact_legacy_request(request: &mut InteractionRequest) -> Result<()> {
+    request.input = match request.kind {
+        InteractionKind::Question => redact_interaction_input(&request.input)?,
+        InteractionKind::Permission => {
+            let object = request.input.as_object().ok_or_else(|| {
+                Error::new(
+                    "SDK_INTERACTION_SCHEMA",
+                    "legacy permission input is malformed",
+                )
+            })?;
+            let fields = object
+                .values()
+                .take(64)
+                .enumerate()
+                .map(|(index, value)| {
+                    let kind = if value.is_array() {
+                        "array"
+                    } else if value.is_null() {
+                        "null"
+                    } else if value.is_object() {
+                        "object"
+                    } else if value.is_string() {
+                        "string"
+                    } else if value.is_boolean() {
+                        "boolean"
+                    } else {
+                        "number"
+                    };
+                    json!({"name":format!("field_{}", index + 1),"type":kind})
+                })
+                .collect::<Vec<_>>();
+            json!({"field_count":object.len(),"fields":fields})
+        }
+    };
+    request.schema_version = 2;
+    request.input_sha256 = digest_json(&request.input)?;
+    validate_request(request)
 }
 
 fn valid_question_input(input: &Value) -> bool {
@@ -2261,28 +2334,166 @@ mod recovery_regression_tests {
     use std::{fs::OpenOptions, io::Write};
     use swarm_contracts::runtime::ModuleReceiptIdentity;
 
+    #[test]
+    fn projected_request_and_reply_persist_no_sdk_input_values_or_question_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-interaction-projection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create callback fixture directory");
+        let journal = InteractionJournal::open(&root, "fixture-binding", 1, "claude:fixture")
+            .expect("open callback journal");
+        let raw_key = format!("{}{}", "ghp_", "0123456789abcdef0123456789abcdef");
+        let raw_value = "private-dynamic-field-value";
+        let raw_path = r"C:\private\fixture\result.txt";
+        let mut raw_input = serde_json::Map::new();
+        raw_input.insert("file_path".to_owned(), json!(raw_path));
+        raw_input.insert(raw_key.clone(), json!(raw_value));
+        let raw_input = Value::Object(raw_input);
+        let projected_input = json!({
+            "field_count":2,
+            "fields":[
+                {"name":"field_1","type":"string"},
+                {"name":"field_2","type":"string"}
+            ]
+        });
+        let request_id = "sdk-private-projection-fixture";
+        let request_sha256 = digest_json(&json!({
+            "schema_version":2,
+            "request_id":request_id,
+            "kind":"permission",
+            "tool_name":"Read",
+            "input":raw_input
+        }))
+        .expect("digest the raw SDK callback in its producer");
+        let input_sha256 = digest_json(&projected_input).expect("digest the safe projection");
+        let request = journal
+            .record_request(InteractionRequestEvidence {
+                schema_version: 2,
+                bridge_boot_id: "fixture-boot",
+                native_root_id: "fixture-root",
+                request_id,
+                kind: InteractionKind::Permission,
+                tool_name: "Read",
+                input: &projected_input,
+                input_sha256: &input_sha256,
+                request_sha256: &request_sha256,
+            })
+            .expect("persist only the typed safe projection");
+        let reply = json!({"type":"permission","decision":"allow"});
+        let reply_sha256 = digest_json(&reply).expect("digest projected reply");
+        journal
+            .begin_reply(request_id, "fixture-reply-operation", &reply, &reply_sha256)
+            .expect("persist the exact projected reply intent");
+
+        let persisted = fs::read(journal.path(request_id).expect("resolve record path"))
+            .expect("read callback record");
+        let persisted = String::from_utf8(persisted).expect("callback JSON is UTF-8");
+        for private in [raw_key.as_str(), raw_value, raw_path] {
+            assert!(
+                !persisted.contains(private),
+                "callback journal leaked {private:?}"
+            );
+        }
+        assert!(persisted.contains(&input_sha256));
+        assert!(persisted.contains(&request_sha256));
+        assert_eq!(request.input, projected_input);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reading_legacy_raw_permission_record_rewrites_only_safe_projection() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-legacy-interaction-projection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create legacy callback fixture directory");
+        let journal = InteractionJournal::open(&root, "fixture-binding", 1, "claude:fixture")
+            .expect("open callback journal");
+        let dynamic_key = "private-value-used-as-a-key";
+        let mut raw_fields = serde_json::Map::new();
+        raw_fields.insert("file_path".to_owned(), json!(r"C:\private\legacy.txt"));
+        raw_fields.insert(dynamic_key.to_owned(), json!("value"));
+        let raw_input = Value::Object(raw_fields);
+        let request_id = "legacy-private-projection-fixture";
+        let request = InteractionRequest {
+            schema_version: 1,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_scope_key: "claude:fixture".to_owned(),
+            bridge_boot_id: "retired-legacy-boot".to_owned(),
+            native_root_id: "fixture-root".to_owned(),
+            request_id: request_id.to_owned(),
+            kind: InteractionKind::Permission,
+            tool_name: "Read".to_owned(),
+            input: raw_input.clone(),
+            input_sha256: String::new(),
+            request_sha256: digest_json(&json!({
+                "schema_version":1,
+                "request_id":request_id,
+                "kind":"permission",
+                "tool_name":"Read",
+                "input":raw_input
+            }))
+            .expect("digest legacy raw request"),
+        };
+        let path = journal
+            .path(request_id)
+            .expect("resolve legacy record path");
+        let legacy_bytes = serde_json::to_vec(&InteractionRecord {
+            schema_version: 1,
+            request,
+            sequence: Some(1),
+            status: InteractionStatus::Pending,
+            reply_operation_id: None,
+            reply_sha256: None,
+            reply: None,
+        })
+        .expect("serialize the pre-projection legacy record");
+        write_private_new(&path, &legacy_bytes).expect("write private legacy fixture record");
+
+        let migrated = journal
+            .get(request_id)
+            .expect("read and migrate legacy callback")
+            .expect("legacy callback exists");
+        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(migrated.input["field_count"], 2);
+        let persisted = fs::read_to_string(path).expect("read migrated callback record");
+        assert!(!persisted.contains(dynamic_key));
+        assert!(!persisted.contains("legacy.txt"));
+        assert!(persisted.contains("field_1"));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn request(
         journal: &InteractionJournal,
         request_id: &str,
         bridge_boot_id: &str,
     ) -> InteractionRequest {
-        let input = json!({"command":"echo fixture"});
+        let raw_input = json!({"command":"echo fixture"});
+        let input = json!({
+            "field_count":1,
+            "fields":[{"name":"field_1","type":"string"}]
+        });
         let request_sha256 = digest_json(&json!({
-            "schema_version":1,
+            "schema_version":2,
             "request_id":request_id,
             "kind":"permission",
             "tool_name":"Bash",
-                "input":input.clone()
+            "input":raw_input
         }))
         .unwrap();
+        let input_sha256 = digest_json(&input).unwrap();
         journal
             .record_request(InteractionRequestEvidence {
+                schema_version: 2,
                 bridge_boot_id,
                 native_root_id: "fixture-root",
                 request_id,
                 kind: InteractionKind::Permission,
                 tool_name: "Bash",
                 input: &input,
+                input_sha256: &input_sha256,
                 request_sha256: &request_sha256,
             })
             .unwrap()
@@ -2304,6 +2515,7 @@ mod recovery_regression_tests {
                 "interaction_kind":request.kind.as_str(),
                 "tool_name":request.tool_name,
                 "request_sha256":request.request_sha256,
+                "input_sha256":request.input_sha256,
                 "reply_sha256":reply_sha256
             }
         });

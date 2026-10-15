@@ -11,6 +11,11 @@ import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { prepareQuery } from './prepared-query.mjs';
+import {
+  canonicalJson as canonicalProjectionJson,
+  projectInteractionInput,
+  restoreQuestionReply,
+} from './interaction-projection.mjs';
 
 const MAX_INPUT_BYTES = 1_100_000;
 const MAX_OUTPUT_BYTES = 700_000;
@@ -373,7 +378,7 @@ class InputQueue {
   }
 }
 
-function validateInteractionReply(request, reply) {
+function validateInteractionReply(request, projectedInput, reply) {
   if (!reply || typeof reply !== 'object' || Array.isArray(reply)
       || Buffer.byteLength(canonicalJson(reply), 'utf8') > MAX_INTERACTION_REPLY_BYTES) return false;
   const keys = Object.keys(reply);
@@ -393,15 +398,15 @@ function validateInteractionReply(request, reply) {
   if (request.kind !== 'question' || request.tool_name !== 'AskUserQuestion'
       || !allowedKeys(reply, ['type', 'updated_input']) || reply.type !== 'question'
       || !allowedKeys(reply.updated_input, ['questions', 'answers'])
-      || !Array.isArray(request.input.questions) || request.input.questions.length === 0
-      || request.input.questions.length > 16
-      || canonicalJson(reply.updated_input.questions) !== canonicalJson(request.input.questions)) {
+      || !Array.isArray(projectedInput.questions) || projectedInput.questions.length === 0
+      || projectedInput.questions.length > 16
+      || canonicalJson(reply.updated_input.questions) !== canonicalProjectionJson(projectedInput.questions)) {
     return false;
   }
   const answers = reply.updated_input.answers;
   if (!answers || typeof answers !== 'object' || Array.isArray(answers)
-      || Object.keys(answers).length !== request.input.questions.length) return false;
-  return request.input.questions.every(question => {
+      || Object.keys(answers).length !== projectedInput.questions.length) return false;
+  return projectedInput.questions.every(question => {
     if (!question || typeof question.question !== 'string') return false;
     const answer = answers[question.question];
     if (typeof answer === 'string') return validAnswer(answer);
@@ -410,11 +415,13 @@ function validateInteractionReply(request, reply) {
   });
 }
 
-function sdkCallbackResult(request, reply, toolUseID) {
+function sdkCallbackResult(request, projectedInput, reply, toolUseID) {
   if (request.kind === 'permission' && reply.decision === 'deny') {
     return { behavior: 'deny', message: reply.message, toolUseID };
   }
-  const updatedInput = reply.updated_input === undefined ? request.input : reply.updated_input;
+  const updatedInput = request.kind === 'question'
+    ? restoreQuestionReply(request.input, projectedInput, reply)
+    : reply.updated_input === undefined ? request.input : reply.updated_input;
   return { behavior: 'allow', updatedInput, toolUseID };
 }
 
@@ -530,24 +537,38 @@ function requestInteraction(sess, toolNameValue, inputValue, callbackOptions) {
     emit({ kind: 'diagnostic', code: 'INTERACTION_REQUEST_ID_REUSED' });
     return Promise.resolve(deny('The Claude SDK callback request identity was already used.'));
   }
+  const kind = toolName === 'AskUserQuestion' ? 'question' : 'permission';
   const request = {
-    schema_version: 1,
-    // Use the SDK's control_request UUID. The callback resolver stays local;
-    // the Store sees only this exact identity, digest, kind and bounded input.
+    schema_version: 2,
+    // Keep raw callback input and question-key restoration inside Node. Rust
+    // receives the exact callback digest/IDs plus this safe projection only.
     request_id: requestID,
-    kind: toolName === 'AskUserQuestion' ? 'question' : 'permission',
+    kind,
     tool_name: toolName,
     input,
   };
   request.request_sha256 = sha256(canonicalJson(request));
+  let projectedInput;
+  try { projectedInput = projectInteractionInput(kind, input); }
+  catch {
+    emit({ kind: 'diagnostic', code: 'INTERACTION_PROJECTION_INVALID' });
+    return Promise.resolve(deny('The Claude SDK callback could not be safely projected.'));
+  }
+  const inputSha256 = sha256(canonicalProjectionJson(projectedInput));
   return new Promise(resolve => {
-    const pending = { request, resolve, signal, toolUseID, abort: null };
+    const pending = { request, projectedInput, inputSha256, resolve, signal, toolUseID, abort: null };
     pending.abort = () => retireInteraction(sess, pending, 'SDK_CALLBACK_ABORTED');
     sess.pendingInteractions.set(request.request_id, pending);
     emit({
       kind: 'interaction_request',
       request: {
-        ...request,
+        schema_version: 2,
+        request_id: request.request_id,
+        kind: request.kind,
+        tool_name: request.tool_name,
+        input: projectedInput,
+        input_sha256: inputSha256,
+        request_sha256: request.request_sha256,
         bridge_boot_id: sess.bridgeBootId,
         native_root_id: sess.nativeRootId,
         native_scope_key: sess.nativeScopeKey,
@@ -568,16 +589,19 @@ function handleControlReply(command) {
   }
   const pending = sess.pendingInteractions.get(command.request_id);
   if (!pending || command.request_sha256 !== pending.request.request_sha256
+      || command.input_sha256 !== pending.inputSha256
       || command.interaction_kind !== pending.request.kind
       || typeof command.reply_sha256 !== 'string'
       || !/^[0-9a-f]{64}$/.test(command.reply_sha256)
-      || !validateInteractionReply(pending.request, command.reply)
+      || !validateInteractionReply(pending.request, pending.projectedInput, command.reply)
       || sha256(canonicalJson(command.reply)) !== command.reply_sha256) {
     throw Object.assign(new Error(), { diagnosticCode: 'INTERACTION_REPLY_MISMATCH' });
   }
   sess.pendingInteractions.delete(command.request_id);
   pending.signal?.removeEventListener('abort', pending.abort);
-  pending.resolve(sdkCallbackResult(pending.request, command.reply, pending.toolUseID));
+  pending.resolve(sdkCallbackResult(
+    pending.request, pending.projectedInput, command.reply, pending.toolUseID,
+  ));
   emit({
     kind: 'interaction_reply_ack',
     operation_id: command.operation_id,
@@ -586,6 +610,7 @@ function handleControlReply(command) {
     native_scope_key: sess.nativeScopeKey,
     request_id: command.request_id,
     request_sha256: command.request_sha256,
+    input_sha256: command.input_sha256,
     reply_sha256: command.reply_sha256,
   });
 }

@@ -136,6 +136,10 @@ pub fn materialize(directory: &Path) -> Result<PathBuf> {
         &directory.join("prepared-query.mjs"),
         include_bytes!("../sdk-harness/prepared-query.mjs"),
     )?;
+    ensure_embedded_file(
+        &directory.join("interaction-projection.mjs"),
+        include_bytes!("../sdk-harness/interaction-projection.mjs"),
+    )?;
     Ok(bridge_path)
 }
 

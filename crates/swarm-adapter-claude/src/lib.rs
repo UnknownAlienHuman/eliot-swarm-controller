@@ -9,8 +9,7 @@ mod sdk_harness;
 pub use config::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, NativeOptions, RUNTIME};
 pub use module_runtime::OwnedBootstrap;
 
-use atlas_redact::redact_auto;
-use interactions::{InteractionJournal, InteractionKind, InteractionRequest, validate_reply};
+use interactions::{InteractionJournal, InteractionKind, validate_reply};
 use journal::{OperationJournal, digest_bytes, digest_json};
 use native_state::{NativeControl, safe_family_resource_links};
 use sdk_harness::{HarnessFrame, NativeHarness};
@@ -1066,20 +1065,7 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
             );
         }
     };
-    let reply = match normalize_redacted_interaction_reply(&request, &command.input["reply"]) {
-        Ok(reply) => reply,
-        Err(_) => {
-            return queue_rejected(
-                config,
-                claim,
-                journal,
-                command,
-                receipt,
-                "INTERACTION_REPLY_MISMATCH",
-                Some(native_root_id),
-            );
-        }
-    };
+    let reply = command.input["reply"].clone();
     if request.bridge_boot_id != boot_id
         || request.native_root_id != native_root_id
         || request.native_scope_key != config.native_options.scope_key()
@@ -1103,6 +1089,7 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
         "interaction_kind":request.kind.as_str(),
         "tool_name":request.tool_name,
         "request_sha256":request.request_sha256,
+        "input_sha256":request.input_sha256,
         "reply_sha256":reply_sha256,
         "reply":reply,
         "bridge_boot_id":request.bridge_boot_id,
@@ -1157,6 +1144,7 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
         "native_scope_key":config.native_options.scope_key(),
         "request_id":request.request_id,
         "request_sha256":request.request_sha256,
+        "input_sha256":request.input_sha256,
         "interaction_kind":request.kind.as_str(),
         "reply_sha256":reply_sha256,
         "reply":reply
@@ -1925,93 +1913,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 // This protocol handler keeps the existing borrowed runtime state explicit.
 #[allow(clippy::too_many_arguments)]
 fn redact_interaction_input(input: &Value) -> Result<Value> {
-    let raw = serde_json::to_string(input)?;
-    let redacted = redact_auto(&raw);
-    let safe_input: Value = serde_json::from_str(&redacted.text).map_err(|_| {
-        Error::new(
-            "SDK_INTERACTION_REDACTION",
-            "redacted interaction input is not valid JSON",
-        )
-    })?;
-    if !safe_input.is_object() {
-        return Err(Error::new(
-            "SDK_INTERACTION_REDACTION",
-            "redacted interaction input changed its object shape",
-        ));
-    }
-    Ok(safe_input)
-}
-
-fn normalize_redacted_interaction_reply(
-    request: &InteractionRequest,
-    reply: &Value,
-) -> Result<Value> {
-    if request.kind != InteractionKind::Question {
-        return Ok(reply.clone());
-    }
-    let original_questions = request.input["questions"]
-        .as_array()
-        .ok_or_else(|| Error::new("INTERACTION_REPLY_SCHEMA", "question request is malformed"))?;
-    let visible_questions = redact_interaction_input(&request.input)?["questions"]
-        .as_array()
-        .cloned()
-        .ok_or_else(|| {
-            Error::new(
-                "INTERACTION_REPLY_SCHEMA",
-                "redacted questions are malformed",
-            )
-        })?;
-    let Some(provided_questions) = reply["updated_input"]["questions"].as_array() else {
-        return Err(Error::new(
-            "INTERACTION_REPLY_SCHEMA",
-            "question reply lacks its displayed question list",
-        ));
-    };
-    let Some(provided_answers) = reply["updated_input"]["answers"].as_object() else {
-        return Err(Error::new(
-            "INTERACTION_REPLY_SCHEMA",
-            "question reply lacks its answer map",
-        ));
-    };
-    if visible_questions.len() != original_questions.len()
-        || provided_questions != &visible_questions
-        || provided_answers.len() != visible_questions.len()
-    {
-        return Err(Error::new(
-            "INTERACTION_REPLY_SCHEMA",
-            "question reply differs from its redacted pending projection",
-        ));
-    }
-    let mut answers = serde_json::Map::new();
-    let mut seen_displayed = std::collections::HashSet::new();
-    let mut seen_original = std::collections::HashSet::new();
-    for (visible, original) in visible_questions.iter().zip(original_questions) {
-        let displayed = visible["question"].as_str().ok_or_else(|| {
-            Error::new("INTERACTION_REPLY_SCHEMA", "displayed question is invalid")
-        })?;
-        let original = original["question"]
-            .as_str()
-            .ok_or_else(|| Error::new("INTERACTION_REPLY_SCHEMA", "native question is invalid"))?;
-        if !seen_displayed.insert(displayed.to_owned())
-            || !seen_original.insert(original.to_owned())
-        {
-            return Err(Error::new(
-                "INTERACTION_REPLY_SCHEMA",
-                "question identity is ambiguous after redaction",
-            ));
-        }
-        let answer = provided_answers.get(displayed).ok_or_else(|| {
-            Error::new(
-                "INTERACTION_REPLY_SCHEMA",
-                "question answer does not name a displayed question",
-            )
-        })?;
-        answers.insert(original.to_owned(), answer.clone());
-    }
-    let mut normalized = reply.clone();
-    normalized["updated_input"]["questions"] = json!(original_questions);
-    normalized["updated_input"]["answers"] = Value::Object(answers);
-    Ok(normalized)
+    interactions::redact_interaction_input(input)
 }
 
 fn redact_pending_interactions(mut pending: Value) -> Result<Value> {
@@ -2037,11 +1939,11 @@ fn redact_pending_interactions(mut pending: Value) -> Result<Value> {
                 "pending interaction snapshot lacks its input",
             )
         })?;
-        let raw = serde_json::to_string(input)?;
+        let projection_bytes = serde_json::to_vec(input)?.len();
         let safe_input = redact_interaction_input(input)?;
         request.insert("input".to_owned(), safe_input);
         request.insert("input_redacted".to_owned(), json!(true));
-        request.insert("input_bytes".to_owned(), json!(raw.len()));
+        request.insert("input_projection_bytes".to_owned(), json!(projection_bytes));
     }
     if serde_json::to_vec(&pending)?.len() > MAX_NATIVE_COMMAND_BYTES {
         return Err(Error::new(
@@ -2580,6 +2482,7 @@ fn record_interaction_request(
         "kind",
         "tool_name",
         "input",
+        "input_sha256",
         "request_sha256",
         "bridge_boot_id",
         "native_root_id",
@@ -2604,6 +2507,7 @@ fn record_interaction_request(
     let bridge_boot_id = required_message_text(request, "bridge_boot_id")?;
     let requested_root = required_message_text(request, "native_root_id")?;
     let request_id = required_message_text(request, "request_id")?;
+    let input_sha256 = required_message_text(request, "input_sha256")?;
     let request_sha256 = required_message_text(request, "request_sha256")?;
     let scope_key = required_message_text(request, "native_scope_key")?;
     let tool_name = required_message_text(request, "tool_name")?;
@@ -2617,7 +2521,7 @@ fn record_interaction_request(
             ));
         }
     };
-    if request["schema_version"].as_u64() != Some(1)
+    if request["schema_version"].as_u64() != Some(2)
         || bridge_boot_id != boot_id
         || scope_key != config.native_options.scope_key()
         || native_root_id != Some(requested_root)
@@ -2630,12 +2534,14 @@ fn record_interaction_request(
         ));
     }
     interactions.record_request(interactions::InteractionRequestEvidence {
+        schema_version: 2,
         bridge_boot_id: boot_id,
         native_root_id: requested_root,
         request_id,
         kind,
         tool_name,
         input: &request["input"],
+        input_sha256,
         request_sha256,
     })?;
     Ok(())
@@ -2672,6 +2578,7 @@ fn acknowledge_interaction_reply(
     let operation_id = required_message_text(frame, "operation_id")?;
     let request_id = required_message_text(frame, "request_id")?;
     let request_sha256 = required_message_text(frame, "request_sha256")?;
+    let input_sha256 = required_message_text(frame, "input_sha256")?;
     let reply_sha256 = required_message_text(frame, "reply_sha256")?;
     let root_id = required_message_text(frame, "native_root_id")?;
     let Some(saved) = journal.get(operation_id)? else {
@@ -2696,6 +2603,7 @@ fn acknowledge_interaction_reply(
         || native["native_root_id"] != root_id
         || native["native_scope_key"] != config.native_options.scope_key()
         || native["request_sha256"] != request_sha256
+        || native["input_sha256"] != input_sha256
         || native["reply_sha256"] != reply_sha256
         || frame["bridge_boot_id"] != boot_id
         || frame["native_scope_key"] != config.native_options.scope_key()
@@ -3417,11 +3325,11 @@ mod failed_prepare_lifecycle_fixture {
     use super::*;
     use crate::{
         config::{AdapterConfig, NativeOptions},
-        interactions::{InteractionKind, InteractionRequestEvidence},
+        interactions::{InteractionKind, InteractionRequest, InteractionRequestEvidence},
         journal::digest_json,
     };
     use serde_json::json;
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, process::Command};
 
     struct FixtureDirectory(PathBuf);
 
@@ -3489,6 +3397,85 @@ mod failed_prepare_lifecycle_fixture {
         (directory, config, journal, interactions)
     }
 
+    #[test]
+    fn sdk_harness_projection_is_the_only_callback_input_persisted_by_rust() {
+        let (_directory, config, _journal, interactions) = fixture_context();
+        let bridge_boot_id = "fixture-privacy-boot";
+        let native_root_id = "fixture-root";
+        let native_scope_key = config.native_options.scope_key();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sdk-harness/interaction-privacy-fixture.mjs");
+        let output = Command::new("node")
+            .arg(script)
+            .env("CLAUDE_PRIVACY_FIXTURE_BOOT_ID", bridge_boot_id)
+            .env("CLAUDE_PRIVACY_FIXTURE_SCOPE_KEY", &native_scope_key)
+            .env("CLAUDE_PRIVACY_FIXTURE_BINDING_ID", &config.binding_id)
+            .env("CLAUDE_PRIVACY_FIXTURE_JSON", "1")
+            .output()
+            .expect("run the bounded Node SDK harness fixture");
+        assert!(
+            output.status.success(),
+            "SDK harness fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .expect("decode safe SDK callback fixture report");
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["restored_callback_observed"], true);
+        assert_eq!(
+            report["request_frame"]["request"]["bridge_boot_id"],
+            bridge_boot_id
+        );
+        assert_eq!(
+            report["request_frame"]["request"]["native_root_id"],
+            native_root_id
+        );
+        assert_eq!(
+            report["request_frame"]["request"]["native_scope_key"],
+            native_scope_key
+        );
+
+        record_interaction_request(
+            &report["request_frame"],
+            &config,
+            bridge_boot_id,
+            Some(native_root_id),
+            true,
+            true,
+            &interactions,
+        )
+        .expect("record only the exact redacted Node projection");
+        let request_id = report["request_frame"]["request"]["request_id"]
+            .as_str()
+            .expect("SDK callback request identity");
+        let path = config
+            .state_dir
+            .join("interactions")
+            .join(format!("{}.json", digest_bytes(request_id.as_bytes())));
+        let persisted: Value = serde_json::from_slice(
+            &fs::read(path).expect("read the durable projected callback record"),
+        )
+        .expect("decode the durable projected callback record");
+        assert_eq!(
+            persisted["request"]["input"],
+            report["request_frame"]["request"]["input"]
+        );
+        assert_eq!(
+            persisted["request"]["request_sha256"],
+            report["request_frame"]["request"]["request_sha256"]
+        );
+        assert_eq!(
+            persisted["request"]["input_sha256"],
+            report["request_frame"]["request"]["input_sha256"]
+        );
+        assert_eq!(persisted["request"]["schema_version"], 2);
+        assert_eq!(persisted["request"]["input_redacted"], Value::Null);
+        assert_eq!(
+            report["reply_ack"]["input_sha256"],
+            persisted["request"]["input_sha256"]
+        );
+    }
+
     fn fixture_receipt(operation_id: &str) -> swarm_contracts::runtime::ModuleReceiptIdentity {
         serde_json::from_value(json!({
             "schema_version":1,
@@ -3539,23 +3526,30 @@ mod failed_prepare_lifecycle_fixture {
             Some("fixture-root"),
         );
 
-        let callback_input = json!({"command":"fixture"});
+        let callback_raw_input = json!({"command":"fixture"});
+        let callback_input = json!({
+            "field_count":1,
+            "fields":[{"name":"field_1","type":"string"}]
+        });
         let callback_digest = digest_json(&json!({
-            "schema_version":1,
+            "schema_version":2,
             "request_id":"fixture-request",
             "kind":"permission",
             "tool_name":"Bash",
-            "input":callback_input.clone()
+            "input":callback_raw_input
         }))
         .expect("digest fixture callback");
+        let projection_digest = digest_json(&callback_input).expect("digest safe projection");
         interactions
             .record_request(InteractionRequestEvidence {
+                schema_version: 2,
                 bridge_boot_id: "fixture-boot",
                 native_root_id: "fixture-root",
                 request_id: "fixture-request",
                 kind: InteractionKind::Permission,
                 tool_name: "Bash",
                 input: &callback_input,
+                input_sha256: &projection_digest,
                 request_sha256: &callback_digest,
             })
             .expect("record a pending callback for retirement");
@@ -3812,10 +3806,20 @@ mod failed_prepare_lifecycle_fixture {
     }
 
     #[test]
-    fn question_reply_restores_redacted_display_keys_to_native_questions() {
-        let question_text = "Use this key sk-ant-api03-1234567890abcdefghijklmnop for the test?";
+    fn projected_question_reply_validates_without_rust_key_restoration() {
+        let input = json!({
+            "questions":[{
+                "question":"Use this key [redacted token] for the test?",
+                "header":"Choice",
+                "options":[
+                    {"label":"Keep","description":"Continue."},
+                    {"label":"Stop","description":"Do not continue."}
+                ],
+                "multiSelect":false
+            }]
+        });
         let request = InteractionRequest {
-            schema_version: 1,
+            schema_version: 2,
             binding_id: "fixture-binding".to_owned(),
             generation: 1,
             native_scope_key: "claude:fixture".to_owned(),
@@ -3824,51 +3828,21 @@ mod failed_prepare_lifecycle_fixture {
             request_id: "sdk-request-id".to_owned(),
             kind: InteractionKind::Question,
             tool_name: "AskUserQuestion".to_owned(),
-            input: json!({
-                "questions":[{
-                    "question":question_text,
-                    "header":"Choice",
-                    "options":[
-                        {"label":"Keep","description":"Continue."},
-                        {"label":"Stop","description":"Do not continue."}
-                    ],
-                    "multiSelect":false
-                }]
-            }),
+            input_sha256: digest_json(&input).expect("digest safe projection"),
+            input,
             request_sha256: "a".repeat(64),
         };
-        let visible_input =
-            redact_interaction_input(&request.input).expect("redact the pending question");
-        assert!(
-            !visible_input
-                .to_string()
-                .contains("sk-ant-api03-1234567890abcdefghijklmnop"),
-            "the Store-facing request must not retain the key-shaped string"
-        );
-        let visible_question = visible_input["questions"][0]["question"]
+        let displayed_question = request.input["questions"][0]["question"]
             .as_str()
-            .expect("redacted question remains addressable");
-        let redacted_reply = json!({
+            .expect("display question remains addressable");
+        let projected_reply = json!({
             "type":"question",
             "updated_input":{
-                "questions":visible_input["questions"],
-                "answers":{visible_question:"Keep"}
+                "questions":request.input["questions"],
+                "answers":{displayed_question:"Keep"}
             }
         });
-
-        let normalized = normalize_redacted_interaction_reply(&request, &redacted_reply)
-            .expect("map the displayed question back to its retained native text");
-        assert_eq!(
-            normalized["updated_input"]["questions"],
-            request.input["questions"]
-        );
-        assert_eq!(
-            normalized["updated_input"]["answers"][question_text],
-            "Keep"
-        );
-        assert!(
-            validate_reply(&request, &normalized).is_ok(),
-            "the SDK receives its exact original question and official answers map"
-        );
+        assert!(validate_reply(&request, &projected_reply).is_ok());
+        assert!(!projected_reply.to_string().contains("Use this key sk-"));
     }
 }
