@@ -321,8 +321,8 @@ mod windows_membership {
     use std::{mem::size_of, ptr};
     use windows_sys::Win32::{
         Foundation::{
-            CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
-            WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
         },
         System::{
             JobObjects::{
@@ -351,7 +351,14 @@ mod windows_membership {
         }
     }
 
-    fn open_job(owner: &ModuleOwner) -> Result<Option<OwnedHandle>> {
+    fn membership_read_error(operation: &str, error: std::io::Error) -> Error {
+        Error::new(
+            "MODULE_MEMBERSHIP_UNKNOWN",
+            format!("{operation} failed; exact module Job membership is unknown: {error}"),
+        )
+    }
+
+    fn open_job(owner: &ModuleOwner) -> Result<OwnedHandle> {
         let name: Vec<u16> = format!(r"Global\EliotSwarmModule-{}", owner.token)
             .encode_utf16()
             .chain(Some(0))
@@ -359,14 +366,12 @@ mod windows_membership {
         // SAFETY: name is nul-terminated UTF-16 and the returned handle is closed by OwnedHandle.
         let job = unsafe { OpenJobObjectW(JOB_QUERY_ACCESS, 0, name.as_ptr()) };
         if job.is_null() {
-            let error = std::io::Error::last_os_error();
-            return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
-                Ok(None)
-            } else {
-                Err(error.into())
-            };
+            return Err(membership_read_error(
+                "OpenJobObjectW",
+                std::io::Error::last_os_error(),
+            ));
         }
-        Ok(Some(OwnedHandle(job)))
+        Ok(OwnedHandle(job))
     }
 
     fn process_signaled(process: HANDLE) -> Result<bool> {
@@ -374,10 +379,13 @@ mod windows_membership {
         match unsafe { WaitForSingleObject(process, 0) } {
             WAIT_OBJECT_0 => Ok(true),
             WAIT_TIMEOUT => Ok(false),
-            WAIT_FAILED => Err(std::io::Error::last_os_error().into()),
+            WAIT_FAILED => Err(membership_read_error(
+                "WaitForSingleObject",
+                std::io::Error::last_os_error(),
+            )),
             status => Err(Error::new(
-                "PROCESS_WAIT",
-                format!("unexpected process wait status {status:#x}"),
+                "MODULE_MEMBERSHIP_UNKNOWN",
+                format!("unexpected WaitForSingleObject status {status:#x}"),
             )),
         }
     }
@@ -390,7 +398,10 @@ mod windows_membership {
             let mut kernel: FILETIME = std::mem::zeroed();
             let mut user: FILETIME = std::mem::zeroed();
             if GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(membership_read_error(
+                    "GetProcessTimes",
+                    std::io::Error::last_os_error(),
+                ));
             }
             Ok(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
         }
@@ -401,7 +412,10 @@ mod windows_membership {
         unsafe {
             let mut member = 0;
             if IsProcessInJob(process, job, &mut member) == 0 {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(membership_read_error(
+                    "IsProcessInJob",
+                    std::io::Error::last_os_error(),
+                ));
             }
             Ok(member != 0)
         }
@@ -419,7 +433,10 @@ mod windows_membership {
                 ptr::null_mut(),
             ) == 0
             {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(membership_read_error(
+                    "QueryInformationJobObject",
+                    std::io::Error::last_os_error(),
+                ));
             }
             if limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0 {
                 return Err(Error::new(
@@ -445,7 +462,7 @@ mod windows_membership {
             return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
                 Ok(None)
             } else {
-                Err(error.into())
+                Err(membership_read_error("OpenProcess", error))
             };
         }
         Ok(Some(OwnedHandle(handle)))
@@ -453,12 +470,18 @@ mod windows_membership {
 
     fn owner_is_live_member(owner: &ModuleOwner, job: HANDLE) -> Result<Option<OwnedHandle>> {
         let Some(process) = open_live_process(owner.pid)? else {
-            return Ok(None);
+            return Err(Error::new(
+                "MODULE_MEMBERSHIP_UNKNOWN",
+                "module owner PID is no longer openable; child Job membership is unknown",
+            ));
         };
         if process_signaled(process.0)?
             || process_creation_filetime(process.0)? != owner.creation_filetime
         {
-            return Ok(None);
+            return Err(Error::new(
+                "MODULE_MEMBERSHIP_UNKNOWN",
+                "exact module owner is no longer live; child Job membership is unknown",
+            ));
         }
         if !process_in_job(process.0, job)? {
             return Ok(None);
@@ -470,9 +493,7 @@ mod windows_membership {
         owner: &ModuleOwner,
         child: &ChildImage,
     ) -> Result<bool> {
-        let Some(job) = open_job(owner)? else {
-            return Ok(false);
-        };
+        let job = open_job(owner)?;
         check_non_killing_job(job.0)?;
         let Some(owner_process) = owner_is_live_member(owner, job.0)? else {
             return Ok(false);
@@ -486,10 +507,42 @@ mod windows_membership {
             return Ok(false);
         }
         let belongs = process_in_job(child_process.0, job.0)?;
-        if !belongs || process_signaled(owner_process.0)? || process_signaled(child_process.0)? {
+        if !belongs {
+            return Ok(false);
+        }
+        if process_signaled(owner_process.0)? {
+            return Err(Error::new(
+                "MODULE_MEMBERSHIP_UNKNOWN",
+                "module owner exited during child Job membership observation",
+            ));
+        }
+        if process_signaled(child_process.0)? {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+
+        #[test]
+        fn missing_or_denied_job_open_is_membership_unknown() {
+            let missing = membership_read_error(
+                "OpenJobObjectW",
+                std::io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32),
+            );
+            let denied = membership_read_error(
+                "OpenJobObjectW",
+                std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32),
+            );
+
+            assert_eq!(missing.code, "MODULE_MEMBERSHIP_UNKNOWN");
+            assert_eq!(denied.code, "MODULE_MEMBERSHIP_UNKNOWN");
+            assert!(missing.message.contains("OpenJobObjectW"));
+            assert!(denied.message.contains("OpenJobObjectW"));
+        }
     }
 }
 

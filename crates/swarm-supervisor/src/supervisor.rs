@@ -47,6 +47,9 @@ const RESTART_HISTORY_LIMIT: u64 = 16_384;
 const MODULE_CONFIG_ENV_PREFIX: &str = "ELIOT_SWARM_CONFIG_";
 const OWNER_DRAIN_POLL: Duration = Duration::from_millis(500);
 const HELPER_START_POLL: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+type ModuleMembershipProbe = fn(&Value, &Value) -> Result<bool>;
 const HELPER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(45);
 const OWNER_FINAL_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(20);
 const PRIOR_OWNER_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -959,6 +962,8 @@ struct Service {
     /// Exact helper Child retained when process, receipt, or family
     /// observation is uncertain. This slot is bounded to one per scope.
     helper_child_custody: AsyncMutex<Option<RetainedHelperChild>>,
+    #[cfg(test)]
+    module_membership_probe: Mutex<Option<ModuleMembershipProbe>>,
 }
 
 struct RetainedHelperChild {
@@ -1087,6 +1092,8 @@ impl Service {
             unknown_operation_ids: Mutex::new(BTreeSet::new()),
             runner: AsyncMutex::new(None),
             helper_child_custody: AsyncMutex::new(None),
+            #[cfg(test)]
+            module_membership_probe: Mutex::new(None),
         }
     }
 
@@ -1214,6 +1221,47 @@ impl Service {
         }
         self.readback_required.store(true, Ordering::Release);
         self.update_status(|status| status.readback_required = true);
+    }
+
+    async fn retain_helper_after_monitor_error(
+        &self,
+        helper: Child,
+        helper_identity: ProcessIdentity,
+        boot_id: &str,
+        error: Error,
+    ) {
+        let reason_code = error.code;
+        self.record_failure(
+            &reason_code,
+            "helper/worker identity or owner-family proof is unresolved",
+        );
+        self.readback_required.store(true, Ordering::Release);
+        self.update_status(|status| {
+            status.lifecycle = match reason_code.as_str() {
+                "MODULE_OWNER_FAMILY_NOT_EMPTY" | "MODULE_FINAL_FAMILY_OBSERVATION_TIMEOUT" => {
+                    LifecycleState::OwnerGroupRetained {
+                        owner_pid: helper_identity.pid,
+                        reason: OwnerRetainedReason::OwnerFamilyNotEmpty,
+                    }
+                }
+                "MODULE_OWNER_FAMILY_OBSERVATION_UNKNOWN"
+                | "MODULE_FINAL_FAMILY_OBSERVATION_UNKNOWN"
+                | "MODULE_MEMBERSHIP_UNKNOWN" => LifecycleState::OwnerGroupRetained {
+                    owner_pid: helper_identity.pid,
+                    reason: OwnerRetainedReason::OwnerFamilyObservationUnknown,
+                },
+                _ => LifecycleState::OwnerIdentityUnknown,
+            };
+            status.owner = Some(helper_identity.clone());
+            status.readback_required = true;
+        });
+        self.retain_helper_child_custody(
+            helper,
+            Some(helper_identity),
+            Some(boot_id.to_owned()),
+            &reason_code,
+        )
+        .await;
     }
 
     async fn restore_helper_child_custody(&self, retained: RetainedHelperChild) {
@@ -2058,37 +2106,11 @@ impl Service {
             {
                 Ok(attempt) => attempt,
                 Err(error) => {
-                    self.record_failure(
-                        &error.code,
-                        "helper/worker identity or owner-family proof is unresolved",
-                    );
-                    self.readback_required.store(true, Ordering::Release);
-                    self.update_status(|status| {
-                        status.lifecycle = match error.code.as_str() {
-                            "MODULE_OWNER_FAMILY_NOT_EMPTY"
-                            | "MODULE_FINAL_FAMILY_OBSERVATION_TIMEOUT" => {
-                                LifecycleState::OwnerGroupRetained {
-                                    owner_pid: helper_identity.pid,
-                                    reason: OwnerRetainedReason::OwnerFamilyNotEmpty,
-                                }
-                            }
-                            "MODULE_OWNER_FAMILY_OBSERVATION_UNKNOWN"
-                            | "MODULE_FINAL_FAMILY_OBSERVATION_UNKNOWN" => {
-                                LifecycleState::OwnerGroupRetained {
-                                    owner_pid: helper_identity.pid,
-                                    reason: OwnerRetainedReason::OwnerFamilyObservationUnknown,
-                                }
-                            }
-                            _ => LifecycleState::OwnerIdentityUnknown,
-                        };
-                        status.owner = Some(helper_identity.clone());
-                        status.readback_required = true;
-                    });
-                    self.retain_helper_child_custody(
+                    self.retain_helper_after_monitor_error(
                         helper,
-                        Some(helper_identity),
-                        Some(boot_id.clone()),
-                        &error.code,
+                        helper_identity,
+                        &boot_id,
+                        error,
                     )
                     .await;
                     return;
@@ -2933,7 +2955,21 @@ impl Service {
                         "worker image receipt differs from the current process incarnation",
                     ));
                 }
-                if !module_child_belongs_to_owner(owner, worker_image)? {
+                let membership = {
+                    #[cfg(test)]
+                    {
+                        let probe = *lock(&self.module_membership_probe);
+                        probe.map_or_else(
+                            || module_child_belongs_to_owner(owner, worker_image),
+                            |probe| probe(owner, worker_image),
+                        )
+                    }
+                    #[cfg(not(test))]
+                    {
+                        module_child_belongs_to_owner(owner, worker_image)
+                    }
+                };
+                if !membership? {
                     return Err(Error::new(
                         "MODULE_WORKER_NOT_OWNED",
                         "adapter process is not a distinct member of the exact owner group",
@@ -4397,7 +4433,16 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     impl WorkerProcessFixture {
         fn new() -> Self {
-            let mut child = StdCommand::new(std::env::current_exe().unwrap())
+            Self::spawn(None)
+        }
+
+        fn new_with_release_file(path: &Path) -> Self {
+            Self::spawn(Some(path))
+        }
+
+        fn spawn(release_file: Option<&Path>) -> Self {
+            let mut command = StdCommand::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "supervisor::tests::worker_process_fixture_waits_for_release",
@@ -4407,9 +4452,11 @@ mod tests {
                 .env("ELIOT_SWARM_SUPERVISOR_WORKER_FIXTURE", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("start OS-backed worker fixture");
+                .stderr(Stdio::null());
+            if let Some(path) = release_file {
+                command.env("ELIOT_SWARM_SUPERVISOR_WORKER_RELEASE_PATH", path);
+            }
+            let mut child = command.spawn().expect("start OS-backed worker fixture");
             let pid = child.id();
             let stdin = child.stdin.take().expect("pipe worker fixture stdin");
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -4456,9 +4503,12 @@ mod tests {
         startup: StartupFixture,
         helper: Option<Child>,
         helper_identity: ProcessIdentity,
+        worker_identity: ProcessIdentity,
         boot_id: String,
         owner_receipt: Value,
         release_path: PathBuf,
+        worker_release_path: PathBuf,
+        owner_exit_path: PathBuf,
     }
 
     #[cfg(any(windows, target_os = "linux"))]
@@ -4469,6 +4519,8 @@ mod tests {
             let boot_id = Uuid::new_v4().to_string();
             let state_dir = &startup.service.state_dir;
             let release_path = state_dir.join("projection-fixture-release");
+            let worker_release_path = state_dir.join("projection-worker-release");
+            let owner_exit_path = state_dir.join("projection-fixture-owner-exit");
             let mut helper = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -4552,9 +4604,12 @@ mod tests {
                 startup,
                 helper: Some(helper),
                 helper_identity,
+                worker_identity,
                 boot_id,
                 owner_receipt,
                 release_path,
+                worker_release_path,
+                owner_exit_path,
             }
         }
 
@@ -4564,6 +4619,20 @@ mod tests {
 
         fn release(&self) {
             fs::write(&self.release_path, b"release").unwrap();
+        }
+
+        async fn exit_owner_only(&self) {
+            fs::write(&self.owner_exit_path, b"exit").unwrap();
+            let mut custody = self.service().helper_child_custody.lock().await;
+            let retained = custody
+                .as_mut()
+                .expect("the direct owner Child remains in custody");
+            let exit = retained.child.wait().await.unwrap();
+            assert_eq!(exit.code(), Some(23));
+        }
+
+        fn release_worker(&self) {
+            fs::write(&self.worker_release_path, b"release").unwrap();
         }
 
         async fn prove_departure(&mut self) {
@@ -4602,6 +4671,8 @@ mod tests {
     impl Drop for ConnectedOwnerFixture {
         fn drop(&mut self) {
             let _ = fs::write(&self.release_path, b"release");
+            let _ = fs::write(&self.worker_release_path, b"release");
+            let _ = fs::write(&self.owner_exit_path, b"exit");
             if let Some(helper) = self.helper.as_mut() {
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
                 loop {
@@ -4664,7 +4735,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut worker = WorkerProcessFixture::new();
+        let worker_release_path = state_dir.join("projection-worker-release");
+        let mut worker = WorkerProcessFixture::new_with_release_file(&worker_release_path);
         let worker_receipt = serde_json::json!({
             "version": 1,
             "boot_id": boot_id,
@@ -4686,16 +4758,147 @@ mod tests {
         fs::write(state_dir.join("projection-fixture-ready"), b"ready").unwrap();
 
         let release_path = state_dir.join("projection-fixture-release");
+        let owner_exit_path = state_dir.join("projection-fixture-owner-exit");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !release_path.exists() {
+        while !release_path.exists() && !owner_exit_path.exists() {
             if std::time::Instant::now() >= deadline {
                 worker.stop();
                 return;
             }
             thread::sleep(Duration::from_millis(10));
         }
+        if owner_exit_path.exists() {
+            std::process::exit(23);
+        }
         worker.stop();
         std::process::exit(23);
+    }
+
+    #[cfg(windows)]
+    fn module_job_open_access_denied(_: &Value, _: &Value) -> Result<bool> {
+        Err(Error::new(
+            "MODULE_MEMBERSHIP_UNKNOWN",
+            "OpenJobObjectW failed: ERROR_ACCESS_DENIED (5); exact module Job membership is unknown",
+        ))
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn module_membership_job_open_uncertainty_retains_child_until_exact_family_departure() {
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        let service = fixture.startup.service.clone();
+        let launch_attempt_path = service.state_dir.join("launch-attempt.json");
+        let launch_attempt_before = fs::read(&launch_attempt_path).unwrap();
+        let token = fixture.owner_receipt["token"].as_str().unwrap();
+        assert!(matches!(
+            observe_process_family(&fixture.owner_receipt["process"], token),
+            ProcessFamilyObservation::Retained
+        ));
+
+        *lock(&service.module_membership_probe) = Some(module_job_open_access_denied);
+        let mut helper = fixture.helper.take().expect("owner Child is retained");
+        let error = match service
+            .monitor_owner_helper(
+                &mut helper,
+                &fixture.boot_id,
+                &fixture.helper_identity,
+                None,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("uncertain Job membership must reject the worker receipt"),
+        };
+        assert_eq!(error.code, "MODULE_MEMBERSHIP_UNKNOWN");
+        assert!(error.message.contains("OpenJobObjectW"));
+        assert!(error.message.contains("ERROR_ACCESS_DENIED"));
+
+        service
+            .retain_helper_after_monitor_error(
+                helper,
+                fixture.helper_identity.clone(),
+                &fixture.boot_id,
+                error,
+            )
+            .await;
+        assert!(matches!(
+            service.current_status().lifecycle,
+            LifecycleState::OwnerGroupRetained {
+                reason: OwnerRetainedReason::OwnerFamilyObservationUnknown,
+                ..
+            }
+        ));
+        assert!(service.current_status().readback_required);
+        assert!(service.helper_child_custody.lock().await.is_some());
+        assert_eq!(
+            fs::read(&launch_attempt_path).unwrap(),
+            launch_attempt_before
+        );
+
+        let error = service
+            .reconcile_retained_helper_child()
+            .await
+            .expect_err("uncertain Job membership cannot release retained Child custody");
+        assert_eq!(error.code, "MODULE_MEMBERSHIP_UNKNOWN");
+        assert!(service.helper_child_custody.lock().await.is_some());
+        assert_eq!(
+            fs::read(&launch_attempt_path).unwrap(),
+            launch_attempt_before
+        );
+
+        *lock(&service.module_membership_probe) = None;
+        fixture.exit_owner_only().await;
+        assert!(!process_identity_is_live(&fixture.helper_identity).unwrap());
+        assert!(process_identity_is_live(&fixture.worker_identity).unwrap());
+
+        lock(&service.demands).insert("queued-second-launch".to_owned(), 1);
+        tokio::time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
+        assert!(service.helper_child_custody.lock().await.is_some());
+        assert_eq!(
+            service
+                .current_status()
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.code.as_str()),
+            Some("MODULE_MEMBERSHIP_UNKNOWN")
+        );
+        assert_eq!(
+            fs::read(&launch_attempt_path).unwrap(),
+            launch_attempt_before
+        );
+
+        lock(&service.demands).clear();
+        service.signal();
+        fixture.release_worker();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process_identity_is_live(&fixture.worker_identity).unwrap() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.reconcile_retained_helper_child(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(service.helper_child_custody.lock().await.is_none());
+        assert!(matches!(
+            service.current_status().lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(&launch_attempt_path).unwrap(),
+            launch_attempt_before
+        );
     }
 
     #[cfg(any(windows, target_os = "linux"))]
@@ -5193,6 +5396,17 @@ mod tests {
     #[ignore = "spawned by the supervisor retained-worker lifecycle regressions"]
     fn worker_process_fixture_waits_for_release() {
         if std::env::var_os("ELIOT_SWARM_SUPERVISOR_WORKER_FIXTURE").is_none() {
+            return;
+        }
+        if let Some(path) = std::env::var_os("ELIOT_SWARM_SUPERVISOR_WORKER_RELEASE_PATH") {
+            let path = PathBuf::from(path);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !path.exists() {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             return;
         }
         let mut byte = [0_u8; 1];
