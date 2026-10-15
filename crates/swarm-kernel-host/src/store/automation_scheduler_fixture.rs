@@ -660,6 +660,41 @@ impl Drop for SchedulerFixtureChild {
     }
 }
 
+#[cfg(windows)]
+struct SchedulerFamilyHold {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: query-only Job handle, never signaled, always closed on Drop.
+#[cfg(windows)]
+unsafe impl Send for SchedulerFamilyHold {}
+
+#[cfg(windows)]
+impl Drop for SchedulerFamilyHold {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Retain the exact scheduler service Job through child exit so Windows
+/// departure proof stays observable. Returns None when the named Job is not
+/// yet visible; the caller then lets finish report truthful PROOF_UNAVAILABLE.
+#[cfg(windows)]
+fn retain_scheduler_family(token: &str) -> Option<SchedulerFamilyHold> {
+    use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
+    const JOB_QUERY_ACCESS: u32 = 0x0004;
+    let name = format!(r"Global\EliotSwarmService-AutomationScheduler-{token}");
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: nul-terminated UTF-16, query-only handle always closed.
+    let handle = unsafe { OpenJobObjectW(JOB_QUERY_ACCESS, 0, wide.as_ptr()) };
+    if handle.is_null() {
+        return None;
+    }
+    Some(SchedulerFamilyHold { handle })
+}
+
 #[test]
 fn scheduler_fixture_owner_child() {
     let Some(config_path) = std::env::var_os("SWARM_SCHEDULER_FIXTURE_CONFIG") else {
@@ -1260,6 +1295,13 @@ async fn r48_owner_lost_store_results_hold_intent_and_process_capacity() {
     assert_eq!(blocked.code, "AUTOMATION_SERVICE_OWNER_RETAINED");
     assert_eq!(child_launch_calls, 1);
     assert!(child.0.try_wait().unwrap().is_none());
+    // Retain the exact service Job through exit so finish observes empty;
+    // missing Job still reports PROOF_UNAVAILABLE, exact identity unchanged.
+    #[cfg(windows)]
+    let _scheduler_hold = store
+        .scheduler_owner_token()
+        .ok()
+        .and_then(|token| retain_scheduler_family(token));
 
     child.0.kill().unwrap();
     child.0.wait().unwrap();
