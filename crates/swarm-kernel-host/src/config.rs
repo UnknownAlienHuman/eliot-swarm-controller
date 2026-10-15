@@ -1068,3 +1068,61 @@ mod owned_opencode_route_validation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod codex_route_example_contract_tests {
+    use super::Route;
+    use serde_json::{Value, json};
+    use swarm_contracts::module_contract::{
+        CODEX_RUST_CONTROLLER_ARTIFACT_ID, CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION,
+    };
+
+    #[test]
+    fn current_codex_example_matches_v6_descriptor_and_native_options() {
+        let controller: toml::Value =
+            toml::from_str(include_str!("../../../config/controller.example.toml"))
+                .expect("parse the checked-in controller example");
+        let route_value = controller["routes"]
+            .as_array()
+            .expect("controller example has routes")
+            .iter()
+            .find(|route| route["alias"].as_str() == Some("codex-opencodex-manager"))
+            .cloned()
+            .expect("controller example has the current Codex route");
+        let mut route: Route = route_value
+            .try_into()
+            .expect("deserialize the documented Codex route");
+
+        let descriptor: Value = serde_json::from_str(include_str!(
+            "../../../crates/swarm-adapter-codex/module-descriptor.template.json"
+        ))
+        .expect("parse the current standalone Codex descriptor");
+        assert_eq!(
+            descriptor["artifact"]["artifact_id"].as_str(),
+            Some(CODEX_RUST_CONTROLLER_ARTIFACT_ID)
+        );
+        assert_eq!(
+            descriptor["artifact"]["version"].as_str(),
+            Some(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION)
+        );
+        assert_eq!(
+            descriptor["workspace_option"]["native_options_pointer"],
+            "/workspaceRoot"
+        );
+        assert_eq!(route.runtime, "codex");
+        assert_eq!(route.module_artifact_id, CODEX_RUST_CONTROLLER_ARTIFACT_ID);
+        assert_eq!(route.workspace_option.as_deref(), Some("workspaceRoot"));
+        assert!(
+            !route.enabled,
+            "the checked-in route remains disabled by default"
+        );
+
+        // Use a local absolute path so this account-free fixture validates on
+        // Windows and Unix without relying on the example's Windows path.
+        route.native_options["workspaceRoot"] =
+            json!(std::env::temp_dir().to_string_lossy().into_owned());
+        route
+            .validate_activation_contract()
+            .expect("the documented disabled route satisfies the current host contract");
+    }
+}

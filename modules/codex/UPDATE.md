@@ -12,15 +12,15 @@
 | License | Apache-2.0 (`vendor_bridge/LICENSE`) |
 | Legacy Python bridge artifact | `codex-sdk-18194bf-bridge.3` |
 | Standalone Rust artifact | `codex-rust-controller.1` |
-| Standalone Rust descriptor version | `4` |
+| Standalone Rust descriptor version | `6` (current; v1–v5 remain historical contracts) |
 | Standalone Rust package / binary | `swarm-adapter-codex` / `swarm-codex-adapter` |
 | Standalone Rust source | `crates/swarm-adapter-codex` |
 | Runtime dependencies | exact pins in `requirements.txt` |
 
 The donor and bridge.2/bridge.3 sections below describe only the legacy Python
 bridge artifact `.3` under `modules/codex`. The standalone Rust artifact
-`.1`, descriptor version `4`, is a separate package and does not vendor or
-update this Python SDK unit.
+`.1`, current descriptor version `6`, is a separate package and does not vendor
+or update this Python SDK unit.
 
 ## Legacy Python bridge artifact `.3`: ELIOT-owned changes in bridge.2
 
@@ -61,33 +61,39 @@ remains `openai-codex-cli-bin==0.153.4`. The
 [security patch record](VENDOR-SECURITY-PATCHES.md) retains the original and
 patched hashes; `verify_vendor.py` checks the complete patched unit.
 
-## Standalone Rust controller artifact `.1`, descriptor version `4`
+## Standalone Rust controller artifact `.1`, current descriptor version `6`
 
 The Rust adapter is separate from the legacy Python bridge and is sourced from
 `crates/swarm-adapter-codex`, with artifact `codex-rust-controller.1` and
-descriptor version `4`. Its route retains `runtime = "codex"` and the exact
-normalized dispatch/result schema pair. The selector is exactly:
+descriptor version `6`. It retains the v4 normalized dispatch/result schema
+pair, adds TaskPrompt v1 and Goal continuation admission/terminal evidence
+schemas, and uses the exact route contract `runtime = "codex"`,
+`workspace_option = "workspaceRoot"`, and native options `modelProvider`,
+`model`, and `workspaceRoot`. Provider/model values must be actual native
+Codex options; proxy or delegation IDs are not interchangeable. The selector
+remains:
 
 ```json
 {"kind":"codex_assistant_result","input_operation_id":"<exact task.dispatch operation ID>"}
 ```
 
-The v4 result path reads one root-thread final assistant response for the
-Store-sealed target `task.dispatch` Operation. It verifies the unique native
+The v6 result path retains the v4 scope: it reads one root-thread final
+assistant response for the Store-sealed target `task.dispatch` Operation. It verifies the unique native
 user item, the exact root turn and completed status, then selects the final
-assistant response. It does not enumerate child threads, verify
+assistant response. The current v6 adapter does not enumerate child threads,
+verify
 `parentThreadId` or `subAgentActivity`, project child history, or retain
 allowlisted tool-call items. The legacy `.3` child/history/tool behavior above
-is not a v4 capability; v4 returns unsupported or unavailable rather than
-inferring child causality. The v4 descriptor's capability/schema rows and
+is not a v6 capability; v6 returns unsupported or unavailable rather than
+inferring child causality. The v6 descriptor's capability/schema rows and
 selector do not require a child ancestry field.
 
 The verified native turn ID remains on the exact parent dispatch Operation and
-is used for readback. The v4 normalized page source retains the response item
+is used for readback. The v6 normalized page source retains the response item
 identity and sealed parent Operation identity; it does not fabricate a
-self-contained turn ID. V4 pages are capped at 24 KiB and the complete
+self-contained turn ID. V6 pages are capped at 24 KiB and the complete
 response at 4 MiB. The shared Store envelope is 64 KiB, but that is not the
-v4 adapter's accepted page limit. V4 result pages report unknown Task
+v6 adapter's accepted page limit. V6 result pages report unknown Task
 completion and no execution-complete or replay claim.
 
 ## Updating the donor

@@ -106,6 +106,7 @@ alias = 'codex-opencodex-manager'
 runtime = 'codex'
 module_artifact_id = 'codex-rust-controller.1'
 enabled = false
+workspace_option = 'workspaceRoot'
 [routes.native_options]
 modelProvider = 'REPLACE_WITH_REGISTERED_CODEX_PROVIDER_ID'
 model = 'REPLACE_WITH_CODEX_VISIBLE_MODEL_ID'
