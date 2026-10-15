@@ -496,6 +496,27 @@ jobs:
           if ((Get-FileHash -LiteralPath $stagedWorker -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $worker -Algorithm SHA256).Hash) {
             throw 'Staged ScriptWorker differs from the binary built for full qualification.'
           }
+          & cargo build --locked --package swarm-forge-worker --bin swarm-forge-worker --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $forgeName = if ($IsWindows) { 'swarm-forge-worker.exe' } else { 'swarm-forge-worker' }
+          $forgeWorker = Join-Path (Join-Path $sharedTargetDir 'debug') $forgeName
+          if (-not (Test-Path -LiteralPath $forgeWorker -PathType Leaf)) {
+            throw 'The Forge worker was not built from this source.'
+          }
+          $forgeDeps = Join-Path $sharedTargetDir 'debug/deps'
+          [void][IO.Directory]::CreateDirectory($forgeDeps)
+          $stagedForge = Join-Path $forgeDeps $forgeName
+          [IO.File]::Copy($forgeWorker, $stagedForge, $false)
+          if ((Get-FileHash -LiteralPath $stagedForge -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $forgeWorker -Algorithm SHA256).Hash) {
+            throw 'Staged Forge worker differs from the binary built for full qualification.'
+          }
+          & cargo build --locked --package swarm-checks --bin swarm-checks --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $checksName = if ($IsWindows) { 'swarm-checks.exe' } else { 'swarm-checks' }
+          $checksBin = Join-Path (Join-Path $sharedTargetDir 'debug') $checksName
+          if (-not (Test-Path -LiteralPath $checksBin -PathType Leaf)) {
+            throw 'The same-source checks executor was not built.'
+          }
           & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage FullRust -TargetDir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify Atlas donor snapshot

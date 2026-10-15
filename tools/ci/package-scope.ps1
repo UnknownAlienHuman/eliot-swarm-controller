@@ -519,6 +519,35 @@ function Invoke-FullOwnedRustChecks([string] $TargetDir) {
     )
     $testSpecs = @($owned | ForEach-Object { $_.Spec })
 
+    if ([string]::IsNullOrWhiteSpace($TargetDir)) { throw 'Full qualification requires an explicit shared TargetDir.' }
+    $resolvedTarget = Resolve-ExternalBuildTargetDir $TargetDir
+    $requiredBins = @(
+        @{ Package = 'swarm-kernel-host'; Bin = 'swarm-kernel-host' },
+        @{ Package = 'swarm-supervisor'; Bin = 'swarm-supervisor' },
+        @{ Package = 'swarm-process'; Bin = 'swarm-module-owner' },
+        @{ Package = 'swarm-script-worker'; Bin = 'swarm-script-worker' },
+        @{ Package = 'swarm-forge-worker'; Bin = 'swarm-forge-worker' },
+        @{ Package = 'swarm-checks'; Bin = 'swarm-checks' }
+    )
+    foreach ($req in $requiredBins) {
+        $pkg = @($graph.Entries | Where-Object { $_.Name -ceq $req.Package })
+        if ($pkg.Count -ne 1) { throw "Full qualification prerequisite package missing in metadata: $($req.Package)" }
+        $bin = @($pkg[0].Package.targets | Where-Object { @($_.kind) -contains 'bin' -and $_.name -ceq $req.Bin })
+        if ($bin.Count -ne 1) { throw "Full qualification prerequisite bin missing in metadata: $($req.Package)::$($req.Bin)" }
+    }
+    foreach ($req in $requiredBins) {
+        Write-Host "cargo build --locked --package $($req.Package) --bin $($req.Bin) --target-dir $resolvedTarget"
+        & cargo build --locked --package $req.Package --bin $req.Bin --target-dir $resolvedTarget
+        if ($LASTEXITCODE -ne 0) { throw "Full qualification prerequisite build failed: $($req.Package)::$($req.Bin) exit $LASTEXITCODE." }
+    }
+    $exeSuffix = if ($IsWindows) { '.exe' } else { '' }
+    foreach ($req in $requiredBins) {
+        $candidate = Join-Path (Join-Path $resolvedTarget 'debug') ($req.Bin + $exeSuffix)
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            throw "Full qualification prerequisite binary was not built from this source: $candidate"
+        }
+    }
+
     $formatArgs = @('fmt', '--check')
     foreach ($package in $formatNames) { $formatArgs += @('--package', $package) }
     $formatArgs += '--'
@@ -527,8 +556,7 @@ function Invoke-FullOwnedRustChecks([string] $TargetDir) {
     if ($LASTEXITCODE -ne 0) { throw "Full owned-package cargo fmt failed with exit code $LASTEXITCODE." }
 
     if ($clippySpecs.Count -gt 0) {
-        if ([string]::IsNullOrWhiteSpace($TargetDir)) { throw 'Scoped Cargo checks require an explicit shared TargetDir.' }
-        $clippyArgs = @('clippy', '--locked', '--lib', '--bins', '--no-deps', '--target-dir', $TargetDir)
+        $clippyArgs = @('clippy', '--locked', '--lib', '--bins', '--no-deps', '--target-dir', $resolvedTarget)
         foreach ($package in $clippySpecs) { $clippyArgs += @('--package', $package) }
         $clippyArgs += @('--', '-D', 'warnings')
         Write-Host "cargo $($clippyArgs -join ' ')"
@@ -536,7 +564,7 @@ function Invoke-FullOwnedRustChecks([string] $TargetDir) {
         if ($LASTEXITCODE -ne 0) { throw "Full owned-package cargo clippy failed with exit code $LASTEXITCODE." }
     }
 
-    $testArgs = @('test', '--locked', '--target-dir', $TargetDir)
+    $testArgs = @('test', '--locked', '--target-dir', $resolvedTarget)
     foreach ($package in $testSpecs) { $testArgs += @('--package', $package) }
     Write-Host "cargo $($testArgs -join ' ')"
     & cargo @testArgs
