@@ -1809,6 +1809,16 @@ impl Journal {
                 let exact_session_readback = target_intent.native_input_id.is_none()
                     && outcome.details["completion_condition"] == "native_session_created"
                     && outcome.details["evidence"] == "exact_session_readback";
+                let exact_reply_readback = target_intent.method == "agent.reply"
+                    && target_intent.native_input_id.is_none()
+                    && target_intent.prompt_sha256.is_none()
+                    && target_intent.prompt_bytes.is_none()
+                    && outcome.native_input_id.is_none()
+                    && outcome.details["completion_condition"] == "native_reply_acknowledged"
+                    && outcome.details["evidence"] == "complete_contiguous_native_reply_history"
+                    && exact_reply_readback_identity(target_intent, outcome);
+                let exact_non_reply_readback = target_intent.method != "agent.reply"
+                    && (exact_input_readback || exact_session_readback);
                 if !matches!(
                     target_intent.method.as_str(),
                     "agent.open"
@@ -1816,7 +1826,7 @@ impl Journal {
                         | "agent.send"
                         | "native.opencode.loop_step"
                         | "agent.reply"
-                ) || !(exact_input_readback || exact_session_readback)
+                ) || !(exact_non_reply_readback || exact_reply_readback)
                 {
                     return Err(recovery_outcome_unknown(
                         "Applied successor lacks the exact readback evidence for its intent",
@@ -2192,6 +2202,129 @@ fn torn_ack_recovery_unknown() -> Error {
 
 fn recovery_outcome_unknown(message: &'static str) -> Error {
     Error::new("ADAPTER_JOURNAL_RECOVERY_UNKNOWN", message)
+}
+
+fn exact_reply_readback_identity(
+    target_intent: &OperationIntent,
+    outcome: &RuntimeOutcome,
+) -> bool {
+    const IDENTITY_FIELDS: [&str; 8] = [
+        "kind",
+        "action",
+        "session_id",
+        "request_id",
+        "request_fingerprint",
+        "affected_request_ids",
+        "effect_payload_sha256",
+        "feedback_present",
+    ];
+
+    let Some(saved) = target_intent
+        .marker
+        .get("native_opencode_reply")
+        .filter(|value| value.is_object())
+    else {
+        return false;
+    };
+    if outcome.details.get("reply_readback_identity") != Some(saved) {
+        return false;
+    }
+    let Some(fields) = saved.as_object() else {
+        return false;
+    };
+    if fields.len() != IDENTITY_FIELDS.len()
+        || IDENTITY_FIELDS
+            .iter()
+            .any(|field| !fields.contains_key(*field))
+    {
+        return false;
+    }
+
+    let Some(kind) = fields.get("kind").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(action) = fields.get("action").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(session_id) = fields.get("session_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(request_id) = fields.get("request_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(request_fingerprint) = fields.get("request_fingerprint").and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(affected) = fields.get("affected_request_ids").and_then(Value::as_array) else {
+        return false;
+    };
+    if fields.get("feedback_present") != Some(&Value::Bool(false))
+        || target_intent.native_root_id.as_deref() != Some(session_id)
+        || outcome.native_root_id.as_deref() != Some(session_id)
+        || !valid_reply_readback_id(session_id, "ses_")
+        || !valid_reply_readback_sha256(request_fingerprint)
+    {
+        return false;
+    }
+    let prefix = match kind {
+        "question" => "que_",
+        "permission" => "per_",
+        _ => return false,
+    };
+    if !valid_reply_readback_id(request_id, prefix) || affected.is_empty() || affected.len() > 64 {
+        return false;
+    }
+    let mut affected_ids = BTreeSet::new();
+    for value in affected {
+        let Some(id) = value.as_str() else {
+            return false;
+        };
+        if !valid_reply_readback_id(id, prefix) || !affected_ids.insert(id) {
+            return false;
+        }
+    }
+    if !affected_ids.contains(request_id) {
+        return false;
+    }
+
+    let effect_digest = match fields.get("effect_payload_sha256") {
+        Some(Value::String(value))
+            if value
+                .strip_prefix("sha256:")
+                .is_some_and(valid_reply_readback_sha256) =>
+        {
+            Some(value.as_str())
+        }
+        Some(Value::Null) => None,
+        _ => return false,
+    };
+    let only_target = affected.len() == 1 && affected_ids.contains(request_id);
+    match (kind, action) {
+        ("question", "reply") | ("permission", "once") => only_target && effect_digest.is_some(),
+        ("question", "reject") => only_target && effect_digest.is_none(),
+        ("permission", "reject") => {
+            let expected = digest_json(&serde_json::json!({"reply":"reject"})).ok();
+            expected.as_deref() == effect_digest
+        }
+        _ => false,
+    }
+}
+
+fn valid_reply_readback_id(value: &str, prefix: &str) -> bool {
+    value.starts_with(prefix)
+        && value.len() > prefix.len()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
+fn valid_reply_readback_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn same_route_digest(left: &str, right: &str) -> bool {

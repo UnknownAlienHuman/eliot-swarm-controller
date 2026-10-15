@@ -27,6 +27,7 @@ use tokio::{
 enum NativeMode {
     Questions,
     PermissionCascade,
+    PermissionCascadeUncertain,
     Refresh,
 }
 
@@ -364,6 +365,58 @@ fn history_for(state: &NativeState, after: u64) -> Vec<Value> {
             .into_iter()
             .filter(|event| event["durable"]["seq"].as_u64().unwrap() > after)
             .collect(),
+        NativeMode::PermissionCascadeUncertain => {
+            let post_was_attempted = state.requests.lock().unwrap().iter().any(|request| {
+                request.method == "POST"
+                    && request.path
+                        == format!("/api/session/{}/permission/per_primary/reply", state.root)
+            });
+            let mut events = vec![root_event];
+            if post_was_attempted {
+                events.extend([
+                    durable_event(
+                        &state.root,
+                        "evt_pr43_permission_primary_asked",
+                        "permission.v2.asked",
+                        2,
+                        native_permission(&state.root, "per_primary"),
+                    ),
+                    durable_event(
+                        &state.root,
+                        "evt_pr43_permission_secondary_asked",
+                        "permission.v2.asked",
+                        3,
+                        native_permission(&state.root, "per_secondary"),
+                    ),
+                    durable_event(
+                        &state.root,
+                        "evt_pr43_permission_primary_replied",
+                        "permission.v2.replied",
+                        4,
+                        json!({
+                            "sessionID":state.root,
+                            "requestID":"per_primary",
+                            "reply":"reject"
+                        }),
+                    ),
+                    durable_event(
+                        &state.root,
+                        "evt_pr43_permission_secondary_replied",
+                        "permission.v2.replied",
+                        5,
+                        json!({
+                            "sessionID":state.root,
+                            "requestID":"per_secondary",
+                            "reply":"reject"
+                        }),
+                    ),
+                ]);
+            }
+            events
+                .into_iter()
+                .filter(|event| event["durable"]["seq"].as_u64().unwrap() > after)
+                .collect()
+        }
     }
 }
 
@@ -487,6 +540,115 @@ async fn permission_reject_cascade_reaches_native_and_outcome_ack() {
             && call.params["details"]["affected_request_ids"]
                 == json!(["per_primary", "per_secondary"])
     }));
+    drop(host);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn full_permission_reject_history_settles_unknown_once_and_records_applied_ack() {
+    let fixture = ControlFixture::new(NativeMode::PermissionCascadeUncertain, 1).await;
+    let host = fixture.host();
+    host.hello_retry().await.unwrap();
+    let target_request = native_permission(fixture.root(), "per_primary");
+    let input = reply_input(
+        &fixture.config.binding_id,
+        fixture.config.generation,
+        "permission",
+        fixture.root(),
+        &target_request,
+        json!({"decision":"reject"}),
+    );
+    let target_id = "pr43-permission-reject-uncertain";
+    let command = fixture.command(target_id, "agent.reply", input, None);
+    execute(&host, &command).await.unwrap();
+
+    let unknown = fixture.journal.load(target_id).unwrap();
+    assert_eq!(unknown.outcome.as_ref().unwrap()["outcome"], "unknown");
+    assert_eq!(unknown.acknowledged_sha256, unknown.outcome_sha256);
+    let target_intent = unknown.intent.as_ref().unwrap();
+    assert_eq!(target_intent.native_input_id, None);
+    assert_eq!(target_intent.prompt_sha256, None);
+    assert_eq!(target_intent.prompt_bytes, None);
+
+    let reconcile = fixture.command(
+        "pr43-permission-reject-reconcile",
+        "agent.reconcile",
+        json!({"operation_id":target_id}),
+        Some(target_intent.module_receipt.input_sha256.clone()),
+    );
+    let reconcile_intent = intent_for(
+        &reconcile,
+        &fixture.claim,
+        &fixture.config.native_options,
+        None,
+        None,
+    )
+    .unwrap();
+    fixture.journal.write_intent(&reconcile_intent).unwrap();
+    let mut different_reply = link_reconcile_target(
+        applied_from_intent(target_intent, None).unwrap(),
+        &reconcile.operation_id,
+    )
+    .unwrap();
+    different_reply.details["reply_readback_identity"]["request_fingerprint"] =
+        json!("f".repeat(64));
+    assert_eq!(
+        fixture
+            .journal
+            .queue_outcome(&different_reply)
+            .unwrap_err()
+            .code,
+        "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
+    );
+    assert_eq!(
+        fixture.journal.load(target_id).unwrap().outcome.unwrap()["outcome"],
+        "unknown"
+    );
+
+    execute(&host, &reconcile).await.unwrap();
+
+    let settled = fixture.journal.load(target_id).unwrap();
+    let applied = settled.outcome.as_ref().unwrap();
+    assert_eq!(applied["outcome"], "applied");
+    assert_eq!(
+        applied["details"]["completion_condition"],
+        "native_reply_acknowledged"
+    );
+    assert_eq!(
+        applied["details"]["evidence"],
+        "complete_contiguous_native_reply_history"
+    );
+    assert_eq!(applied["details"]["native_replay"], false);
+    assert_eq!(applied["native_input_id"], Value::Null);
+    assert_eq!(
+        applied["details"]["reply_readback_identity"],
+        target_intent.marker["native_opencode_reply"]
+    );
+    assert_eq!(settled.acknowledged_sha256, settled.outcome_sha256);
+
+    let calls = fixture.rpc.calls();
+    assert!(calls.iter().any(|call| {
+        call.method == "module.outcome"
+            && call.recorded == Some(true)
+            && call.params["operation_id"] == target_id
+            && call.params["details"]["completion_condition"] == "native_reply_acknowledged"
+            && call.params["details"]["evidence"] == "complete_contiguous_native_reply_history"
+    }));
+    let posts = fixture
+        .native
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .collect::<Vec<_>>();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        posts[0].path,
+        format!(
+            "/api/session/{}/permission/per_primary/reply",
+            fixture.root()
+        )
+    );
+    assert_eq!(posts[0].body, json!({"reply":"reject"}));
     drop(host);
     fixture.close().await;
 }
@@ -696,12 +858,21 @@ fn native_response(
                 native_question(&state.root, "que_reject"),
             ],
             NativeMode::Refresh => vec![native_question(&state.root, "que_refresh")],
-            NativeMode::PermissionCascade => Vec::new(),
+            NativeMode::PermissionCascade | NativeMode::PermissionCascadeUncertain => Vec::new(),
         };
         return json_response(200, json!({"data":questions}));
     }
     if method == "GET" && path == format!("/api/session/{}/permission", state.root) {
-        let permissions = if matches!(state.mode, NativeMode::PermissionCascade) {
+        let permission_reject_posted = state.requests.lock().unwrap().iter().any(|request| {
+            request.method == "POST"
+                && request.path
+                    == format!("/api/session/{}/permission/per_primary/reply", state.root)
+        });
+        let permissions = if matches!(
+            state.mode,
+            NativeMode::PermissionCascade | NativeMode::PermissionCascadeUncertain
+        ) && !permission_reject_posted
+        {
             vec![
                 native_permission(&state.root, "per_primary"),
                 native_permission(&state.root, "per_secondary"),
@@ -716,6 +887,11 @@ fn native_response(
             || path == format!("/api/session/{}/question/que_reject/reject", state.root)
             || path == format!("/api/session/{}/permission/per_primary/reply", state.root))
     {
+        if matches!(state.mode, NativeMode::PermissionCascadeUncertain)
+            && path == format!("/api/session/{}/permission/per_primary/reply", state.root)
+        {
+            return json_response(500, json!({"error":"reply committed before lost response"}));
+        }
         return Some(NativeResponse {
             status: 204,
             content_type: "application/json",
