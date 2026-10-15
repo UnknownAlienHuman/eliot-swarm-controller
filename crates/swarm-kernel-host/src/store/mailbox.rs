@@ -498,7 +498,8 @@ fn legacy_reply_matches(prior: &Value, sender_id: &str, recipient_id: &str, repl
 mod mailbox_identity_index_tests {
     use super::*;
 
-    const MIGRATION_SQL: &str = include_str!("../../migrations/015_mailbox_delivery_identity.sql");
+    const MIGRATION_SQL: &str =
+        include_str!("../../migrations/015_mailbox_delivery_identity.sql");
 
     /// Byte-identical copy of the pre-index existence query. Malformed
     /// result_json in scope made this statement THROW (json_extract on
@@ -543,8 +544,7 @@ mod mailbox_identity_index_tests {
         // insert; the pragma admits one retained-corruption row so the guard
         // path is exercised end to end. PRAGMA is connection-scoped and reset
         // immediately after the insert.
-        db.execute_batch("PRAGMA ignore_check_constraints=ON;")
-            .unwrap();
+        db.execute_batch("PRAGMA ignore_check_constraints=ON;").unwrap();
         db.execute(
             "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,settled_at_ms,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'{}','{}',?5,'{',CASE WHEN ?5 IN ('settled','rejected','cancelled') THEN 1 ELSE NULL END,1,1,1)",
             rusqlite::params![
@@ -556,39 +556,14 @@ mod mailbox_identity_index_tests {
             ],
         )
         .unwrap();
-        db.execute_batch("PRAGMA ignore_check_constraints=OFF;")
-            .unwrap();
+        db.execute_batch("PRAGMA ignore_check_constraints=OFF;").unwrap();
     }
 
     fn seed_fixture(db: &rusqlite::Connection) {
-        seed_op(
-            db,
-            "op-1",
-            "message.send",
-            "settled",
-            &serde_json::json!({"delivery_id": "d-1", "message_id": "m-1"}),
-        );
-        seed_op(
-            db,
-            "op-2",
-            "message.send",
-            "settled",
-            &serde_json::json!({"delivery_id": "d-1", "message_id": "m-2"}),
-        );
-        seed_op(
-            db,
-            "op-3",
-            "message.send",
-            "queued",
-            &serde_json::json!({"delivery_id": "d-3", "message_id": "m-3"}),
-        );
-        seed_op(
-            db,
-            "op-4",
-            "task.create",
-            "settled",
-            &serde_json::json!({"delivery_id": "d-4"}),
-        );
+        seed_op(db, "op-1", "message.send", "settled", &serde_json::json!({"delivery_id": "d-1", "message_id": "m-1"}));
+        seed_op(db, "op-2", "message.send", "settled", &serde_json::json!({"delivery_id": "d-1", "message_id": "m-2"}));
+        seed_op(db, "op-3", "message.send", "queued", &serde_json::json!({"delivery_id": "d-3", "message_id": "m-3"}));
+        seed_op(db, "op-4", "task.create", "settled", &serde_json::json!({"delivery_id": "d-4"}));
     }
 
     #[test]
@@ -705,7 +680,10 @@ mod mailbox_identity_index_tests {
                 plan.contains("SEARCH") && plan.contains(index),
                 "branch must seek {index}, got: {plan}"
             );
-            assert!(!plan.contains("SCAN"), "branch must not scan, got: {plan}");
+            assert!(
+                !plan.contains("SCAN"),
+                "branch must not scan, got: {plan}"
+            );
         }
         // Corruption sentinel: the probe must resolve through the invalid-row
         // index, never a base-table scan. A scan of that partial index stays
