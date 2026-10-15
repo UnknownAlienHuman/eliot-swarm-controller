@@ -460,6 +460,53 @@ fn retire_owned_harness(
     Ok(())
 }
 
+fn shutdown_scope(input: &Value) -> Option<&str> {
+    match input.get("owned_scope").and_then(Value::as_str) {
+        Some("owned_sdk_transport") => Some("owned_sdk_transport"),
+        _ => None,
+    }
+}
+
+struct ShutdownInvocation<'a> {
+    config: &'a AdapterConfig,
+    claim: &'a ModuleContractClaim,
+    journal: &'a OperationJournal,
+    interactions: &'a InteractionJournal,
+    harness: &'a mut Option<NativeHarness>,
+    harness_alive: &'a mut bool,
+    boot_id: &'a str,
+    native_root_id: Option<&'a str>,
+    command: &'a RuntimeCommand,
+    receipt: &'a swarm_contracts::runtime::ModuleReceiptIdentity,
+}
+
+async fn handle_shutdown(invocation: ShutdownInvocation<'_>) -> Result<bool> {
+    let ShutdownInvocation { config, claim, journal, interactions, harness, harness_alive, boot_id, native_root_id, command, receipt } = invocation;
+    if let Err(error) = validate_route(config, command) {
+        return queue_rejected(config, claim, journal, command, receipt, &error.code, native_root_id);
+    }
+    if shutdown_scope(&command.input).is_none() {
+        return queue_rejected(config, claim, journal, command, receipt, "SHUTDOWN_SCOPE_UNSUPPORTED", native_root_id);
+    }
+    let intent = intent_for(command, receipt, None, boot_id, &config.native_options.scope_key())?;
+    journal.write_intent(&command.operation_id, receipt, &command.method, &intent)?;
+    match retire_owned_harness(harness, interactions, boot_id, journal) {
+        Ok(()) => {
+            *harness_alive = false;
+            let mut details = json!({"diagnostic_code":"OWNED_TRANSPORT_RELEASED","completion_condition":"owned_resource_released","disposition":"owned_transport_released","replay_permitted":false});
+            receipt::insert(&mut details, receipt)?;
+            let outcome = RuntimeOutcome { operation_id: command.operation_id.clone(), outcome: EffectOutcome::Applied, native_scope_key: Some(config.native_options.scope_key()), native_root_id: native_root_id.map(ToOwned::to_owned), turn_id: None, native_input_id: None, details };
+            journal.save_outcome(&command.operation_id, &outcome)?;
+            Ok(true)
+        }
+        Err(error) => {
+            let outcome = unknown_outcome(command, receipt, &error.code, native_root_id, &config.native_options.scope_key())?;
+            journal.save_outcome(&command.operation_id, &outcome)?;
+            Ok(true)
+        }
+    }
+}
+
 struct UnknownResultInvocation<'a> {
     config: &'a AdapterConfig,
     journal: &'a OperationJournal,
@@ -1013,6 +1060,21 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                 native_root_id,
                 native_control,
                 command,
+            })
+            .await
+        }
+        "agent.shutdown" => {
+            handle_shutdown(ShutdownInvocation {
+                config,
+                claim,
+                journal,
+                interactions,
+                harness,
+                harness_alive,
+                boot_id,
+                native_root_id,
+                command,
+                receipt: &receipt,
             })
             .await
         }
@@ -3626,7 +3688,7 @@ mod failed_prepare_lifecycle_fixture {
         serde_json::from_value(json!({
             "schema_version":1,
             "module_id":"claude",
-            "artifact":{"artifact_id":"claude-agent-sdk-rust-controller.5","version":"5","build_id":null},
+            "artifact":{"artifact_id":"claude-agent-sdk-rust-controller.6","version":"6","build_id":null},
             "protocol":{"major":1,"minor":0},
             "binding_id":"fixture-binding",
             "binding_generation":1,
@@ -5287,5 +5349,20 @@ if (process.argv[2] === '--held-descendant') {
 
     fn read_report(path: PathBuf) -> Option<Value> {
         serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+}
+
+#[cfg(test)]
+mod agent_shutdown_tests {
+    use super::shutdown_scope;
+    #[test]
+    fn accepts_only_owned_sdk_transport() {
+        assert_eq!(shutdown_scope(&serde_json::json!({"owned_scope": "owned_sdk_transport"})), Some("owned_sdk_transport"));
+    }
+    #[test]
+    fn rejects_foreign_missing_and_empty_scope() {
+        for input in [serde_json::json!({}), serde_json::json!({"owned_scope": "external_attach"}), serde_json::json!({"owned_scope": "server"}), serde_json::json!({"owned_scope": ""})] {
+            assert_eq!(shutdown_scope(&input), None);
+        }
     }
 }

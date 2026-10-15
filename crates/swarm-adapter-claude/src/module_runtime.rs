@@ -14,7 +14,7 @@ use swarm_contracts::{
 };
 use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_from_env};
 
-const CAPABILITIES: [&str; 7] = [
+const CAPABILITIES: [&str; 8] = [
     "agent.open",
     "agent.reconcile",
     "agent.refresh",
@@ -22,6 +22,7 @@ const CAPABILITIES: [&str; 7] = [
     "agent.result",
     "agent.send/next_turn",
     "task.dispatch",
+    "agent.shutdown",
 ];
 
 pub struct OwnedBootstrap {

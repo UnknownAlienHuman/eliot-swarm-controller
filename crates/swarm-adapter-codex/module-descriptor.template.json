@@ -3,7 +3,7 @@
   "module_id": "codex",
   "artifact": {
     "artifact_id": "codex-rust-controller.1",
-    "version": "8",
+    "version": "9",
     "build_id": null
   },
   "launch": {
@@ -83,6 +83,7 @@
     "agent.reconcile",
     "agent.result",
     "agent.send",
+    "agent.shutdown",
     "task.dispatch"
   ],
   "lifecycle": "external_attach",

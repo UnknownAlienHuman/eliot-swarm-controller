@@ -11,7 +11,7 @@
           "adapter": "Codex",
           "module_id": "codex",
           "artifact_id": "codex-rust-controller.1",
-          "version": "8"
+          "version": "9"
         }
       ]
     },
@@ -36,8 +36,8 @@
         {
           "adapter": "Claude",
           "module_id": "claude",
-          "artifact_id": "claude-agent-sdk-rust-controller.5",
-          "version": "5"
+          "artifact_id": "claude-agent-sdk-rust-controller.6",
+          "version": "6"
         }
       ]
     },

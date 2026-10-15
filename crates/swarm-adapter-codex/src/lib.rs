@@ -5939,6 +5939,11 @@ async fn handle_command(
                     }
                 }
             }
+            "agent.shutdown" => {
+                let mut result = shutdown_operation(&command, journal, native, claim).await;
+                attach_command_receipt(&mut result, &command, claim)?;
+                vec![result]
+            }
             _ => {
                 let mut result = rejected(&command, "CAPABILITY_UNAVAILABLE", &journal.state);
                 result.details["capability"] = json!(command.method);
@@ -5968,6 +5973,55 @@ async fn handle_command(
         journal.store_outcome(outcome, &method, &kind)?;
     }
     Ok(result)
+}
+
+fn shutdown_scope(input: &Value) -> Result<&str, &'static str> {
+    match input.get("owned_scope").and_then(Value::as_str) {
+        Some("external_attach") => Ok("external_attach"),
+        Some(_) | None => Err("SHUTDOWN_SCOPE_UNSUPPORTED"),
+    }
+}
+
+async fn release_owned_connection(native: &mut NativeClient) -> Result<&'static str, &'static str> {
+    let writer = native.writer.take().ok_or("CODEX_CONNECTION_ALREADY_RELEASED")?;
+    let send = {
+        let mut guard = writer.lock().await;
+        timeout(CONNECT_TIMEOUT, guard.send(Message::Close(None))).await
+    };
+    if let Some(task) = native.reader_task.take() {
+        task.abort();
+    }
+    match send {
+        Ok(Ok(())) => Ok("owned_connection_closed"),
+        _ => Err("CODEX_CONNECTION_CLOSE_UNKNOWN"),
+    }
+}
+
+async fn shutdown_operation(
+    command: &RuntimeCommand,
+    journal: &Journal,
+    native: &mut NativeClient,
+    claim: &ModuleContractClaim,
+) -> RuntimeOutcome {
+    if !claim.capabilities.iter().any(|capability| capability.as_str() == "agent.shutdown") {
+        return rejected(command, "CAPABILITY_UNAVAILABLE", &journal.state);
+    }
+    if shutdown_scope(&command.input).is_err() {
+        let mut outcome = rejected(command, "SHUTDOWN_SCOPE_UNSUPPORTED", &journal.state);
+        outcome.details["owned_scope"] = command.input.get("owned_scope").cloned().unwrap_or(Value::Null);
+        return outcome;
+    }
+    match release_owned_connection(native).await {
+        Ok(disposition) => {
+            let mut details = base_details(&journal.state);
+            details["diagnostic_code"] = json!("OWNED_CONNECTION_RELEASED");
+            details["completion_condition"] = json!("owned_resource_released");
+            details["disposition"] = json!(disposition);
+            details["native_replay"] = json!(false);
+            outcome(&command.operation_id, EffectOutcome::Applied, None, journal.state.native_scope_key.as_deref(), None, None, details)
+        }
+        Err(code) => rejected(command, code, &journal.state),
+    }
 }
 
 async fn build_normalized_result_page(
@@ -7041,3 +7095,18 @@ mod reg34_reg35_checkpoint_integrity_tests {
 #[cfg(test)]
 #[path = "native_identity_tests.rs"]
 mod native_identity_tests;
+
+#[cfg(test)]
+mod agent_shutdown_tests {
+    use super::shutdown_scope;
+    #[test]
+    fn accepts_only_external_attach() {
+        assert_eq!(shutdown_scope(&serde_json::json!({"owned_scope": "external_attach"})), Ok("external_attach"));
+    }
+    #[test]
+    fn rejects_foreign_missing_and_empty_scope() {
+        for input in [serde_json::json!({}), serde_json::json!({"owned_scope": "owned_sdk_transport"}), serde_json::json!({"owned_scope": "server"}), serde_json::json!({"owned_scope": ""})] {
+            assert_eq!(shutdown_scope(&input), Err("SHUTDOWN_SCOPE_UNSUPPORTED"));
+        }
+    }
+}

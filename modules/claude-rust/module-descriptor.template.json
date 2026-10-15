@@ -2,8 +2,8 @@
   "schema_version": 1,
   "module_id": "claude",
   "artifact": {
-    "artifact_id": "claude-agent-sdk-rust-controller.5",
-    "version": "5",
+    "artifact_id": "claude-agent-sdk-rust-controller.6",
+    "version": "6",
     "build_id": null
   },
   "launch": {
@@ -51,7 +51,8 @@
     "agent.result",
     "agent.refresh",
     "agent.send/next_turn",
-    "task.dispatch"
+    "task.dispatch",
+    "agent.shutdown"
   ],
   "lifecycle": "owned_service",
   "activation": "on_demand",

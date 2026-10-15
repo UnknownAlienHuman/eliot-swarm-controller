@@ -1201,35 +1201,13 @@ fn validate_agent_shutdown_request(
             swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.message(),
         ));
     }
-    let runtime = binding["route"]["runtime"].as_str().unwrap_or_default();
-    let artifact = binding["module_artifact_id"].as_str().unwrap_or_default();
-    match scope {
-        "owned_sdk_transport" => {
-            let is_claude = crate::runtime::prepared::is_prepared_claude_route(&binding["route"])
-                || runtime == crate::runtime::prepared::CLAUDE_RUNTIME
-                || runtime == crate::runtime::prepared::CLAUDE_MODULE_RUNTIME;
-            if !is_claude || !artifact.starts_with("claude-agent-sdk-") {
-                return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "owned SDK transport shutdown requires the owning Claude bridge binding"));
-            }
-            let boot = binding.get("observation").and_then(|o| o.get("bridge_boot_id")).and_then(|v| v.as_str()).filter(|v| !v.is_empty());
-            if boot.is_none() {
-                return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "owned SDK transport shutdown requires the bridge boot owner"));
-            }
-        }
-        "external_attach" => {
-            if runtime != crate::runtime::codex::RUNTIME || artifact != swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID {
-                return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "external attach shutdown requires the owning Codex connection binding"));
-            }
-            if binding["native_scope_key"].as_str().map(|s| s.is_empty() || s == "shared-server").unwrap_or(true) {
-                return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "external attach shutdown requires the binding owned connection scope"));
-            }
-        }
-        _ => {
-            return Err(Error::new(
-                swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.code(),
-                swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.message(),
-            ));
-        }
+    let input_binding = model::text(input, "binding_id")?;
+    let input_generation = model::positive(input, "generation")?;
+    if input_binding != model::text(binding, "binding_id")? || input_generation != model::positive(binding, "generation")? {
+        return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "shutdown names only its exact own binding generation"));
+    }
+    if binding["state"] != "ready" {
+        return Err(Error::new("BINDING_NOT_READY", "native session is not ready"));
     }
     Ok(())
 }
@@ -6470,5 +6448,32 @@ mod codex_goal_controller_contract_fixtures {
         )
         .unwrap_err();
         assert_eq!(error.code, "GOAL_UNSUPPORTED_RUNTIME");
+    }
+}
+
+#[cfg(test)]
+mod agent_shutdown_validation_tests {
+    use super::*;
+    fn binding(state: &str) -> Value {
+        json!({"binding_id": "b", "generation": 1, "state": state, "route": {"runtime": "codex"}})
+    }
+    #[test]
+    fn accepts_exact_own_ready_binding() {
+        let b = binding("ready");
+        for scope in ["external_attach", "owned_sdk_transport"] {
+            let input = json!({"binding_id": "b", "generation": 1, "owned_scope": scope});
+            assert!(validate_agent_shutdown_request(&b, &input).is_ok());
+        }
+    }
+    #[test]
+    fn rejects_foreign_unready_and_unknown_scope() {
+        let b = binding("ready");
+        let foreign = json!({"binding_id": "other", "generation": 1, "owned_scope": "external_attach"});
+        assert!(validate_agent_shutdown_request(&b, &foreign).is_err());
+        let stale = binding("closed");
+        let input = json!({"binding_id": "b", "generation": 1, "owned_scope": "external_attach"});
+        assert!(validate_agent_shutdown_request(&stale, &input).is_err());
+        let bad = json!({"binding_id": "b", "generation": 1, "owned_scope": "server"});
+        assert!(validate_agent_shutdown_request(&b, &bad).is_err());
     }
 }

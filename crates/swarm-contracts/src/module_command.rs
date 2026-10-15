@@ -283,3 +283,21 @@ pub fn classify_runtime_command(
 pub fn capability_satisfies(advertised: &str, required: &str) -> bool {
     advertised == required || (required.starts_with("agent.send/") && advertised == "agent.send")
 }
+
+#[cfg(test)]
+mod agent_shutdown_tests {
+    use super::*;
+    #[test]
+    fn classifies_both_closed_scopes() {
+        for scope in ["external_attach", "owned_sdk_transport"] {
+            let input = serde_json::json!({"owned_scope": scope});
+            assert_eq!(classify_runtime_command(AGENT_SHUTDOWN_METHOD, &input), Ok(RuntimeCommandKind::AgentShutdown));
+        }
+    }
+    #[test]
+    fn rejects_absent_unknown_and_non_string_scope() {
+        for input in [serde_json::json!({}), serde_json::json!({"owned_scope": "server"}), serde_json::json!({"owned_scope": ""}), serde_json::json!({"owned_scope": 7})] {
+            assert_eq!(classify_runtime_command(AGENT_SHUTDOWN_METHOD, &input), Err(RuntimeCommandClassError::InvalidAgentShutdownScope));
+        }
+    }
+}

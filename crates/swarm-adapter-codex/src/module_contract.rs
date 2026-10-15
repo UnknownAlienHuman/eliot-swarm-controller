@@ -11,17 +11,19 @@ use crate::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterError, MODULE_ID};
 
 pub(crate) const GOAL_CONTINUATION_ADMISSION_SCHEMA_ID: &str = "swarm.goal_continuation_admission";
 
-const CAPABILITIES: [&str; 4] = [
+const CAPABILITIES: [&str; 5] = [
     "agent.open",
     "agent.reconcile",
     "agent.send",
+    "agent.shutdown",
     "task.dispatch",
 ];
-const RESULT_CAPABILITIES: [&str; 5] = [
+const RESULT_CAPABILITIES: [&str; 6] = [
     "agent.open",
     "agent.reconcile",
     "agent.result",
     "agent.send",
+    "agent.shutdown",
     "task.dispatch",
 ];
 
