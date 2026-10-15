@@ -29,6 +29,7 @@ use swarm_contracts::{
 use tokio::{sync::mpsc, time::sleep};
 
 const IDLE_POLL_MS: u64 = 500;
+const STARTUP_RECOVERY_TICK_MS: u64 = 250;
 const MAX_FRAMES: usize = 256;
 const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TASK_SNAPSHOT_BYTES: usize = 64 * 1024;
@@ -90,6 +91,11 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     tokio::pin!(ctrl_c);
     let mut frames_closed = false;
     let mut stale_interactions_recovered = false;
+    let mut recovery_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(STARTUP_RECOVERY_TICK_MS),
+        Duration::from_millis(STARTUP_RECOVERY_TICK_MS),
+    );
+    recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         flush_outbox(&mut link, &journal, &interactions).await?;
@@ -147,7 +153,32 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     None => frames_closed = true,
                 }
             }
-            response = link.next() => {
+            response = wait_for_next_with_recovery(
+                link.next(),
+                &mut recovery_tick,
+                || {
+                    if startup_recovery_blocked {
+                        return false;
+                    }
+                    match journal.startup_recovery_complete() {
+                        Ok(true) => return false,
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!("Claude startup recovery remains incomplete: {}", error.code);
+                            startup_recovery_blocked = true;
+                            return false;
+                        }
+                    }
+                    if let Err(error) = journal.try_recover_startup_window_for_boot(
+                        "ADAPTER_RESTART_AFTER_EFFECT_MARKER", &boot_id,
+                    ) {
+                        eprintln!("Claude startup recovery remains incomplete: {}", error.code);
+                        startup_recovery_blocked = true;
+                        return false;
+                    }
+                    true
+                },
+            ) => {
                 let response = response?;
                 let command_value = response.get("command").ok_or_else(|| {
                     Error::new("HOST_COMMAND_SCHEMA", "module.next response lacks command state")
@@ -244,6 +275,50 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+async fn wait_for_next_with_recovery<F: std::future::Future>(
+    next: F,
+    recovery_tick: &mut tokio::time::Interval,
+    mut advance: impl FnMut() -> bool,
+) -> F::Output {
+    tokio::pin!(next);
+    let mut enabled = true;
+    loop {
+        tokio::select! {
+            response = &mut next => return response,
+            _ = recovery_tick.tick(), if enabled => enabled = advance(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_poll_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_windows_advance_while_one_module_next_stays_pending() {
+        let mut tick = tokio::time::interval(Duration::from_millis(1));
+        tick.tick().await;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut send = Some(send);
+        let mut windows = 0;
+        let next = async { receive.await.unwrap() };
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_next_with_recovery(next, &mut tick, || {
+                windows += 1;
+                if windows == 32 {
+                    send.take().unwrap().send("agent.reconcile").unwrap();
+                }
+                windows < 32
+            }),
+        )
+        .await
+        .expect("bounded recovery must progress without a new module.next request");
+        assert_eq!(response, "agent.reconcile");
+        assert_eq!(windows, 32);
     }
 }
 

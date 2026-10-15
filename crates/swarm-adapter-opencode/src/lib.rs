@@ -308,11 +308,11 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
             TokioInstant::now() + Duration::from_millis(STARTUP_RECOVERY_TICK_MS),
             Duration::from_millis(STARTUP_RECOVERY_TICK_MS),
         );
+        recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut module_next = Box::pin(host.call("module.next", json!({})));
         let mut root_checked = false;
         let mut retention_started = false;
         let mut recovery_report_queued = false;
-        let mut recovery_window_advanced = false;
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         loop {
@@ -324,13 +324,11 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                 event = wait_for_module_next_or_recovery(
                     module_next.as_mut(),
                     &mut recovery_tick,
-                    !recovery_window_advanced
-                        && !startup_recovery.blocked
+                    !startup_recovery.blocked
                         && !journal.startup_recovery_complete(),
                 ) => event,
             };
             if let StartupPoll::ModuleNext(result) = event {
-                recovery_window_advanced = false;
                 let response = result?;
                 let command_value = response.get("command").ok_or_else(|| {
                     Error::new(
@@ -376,9 +374,6 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     &mut journal_recovery_count,
                 )
                 .await;
-            if !matches!(step, StartupRecoveryStep::WaitingForInventory) {
-                recovery_window_advanced = true;
-            }
             if matches!(step, StartupRecoveryStep::Complete) {
                 if !root_checked {
                     if let Some(root) = journal.native_root_for_hello(
