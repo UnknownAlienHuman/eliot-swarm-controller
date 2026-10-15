@@ -1140,20 +1140,22 @@ fn capture_supervisor_child_identity(
     capture_supervisor_child_identity_with_readers(
         child,
         executable,
+        Child::id,
         process_birth_identity,
         process_image_identity,
     )
 }
 
-// Keep fault selection local to the private caller; production always supplies
-// the real OS readers above and retains the same birth/image/birth validation.
+// Keep fault selection local to the private caller; production supplies Child::id
+// and the real OS readers while retaining birth/image/birth validation.
 fn capture_supervisor_child_identity_with_readers(
     child: &Child,
     executable: &Path,
+    read_pid: impl FnOnce(&Child) -> Option<u32>,
     mut read_birth: impl FnMut(u32) -> swarm_contracts::error::Result<Option<Value>>,
     read_image: impl FnOnce(u32) -> swarm_contracts::error::Result<Value>,
 ) -> Result<SupervisorChildIdentity> {
-    let pid = child.id().ok_or_else(|| {
+    let pid = read_pid(child).ok_or_else(|| {
         Error::new(
             "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
             "supervisor child PID is unavailable",
@@ -2401,6 +2403,8 @@ mod tests {
         enum ReaderFailure {
             Birth,
             Image,
+            PidUnavailable,
+            BirthChanged,
         }
 
         #[tokio::test]
@@ -2411,6 +2415,16 @@ mod tests {
         #[tokio::test]
         async fn unknown362_image_read_failure_and_health_write_failure_keep_exact_child_custody() {
             reader_failure_keeps_exact_child_custody(ReaderFailure::Image).await;
+        }
+
+        #[tokio::test]
+        async fn pr71_a2_pid_unavailable_keeps_exact_child_custody() {
+            reader_failure_keeps_exact_child_custody(ReaderFailure::PidUnavailable).await;
+        }
+
+        #[tokio::test]
+        async fn pr71_a2_birth_tuple_changed_between_reads_keeps_exact_child_custody() {
+            reader_failure_keeps_exact_child_custody(ReaderFailure::BirthChanged).await;
         }
 
         // Compose the same prior-child/admission/intent/readback/spawn gates as
@@ -2511,6 +2525,7 @@ mod tests {
             install_health_rejection(&root, SUPERVISOR_SPAWN_PENDING);
 
             let mut launches = Vec::new();
+            let mut pid_reads = 0;
             let mut birth_reads = 0;
             let mut image_reads = 0;
             let capture_error =
@@ -2520,20 +2535,42 @@ mod tests {
                     capture_supervisor_child_identity_with_readers(
                         child,
                         executable,
+                        |child| {
+                            pid_reads += 1;
+                            if matches!(failure, ReaderFailure::PidUnavailable) {
+                                None
+                            } else {
+                                child.id()
+                            }
+                        },
                         |pid| {
                             assert_eq!(pid, expected_pid, "birth reader received this exact Child");
                             birth_reads += 1;
-                            if matches!(failure, ReaderFailure::Birth) {
-                                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)
-                                    .into())
-                            } else {
-                                process_birth_identity(pid)
+                            match failure {
+                                ReaderFailure::Birth => {
+                                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+                                        .into())
+                                }
+                                ReaderFailure::BirthChanged if birth_reads == 2 => {
+                                    process_birth_identity(pid).map(|birth| {
+                                        birth.map(|mut birth| {
+                                            birth["pr71_a2_changed_tuple"] = json!(true);
+                                            birth
+                                        })
+                                    })
+                                }
+                                _ => process_birth_identity(pid),
                             }
                         },
                         |pid| {
                             assert_eq!(pid, expected_pid, "image reader received this exact Child");
                             image_reads += 1;
-                            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+                            if matches!(failure, ReaderFailure::Image) {
+                                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+                                    .into())
+                            } else {
+                                process_image_identity(pid)
+                            }
                         },
                     )
                 })
@@ -2541,19 +2578,37 @@ mod tests {
                 .expect_err("actual spawned Child must enter the reader-error custody path");
             assert_eq!(
                 capture_error.code,
-                "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN"
+                match failure {
+                    ReaderFailure::BirthChanged => "MODULE_SUPERVISOR_CHILD_BIRTH_CHANGED",
+                    _ => "MODULE_SUPERVISOR_CHILD_IDENTITY_UNKNOWN",
+                }
             );
             assert_eq!(
                 capture_error.message,
                 match failure {
+                    ReaderFailure::PidUnavailable => "supervisor child PID is unavailable",
                     ReaderFailure::Birth => "supervisor child birth identity could not be read",
                     ReaderFailure::Image => "supervisor child image identity could not be read",
+                    ReaderFailure::BirthChanged => {
+                        "supervisor child birth identity changed during image capture"
+                    }
                 }
             );
-            assert_eq!(birth_reads, 1);
+            assert_eq!(pid_reads, 1);
+            assert_eq!(
+                birth_reads,
+                match failure {
+                    ReaderFailure::PidUnavailable => 0,
+                    ReaderFailure::Birth | ReaderFailure::Image => 1,
+                    ReaderFailure::BirthChanged => 2,
+                }
+            );
             assert_eq!(
                 image_reads,
-                usize::from(matches!(failure, ReaderFailure::Image))
+                usize::from(matches!(
+                    failure,
+                    ReaderFailure::Image | ReaderFailure::BirthChanged
+                ))
             );
             assert_eq!(launches.len(), 1, "one actual Child was acquired");
             let (pid, birth) = launches[0].clone();
