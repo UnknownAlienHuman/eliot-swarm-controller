@@ -774,6 +774,7 @@ jobs:
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 're_promoted_gm_does_not_make_an_old_queued_epoch_current_again' -Expected 1 -ExpectedNames @('re_promoted_gm_does_not_make_an_old_queued_epoch_current_again')
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'attempt_control_requires_current_gm_scope_and_exact_live_attempt' -Expected 1 -ExpectedNames @('attempt_control_requires_current_gm_scope_and_exact_live_attempt')
           } elseif ($env:QUALIFICATION -ceq 'focused-isolation') {
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'invalid_operation_id_is_quarantined_and_waiting_deadline_survives' -Expected 1 -ExpectedNames @('invalid_operation_id_is_quarantined_and_waiting_deadline_survives')
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'legacy_worker_demand_poison_tests' -Expected 4 -ExpectedNames @(
               'legacy_demand_poison_reaches_existing_check_and_launch_isolators',
               'legacy_demand_quarantined_launch_is_stable_and_changed_bytes_reactivate',
