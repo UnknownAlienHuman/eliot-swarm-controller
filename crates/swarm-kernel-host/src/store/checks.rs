@@ -202,6 +202,11 @@ static PR61_CACHE_VERIFY_WORKER_PANIC_INPUT_FINGERPRINT: std::sync::Mutex<Option
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static PR61_CACHE_VERIFY_WORKER_ENTRY_NOTIFICATION: std::sync::Mutex<
+    Option<tokio::sync::oneshot::Sender<std::time::Instant>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
 fn take_pr61_cache_verify_worker_panic(input_fingerprint: &str) -> bool {
     let mut target = PR61_CACHE_VERIFY_WORKER_PANIC_INPUT_FINGERPRINT
         .lock()
@@ -210,6 +215,14 @@ fn take_pr61_cache_verify_worker_panic(input_fingerprint: &str) -> bool {
         return false;
     }
     *target = None;
+    let entered_at = std::time::Instant::now();
+    let notification = PR61_CACHE_VERIFY_WORKER_ENTRY_NOTIFICATION
+        .lock()
+        .expect("PR 61 cache verification worker entry notification lock")
+        .take();
+    if let Some(notification) = notification {
+        let _ = notification.send(entered_at);
+    }
     true
 }
 
@@ -4956,6 +4969,44 @@ mod tests {
 
     static PR61_PROBE_FAILURE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PR61_PROBE_SUCCESS_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PR61_STORE_RESOLVER_TEST_PROBE_STARTED_AT: Mutex<Option<std::time::Instant>> =
+        Mutex::new(None);
+    static PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED_AT: Mutex<Option<std::time::Instant>> =
+        Mutex::new(None);
+    // The resolver verifies the full configured executable before it invokes
+    // the test version-probe override. Keep that cold preparation separate
+    // from the bounded cache-worker panic unwind, while staying inside the
+    // live process fixture's 60-second lifetime.
+    const PR61_CACHE_INPUT_PREPARATION_BOUND: Duration = Duration::from_secs(45);
+    const PR61_CACHE_WORKER_UNWIND_BOUND: Duration = Duration::from_secs(5);
+    const PR61_CACHE_OWNER_HOLD_BOUND: Duration = Duration::from_secs(55);
+
+    struct Pr61CacheWorkerEntryObserverGuard;
+
+    impl Drop for Pr61CacheWorkerEntryObserverGuard {
+        fn drop(&mut self) {
+            if let Ok(mut notification) = super::PR61_CACHE_VERIFY_WORKER_ENTRY_NOTIFICATION.lock()
+            {
+                let _ = notification.take();
+            }
+        }
+    }
+
+    fn observe_pr61_cache_worker_entry() -> (
+        tokio::sync::oneshot::Receiver<std::time::Instant>,
+        Pr61CacheWorkerEntryObserverGuard,
+    ) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut notification = super::PR61_CACHE_VERIFY_WORKER_ENTRY_NOTIFICATION
+            .lock()
+            .expect("PR 61 cache verification worker entry notification lock");
+        assert!(
+            notification.is_none(),
+            "only one cache entry observer is active"
+        );
+        *notification = Some(sender);
+        (receiver, Pr61CacheWorkerEntryObserverGuard)
+    }
 
     #[derive(Default)]
     struct Pr61ProbeOverlapState {
@@ -6497,15 +6548,25 @@ mod tests {
     ) -> Result<Vec<u8>> {
         let call = PR61_STORE_RESOLVER_TEST_PROBE_STARTED.fetch_add(1, Ordering::SeqCst) + 1;
         let started = std::time::Instant::now();
+        *PR61_STORE_RESOLVER_TEST_PROBE_STARTED_AT
+            .lock()
+            .expect("PR 61 resolver probe start timestamp lock") = Some(started);
+        let program_bytes = std::fs::metadata(program)
+            .ok()
+            .map(|metadata| metadata.len());
         eprintln!(
-            "pr61_store_resolver_test_probe_started={{\"call\":{call},\"program\":{:?},\"args\":{:?}}}",
-            program, args
+            "pr61_store_resolver_test_probe_started={{\"call\":{call},\"program\":{:?},\"program_bytes\":{:?},\"args\":{:?}}}",
+            program, program_bytes, args
         );
         let result = test_version_probe(program, args, env, cwd);
+        let completed_at = std::time::Instant::now();
+        *PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED_AT
+            .lock()
+            .expect("PR 61 resolver probe completion timestamp lock") = Some(completed_at);
         let completed = PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.fetch_add(1, Ordering::SeqCst) + 1;
         eprintln!(
             "pr61_store_resolver_test_probe_completed={{\"call\":{call},\"completed\":{completed},\"elapsed_ms\":{}}}",
-            started.elapsed().as_millis()
+            completed_at.duration_since(started).as_millis()
         );
         result
     }
@@ -6918,6 +6979,7 @@ mod tests {
                 .expect("derive unrelated retained-owner scope");
             assert!(!cache_scope.overlaps(&owner_scope));
 
+            let owner_family_started = std::time::Instant::now();
             let (owner, process_fixture) =
                 inputs::tests::pending_probe_custody_fixture(owner_scope.clone());
             let helper_identity = process_fixture.helper_launch_identity().clone();
@@ -6957,12 +7019,12 @@ mod tests {
                 PR61_STORE_RESOLVER_TEST_PROBE_STARTED.load(Ordering::SeqCst);
             let failure_probe_completed_before =
                 PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.load(Ordering::SeqCst);
-            let failure_resolver_started = std::time::Instant::now();
             eprintln!(
-                "pr61_cache_failure_override={{\"profile_id\":{:?},\"profile_revision\":{:?},\"resource\":{:?},\"seed_check_id\":{:?}}}",
+                "pr61_cache_failure_override={{\"profile_id\":{:?},\"profile_revision\":{:?},\"resource\":{:?},\"candidate_artifact_bytes\":{},\"seed_check_id\":{:?}}}",
                 failure_snapshot.profile.profile_id,
                 failure_snapshot.profile.profile_revision,
                 failure_snapshot.profile.resource,
+                cached_source.byte_length,
                 original_check
             );
             let _failure_probe = inputs::override_probe_for_test(
@@ -6979,22 +7041,80 @@ mod tests {
                 );
                 *target = Some(original_input_fingerprint.clone());
             }
-            let resolution = match timeout(
-                Duration::from_secs(5),
-                store.resolve_check_plan_snapshot(Ok(failure_snapshot)),
-            )
-            .await
-            {
-                Ok(result) => result.unwrap(),
-                Err(error) => panic!(
-                    "cache artifact-worker panic must remain a bounded preflight failure: {error:?}; resolver_elapsed_ms={}; exact_test_override_probe_calls={{started:{},completed:{}}}",
-                    failure_resolver_started.elapsed().as_millis(),
-                    PR61_STORE_RESOLVER_TEST_PROBE_STARTED.load(Ordering::SeqCst)
-                        - failure_probe_started_before,
-                    PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.load(Ordering::SeqCst)
-                        - failure_probe_completed_before
-                ),
+            let (cache_worker_entry, _cache_worker_entry_guard) = observe_pr61_cache_worker_entry();
+            *PR61_STORE_RESOLVER_TEST_PROBE_STARTED_AT.lock().unwrap() = None;
+            *PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED_AT.lock().unwrap() = None;
+            let failure_resolver_started = std::time::Instant::now();
+            let resolver_store = (*store).clone();
+            let mut failure_resolution_task = tokio::spawn(async move {
+                resolver_store
+                    .resolve_check_plan_snapshot(Ok(failure_snapshot))
+                    .await
+            });
+            let cache_worker_entered_at = tokio::select! {
+                joined = &mut failure_resolution_task => {
+                    match joined.expect("cache failure resolver task did not panic") {
+                        Ok(resolution) => panic!(
+                            "cache resolver returned before the exact worker panic hook: result_ok={}, cache_hit={}",
+                            resolution.result.is_ok(),
+                            resolution.cache_hit.is_some()
+                        ),
+                        Err(error) => panic!(
+                            "cache resolver failed before the exact worker panic hook: {error:?}"
+                        ),
+                    }
+                },
+                entered = timeout(PR61_CACHE_INPUT_PREPARATION_BOUND, cache_worker_entry) => {
+                    match entered {
+                        Ok(Ok(at)) => at,
+                        Ok(Err(error)) => panic!(
+                            "cache worker entry notification closed before the panic hook: {error}"
+                        ),
+                        Err(error) => {
+                            failure_resolution_task.abort();
+                            panic!(
+                                "cache worker entry was not reached within the bounded input-resolution preparation phase: {error:?}; resolver_elapsed_ms={}; exact_test_override_probe_calls={{started:{},completed:{}}}",
+                                failure_resolver_started.elapsed().as_millis(),
+                                PR61_STORE_RESOLVER_TEST_PROBE_STARTED.load(Ordering::SeqCst)
+                                    - failure_probe_started_before,
+                                PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.load(Ordering::SeqCst)
+                                    - failure_probe_completed_before
+                            )
+                        }
+                    }
+                },
             };
+            let input_preparation_elapsed =
+                cache_worker_entered_at.duration_since(failure_resolver_started);
+            let test_probe_started_at = PR61_STORE_RESOLVER_TEST_PROBE_STARTED_AT
+                .lock()
+                .unwrap()
+                .expect("exact test probe start timestamp was recorded");
+            let test_probe_completed_at = PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED_AT
+                .lock()
+                .unwrap()
+                .expect("exact test probe completion timestamp was recorded");
+            assert!(test_probe_started_at <= test_probe_completed_at);
+            assert!(test_probe_completed_at <= cache_worker_entered_at);
+            eprintln!(
+                "pr61_cache_resolver_phase_timing={{\"pre_probe_ms\":{},\"probe_ms\":{},\"post_probe_to_worker_ms\":{},\"probe_program_bytes\":{:?}}}",
+                test_probe_started_at
+                    .duration_since(failure_resolver_started)
+                    .as_millis(),
+                test_probe_completed_at
+                    .duration_since(test_probe_started_at)
+                    .as_millis(),
+                cache_worker_entered_at
+                    .duration_since(test_probe_completed_at)
+                    .as_millis(),
+                std::fs::metadata(&cache_profile.executable)
+                    .ok()
+                    .map(|metadata| metadata.len())
+            );
+            eprintln!(
+                "pr61_cache_worker_panic_entry={{\"matched_exact_fingerprint\":true,\"input_preparation_ms\":{}}}",
+                input_preparation_elapsed.as_millis()
+            );
             assert_eq!(
                 PR61_STORE_RESOLVER_TEST_PROBE_STARTED.load(Ordering::SeqCst)
                     - failure_probe_started_before,
@@ -7007,9 +7127,49 @@ mod tests {
                 1,
                 "the cache failure resolver test probe completed before artifact verification"
             );
+            let worker_unwind_deadline = tokio::time::Instant::from_std(
+                cache_worker_entered_at + PR61_CACHE_WORKER_UNWIND_BOUND,
+            );
+            let resolution = match tokio::time::timeout_at(
+                worker_unwind_deadline,
+                &mut failure_resolution_task,
+            )
+            .await
+            {
+                Ok(joined) => joined
+                    .expect("cache failure resolver task did not panic")
+                    .unwrap(),
+                Err(error) => {
+                    failure_resolution_task.abort();
+                    panic!(
+                        "cache artifact-worker panic unwind exceeded five seconds from exact worker entry: {error:?}; input_preparation_ms={}; worker_unwind_ms={}; probe_calls={{started:{},completed:{}}}",
+                        input_preparation_elapsed.as_millis(),
+                        std::time::Instant::now()
+                            .duration_since(cache_worker_entered_at)
+                            .as_millis(),
+                        PR61_STORE_RESOLVER_TEST_PROBE_STARTED.load(Ordering::SeqCst)
+                            - failure_probe_started_before,
+                        PR61_STORE_RESOLVER_TEST_PROBE_COMPLETED.load(Ordering::SeqCst)
+                            - failure_probe_completed_before
+                    )
+                }
+            };
+            let worker_unwind_elapsed =
+                std::time::Instant::now().duration_since(cache_worker_entered_at);
+            let resolver_elapsed = failure_resolver_started.elapsed();
+            assert!(
+                worker_unwind_elapsed <= PR61_CACHE_WORKER_UNWIND_BOUND,
+                "panic unwind is bounded from cache-worker entry"
+            );
+            assert!(
+                resolver_elapsed < PR61_CACHE_OWNER_HOLD_BOUND,
+                "cold input resolution plus cache-worker unwind completes before the owned helper's 60-second lifetime"
+            );
             eprintln!(
-                "pr61_cache_failure_resolver_completed={{\"elapsed_ms\":{},\"cache_hit\":{}}}",
-                failure_resolver_started.elapsed().as_millis(),
+                "pr61_cache_failure_resolver_completed={{\"input_preparation_ms\":{},\"worker_unwind_ms\":{},\"resolver_elapsed_ms\":{},\"cache_hit\":{}}}",
+                input_preparation_elapsed.as_millis(),
+                worker_unwind_elapsed.as_millis(),
+                resolver_elapsed.as_millis(),
                 resolution.cache_hit.is_some()
             );
             assert!(resolution.result.is_ok());
@@ -7054,18 +7214,24 @@ mod tests {
                 "the unrelated live owner continues to hold its own resource"
             );
 
+            let owner_hold_elapsed = owner_family_started.elapsed();
+            assert!(
+                owner_hold_elapsed < PR61_CACHE_OWNER_HOLD_BOUND,
+                "the live helper family remains controlled and is released before its 60-second fixture lifetime"
+            );
             process_fixture.release_all();
             reap_probe_owners_to(custody, 0).await;
             assert!(process_fixture.process_departed(&helper_identity));
             assert!(process_fixture.process_departed(&target_identity));
             assert!(process_fixture.process_departed(&descendant_identity));
             eprintln!(
-                "cache_verify_worker_panic_custody={{\"helper_pid\":{},\"target_pid\":{},\"descendant_pid\":{},\"cache_resource\":\"{}\",\"owner_resource\":\"{}\",\"reservation_released\":true,\"owner_retained_until_exact_departure\":true}}",
+                "cache_verify_worker_panic_custody={{\"helper_pid\":{},\"target_pid\":{},\"descendant_pid\":{},\"cache_resource\":\"{}\",\"owner_resource\":\"{}\",\"owner_hold_elapsed_ms\":{},\"reservation_released\":true,\"owner_retained_until_exact_departure\":true}}",
                 process_fixture.helper_pid(),
                 target_identity["pid"],
                 descendant_identity["pid"],
                 cache_scope.resource,
-                owner_scope.resource
+                owner_scope.resource,
+                owner_hold_elapsed.as_millis()
             );
             drop(process_fixture);
         }
