@@ -1865,8 +1865,15 @@ impl InteractionJournal {
                 "callback state has inconsistent reply evidence",
             ));
         }
-        if record.request.schema_version == 1 {
+        let legacy_request = record.request.schema_version == 1;
+        if legacy_request {
             redact_legacy_request(&mut record.request)?;
+        }
+        let legacy_question_reply = record
+            .reply
+            .as_ref()
+            .is_some_and(|reply| is_legacy_question_reply(&record.request, reply));
+        if legacy_request || legacy_question_reply {
             if record.reply.take().is_some() {
                 // The legacy payload may contain raw SDK input or a Node-only
                 // question mapping. Keep its exact identity, but do not retain
@@ -2206,6 +2213,29 @@ fn redact_legacy_request(request: &mut InteractionRequest) -> Result<()> {
     request.schema_version = 2;
     request.input_sha256 = digest_json(&request.input)?;
     validate_request(request)
+}
+
+fn is_legacy_question_reply(request: &InteractionRequest, reply: &Value) -> bool {
+    if request.kind != InteractionKind::Question {
+        return false;
+    }
+    let Some(request_questions) = request.input.get("questions").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(reply_questions) = reply["updated_input"]["questions"].as_array() else {
+        return false;
+    };
+    let Some(answers) = reply["updated_input"]["answers"].as_object() else {
+        return false;
+    };
+    let answer_keys_match = answers.len() == request_questions.len()
+        && request_questions.iter().all(|question| {
+            question
+                .get("question")
+                .and_then(Value::as_str)
+                .is_some_and(|question| answers.contains_key(question))
+        });
+    reply_questions != request_questions || !answer_keys_match
 }
 
 fn valid_question_input(input: &Value) -> bool {
@@ -2599,6 +2629,172 @@ mod recovery_regression_tests {
             .expect_err("acknowledged legacy reply cannot become a fresh intent");
         assert_eq!(retry.code, "INTERACTION_NOT_PENDING");
         assert_eq!(fs::read_to_string(&path).unwrap(), persisted);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_two_partial_migration_scrubs_legacy_question_reply_only() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-schema-two-legacy-reply-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create schema-two legacy reply fixture directory");
+        let journal = InteractionJournal::open(&root, "fixture-binding", 1, "claude:fixture")
+            .expect("open callback journal");
+        let raw_question = "ghp_0123456789abcdef0123456789abcdef0123";
+        let raw_questions = json!([{
+            "question":raw_question,
+            "header":"Choice",
+            "options":[
+                {"label":"Keep","description":"Keep the current value"},
+                {"label":"Skip","description":"Leave it unchanged"}
+            ],
+            "multiSelect":false
+        }]);
+        let raw_input = json!({"questions":raw_questions});
+        let request_id = "partially-migrated-question-reply";
+        let request_sha256 = digest_json(&json!({
+            "schema_version":1,
+            "request_id":request_id,
+            "kind":"question",
+            "tool_name":"AskUserQuestion",
+            "input":raw_input
+        }))
+        .expect("digest original legacy request");
+        let mut request = InteractionRequest {
+            schema_version: 1,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_scope_key: "claude:fixture".to_owned(),
+            bridge_boot_id: "retired-legacy-boot".to_owned(),
+            native_root_id: "fixture-root".to_owned(),
+            request_id: request_id.to_owned(),
+            kind: InteractionKind::Question,
+            tool_name: "AskUserQuestion".to_owned(),
+            input: raw_input,
+            input_sha256: String::new(),
+            request_sha256: request_sha256.clone(),
+        };
+        redact_legacy_request(&mut request).expect("simulate the partial schema-two migration");
+        assert_eq!(request.schema_version, 2);
+        assert!(!request.input.to_string().contains(raw_question));
+
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            raw_question.to_owned(),
+            json!("legacy-private-answer-marker"),
+        );
+        let reply = json!({
+            "type":"question",
+            "updated_input":{
+                "questions":raw_questions,
+                "answers":Value::Object(answers)
+            }
+        });
+        let reply_sha256 = digest_json(&reply).expect("digest legacy question reply");
+        let reply_operation_id = "partially-migrated-reply-operation";
+        let path = journal
+            .path(request_id)
+            .expect("resolve partially migrated interaction path");
+        write_private_new(
+            &path,
+            &serde_json::to_vec(&InteractionRecord {
+                schema_version: 1,
+                request,
+                sequence: Some(1),
+                status: InteractionStatus::Acknowledged,
+                reply_operation_id: Some(reply_operation_id.to_owned()),
+                reply_sha256: Some(reply_sha256.clone()),
+                reply: Some(reply),
+            })
+            .expect("serialize partially migrated interaction"),
+        )
+        .expect("write partially migrated interaction");
+
+        let migrated = journal
+            .read_path(&path)
+            .expect("read and scrub partially migrated interaction");
+        assert_eq!(migrated.request.schema_version, 2);
+        assert_eq!(migrated.request.request_sha256, request_sha256);
+        assert!(!migrated.request.input.to_string().contains(raw_question));
+        assert!(migrated.reply.is_none());
+        assert_eq!(
+            migrated.reply_operation_id.as_deref(),
+            Some(reply_operation_id)
+        );
+        assert_eq!(
+            migrated.reply_sha256.as_deref(),
+            Some(reply_sha256.as_str())
+        );
+        assert_eq!(migrated.status, InteractionStatus::Acknowledged);
+        let persisted = fs::read_to_string(&path).expect("read scrubbed interaction");
+        assert!(!persisted.contains(raw_question));
+        assert!(!persisted.contains("legacy-private-answer-marker"));
+        assert!(persisted.contains(&request_sha256));
+        assert!(persisted.contains(&reply_sha256));
+        journal
+            .acknowledge_reply(request_id, reply_operation_id, &reply_sha256)
+            .expect("preserve exact historical acknowledgement");
+
+        let safe_questions = json!([{
+            "question":"Which option should remain?",
+            "header":"Choice",
+            "options":[
+                {"label":"Keep","description":"Keep the current value"},
+                {"label":"Skip","description":"Leave it unchanged"}
+            ],
+            "multiSelect":false
+        }]);
+        let safe_input = json!({"questions":safe_questions});
+        let live_request_id = "current-schema-two-question-reply";
+        let input_sha256 = digest_json(&safe_input).expect("digest current safe input");
+        let live_request_sha256 = digest_json(&json!({
+            "schema_version":2,
+            "request_id":live_request_id,
+            "kind":"question",
+            "tool_name":"AskUserQuestion",
+            "input":safe_input
+        }))
+        .expect("digest current request");
+        journal
+            .record_request(InteractionRequestEvidence {
+                schema_version: 2,
+                bridge_boot_id: "current-boot",
+                native_root_id: "fixture-root",
+                request_id: live_request_id,
+                kind: InteractionKind::Question,
+                tool_name: "AskUserQuestion",
+                input: &safe_input,
+                input_sha256: &input_sha256,
+                request_sha256: &live_request_sha256,
+            })
+            .expect("record current schema-two question");
+        let live_reply = json!({
+            "type":"question",
+            "updated_input":{
+                "questions":safe_questions,
+                "answers":{"Which option should remain?":"Keep"}
+            }
+        });
+        let live_reply_sha256 = digest_json(&live_reply).expect("digest current reply");
+        journal
+            .begin_reply(
+                live_request_id,
+                "current-schema-two-reply-operation",
+                &live_reply,
+                &live_reply_sha256,
+            )
+            .expect("persist current schema-two reply");
+        let live_path = journal
+            .path(live_request_id)
+            .expect("resolve current schema-two interaction path");
+        assert_eq!(
+            journal
+                .read_path(&live_path)
+                .expect("read current schema-two reply")
+                .reply,
+            Some(live_reply)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
