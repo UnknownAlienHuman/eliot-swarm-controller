@@ -3134,3 +3134,215 @@ async fn issue99_accepted_scope_path_symbol_interface_cross_task_uses_each_owner
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test]
+async fn unowned_blocking_consult_reaches_current_manager_attention_once() {
+    let (owner, directory, subject, _) =
+        start_integration_fixture("issue99-unowned-blocking-attention").await;
+    let unrelated_subject = seed_subject(
+        &owner.store,
+        "issue99-unowned-blocking-attention-unrelated",
+        "review-owner-v2",
+        crate::policy::OWNER_POLICY_V2_ID,
+        false,
+    )
+    .await;
+    let caller = register_integration_participant(
+        &owner,
+        &subject,
+        "issue99-unowned-blocking-attention-caller",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let retired = register_integration_participant(
+        &owner,
+        &unrelated_subject,
+        "issue99-unowned-blocking-attention-retired",
+        json!({"kind":"attempt_owner"}),
+    )
+    .await;
+    let manager = principal("review-owner-v2", Role::Manager);
+    let request = json!({
+        "client_request_id":"issue99-unowned-blocking-attention-consult",
+        "target":{"contract_key":"issue99-unowned-blocking-attention-selector"},
+        "field":"interfaces",
+        "question_kind":"contract_shape",
+        "question":"Who owns this exact integration contract?",
+        "why_needed":"The missing owner blocks this Task.",
+        "expected_answer":"one_fact",
+        "blocking":true,
+        "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+        "evidence_refs":[],
+    });
+    let first = owner
+        .store
+        .call(
+            caller.clone(),
+            "coordination.consult".into(),
+            request.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["status"], "unowned");
+    assert_eq!(first["manager_attention"]["created"], true);
+    assert_eq!(first["task_id"], subject.task_id);
+    assert_eq!(first["task_revision"], 1);
+    assert_eq!(first["attempt_id"], subject.attempt_id);
+
+    let report = owner
+        .store
+        .call(
+            manager.clone(),
+            "report.attention".into(),
+            json!({"after":0,"limit":200}),
+        )
+        .await
+        .unwrap();
+    let attention = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "unowned_blocking_consult")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(attention.len(), 1);
+    let item = &attention[0];
+    assert_eq!(
+        item["address"]["operation_id"],
+        first["manager_attention"]["operation_id"]
+    );
+    assert_eq!(item["address"]["requester_id"], caller.client_id);
+    assert_eq!(item["address"]["task_id"], subject.task_id);
+    assert_eq!(item["address"]["task_revision"], first["task_revision"]);
+    assert_eq!(item["address"]["attempt_id"], subject.attempt_id);
+    assert_eq!(
+        item["address"]["selector"],
+        json!({"contract_key":"issue99-unowned-blocking-attention-selector"})
+    );
+    assert_eq!(item["address"]["field"], "interfaces");
+
+    let retry = owner
+        .store
+        .call(caller.clone(), "coordination.consult".into(), request)
+        .await
+        .unwrap();
+    assert_eq!(
+        retry["manager_attention"]["operation_id"],
+        first["manager_attention"]["operation_id"]
+    );
+    let retry_report = owner
+        .store
+        .call(
+            manager.clone(),
+            "report.attention".into(),
+            json!({"after":0,"limit":200}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retry_report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["kind"] == "unowned_blocking_consult")
+            .count(),
+        1
+    );
+
+    let nonblocking = owner
+        .store
+        .call(
+            caller.clone(),
+            "coordination.consult".into(),
+            json!({
+                "client_request_id":"issue99-unowned-nonblocking-attention-consult",
+                "target":{"contract_key":"issue99-unowned-nonblocking-attention-nonblocking"},
+                "field":"interfaces",
+                "question_kind":"contract_shape",
+                "question":"Who owns this optional integration contract?",
+                "why_needed":"Record this nonblocking lookup.",
+                "expected_answer":"one_fact",
+                "blocking":false,
+                "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+                "evidence_refs":[],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nonblocking["status"], "unowned");
+    assert!(nonblocking["manager_attention"].is_null());
+
+    let unrelated_task_ids = vec![unrelated_subject.task_id.clone()];
+    let unrelated_scope_report = owner
+        .store
+        .run(move |db| {
+            super::super::capacity::attention_report_for_scope(db, 200, 0, &unrelated_task_ids)
+        })
+        .await
+        .unwrap();
+    assert!(
+        unrelated_scope_report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["kind"] != "unowned_blocking_consult")
+    );
+
+    owner
+        .store
+        .call(
+            manager.clone(),
+            "coordination.participant.disable".into(),
+            json!({
+                "client_request_id":"issue99-unowned-blocking-attention-disable",
+                "client_id":retired.client_id,
+                "expected_grant_revision":1,
+            }),
+        )
+        .await
+        .unwrap();
+    let retired_consult = owner
+        .store
+        .call(
+            retired,
+            "coordination.consult".into(),
+            json!({
+                "client_request_id":"issue99-retired-unowned-blocking-attention-consult",
+                "target":{"contract_key":"issue99-retired-unowned-blocking-attention-selector"},
+                "field":"interfaces",
+                "question_kind":"contract_shape",
+                "question":"Who owns this retired participant's selector?",
+                "why_needed":"This actor has been disabled.",
+                "expected_answer":"one_fact",
+                "blocking":true,
+                "reply_deadline_ms":model::now_ms().unwrap()+60_000,
+                "evidence_refs":[],
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(retired_consult.code, "UNAUTHORIZED");
+    let final_report = owner
+        .store
+        .call(
+            manager,
+            "report.attention".into(),
+            json!({"after":0,"limit":200}),
+        )
+        .await
+        .unwrap();
+    let final_items = final_report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "unowned_blocking_consult")
+        .collect::<Vec<_>>();
+    assert_eq!(final_items.len(), 1);
+    assert_eq!(
+        final_items[0]["address"]["operation_id"],
+        first["manager_attention"]["operation_id"]
+    );
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}

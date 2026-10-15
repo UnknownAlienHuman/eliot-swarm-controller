@@ -19,7 +19,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-const LIVE_ATTEMPT_STATES: &[&str] = &[
+pub(super) const LIVE_ATTEMPT_STATES: &[&str] = &[
     "reserved",
     "running",
     "submitted",
@@ -7214,16 +7214,15 @@ fn consult(
                 "field":request.field,
                 "delivery_created":false,
                 "coverage":"complete",
+                "task_id":sender.task["task_id"],
+                "task_revision":sender.task["revision"],
+                "attempt_id":sender.attempt["attempt_id"],
                 "manager_attention":if request.blocking {
-                    json!({"created":false,"gap":"blocking_unowned_attention_not_implemented"})
+                    json!({"created":true,"operation_id":operation_id,"read_method":"report.attention"})
                 } else {
                     Value::Null
                 },
-                "gaps":if request.blocking {
-                    json!([{"kind":"manager_attention_not_recorded"}])
-                } else {
-                    json!([])
-                },
+                "gaps":[],
             }),
         );
     }

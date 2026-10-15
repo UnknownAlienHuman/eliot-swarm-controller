@@ -4556,6 +4556,116 @@ fn attention_item(
     })
 }
 
+/// A settled coordination.consult Operation is the durable source for a
+/// blocking unowned result. Project it only while its exact Task revision and
+/// Attempt are current; the existing Task-scoped attention view then filters
+/// the item by address.task_id.
+fn append_unowned_blocking_consult_attention(
+    db: &Connection,
+    items: &mut Vec<Value>,
+) -> Result<()> {
+    let attempt_states = super::coordination::LIVE_ATTEMPT_STATES;
+    let state_placeholders = attempt_states
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT op.operation_id,op.caller_id,op.task_id,op.attempt_id,op.created_at_ms, \
+                op.original_request_json,op.result_json,attempt.task_revision \
+         FROM operations AS op \
+         JOIN tasks AS task ON task.task_id=op.task_id AND task.state='open' \
+         JOIN attempts AS attempt ON attempt.attempt_id=op.attempt_id \
+              AND attempt.task_id=op.task_id AND attempt.task_revision=task.revision \
+              AND attempt.released_at_ms IS NULL AND attempt.state IN ({state_placeholders}) \
+         WHERE op.method='coordination.consult' AND op.state='settled' \
+           AND json_extract(op.original_request_json,'$.blocking')=1 \
+           AND json_extract(op.result_json,'$.status')='unowned' \
+           AND json_extract(op.result_json,'$.owner_state')='unowned' \
+           AND json_extract(op.result_json,'$.coverage')='complete' \
+           AND json_extract(op.result_json,'$.delivery_created')=0 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM attempts AS other_attempt \
+               WHERE other_attempt.task_id=op.task_id \
+                 AND other_attempt.released_at_ms IS NULL \
+                 AND other_attempt.attempt_id<>op.attempt_id \
+           ) \
+         ORDER BY op.operation_id"
+    );
+    let mut stmt = db.prepare(&query)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(attempt_states.iter().copied()),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (
+        operation_id,
+        caller_id,
+        task_id,
+        attempt_id,
+        created_at_ms,
+        request_json,
+        result_json,
+        task_revision,
+    ) in rows
+    {
+        let request: Value = serde_json::from_str(&request_json)?;
+        let parsed = crate::coordination::parse_consult_request(&request)?;
+        if !parsed.blocking {
+            continue;
+        }
+        let result: Value = serde_json::from_str(&result_json)?;
+        if result["target"] != request["target"]
+            || result["field"] != request["field"]
+            || result
+                .get("task_id")
+                .is_some_and(|value| value != &json!(task_id))
+            || result
+                .get("task_revision")
+                .is_some_and(|value| value != &json!(task_revision))
+            || result
+                .get("attempt_id")
+                .is_some_and(|value| value != &json!(attempt_id))
+        {
+            continue;
+        }
+
+        let scope_key = format!("task:{task_id}:revision:{task_revision}:attempt:{attempt_id}");
+        items.push(attention_item(
+            "unowned_blocking_consult",
+            &scope_key,
+            None,
+            None,
+            json!({
+                "operation_id":operation_id,
+                "requester_id":caller_id,
+                "task_id":task_id,
+                "task_revision":task_revision,
+                "attempt_id":attempt_id,
+                "selector":request["target"],
+                "field":request["field"],
+            }),
+            attention_source("coordination_operation", Some(created_at_ms), false),
+            json!({"method":"operation.get","operation_id":operation_id}),
+            true,
+        ));
+    }
+    Ok(())
+}
 fn safe_health_code(value: &Value) -> Option<&str> {
     value.as_str().filter(|code| {
         !code.is_empty()
@@ -4705,6 +4815,7 @@ fn append_independent_module_attention(
 fn build_attention_items(db: &Connection, now: i64) -> Result<Vec<Value>> {
     let mut items: Vec<Value> = Vec::new();
     append_independent_module_attention(db, now, &mut items)?;
+    append_unowned_blocking_consult_attention(db, &mut items)?;
     let mut stmt = db.prepare(
         "SELECT binding_id,generation FROM bindings WHERE released_at_ms IS NULL ORDER BY binding_id,generation",
     )?;
