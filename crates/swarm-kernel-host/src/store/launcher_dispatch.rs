@@ -869,7 +869,8 @@ fn build_packet(
             .next()
             .ok_or_else(|| stale_capability("required Participant tool is not observed"))?;
         if found.next().is_some()
-            || model::canonical(&observed["input_schema"])? != model::canonical(schema)?
+            || model::canonical(&schema_for_javascript(&observed["input_schema"])?)?
+                != model::canonical(&schema_for_javascript(schema)?)?
         {
             return Err(stale_capability(
                 "observed Participant tool schema differs from the canonical contract",
@@ -1009,6 +1010,33 @@ fn validate_projected_hook_tools(tools: &[Value]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// OpenCode carries MCP schemas through JavaScript JSON. Compare that numeric
+// representation, including rounded i64 bounds, while keeping every key,
+// string, boolean and array unchanged. This applies only to schema metadata;
+// application argument validation and the captured evidence digests stay exact.
+fn schema_for_javascript(value: &Value) -> Result<Value> {
+    match value {
+        Value::Number(number) => number
+            .as_f64()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number)
+            .ok_or_else(|| {
+                stale_capability("MCP schema number is not representable in JavaScript")
+            }),
+        Value::Array(values) => values
+            .iter()
+            .map(schema_for_javascript)
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), schema_for_javascript(value)?)))
+            .collect::<Result<serde_json::Map<String, Value>>>()
+            .map(Value::Object),
+        _ => Ok(value.clone()),
+    }
 }
 
 fn validate_capability_proof(

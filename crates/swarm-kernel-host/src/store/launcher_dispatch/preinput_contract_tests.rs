@@ -359,6 +359,44 @@ fn packet_uses_verified_per_launch_service_instead_of_configured_base_name() {
 }
 
 #[test]
+fn packet_accepts_participant_schemas_after_javascript_json_roundtrip() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let fixture = packet_fixture();
+    let mut proof = fixture.proof;
+    let mut child = Command::new("node")
+        .args([
+            "-e",
+            "let s='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>process.stdout.write(JSON.stringify(JSON.parse(s))));",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the JavaScript schema transport");
+    child
+        .stdin
+        .take()
+        .expect("schema transport stdin")
+        .write_all(&serde_json::to_vec(&proof["native_discovered"]["tools"]).unwrap())
+        .expect("send canonical MCP schemas through JavaScript JSON");
+    let output = child.wait_with_output().expect("finish schema transport");
+    assert!(output.status.success());
+    proof["native_discovered"]["tools"] =
+        serde_json::from_slice(&output.stdout).expect("read transported native schemas");
+    refresh_synthetic_observation_digests(&mut proof);
+    build_packet(
+        &fixture.parent,
+        &fixture.attempt,
+        &fixture.binding,
+        &proof,
+        SERVICE_ID,
+    )
+    .expect("accept the same MCP contracts after JavaScript JSON transport");
+}
+
+#[test]
 fn packet_rejects_changed_core_tool_schema() {
     let fixture = packet_fixture();
     assert_current_parent_tuple(&fixture);
