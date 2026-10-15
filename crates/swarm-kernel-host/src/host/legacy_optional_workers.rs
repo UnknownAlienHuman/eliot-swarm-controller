@@ -327,6 +327,7 @@ async fn run_automation_scheduler_worker(
             "standalone scheduler executable is unavailable",
         ));
     }
+    let service_owner_token = store.scheduler_owner_token()?.to_owned();
     let config_path = store.automation_scheduler_worker_config_path();
     let (scope, launch_id, mut child) = begin_scheduler_worker_then_spawn(&store, move || {
         let mut command = Command::new(executable);
@@ -365,13 +366,14 @@ async fn run_automation_scheduler_worker(
         )
     });
     let identity = match launched.and_then(|identity| {
-        swarm_automation::service_owner_group_identity(&identity, store.scheduler_owner_token()?)
-            .map_err(|_| {
+        swarm_automation::service_owner_group_identity(&identity, &service_owner_token).map_err(
+            |_| {
                 Error::new(
                     "AUTOMATION_WORKER_IDENTITY_UNKNOWN",
                     "standalone scheduler group proof is invalid",
                 )
-            })
+            },
+        )
     }) {
         Ok(identity) => identity,
         Err(error) => {
@@ -418,10 +420,8 @@ async fn run_automation_scheduler_worker(
     // Readiness proves that this service has entered its exact Job. Keep that
     // Job observable across activation uncertainty, child exit and finish.
     #[cfg(windows)]
-    let _scheduler_hold = store
-        .scheduler_owner_token()
-        .ok()
-        .and_then(|token| swarm_automation::retain_service_owner_family(&identity, token).ok());
+    let _scheduler_hold =
+        retain_scheduler_family_or_stop(&mut child, &identity, &service_owner_token).await?;
     if let Err(error) = store
         .activate_automation_scheduler_worker(scope.clone(), launch_id.clone(), identity.clone())
         .await
@@ -508,6 +508,25 @@ pub(crate) async fn begin_scheduler_worker_then_spawn<T>(
 /// durable owner receipt. Try to stop and reap the direct child, then report
 /// cleanup attention so the optional-worker supervisor persists it in
 /// `host.status`; the `launching` receipt remains held for exact recovery.
+#[cfg(windows)]
+pub(crate) async fn retain_scheduler_family_or_stop(
+    child: &mut tokio::process::Child,
+    identity: &serde_json::Value,
+    service_owner_token: &str,
+) -> Result<swarm_process::Group> {
+    match swarm_automation::retain_service_owner_family(identity, service_owner_token) {
+        Ok(hold) => Ok(hold),
+        Err(error) => {
+            let proof_error = Error::new(
+                "AUTOMATION_SERVICE_OWNER_PROOF_UNAVAILABLE",
+                "scheduler Job observation could not be retained before activation",
+            )
+            .with_secondary_error(error.into());
+            Err(retain_unidentified_scheduler_owner(child, proof_error).await)
+        }
+    }
+}
+
 async fn retain_unidentified_scheduler_owner(
     child: &mut tokio::process::Child,
     identity_error: Error,

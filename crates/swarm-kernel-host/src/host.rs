@@ -16,6 +16,8 @@ mod legacy_optional_workers;
 pub(crate) use legacy_optional_workers::ShutdownCustody;
 #[cfg(test)]
 pub(crate) use legacy_optional_workers::begin_scheduler_worker_then_spawn;
+#[cfg(all(test, windows))]
+pub(crate) use legacy_optional_workers::retain_scheduler_family_or_stop;
 
 pub async fn run(config: Config) -> Result<()> {
     run_until(config, async {

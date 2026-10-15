@@ -1303,6 +1303,92 @@ async fn r48_owner_lost_store_results_hold_intent_and_process_capacity() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn r48_owner_query_retention_failure_stops_child_before_activation() {
+    let (owner, directory) = scheduler_store_fixture().await;
+    let store = &owner.store;
+    let ready_path = directory.join("r48-retention-refusal-ready");
+    let config_path = store.automation_scheduler_worker_config_path();
+    let (scope, launch_id, mut child) =
+        crate::host::begin_scheduler_worker_then_spawn(store, || {
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::automation_scheduler::fixture::scheduler_fixture_owner_child",
+                ])
+                .env("SWARM_SCHEDULER_FIXTURE_CONFIG", &config_path)
+                .env("SWARM_SCHEDULER_FIXTURE_READY", &ready_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !ready_path.exists() {
+            assert!(child.try_wait().unwrap().is_none());
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the actual scheduler fixture enters its service Job");
+    let launched = swarm_process::spawned_identity(child.id().unwrap()).unwrap();
+    let identity = swarm_automation::service_owner_group_identity(
+        &launched,
+        store.scheduler_owner_token().unwrap(),
+    )
+    .unwrap();
+    // This independent test observer lets final cleanup prove the real family
+    // empty; it is never passed to the production retention-failure path.
+    let observed = swarm_automation::retain_service_owner_family(
+        &identity,
+        store.scheduler_owner_token().unwrap(),
+    )
+    .unwrap();
+    let wrong_token = format!("{}{}", crate::model::new_id(), crate::model::new_id());
+    let error =
+        match crate::host::retain_scheduler_family_or_stop(&mut child, &identity, &wrong_token)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an unavailable exact Job must not permit activation"),
+        };
+    assert_eq!(error.code, "AUTOMATION_WORKER_CLEANUP_UNKNOWN");
+    assert!(
+        error
+            .secondary_codes
+            .iter()
+            .any(|code| code == "AUTOMATION_SERVICE_OWNER_PROOF_UNAVAILABLE")
+    );
+    assert!(child.try_wait().unwrap().is_some());
+    let retained = store
+        .run(|db| super::owner_record(db))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.phase, super::SchedulerOwnerPhase::Launching);
+    assert_eq!(retained.launch_id, launch_id);
+    let mut replayed = false;
+    let retry = crate::host::begin_scheduler_worker_then_spawn(store, || {
+        replayed = true;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(retry.code, "AUTOMATION_SERVICE_OWNER_UNKNOWN");
+    assert!(!replayed);
+    store
+        .abandon_exited_automation_scheduler_worker(scope, launch_id, identity)
+        .await
+        .unwrap();
+    drop(observed);
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn r48_owner_stale_callbacks_keep_old_receipt_out_of_current_host_status() {
     use super::super::{meta, set_meta};

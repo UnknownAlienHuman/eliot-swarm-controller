@@ -1113,7 +1113,8 @@ jobs:
               foreach ($case in @(
                 'terminal_receipt_fallback_requires_valid_proof_and_child_exit',
                 'probe_custody_reaps_nested_family_after_helper_exit',
-                'pending_git_owner_reaps_family_after_helper_exit'
+                'pending_git_owner_reaps_family_after_helper_exit',
+                'r48_owner_query_retention_failure_stops_child_before_activation'
               )) {
                 Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
               }
