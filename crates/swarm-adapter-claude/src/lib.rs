@@ -2726,10 +2726,17 @@ fn verify_command_scope(
 }
 
 fn validate_route(config: &AdapterConfig, command: &RuntimeCommand) -> Result<()> {
+    let native_options: NativeOptions =
+        serde_json::from_value(command.route["native_options"].clone()).map_err(|_| {
+            Error::new(
+                "ARTIFACT_MISMATCH",
+                "route options do not match the Claude adapter contract",
+            )
+        })?;
     if command.route["runtime"] != RUNTIME
         || command.route["module_artifact_id"] != ARTIFACT_ID
         || command.route["workspace_option"] != "workspaceRoot"
-        || command.route["native_options"] != serde_json::to_value(&config.native_options)?
+        || native_options != config.native_options
     {
         return Err(Error::new(
             "ARTIFACT_MISMATCH",
@@ -2737,6 +2744,82 @@ fn validate_route(config: &AdapterConfig, command: &RuntimeCommand) -> Result<()
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod route_option_semantics {
+    use super::*;
+
+    fn fixture() -> (AdapterConfig, RuntimeCommand) {
+        let root = std::env::temp_dir().join("claude-route-option-unit");
+        let options = NativeOptions {
+            workspace_root: root.join("workspace"),
+            sdk_runtime_root: root.join("sdk"),
+            node_executable: root.join("node.exe"),
+            native_executable: None,
+            claude_config_dir: root.join("claude"),
+            model_id: "sonnet".to_owned(),
+            permission_mode: None,
+            allow_dangerously_skip_permissions: false,
+        };
+        let command: RuntimeCommand = serde_json::from_value(json!({
+            "operation_id":"route-option-unit",
+            "method":"agent.open",
+            "created_at_ms":1,
+            "binding_id":"route-option-binding",
+            "generation":1,
+            "native_root_id":null,
+            "route":{
+                "runtime":RUNTIME,
+                "module_artifact_id":ARTIFACT_ID,
+                "workspace_option":"workspaceRoot",
+                "native_options":serde_json::to_value(&options).unwrap(),
+            },
+            "input":{},
+        }))
+        .unwrap();
+        let config = AdapterConfig {
+            host_data_dir: root.join("host"),
+            credential_file: root.join("credential.json"),
+            state_dir: root.join("state"),
+            sdk_harness_dir: root.join("harness"),
+            binding_id: "route-option-binding".to_owned(),
+            generation: 1,
+            native_options: options,
+            ipc: Default::default(),
+        };
+        (config, command)
+    }
+
+    #[test]
+    fn absent_and_null_optional_values_match_the_same_prepared_route() {
+        let (config, mut command) = fixture();
+        validate_route(&config, &command).expect("explicit null represents absent options");
+        let options = command.route["native_options"].as_object_mut().unwrap();
+        options.remove("permissionMode");
+        options.remove("nativeExecutable");
+        validate_route(&config, &command).expect("omitted options represent the same values");
+    }
+
+    #[test]
+    fn changed_permission_mode_still_rejects_the_route() {
+        let (config, mut command) = fixture();
+        command.route["native_options"]["permissionMode"] = json!("acceptEdits");
+        assert_eq!(
+            validate_route(&config, &command).unwrap_err().code,
+            "ARTIFACT_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn unknown_option_is_rejected_instead_of_discarded() {
+        let (config, mut command) = fixture();
+        command.route["native_options"]["unrecognizedOverride"] = json!(true);
+        assert_eq!(
+            validate_route(&config, &command).unwrap_err().code,
+            "ARTIFACT_MISMATCH"
+        );
+    }
 }
 
 fn verify_hello(
