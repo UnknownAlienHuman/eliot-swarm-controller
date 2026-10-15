@@ -151,7 +151,8 @@ function Get-AdditionalResourceSpecGroups([System.Collections.IDictionary] $Spec
 function Assert-ResourceManifest(
     [object] $Manifest,
     [System.Collections.IDictionary] $Spec,
-    [string] $Label
+    [string] $Label,
+    [switch] $AllowLegacyMissingAdditionalGroups
 ) {
     $expected = @(Get-ResourceSpecFiles $Spec)
     if ($expected.Count -eq 0) {
@@ -213,7 +214,19 @@ function Assert-ResourceManifest(
         }
     }
     $expectedGroups = @(Get-AdditionalResourceSpecGroups $Spec)
-    $actualGroups = @($resources.additional_groups)
+    # Strict-mode safe: a legacy build manifest has no 'additional_groups' key at all.
+    $actualGroups = @()
+    if ($resources.Contains('additional_groups')) {
+        $actualGroups = @($resources['additional_groups'] | Where-Object { $null -ne $_ })
+    }
+    if ($AllowLegacyMissingAdditionalGroups -and $actualGroups.Count -eq 0) {
+        # Inventory of an already installed package trusts its own build-manifest
+        # identity: a legacy host staged before the Antigravity group existed
+        # declares no additional groups and must not demand current group files.
+        # New packages never pass this switch, so their exact group requirement
+        # below stays mandatory.
+        return $resources
+    }
     if ($actualGroups.Count -ne $expectedGroups.Count) {
         throw "$Label has an incomplete additional resource group set."
     }
@@ -288,7 +301,11 @@ function Assert-InstalledResourceFiles(
     if ($null -eq $Resources) { return }
     $resourceRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot ([string]$Spec.resource_installed_relative_root)))
     Assert-InstalledResourceRows -ResourceRoot $resourceRoot -InstallRoot $InstallRoot -Rows @($Resources.files) -Label $Label
-    foreach ($group in @($Resources.additional_groups)) {
+    $installedGroups = @()
+    if ($Resources.Contains('additional_groups')) {
+        $installedGroups = @($Resources['additional_groups'] | Where-Object { $null -ne $_ })
+    }
+    foreach ($group in $installedGroups) {
         $additionalRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot ([string]$group.installed_relative_root)))
         Assert-InstalledResourceRows -ResourceRoot $additionalRoot -InstallRoot $InstallRoot -Rows @($group.files) -Label "$Label $($group.coordinate)"
     }
@@ -921,27 +938,21 @@ function Get-InstalledFrontend(
     $binaryPath = Join-Path $Root $binaryLeaf
     $buildPath = Join-Path $Root ([string]$Spec.binary + '.build-manifest.json')
     $receiptPath = Join-Path $Root ([string]$Spec.binary + '.install-receipt.json')
-    $resourcePaths = @(
-        foreach ($entry in @(Get-ResourceSpecFiles $Spec)) {
-            Join-Path (Join-Path $Root ([string]$Spec.resource_installed_relative_root)) ([string]$entry.path)
-        }
-        foreach ($group in @(Get-AdditionalResourceSpecGroups $Spec)) {
-            foreach ($entry in @($group.resource_files)) {
-                Join-Path (Join-Path $Root ([string]$group.installed_relative_root)) ([string]$entry.path)
-            }
-        }
-    )
-    $paths = @($binaryPath, $buildPath, $receiptPath) + $resourcePaths
-    $present = @($paths | Where-Object { Test-Path -LiteralPath $_ })
-    if ($present.Count -eq 0) { return $null }
-    if ($present.Count -ne $paths.Count) {
-        $missing = @($paths | Where-Object { -not (Test-Path -LiteralPath $_) })
+    # Identity sidecars decide whether the package is installed at all. Resource
+    # files are required by the installed build manifest's own identity (read
+    # below), so a legacy host without the current Antigravity group is not
+    # forced to carry current group files here.
+    $identityPaths = @($binaryPath, $buildPath, $receiptPath)
+    $identityPresent = @($identityPaths | Where-Object { Test-Path -LiteralPath $_ })
+    if ($identityPresent.Count -eq 0) { return $null }
+    if ($identityPresent.Count -ne $identityPaths.Count) {
+        $missing = @($identityPaths | Where-Object { -not (Test-Path -LiteralPath $_) })
         if ($Name -ceq 'swarm-gateway' -and $RequestedPackage -ceq 'eliot-swarm-controller') {
             throw "The existing swarm gateway sibling is not provenance-complete; missing $($missing -join ', '). Use a new empty install directory, install the matching swarm-gateway package there first, then install the root swarm-host package."
         }
         throw "Installed frontend '$Name' is incomplete; missing $($missing -join ', '). Use a new empty install directory or restore the exact package files before installing another frontend."
     }
-    foreach ($path in $paths) {
+    foreach ($path in $identityPaths) {
         Assert-NoReparseTraversal $path
         $item = Get-Item -LiteralPath $path -Force
         if ($item.PSIsContainer -or $item.Length -le 0) { throw "Installed frontend file is not a non-empty regular file: $path" }
@@ -990,7 +1001,34 @@ function Get-InstalledFrontend(
     Assert-SourceIdentity $manifest.source 'Installed build source' $isHostPackage
     Assert-DependencyPins $manifest "Installed frontend '$Name' build manifest"
     Assert-CompatibilityManifest $manifest $Name $Spec "Installed frontend '$Name' build manifest"
-    $resources = Assert-ResourceManifest $manifest $Spec "Installed frontend '$Name' build manifest"
+    $resources = Assert-ResourceManifest $manifest $Spec "Installed frontend '$Name' build manifest" -AllowLegacyMissingAdditionalGroups
+    if ($null -ne $resources) {
+        # Required resource files come from the installed build manifest's own
+        # identity: legacy hosts declare no additional groups, current hosts
+        # declare the exact Antigravity group validated above.
+        $installedResourcePaths = @(
+            foreach ($row in @($resources.files)) {
+                Join-Path (Join-Path $Root ([string]$Spec.resource_installed_relative_root)) ([string]$row.path)
+            }
+            $legacyGroups = @()
+            if ($resources.Contains('additional_groups')) {
+                $legacyGroups = @($resources['additional_groups'] | Where-Object { $null -ne $_ })
+            }
+            foreach ($group in $legacyGroups) {
+                foreach ($row in @($group.files)) {
+                    Join-Path (Join-Path $Root ([string]$group.installed_relative_root)) ([string]$row.path)
+                }
+            }
+        )
+        $installedResourcePresent = @($installedResourcePaths | Where-Object { Test-Path -LiteralPath $_ })
+        if ($installedResourcePresent.Count -ne $installedResourcePaths.Count) {
+            $missing = @($installedResourcePaths | Where-Object { -not (Test-Path -LiteralPath $_) })
+            if ($Name -ceq 'swarm-gateway' -and $RequestedPackage -ceq 'eliot-swarm-controller') {
+                throw "The existing swarm gateway sibling is not provenance-complete; missing $($missing -join ', '). Use a new empty install directory, install the matching swarm-gateway package there first, then install the root swarm-host package."
+            }
+            throw "Installed frontend '$Name' is incomplete; missing $($missing -join ', '). Use a new empty install directory or restore the exact package files before installing another frontend."
+        }
+    }
     Assert-ReceiptResourceContract $receipt $resources "Installed frontend '$Name'"
     Assert-InstalledResourceFiles $Root $Spec $resources "Installed frontend '$Name'"
     if ($null -ne $resources) {
