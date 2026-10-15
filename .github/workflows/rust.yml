@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery, focused-proof-gaps]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery, focused-proof-gaps, focused-retention-delivery]
 permissions:
   contents: read
 jobs:
@@ -935,6 +935,44 @@ jobs:
             )) {
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
             }
+          } elseif ($env:QUALIFICATION -ceq 'focused-retention-delivery') {
+            foreach ($case in @(
+              'probe_reservation_contention_keeps_one_shot_eligible_after_release',
+              'work_dispatch_public_root_limit_refuses_before_reserving_launch_or_effects',
+              'work_dispatch_public_disabled_route_refuses_before_reserving_launch_or_effects',
+              'owner_readback_requires_the_configured_model_catalog_mode'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            foreach ($case in @(
+              'cold_legacy_before_hello_is_bounded_and_append_resumes',
+              'startup_recovery_bounds_large_history_and_resumes_sparse_tail',
+              'steady_recovery_reads_only_the_sparse_tail',
+              'recovery_ticks_keep_an_inflight_module_next_available',
+              'run_owned_keeps_module_service_live_through_256_legacy_records_and_recovers_exact_memo_after_restart',
+              'retention_pass_resumes_cursor_after_reopen_and_keeps_unresolved_reconcile_target',
+              'retention_keeps_unknown_removal_across_empty_pass_and_reopen',
+              'opencode_root_checkpoint_is_durable_before_source_delete_crash_boundary',
+              'opencode_cursor_publication_failure_keeps_acknowledged_source_before_delete',
+              'opencode_journal_change_between_classification_and_delete_is_retained',
+              'opencode_cleanup_failure_preserves_store_ack_and_never_authorizes_replay',
+              'retention_v3_complete_cursor_migrates_to_versioned_sparse_startup_barrier'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            foreach ($case in @(
+              'claude_current_boot_dispatch_compacts_before_delete_and_reads_anchor_directly',
+              'legacy_migration_is_bounded_resumable_and_append_safe',
+              'recovery_windows_advance_while_one_module_next_stays_pending'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-adapter-claude' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            $removalCase = if ($IsWindows) {
+              'acknowledged_removal_reports_unknown_after_windows_namespace_delete'
+            } else {
+              'acknowledged_removal_reports_parent_barrier_failure_and_is_idempotent'
+            }
+            Invoke-FocusedCohort -Package 'swarm-process' -Filter $removalCase -Expected 1 -ExpectedNames @($removalCase)
           } elseif ($env:QUALIFICATION -ceq 'focused-workspace-git') {
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace' -Expected 1 -ExpectedNames @('work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace')
             if ($IsWindows) {
