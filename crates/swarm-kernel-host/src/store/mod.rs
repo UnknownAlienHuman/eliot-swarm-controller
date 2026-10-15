@@ -5267,7 +5267,7 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                         registration["participation_basis"]["kind"].as_str(),
                         Some("attempt_owner" | "producer_ref")
                     ) {
-                        allowed.extend(["task.submit", "artifact.read"]);
+                        allowed.extend(["source.capture", "task.submit", "artifact.read"]);
                     } else if registration["participation_basis"]["kind"] == "sponsored_reviewer" {
                         allowed.extend([
                             "review.submit",

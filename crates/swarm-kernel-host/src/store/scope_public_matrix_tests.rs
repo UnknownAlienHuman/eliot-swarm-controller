@@ -2224,6 +2224,15 @@ mod connected_store {
         let first = setup.first.clone();
         let second = setup.second.clone();
         let participant = setup.participant.clone();
+        let discovery = call(store, &participant, "mcp.authorization", json!({})).await;
+        assert!(
+            discovery["allowed_methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method == "source.capture"),
+            "current writer discovery must include its guarded source capture"
+        );
         let foreign_page = setup.foreign_page.clone();
         for page in [&first, &second] {
             for principal in [&f.operator, &f.manager_a] {
@@ -3476,6 +3485,15 @@ mod connected_store {
         .await;
         assert_eq!(result["verdict"], "pass");
 
+        let discovery = call(store, &reviewer, "mcp.authorization", json!({})).await;
+        assert!(
+            !discovery["allowed_methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method == "source.capture"),
+            "reviewer discovery must not acquire writer source capture"
+        );
         let view = call(
             store,
             &reviewer,
