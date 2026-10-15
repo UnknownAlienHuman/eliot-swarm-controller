@@ -1979,6 +1979,10 @@ where
         files,
         family_identity: None,
         family_token: None,
+        #[cfg(windows)]
+        family_query: None,
+        #[cfg(windows)]
+        response_group_empty: None,
         exit_status: None,
         status_observation_failed: false,
         capture_setup_failed: false,
@@ -2087,6 +2091,10 @@ struct GitHelperCustody {
     files: GitProbeFiles,
     family_identity: Option<Value>,
     family_token: Option<String>,
+    #[cfg(windows)]
+    family_query: Option<platform::process_group::Group>,
+    #[cfg(windows)]
+    response_group_empty: Option<bool>,
     exit_status: Option<ExitStatus>,
     status_observation_failed: bool,
     capture_setup_failed: bool,
@@ -2142,6 +2150,16 @@ impl GitHelperCustody {
             }
         }
         self.load_family_identity();
+        #[cfg(windows)]
+        self.retain_family_query();
+        #[cfg(windows)]
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(CaptureStream::is_finished)
+        {
+            self.load_response_group_state();
+        }
         if self.exit_status.is_none() || !self.family_departed_once() {
             return;
         }
@@ -2212,11 +2230,46 @@ impl GitHelperCustody {
         {
             return;
         }
+        #[cfg(windows)]
+        if self.launch_identity.as_ref().is_some_and(|launch| {
+            launch["creation_filetime"].as_u64().is_none()
+                || launch["creation_filetime"] != identity["creation_filetime"]
+        }) {
+            return;
+        }
         let Ok(token) = check_probe_group_token(&identity) else {
             return;
         };
         self.family_identity = Some(identity);
         self.family_token = Some(token);
+    }
+
+    #[cfg(windows)]
+    fn retain_family_query(&mut self) {
+        if self.family_query.is_none()
+            && let (Some(identity), Some(token)) =
+                (self.family_identity.as_ref(), self.family_token.as_deref())
+        {
+            self.family_query =
+                platform::process_group::Group::open_check_query(identity, token).ok();
+        }
+    }
+
+    #[cfg(windows)]
+    fn load_response_group_state(&mut self) {
+        if self.response_group_empty.is_some()
+            || self.capture.as_ref().is_none_or(|capture| {
+                !capture.is_finished() || capture.truncated() || capture.reader_failed()
+            })
+        {
+            return;
+        }
+        let Ok(bytes) = read_bounded(&self.files.response_path()) else {
+            return;
+        };
+        self.response_group_empty = decode_git_probe_response(&bytes)
+            .ok()
+            .map(|response| response.group_empty);
     }
 
     fn family_departed_once(&self) -> bool {
@@ -2236,6 +2289,18 @@ impl GitHelperCustody {
             // therefore proves that no nested family was launched.
             return true;
         };
+        #[cfg(windows)]
+        if self.exit_status.is_some() {
+            if let Some(query) = self.family_query.as_ref() {
+                return query.family_empty().is_ok_and(|empty| empty);
+            }
+            // A fast helper may disarm its named Job before the first parent
+            // poll. Its complete bounded response is carried by this exact
+            // Child pipe; only a positive group-empty frame proves departure.
+            if self.response_group_empty == Some(true) {
+                return true;
+            }
+        }
         let owner_departed =
             platform::process_group::departed_empty(identity, token).is_ok_and(|departed| departed);
         let launch_departed = match self.launch_identity.as_ref() {
@@ -4003,6 +4068,20 @@ mod tests {
             .family_token
             .as_deref()
             .expect("retain the helper's exact family token");
+        #[cfg(windows)]
+        {
+            let family_query = owner
+                .custody
+                .family_query
+                .as_ref()
+                .expect("retain the helper's exact query-only Job handle");
+            assert!(
+                !family_query
+                    .family_empty()
+                    .expect("query the still-live helper family"),
+                "the retained Job handle observes the live descendant"
+            );
+        }
         assert!(
             !platform::process_group::departed_empty(family_identity, family_token)
                 .expect("observe the still-live family")
@@ -4022,6 +4101,17 @@ mod tests {
             "exact family departure releases custody"
         );
         assert!(owner.custody.family_departed_proven);
+        #[cfg(windows)]
+        assert!(
+            owner
+                .custody
+                .family_query
+                .as_ref()
+                .expect("retain helper Job query through cleanup")
+                .family_empty()
+                .expect("query departed helper family"),
+            "the retained Job query reports zero members after departure"
+        );
         assert!(!process_identity_is_current(&descendant_identity));
         let evidence_dir = owner.custody.files.directory.clone();
         let outcome = owner
