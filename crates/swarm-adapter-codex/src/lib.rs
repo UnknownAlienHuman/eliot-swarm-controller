@@ -6026,8 +6026,8 @@ fn recover_intent_only_shutdown(
         .operations
         .iter()
         .filter(|(_, record)| record.method == "agent.shutdown" && record.kind == "shutdown" && record.outcome.is_none())
-        .filter_map(|(operation_id, record)| record.input_sha256.as_deref().filter(|digest| valid_sha256(digest)).map(|digest| (operation_id.clone(), digest.to_owned())))
-        .collect();
+        .map(|(operation_id, record)| record.input_sha256.as_deref().filter(|digest| valid_sha256(digest)).map(|digest| (operation_id.clone(), digest.to_owned())).ok_or(AdapterError::Checkpoint))
+        .collect::<Result<Vec<_>, _>>()?;
     if pending.is_empty() {
         return Ok(());
     }
@@ -7470,6 +7470,37 @@ mod agent_shutdown_loopback_tests {
         let rest = stable.state.operations.get("shutdown-crash-1").expect("record").outcome.clone().expect("outcome stable");
         let rest: RuntimeOutcome = serde_json::from_value(rest).expect("stable outcome decodes");
         assert!(matches!(rest.outcome, EffectOutcome::Unknown));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+    #[test]
+    fn corrupt_selected_intent_fails_closed_without_mutation() {
+        let (directory, mut journal) = fixture_journal("codex-shutdown-corrupt-intent");
+        journal.bind("test-binding", 1).expect("bind fixture binding");
+        let claim = full_claim();
+        let mut missing = OperationRecord::intent("agent.shutdown", "shutdown");
+        missing.native_scope_key = Some("corrupt-scope".to_owned());
+        journal.state.operations.insert("shutdown-corrupt-missing".to_owned(), missing);
+        let mut bad = OperationRecord::intent("agent.shutdown", "shutdown");
+        bad.input_sha256 = Some("z".repeat(64));
+        bad.native_scope_key = Some("corrupt-scope".to_owned());
+        journal.state.operations.insert("shutdown-corrupt-bad".to_owned(), bad);
+        journal.save().expect("persist corrupt intents");
+        drop(journal);
+        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned()).expect("reopen after crash");
+        assert!(reopened.state.operations.get("shutdown-corrupt-missing").expect("intent survived").outcome.is_none());
+        assert!(reopened.state.operations.get("shutdown-corrupt-bad").expect("intent survived").outcome.is_none());
+        assert!(!reopened.state.native_retired);
+        assert!(shutdown_intent_without_outcome(&reopened.state));
+        let error = recover_intent_only_shutdown(&mut reopened, &claim).expect_err("corrupt intent must fail closed");
+        assert!(matches!(error, AdapterError::Checkpoint));
+        assert!(reopened.state.operations.get("shutdown-corrupt-missing").expect("record").outcome.is_none());
+        assert!(reopened.state.operations.get("shutdown-corrupt-bad").expect("record").outcome.is_none());
+        assert!(!reopened.state.native_retired);
+        drop(reopened);
+        let stable = Journal::open(directory.clone(), "boot-shutdown-stable".to_owned()).expect("stable reopen");
+        assert!(stable.state.operations.get("shutdown-corrupt-missing").expect("record").outcome.is_none());
+        assert!(stable.state.operations.get("shutdown-corrupt-bad").expect("record").outcome.is_none());
+        assert!(!stable.state.native_retired);
         std::fs::remove_dir_all(&directory).ok();
     }
 }
