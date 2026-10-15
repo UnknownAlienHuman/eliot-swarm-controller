@@ -16,6 +16,7 @@ pub mod test_support {
 
     std::thread_local! {
         static ACTIVE_BARRIER: RefCell<Option<BarrierHook>> = const { RefCell::new(None) };
+        static ACTIVE_PREPUBLICATION_FAULT: RefCell<Option<BarrierHook>> = const { RefCell::new(None) };
     }
 
     /// Installs a barrier override on this thread until the returned fixture
@@ -26,11 +27,26 @@ pub mod test_support {
         previous: Option<BarrierHook>,
     }
 
+    /// Test-only fault at the shared exact-file boundary after the private
+    /// temporary is synced but before its final name is published.
+    #[must_use]
+    pub struct ScopedPrepublicationFault {
+        previous: Option<BarrierHook>,
+    }
+
     pub fn scoped_durability_barrier(
         hook: impl Fn(&Path) -> Result<()> + 'static,
     ) -> ScopedDurabilityBarrier {
         let previous = ACTIVE_BARRIER.with(|active| active.borrow_mut().replace(Rc::new(hook)));
         ScopedDurabilityBarrier { previous }
+    }
+
+    pub fn scoped_prepublication_fault(
+        hook: impl Fn(&Path) -> Result<()> + 'static,
+    ) -> ScopedPrepublicationFault {
+        let previous =
+            ACTIVE_PREPUBLICATION_FAULT.with(|active| active.borrow_mut().replace(Rc::new(hook)));
+        ScopedPrepublicationFault { previous }
     }
 
     impl Drop for ScopedDurabilityBarrier {
@@ -40,8 +56,20 @@ pub mod test_support {
         }
     }
 
+    impl Drop for ScopedPrepublicationFault {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            ACTIVE_PREPUBLICATION_FAULT.with(|active| *active.borrow_mut() = previous);
+        }
+    }
+
     pub(super) fn invoke(path: &Path) -> Option<Result<()>> {
         let hook = ACTIVE_BARRIER.with(|active| active.borrow().clone());
+        hook.map(|hook| hook(path))
+    }
+
+    pub(super) fn prepublication_fault(path: &Path) -> Option<Result<()>> {
+        let hook = ACTIVE_PREPUBLICATION_FAULT.with(|active| active.borrow().clone());
         hook.map(|hook| hook(path))
     }
 }
@@ -159,6 +187,10 @@ fn write_private_new_with_barrier(
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
+        #[cfg(feature = "test-support")]
+        if let Some(result) = test_support::prepublication_fault(&target) {
+            result?;
+        }
         publish_new(&temp, &target)?;
         barrier(&target)
     })();

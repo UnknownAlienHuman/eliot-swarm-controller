@@ -395,24 +395,92 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
     let retained_worker =
         fs::read(run_dir.join("worker.json")).expect("read actual Worker ABI receipt");
 
-    let barrier_path = decision_path.clone();
-    let allow_work = work.clone();
-    let failed_publication = owner
+    let prepublication_path = decision_path.clone();
+    let allow_with_prepublication_fault = work.clone();
+    let prepublication_error = owner
         .store
         .file_io(move |_| {
-            let _barrier = swarm_process::test_support::scoped_durability_barrier(move |path| {
-                if path == barrier_path {
+            let _fault = swarm_process::test_support::scoped_prepublication_fault(move |path| {
+                if path == prepublication_path {
                     Err(swarm_contracts::error::Error::new(
-                        "PRIVATE_FILE_DURABILITY_UNKNOWN",
-                        "injected Store start-decision persistence failure",
+                        "FIXTURE_PREPUBLICATION_FAILURE",
+                        "injected failure after temp sync and before decision publication",
                     ))
                 } else {
-                    swarm_process::sync_parent_directory(path)
+                    Ok(())
                 }
             });
-            crate::scripts::runner::allow(&allow_work)
+            crate::scripts::runner::allow(&allow_with_prepublication_fault)
         })
         .await
+        .expect_err("pre-publication fault leaves the decision pending");
+    assert_eq!(prepublication_error.code, "FIXTURE_PREPUBLICATION_FAILURE");
+    assert!(
+        !decision_path.exists(),
+        "pre-publication failure leaves no decision"
+    );
+    assert_eq!(
+        crate::scripts::runner::start_decision(&work).unwrap(),
+        swarm_script_worker::StartDecisionRead::Pending
+    );
+    assert!(!run_dir.join("execution-plan.json").exists());
+    assert!(!run_dir.join("execution-plan-ready.json").exists());
+    assert!(!run_dir.join("started.json").exists());
+    assert!(!marker_path.exists());
+    assert_eq!(
+        fs::read(run_dir.join("worker.json")).unwrap(),
+        retained_worker
+    );
+    assert_eq!(
+        custody
+            .exit_observed(&work.run_id, &work.operation_id)
+            .unwrap(),
+        Some(false),
+        "the real source worker stays held across a pre-publication path failure"
+    );
+
+    let barrier_path = decision_path.clone();
+    let allow_work = work.clone();
+    let store = owner.store.clone();
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let failed_publication = tokio::spawn(async move {
+        store
+            .file_io(move |_| {
+                let _barrier =
+                    swarm_process::test_support::scoped_durability_barrier(move |path| {
+                        if path == barrier_path {
+                            published_tx
+                                .send(())
+                                .expect("signal the competing Deny after Allow is visible");
+                            resume_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("resume the uncertain Allow after the competing Deny");
+                            Err(swarm_contracts::error::Error::new(
+                                "PRIVATE_FILE_DURABILITY_UNKNOWN",
+                                "injected Store start-decision persistence failure",
+                            ))
+                        } else {
+                            swarm_process::sync_parent_directory(path)
+                        }
+                    });
+                crate::scripts::runner::allow(&allow_work)
+            })
+            .await
+    });
+    tokio::task::spawn_blocking(move || published_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .expect("wait for the published Store Allow without blocking the test runtime")
+        .expect("the Store Allow publishes bytes before its durability barrier");
+    let competing_deny = crate::scripts::runner::deny(&work, "DENIED")
+        .expect_err("the concurrent Deny cannot replace retained Allow");
+    assert_eq!(competing_deny.code, "CONFLICT");
+    resume_tx
+        .send(())
+        .expect("release the publisher after the opposite intent conflicts");
+    let failed_publication = failed_publication
+        .await
+        .expect("the Store publication task completes")
         .expect_err("unconfirmed Store Allow remains unknown");
     assert_eq!(failed_publication.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
     let visible_bytes = fs::read(&decision_path).expect("published decision bytes remain visible");
@@ -452,14 +520,28 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
         .expect("Store retries the same retained child identity");
     assert_eq!(replay_launch, launch, "retry never creates a second worker");
 
-    for _ in 0..2 {
-        let retry_work = work.clone();
-        owner
-            .store
-            .file_io(move |_| crate::scripts::runner::allow(&retry_work))
-            .await
-            .expect("durable current Allow materializes the existing plan");
-    }
+    let allow_work = work.clone();
+    let deny_work = work.clone();
+    let allow_retry = owner
+        .store
+        .file_io(move |_| crate::scripts::runner::allow(&allow_work));
+    let deny_retry = owner
+        .store
+        .file_io(move |_| crate::scripts::runner::deny(&deny_work, "DENIED"));
+    let (allow_retry, deny_retry) = tokio::join!(allow_retry, deny_retry);
+    allow_retry.expect("durable Allow winner materializes the existing plan");
+    assert_eq!(
+        deny_retry
+            .expect_err("the concurrent Store Deny conflicts with retained Allow")
+            .code,
+        "CONFLICT"
+    );
+    let replay_work = work.clone();
+    owner
+        .store
+        .file_io(move |_| crate::scripts::runner::allow(&replay_work))
+        .await
+        .expect("same-intent Store retry retains Allow without a second execution");
     let completion_path = run_dir.join("completion.json");
     let start_deadline = Instant::now() + Duration::from_secs(10);
     while !marker_path.is_file() {
@@ -549,6 +631,140 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
         }
     }
     cleanup.disarm();
+
+    // The same pinned source worker must honor a retained Deny as well. The
+    // competing Allow publisher is already live, then released after Deny has
+    // won so this second race phase is deterministic without hand-written
+    // decision bytes.
+    let mut denied_work = work.clone();
+    denied_work.run_id = uuid::Uuid::new_v4().to_string();
+    denied_work.operation_id = uuid::Uuid::new_v4().to_string();
+    denied_work.token = uuid::Uuid::new_v4().to_string();
+    denied_work.invocation.run_id = denied_work.run_id.clone();
+    denied_work.invocation.operation_id = denied_work.operation_id.clone();
+    let (denied_receipt, denied_work_digest) = crate::scripts::runner::write_work(&denied_work)
+        .expect("write the second immutable Work receipt for the Deny winner");
+    assert!(denied_receipt.is_file());
+    let denied_run_dir = crate::scripts::runner::directory(&data_dir, &denied_work.run_id).unwrap();
+    let mut denied_cleanup = SourceWorkerCleanup {
+        custody: custody.clone(),
+        work: denied_work.clone(),
+        data_dir: data_dir.clone(),
+        run_dir: denied_run_dir.clone(),
+        terminal_settlement_confirmed: false,
+        armed: true,
+    };
+    let spawn_denied_work = denied_work.clone();
+    let spawn_denied_digest = denied_work_digest.clone();
+    let spawn_denied_custody = custody.clone();
+    let denied_launch = owner
+        .store
+        .file_io(move |_| {
+            spawn_denied_custody.prepare_and_spawn(&spawn_denied_work, &spawn_denied_digest)
+        })
+        .await
+        .expect("Store file-I/O owner spawns the same pinned worker for the Deny phase");
+    let denied_ready_deadline = Instant::now() + Duration::from_secs(10);
+    let denied_ready = loop {
+        if let Some(ready) = crate::scripts::runner::ready(&denied_work).unwrap() {
+            break ready;
+        }
+        assert!(
+            Instant::now() < denied_ready_deadline,
+            "source worker becomes ready for the Deny phase"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(denied_ready["run_id"], denied_work.run_id);
+    assert_eq!(denied_ready["operation_id"], denied_work.operation_id);
+    assert_eq!(denied_ready["token"], denied_work.token);
+    assert_eq!(denied_ready["control_version"], 1);
+    assert_eq!(
+        denied_launch["process"]["pid"],
+        denied_ready["process"]["pid"]
+    );
+
+    let (allow_waiting_tx, allow_waiting_rx) = std::sync::mpsc::channel();
+    let (release_allow_tx, release_allow_rx) = std::sync::mpsc::channel();
+    let late_allow_work = denied_work.clone();
+    let late_allow = thread::spawn(move || {
+        allow_waiting_tx
+            .send(())
+            .expect("report the live competing Allow publisher");
+        release_allow_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("release the Allow publisher after Deny wins");
+        crate::scripts::runner::allow(&late_allow_work)
+    });
+    allow_waiting_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the opposite intent is ready to publish");
+    let deny_work_for_store = denied_work.clone();
+    owner
+        .store
+        .file_io(move |_| crate::scripts::runner::deny(&deny_work_for_store, "DENIED"))
+        .await
+        .expect("the real Store file-I/O publisher retains Deny first");
+    release_allow_tx
+        .send(())
+        .expect("release the losing Allow publisher");
+    assert_eq!(
+        late_allow
+            .join()
+            .expect("the competing Allow publisher exits")
+            .expect_err("Allow cannot replace the retained Deny")
+            .code,
+        "CONFLICT"
+    );
+
+    let denied_completion_path = denied_run_dir.join("completion.json");
+    let denied_finish_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if custody
+            .exit_observed(&denied_work.run_id, &denied_work.operation_id)
+            .unwrap()
+            == Some(true)
+            && denied_completion_path.is_file()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < denied_finish_deadline,
+            "the real source worker finishes without passing the Deny gate"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let denied_completion: Value =
+        serde_json::from_slice(&fs::read(&denied_completion_path).unwrap()).unwrap();
+    assert_eq!(denied_completion["run_id"], denied_work.run_id);
+    assert_eq!(denied_completion["operation_id"], denied_work.operation_id);
+    assert_eq!(denied_completion["token"], denied_work.token);
+    assert_eq!(denied_completion["state"], "failed");
+    assert_eq!(denied_completion["error_code"], "DENIED");
+    assert!(!denied_run_dir.join("execution-plan.json").exists());
+    assert!(!denied_run_dir.join("execution-plan-ready.json").exists());
+    assert!(!denied_run_dir.join("started.json").exists());
+    assert_eq!(
+        fs::read_to_string(&marker_path)
+            .expect("read the unchanged interpreter marker")
+            .lines()
+            .collect::<Vec<_>>(),
+        ["started"],
+        "the Deny-winning real worker never starts the interpreter"
+    );
+    assert!(
+        custody
+            .release_after_terminal(&denied_work.run_id, &denied_work.operation_id)
+            .expect("release the denied worker after its direct child exits")
+    );
+    denied_cleanup.disarm();
+    assert_eq!(
+        custody
+            .exit_observed(&denied_work.run_id, &denied_work.operation_id)
+            .unwrap(),
+        None
+    );
+
     owner
         .close()
         .await
@@ -560,6 +776,7 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
 #[test]
 fn reconcile_scripts_retains_operation_and_source_worker_across_allow_durability_unknown() {
     use crate::{
+        artifacts::ArtifactFiles,
         config::Config,
         model::{self, Credential},
         platform::{DataRoot, bootstrap_credential},
@@ -609,6 +826,51 @@ fn reconcile_scripts_retains_operation_and_source_worker_across_allow_durability
             })
             .await
             .expect("reselect the single pending subject for this focused pass");
+    }
+
+    fn copy_completion_fixture(
+        source_data_dir: &std::path::Path,
+        source_run_dir: &std::path::Path,
+        work: &crate::scripts::runner::Work,
+        completion: &Value,
+        label: &str,
+    ) -> (PathBuf, crate::scripts::runner::Work, ArtifactFiles) {
+        let copied_data_dir = std::env::temp_dir().join(format!(
+            "script-completion-wire-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&copied_data_dir).expect("create completion copy root");
+        let copied_data_dir =
+            fs::canonicalize(&copied_data_dir).expect("canonicalize completion copy root");
+        let copied_run_dir = copied_data_dir.join(
+            source_run_dir
+                .strip_prefix(source_data_dir)
+                .expect("ScriptRun belongs to the fixture data root"),
+        );
+        fs::create_dir_all(&copied_run_dir).expect("create isolated completion wire fixture");
+        for file_name in ["worker.json", "completion.json"] {
+            fs::copy(
+                source_run_dir.join(file_name),
+                copied_run_dir.join(file_name),
+            )
+            .expect("copy actual source-worker protocol receipt");
+        }
+        for artifact_name in ["result", "stdout", "stderr"] {
+            let relative = completion[artifact_name]["relative_path"]
+                .as_str()
+                .expect("completion retains an artifact path");
+            assert!(!std::path::Path::new(relative).is_absolute());
+            let source = source_data_dir.join(relative);
+            let destination = copied_data_dir.join(relative);
+            fs::create_dir_all(destination.parent().expect("artifact has a parent"))
+                .expect("create copied artifact directory");
+            fs::copy(source, destination).expect("copy actual content-addressed artifact");
+        }
+        let mut copied_work = work.clone();
+        copied_work.data_dir = copied_data_dir.clone();
+        let files = ArtifactFiles::new(&copied_data_dir)
+            .expect("open isolated ArtifactFiles over copied actual receipts");
+        (copied_data_dir, copied_work, files)
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1035,6 +1297,104 @@ $result = [ordered]@{
                 None => panic!("Store released the source worker before terminal settlement"),
             }
         }
+
+        let source_artifacts = ArtifactFiles::new(&data_dir).unwrap();
+        assert!(
+            crate::scripts::runner::completion(&work, &source_artifacts)
+                .unwrap()
+                .is_some(),
+            "the exact completed-null source-worker receipt is valid"
+        );
+
+        let (missing_value_dir, missing_value_work, missing_value_files) =
+            copy_completion_fixture(&data_dir, &run_dir, &work, &completion, "missing-value");
+        let _missing_value_cleanup = FixtureDirectory(missing_value_dir.clone());
+        let missing_value_completion = crate::scripts::runner::directory(
+            &missing_value_dir,
+            &run_id,
+        )
+        .unwrap()
+        .join("completion.json");
+        let mut missing_value_receipt: Value =
+            serde_json::from_slice(&fs::read(&missing_value_completion).unwrap()).unwrap();
+        assert!(
+            missing_value_receipt
+                .as_object_mut()
+                .unwrap()
+                .remove("result_value")
+                .is_some(),
+            "the positive receipt carries an explicit result_value key"
+        );
+        fs::write(
+            &missing_value_completion,
+            serde_json::to_vec(&missing_value_receipt).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::scripts::runner::completion(&missing_value_work, &missing_value_files)
+                .unwrap_err()
+                .code,
+            "CONFLICT",
+            "a missing completed result_value is rejected even for Null schema"
+        );
+
+        let (nonnull_schema_dir, nonnull_schema_work, nonnull_schema_files) =
+            copy_completion_fixture(&data_dir, &run_dir, &work, &completion, "nonnull-schema");
+        let _nonnull_schema_cleanup = FixtureDirectory(nonnull_schema_dir);
+        let mut nonnull_schema_work = nonnull_schema_work;
+        nonnull_schema_work.bundle.result_schema =
+            crate::scripts::manifest::ScriptValueSchema::String { max_bytes: 64 };
+        assert_eq!(
+            crate::scripts::runner::completion(&nonnull_schema_work, &nonnull_schema_files)
+                .unwrap_err()
+                .code,
+            "CONFLICT",
+            "explicit null is invalid under a non-null immutable result schema"
+        );
+
+        let (missing_member_dir, missing_member_work, missing_member_files) =
+            copy_completion_fixture(&data_dir, &run_dir, &work, &completion, "missing-member");
+        let _missing_member_cleanup = FixtureDirectory(missing_member_dir.clone());
+        let missing_member_run_dir =
+            crate::scripts::runner::directory(&missing_member_dir, &run_id).unwrap();
+        let missing_member_completion = missing_member_run_dir.join("completion.json");
+        let mut missing_member_receipt: Value =
+            serde_json::from_slice(&fs::read(&missing_member_completion).unwrap()).unwrap();
+        let result_relative = missing_member_receipt["result"]["relative_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let result_path = missing_member_dir.join(result_relative);
+        let mut result_document: Value =
+            serde_json::from_slice(&fs::read(&result_path).unwrap()).unwrap();
+        assert!(
+            result_document
+                .as_object_mut()
+                .unwrap()
+                .remove("result")
+                .is_some(),
+            "the positive result artifact carries the result member"
+        );
+        let result_bytes = crate::model::canonical(&result_document)
+            .unwrap()
+            .into_bytes();
+        missing_member_receipt["result"]["byte_length"] = json!(result_bytes.len() as u64);
+        missing_member_receipt["result"]["content_digest"] =
+            json!(crate::model::digest(&result_bytes));
+        fs::write(&result_path, &result_bytes).unwrap();
+        fs::write(
+            &missing_member_completion,
+            serde_json::to_vec(&missing_member_receipt).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::scripts::runner::completion(&missing_member_work, &missing_member_files)
+                .unwrap_err()
+                .code,
+            "CONFLICT",
+            "a correctly hashed result artifact without its result member is rejected"
+        );
+
         let (operation_state, run_state, diagnostic, retained_identity) =
             stored_state(&owner.store, &run_id, &operation_id).await;
         assert_eq!(operation_state, "native_accepted");

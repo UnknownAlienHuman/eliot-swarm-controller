@@ -2880,6 +2880,63 @@ mod script_run_canonical_golden {
 mod publication_failure_fault_fixture {
     use super::*;
 
+    fn start_gate_work(root: &Path) -> ScriptWork {
+        let interpreter = InterpreterIdentity {
+            kind: InterpreterKind::Powershell,
+            canonical_path: root.join("pwsh.exe"),
+            sha256: "a".repeat(64),
+            byte_length: 1,
+        };
+        let bundle = ScriptBundle {
+            bundle_version: 1,
+            script_id: "identity_fixture".to_owned(),
+            interpreter: interpreter.clone(),
+            entrypoint: "main.ps1".to_owned(),
+            argv: Vec::new(),
+            trust: ScriptTrust::TrustedLocal,
+            inherit_environment: Vec::new(),
+            controller_effects: Vec::new(),
+            input_schema: ScriptValueSchema::Null,
+            result_schema: ScriptValueSchema::Null,
+            files: Vec::new(),
+        };
+        let run_id = "run".to_owned();
+        let operation_id = "operation".to_owned();
+        let token = "token".to_owned();
+        let bundle_id = format!("script-{}", "b".repeat(64));
+        ScriptWork {
+            run_id: run_id.clone(),
+            operation_id: operation_id.clone(),
+            token,
+            data_dir: root.to_path_buf(),
+            bundle_record: ArtifactRecord {
+                kind: "script_bundle".to_owned(),
+                artifact_id: bundle_id.clone(),
+                relative_path: format!("artifacts/{bundle_id}.bin"),
+                byte_length: 0,
+                content_digest: "c".repeat(64),
+                metadata: json!({}),
+            },
+            bundle,
+            interpreter,
+            environment: std::collections::BTreeMap::new(),
+            environment_sha256: "d".repeat(64),
+            invocation: ScriptInvocation {
+                protocol_version: 1,
+                operation_id,
+                run_id,
+                script_id: "identity_fixture".to_owned(),
+                script_revision: 1,
+                task_id: None,
+                task_revision: None,
+                attempt_id: None,
+                input: Value::Null,
+                controller_effects: Vec::new(),
+            },
+            executor: None,
+        }
+    }
+
     #[test]
     fn writer_error_does_not_release_pending_or_unknown_family_custody() {
         let publication: Result<()> = Err(Error::new("FIXTURE_WRITE_FAILED", "injected"));
@@ -2888,6 +2945,62 @@ mod publication_failure_fault_fixture {
         assert!(!script_owner_release_authorized(false, true));
         assert!(!script_owner_release_authorized(true, false));
         assert!(script_owner_release_authorized(true, true));
+    }
+
+    #[test]
+    fn mismatched_run_and_token_never_pass_worker_start_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-decision-identity-gate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let work = start_gate_work(&root);
+
+        let wrong_run_dir = root.join("wrong-run");
+        fs::create_dir(&wrong_run_dir).unwrap();
+        publish_start_decision(
+            &wrong_run_dir,
+            ScriptStartDecision::Allow {
+                schema_version: 1,
+                run_id: "different-run".to_owned(),
+                operation_id: work.operation_id.clone(),
+                token: work.token.clone(),
+                decided_at_ms: 1,
+            },
+        )
+        .expect("publish a valid decision carrying the wrong Run identity");
+        assert_eq!(
+            wait_for_start_decision(&work, &wrong_run_dir)
+                .unwrap_err()
+                .code,
+            "SCRIPT_START_DECISION_INVALID"
+        );
+        assert!(!wrong_run_dir.join("execution-plan.json").exists());
+        assert!(!wrong_run_dir.join("started.json").exists());
+
+        let wrong_token_dir = root.join("wrong-token");
+        fs::create_dir(&wrong_token_dir).unwrap();
+        publish_start_decision(
+            &wrong_token_dir,
+            ScriptStartDecision::Allow {
+                schema_version: 1,
+                run_id: work.run_id.clone(),
+                operation_id: work.operation_id.clone(),
+                token: "different-token".to_owned(),
+                decided_at_ms: 1,
+            },
+        )
+        .expect("publish a valid decision carrying the wrong token identity");
+        assert_eq!(
+            wait_for_start_decision(&work, &wrong_token_dir)
+                .unwrap_err()
+                .code,
+            "SCRIPT_START_DECISION_INVALID"
+        );
+        assert!(!wrong_token_dir.join("execution-plan.json").exists());
+        assert!(!wrong_token_dir.join("started.json").exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2942,6 +3055,16 @@ mod publication_failure_fault_fixture {
         ));
         assert_eq!(fs::read(root.join("start-decision.json")).unwrap(), bytes);
         assert!(read_start_decision(&root, "run", "different-operation", "token").is_err());
+        assert!(read_start_decision(&root, "different-run", "operation", "token").is_err());
+        assert!(read_start_decision(&root, "run", "operation", "different-token").is_err());
+        assert!(
+            !root.join("execution-plan.json").exists(),
+            "mismatched decision identity cannot authorize a plan"
+        );
+        assert!(
+            !root.join("started.json").exists(),
+            "mismatched decision identity cannot authorize interpreter start"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
