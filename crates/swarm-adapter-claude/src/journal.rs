@@ -767,8 +767,11 @@ impl OperationJournal {
     }
 
     pub fn has_terminal_shutdown(&self) -> Result<bool> {
-        for entry in fs::read_dir(&self.root).map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be listed"))? {
-            let entry = entry.map_err(|_| Error::new("ADAPTER_JOURNAL", "operation entry cannot be read"))?;
+        for entry in fs::read_dir(&self.root)
+            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be listed"))?
+        {
+            let entry = entry
+                .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation entry cannot be read"))?;
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
@@ -785,7 +788,9 @@ impl OperationJournal {
             if state.method.as_deref() != Some("agent.shutdown") {
                 continue;
             }
-            if state.outcome.as_ref().is_some_and(|outcome| matches!(outcome["outcome"].as_str(), Some("applied" | "unknown"))) {
+            if state.outcome.as_ref().is_some_and(|outcome| {
+                matches!(outcome["outcome"].as_str(), Some("applied" | "unknown"))
+            }) {
                 return Ok(true);
             }
         }

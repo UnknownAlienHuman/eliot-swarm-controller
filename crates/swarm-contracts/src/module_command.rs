@@ -26,10 +26,7 @@ pub const COMMAND_RELEASE_EVIDENCE_FIELD: &str = "capture_release_evidence";
 pub const AGENT_SHUTDOWN_METHOD: &str = "agent.shutdown";
 
 /// Closed vocabulary of exactly which owned resource a retirement may name.
-pub const AGENT_SHUTDOWN_SCOPES: [&str; 2] = [
-    "external_attach",
-    "owned_sdk_transport",
-];
+pub const AGENT_SHUTDOWN_SCOPES: [&str; 2] = ["external_attach", "owned_sdk_transport"];
 
 /// Request field carrying the closed scope. A missing or unknown scope is a
 /// rejection, never a broader default retirement.
@@ -291,13 +288,24 @@ mod agent_shutdown_tests {
     fn classifies_both_closed_scopes() {
         for scope in ["external_attach", "owned_sdk_transport"] {
             let input = serde_json::json!({"owned_scope": scope});
-            assert_eq!(classify_runtime_command(AGENT_SHUTDOWN_METHOD, &input), Ok(RuntimeCommandKind::AgentShutdown));
+            assert_eq!(
+                classify_runtime_command(AGENT_SHUTDOWN_METHOD, &input),
+                Ok(RuntimeCommandKind::AgentShutdown)
+            );
         }
     }
     #[test]
     fn rejects_absent_unknown_and_non_string_scope() {
-        for input in [serde_json::json!({}), serde_json::json!({"owned_scope": "server"}), serde_json::json!({"owned_scope": ""}), serde_json::json!({"owned_scope": 7})] {
-            assert_eq!(classify_runtime_command(AGENT_SHUTDOWN_METHOD, &input), Err(RuntimeCommandClassError::InvalidAgentShutdownScope));
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"owned_scope": "server"}),
+            serde_json::json!({"owned_scope": ""}),
+            serde_json::json!({"owned_scope": 7}),
+        ] {
+            assert_eq!(
+                classify_runtime_command(AGENT_SHUTDOWN_METHOD, &input),
+                Err(RuntimeCommandClassError::InvalidAgentShutdownScope)
+            );
         }
     }
 }

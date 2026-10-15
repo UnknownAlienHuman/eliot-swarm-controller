@@ -5994,7 +5994,10 @@ async fn release_owned_connection_with_timeout(
     native: &mut NativeClient,
     close_timeout: Duration,
 ) -> Result<&'static str, &'static str> {
-    let writer = native.writer.take().ok_or("CODEX_CONNECTION_ALREADY_RELEASED")?;
+    let writer = native
+        .writer
+        .take()
+        .ok_or("CODEX_CONNECTION_ALREADY_RELEASED")?;
     let sent = {
         let mut guard = writer.lock().await;
         timeout(CONNECT_TIMEOUT, guard.send(Message::Close(None))).await
@@ -6014,7 +6017,9 @@ async fn release_owned_connection_with_timeout(
     }
 }
 fn shutdown_intent_without_outcome(state: &Checkpoint) -> bool {
-    state.operations.values().any(|record| record.method == "agent.shutdown" && record.kind == "shutdown" && record.outcome.is_none())
+    state.operations.values().any(|record| {
+        record.method == "agent.shutdown" && record.kind == "shutdown" && record.outcome.is_none()
+    })
 }
 
 fn recover_intent_only_shutdown(
@@ -6025,19 +6030,39 @@ fn recover_intent_only_shutdown(
         .state
         .operations
         .iter()
-        .filter(|(_, record)| record.method == "agent.shutdown" && record.kind == "shutdown" && record.outcome.is_none())
-        .map(|(operation_id, record)| record.input_sha256.as_deref().filter(|digest| valid_sha256(digest)).map(|digest| (operation_id.clone(), digest.to_owned())).ok_or(AdapterError::Checkpoint))
+        .filter(|(_, record)| {
+            record.method == "agent.shutdown"
+                && record.kind == "shutdown"
+                && record.outcome.is_none()
+        })
+        .map(|(operation_id, record)| {
+            record
+                .input_sha256
+                .as_deref()
+                .filter(|digest| valid_sha256(digest))
+                .map(|digest| (operation_id.clone(), digest.to_owned()))
+                .ok_or(AdapterError::Checkpoint)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if pending.is_empty() {
         return Ok(());
     }
-    let (binding_id, generation) = match (journal.state.binding_id.clone(), journal.state.generation) {
-        (Some(binding_id), Some(generation)) => (binding_id, generation),
-        _ => return Err(AdapterError::Checkpoint),
-    };
+    let (binding_id, generation) =
+        match (journal.state.binding_id.clone(), journal.state.generation) {
+            (Some(binding_id), Some(generation)) => (binding_id, generation),
+            _ => return Err(AdapterError::Checkpoint),
+        };
     for (operation_id, digest) in pending {
-        let mut outcome = unknown_shutdown_for_id(&operation_id, &journal.state, "SHUTDOWN_EFFECT_UNCERTAIN");
-        attach_module_receipt(&mut outcome, claim, &binding_id, generation, &operation_id, &digest)?;
+        let mut outcome =
+            unknown_shutdown_for_id(&operation_id, &journal.state, "SHUTDOWN_EFFECT_UNCERTAIN");
+        attach_module_receipt(
+            &mut outcome,
+            claim,
+            &binding_id,
+            generation,
+            &operation_id,
+            &digest,
+        )?;
         journal.store_outcome(&outcome, "agent.shutdown", "shutdown")?;
     }
     journal.state.native_retired = true;
@@ -6070,19 +6095,31 @@ async fn shutdown_operation(
     native: &mut NativeClient,
     claim: &ModuleContractClaim,
 ) -> RuntimeOutcome {
-    if !claim.capabilities.iter().any(|capability| capability.as_str() == "agent.shutdown") {
+    if !claim
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == "agent.shutdown")
+    {
         return rejected(command, "CAPABILITY_UNAVAILABLE", &journal.state);
     }
     if shutdown_scope(&command.input).is_err() {
         let mut outcome = rejected(command, "SHUTDOWN_SCOPE_UNSUPPORTED", &journal.state);
-        outcome.details["owned_scope"] = command.input.get("owned_scope").cloned().unwrap_or(Value::Null);
+        outcome.details["owned_scope"] = command
+            .input
+            .get("owned_scope")
+            .cloned()
+            .unwrap_or(Value::Null);
         return outcome;
     }
     if let Some(previous) = journal.state.operations.get(&command.operation_id) {
         if let Some(result) = &previous.outcome {
             return decode_outcome(result, &command.operation_id);
         }
-        return unknown_shutdown_for_id(&command.operation_id, &journal.state, "SHUTDOWN_EFFECT_UNCERTAIN");
+        return unknown_shutdown_for_id(
+            &command.operation_id,
+            &journal.state,
+            "SHUTDOWN_EFFECT_UNCERTAIN",
+        );
     }
     if native.writer.is_none() {
         return rejected(command, "CODEX_CONNECTION_NOT_HELD", &journal.state);
@@ -6090,7 +6127,10 @@ async fn shutdown_operation(
     let mut record = OperationRecord::intent(&command.method, "shutdown");
     record.input_sha256 = command.input_sha256.clone();
     record.native_scope_key = journal.state.native_scope_key.clone();
-    journal.state.operations.insert(command.operation_id.clone(), record);
+    journal
+        .state
+        .operations
+        .insert(command.operation_id.clone(), record);
     if journal.save().is_err() {
         return outcome(
             &command.operation_id,
@@ -7254,11 +7294,19 @@ mod agent_shutdown_tests {
     use super::shutdown_scope;
     #[test]
     fn accepts_only_external_attach() {
-        assert_eq!(shutdown_scope(&serde_json::json!({"owned_scope": "external_attach"})), Ok("external_attach"));
+        assert_eq!(
+            shutdown_scope(&serde_json::json!({"owned_scope": "external_attach"})),
+            Ok("external_attach")
+        );
     }
     #[test]
     fn rejects_foreign_missing_and_empty_scope() {
-        for input in [serde_json::json!({}), serde_json::json!({"owned_scope": "owned_sdk_transport"}), serde_json::json!({"owned_scope": "server"}), serde_json::json!({"owned_scope": ""})] {
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"owned_scope": "owned_sdk_transport"}),
+            serde_json::json!({"owned_scope": "server"}),
+            serde_json::json!({"owned_scope": ""}),
+        ] {
             assert_eq!(shutdown_scope(&input), Err("SHUTDOWN_SCOPE_UNSUPPORTED"));
         }
     }
@@ -7288,37 +7336,56 @@ mod agent_shutdown_loopback_tests {
             return;
         }
         while let Some(message) = futures_util::StreamExt::next(&mut ws).await {
-            if let tokio_tungstenite::tungstenite::Message::Close(_) = message.expect("loopback read") {
-                    closes_seen.fetch_add(1, Ordering::SeqCst);
-                    if mode == "echo" {
-                        let _ = futures_util::SinkExt::send(
-                            &mut ws,
-                            tokio_tungstenite::tungstenite::Message::Close(None),
-                        )
-                        .await;
-                    }
-                    return;
+            if let tokio_tungstenite::tungstenite::Message::Close(_) =
+                message.expect("loopback read")
+            {
+                closes_seen.fetch_add(1, Ordering::SeqCst);
+                if mode == "echo" {
+                    let _ = futures_util::SinkExt::send(
+                        &mut ws,
+                        tokio_tungstenite::tungstenite::Message::Close(None),
+                    )
+                    .await;
+                }
+                return;
             }
         }
     }
     async fn loopback_pair(mode: &'static str) -> (NativeClient, Arc<AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
         let address = listener.local_addr().expect("loopback address");
         let closes = Arc::new(AtomicUsize::new(0));
         tokio::spawn(serve_once(listener, mode, Arc::clone(&closes)));
         let endpoint = format!("ws://{address}/");
-        let (socket, _) = tokio_tungstenite::connect_async(endpoint).await.expect("loopback connect");
+        let (socket, _) = tokio_tungstenite::connect_async(endpoint)
+            .await
+            .expect("loopback connect");
         let (writer_half, reader_half) = socket.split();
         let writer = Arc::new(AsyncMutex::new(writer_half));
         let demux = Arc::new(NativeRpcDemultiplexer::new(NativeEventSink::new()));
-        let reader_task = tokio::spawn(read_native_messages(reader_half, Arc::clone(&writer), Arc::clone(&demux)));
-        let native = NativeClient { writer: Some(writer), demux, events: NativeEventSink::new(), reader_task: Some(reader_task), native_scope_key: Some("test-scope".to_owned()), server_identity: None };
+        let reader_task = tokio::spawn(read_native_messages(
+            reader_half,
+            Arc::clone(&writer),
+            Arc::clone(&demux),
+        ));
+        let native = NativeClient {
+            writer: Some(writer),
+            demux,
+            events: NativeEventSink::new(),
+            reader_task: Some(reader_task),
+            native_scope_key: Some("test-scope".to_owned()),
+            server_identity: None,
+        };
         (native, closes)
     }
     #[tokio::test]
     async fn echo_proves_release_and_never_replays() {
         let (mut native, closes) = loopback_pair("echo").await;
-        let disposition = release_owned_connection(&mut native).await.expect("echoed close proves release");
+        let disposition = release_owned_connection(&mut native)
+            .await
+            .expect("echoed close proves release");
         assert_eq!(disposition, "owned_connection_closed");
         assert!(native.writer.is_none());
         assert_eq!(closes.load(Ordering::SeqCst), 1);
@@ -7329,22 +7396,30 @@ mod agent_shutdown_loopback_tests {
     #[tokio::test]
     async fn unconfirmed_close_is_unknown() {
         let (mut native, _) = loopback_pair("ignore").await;
-        let outcome = release_owned_connection_with_timeout(&mut native, std::time::Duration::from_millis(200)).await;
+        let outcome = release_owned_connection_with_timeout(
+            &mut native,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
         assert_eq!(outcome, Err("CODEX_CONNECTION_CLOSE_UNKNOWN"));
         assert!(native.writer.is_none());
     }
     #[tokio::test]
     async fn peer_drop_is_observed_close() {
         let (mut native, closes) = loopback_pair("read_then_drop").await;
-        let disposition = release_owned_connection(&mut native).await.expect("dropped peer is observed close");
+        let disposition = release_owned_connection(&mut native)
+            .await
+            .expect("dropped peer is observed close");
         assert_eq!(disposition, "owned_connection_closed");
         assert_eq!(closes.load(Ordering::SeqCst), 1);
     }
     #[tokio::test]
     async fn handler_rejects_no_writer_before_effect() {
-        let directory = std::env::temp_dir().join(format!("codex-shutdown-nowriter-{}", uuid::Uuid::new_v4()));
+        let directory =
+            std::env::temp_dir().join(format!("codex-shutdown-nowriter-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).expect("fixture journal");
-        let mut journal = Journal::open(directory, "boot-shutdown".to_owned()).expect("open fixture journal");
+        let mut journal =
+            Journal::open(directory, "boot-shutdown".to_owned()).expect("open fixture journal");
         let claim: ModuleContractClaim = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "module_id": "codex",
@@ -7365,10 +7440,20 @@ mod agent_shutdown_loopback_tests {
             input_sha256: Some("a".repeat(64)),
             target_input_sha256: None,
         };
-        let mut native = NativeClient { writer: None, demux: Arc::new(NativeRpcDemultiplexer::new(NativeEventSink::new())), events: NativeEventSink::new(), reader_task: None, native_scope_key: None, server_identity: None };
+        let mut native = NativeClient {
+            writer: None,
+            demux: Arc::new(NativeRpcDemultiplexer::new(NativeEventSink::new())),
+            events: NativeEventSink::new(),
+            reader_task: None,
+            native_scope_key: None,
+            server_identity: None,
+        };
         let outcome = shutdown_operation(&command, &mut journal, &mut native, &claim).await;
         assert_eq!(outcome.outcome, EffectOutcome::Rejected);
-        assert_eq!(outcome.details["diagnostic_code"], "CODEX_CONNECTION_NOT_HELD");
+        assert_eq!(
+            outcome.details["diagnostic_code"],
+            "CODEX_CONNECTION_NOT_HELD"
+        );
         assert!(!journal.state.operations.contains_key("shutdown-nowriter"));
         assert!(!journal.state.native_retired);
     }
@@ -7399,7 +7484,8 @@ mod agent_shutdown_loopback_tests {
         let directory = std::env::temp_dir().join(tag);
         std::fs::remove_dir_all(&directory).ok();
         std::fs::create_dir_all(&directory).expect("fixture journal dir");
-        let journal = Journal::open(directory.clone(), "boot-shutdown-test".to_owned()).expect("open fixture journal");
+        let journal = Journal::open(directory.clone(), "boot-shutdown-test".to_owned())
+            .expect("open fixture journal");
         (directory, journal)
     }
     #[tokio::test]
@@ -7410,18 +7496,32 @@ mod agent_shutdown_loopback_tests {
         let command = shutdown_cmd("shutdown-applied-1", "external_attach");
         let mut outcome = shutdown_operation(&command, &mut journal, &mut native, &claim).await;
         assert!(matches!(outcome.outcome, EffectOutcome::Applied));
-        assert_eq!(outcome.details["completion_condition"], "owned_resource_released");
+        assert_eq!(
+            outcome.details["completion_condition"],
+            "owned_resource_released"
+        );
         assert_eq!(outcome.details["disposition"], "owned_connection_closed");
         assert_eq!(outcome.details["native_replay"], false);
         assert!(journal.state.native_retired);
         assert_eq!(closes.load(Ordering::SeqCst), 1);
-        journal.bind("test-binding", 1).expect("bind fixture binding");
+        journal
+            .bind("test-binding", 1)
+            .expect("bind fixture binding");
         attach_command_receipt(&mut outcome, &command, &claim).expect("attach receipt");
-        journal.store_outcome(&outcome, "agent.shutdown", "shutdown").expect("loop persists outcome");
+        journal
+            .store_outcome(&outcome, "agent.shutdown", "shutdown")
+            .expect("loop persists outcome");
         drop(journal);
-        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned()).expect("reopen retired journal");
+        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned())
+            .expect("reopen retired journal");
         assert!(reopened.state.native_retired);
-        assert!(!reopened.state.acknowledged_outcomes.contains("shutdown-applied-1"), "shutdown ACK stays pending for the startup drain");
+        assert!(
+            !reopened
+                .state
+                .acknowledged_outcomes
+                .contains("shutdown-applied-1"),
+            "shutdown ACK stays pending for the startup drain"
+        );
         let again = shutdown_operation(&command, &mut reopened, &mut native, &claim).await;
         assert!(matches!(again.outcome, EffectOutcome::Applied));
         assert_eq!(closes.load(Ordering::SeqCst), 1);
@@ -7435,39 +7535,79 @@ mod agent_shutdown_loopback_tests {
         let command = shutdown_cmd("shutdown-uncertain-1", "external_attach");
         let outcome = shutdown_operation(&command, &mut journal, &mut native, &claim).await;
         assert!(matches!(outcome.outcome, EffectOutcome::Unknown));
-        assert_eq!(outcome.details["diagnostic_code"], "CODEX_CONNECTION_CLOSE_UNKNOWN");
+        assert_eq!(
+            outcome.details["diagnostic_code"],
+            "CODEX_CONNECTION_CLOSE_UNKNOWN"
+        );
         assert!(journal.state.native_retired);
-        let record = journal.state.operations.get("shutdown-uncertain-1").expect("intent retained");
+        let record = journal
+            .state
+            .operations
+            .get("shutdown-uncertain-1")
+            .expect("intent retained");
         assert!(record.outcome.is_none());
         std::fs::remove_dir_all(&directory).ok();
     }
     #[test]
     fn crash_intent_only_recovers_unknown_without_io() {
         let (directory, mut journal) = fixture_journal("codex-shutdown-crash");
-        journal.bind("test-binding", 1).expect("bind fixture binding");
+        journal
+            .bind("test-binding", 1)
+            .expect("bind fixture binding");
         let claim = full_claim();
         let mut record = OperationRecord::intent("agent.shutdown", "shutdown");
         record.input_sha256 = Some("c".repeat(64));
         record.native_scope_key = Some("crash-scope".to_owned());
-        journal.state.operations.insert("shutdown-crash-1".to_owned(), record);
+        journal
+            .state
+            .operations
+            .insert("shutdown-crash-1".to_owned(), record);
         journal.save().expect("persist intent only");
         drop(journal);
-        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned()).expect("reopen after crash");
-        assert!(reopened.state.operations.get("shutdown-crash-1").expect("intent survived").outcome.is_none());
+        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned())
+            .expect("reopen after crash");
+        assert!(
+            reopened
+                .state
+                .operations
+                .get("shutdown-crash-1")
+                .expect("intent survived")
+                .outcome
+                .is_none()
+        );
         assert!(!reopened.state.native_retired);
         assert!(shutdown_intent_without_outcome(&reopened.state));
         recover_intent_only_shutdown(&mut reopened, &claim).expect("recover intent");
-        let stored = reopened.state.operations.get("shutdown-crash-1").expect("record").outcome.clone().expect("unknown stored");
-        let outcome: RuntimeOutcome = serde_json::from_value(stored).expect("stored outcome decodes");
+        let stored = reopened
+            .state
+            .operations
+            .get("shutdown-crash-1")
+            .expect("record")
+            .outcome
+            .clone()
+            .expect("unknown stored");
+        let outcome: RuntimeOutcome =
+            serde_json::from_value(stored).expect("stored outcome decodes");
         assert!(matches!(outcome.outcome, EffectOutcome::Unknown));
-        assert_eq!(outcome.details["diagnostic_code"], "SHUTDOWN_EFFECT_UNCERTAIN");
+        assert_eq!(
+            outcome.details["diagnostic_code"],
+            "SHUTDOWN_EFFECT_UNCERTAIN"
+        );
         assert_eq!(outcome.details["native_replay"], false);
         assert!(reopened.state.native_retired);
         drop(reopened);
-        let mut stable = Journal::open(directory.clone(), "boot-shutdown-stable".to_owned()).expect("stable reopen");
+        let mut stable = Journal::open(directory.clone(), "boot-shutdown-stable".to_owned())
+            .expect("stable reopen");
         assert!(stable.state.native_retired);
         recover_intent_only_shutdown(&mut stable, &claim).expect("second recovery no-op");
-        let rest = stable.state.operations.get("shutdown-crash-1").expect("record").outcome.clone().expect("outcome stable");
+        let rest = stable
+            .state
+            .operations
+            .get("shutdown-crash-1")
+            .expect("record")
+            .outcome
+            .clone()
+            .expect("outcome stable");
         let rest: RuntimeOutcome = serde_json::from_value(rest).expect("stable outcome decodes");
         assert!(matches!(rest.outcome, EffectOutcome::Unknown));
         std::fs::remove_dir_all(&directory).ok();
@@ -7475,31 +7615,90 @@ mod agent_shutdown_loopback_tests {
     #[test]
     fn corrupt_selected_intent_fails_closed_without_mutation() {
         let (directory, mut journal) = fixture_journal("codex-shutdown-corrupt-intent");
-        journal.bind("test-binding", 1).expect("bind fixture binding");
+        journal
+            .bind("test-binding", 1)
+            .expect("bind fixture binding");
         let claim = full_claim();
         let mut missing = OperationRecord::intent("agent.shutdown", "shutdown");
         missing.native_scope_key = Some("corrupt-scope".to_owned());
-        journal.state.operations.insert("shutdown-corrupt-missing".to_owned(), missing);
+        journal
+            .state
+            .operations
+            .insert("shutdown-corrupt-missing".to_owned(), missing);
         let mut bad = OperationRecord::intent("agent.shutdown", "shutdown");
         bad.input_sha256 = Some("z".repeat(64));
         bad.native_scope_key = Some("corrupt-scope".to_owned());
-        journal.state.operations.insert("shutdown-corrupt-bad".to_owned(), bad);
+        journal
+            .state
+            .operations
+            .insert("shutdown-corrupt-bad".to_owned(), bad);
         journal.save().expect("persist corrupt intents");
         drop(journal);
-        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned()).expect("reopen after crash");
-        assert!(reopened.state.operations.get("shutdown-corrupt-missing").expect("intent survived").outcome.is_none());
-        assert!(reopened.state.operations.get("shutdown-corrupt-bad").expect("intent survived").outcome.is_none());
+        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned())
+            .expect("reopen after crash");
+        assert!(
+            reopened
+                .state
+                .operations
+                .get("shutdown-corrupt-missing")
+                .expect("intent survived")
+                .outcome
+                .is_none()
+        );
+        assert!(
+            reopened
+                .state
+                .operations
+                .get("shutdown-corrupt-bad")
+                .expect("intent survived")
+                .outcome
+                .is_none()
+        );
         assert!(!reopened.state.native_retired);
         assert!(shutdown_intent_without_outcome(&reopened.state));
-        let error = recover_intent_only_shutdown(&mut reopened, &claim).expect_err("corrupt intent must fail closed");
+        let error = recover_intent_only_shutdown(&mut reopened, &claim)
+            .expect_err("corrupt intent must fail closed");
         assert!(matches!(error, AdapterError::Checkpoint));
-        assert!(reopened.state.operations.get("shutdown-corrupt-missing").expect("record").outcome.is_none());
-        assert!(reopened.state.operations.get("shutdown-corrupt-bad").expect("record").outcome.is_none());
+        assert!(
+            reopened
+                .state
+                .operations
+                .get("shutdown-corrupt-missing")
+                .expect("record")
+                .outcome
+                .is_none()
+        );
+        assert!(
+            reopened
+                .state
+                .operations
+                .get("shutdown-corrupt-bad")
+                .expect("record")
+                .outcome
+                .is_none()
+        );
         assert!(!reopened.state.native_retired);
         drop(reopened);
-        let stable = Journal::open(directory.clone(), "boot-shutdown-stable".to_owned()).expect("stable reopen");
-        assert!(stable.state.operations.get("shutdown-corrupt-missing").expect("record").outcome.is_none());
-        assert!(stable.state.operations.get("shutdown-corrupt-bad").expect("record").outcome.is_none());
+        let stable = Journal::open(directory.clone(), "boot-shutdown-stable".to_owned())
+            .expect("stable reopen");
+        assert!(
+            stable
+                .state
+                .operations
+                .get("shutdown-corrupt-missing")
+                .expect("record")
+                .outcome
+                .is_none()
+        );
+        assert!(
+            stable
+                .state
+                .operations
+                .get("shutdown-corrupt-bad")
+                .expect("record")
+                .outcome
+                .is_none()
+        );
         assert!(!stable.state.native_retired);
         std::fs::remove_dir_all(&directory).ok();
     }

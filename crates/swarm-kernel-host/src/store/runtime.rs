@@ -1190,24 +1190,34 @@ fn validate_command_session_control(
     Ok(())
 }
 
-fn validate_agent_shutdown_request(
-    binding: &Value,
-    input: &Value,
-) -> Result<()> {
-    let scope = model::text(input, swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPE_FIELD)?;
+fn validate_agent_shutdown_request(binding: &Value, input: &Value) -> Result<()> {
+    let scope = model::text(
+        input,
+        swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPE_FIELD,
+    )?;
     if !swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPES.contains(&scope) {
         return Err(Error::new(
-            swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.code(),
-            swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.message(),
+            swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope
+                .code(),
+            swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope
+                .message(),
         ));
     }
     let input_binding = model::text(input, "binding_id")?;
     let input_generation = model::positive(input, "generation")?;
-    if input_binding != model::text(binding, "binding_id")? || input_generation != model::positive(binding, "generation")? {
-        return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "shutdown names only its exact own binding generation"));
+    if input_binding != model::text(binding, "binding_id")?
+        || input_generation != model::positive(binding, "generation")?
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "shutdown names only its exact own binding generation",
+        ));
     }
     if binding["state"] != "ready" {
-        return Err(Error::new("BINDING_NOT_READY", "native session is not ready"));
+        return Err(Error::new(
+            "BINDING_NOT_READY",
+            "native session is not ready",
+        ));
     }
     Ok(())
 }
@@ -5797,7 +5807,9 @@ fn user_command_with_actor(
         });
     }
     if method == swarm_contracts::module_command::AGENT_SHUTDOWN_METHOD {
-        let shutdown_scope = v[swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPE_FIELD].as_str().unwrap_or_default();
+        let shutdown_scope = v[swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPE_FIELD]
+            .as_str()
+            .unwrap_or_default();
         effective["operation_contract"] = json!({
             "effect_scope": {"binding_id": id, "generation": generation, "owned_scope": shutdown_scope},
             "order_scope": {"binding_id": id, "generation": generation},
@@ -6468,7 +6480,8 @@ mod agent_shutdown_validation_tests {
     #[test]
     fn rejects_foreign_unready_and_unknown_scope() {
         let b = binding("ready");
-        let foreign = json!({"binding_id": "other", "generation": 1, "owned_scope": "external_attach"});
+        let foreign =
+            json!({"binding_id": "other", "generation": 1, "owned_scope": "external_attach"});
         assert!(validate_agent_shutdown_request(&b, &foreign).is_err());
         let stale = binding("closed");
         let input = json!({"binding_id": "b", "generation": 1, "owned_scope": "external_attach"});

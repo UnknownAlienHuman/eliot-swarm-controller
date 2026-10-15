@@ -948,7 +948,10 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             text(params, "client_request_id")?;
             text(params, "binding_id")?;
             positive(params, "generation")?;
-            let scope = text(params, swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPE_FIELD)?;
+            let scope = text(
+                params,
+                swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPE_FIELD,
+            )?;
             if !swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPES.contains(&scope) {
                 return Err(Error::new(
                     swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope

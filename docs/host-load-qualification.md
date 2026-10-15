@@ -9,9 +9,7 @@ evidence about real incidents. The plan's figures (200 observed agents /
 §12, architecture §14) are *measurement targets*; this contour records what
 one run measured, under the conditions stated below, and no more.
 
-## Scenario
-
-### Local Windows execution, 15 October 2026
+## Local Windows execution, 15 October 2026
 
 The existing harness ran once against the clean `350b4cbdbb3c2cf4f4da88dc9d8bf881d7833c80`
 release package. The measured kernel image SHA-256 was
@@ -41,6 +39,8 @@ percentage gate. The 1,000-events/s target was **not met**. The harness integrit
 checks passed, but Issue #11 remains open for the throughput target and its
 separate requirement to qualify 200 real native agents. This run establishes
 neither a native population result nor a whole-project pass.
+
+## Scenario
 
 `tools/host-load.py` (Python 3 standard library only) starts one real
 `swarm-kernel-host host` process on a fresh temporary data directory and drives
