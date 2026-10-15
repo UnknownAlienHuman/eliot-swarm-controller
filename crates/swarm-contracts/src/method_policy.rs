@@ -787,6 +787,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         participant: ParticipantAccess::None,
     },
     MethodPolicy {
+        method: "agent.shutdown",
+        class: MethodClass::Mutation,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "agent.configure",
         class: MethodClass::Mutation,
         mcp: true,

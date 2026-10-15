@@ -2103,6 +2103,7 @@ impl Store {
                 | "native.opencode.loop_step"
                 | "native.command.cancel_turn"
                 | "native.command.close_session"
+                | swarm_contracts::module_command::AGENT_SHUTDOWN_METHOD
                 | "agent.configure"
                 | "agent.goal"
                 | "agent.background"
@@ -7252,6 +7253,7 @@ fn apply(
         | "native.opencode.loop_step"
         | "native.command.cancel_turn"
         | "native.command.close_session"
+        | swarm_contracts::module_command::AGENT_SHUTDOWN_METHOD
         | swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD => {
             runtime::user_command(tx, p, method, v, id, config).map(|v| (v, true))
         }

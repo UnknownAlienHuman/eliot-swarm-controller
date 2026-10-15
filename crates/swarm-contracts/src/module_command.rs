@@ -13,6 +13,28 @@ use serde_json::Value;
 pub const COMMAND_RELEASE_EVIDENCE_METHOD: &str = "native.command.release_evidence";
 pub const COMMAND_RELEASE_EVIDENCE_FIELD: &str = "capture_release_evidence";
 
+/// Explicit scoped retirement of one owned resource at the Module/RuntimeCommand
+/// boundary.
+///
+/// The scope names the exact resource the caller's binding owns and its
+/// disposition. `owned_sdk_transport` releases only the transport this module
+/// itself started; `external_attach` releases the binding's native connection
+/// without stopping a shared native service. Neither scope stops a server or
+/// another line's children, and neither claims Task, native turn, or process
+/// family completion: those stay owned by their existing operations and by the
+/// parent's process-family readback.
+pub const AGENT_SHUTDOWN_METHOD: &str = "agent.shutdown";
+
+/// Closed vocabulary of exactly which owned resource a retirement may name.
+pub const AGENT_SHUTDOWN_SCOPES: [&str; 2] = [
+    "external_attach",
+    "owned_sdk_transport",
+];
+
+/// Request field carrying the closed scope. A missing or unknown scope is a
+/// rejection, never a broader default retirement.
+pub const AGENT_SHUTDOWN_SCOPE_FIELD: &str = "owned_scope";
+
 /// Store's immutable readback proof authorizing deletion of one Command run's
 /// native captures. The Operation envelope supplies release-operation identity
 /// and binding authority; these fields bind the proof to the target and every
@@ -33,6 +55,25 @@ pub struct CommandCaptureOutputCoverage {
     pub native_output: String,
     pub target_command_output: Value,
     pub pages: Vec<CommandCaptureArtifactPage>,
+}
+
+/// Exact closed identity of the owned resource a scoped retirement names.
+/// The serialized form is a bare scope string, so an unknown scope fails
+/// deserialization instead of defaulting to a broader retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentShutdownScope {
+    ExternalAttach,
+    OwnedSdkTransport,
+}
+
+impl AgentShutdownScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExternalAttach => "external_attach",
+            Self::OwnedSdkTransport => "owned_sdk_transport",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,7 +116,7 @@ pub const MODULE_COMMAND_METHODS: [&str; 19] = [
 
 /// Commands selected by the module-demand page. Native-MCP phases reuse an
 /// already-retained native session and do not create a second process demand.
-pub const MODULE_DEMAND_METHODS: [&str; 15] = [
+pub const MODULE_DEMAND_METHODS: [&str; 16] = [
     "agent.open",
     "task.dispatch",
     "agent.send",
@@ -91,6 +132,7 @@ pub const MODULE_DEMAND_METHODS: [&str; 15] = [
     "native.command.cancel_turn",
     "native.command.close_session",
     COMMAND_RELEASE_EVIDENCE_METHOD,
+    AGENT_SHUTDOWN_METHOD,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +153,7 @@ pub enum RuntimeCommandKind {
     CommandCancelTurn,
     CommandCloseSession,
     CommandReleaseEvidence,
+    AgentShutdown,
     NativeMcp(NativeMcpPhase),
 }
 
@@ -133,6 +176,7 @@ impl RuntimeCommandKind {
             Self::CommandCancelTurn => "native.command.cancel_turn",
             Self::CommandCloseSession => "native.command.close_session",
             Self::CommandReleaseEvidence => COMMAND_RELEASE_EVIDENCE_METHOD,
+            Self::AgentShutdown => AGENT_SHUTDOWN_METHOD,
             Self::NativeMcp(phase) => phase.method(),
         }
     }
@@ -147,6 +191,7 @@ pub enum RuntimeCommandClassError {
     UnknownMethod,
     InvalidAgentSendDelivery,
     InvalidCommandReleaseEvidence,
+    InvalidAgentShutdownScope,
 }
 
 impl RuntimeCommandClassError {
@@ -155,6 +200,7 @@ impl RuntimeCommandClassError {
             Self::UnknownMethod => "MODULE_COMMAND_UNMAPPED",
             Self::InvalidAgentSendDelivery => "MODULE_COMMAND_INVALID",
             Self::InvalidCommandReleaseEvidence => "MODULE_COMMAND_INVALID",
+            Self::InvalidAgentShutdownScope => "MODULE_COMMAND_INVALID",
         }
     }
 
@@ -168,6 +214,9 @@ impl RuntimeCommandClassError {
             }
             Self::InvalidCommandReleaseEvidence => {
                 "Command capture release requires its exact target and Store artifact evidence"
+            }
+            Self::InvalidAgentShutdownScope => {
+                "scoped module retirement requires an exact owned resource scope"
             }
         }
     }
@@ -213,6 +262,18 @@ pub fn classify_runtime_command(
         NATIVE_MCP_OBSERVE_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Observe),
         NATIVE_MCP_ARM_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Arm),
         NATIVE_MCP_READ_METHOD => RuntimeCommandKind::NativeMcp(NativeMcpPhase::Read),
+        AGENT_SHUTDOWN_METHOD => {
+            // An absent, non-string, or unknown scope is rejected here; a
+            // retirement never widens its own scope by default.
+            let scope = input
+                .get(AGENT_SHUTDOWN_SCOPE_FIELD)
+                .and_then(|value| serde_json::from_value::<AgentShutdownScope>(value.clone()).ok())
+                .ok_or(RuntimeCommandClassError::InvalidAgentShutdownScope)?;
+            if !AGENT_SHUTDOWN_SCOPES.contains(&scope.as_str()) {
+                return Err(RuntimeCommandClassError::InvalidAgentShutdownScope);
+            }
+            RuntimeCommandKind::AgentShutdown
+        }
         _ => return Err(RuntimeCommandClassError::UnknownMethod),
     })
 }

@@ -995,11 +995,12 @@ pub(super) fn selected_native_command_supported(
         swarm_contracts::module_command::RuntimeCommandKind::CommandCancelTurn
             | swarm_contracts::module_command::RuntimeCommandKind::CommandCloseSession
     );
+    let is_shutdown = matches!(command, swarm_contracts::module_command::RuntimeCommandKind::AgentShutdown);
     let Some(retained) = retained_contract_identity(db, binding_artifact_id, selector)? else {
         // Native MCP phase Operations are meaningful only under the exact
         // retained descriptor that authorizes their command schema. Preserve
         // legacy behavior only for known pre-existing agent.* commands.
-        return Ok(if native_mcp || command_control {
+        return Ok(if native_mcp || command_control || is_shutdown {
             Some(false)
         } else {
             None

@@ -1190,6 +1190,50 @@ fn validate_command_session_control(
     Ok(())
 }
 
+fn validate_agent_shutdown_request(
+    binding: &Value,
+    input: &Value,
+) -> Result<()> {
+    let scope = model::text(input, swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPE_FIELD)?;
+    if !swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPES.contains(&scope) {
+        return Err(Error::new(
+            swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.code(),
+            swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.message(),
+        ));
+    }
+    let runtime = binding["route"]["runtime"].as_str().unwrap_or_default();
+    let artifact = binding["module_artifact_id"].as_str().unwrap_or_default();
+    match scope {
+        "owned_sdk_transport" => {
+            let is_claude = crate::runtime::prepared::is_prepared_claude_route(&binding["route"])
+                || runtime == crate::runtime::prepared::CLAUDE_RUNTIME
+                || runtime == crate::runtime::prepared::CLAUDE_MODULE_RUNTIME;
+            if !is_claude || !artifact.starts_with("claude-agent-sdk-") {
+                return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "owned SDK transport shutdown requires the owning Claude bridge binding"));
+            }
+            let boot = binding.get("observation").and_then(|o| o.get("bridge_boot_id")).and_then(|v| v.as_str()).filter(|v| !v.is_empty());
+            if boot.is_none() {
+                return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "owned SDK transport shutdown requires the bridge boot owner"));
+            }
+        }
+        "external_attach" => {
+            if runtime != crate::runtime::codex::RUNTIME || artifact != swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID {
+                return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "external attach shutdown requires the owning Codex connection binding"));
+            }
+            if binding["native_scope_key"].as_str().map(|s| s.is_empty() || s == "shared-server").unwrap_or(true) {
+                return Err(Error::new("NATIVE_IDENTITY_MISMATCH", "external attach shutdown requires the binding owned connection scope"));
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.code(),
+                swarm_contracts::module_command::RuntimeCommandClassError::InvalidAgentShutdownScope.message(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_command_capture_release_request(
     db: &Connection,
     binding: &Value,
@@ -1726,7 +1770,9 @@ fn next_internal(
                 &input,
             )?;
         }
-        if matches!(
+        if method.as_str() == swarm_contracts::module_command::AGENT_SHUTDOWN_METHOD {
+            validate_agent_shutdown_request(&b, &input)?;
+        } else if matches!(
             method.as_str(),
             "native.command.cancel_turn" | "native.command.close_session"
         ) {
@@ -5490,7 +5536,9 @@ fn user_command_with_actor(
             ));
         }
     }
-    if matches!(
+    if method == swarm_contracts::module_command::AGENT_SHUTDOWN_METHOD {
+        validate_agent_shutdown_request(&b, v)?;
+    } else if matches!(
         method,
         "native.command.cancel_turn" | "native.command.close_session"
     ) {
@@ -5768,6 +5816,17 @@ fn user_command_with_actor(
             "replay_policy":"readback_only_no_mutation_replay",
             "fallback_used":false,
             "contract_revision":"opencode-input-v1"
+        });
+    }
+    if method == swarm_contracts::module_command::AGENT_SHUTDOWN_METHOD {
+        let shutdown_scope = v[swarm_contracts::module_command::AGENT_SHUTDOWN_SCOPE_FIELD].as_str().unwrap_or_default();
+        effective["operation_contract"] = json!({
+            "effect_scope": {"binding_id": id, "generation": generation, "owned_scope": shutdown_scope},
+            "order_scope": {"binding_id": id, "generation": generation},
+            "completion_condition": "owned_resource_released",
+            "replay_policy": "readback_only_no_mutation_replay",
+            "fallback_used": false,
+            "contract_revision": "agent-shutdown-v1"
         });
     }
     if let Some(prerequisite_id) = &prerequisite_id {

@@ -342,7 +342,8 @@ fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>>
         | "agent.recover"
         | "native.opencode.loop_step"
         | "native.command.cancel_turn"
-        | "native.command.close_session" => &[
+        | "native.command.close_session"
+        | swarm_contracts::module_command::AGENT_SHUTDOWN_METHOD => &[
             "operation_id",
             "state",
             "outcome",
