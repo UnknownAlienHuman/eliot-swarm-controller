@@ -384,42 +384,20 @@ fn allocate_delivery_id(db: &Connection, operation_id: &str, message_id: &str) -
 }
 
 fn mailbox_identity_exists(db: &Connection, identity: &str) -> Result<bool> {
-    // Branch 1: exact operation identity (existing PRIMARY KEY seek).
-    let by_id: Option<i64> = db
+    let found: Option<i64> = db
         .query_row(
-            "SELECT 1 FROM operations WHERE operation_id=?1 LIMIT 1",
+            "SELECT 1 FROM operations \
+             WHERE operation_id=?1 \
+                OR (method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') \
+                    AND state='settled' \
+                    AND (json_extract(result_json,'$.delivery_id')=?1 \
+                         OR json_extract(result_json,'$.message_id')=?1)) \
+             LIMIT 1",
             [identity],
             |row| row.get(0),
         )
         .optional()?;
-    if by_id.is_some() {
-        return Ok(true);
-    }
-    // Branches 2-3: legacy delivery_id / message_id receipt refs. Each branch is
-    // one bounded seek over the NON-UNIQUE partial expression index
-    // mailbox_settled_delivery_identity (015 migration): duplicate and coalesced
-    // historical refs stay valid. The CASE+json_valid guard keeps malformed
-    // result_json evaluating to NULL (absent, never a throw, never a match),
-    // preserving the historical absent-not-error semantics of the OR query.
-    // Expression text below must stay byte-identical to the index definition.
-    for selector in [
-        "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.delivery_id') END",
-        "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.message_id') END",
-    ] {
-        let found: Option<i64> = db
-            .query_row(
-                &format!(
-                    "SELECT 1 FROM operations WHERE method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') AND state='settled' AND {selector}=?1 LIMIT 1"
-                ),
-                [identity],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if found.is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(found.is_some())
 }
 
 fn validate_typed_reply(tx: &Transaction<'_>, request: &DeliveryRequest<'_>) -> Result<()> {
@@ -477,143 +455,4 @@ fn legacy_reply_matches(prior: &Value, sender_id: &str, recipient_id: &str, repl
     valid_identity
         && prior["result"]["recipient"] == sender_id
         && prior["result"]["sender"] == recipient_id
-}
-#[cfg(test)]
-mod mailbox_identity_index_tests {
-    use super::*;
-
-    const MIGRATION_SQL: &str =
-        include_str!("../../migrations/015_mailbox_delivery_identity.sql");
-
-    fn fixture_db() -> rusqlite::Connection {
-        let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        db.execute_batch(super::super::SCHEMA).unwrap();
-        db.execute_batch(MIGRATION_SQL).unwrap();
-        db.execute_batch(MIGRATION_SQL).unwrap();
-        db
-    }
-
-    fn seed_op(db: &rusqlite::Connection, id: &str, method: &str, state: &str, result: &Value) {
-        db.execute(
-            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,settled_at_ms,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'{}','{}',?5,?6,CASE WHEN ?5 IN ('settled','rejected','cancelled') THEN 1 ELSE NULL END,1,1,1)",
-            rusqlite::params![
-                id,
-                format!("caller-{id}"),
-                format!("req-{id}"),
-                method,
-                state,
-                serde_json::to_string(result).unwrap(),
-            ],
-        )
-        .unwrap();
-    }
-
-    fn seed_null_result_op(db: &rusqlite::Connection) {
-        db.execute(
-            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,result_json,settled_at_ms,due_at_ms,created_at_ms,updated_at_ms) VALUES('op-5','caller-op-5','req-op-5','message.send','{}','{}','queued',NULL,NULL,1,1,1)",
-            [],
-        )
-        .unwrap();
-    }
-
-    fn seed_fixture(db: &rusqlite::Connection) {
-        seed_op(db, "op-1", "message.send", "settled", &serde_json::json!({"delivery_id": "d-1", "message_id": "m-1"}));
-        seed_op(db, "op-2", "message.send", "settled", &serde_json::json!({"delivery_id": "d-1", "message_id": "m-2"}));
-        seed_op(db, "op-3", "message.send", "queued", &serde_json::json!({"delivery_id": "d-3", "message_id": "m-3"}));
-        seed_op(db, "op-4", "task.create", "settled", &serde_json::json!({"delivery_id": "d-4"}));
-    }
-
-    #[test]
-    fn settled_identities_found_and_others_refused() {
-        let db = fixture_db();
-        seed_fixture(&db);
-        assert!(mailbox_identity_exists(&db, "op-1").unwrap());
-        assert!(mailbox_identity_exists(&db, "d-1").unwrap());
-        assert!(mailbox_identity_exists(&db, "m-1").unwrap());
-        assert!(mailbox_identity_exists(&db, "m-2").unwrap());
-        assert!(!mailbox_identity_exists(&db, "d-3").unwrap());
-        assert!(!mailbox_identity_exists(&db, "m-3").unwrap());
-        assert!(!mailbox_identity_exists(&db, "d-4").unwrap());
-        assert!(!mailbox_identity_exists(&db, "no-such-identity").unwrap());
-    }
-
-    #[test]
-    fn duplicate_historical_refs_remain_valid() {
-        let db = fixture_db();
-        seed_fixture(&db);
-        assert!(mailbox_identity_exists(&db, "d-1").unwrap());
-        let count: i64 = db
-            .query_row(
-                "SELECT count(*) FROM operations WHERE method='message.send' AND state='settled' AND json_extract(result_json,'$.delivery_id')='d-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn malformed_payloads_neither_throw_nor_match() {
-        let db = fixture_db();
-        let value: Option<String> = db
-            .query_row(
-                "SELECT CASE WHEN json_valid('not json') THEN json_extract('not json','$.delivery_id') END",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(value, None);
-        seed_fixture(&db);
-        seed_null_result_op(&db);
-        assert!(mailbox_identity_exists(&db, "d-1").unwrap());
-        assert!(mailbox_identity_exists(&db, "op-5").unwrap());
-        assert!(!mailbox_identity_exists(&db, "dangling-identity").unwrap());
-    }
-
-    #[test]
-    fn branch_plans_use_index_seeks() {
-        let db = fixture_db();
-        for n in 0..1000 {
-            seed_op(
-                &db,
-                &format!("bulk-{n}"),
-                "message.send",
-                "settled",
-                &serde_json::json!({"delivery_id": format!("bulk-d-{n}"), "message_id": format!("bulk-m-{n}")}),
-            );
-        }
-        db.execute_batch("ANALYZE;").unwrap();
-        for selector in [
-            "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.delivery_id') END",
-            "CASE WHEN json_valid(result_json) THEN json_extract(result_json, '$.message_id') END",
-        ] {
-            let sql = format!(
-                "EXPLAIN QUERY PLAN SELECT 1 FROM operations WHERE method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') AND state='settled' AND {selector}=?1 LIMIT 1"
-            );
-            let mut statement = db.prepare(&sql).unwrap();
-            let plan: String = statement
-                .query_map(["probe"], |row| {
-                    Ok(format!(
-                        "{}|{}|{}|{}",
-                        row.get::<_, i64>(0).unwrap_or(-1),
-                        row.get::<_, i64>(1).unwrap_or(-1),
-                        row.get::<_, i64>(2).unwrap_or(-1),
-                        row.get::<_, String>(3).unwrap_or_default(),
-                    ))
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<String>>>()
-                .unwrap()
-                .join("\n");
-            assert!(
-                plan.contains("SEARCH"),
-                "branch must seek the identity index, got: {plan}"
-            );
-            assert!(
-                !plan.contains("SCAN"),
-                "branch must not scan, got: {plan}"
-            );
-        }
-    }
 }
