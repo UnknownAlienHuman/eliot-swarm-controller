@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery, focused-proof-gaps, focused-retention-delivery, focused-retention-tail, focused-native-fixtures, focused-core-runtime]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery, focused-proof-gaps, focused-retention-delivery, focused-retention-tail, focused-native-fixtures, focused-core-runtime, focused-opencode-controls]
 permissions:
   contents: read
 jobs:
@@ -1090,6 +1090,21 @@ jobs:
             )
             $descriptorCase = 'pr44_command_acp_descriptor_deactivates_configure_and_host_rejects_the_old_set'
             Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter $descriptorCase -Expected 1 -ExpectedNames @($descriptorCase)
+          } elseif ($env:QUALIFICATION -ceq 'focused-opencode-controls') {
+            foreach ($case in @(
+              'background_idle_session_is_the_documented_native_noop',
+              'background_moves_foreground_tool_and_child_continues',
+              'lost_background_response_reconciles_by_notice_without_replay',
+              'background_reconcile_without_notice_stays_unknown',
+              'background_targets_owned_member_and_never_a_foreign_session'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            Invoke-FocusedCohort -Package 'swarm-adapter-opencode' -Filter 'control_consumer_tests' -Expected 3 -ExpectedNames @(
+              'question_reply_and_reject_cross_native_and_outcome_ack',
+              'permission_reject_cascade_reaches_native_and_outcome_ack',
+              'refresh_cursor_is_published_only_after_recorded_observation_ack'
+            )
           } elseif ($env:QUALIFICATION -ceq 'focused-workspace-git') {
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace' -Expected 1 -ExpectedNames @('work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace')
             if ($IsWindows) {
