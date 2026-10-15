@@ -344,31 +344,59 @@ async fn serve_startup_fixture(
     events: mpsc::UnboundedSender<serde_json::Value>,
 ) -> std::io::Result<()> {
     loop {
-        let stream = listener
-            .accept()
-            .await
-            .map_err(|_| std::io::Error::other("fixture IPC listener failed"))?;
-        serve_startup_fixture_connection(
+        let stream = listener.accept().await.map_err(|error| {
+            std::io::Error::other(format!("startup fixture IPC accept failed: {error}"))
+        })?;
+        match serve_startup_fixture_connection(
             stream,
             startup_fixture_hello(&config, &claim),
             probe.clone(),
             events.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(error) if startup_fixture_peer_closed(&error) => {
+                eprintln!("startup fixture IPC peer disconnected: {error:?}");
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("startup fixture IPC connection failed: {error:?}"),
+                ));
+            }
+        }
     }
+}
+
+fn startup_fixture_peer_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 async fn next_startup_fixture_event(
     events: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    server: &mut tokio::task::JoinHandle<std::io::Result<()>>,
 ) -> serde_json::Value {
-    tokio::time::timeout(Duration::from_secs(30), events.recv())
-        .await
-        .expect("source adapter startup fixture call arrived within 30 seconds")
-        .expect("source adapter startup fixture server remains connected")
+    match tokio::time::timeout(Duration::from_secs(30), events.recv()).await {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            let server_result = server.await;
+            panic!("startup fixture event channel closed; server result: {server_result:?}");
+        }
+        Err(_) => panic!("source adapter startup fixture call did not arrive within 30 seconds"),
+    }
 }
 
 async fn assert_startup_fixture_report(
     events: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    server: &mut tokio::task::JoinHandle<std::io::Result<()>>,
     journal: &StartupJournalProbe,
     boot_id: &str,
     unresolved_id: &str,
@@ -379,7 +407,7 @@ async fn assert_startup_fixture_report(
     let mut hello_seen = false;
     let mut incomplete_next_calls = 0usize;
     loop {
-        let event = next_startup_fixture_event(events).await;
+        let event = next_startup_fixture_event(events, server).await;
         let method = event["method"].as_str().unwrap_or_default();
         let params = &event["params"];
         let legacy_migration_complete = event["legacy_migration_complete"] == true;
@@ -434,10 +462,11 @@ async fn assert_startup_fixture_report(
 
 async fn wait_for_startup_fixture_next(
     events: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    server: &mut tokio::task::JoinHandle<std::io::Result<()>>,
     boot_id: &str,
 ) {
     loop {
-        let event = next_startup_fixture_event(events).await;
+        let event = next_startup_fixture_event(events, server).await;
         if event["method"] == "module.next" && event["boot_id"] == boot_id {
             return;
         }
@@ -515,7 +544,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
     };
     let listener = swarm_kernel_host::ipc::Listener::bind(&host_data_dir).unwrap();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let server = tokio::spawn(serve_startup_fixture(
+    let mut server = tokio::spawn(serve_startup_fixture(
         listener,
         config.clone(),
         claim_value,
@@ -534,6 +563,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
     )));
     let incomplete_next_calls = assert_startup_fixture_report(
         &mut events_rx,
+        &mut server,
         &probe,
         first_boot_id,
         unresolved_id,
@@ -543,7 +573,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
     )
     .await;
     assert!(incomplete_next_calls >= 2);
-    wait_for_startup_fixture_next(&mut events_rx, first_boot_id).await;
+    wait_for_startup_fixture_next(&mut events_rx, &mut server, first_boot_id).await;
     first_run.abort();
     assert!(first_run.await.unwrap_err().is_cancelled());
 
@@ -578,6 +608,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
     )));
     assert_startup_fixture_report(
         &mut events_rx,
+        &mut server,
         &probe,
         second_boot_id,
         unresolved_id,
@@ -586,7 +617,7 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
         0,
     )
     .await;
-    wait_for_startup_fixture_next(&mut events_rx, second_boot_id).await;
+    wait_for_startup_fixture_next(&mut events_rx, &mut server, second_boot_id).await;
     second_run.abort();
     assert!(second_run.await.unwrap_err().is_cancelled());
 
