@@ -4931,6 +4931,8 @@ mod tests {
     use super::*;
     #[path = "check_child_departure_durable_tests.rs"]
     mod check_child_departure_durable_tests;
+    #[path = "healthy_check_consumer_tests.rs"]
+    mod healthy_check_consumer_tests;
     #[path = "check_held_tests.rs"]
     mod check_held_tests;
     #[path = "check_launch_fact_durable_tests.rs"]
