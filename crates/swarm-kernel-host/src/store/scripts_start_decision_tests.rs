@@ -793,7 +793,7 @@ $result = [ordered]@{
         assert_eq!(worker_pin.sha256, crate::model::digest(&fs::read(&verified_worker).unwrap()));
 
         let custody = owner.store.script_child_custody.clone();
-        let cleanup = SourceWorkerCleanup {
+        let mut cleanup = SourceWorkerCleanup {
             custody: custody.clone(),
             work: work.clone(),
             data_dir: data_dir.clone(),
@@ -1009,8 +1009,10 @@ $result = [ordered]@{
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        // Reconciliation may have already released the exact child after
+        // terminal projection; an absent custody entry is confirmed release.
         match custody.exit_observed(&run_id, &operation_id).unwrap() {
-            None => {},
+            None => cleanup.disarm(),
             Some(true) => assert!(
                 custody
                     .release_after_terminal(&run_id, &operation_id)
@@ -1018,6 +1020,7 @@ $result = [ordered]@{
             ),
             Some(false) => panic!("terminal ScriptRun still has a live Store-owned worker"),
         }
+        cleanup.disarm();
         drop(cleanup);
         assert_eq!(
             custody.exit_observed(&run_id, &operation_id).unwrap(),
