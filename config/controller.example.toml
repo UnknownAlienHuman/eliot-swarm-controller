@@ -93,13 +93,18 @@ modelId = 'REPLACE_WITH_EXACT_NATIVE_MODEL_ID'
 # subscription via OpenCodex's stored login (tier not reported by
 # upstream) — this is NOT the native Claude route and NOT a "Max route";
 # the native Max route is modules/claude/ above.
-# Attach the .2 scoped bridge to an explicitly operator-owned Codex app-server.
+# Current writable route: standalone Rust swarm-adapter-codex over an
+# explicitly operator-owned installed Codex app-server. New Store bindings
+# require the exact registered current descriptor (codex-rust-controller.1,
+# v6), including TaskPrompt v1 and dispatch-admission schemas; the Store builds
+# the immutable prompt from the frozen Task. The Python bridge is historical
+# fixture provenance and is not a new writable route.
 # Provider is its registered native provider ID; model is the Codex-visible ID.
 # A slash inside a model ID is not parsed as a provider selection.
 [[routes]]
 alias = 'codex-opencodex-manager'
 runtime = 'codex'
-module_artifact_id = 'codex-sdk-18194bf-bridge.3'
+module_artifact_id = 'codex-rust-controller.1'
 enabled = false
 [routes.native_options]
 modelProvider = 'REPLACE_WITH_REGISTERED_CODEX_PROVIDER_ID'
