@@ -2459,13 +2459,36 @@ mod tests {
             {
                 return Ok(None);
             }
-            let executable = std::env::current_exe()?;
+            #[cfg(target_os = "linux")]
+            let (executable, command) = {
+                // A debug libtest image can exceed the production executable
+                // hash boundary. Use a real small OS executable for this
+                // release-file child; keep the production image limit intact.
+                let executable = PathBuf::from("/bin/sh").canonicalize()?;
+                let mut command = Command::new(&executable);
+                command
+                    .args([
+                        "-c",
+                        "while [ ! -e \"$1\" ]; do sleep 0.02; done",
+                        "eliot-identity-fixture",
+                    ])
+                    .arg(release)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                (executable, command)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let (executable, command) = (
+                std::env::current_exe()?,
+                fixture_child_command(release, true),
+            );
             spawn_supervisor_child_with_identity_reader(
                 &runtime.owner.store,
                 &executable,
                 b"",
                 custody,
-                fixture_child_command(release, true),
+                command,
                 read_identity,
             )
             .await
