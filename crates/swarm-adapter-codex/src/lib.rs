@@ -2514,6 +2514,7 @@ fn strip_windows_namespace_prefix(path: &str) -> Option<String> {
     None
 }
 
+#[cfg(windows)]
 fn normalize_windows_path_identity(path: &str) -> Option<String> {
     let path = path.replace('/', "\\");
     let path = strip_windows_namespace_prefix(&path)?;
@@ -2768,7 +2769,7 @@ impl NativeClient {
         Self::attach_inner(endpoint, bearer, credential_unavailable, events, true).await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     async fn attach_for_existing_thread_readback(
         endpoint: &str,
         events: NativeEventSink,
