@@ -682,4 +682,170 @@ process.stdin.on('end',()=>process.exit(0));
   }
 }
 
+// 7. An ephemeral host with no compatible metadata readback must reject
+// dispatch before creating a native turn or a replay record.
+{
+  const fixture=await load('session-list-unsupported.json');
+  const dir=await mkdtemp(path.join(os.tmpdir(),'muse-session-list-unsupported-'));
+  const stateDir=path.join(dir,'state');
+  const home=path.join(dir,'native-home');
+  await mkdir(stateDir);await mkdir(home);
+  const ownerFile=path.join(stateDir,'owner.json');
+  const token='fixture-session-list-unsupported-boot';
+  await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token}));
+  const nativeScript=path.join(dir,'fake-native.mjs');
+  const fixturePath=path.join(dir,'native-fixture.json');
+  const auditPath=path.join(dir,'native-audit.json');
+  await writeFile(fixturePath,JSON.stringify(fixture));
+  const sessionId='ses_list_unsupported_fixture';
+  const openId='50000000-0000-4000-8000-000000000001';
+  const refreshId='50000000-0000-4000-8000-000000000002';
+  const sendId='50000000-0000-4000-8000-000000000003';
+  const sentText='fixture-only-payload-must-not-reach-native';
+  function command(operationId,createdAtMs,method,input,routeExtra={}) {
+    const inputSha256=createHash('sha256').update(canonicalFixtureJson(input),'utf8').digest('hex');
+    return {operation_id:operationId,created_at_ms:createdAtMs,method,binding_id:'fixture-binding',generation:1,
+      native_root_id:sessionId,route:{runtime:'muse',module_artifact_id:museDescriptor.artifact.artifact_id,...routeExtra},
+      input_sha256:inputSha256,input};
+  }
+  const openCommand=command(openId,AT_MS+20,'agent.open',{},
+    {native_options:{workspaceRoot:home,modelId:'fixture-model',reasoningEffort:'max'}});
+  const refreshCommand=command(refreshId,AT_MS+21,'agent.refresh',{});
+  const sendCommand=command(sendId,AT_MS+22,'agent.send',{delivery:'next_turn',text:sentText});
+  await writeFile(nativeScript,String.raw`
+import { readFile, writeFile } from 'node:fs/promises';
+const arg=name=>{const i=process.argv.indexOf(name);return i<0?null:process.argv[i+1]};
+const home=arg('--home'),auditPath=arg('--audit'),fixturePath=arg('--fixtures');
+const fixture=JSON.parse(await readFile(fixturePath,'utf8'));
+const audit={methods:[],turn_start_count:0,turn_start_text:null,session_read_count:0,session_resume_count:0,
+  session_list_count:0,session_list_params:null};
+const session={sessionId:${JSON.stringify(sessionId)},status:'idle',activeTurnId:null,modelId:'fixture-model',
+  providerId:null,turnCount:0,workspaceRoot:home};
+const save=()=>writeFile(auditPath,JSON.stringify(audit));
+const respond=(id,result,error,after)=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id,...(error?{error}:{result})})+'\n',after);
+async function handle(frame){
+  if(typeof frame.method!=='string'||!Object.hasOwn(frame,'id'))return;
+  audit.methods.push(frame.method);
+  if(frame.method==='initialize'){
+    await save();
+    respond(frame.id,{museHome:home,serverInfo:{name:'fixture-muse',version:'1.4.0'},schema:{fingerprint:'fixture-schema'},
+      sessionDurability:'ephemeral',grantedCapabilities:[]});
+    return;
+  }
+  if(frame.method==='usage/read'){
+    await save();respond(frame.id,null,{code:-32601,message:'Method not found',data:{kind:'methodNotFound'}});return;
+  }
+  if(frame.method==='session/start'){
+    await save();respond(frame.id,{session});return;
+  }
+  if(frame.method==='session/list'){
+    audit.session_list_count++;
+    audit.session_list_params=frame.params;
+    await save();
+    if(audit.session_list_count===1){respond(frame.id,{sessions:[session],nextCursor:null});return;}
+    respond(frame.id,null,{code:fixture.native_error.code,message:'Method not found',data:fixture.native_error.data},()=>process.exit(0));return;
+  }
+  if(frame.method==='approval/listPending'){await save();respond(frame.id,{approvals:[],userInputs:[]});return;}
+  if(frame.method==='session/read')audit.session_read_count++;
+  if(frame.method==='session/resume')audit.session_resume_count++;
+  if(frame.method==='turn/start'){
+    audit.turn_start_count++;
+    audit.turn_start_text=frame.params?.input?.map(part=>part.text).join('\n')??null;
+  }
+  await save();respond(frame.id,{});
+}
+process.stdin.setEncoding('utf8');
+let buffer='';
+process.stdin.on('data',chunk=>{
+  buffer+=chunk;let end;
+  while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;
+    try{void handle(JSON.parse(line)).catch(()=>process.exit(2));}catch{process.exit(2);}}
+});
+process.stdin.on('end',()=>process.exit(0));
+`);
+  const endpoint=process.platform==='win32'?'\\\\.\\pipe\\muse-session-list-unsupported-'+randomUUID():path.join(dir,'control.sock');
+  const sockets=new Set();
+  const outcomes=new Map();
+  const commands=[openCommand];
+  let refreshQueued=false,sendQueued=false,bridge,stderr='',teardownStarted=false;
+  let resolveFinished,rejectFinished;
+  const finished=new Promise((resolve,reject)=>{resolveFinished=resolve;rejectFinished=reject;});
+  const server=net.createServer(socket=>{
+    sockets.add(socket);socket.setEncoding('utf8');let buffer='';
+    socket.on('close',()=>sockets.delete(socket));
+    socket.on('error',error=>{if(teardownStarted&&error?.code==='ECONNRESET')return;
+      rejectFinished(new Error(`session-list fixture socket: ${error?.code??error?.message??error}`));});
+    socket.on('data',chunk=>{
+      buffer+=chunk;let end;
+      while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;
+        let packet;try{packet=JSON.parse(line);}catch{rejectFinished(new Error('session-list fixture received invalid JSON'));return;}
+        void respondHost(socket,packet).catch(rejectFinished);
+      }
+    });
+  });
+  async function respondHost(socket,packet) {
+    let result={};
+    if(packet.method==='client.hello')result={client_id:'muse-fixture-client'};
+    else if(packet.method==='module.hello'){
+      assert.deepEqual(packet.params.module_contract,museModuleContractClaim);
+      result={binding_id:'fixture-binding',generation:1,recovery_required:false,native_root_id:null,native_scope_key:null,
+        module_contract_negotiation:museModuleContractNegotiation};
+    } else if(packet.method==='module.next') {
+      if(commands.length)result={command:commands.shift()};
+      else await delay(10);
+    } else if(packet.method==='module.outcome') {
+      const outcome=packet.params;outcomes.set(outcome.operation_id,outcome);
+      if(outcome.operation_id===openId&&outcome.outcome==='applied'&&!refreshQueued){commands.push(refreshCommand);refreshQueued=true;}
+      if(outcome.operation_id===refreshId&&outcome.outcome==='applied'&&!sendQueued){commands.push(sendCommand);sendQueued=true;}
+      if(outcome.operation_id===sendId)resolveFinished(outcome);
+    }
+    socket.write(JSON.stringify({jsonrpc:'2.0',id:packet.id,result})+'\n');
+  }
+  let closed,closeResult;
+  try {
+    await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
+    const credentialFile=path.join(dir,'credential.json');
+    const configFile=path.join(dir,'module.json');
+    await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.11',
+      command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',fixturePath]}));
+    const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
+      TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
+    bridge=spawn(process.execPath,[path.join(here,'bridge.mjs'),'--config',configFile],
+      {cwd:here,env,windowsHide:true,stdio:['ignore','ignore','pipe']});
+    bridge.stderr.setEncoding('utf8');bridge.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
+    closed=new Promise(resolve=>bridge.once('close',(code,signal)=>resolve({code,signal})));
+    const outcome=await Promise.race([finished,delay(12000).then(()=>{throw new Error(`session-list fixture timed out: ${stderr}`);})]);
+    assert.equal(outcomes.get(openId)?.outcome,'applied','the fixture root opens before dispatch preflight');
+    assert.equal(outcomes.get(refreshId)?.outcome,'applied','an exact ephemeral session/list row supports refresh');
+    assert.equal(outcome.outcome,fixture.expected.operation_outcome);
+    assert.equal(outcome.details.diagnostic_code,fixture.expected.diagnostic);
+    assert.equal(outcome.details.native_code,fixture.native_error.code);
+    assert.equal(outcome.details.native_kind,fixture.native_error.data.kind);
+  } finally {
+    teardownStarted=true;
+    if(bridge&&bridge.exitCode===null)bridge.kill('SIGTERM');
+    if(bridge&&closed)closeResult=await Promise.race([closed,delay(5000).then(()=>null)]);
+    for(const socket of sockets)socket.destroy();
+    if(server.listening)await new Promise(resolve=>server.close(resolve));
+    try {
+      const audit=JSON.parse(await readFile(auditPath,'utf8'));
+      for(const method of fixture.expected.no_requests)assert.equal(audit.methods.includes(method),false,`${method} stays before no native effect`);
+      assert.equal(audit.turn_start_count,0,'unsupported readback prevents turn/start');
+      assert.equal(audit.turn_start_text,null,'fixture payload never reaches native input');
+      assert.equal(audit.session_list_count,2,'one supported row is read, then the unavailable dispatch readback fails');
+      assert.equal(audit.session_read_count,0,'ephemeral profile never calls the withheld session/read method');
+      assert.equal(audit.session_resume_count,0,'dispatch failure never attempts recovery');
+      assert.equal(audit.session_list_params?.workspaceRoot,home,'readback stays within the configured workspace');
+      assert.equal(audit.session_list_params?.limit,200,'the native list page is bounded');
+      const checkpoint=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
+      assert.equal(checkpoint.native_pending?.some(([id])=>id===sendId),false,'failed preflight creates no replayable native command');
+    } finally {
+      await rm(dir,{recursive:true,force:true});
+    }
+    assert.ok(closeResult,'the fixture bridge stops after the fake native host has exited');
+  }
+  console.log('PASS ephemeral session-list fixture: unsupported readback rejects before native input or replay record');
+}
+
 console.log('MUSE SELFTEST OK');

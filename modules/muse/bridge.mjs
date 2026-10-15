@@ -203,6 +203,83 @@ function compactSession(s) {
   return { sessionId:s.sessionId, status:s.status, activeTurnId:s.activeTurnId,
     modelId:s.modelId, providerId:s.providerId, approvalMode:s.approvalMode, attention:s.attention, turnCount:s.turnCount };
 }
+const SESSION_LIST_LIMIT=200;
+class NativeCompatibilityError extends Error {
+  constructor(diagnosticCode,nativeError) {
+    super(diagnosticCode);
+    this.name='NativeCompatibilityError';
+    this.diagnosticCode=diagnosticCode;
+    if(nativeError instanceof MspError)this.nativeError=nativeError;
+  }
+}
+function nativeErrorOf(error) {
+  if(error instanceof MspError)return error;
+  return error instanceof NativeCompatibilityError?error.nativeError:null;
+}
+function diagnosticCode(error,fallback='NATIVE_ERROR') {
+  if(error instanceof NativeCompatibilityError)return error.diagnosticCode;
+  if(error instanceof MspError)return 'NATIVE_ERROR';
+  return typeof error?.message==='string'&&/^[A-Z0-9_]{1,120}$/.test(error.message)?error.message:fallback;
+}
+function methodNotFound(error) {
+  const native=nativeErrorOf(error);
+  return native?.code===-32601||native?.kind==='methodNotFound';
+}
+function validateNativeSession(session,sessionId,{allowNotLoaded=false}={}) {
+  if(!isRecord(session)||session.sessionId!==sessionId)throw new NativeCompatibilityError('NATIVE_SESSION_READBACK_IDENTITY_MISMATCH');
+  if(!['notLoaded','idle','running'].includes(session.status))throw new NativeCompatibilityError('NATIVE_SESSION_READBACK_STATUS_UNKNOWN');
+  if(!Object.hasOwn(session,'activeTurnId')
+      || session.activeTurnId!==null&&(typeof session.activeTurnId!=='string'||!session.activeTurnId))
+    throw new NativeCompatibilityError('NATIVE_SESSION_READBACK_STATE_INVALID');
+  if(session.status==='idle'&&session.activeTurnId!==null
+      || session.status==='running'&&typeof session.activeTurnId!=='string')
+    throw new NativeCompatibilityError('NATIVE_SESSION_READBACK_STATE_INVALID');
+  if(session.status==='notLoaded'&&!allowNotLoaded)throw new NativeCompatibilityError('NATIVE_SESSION_READBACK_NOT_LOADED');
+  if(session.modelId!==null&&session.modelId!==undefined&&typeof session.modelId!=='string')
+    throw new NativeCompatibilityError('NATIVE_SESSION_READBACK_MODEL_INVALID');
+  return session;
+}
+async function readListedSession(sessionId,{allowNotLoaded=false}={}) {
+  if(!msp)throw new Error('NATIVE_NOT_OPEN');
+  const workspaceRoot=routeDefaults.workspaceRoot;
+  if(typeof workspaceRoot!=='string'||!path.isAbsolute(workspaceRoot))
+    throw new NativeCompatibilityError('NATIVE_SESSION_LIST_WORKSPACE_UNAVAILABLE');
+  let result;
+  try {
+    result=await msp.connection.request('session/list',{workspaceRoot,limit:SESSION_LIST_LIMIT});
+  } catch(error) {
+    if(methodNotFound(error))throw new NativeCompatibilityError('NATIVE_SESSION_LIST_UNSUPPORTED',nativeErrorOf(error));
+    throw error;
+  }
+  if(!Array.isArray(result?.sessions)||!(result.nextCursor===null||typeof result.nextCursor==='string'))
+    throw new NativeCompatibilityError('NATIVE_SESSION_LIST_RESPONSE_INVALID');
+  const matches=result.sessions.filter(session=>session?.sessionId===sessionId);
+  if(matches.length>1)throw new NativeCompatibilityError('NATIVE_SESSION_LIST_IDENTITY_AMBIGUOUS');
+  if(matches.length===0)throw new NativeCompatibilityError(result.nextCursor
+    ?'NATIVE_SESSION_LIST_READBACK_INCOMPLETE':'NATIVE_SESSION_LIST_SESSION_MISSING');
+  return validateNativeSession(matches[0],sessionId,{allowNotLoaded});
+}
+let sessionReadUnavailable=false;
+async function readNativeSession(sessionId,{allowNotLoaded=false}={}) {
+  if(!msp)throw new Error('NATIVE_NOT_OPEN');
+  if(latest.host_durability?.profile==='durable'&&!sessionReadUnavailable) {
+    try {
+      const result=await msp.connection.request('session/read',{sessionId,excludeItems:true});
+      const session=validateNativeSession(result?.session,sessionId,{allowNotLoaded});
+      if(typeof result.viewCursor!=='string'||!result.viewCursor)
+        throw new NativeCompatibilityError('NATIVE_SESSION_READBACK_CURSOR_MISSING');
+      return {session,method:'session/read',viewCursor:result.viewCursor};
+    } catch(error) {
+      if(!methodNotFound(error))throw error;
+      sessionReadUnavailable=true;
+    }
+  }
+  return {session:await readListedSession(sessionId,{allowNotLoaded}),method:'session/list'};
+}
+function sessionResumeUnavailableCode() {
+  return latest.host_durability?.profile==='ephemeral'
+    ?'NATIVE_SESSION_RESUME_UNSUPPORTED_EPHEMERAL':'NATIVE_SESSION_RESUME_DURABILITY_UNKNOWN';
+}
 const argv = process.argv.slice(2);
 if (argv.length !== 2 || argv[0] !== '--config') {
   console.error('Usage: node bridge.mjs --config <local-module.json>'); process.exit(2);
@@ -546,7 +623,7 @@ function onNotification(n) {
   // Do not duplicate token streams, tool output or the SDK's full transcript.
   if (n.method === 'item/delta') return;
   eventsSeen++;
-  sessionChanged(p.sessionId,
+  sessionChanged(p.sessionId??p.session?.sessionId,
     n.method==='view/gap'||n.method==='session/viewHealthChanged'
       ?'native_view_gap_after_read':'native_event_after_read');
   // A correlated event can resolve a lost turn admission reply. It never
@@ -655,22 +732,23 @@ async function refreshRoot() {
   refreshInFlight = (async () => {
     if (!msp || !rootId) throw new Error('NATIVE_NOT_OPEN');
     const before = sessionVersions.get(rootId)??0;
-    const r = await msp.connection.request('session/read', {sessionId:rootId,excludeItems:true});
-    const snapshot = compactSession(r.session);
-    if (snapshot.sessionId !== rootId) throw new Error('SNAPSHOT_IDENTITY_MISMATCH');
+    const read = await readNativeSession(rootId);
+    const snapshot = compactSession(read.session);
     // Live events received during the read take precedence. No ordering is
     // invented by parsing opaque native cursors.
     const fresh = before === (sessionVersions.get(rootId)??0);
     if (fresh) {
       latest.session = snapshot; latest.execution = snapshot.status;
       latest.active_turn_id = snapshot.activeTurnId;
-      for (const entry of nativePending.values()) acceptModel(entry, snapshot, {method:'session/read',viewCursor:r.viewCursor});
+      const evidence={method:read.method,...(read.viewCursor?{viewCursor:read.viewCursor}:{updatedAt:read.session.updatedAt})};
+      for (const entry of nativePending.values()) acceptModel(entry, snapshot, evidence);
     }
     const pendingAt = sessionVersions.get(rootId)??0;
     const pending = await msp.connection.request('approval/listPending', {sessionId:rootId});
     const pendingApplied = replacePendingInventory(rootId, pending, pendingAt);
     latest.last_refresh = {at_ms:Date.now(),metadata_applied:fresh,pending_inventory_applied:pendingApplied,
-      viewCursor:r.viewCursor,coverage:'root_metadata_and_pending_requests'};
+      readback_method:read.method,...(read.viewCursor?{viewCursor:read.viewCursor}:{}),
+      coverage:'root_metadata_and_pending_requests'};
     changed();
     return latest.last_refresh;
   })();
@@ -729,10 +807,11 @@ async function completeNative(entry, ack) {
   }
 }
 
-async function submitNative(command, method, params, kind, setting, taskPrompt) {
+async function submitNative(command, method, params, kind, setting, taskPrompt, beforeNativeRequest) {
   const entry = {command,id:commandId(command),method,params,kind,setting,taskPrompt,ack:null,resolved:false,submission_boot_id:bootId};
   nativePending.set(command.operation_id, entry);
   await checkpoint(true); // Native mutation must not precede its recoverable ID/payload.
+  beforeNativeRequest?.();
   const ack = await msp.connection.command(method, params, {maxAttempts:1,commandId:entry.id});
   await completeNative(entry, ack);
 }
@@ -746,14 +825,18 @@ async function reconcileNative(target) {
     await completeNative(entry,entry.ack);
     return {target_operation_id:target,disposition:entry.resolved?'resolved':'pending_application',resubmitted:false};
   }
+  if(entry.method==='session/resume'&&latest.host_durability?.profile!=='durable')
+    throw new NativeCompatibilityError(sessionResumeUnavailableCode());
   // This is an explicit reconciliation command, not a read-only healthcheck.
   // SDK/server idempotency joins the SAME command ID with byte-equivalent params.
   try {
     const ack = await msp.connection.command(entry.method, entry.params, {maxAttempts:1,commandId:entry.id});
     await completeNative(entry, ack);
   } catch (error) {
-    saveOutcome(target, {outcome:failedReconcileOutcome(error instanceof MspError?{code:error.code,kind:error.kind}:null, Boolean(entry.ack)),native_root_id:rootId,native_scope_key:nativeScope,
-      details:{evidence_kind:'explicit_same_command_reconciliation',native_code:error instanceof MspError?error.code:null,native_kind:error instanceof MspError?error.kind:null}},entry.command);
+    const native=nativeErrorOf(error);
+    saveOutcome(target, {outcome:failedReconcileOutcome(native?{code:native.code,kind:native.kind}:null, Boolean(entry.ack)),native_root_id:rootId,native_scope_key:nativeScope,
+      details:{evidence_kind:'explicit_same_command_reconciliation',native_code:native?.code??null,native_kind:native?.kind??null,
+        diagnostic_code:diagnosticCode(error)}},entry.command);
     throw error;
   }
   return {target_operation_id:target,disposition:entry.resolved?'resolved':'pending_application',resubmitted:true,native_command_id:entry.id};
@@ -764,26 +847,52 @@ async function refreshChild(id) {
   if (!children.has(id)) throw new Error('CHILD_OUTSIDE_OBSERVED_FAMILY');
   const pending = (async () => {
     let stage='session_read';
-    const before = sessionVersions.get(id)??0;
     try {
-      const r = await msp.connection.request('session/read', {sessionId:id,excludeItems:true});
-      const snapshot = compactSession(r.session);
-      if (snapshot.sessionId!==id) throw new Error('SNAPSHOT_IDENTITY_MISMATCH');
-      // Subscribe from the read cursor, then verify no event arrived during
-      // either subscription replay or pending-request inventory. The previous
-      // snapshot stays intact until that whole read window is stable.
-      stage='view_subscribe';
-      await msp.connection.request('view/subscribe', {sessionId:id,after:required(r,'viewCursor')});
+      let snapshot,readbackMethod,viewCursor,subscriptionViewCursor,baseline;
+      const canReadStored=latest.host_durability?.profile==='durable'&&!sessionReadUnavailable;
+      if(canReadStored) {
+        const before=sessionVersions.get(id)??0;
+        let read;
+        try {
+          read=await msp.connection.request('session/read',{sessionId:id,excludeItems:true});
+        } catch(error) {
+          if(!methodNotFound(error))throw error;
+          sessionReadUnavailable=true;
+        }
+        if(read) {
+          validateNativeSession(read.session,id,{allowNotLoaded:true});
+          viewCursor=required(read,'viewCursor');
+          snapshot=compactSession(read.session);readbackMethod='session/read';baseline=before;
+          // Subscribe from the read cursor, then verify no event arrived during
+          // either subscription replay or pending-request inventory.
+          stage='view_subscribe';
+          await msp.connection.request('view/subscribe',{sessionId:id,after:viewCursor});
+        }
+      }
+      if(!snapshot) {
+        // Ephemeral hosts intentionally withhold session/read. Subscribe from
+        // the current head first, then list the exact loaded row. If an event
+        // arrives during the list/pending window, retain the prior stale state.
+        stage='view_subscribe';
+        const subscribed=await msp.connection.request('view/subscribe',{sessionId:id});
+        subscriptionViewCursor=required(subscribed,'viewCursor');
+        baseline=sessionVersions.get(id)??0;
+        stage='session_list';
+        const session=await readListedSession(id);
+        snapshot=compactSession(session);readbackMethod='session/list';
+      }
       const pendingAt = sessionVersions.get(id)??0;
       stage='pending_inventory';
       const questions = await msp.connection.request('approval/listPending',{sessionId:id});
       const pendingApplied = replacePendingInventory(id, questions, pendingAt);
-      const fresh = before===(sessionVersions.get(id)??0);
+      const fresh = baseline===(sessionVersions.get(id)??0);
       const refreshed={at_ms:Date.now(),session_id:id,metadata_applied:fresh,pending_inventory_applied:pendingApplied,
-        viewCursor:r.viewCursor,coverage:'observed_child_metadata_and_pending_requests'};
+        readback_method:readbackMethod,...(viewCursor?{viewCursor}:{subscription_view_cursor:subscriptionViewCursor}),
+        coverage:'observed_child_metadata_and_pending_requests'};
       const current=children.get(id);
       if (fresh) {
-        children.set(id,{...current,snapshot,snapshot_freshness:'fresh',snapshot_freshness_reason:'stable_native_read',
+        children.set(id,{...current,snapshot,snapshot_freshness:'fresh',snapshot_freshness_reason:readbackMethod==='session/list'
+          ?'stable_session_list_after_view_subscription':'stable_native_read',
           last_refresh:refreshed,last_refresh_attempt:{...refreshed,status:'applied'}});
       } else {
         children.set(id,{...current,snapshot_freshness:current?.snapshot?'stale':'unknown',snapshot_freshness_reason:'native_event_during_refresh',
@@ -796,11 +905,12 @@ async function refreshChild(id) {
       // refresh as stale evidence. A failed/missing read only changes the
       // currentness marker and records a bounded diagnostic for this attempt.
       const current=children.get(id);
+      const native=nativeErrorOf(error);
       children.set(id,{...current,snapshot_freshness:current?.snapshot?'stale':'unknown',snapshot_freshness_reason:'native_read_failed',
         last_refresh_attempt:{at_ms:Date.now(),status:'failed',stage,
           error_type:error?.name??'Error',
-          native_kind:error instanceof MspError?error.kind:undefined,
-          diagnostic_code:typeof error?.message==='string'&&/^[A-Z0-9_]{1,80}$/.test(error.message)?error.message:'NATIVE_READ_FAILED',
+          native_code:native?.code??undefined,native_kind:native?.kind??undefined,
+          diagnostic_code:diagnosticCode(error,'NATIVE_READ_FAILED'),
           snapshot_retained:Boolean(current?.snapshot)}});
       changed();
       throw error;
@@ -819,6 +929,7 @@ async function launchConnection(options) {
   const allowed=['workspaceRoot','modelId','providerId','reasoningEffort','approvalMode'];
   for (const name of Object.keys(options)) if (!allowed.includes(name)) throw new Error(`UNSUPPORTED_NATIVE_OPTION_${name}`);
   // Explicit launch only, never from describe/status/reconnect. Current vendor auth is inherited.
+  sessionReadUnavailable=false;
   handshake=(recovery?spawnOwned:spawnMspConnection)({command:config.command,args:config.args,cwd:options.workspaceRoot,
     onStderr:()=>{latest.stderr_chunks=(latest.stderr_chunks??0)+1;}});
   handshake.onNotification(onNotification);
@@ -883,24 +994,26 @@ async function startNative(command) {
   return {native_scope_key:nativeScope,native_root_id:rootId,details:{session:latest.session,server:init.serverInfo,
     reasoning:{requested:options.reasoningEffort,application:'per_turn_at_submission'},fingerprint_warning:Boolean(msp.fingerprintWarning)}};
 }
-async function recoverNative(command) {
+async function recoverNative(command,markNativeAdmissionPossible) {
   if(!recovery || !rootId || !nativeScope)throw new Error('RECOVERY_CHECKPOINT_UNAVAILABLE');
   if(command.input.expected_boot_id!==bootId || command.native_root_id!==rootId)throw new Error('RECOVERY_TARGET_CHANGED');
   if(nativeReady)throw new Error('NATIVE_ALREADY_READY');
+  if(latest.host_durability?.profile==='ephemeral')throw new NativeCompatibilityError(sessionResumeUnavailableCode());
   if(!handshake)await launchConnection(routeDefaults);
   if(!msp)throw new Error('NATIVE_INITIALIZE_UNKNOWN');
+  if(latest.host_durability?.profile!=='durable')throw new NativeCompatibilityError(sessionResumeUnavailableCode());
   // Check the retained root before taking a writer lease. Never replace a
   // missing session with a new one, fork, or an initial Task prompt.
-  const read=await msp.connection.request('session/read',{sessionId:rootId,excludeItems:true});
+  const read=await readNativeSession(rootId,{allowNotLoaded:true});
   const session=compactSession(read.session);
-  if(session.sessionId!==rootId)throw new Error('RECOVERY_SESSION_MISMATCH');
   if(!modelMatches(session,routeDefaults)) {
     const expected=[...nativePending.values()].some(entry=>entry.kind==='configure' && entry.setting?.key==='model' && modelMatches(session,entry.setting.desired));
     if(!expected)throw new Error('RECOVERY_MODEL_MISMATCH');
     routeDefaults.modelId=session.modelId;routeDefaults.providerId=session.providerId??undefined;
     await checkpoint(true);
   }
-  await submitNative(command,'session/resume',{sessionId:rootId,excludeItems:true},'recover');
+  await submitNative(command,'session/resume',{sessionId:rootId,excludeItems:true},'recover',undefined,undefined,
+    markNativeAdmissionPossible);
 }
 async function execute(command) {
   const base={operation_id:command.operation_id};
@@ -909,13 +1022,13 @@ async function execute(command) {
     if(!moduleReceipt(command))throw new Error('HOST_COMMAND_IDENTITY_INVALID');
     let result;
     if (command.method==='agent.open') { nativeAdmissionPossible=true;result=await startNative(command); }
-    else if(command.method==='agent.recover') {nativeAdmissionPossible=true;await recoverNative(command);return;}
+    else if(command.method==='agent.recover') {await recoverNative(command,()=>{nativeAdmissionPossible=true;});return;}
     else {
       if (!msp || command.native_root_id!==rootId) throw new Error('NATIVE_IDENTITY_MISMATCH');
       const p=command.input;
       if (command.method==='task.dispatch' || command.method==='agent.send') {
         const taskPrompt=command.method==='task.dispatch'?taskPromptFor(command):undefined;
-        const observed=await msp.connection.request('session/read',{sessionId:rootId});
+        const observed=await readNativeSession(rootId);
         if(!modelMatches(observed.session,routeDefaults))throw new Error('MODEL_CHANGED_BEFORE_SEND');
         const steer=p.delivery==='steer';
         const promptText=taskPrompt?taskPrompt.envelope.prompt:required(p,'text');
@@ -942,7 +1055,7 @@ async function execute(command) {
         const goal = goalCommand(p,rootId);
         if (goal.startsWork) {
           if (standingEffort !== routeDefaults.reasoningEffort) throw new Error('CONFIGURE_STANDING_EFFORT_BEFORE_GOAL');
-          const read = await msp.connection.request('session/read',{sessionId:rootId});
+          const read = await readNativeSession(rootId);
           if (!modelMatches(read.session,routeDefaults)) throw new Error('MODEL_CHANGED_BEFORE_GOAL');
         }
         nativeAdmissionPossible = true;
@@ -962,12 +1075,15 @@ async function execute(command) {
     }
     saveOutcome(command.operation_id,{outcome:'applied',...result},command);
   } catch(error) {
-    // Only the pinned durable commandRejected code/kind settles admitted
-    // native work. Other errors can prove nothing or mean nothing was admitted;
-    // keep those operations unknown for explicit same-ID reconciliation.
-    const rejected=!nativeAdmissionPossible || error instanceof MspError && (error.code===-32030 || error.kind==='commandRejected');
+    // Compatibility and method-not-found failures prove no native method ran.
+    // After admission, only the pinned durable commandRejected code/kind settles
+    // native work; other errors remain unknown for explicit same-ID reconciliation.
+    const native=nativeErrorOf(error);
+    const rejected=!nativeAdmissionPossible || error instanceof NativeCompatibilityError || methodNotFound(error)
+      || native && (native.code===-32030 || native.kind==='commandRejected');
     const accepted = nativePending.get(command.operation_id)?.ack;
-    const outcome={...base,outcome:accepted?'accepted':rejected?'rejected':'unknown',details:{error_type:error.name,native_kind:error instanceof MspError?error.kind:null,native_code:error instanceof MspError?error.code:null,diagnostic_code:error instanceof MspError?'NATIVE_ERROR':String(error.message).slice(0,120)}};
+    const outcome={...base,outcome:accepted?'accepted':rejected?'rejected':'unknown',details:{error_type:error.name,
+      native_kind:native?.kind??null,native_code:native?.code??null,diagnostic_code:diagnosticCode(error,String(error.message).slice(0,120))}};
     if(rootId){outcome.native_root_id=rootId;outcome.native_scope_key=nativeScope;}
     saveOutcome(command.operation_id,outcome,command);
   } finally {
@@ -1013,7 +1129,8 @@ const interval=setInterval(()=>{
 interval.unref();
 async function stop(){
   if(stopping)return;stopping=true;connected=false;control?.close();clearInterval(interval);
-  // Only explicit termination of this SDK owner closes the native transport.
+  // SDK close ends this owned transport/process. The public MSP surface has no
+  // session/close request; do not fabricate one or infer session settlement here.
   await checkpoint(true).catch(()=>{});
   if(handshake)await handshake.close().catch(()=>{});
 }
