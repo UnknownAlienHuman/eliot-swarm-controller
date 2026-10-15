@@ -9,7 +9,7 @@ the new version is activated for new bindings, and how to roll back.
 
 | Fact | Value |
 |---|---|
-| Module artifact | `muse-sdk-1.3.0-bridge.11` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
+| Module artifact | `muse-sdk-1.3.0-bridge.12` (route `module_artifact_id`, module config `moduleArtifactId`, `config/controller.example.toml`) |
 | SDK package | `@muse-code/sdk` **1.3.0**, exact, via `package.json` + `package-lock.json`; installed module-locally with `npm ci`, never globally |
 | SDK canonical source | `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT); the MSP schema is pinned at that commit |
 | Bridge code | ELIOT-owned `*.mjs` in this directory (`bridge`, `checkpoint`, `control`, `owned`, `results`, `settings`) |
@@ -90,19 +90,21 @@ the recorded root/known child and falls back to root refresh for an unknown
 session. No splice-fill, native decision or gap-closure claim is fabricated.
 The Store receives no fabricated native ID or decision.
 
+Bridge.12 retains the bridge.11 observation and checkpoint behavior and adds session-scoped native MCP admission: initialize requests the documented `sessionMcp` grant, and a configured `mcpServers` map is validated against the closed transport union and forwarded as `session/start` config over the raw Connection (the pinned facade omits `config` until its grant check lands). Retained installed CLI 1.4.0 observations show `sessionMcp` in both durable and ephemeral profiles. `session/start` accepted config even when a required stdio executable was unavailable, so its ACK proves admission only and says nothing about server liveness. The bridge refuses out-of-union transports before sending; a separate direct native decode refused an unknown transport with -32602. The documented reads (`session/read`, `view/subscribe`, `view/page`, `skill/list` and `session/list`) exposed no native MCP inventory, and an eight-second view watch on an MCP-attached session delivered only `session/started`. No model, turn, native inventory, or dispatch claim follows from admission; the Store gate refuses dispatch.
+
 A present checkpoint containing JSON null fails with CHECKPOINT_CORRUPT before
 host connection or native launch; an absent checkpoint keeps its existing
 fresh-state behavior. The SDK pin is unchanged. The current bridge rejects a
 configuration naming an earlier artifact; do not relabel an existing checkpoint
 or overwrite a running bridge to bypass that check. The host must retain and
-accept the exact bridge.11 descriptor before activation. No earlier fixture
-pass is transferred to bridge.11.
+accept the exact bridge.12 descriptor before activation. No earlier fixture
+pass is transferred to bridge.12.
 
 ## Activation
 
-The host native-usage consumer supports bridge.9, bridge.10 and bridge.11 while
+The host native-usage consumer supports bridge.9 through bridge.12 while
 checking each observation against its binding's exact artifact. Register the
-exact bridge.11 descriptor before activating this source for new bindings.
+exact bridge.12 descriptor before activating this source for new bindings.
 
 Activation is per binding, through the recorded artifact id:
 
@@ -110,14 +112,14 @@ Activation is per binding, through the recorded artifact id:
    directory. Never overwrite the scripts or executable of a running
    bridge, and never retrofit proof into it (README rule); a running
    bridge keeps the exact code it started with.
-2. Set `muse-sdk-1.3.0-bridge.11` in both the controller route
+2. Set `muse-sdk-1.3.0-bridge.12` in both the controller route
    (`module_artifact_id`) and the private module config
    (`moduleArtifactId`). They must match exactly.
 3. Reserve new bindings with `agent.open`. A binding records the
    artifact id of its route at reservation; the bridge announces its id
    in `module.hello` and the host rejects a mismatch with
-   `ARTIFACT_MISMATCH`. New bindings therefore run bridge.11; existing
-   bridge.9/bridge.10 bindings keep their recorded artifact id and original
+   `ARTIFACT_MISMATCH`. New bindings therefore run bridge.12; existing
+   bridge.9 through bridge.11 bindings keep their recorded artifact id and original
    code. The bridges never cross-serve a binding.
 4. Retire the old bridge only after its bindings are released and its
    managed process group has departed on its own. The module-run owner

@@ -719,6 +719,11 @@ pub(super) fn current_dispatch_capability_readback(
         return dispatch_capability_readback(open_code["state"].as_str() == Some("ready"));
     }
 
+    if route.runtime == "muse" {
+        let muse = super::launcher_mcp_tools::muse_connection_readback(db, launch_operation_id);
+        return dispatch_capability_readback(muse["state"].as_str() == Some("ready"));
+    }
+
     let ready = route.runtime == "antigravity"
         && route.module_artifact_id == antigravity_capability::ANTIGRAVITY_ARTIFACT_ID
         && require_current_dispatch_capability(db, config, launch_operation_id, None).is_ok();
@@ -743,6 +748,14 @@ pub(super) fn require_current_dispatch_capability(
             config,
             launch_operation_id,
             dispatch_operation_id,
+        );
+    }
+
+    if route.runtime == "muse" {
+        return super::launcher_mcp_tools::require_current_muse_connection(
+            db,
+            &route,
+            launch_operation_id,
         );
     }
 
@@ -1857,3 +1870,47 @@ fn stale_capability(message: &str) -> Error {
 
 #[cfg(test)]
 pub(in crate::store) mod preinput_contract_tests;
+#[cfg(test)]
+mod muse_router_tests {
+    use crate::config::{Config, Route};
+    use rusqlite::Connection;
+    use serde_json::Value;
+
+    const OP: &str = "op-muse-router-1";
+
+    fn config() -> Config {
+        Config {
+            routes: vec![Route {
+                alias: "muse-manager".into(),
+                runtime: "muse".into(),
+                module_artifact_id: "muse-sdk-1.3.0-bridge.12".into(),
+                enabled: true,
+                native_options: Value::Null,
+                workspace_option: None,
+                owned_service: None,
+                admission_policy: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn muse_dispatch_gate_refuses_without_retained_proof() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db.execute(
+            "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) VALUES(?1,'manager','req-muse-router-1','swarm.launch','{}',?2,'queued',1,1,1)",
+            rusqlite::params![OP, "{\"launch_manifest\":{\"runtime\":{\"route\":{\"alias\":\"muse-manager\"}}}}"],
+        )
+        .unwrap();
+        let config = config();
+        let missing = super::require_current_dispatch_capability(&db, &config, OP, None)
+            .expect_err("muse dispatch without a retained record must refuse");
+        assert_eq!(missing.code, "NATIVE_MCP_CAPABILITY_UNAVAILABLE");
+        assert_eq!(
+            missing.message,
+            "exact acknowledged muse MCP proof is not retained"
+        );
+    }
+}

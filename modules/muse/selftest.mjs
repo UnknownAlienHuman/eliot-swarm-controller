@@ -20,6 +20,7 @@ import {
   failedReconcileOutcome,
 } from './observe.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
+import { nativeMcpServers, startNativeMcpSession } from './settings.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 async function load(name) {
@@ -199,7 +200,7 @@ function canonicalFixtureJson(value) {
   try {
     await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-null-fixture',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.11',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.12',
       command:process.execPath,args:[nativeScript]}));
     await writeFile(nativeScript,
       `import { writeFile } from 'node:fs/promises';\nawait writeFile(${JSON.stringify(nativeMarker)},'started');\n`,'utf8');
@@ -528,7 +529,7 @@ process.stdin.on('end',()=>process.exit(0));
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.11',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.12',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',nativeFixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
@@ -807,7 +808,7 @@ process.stdin.on('end',()=>process.exit(0));
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.11',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.12',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',fixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
@@ -1133,7 +1134,7 @@ syncBuiltinESMExports();
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.11',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.12',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',fixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
@@ -1232,4 +1233,67 @@ await runWorkFenceCase('read-race');
 await runWorkFenceCase('checkpoint-race');
 await runWorkFenceCase('goal-checkpoint-race');
 
+// 5. The bridge's closed transport validator mirrors the installed host's
+// session/start union. Invalid entries fail before any native frame; admitted
+// entries keep only validated fields and invent no defaults for mode.
+{
+  const admitted = nativeMcpServers({
+    'local-stdio': { transport:'stdio', command:'C:/tools/probe.exe', mode:'optional' },
+    'remote-http': { transport:'streamableHttp', url:'http://127.0.0.1:9/probe' },
+  });
+  assert.deepEqual(Object.keys(admitted).sort(), ['local-stdio','remote-http']);
+  assert.equal(admitted['local-stdio'].transport, 'stdio');
+  assert.ok(!('mode' in admitted['remote-http']), 'omitted mode stays omitted');
+  assert.deepEqual(nativeMcpServers({}), {}, 'the SDK permits an empty server map');
+  const opaqueServerName = 'MCP service / 服务 '.repeat(8);
+  const manyServers = Object.fromEntries(Array.from({length:40}, (_,index) =>
+    [index === 0 ? opaqueServerName : `fixture-${index}`, {transport:'stdio',command:'fixture-only'}]));
+  assert.deepEqual(nativeMcpServers(manyServers), manyServers,
+    'SDK Record keys stay opaque and have no invented server-count or name limit');
+  assert.throws(() => nativeMcpServers({ bad:{ transport:'bogusPipe' } }));
+  assert.throws(() => nativeMcpServers({ bad:{ transport:'stdio' } }));
+  assert.throws(() => nativeMcpServers({ bad:{ transport:'streamableHttp' } }));
+  assert.throws(() => nativeMcpServers({ bad:{ transport:'stdio', command:'c', extra:'field' } }));
+  assert.throws(() => nativeMcpServers({ bad:'not-an-object' }));
+
+  const protoServer = JSON.parse('{"__proto__":{"transport":"stdio","command":"fixture-only"}}');
+  const protoAdmitted = nativeMcpServers(protoServer);
+  assert.deepEqual(Object.keys(protoAdmitted), ['__proto__']);
+  assert.equal(Object.hasOwn(protoAdmitted, '__proto__'), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(protoAdmitted)), protoServer,
+    'a valid server name is preserved as an own JSON property');
+
+  const requestedServers = nativeMcpServers({
+    'required-dead': { transport:'stdio', command:'fixture-only', mode:'required' },
+  });
+  const failedState = {
+    mcp_servers_requested:Object.keys(requestedServers),
+    mcp_servers_config_forwarded:null,
+    mcp_servers_admission_ack:{session_id:'stale-fixture'},
+  };
+  let admissionPossible = false;
+  await assert.rejects(startNativeMcpSession({
+    async command(method,params) {
+      assert.equal(method,'session/start');
+      assert.deepEqual(params.config.mcpServers,requestedServers);
+      assert.equal(admissionPossible,true,'the admission boundary is marked at the command call');
+      throw new Error('fixture admission rejected');
+    },
+  },{workspaceRoot:'C:/fixture',modelId:'fixture-model'},{maxAttempts:1},requestedServers,failedState,
+    ()=>{admissionPossible=true;}),/fixture admission rejected/);
+  assert.deepEqual(failedState,{
+    mcp_servers_requested:['required-dead'],
+    mcp_servers_config_forwarded:['required-dead'],
+    mcp_servers_admission_ack:null,
+  },'failed session/start is never reported as applied or acknowledged');
+  assert.equal(Object.hasOwn(failedState,'mcp_servers_applied'),false);
+
+  const acceptedState = {mcp_servers_admission_ack:null};
+  await startNativeMcpSession({
+    async command() { return {session:{sessionId:'ses_fixture_ack'}}; },
+  },{workspaceRoot:'C:/fixture',modelId:'fixture-model'},{maxAttempts:1},requestedServers,acceptedState,()=>{});
+  assert.deepEqual(acceptedState.mcp_servers_admission_ack,{session_id:'ses_fixture_ack'},
+    'the admission acknowledgement records only the returned session identity');
+  console.log('PASS native-mcp-servers: closed transport union admitted without invented defaults');
+}
 console.log('MUSE SELFTEST OK');

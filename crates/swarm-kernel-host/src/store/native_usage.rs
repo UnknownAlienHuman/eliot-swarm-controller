@@ -37,7 +37,10 @@ pub(super) fn parse(
         UsageService::Muse => {
             matches!(
                 artifact,
-                "muse-sdk-1.3.0-bridge.9" | "muse-sdk-1.3.0-bridge.10" | "muse-sdk-1.3.0-bridge.11"
+                "muse-sdk-1.3.0-bridge.9"
+                    | "muse-sdk-1.3.0-bridge.10"
+                    | "muse-sdk-1.3.0-bridge.11"
+                    | "muse-sdk-1.3.0-bridge.12"
             ) && matches!(
                 binding["route"]["runtime"].as_str(),
                 Some("muse" | "module")
@@ -259,7 +262,7 @@ mod tests {
 
     #[test]
     fn muse_usage_accepts_exact_artifact_without_cross_serving_other_bindings() {
-        for version in ["9", "10", "11"] {
+        for version in ["9", "10", "11", "12"] {
             let artifact = format!("muse-sdk-1.3.0-bridge.{version}");
             let mut current_observation = observation(snapshot());
             current_observation["module_artifact_id"] = json!(artifact);
@@ -279,6 +282,12 @@ mod tests {
             ("10", "11"),
             ("11", "9"),
             ("11", "10"),
+            ("11", "12"),
+            ("12", "9"),
+            ("12", "10"),
+            ("12", "11"),
+            ("9", "12"),
+            ("10", "12"),
         ] {
             let mut state = observation(snapshot());
             state["module_artifact_id"] = json!(format!("muse-sdk-1.3.0-bridge.{observed}"));

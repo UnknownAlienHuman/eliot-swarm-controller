@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import museDescriptor from './module-descriptor.template.json' with { type: 'json' };
 import { spawnMspConnection, MspError } from '@muse-code/sdk';
 import { Control } from './control.mjs';
-import { configuration, modelMatches, goalCommand } from './settings.mjs';
+import { configuration, modelMatches, goalCommand, nativeMcpServers, startNativeMcpSession } from './settings.mjs';
 import { readResult } from './results.mjs';
 import { spawnOwned } from './owned.mjs';
 import { recoveryState } from './checkpoint.mjs';
@@ -20,8 +20,8 @@ import {
   restoredNativeUsageSnapshot,
 } from './native-usage.mjs';
 
-const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.11';
-const MUSE_ARTIFACT_VERSION = '11';
+const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.12';
+const MUSE_ARTIFACT_VERSION = '12';
 const MAX_TASK_PROMPT_BYTES = 1_000_000;
 const MAX_OBSERVATION_STATE_BYTES = 700_000;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -985,8 +985,9 @@ async function launchConnection(options) {
   if (handshake) throw new Error('NATIVE_ALREADY_OWNED');
   required(options,'workspaceRoot'); required(options,'modelId'); required(options,'reasoningEffort');
   if (!path.isAbsolute(options.workspaceRoot)) throw new Error('WORKSPACE_MUST_BE_ABSOLUTE');
-  const allowed=['workspaceRoot','modelId','providerId','reasoningEffort','approvalMode'];
+  const allowed=['workspaceRoot','modelId','providerId','reasoningEffort','approvalMode','mcpServers'];
   for (const name of Object.keys(options)) if (!allowed.includes(name)) throw new Error(`UNSUPPORTED_NATIVE_OPTION_${name}`);
+  if (options.mcpServers !== undefined) nativeMcpServers(options.mcpServers);
   // Explicit launch only, never from describe/status/reconnect. Current vendor auth is inherited.
   sessionReadUnavailable=false;
   handshake=(recovery?spawnOwned:spawnMspConnection)({command:config.command,args:config.args,cwd:options.workspaceRoot,
@@ -1012,7 +1013,7 @@ async function launchConnection(options) {
     latest.host_death=hostDeathObservation(latest.host_durability?.profile,exit,Date.now());closeNativeUsageConnection();changed();},
     ()=>{nativeReady=false;nativeConnectionExited=true;latest.execution='native_failed';
     latest.host_death=hostDeathObservation(latest.host_durability?.profile,null,Date.now());closeNativeUsageConnection();changed();});
-  msp=await handshake.initialize({clientInfo:{name:'eliot_swarm_controller',version:'0.1.0'}});
+  msp=await handshake.initialize({clientInfo:{name:'eliot_swarm_controller',version:'0.1.0'},capabilities:{requestedCapabilities:['sessionMcp']}});
   beginNativeUsageConnection();
   const init=msp.initializeResult;
   const home=await realpath(required(init,'museHome'));
@@ -1020,6 +1021,7 @@ async function launchConnection(options) {
   if(nativeScope && nativeScope!==scope)throw new Error('RECOVERY_NAMESPACE_MISMATCH');
   nativeScope=scope;
   latest.server=init.serverInfo; latest.schema=init.schema;
+  latest.granted_capabilities=Array.isArray(init.grantedCapabilities)?init.grantedCapabilities.filter(name=>typeof name==="string"):[];
   // The handshake's own durability declaration, classified per SS2.13.1.
   // Recorded at every launch; a restored checkpoint keeps the previous
   // connection's profile until a new handshake replaces it.
@@ -1030,15 +1032,31 @@ async function launchConnection(options) {
   return init;
 }
 
-async function startNative(command) {
+async function startNative(command,markNativeAdmissionPossible) {
   const options=command.route.native_options;
   Object.assign(routeDefaults,options);
+  const mcpServers=options.mcpServers===undefined?undefined:nativeMcpServers(options.mcpServers);
+  delete latest.mcp_servers_requested;
+  delete latest.mcp_servers_config_forwarded;
+  delete latest.mcp_servers_admission_ack;
+  if(mcpServers!==undefined){
+    latest.mcp_servers_requested=Object.keys(mcpServers);
+    latest.mcp_servers_config_forwarded=null;
+    latest.mcp_servers_admission_ack=null;
+  }
   await checkpoint(true);
   const init=await launchConnection(options);
   const params={workspaceRoot:options.workspaceRoot,modelId:options.modelId};
   if(options.providerId!==undefined)params.providerId=options.providerId;
   if(options.approvalMode!==undefined)params.approvalMode=options.approvalMode;
-  const r=await msp.connection.command('session/start',params,{maxAttempts:1,commandId:commandId(command)});
+  if(mcpServers!==undefined){
+    // The pinned facade omits config until its grant check lands; this raw
+    // Connection frame is the only documented forwarding path (installed 1.4.0
+    // refuses unknown transports at decode, verified memory-only, no turn).
+    if(!(Array.isArray(latest.granted_capabilities)&&latest.granted_capabilities.includes('sessionMcp')))throw new Error('SESSION_MCP_NOT_GRANTED');
+  }
+  const r=await startNativeMcpSession(msp.connection,params,
+    {maxAttempts:1,commandId:commandId(command)},mcpServers,latest,markNativeAdmissionPossible);
   rootId=required(r.session,'sessionId'); latest.session=compactSession(r.session);latest.execution=r.session.status;
   // Persist the root identity before any further native work or readback
   // verdict: a crash after session/start must leave a recorded session that
@@ -1050,7 +1068,11 @@ async function startNative(command) {
   latest.reasoning_application='explicit_per_turn_option'; // Sampled at submission, not a claimed inference measurement.
   nativeReady=true;changed();
   await checkpoint();
-  return {native_scope_key:nativeScope,native_root_id:rootId,details:{session:latest.session,server:init.serverInfo,
+  return {native_scope_key:nativeScope,native_root_id:rootId,details:{session:latest.session,server:init.serverInfo,mcp:{
+    granted_capabilities:Array.isArray(latest.granted_capabilities)?[...latest.granted_capabilities]:[],
+    requested_server_names:latest.mcp_servers_requested??null,
+    config_forwarded_server_names:latest.mcp_servers_config_forwarded??null,
+    session_start_admission_ack:latest.mcp_servers_admission_ack??null},
     reasoning:{requested:options.reasoningEffort,application:'per_turn_at_submission'},fingerprint_warning:Boolean(msp.fingerprintWarning)}};
 }
 async function recoverNative(command,markNativeAdmissionPossible) {
@@ -1080,7 +1102,7 @@ async function execute(command) {
   try {
     if(!moduleReceipt(command))throw new Error('HOST_COMMAND_IDENTITY_INVALID');
     let result;
-    if (command.method==='agent.open') { nativeAdmissionPossible=true;result=await startNative(command); }
+    if (command.method==='agent.open') { result=await startNative(command,()=>{nativeAdmissionPossible=true;}); }
     else if(command.method==='agent.recover') {await recoverNative(command,()=>{nativeAdmissionPossible=true;});return;}
     else {
       if (!msp || command.native_root_id!==rootId) throw new Error('NATIVE_IDENTITY_MISMATCH');

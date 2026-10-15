@@ -4531,6 +4531,196 @@ fn record_error(message: &str) -> Error {
     Error::new("NATIVE_MCP_STORE", message)
 }
 
+/// Muse-native MCP install intent and tool-proof arm (C8 consumer predicate).
+///
+/// The pinned `@muse-code/sdk` 1.3.0 facade omits `config` from
+/// `StartSessionOptions` until its `sessionMcp` grant check lands, so the
+/// bridge forwards `config.mcpServers` over the raw `Connection` only after
+/// a granted `initialize`. This arm validates that retained grant plus the
+/// admitted session/config readback. It never borrows the OpenCode install
+/// kind, expected version, or tool-proof contract: a Muse record presented
+/// to the OpenCode arm (and vice versa) is refused by both sides. No model
+/// consumption is claimed; `dispatch_permitted` stays false and dispatch
+/// selection for the `muse` runtime is a later slice.
+const MUSE_BRIDGE_ARTIFACT_ID: &str = "muse-sdk-1.3.0-bridge.12";
+const MUSE_VERSION: &str = "1.4.0";
+const MUSE_MCP_INSTALL_KIND: &str = "muse_mcp_install_intent";
+const MUSE_MCP_PROOF_CONTRACT: &str = "muse-native-mcp-proof-v1";
+
+fn muse_grant_lists_session_mcp(granted: &Value) -> bool {
+    granted.as_array().is_some_and(|grants| {
+        !grants.is_empty()
+            && grants.len() <= 8
+            && grants.iter().all(|entry| {
+                entry
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty() && name.len() <= 64)
+            })
+            && grants
+                .iter()
+                .any(|entry| entry.as_str() == Some("sessionMcp"))
+    })
+}
+
+/// Validate one retained Muse-native MCP record: session-scoped install
+/// intent, connected serve-child readback carrying the granted `sessionMcp`
+/// capability, and the bounded tool-proof envelope. Read-only: no native
+/// contact, no receipt upgrade, no model-consumption claim.
+pub(crate) fn validate_muse_connection_record(record: &Value) -> Result<Value> {
+    if record["schema_version"] != 1 || record["kind"] != "launcher_native_mcp_tools" {
+        return Err(record_error("muse MCP record identity is invalid"));
+    }
+    if record["dispatch_permitted"] != false {
+        return Err(record_error("muse MCP record permits dispatch"));
+    }
+    let assignment = &record["assignment"];
+    if !assignment.is_object() {
+        return Err(record_error("muse MCP assignment is missing"));
+    }
+    let admitted_session = record["session"]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| record_error("muse MCP admitted session is missing"))?;
+    let service = &record["service"];
+    if service["id"].as_str().filter(|id| !id.is_empty()).is_none() {
+        return Err(record_error("muse MCP service identity is missing"));
+    }
+    let service_pid = service["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| record_error("muse MCP service PID is invalid"))?;
+    if service["version"].as_str() != Some(MUSE_VERSION) {
+        return Err(record_error(
+            "muse MCP service version is not the pinned native",
+        ));
+    }
+    let intent = &record["install"]["intent"];
+    if intent["schema_version"] != 1
+        || intent["kind"] != MUSE_MCP_INSTALL_KIND
+        || intent["registration"] != "session_scoped_in_memory"
+        || intent["expected_bridge_artifact"] != MUSE_BRIDGE_ARTIFACT_ID
+        || intent["granted_capability"] != "sessionMcp"
+        || intent["native_tool_set"] != "unknown"
+        || intent["provider_request_context"] != "unknown"
+        || intent["model_consumption"] != "unknown"
+        || intent["dispatch_permitted"] != false
+    {
+        return Err(record_error("muse MCP install intent is invalid"));
+    }
+    if model::canonical(&intent["assignment"])? != model::canonical(assignment)? {
+        return Err(record_error("muse MCP install assignment does not match"));
+    }
+    intent["server_name"]
+        .as_str()
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 96
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte))
+        })
+        .ok_or_else(|| record_error("muse MCP server name is missing"))?;
+    intent["config_digest"]
+        .as_str()
+        .filter(|digest| valid_prefixed_sha256(digest))
+        .ok_or_else(|| record_error("muse MCP config digest is invalid"))?;
+    if record["install"]["state"] != "registered" {
+        return Err(record_error("muse MCP install is not registered"));
+    }
+    let readback = &record["install"]["readback"];
+    if readback["runtime_status"] != "connected"
+        || readback["service_version"].as_str() != Some(MUSE_VERSION)
+        || readback["service_process_id"].as_u64() != Some(u64::from(service_pid))
+        || readback["dispatch_permitted"] != false
+        || !muse_grant_lists_session_mcp(&readback["granted_capabilities"])
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "muse MCP install acknowledgement or sessionMcp grant is incomplete",
+        ));
+    }
+    let tools = &record["tools_readback"];
+    if model::canonical(tools)?.len() > MAX_PRIVATE_READBACK_BYTES
+        || tools["contract"] != MUSE_MCP_PROOF_CONTRACT
+        || tools["dispatch_permitted"] != false
+        || tools["model_consumed"] != "unknown"
+        || model::canonical(&tools["assignment"])? != model::canonical(assignment)?
+        || tools["service"]["id"] != service["id"]
+        || tools["service"]["pid"] != service["pid"]
+        || tools["service"]["version"] != service["version"]
+        || tools["session"]["id"].as_str() != Some(admitted_session)
+        || tools["config_digest"] != intent["config_digest"]
+        || !muse_grant_lists_session_mcp(&tools["granted_capabilities"])
+    {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "muse MCP tool evidence does not match the acknowledged session scope",
+        ));
+    }
+    let mut evidence_without_digest = tools.clone();
+    let evidence_digest = evidence_without_digest
+        .as_object_mut()
+        .and_then(|evidence| evidence.remove("evidence_digest"))
+        .and_then(|digest| digest.as_str().map(str::to_owned))
+        .filter(|digest| valid_prefixed_sha256(digest))
+        .ok_or_else(|| record_error("muse MCP evidence digest is missing or invalid"))?;
+    if digest_json(&evidence_without_digest)? != evidence_digest {
+        return Err(record_error(
+            "muse MCP evidence digest does not match its observer readback",
+        ));
+    }
+    Ok(tools.clone())
+}
+/// Strict dispatch gate for the `muse` runtime.
+///
+/// The route must be the pinned bridge, a record must be retained, and
+/// the record must pass the Muse arm. Admission proof alone must never
+/// become tool proof: the pinned CLI exposes no safe native inventory
+/// surface, so a fully admitted record still ends here with the actual
+/// reason instead of a fabricated inventory.
+pub(crate) fn require_current_muse_connection(
+    db: &Connection,
+    route: &crate::config::Route,
+    launch_operation_id: &str,
+) -> Result<Value> {
+    if route.runtime != "muse" || route.module_artifact_id != MUSE_BRIDGE_ARTIFACT_ID {
+        return Err(Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "muse route is not the pinned bridge",
+        ));
+    }
+    let record = meta(db, &record_key(launch_operation_id))?.ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "exact acknowledged muse MCP proof is not retained",
+        )
+    })?;
+    validate_muse_connection_record(&record)?;
+    Err(Error::new(
+        "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+        "muse MCP tool inventory has no safe native surface on the pinned CLI",
+    ))
+}
+
+/// Bounded public readback for one Muse launch: retained-record state
+/// only, never a dispatch claim. Readiness stays false until a safe
+/// native inventory surface exists.
+pub(crate) fn muse_connection_readback(db: &Connection, launch_operation_id: &str) -> Value {
+    let state = match meta(db, &record_key(launch_operation_id)) {
+        Ok(Some(record)) => match validate_muse_connection_record(&record) {
+            Ok(_) => "recorded_without_inventory",
+            Err(_) => "invalid",
+        },
+        _ => "unavailable",
+    };
+    json!({
+        "schema_version": 1,
+        "state": state,
+        "dispatch_permitted": false,
+        "model_consumed": "unknown",
+    })
+}
 #[cfg(test)]
 #[path = "launcher_mcp_projection_tests.rs"]
 mod projection_contract_tests;
@@ -4860,5 +5050,148 @@ mod failure_event_tests {
             .unwrap();
         assert_eq!(quarantined, 1);
         tx.commit().unwrap();
+    }
+}
+#[cfg(test)]
+mod muse_grant_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn muse_record() -> Value {
+        let assignment = json!({
+            "task_id":"task-muse-1","task_revision":1,"attempt_id":"attempt-muse-1",
+            "binding_id":"binding-muse-1","binding_generation":1,
+            "native_session_id":"01a13dfa-815e-7d73-a5b7-0140071f33cd",
+            "participant_id":"participant-muse-1",
+        });
+        let intent = json!({
+            "schema_version":1,"kind":"muse_mcp_install_intent",
+            "registration":"session_scoped_in_memory",
+            "expected_bridge_artifact":"muse-sdk-1.3.0-bridge.12",
+            "granted_capability":"sessionMcp",
+            "assignment":assignment,
+            "native_tool_set":"unknown","provider_request_context":"unknown",
+            "model_consumption":"unknown","dispatch_permitted":false,
+            "server_name":"probe-unreachable",
+            "config_digest":"sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        });
+        let service = json!({"id":"muse-serve-child","version":"1.4.0","pid":4242});
+        let mut tools = json!({
+            "contract":"muse-native-mcp-proof-v1",
+            "dispatch_permitted":false,"model_consumed":"unknown",
+            "assignment":assignment,
+            "service":service,
+            "session":{"id":"01a13dfa-815e-7d73-a5b7-0140071f33cd"},
+            "granted_capabilities":["sessionMcp"],
+            "config_digest":"sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        });
+        let digest = digest_json(&tools).unwrap();
+        tools
+            .as_object_mut()
+            .unwrap()
+            .insert("evidence_digest".into(), json!(digest));
+        json!({
+            "schema_version":1,"kind":"launcher_native_mcp_tools",
+            "operation_id":"op-muse-grant-1","dispatch_permitted":false,
+            "assignment":assignment,
+            "session":{"id":"01a13dfa-815e-7d73-a5b7-0140071f33cd"},
+            "service":service,
+            "install":{"state":"registered","intent":intent,"readback":{
+                "runtime_status":"connected","service_version":"1.4.0",
+                "service_process_id":4242,"dispatch_permitted":false,
+                "granted_capabilities":["sessionMcp"],
+                "schema_fingerprint":"sha256:36466f634c8c78a812462ec941187fd4547b232ee06153e5feb2a1482f0d3d7f"}},
+            "tools_readback":tools,
+        })
+    }
+
+    #[test]
+    fn muse_grant_arm_accepts_session_mcp_record_and_refuses_tampered_grant() {
+        // Synthetic retained context supplies no live authority; the grant
+        // shape mirrors the installed 1.4.0 initialize/session-start readback
+        // observed memory-only (granted sessionMcp, accepted optional-server
+        // config, bogus transport refused at decode). No model or turn ran.
+        let record: Value =
+            serde_json::from_slice(&serde_json::to_vec(&muse_record()).unwrap()).unwrap();
+        let proof = super::validate_muse_connection_record(&record).unwrap();
+        assert_eq!(proof["contract"], "muse-native-mcp-proof-v1");
+        assert_eq!(proof["dispatch_permitted"], false);
+        assert_eq!(proof["model_consumed"], "unknown");
+        assert_eq!(
+            proof["session"]["id"],
+            "01a13dfa-815e-7d73-a5b7-0140071f33cd"
+        );
+
+        // The OpenCode install kind is refused by the Muse arm: no borrowing.
+        let mut wrong_kind = record.clone();
+        wrong_kind["install"]["intent"]["kind"] = json!("opencode_v2_mcp_install_intent");
+        assert!(super::validate_muse_connection_record(&wrong_kind).is_err());
+
+        // A grant stripped after admission is refused even with a recomputed
+        // enclosing digest: absent sessionMcp stays honest unsupported.
+        let mut stripped = record.clone();
+        stripped["tools_readback"]["granted_capabilities"] = json!([]);
+        let mut evidence = stripped["tools_readback"].clone();
+        evidence.as_object_mut().unwrap().remove("evidence_digest");
+        stripped["tools_readback"]["evidence_digest"] = json!(digest_json(&evidence).unwrap());
+        assert!(super::validate_muse_connection_record(&stripped).is_err());
+    }
+    fn muse_route() -> crate::config::Route {
+        crate::config::Route {
+            alias: "muse-manager".into(),
+            runtime: "muse".into(),
+            module_artifact_id: super::MUSE_BRIDGE_ARTIFACT_ID.into(),
+            enabled: true,
+            native_options: serde_json::Value::Null,
+            workspace_option: None,
+            owned_service: None,
+            admission_policy: None,
+        }
+    }
+
+    fn muse_db() -> rusqlite::Connection {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db
+    }
+
+    #[test]
+    fn muse_gate_refuses_without_inventory_surface() {
+        let mut db = muse_db();
+        let route = muse_route();
+        let missing = super::require_current_muse_connection(&db, &route, "op-muse-missing-1")
+            .expect_err("muse dispatch without a retained record must refuse");
+        assert_eq!(missing.code, "NATIVE_MCP_CAPABILITY_UNAVAILABLE");
+        assert_eq!(
+            missing.message,
+            "exact acknowledged muse MCP proof is not retained"
+        );
+        let mut record = muse_record();
+        record["operation_id"] = json!("op-muse-gate-1");
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        super::set_meta(&tx, &super::record_key("op-muse-gate-1"), &record).unwrap();
+        tx.commit().unwrap();
+        let refused = super::require_current_muse_connection(&db, &route, "op-muse-gate-1")
+            .expect_err("muse admission must not become dispatch");
+        assert_eq!(refused.code, "NATIVE_MCP_CAPABILITY_UNAVAILABLE");
+        assert_eq!(
+            refused.message,
+            "muse MCP tool inventory has no safe native surface on the pinned CLI"
+        );
+        let other = crate::config::Route {
+            runtime: "opencode_v2".into(),
+            ..muse_route()
+        };
+        let routed = super::require_current_muse_connection(&db, &other, "op-muse-gate-1")
+            .expect_err("a non-muse route must not reach the Muse arm");
+        assert_eq!(routed.message, "muse route is not the pinned bridge");
+        let readback = super::muse_connection_readback(&db, "op-muse-gate-1");
+        assert_eq!(readback["state"], "recorded_without_inventory");
+        assert_eq!(readback["dispatch_permitted"], false);
+        let absent = super::muse_connection_readback(&db, "op-muse-missing-1");
+        assert_eq!(absent["state"], "unavailable");
     }
 }

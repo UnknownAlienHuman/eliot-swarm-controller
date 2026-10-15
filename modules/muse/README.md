@@ -1,8 +1,8 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The committed `muse-sdk-1.3.0-bridge.11` implementation retains TaskPrompt/checkpoint behavior and adds bounded observation. The [APP399 verification record](../../docs/remediation/2026-10-12/MUSE-BOUNDED-OBSERVATION-VERIFICATION.json) documents scoped Windows/Linux syntax, SDK import, local fixture and Store-consumer passes for its recorded inputs. Retain and accept the exact descriptor before selecting new bindings. Live Muse/Max inference and Windows native launch remain unqualified.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The `muse-sdk-1.3.0-bridge.12` source retains bridge.11 TaskPrompt/checkpoint behavior and bounded observation, and adds grant-aware session MCP configuration with an explicit native-inventory boundary. The [APP399 verification record](../../docs/remediation/2026-10-12/MUSE-BOUNDED-OBSERVATION-VERIFICATION.json) is for bridge.11 and its recorded source hashes; its scoped syntax, SDK import, fixture and Store-consumer checks do not qualify bridge.12. Retain and accept the exact descriptor before selecting new bindings. Live Muse/Max inference and Windows native launch remain unqualified.
 
-Before activation, register and retain the exact bridge.11 descriptor before
+Before activation, register and retain the exact bridge.12 descriptor before
 selecting it for a new binding. Existing bindings keep their original artifact
 identity and code; an artifact ID must never be relabelled or cross-served.
 
@@ -20,13 +20,22 @@ The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.11'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.12'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
 modelId = 'muse-spark-1.3-contributor'
 reasoningEffort = 'max'
 approvalMode = 'allowAll'
+```
+
+Optional session-scoped native MCP servers (bridge.12): `mcpServers` maps a server name to one closed-union entry. The bridge requests the documented `sessionMcp` grant at initialize and forwards the validated map as `session/start` config over the raw Connection (the pinned facade omits `config` until its grant check lands). Retained installed CLI 1.4.0 observations show the grant in durable and ephemeral profiles and show `session/start` accepting config even when a required stdio executable is unavailable; that admission ACK does not establish server liveness. The bridge rejects transports outside its closed union before forwarding; a separate direct native decode refused an unknown transport (`-32602`). The documented reads (`session/read`, `view/subscribe`, `view/page`, `skill/list`, `session/list`) exposed no native tool inventory, and the view watch delivered only `session/started`. The Store gate continues to refuse dispatch; no native inventory is claimed.
+
+```toml
+[routes.native_options.mcpServers.probe-unreachable]
+transport = 'streamableHttp'
+url = 'http://127.0.0.1:9/probe'
+mode = 'optional'
 ```
 
 ```powershell
@@ -56,17 +65,18 @@ This follows the pinned SDK's [approval update field ownership](https://github.c
 No SDK approval handler or automatic decision is installed. Presentation still
 returns `{}`; an answer remains an explicit addressed `agent.reply` Operation.
 
-This code requires artifact `muse-sdk-1.3.0-bridge.11` and refuses to announce a
+This code requires artifact `muse-sdk-1.3.0-bridge.12` and refuses to announce a
 previous artifact ID. Stage it for new bindings only. Existing bridge.9 and
 bridge.10 bindings and checkpoints retain their original code and identity; they
 are not migrated.
-The SDK pin is unchanged. The APP399 verification record binds the committed
-bridge.11 source to its syntax, SDK import, fixture and Store-consumer checks.
+The SDK pin is unchanged. The APP399 verification record binds bridge.11 source
+hashes to its scoped syntax, SDK import, fixture and Store-consumer checks; it
+does not qualify bridge.12.
 Changed source requires its own checks before activation; installed native
 behavior requires separate qualification. Earlier artifact evidence retains
 its original hashes and scope.
 
-The bridge.11 observation projection measures the complete serialized
+The bridge.12 observation projection measures the complete serialized
 `module.observe` JSON-RPC line against the existing 1 MiB control cap. When
 request details are too large, it retains exact session/native request IDs and
 marks details unknown. If some identities themselves cannot fit, fitting
