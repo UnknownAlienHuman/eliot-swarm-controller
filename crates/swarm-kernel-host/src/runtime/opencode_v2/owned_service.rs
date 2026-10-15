@@ -4010,6 +4010,86 @@ mod deadline_contract_tests {
         fs::write(directory.join("done"), b"done").unwrap();
     }
 
+    #[test]
+    fn owner_readback_requires_the_configured_model_catalog_mode() {
+        for (model_catalog, mismatched_mode) in [("offline", "refresh"), ("refresh", "offline")] {
+            let directory = TestDirectory::new("catalog-mode-readback");
+            let state_root = directory.path().join("state");
+            fs::create_dir_all(&state_root).unwrap();
+            let connection_file = state_root.join("connection.json");
+            let plan = HelperPlan {
+                schema_version: 1,
+                startup_deadline_unix_ms: None,
+                owner_nonce: model::new_id(),
+                service_id: "catalog-mode-test-service".into(),
+                version: VERSION.into(),
+                model: ModelRef {
+                    id: "catalog-mode-test-model".into(),
+                    provider_id: "catalog-mode-test-provider".into(),
+                    variant: "fixture".into(),
+                },
+                model_catalog: model_catalog.into(),
+                credential_ref: None,
+                bun_executable: directory.path().join("bun.exe"),
+                bun_sha256: "a".repeat(64),
+                server_program: directory.path().join("serve.mjs"),
+                server_program_sha256: "b".repeat(64),
+                state_root: state_root.clone(),
+                password_file: state_root.join("server.password"),
+                connection_file: connection_file.clone(),
+                config_file: state_root.join("config.json"),
+                workspace_directory: directory.path().to_path_buf(),
+                port: 43_721,
+                route_digest: "c".repeat(64),
+                config_digest: "d".repeat(64),
+                module_sha256: "e".repeat(64),
+                entrypoint_sha256: "f".repeat(64),
+            };
+
+            let endpoint = format!("http://127.0.0.1:{}", plan.port);
+            let connection = json!({
+                "schema_version":1,
+                "endpoint":endpoint,
+                "pid":4242,
+                "username":"opencode",
+                "password":"fixture-password"
+            });
+            fs::write(
+                &plan.connection_file,
+                serde_json::to_vec(&connection).unwrap(),
+            )
+            .unwrap();
+            let owner_path = plan.state_root.join("owner.json");
+            let mut owner = json!({
+                "schema_version":1,
+                "owner_nonce":plan.owner_nonce,
+                "status":"ready",
+                "runtime":"bun",
+                "runtime_version":BUN_VERSION,
+                "native_server":"@opencode/server",
+                "native_server_version":VERSION,
+                "model_catalog_mode":model_catalog,
+                "pid":4242,
+                "endpoint":endpoint,
+                "bound_port":plan.port,
+                "connection_file":path_text(&connection_file).unwrap(),
+                "stop_receipt":path_text(&plan.state_root.join("stop-receipt.json")).unwrap(),
+                "database_path":path_text(&plan.state_root.join("data").join("opencode.sqlite")).unwrap()
+            });
+            fs::write(&owner_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+
+            assert!(load_owner_connection(&plan, &owner_path, &connection_file).is_ok());
+
+            owner["model_catalog_mode"] = json!(mismatched_mode);
+            fs::write(&owner_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+            let error = match load_owner_connection(&plan, &owner_path, &connection_file) {
+                Err(error) => error,
+                Ok(_) => panic!("readback must reject a changed model catalog mode"),
+            };
+            assert_eq!(error.code, "OWNED_SERVICE_READBACK");
+        }
+    }
+
     #[tokio::test]
     async fn materialized_start_deadline_is_shared_with_helper_before_spawn() {
         let directory = TestDirectory::new("start-deadline");
