@@ -102,26 +102,69 @@ fn unquarantined_automation_entry_damage(db: &Connection) -> Result<bool> {
     })?;
     for row in rows {
         let (key, raw) = row?;
-        match super::automation_publication::entry_quarantine_matches(db, &key, &raw) {
-            Ok(true) => {}
-            Ok(false) => return Ok(true),
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "AUTOMATION_RECORD_CORRUPT"
-                        | "AUTOMATION_RECORD_INVALID"
-                        | "AUTOMATION_RECORD_VERSION"
-                        | "AUTOMATION_RECORD_TOO_LARGE"
-                        | "AUTOMATION_QUARANTINE_RECORD_CORRUPT"
-                        | "AUTOMATION_QUARANTINE_IDENTITY_CONFLICT"
-                ) =>
-            {
-                return Ok(true);
-            }
-            Err(error) => return Err(error),
+        if automation_entry_damage_requires_activation(db, &key, &raw)? {
+            return Ok(true);
         }
     }
+
+    // The retained v1 producer seals a closed AutomationEntry schema. `scope`
+    // is required and must be an object; detect this concrete valid-JSON
+    // schema failure without parsing the entry ledger in the activation path.
+    // Iterate every matching damaged row so an earlier exact quarantine does
+    // not mask a later unquarantined obligation. Keep the same key range and
+    // JSON validity guard; healthy entry payloads are not parsed in Rust.
+    let mut statement = db.prepare(
+        "SELECT key,value_json FROM meta \
+         WHERE key >= ?1 AND key < ?2 \
+           AND CASE WHEN json_valid(value_json) THEN \
+             json_type(value_json,'$.schema_version')='integer' \
+             AND json_extract(value_json,'$.schema_version')=1 \
+             AND json_type(value_json,'$.record')='object' \
+             AND json_type(value_json,'$.record.schema_version')='integer' \
+             AND json_extract(value_json,'$.record.schema_version')=1 \
+             AND json_type(value_json,'$.record.scope') IS NOT 'object' \
+           ELSE 0 END \
+         ORDER BY key",
+    )?;
+    let rows = statement.query_map(
+        params!["automation:v1:entry:", "automation:v1:entry;"],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    for row in rows {
+        let (key, raw) = row?;
+        if automation_entry_damage_requires_activation(db, &key, &raw)? {
+            return Ok(true);
+        }
+    }
+
     Ok(false)
+}
+
+fn automation_entry_damage_requires_activation(
+    db: &Connection,
+    key: &str,
+    raw: &str,
+) -> Result<bool> {
+    match super::automation_publication::entry_quarantine_matches(db, key, raw) {
+        Ok(true) => Ok(false),
+        Ok(false) => Ok(true),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "AUTOMATION_RECORD_CORRUPT"
+                    | "AUTOMATION_RECORD_INVALID"
+                    | "AUTOMATION_RECORD_VERSION"
+                    | "AUTOMATION_RECORD_TOO_LARGE"
+                    | "AUTOMATION_QUARANTINE_RECORD_CORRUPT"
+                    | "AUTOMATION_QUARANTINE_IDENTITY_CONFLICT"
+            ) =>
+        {
+            // Keep retained subject/marker damage with its existing owner.
+            // Actual SQLite and connection failures still propagate.
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerDemand> {
