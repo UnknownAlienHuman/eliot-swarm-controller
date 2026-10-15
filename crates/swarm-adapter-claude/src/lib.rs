@@ -81,7 +81,9 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
     )?;
     journal.recover_uncertain_with_code("ADAPTER_RESTART_AFTER_EFFECT_MARKER")?;
     if journal.has_terminal_shutdown()? {
+        journal.prepare_terminal_shutdown_drain()?;
         flush_outbox(&mut link, &journal, &interactions).await?;
+        journal.require_terminal_shutdown_acknowledged()?;
         return Ok(());
     }
     let bridge_path = sdk_harness::materialize(&config.sdk_harness_dir)?;
@@ -3811,7 +3813,7 @@ mod failed_prepare_lifecycle_fixture {
         serde_json::from_value(json!({
             "schema_version":1,
             "module_id":"claude",
-            "artifact":{"artifact_id":"claude-agent-sdk-rust-controller.6","version":"6","build_id":null},
+            "artifact":{"artifact_id":crate::ARTIFACT_ID,"version":crate::ARTIFACT_VERSION,"build_id":null},
             "protocol":{"major":1,"minor":0},
             "binding_id":"fixture-binding",
             "binding_generation":1,
@@ -5569,7 +5571,7 @@ mod agent_shutdown_handler_tests {
         (root, config, journal, interactions)
     }
     fn shutdown_claim() -> ModuleContractClaim {
-        serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": "claude-agent-sdk-rust-controller.6", "version": "6", "build_id": null}, "protocol": {"major": 1, "minor": 0}, "capabilities": ["agent.shutdown"], "config_schema": null, "command_schemas": [], "event_schemas": []})).expect("shutdown fixture claim")
+        serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": crate::ARTIFACT_ID, "version": crate::ARTIFACT_VERSION, "build_id": null}, "protocol": {"major": 1, "minor": 0}, "capabilities": ["agent.shutdown"], "config_schema": null, "command_schemas": [], "event_schemas": []})).expect("shutdown fixture claim")
     }
     fn shutdown_command(
         config: &AdapterConfig,
@@ -5680,7 +5682,7 @@ mod agent_shutdown_handler_tests {
                 true,
             ),
         ] {
-            let receipt: swarm_contracts::runtime::ModuleReceiptIdentity = serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": "claude-agent-sdk-rust-controller.6", "version": "6", "build_id": null}, "protocol": {"major": 1, "minor": 0}, "binding_id": "fixture-binding", "binding_generation": 1, "operation_id": id, "input_sha256": "e".repeat(64)})).expect("predicate receipt");
+            let receipt: swarm_contracts::runtime::ModuleReceiptIdentity = serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": crate::ARTIFACT_ID, "version": crate::ARTIFACT_VERSION, "build_id": null}, "protocol": {"major": 1, "minor": 0}, "binding_id": "fixture-binding", "binding_generation": 1, "operation_id": id, "input_sha256": "e".repeat(64)})).expect("predicate receipt");
             journal
                 .write_intent(id, &receipt, "agent.shutdown", &serde_json::json!({}))
                 .expect("predicate intent");
@@ -5781,7 +5783,7 @@ mod agent_shutdown_handler_tests {
             ),
             ("shutdown-scan-retired", "OWNED_TRANSPORT_RELEASED", true),
         ] {
-            let receipt: swarm_contracts::runtime::ModuleReceiptIdentity = serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": "claude-agent-sdk-rust-controller.6", "version": "6", "build_id": null}, "protocol": {"major": 1, "minor": 0}, "binding_id": "fixture-binding", "binding_generation": 1, "operation_id": id, "input_sha256": "e".repeat(64)})).expect("scan receipt");
+            let receipt: swarm_contracts::runtime::ModuleReceiptIdentity = serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": crate::ARTIFACT_ID, "version": crate::ARTIFACT_VERSION, "build_id": null}, "protocol": {"major": 1, "minor": 0}, "binding_id": "fixture-binding", "binding_generation": 1, "operation_id": id, "input_sha256": "e".repeat(64)})).expect("scan receipt");
             let method = if code == "agent.send" {
                 "agent.send"
             } else {

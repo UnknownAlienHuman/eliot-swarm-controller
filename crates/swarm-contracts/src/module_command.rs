@@ -89,7 +89,7 @@ pub struct CommandCaptureArtifactPage {
 }
 
 /// Every command that may require a selected module credential.
-pub const MODULE_COMMAND_METHODS: [&str; 19] = [
+pub const MODULE_COMMAND_METHODS: [&str; 20] = [
     "agent.open",
     "task.dispatch",
     "agent.send",
@@ -109,6 +109,7 @@ pub const MODULE_COMMAND_METHODS: [&str; 19] = [
     NATIVE_MCP_OBSERVE_METHOD,
     NATIVE_MCP_ARM_METHOD,
     NATIVE_MCP_READ_METHOD,
+    AGENT_SHUTDOWN_METHOD,
 ];
 
 /// Commands selected by the module-demand page. Native-MCP phases reuse an

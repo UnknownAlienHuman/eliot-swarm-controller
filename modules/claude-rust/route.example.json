@@ -1,7 +1,7 @@
 {
   "alias": "<operator-selected-route-alias>",
   "runtime": "module",
-  "module_artifact_id": "claude-agent-sdk-rust-controller.5",
+  "module_artifact_id": "claude-agent-sdk-rust-controller.7",
   "enabled": false,
   "workspace_option": "workspaceRoot",
   "native_options": {

@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 pub const MODULE_PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const CODEX_RUST_CONTROLLER_ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "9";
+pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "10";
 pub const RUNTIME_COMMAND_SCHEMA_ID: &str = "swarm.runtime_command";
 pub const RUNTIME_OUTCOME_SCHEMA_ID: &str = "swarm.runtime_outcome";
 pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
@@ -329,6 +329,9 @@ impl ModuleContractTemplate {
         let mut template = Self::codex_rust_controller_v6()?;
         template.artifact.version =
             ArtifactVersion::new(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION)?;
+        template
+            .capabilities
+            .insert(CapabilityId::new("agent.shutdown")?);
         Ok(template)
     }
 
@@ -502,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_goal_receipt_schemas_are_additive_in_current_descriptor_v8() {
+    fn codex_goal_receipt_schemas_are_additive_in_current_descriptor() {
         let v5 = ModuleContractTemplate::codex_rust_controller_v5().unwrap();
         let v6 = ModuleContractTemplate::codex_rust_controller_v6().unwrap();
         let v8 = ModuleContractTemplate::codex_rust_controller_v8().unwrap();
@@ -514,12 +517,19 @@ mod tests {
             CODEX_RUST_CONTROLLER_ARTIFACT_ID
         );
         assert_eq!(v6.artifact.version.as_str(), "6");
-        assert_eq!(v8.artifact.version.as_str(), "8");
         assert_eq!(
             v8.artifact.version.as_str(),
             CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
         );
-        assert_eq!(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION, "9");
+        assert_eq!(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION, "10");
+        assert!(
+            v8.capabilities
+                .contains(&CapabilityId::new("agent.shutdown").unwrap())
+        );
+        assert!(
+            !v6.capabilities
+                .contains(&CapabilityId::new("agent.shutdown").unwrap())
+        );
         assert!(!v5.event_schemas.contains(&continuation));
         assert!(!v5.event_schemas.contains(&terminal));
         assert!(v6.event_schemas.contains(&continuation));

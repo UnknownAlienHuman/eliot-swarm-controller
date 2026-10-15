@@ -1326,10 +1326,10 @@ function Get-AdapterContract {
         }
         'Codex' {
             return [pscustomobject]@{
-                module_id = 'codex'; artifact_id = 'codex-rust-controller.1'; version = '8'; runtime = 'codex';
+                module_id = 'codex'; artifact_id = 'codex-rust-controller.1'; version = '10'; runtime = 'codex';
                 build_package = 'swarm-adapter-codex'; build_target = 'swarm-codex-adapter';
                 build_manifest = 'crates/swarm-adapter-codex/Cargo.toml';
-                capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send', 'task.dispatch');
+                capabilities = @('agent.open', 'agent.reconcile', 'agent.result', 'agent.send', 'agent.shutdown', 'task.dispatch');
                 command_schemas = @('swarm.normalized_result_context@1:', 'swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
                 event_schemas = @('swarm.goal_continuation_admission@1:', 'swarm.goal_terminal_evidence@1:', 'swarm.normalized_result_page@1:', 'swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;
@@ -1352,10 +1352,10 @@ function Get-AdapterContract {
         }
         'Claude' {
             return [pscustomobject]@{
-                module_id = 'claude'; artifact_id = 'claude-agent-sdk-rust-controller.5'; version = '5'; runtime = 'module';
+                module_id = 'claude'; artifact_id = 'claude-agent-sdk-rust-controller.7'; version = '7'; runtime = 'module';
                 build_package = 'swarm-adapter-claude'; build_target = 'swarm-adapter-claude';
                 build_manifest = 'crates/swarm-adapter-claude/Cargo.toml';
-                capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.reply', 'agent.result', 'agent.send/next_turn', 'task.dispatch');
+                capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.reply', 'agent.result', 'agent.send/next_turn', 'agent.shutdown', 'task.dispatch');
                 command_schemas = @('swarm.runtime_command@1:', 'swarm.task_dispatch_context@1:', 'swarm.task_prompt@1:');
                 event_schemas = @('swarm.runtime_outcome@1:', 'swarm.task_dispatch_admission@1:');
                 expected_config_schema_id = $null; expected_config_schema_version = $null; expected_config_schema_sha256 = $null;

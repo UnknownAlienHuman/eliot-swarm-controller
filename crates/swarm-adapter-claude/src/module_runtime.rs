@@ -21,8 +21,8 @@ const CAPABILITIES: [&str; 8] = [
     "agent.reply",
     "agent.result",
     "agent.send/next_turn",
-    "task.dispatch",
     "agent.shutdown",
+    "task.dispatch",
 ];
 
 pub struct OwnedBootstrap {

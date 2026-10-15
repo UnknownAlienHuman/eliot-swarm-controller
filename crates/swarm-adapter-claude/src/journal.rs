@@ -767,6 +767,59 @@ impl OperationJournal {
     }
 
     pub fn has_terminal_shutdown(&self) -> Result<bool> {
+        Ok(!self.terminal_shutdown_states(false)?.is_empty())
+    }
+
+    /// Restore exact outcome delivery after the ordinary bounded cursor has
+    /// passed damaged/deferred work. This never submits native input.
+    pub fn prepare_terminal_shutdown_drain(&self) -> Result<()> {
+        for mut state in self.terminal_shutdown_states(true)? {
+            let outcome = state
+                .outcome
+                .clone()
+                .ok_or_else(torn_ack_recovery_unknown)?;
+            if state.torn_tail_evidence.is_some() {
+                if !self.repair_torn_acknowledgement(&state.operation_id, &outcome)? {
+                    return Err(torn_ack_recovery_unknown());
+                }
+                state = self
+                    .get(&state.operation_id)?
+                    .ok_or_else(torn_ack_recovery_unknown)?;
+            }
+            if state.acknowledged_sha256 != state.outcome_sha256 {
+                self.save_outcome_value(&state.operation_id, &outcome)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn require_terminal_shutdown_acknowledged(&self) -> Result<()> {
+        let terminal = self.terminal_shutdown_states(true)?;
+        if terminal.is_empty() {
+            return Err(Error::new(
+                "ADAPTER_SHUTDOWN_ACK_PENDING",
+                "previously selected shutdown evidence is unavailable",
+            ));
+        }
+        for state in terminal {
+            if state.torn_tail_evidence.is_some()
+                || state.outcome_sha256.is_none()
+                || state.acknowledged_sha256 != state.outcome_sha256
+            {
+                return Err(Error::new(
+                    "ADAPTER_SHUTDOWN_ACK_PENDING",
+                    "retired transport retains an unacknowledged shutdown outcome",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn terminal_shutdown_states(
+        &self,
+        require_readable_drain: bool,
+    ) -> Result<Vec<OperationState>> {
+        let mut terminal = Vec::new();
         for entry in fs::read_dir(&self.root)
             .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation directory cannot be listed"))?
         {
@@ -781,6 +834,9 @@ impl OperationJournal {
                 Ok(state) => state,
                 Err(error) if is_item_local_operation_damage(&error) => {
                     self.note_deferred_damage()?;
+                    if require_readable_drain {
+                        return Err(error);
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -791,10 +847,10 @@ impl OperationJournal {
             if state.outcome.as_ref().is_some_and(|outcome| {
                 matches!(outcome["outcome"].as_str(), Some("applied" | "unknown"))
             }) {
-                return Ok(true);
+                terminal.push(state);
             }
         }
-        Ok(false)
+        Ok(terminal)
     }
     pub fn has_task_dispatch_for_boot(&self, boot_id: &str) -> Result<bool> {
         let path = self.boot_marker_path(boot_id);
@@ -1315,7 +1371,11 @@ impl OperationJournal {
             }
             pointer.outcome_sha256 = Some(digest);
         }
-        if pointer.phase == WorkPhase::Deferred && pointer.acknowledged_sha256.is_none() {
+        let retention = self.read_retention_state()?;
+        if (pointer.phase == WorkPhase::Deferred
+            || pointer.sequence < retention.outbox_cursor_sequence)
+            && pointer.acknowledged_sha256.is_none()
+        {
             let mut state = self.read_retention_state()?;
             let sequence = state.next_outbox_sequence;
             state.next_outbox_sequence = sequence
@@ -1945,6 +2005,15 @@ impl OperationJournal {
             self.note_deferred_damage()?;
             return Ok(false);
         };
+        // This one terminal record is the binding's durable retirement
+        // marker. Removing it would let a later boot reopen native work.
+        if state.method.as_deref() == Some("agent.shutdown")
+            && state.outcome.as_ref().is_some_and(|outcome| {
+                matches!(outcome["outcome"].as_str(), Some("applied" | "unknown"))
+            })
+        {
+            return Ok(false);
+        }
         if state.compacted {
             if state.acknowledged_sha256.as_deref() != Some(expected_acknowledged_sha256) {
                 self.note_deferred_damage()?;
@@ -3397,6 +3466,82 @@ mod recovery_tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn shutdown_drain_recovers_past_damaged_outbox_and_requires_exact_ack() {
+        let root =
+            std::env::temp_dir().join(format!("claude-shutdown-drain-{}", uuid::Uuid::new_v4()));
+        let journal =
+            OperationJournal::open(&root, "shutdown-binding", 1, "scope", &"b".repeat(64)).unwrap();
+        let receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+            "schema_version":1,"module_id":"eliot.claude",
+            "artifact":{"artifact_id":crate::ARTIFACT_ID,"version":crate::ARTIFACT_VERSION},
+            "protocol":{"major":1,"minor":0},"binding_id":"shutdown-binding",
+            "binding_generation":1,"operation_id":"shutdown-operation","input_sha256":"a".repeat(64)
+        }))
+        .unwrap();
+        journal
+            .write_intent(
+                "shutdown-operation",
+                &receipt,
+                "agent.shutdown",
+                &json!({"owned_scope":"owned_sdk_transport"}),
+            )
+            .unwrap();
+        let outcome = json!({"operation_id":"shutdown-operation","outcome":"applied","details":{"completion_condition":"owned_resource_released","native_replay":false}});
+        journal
+            .save_outcome_value("shutdown-operation", &outcome)
+            .unwrap();
+        let old_sequence = journal
+            .get("shutdown-operation")
+            .unwrap()
+            .unwrap()
+            .outbox_sequence
+            .unwrap();
+        let damaged_item = journal.outbox_item_path(old_sequence);
+        std::fs::write(&damaged_item, b"{").unwrap();
+        assert!(journal.pending_outcomes().unwrap().is_empty());
+        assert!(journal.has_terminal_shutdown().unwrap());
+        assert_eq!(
+            journal
+                .require_terminal_shutdown_acknowledged()
+                .unwrap_err()
+                .code,
+            "ADAPTER_SHUTDOWN_ACK_PENDING"
+        );
+        journal.prepare_terminal_shutdown_drain().unwrap();
+        let pending = journal.pending_outcomes().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].outcome.as_ref(), Some(&outcome));
+        assert_eq!(pending[0].operation_id, "shutdown-operation");
+        assert_eq!(std::fs::read(&damaged_item).unwrap(), b"{");
+        journal.acknowledge("shutdown-operation", &outcome).unwrap();
+        journal.require_terminal_shutdown_acknowledged().unwrap();
+        journal.process_cleanup_batch(MAX_CURSOR_STEPS).unwrap();
+        assert!(journal.path("shutdown-operation").unwrap().is_file());
+        drop(journal);
+        let reopened =
+            OperationJournal::open(&root, "shutdown-binding", 1, "scope", &"b".repeat(64)).unwrap();
+        assert!(reopened.has_terminal_shutdown().unwrap());
+        reopened.require_terminal_shutdown_acknowledged().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_drain_cannot_succeed_without_retained_shutdown_evidence() {
+        let root =
+            std::env::temp_dir().join(format!("claude-shutdown-missing-{}", uuid::Uuid::new_v4()));
+        let journal =
+            OperationJournal::open(&root, "shutdown-binding", 1, "scope", &"b".repeat(64)).unwrap();
+        assert_eq!(
+            journal
+                .require_terminal_shutdown_acknowledged()
+                .unwrap_err()
+                .code,
+            "ADAPTER_SHUTDOWN_ACK_PENDING"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn lost_result_ack_recovery_retains_exact_intent_and_never_allows_native_replay() {

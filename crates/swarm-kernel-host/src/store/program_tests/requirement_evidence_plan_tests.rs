@@ -1424,6 +1424,14 @@ fn dispatch_fixture_config() -> Config {
 }
 
 async fn retained_dispatch_binding(store: &Store, uses_task_prompt: bool) -> (String, Principal) {
+    retained_binding_with_capabilities(store, uses_task_prompt, json!(["task.dispatch"])).await
+}
+
+async fn retained_binding_with_capabilities(
+    store: &Store,
+    uses_task_prompt: bool,
+    capabilities: Value,
+) -> (String, Principal) {
     // Seed a ready retained module, including its exact trusted selector, link
     // and boot. The non-TaskPrompt contract is retained-only: no new binding
     // admission or native executable is simulated by this metadata fixture.
@@ -1456,7 +1464,7 @@ async fn retained_dispatch_binding(store: &Store, uses_task_prompt: bool) -> (St
                     {"schema_id":"swarm.task_dispatch_admission","version":"1"},
                 ],
                 "protocol":{"minimum":{"major":1,"minor":0},"maximum":{"major":1,"minor":0}},
-                "capabilities":["task.dispatch"],
+                "capabilities":capabilities,
                 "lifecycle":"owned_service","activation":"on_demand","enabled":true,
             });
             let registered = crate::store::module_handshake::register_trusted_descriptor(
@@ -1518,6 +1526,42 @@ async fn dispatch_request(store: &Store, attempt_id: &str) -> Result<Value> {
             }),
         )
         .await
+}
+
+#[tokio::test]
+async fn scoped_shutdown_is_delivered_by_store_module_next() {
+    let (owner, directory, credential) =
+        start_store_with_config("shutdown-delivery", dispatch_fixture_config()).await;
+    let store = &owner.store;
+    seed_clients(store).await;
+    let operator = store.authenticate(credential).await.unwrap();
+    let (binding_id, module) = retained_binding_with_capabilities(
+        store,
+        false,
+        json!(["task.dispatch", "agent.shutdown"]),
+    )
+    .await;
+    let admitted = store
+        .call(
+            operator,
+            "agent.shutdown".into(),
+            json!({
+                "client_request_id":model::new_id(),
+                "binding_id":binding_id,"generation":1,"owned_scope":"external_attach"
+            }),
+        )
+        .await
+        .unwrap();
+    let next = store
+        .call(module, "module.next".into(), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(next["command"]["method"], "agent.shutdown");
+    assert_eq!(next["command"]["operation_id"], admitted["operation_id"]);
+    assert_eq!(next["command"]["binding_id"], binding_id);
+    assert_eq!(next["command"]["input"]["owned_scope"], "external_attach");
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 async fn assert_valid_dispatch_keeps_original_snapshot(

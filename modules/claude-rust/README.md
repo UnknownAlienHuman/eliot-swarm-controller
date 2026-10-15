@@ -7,7 +7,7 @@ Claude configuration or install, register, or launch the artifact.
 
 Install the built `swarm-adapter-claude` executable with the repository's
 standard `Install-ModuleArtifact.ps1` and this descriptor template. This is
-artifact version 5; versions 2, 3, and 4 remain separate retained artifacts.
+artifact version 7; versions 2 through 6 remain separate retained artifacts.
 The Rust binary embeds the pinned `bridge.mjs` and `prepared-query.mjs` bytes and writes
 them to the binding owner's private state directory on demand. Its typed
 `module_host_config_path` launch argument is preserved by the generic installer
@@ -24,6 +24,14 @@ route. The Store authorizes rootless open only through the descriptor's typed
 `pre_input_open` contract. It adopts a native identity only after the first
 `task.dispatch` returns the exact SDK frame echo and prompt/snapshot digests.
 No descriptor capability grants Store or provider authority.
+
+`agent.shutdown` supports only `owned_sdk_transport` on the exact ready binding.
+It records intent before release, retains unknown effects, and drains the exact
+saved outcome through Store acknowledgement after restart without native input
+replay. The terminal journal remains the retirement marker even after cleanup;
+a damaged delivery pointer or missing ACK cannot become successful drain.
+This does not prove Task completion, shared-service shutdown or native family
+departure. See the [scope contract](../../docs/agent_swarm.module-contract-v2.md).
 
 `claude-native-options.schema.json` documents the route option shape. The
 descriptor intentionally keeps `config_schema` null; Store admission does not

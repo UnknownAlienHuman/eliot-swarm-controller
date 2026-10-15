@@ -6036,6 +6036,15 @@ fn recover_intent_only_shutdown(
                 && record.outcome.is_none()
         })
         .map(|(operation_id, record)| {
+            let scope = journal
+                .state
+                .native_scope_key
+                .as_deref()
+                .filter(|scope| !scope.trim().is_empty())
+                .ok_or(AdapterError::Checkpoint)?;
+            if record.native_scope_key.as_deref() != Some(scope) {
+                return Err(AdapterError::Checkpoint);
+            }
             record
                 .input_sha256
                 .as_deref()
@@ -7423,7 +7432,7 @@ mod agent_shutdown_loopback_tests {
         let claim: ModuleContractClaim = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "module_id": "codex",
-            "artifact": {"artifact_id": "codex-rust-controller.1", "version": "9", "build_id": null},
+            "artifact": {"artifact_id": ARTIFACT_ID, "version": ARTIFACT_VERSION, "build_id": null},
             "protocol": {"major": 1, "minor": 0},
             "capabilities": ["agent.open", "agent.reconcile", "agent.result", "agent.send", "agent.shutdown", "task.dispatch"], "config_schema": null,
             "command_schemas": [], "event_schemas": []
@@ -7460,11 +7469,12 @@ mod agent_shutdown_loopback_tests {
     fn full_claim() -> ModuleContractClaim {
         serde_json::from_value(serde_json::json!({"schema_version": 1,
             "module_id": "codex",
-            "artifact": {"artifact_id": "codex-rust-controller.1", "version": "9", "build_id": null},
+            "artifact": {"artifact_id": ARTIFACT_ID, "version": ARTIFACT_VERSION, "build_id": null},
             "protocol": {"major": 1, "minor": 0},
             "capabilities": ["agent.shutdown"], "config_schema": null,
             "command_schemas": [], "event_schemas": []
-        })).expect("shutdown fixture claim")
+        }))
+        .expect("shutdown fixture claim")
     }
     fn shutdown_cmd(operation_id: &str, scope: &str) -> RuntimeCommand {
         RuntimeCommand {
@@ -7555,6 +7565,7 @@ mod agent_shutdown_loopback_tests {
             .bind("test-binding", 1)
             .expect("bind fixture binding");
         let claim = full_claim();
+        journal.state.native_scope_key = Some("crash-scope".to_owned());
         let mut record = OperationRecord::intent("agent.shutdown", "shutdown");
         record.input_sha256 = Some("c".repeat(64));
         record.native_scope_key = Some("crash-scope".to_owned());
@@ -7619,6 +7630,7 @@ mod agent_shutdown_loopback_tests {
             .bind("test-binding", 1)
             .expect("bind fixture binding");
         let claim = full_claim();
+        journal.state.native_scope_key = Some("corrupt-scope".to_owned());
         let mut missing = OperationRecord::intent("agent.shutdown", "shutdown");
         missing.native_scope_key = Some("corrupt-scope".to_owned());
         journal
@@ -7701,5 +7713,47 @@ mod agent_shutdown_loopback_tests {
         );
         assert!(!stable.state.native_retired);
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn corrupt_selected_shutdown_scope_with_valid_hash_prevents_partial_recovery() {
+        for scope in [None, Some("foreign-scope")] {
+            let tag = format!("codex-shutdown-scope-{}", uuid::Uuid::new_v4());
+            let (directory, mut journal) = fixture_journal(&tag);
+            journal.bind("test-binding", 1).expect("bind");
+            journal.state.native_scope_key = Some("retained-scope".to_owned());
+            let mut valid = OperationRecord::intent("agent.shutdown", "shutdown");
+            valid.input_sha256 = Some("c".repeat(64));
+            valid.native_scope_key = Some("retained-scope".to_owned());
+            journal
+                .state
+                .operations
+                .insert("00-valid".to_owned(), valid);
+            let mut corrupt = OperationRecord::intent("agent.shutdown", "shutdown");
+            corrupt.input_sha256 = Some("d".repeat(64));
+            corrupt.native_scope_key = scope.map(str::to_owned);
+            journal
+                .state
+                .operations
+                .insert("99-corrupt".to_owned(), corrupt);
+            journal.save().expect("persist selected intents");
+            let before = serde_json::to_value(&journal.state).unwrap();
+            let error = recover_intent_only_shutdown(&mut journal, &full_claim())
+                .expect_err("a valid-looking hash does not prove the retained scope");
+            assert!(matches!(error, AdapterError::Checkpoint));
+            assert_eq!(serde_json::to_value(&journal.state).unwrap(), before);
+            drop(journal);
+            let reopened = Journal::open(directory.clone(), "verify-no-mutation".to_owned())
+                .expect("reopen retained checkpoint");
+            assert!(!reopened.state.native_retired);
+            assert!(
+                reopened
+                    .state
+                    .operations
+                    .values()
+                    .all(|record| record.outcome.is_none())
+            );
+            std::fs::remove_dir_all(&directory).ok();
+        }
     }
 }

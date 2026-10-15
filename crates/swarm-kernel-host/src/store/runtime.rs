@@ -1333,7 +1333,7 @@ fn next_internal(
              WHERE binding_id=?1 AND binding_generation=?2 AND state='queued' AND due_at_ms<=?3
                AND (?5=0 OR (method='agent.result' AND json_type(candidate.effective_request_json,'$.normalized_result_origin')='object'))
                AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
-               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
+               AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','agent.shutdown','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
                AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
                  OR (method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer')
                  OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))

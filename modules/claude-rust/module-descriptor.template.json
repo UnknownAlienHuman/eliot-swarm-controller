@@ -2,8 +2,8 @@
   "schema_version": 1,
   "module_id": "claude",
   "artifact": {
-    "artifact_id": "claude-agent-sdk-rust-controller.6",
-    "version": "6",
+    "artifact_id": "claude-agent-sdk-rust-controller.7",
+    "version": "7",
     "build_id": null
   },
   "launch": {

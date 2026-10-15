@@ -110,6 +110,12 @@ Cargo-пакетом/executable с версионированным IPC, без 
 | `reply` | Ответ текущему native request со stale-guard | Право угадать смысл ответа или ответить по уже устаревшему request |
 | `shutdown` | Явный scope и реальный disposition собственного ресурса | Разрешение остановить общий server или чужих детей |
 
+`agent.shutdown` принимает `client_request_id`, точные `binding_id`/`generation` и обязательный `owned_scope`. Закрытый словарь scope: `external_attach` освобождает только соединение binding с внешним сервисом (Codex); `owned_sdk_transport` освобождает только принадлежащий адаптеру SDK transport (Claude). Store проверяет текущую ready-binding и права вызывающего, а выбранный descriptor должен объявлять capability `agent.shutdown`. Capability не предоставляет дополнительных прав. Отсутствующий, неизвестный или не поддержанный адаптером scope отклоняется без расширения области остановки.
+
+Перед освобождением сохраняется durable intent. Неизвестный эффект остаётся `unknown` и не повторяет native input. После retirement адаптер доставляет сохранённые outcomes и подтверждения через контроллер; освобождение транспорта не означает выполнение Task, остановку общего сервера или доказанное завершение всей семьи процессов. Неподтверждённый shutdown outcome не разрешает объявить доставку завершённой. Claude сохраняет terminal shutdown journal как признак retirement между перезапусками; Codex проверяет точный scope выбранного intent до записи результата восстановления.
+
+Текущие реализации этого среза — Codex descriptor `10` и Claude artifact `claude-agent-sdk-rust-controller.7`. Их source/fixture-проверки не являются полной live qualification; старые установленные артефакты и bindings не обновляются автоматически.
+
 Малый `OperationContract` сохраняется в `effective_request_json`: `effect_scope`, `order_scope`, `completion_condition`, `replay_policy`, `fallback_used`, `contract_revision`. Это обычные данные решения adapter, не язык выполнения произвольных workflows. Scope задаёт binding/session/turn/request либо shared service, если операция действительно глобальная.
 
 ### Scoped delivery (R22)
