@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery, focused-proof-gaps, focused-retention-delivery, focused-retention-tail, focused-native-fixtures]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery, focused-proof-gaps, focused-retention-delivery, focused-retention-tail, focused-native-fixtures, focused-core-runtime]
 permissions:
   contents: read
 jobs:
@@ -608,6 +608,12 @@ jobs:
           & git rev-parse HEAD
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Source: $env:GITHUB_SHA; OS: $env:RUNNER_OS"
+      - name: Runtime identity for owned-service deadline fixtures
+        if: inputs.qualification == 'focused-native-fixtures'
+        id: focused-bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.0'
       - name: Provision temporary libclang for rusqlite bindgen
         shell: pwsh
         run: |
@@ -1001,6 +1007,10 @@ jobs:
               Invoke-FocusedCohort -Package 'swarm-process' -Filter $syncCase -Expected 1 -ExpectedNames @($syncCase)
             }
           } elseif ($env:QUALIFICATION -ceq 'focused-native-fixtures') {
+            $env:ELIOT_OPENCODE_BUN_EXE = '${{ steps.focused-bun.outputs.bun-path }}'
+            if (-not (Test-Path -LiteralPath $env:ELIOT_OPENCODE_BUN_EXE -PathType Leaf)) {
+              throw 'The deadline fixture requires the actual Bun runtime image.'
+            }
             & npm ci --prefix modules/opencode --ignore-scripts --no-audit --no-fund
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $env:ELIOT_OPENCODE_SOURCE_RESOURCES = '1'
@@ -1035,6 +1045,49 @@ jobs:
               'plugin_package_path_projects_verbatim_drive_and_unc_paths',
               'plugin_package_path_config_roundtrips_through_source_validation'
             )
+          } elseif ($env:QUALIFICATION -ceq 'focused-core-runtime') {
+            & cargo build --locked --package swarm-script-worker --bin swarm-script-worker --target-dir $targetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $workerName = if ($IsWindows) { 'swarm-script-worker.exe' } else { 'swarm-script-worker' }
+            $worker = Join-Path (Join-Path $targetDir 'debug') $workerName
+            $deps = Join-Path $targetDir 'debug/deps'
+            [void][IO.Directory]::CreateDirectory($deps)
+            $stagedWorker = Join-Path $deps $workerName
+            [IO.File]::Copy($worker, $stagedWorker, $false)
+            $workerHash = (Get-FileHash -LiteralPath $worker -Algorithm SHA256).Hash
+            if ((Get-FileHash -LiteralPath $stagedWorker -Algorithm SHA256).Hash -cne $workerHash) {
+              throw 'Staged ScriptWorker differs from the binary built at the recorded source.'
+            }
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "ScriptWorker SHA-256: $workerHash"
+            foreach ($case in @(
+              'reusable_admission_requires_current_accepted_original_process_and_intact_outputs',
+              'r48_owner_lost_store_results_hold_intent_and_process_capacity',
+              'r48_owner_stale_callbacks_keep_old_receipt_out_of_current_host_status',
+              'pr71_a2_pid_unavailable_keeps_exact_child_custody',
+              'pr71_a2_birth_tuple_changed_between_reads_keeps_exact_child_custody',
+              'scheduler_owner_status_stale_generation_or_host_scope_cannot_be_ready',
+              'constructor_failure_is_persisted_without_blocking_healthy_scope',
+              'reconcile_scripts_retains_operation_and_source_worker_across_allow_durability_unknown',
+              'store_source_worker_waits_for_durable_allow_and_runs_once_after_recovery'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter 'adapter::acp::tests::pr44_command_acp_' -Expected 12 -ExpectedNames @(
+              'pr44_command_acp_route_accepts_optional_effort_mode_and_rejects_malformed_values',
+              'pr44_command_acp_line_framing_distinguishes_eof_and_rejects_bad_frames',
+              'pr44_command_acp_restore_identity_requires_exact_binding_workspace_and_model_before_effects',
+              'pr44_command_acp_restore_readback_requires_selected_effort_and_mode',
+              'pr44_command_acp_config_setters_require_exact_typed_readback',
+              'pr44_command_acp_mode_setter_waits_for_current_mode_update',
+              'pr44_command_acp_restore_intent_coalesces_and_changed_target_conflicts',
+              'pr44_command_acp_family_stays_unknown_after_direct_child_exit',
+              'pr44_command_acp_restore_routes_pre_response_history_to_the_retained_session',
+              'pr44_command_acp_restore_failure_does_not_fallback_or_replay',
+              'pr44_command_acp_cancel_and_reply_race_claims_one_response',
+              'pr44_command_acp_config_option_snapshot_keeps_typed_values_and_resolves_model_id'
+            )
+            $descriptorCase = 'pr44_command_acp_descriptor_deactivates_configure_and_host_rejects_the_old_set'
+            Invoke-FocusedCohort -Package 'swarm-adapter-command' -Filter $descriptorCase -Expected 1 -ExpectedNames @($descriptorCase)
           } elseif ($env:QUALIFICATION -ceq 'focused-workspace-git') {
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace' -Expected 1 -ExpectedNames @('work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace')
             if ($IsWindows) {

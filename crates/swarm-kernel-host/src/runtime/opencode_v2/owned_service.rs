@@ -3774,7 +3774,7 @@ mod deadline_contract_tests {
             let path = std::env::temp_dir()
                 .join(format!("eliot-owned-service-{label}-{}", model::new_id()));
             fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(path.canonicalize().unwrap())
         }
 
         fn path(&self) -> &Path {
@@ -3909,7 +3909,18 @@ mod deadline_contract_tests {
     fn prepared_service(directory: &Path) -> PreparedOwnedService {
         let workspace = directory.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
-        let bun_executable = std::env::current_exe().unwrap();
+        // The plan pins the actual runtime file. The independently launched
+        // libtest child is only the deadline/custody fixture, never a Bun image.
+        let bun_executable = std::env::var_os("ELIOT_OPENCODE_BUN_EXE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                    .map(|directory| directory.join(if cfg!(windows) { "bun.exe" } else { "bun" }))
+                    .find(|path| path.is_file())
+            })
+            .expect("deadline fixture requires the actual Bun runtime; set ELIOT_OPENCODE_BUN_EXE")
+            .canonicalize()
+            .unwrap();
         let server_program = super::super::resource_paths::required_file("serve.mjs").unwrap();
         let route = OwnedServiceRoute::from_config(&OwnedOpenCodeServiceConfig {
             origin: "fresh_owned_service".into(),
