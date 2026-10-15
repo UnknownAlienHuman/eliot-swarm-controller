@@ -139,6 +139,8 @@ const GM_FENCING_SCHEMA: &str = include_str!("../../migrations/012_gm_fencing.sq
 const READ_POSITION_SCHEMA: &str = include_str!("../../migrations/013_read_positions.sql");
 const PROVIDER_CONDITION_SCHEMA: &str =
     include_str!("../../migrations/014_provider_conditions.sql");
+const MAILBOX_IDENTITY_SCHEMA: &str =
+    include_str!("../../migrations/015_mailbox_delivery_identity.sql");
 const APPLICATION_ID: i64 = 0x45534331;
 const LOCAL_OPERATOR_CLIENT_ID_KEY: &str = "local_operator_client_id";
 pub(crate) const MANAGER_EVENT_SOURCE_STREAM: &str = "controller:manager-events";
@@ -3818,6 +3820,12 @@ fn initialize_database(
         "schema_extension:provider_conditions:v1",
         PROVIDER_CONDITION_SCHEMA,
         &["provider_conditions", "provider_conditions_binding"],
+    )?;
+    install_schema_extension(
+        tx,
+        "schema_extension:mailbox_delivery_identity:v1",
+        MAILBOX_IDENTITY_SCHEMA,
+        &[],
     )?;
     let scheduler_key = format!("client:{}", model::INTERNAL_SCHEDULER_CLIENT_ID);
     match meta(tx, &scheduler_key)? {
