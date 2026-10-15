@@ -1001,6 +1001,9 @@ jobs:
               Invoke-FocusedCohort -Package 'swarm-process' -Filter $syncCase -Expected 1 -ExpectedNames @($syncCase)
             }
           } elseif ($env:QUALIFICATION -ceq 'focused-native-fixtures') {
+            & npm ci --prefix modules/opencode --ignore-scripts --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:ELIOT_OPENCODE_SOURCE_RESOURCES = '1'
             if (-not $IsWindows) {
               & cargo build --locked --package swarm-kernel-host --bin swarm-kernel-host --target-dir $targetDir
               if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

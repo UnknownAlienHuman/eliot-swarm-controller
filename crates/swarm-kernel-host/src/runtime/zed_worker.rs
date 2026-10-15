@@ -376,7 +376,7 @@ fn observe_native(
             }
         }
 
-        let family_empty = match group.children_empty() {
+        let mut family_empty = match group.children_empty() {
             Ok(true) => {
                 if !containment_lost {
                     evidence.family_departure = "confirmed".to_owned();
@@ -394,6 +394,44 @@ fn observe_native(
                 false
             }
         };
+
+        // The child can exit between the first wait observation and the
+        // Group scan. Re-read this exact Child before treating an empty Group
+        // as containment loss; absence of a process is not an exit receipt.
+        if family_empty && direct_status.is_none() && !direct_observation_failed {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    direct_status = Some(status);
+                    record_exit(status, evidence);
+                    // Refresh the Group after the exit receipt, rather than
+                    // releasing against the earlier, potentially stale scan.
+                    family_empty = match group.children_empty() {
+                        Ok(true) => {
+                            if !containment_lost {
+                                evidence.family_departure = "confirmed".to_owned();
+                                evidence.family_error = None;
+                            }
+                            true
+                        }
+                        Ok(false) => {
+                            evidence.family_departure = "observed_active".to_owned();
+                            false
+                        }
+                        Err(error) => {
+                            evidence.family_departure = "observation_unknown".to_owned();
+                            evidence.family_error = Some(error.to_string());
+                            false
+                        }
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    direct_observation_failed = true;
+                    evidence.direct_exit = "observation_unknown".to_owned();
+                    evidence.direct_exit_error = Some(error.to_string());
+                }
+            }
+        }
 
         if family_empty
             && direct_status.is_none()
