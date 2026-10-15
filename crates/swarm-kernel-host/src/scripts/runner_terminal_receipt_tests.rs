@@ -304,11 +304,11 @@ fn terminal_receipt_fallback_requires_valid_proof_and_child_exit() {
     let valid = OwnedFixture::spawn("valid_hold");
     valid.wait_for_ready();
     let files = ArtifactFiles::new(&valid.work.data_dir).expect("open valid receipt artifacts");
-    let completion = completion(&valid.work, &files)
+    let live_completion = completion(&valid.work, &files)
         .expect("validate live worker terminal")
         .expect("terminal receipt exists");
     assert!(
-        !completion_family_departed(&valid.work, &completion)
+        !completion_family_departed(&valid.work, &live_completion)
             .expect("query family while the actual Child is live"),
         "a positive receipt cannot replace the live Child/family observation"
     );
@@ -329,11 +329,11 @@ fn terminal_receipt_fallback_requires_valid_proof_and_child_exit() {
         spawned_departed(&launch["process"], &valid.work.token),
         Err(ref error) if error.code == "PROCESS_FAMILY_UNKNOWN"
     ));
-    let completion = completion(&valid.work, &files)
+    let exited_completion = completion(&valid.work, &files)
         .expect("revalidate terminal after Child exit")
         .expect("terminal receipt remains available");
     assert!(
-        completion_family_departed(&valid.work, &completion)
+        completion_family_departed(&valid.work, &exited_completion)
             .expect("consume exact terminal family proof after the name disappears")
     );
     assert!(
