@@ -82,6 +82,11 @@ impl NativeHarness {
         Ok(Self { stdin })
     }
 
+    #[cfg(test)]
+    pub fn for_test_stdio(stdin: ChildStdin) -> Self {
+        Self { stdin }
+    }
+
     pub async fn send(&mut self, value: Value) -> Result<()> {
         let bytes = serde_json::to_vec(&value)?;
         if bytes.len() > MAX_COMMAND_BYTES {

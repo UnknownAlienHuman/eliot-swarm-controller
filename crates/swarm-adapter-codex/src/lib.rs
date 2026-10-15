@@ -473,6 +473,8 @@ struct Checkpoint {
     pending_native_events: Vec<NativeEventRecord>,
     #[serde(default)]
     native_usage: Option<swarm_contracts::native_usage::NativeUsageSnapshot>,
+    #[serde(default)]
+    native_retired: bool,
 }
 
 impl Checkpoint {
@@ -498,6 +500,7 @@ impl Checkpoint {
             pending_observation: None,
             pending_native_events: Vec::new(),
             native_usage: None,
+            native_retired: false,
         }
     }
 
@@ -5961,6 +5964,7 @@ async fn handle_command(
                 "agent.send" | "task.dispatch" => String::from("send"),
                 "agent.reconcile" => String::from("reconcile"),
                 "agent.result" => String::from("result_page"),
+                "agent.shutdown" => String::from("shutdown"),
                 _ => String::from("receipt"),
             };
             (command.method.clone(), kind)
@@ -5982,24 +5986,56 @@ fn shutdown_scope(input: &Value) -> Result<&str, &'static str> {
     }
 }
 
+const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 async fn release_owned_connection(native: &mut NativeClient) -> Result<&'static str, &'static str> {
+    release_owned_connection_with_timeout(native, SHUTDOWN_CLOSE_TIMEOUT).await
+}
+async fn release_owned_connection_with_timeout(
+    native: &mut NativeClient,
+    close_timeout: Duration,
+) -> Result<&'static str, &'static str> {
     let writer = native.writer.take().ok_or("CODEX_CONNECTION_ALREADY_RELEASED")?;
-    let send = {
+    let sent = {
         let mut guard = writer.lock().await;
         timeout(CONNECT_TIMEOUT, guard.send(Message::Close(None))).await
     };
-    if let Some(task) = native.reader_task.take() {
+    let reader_clean = match native.reader_task.as_mut() {
+        Some(task) => matches!(timeout(close_timeout, task).await, Ok(Ok(()))),
+        None => false,
+    };
+    if let Some(task) = native.reader_task.take()
+        && !task.is_finished()
+    {
         task.abort();
     }
-    match send {
-        Ok(Ok(())) => Ok("owned_connection_closed"),
+    match (sent, reader_clean) {
+        (Ok(Ok(())), true) => Ok("owned_connection_closed"),
         _ => Err("CODEX_CONNECTION_CLOSE_UNKNOWN"),
     }
 }
-
+fn unknown_shutdown(
+    command: &RuntimeCommand,
+    state: &Checkpoint,
+    code: &'static str,
+) -> RuntimeOutcome {
+    let mut details = base_details(state);
+    details["diagnostic_code"] = json!(code);
+    details["completion_condition"] = Value::Null;
+    details["disposition"] = json!("unknown");
+    details["native_replay"] = json!(false);
+    outcome(
+        &command.operation_id,
+        EffectOutcome::Unknown,
+        None,
+        state.native_scope_key.as_deref(),
+        None,
+        None,
+        details,
+    )
+}
 async fn shutdown_operation(
     command: &RuntimeCommand,
-    journal: &Journal,
+    journal: &mut Journal,
     native: &mut NativeClient,
     claim: &ModuleContractClaim,
 ) -> RuntimeOutcome {
@@ -6011,19 +6047,54 @@ async fn shutdown_operation(
         outcome.details["owned_scope"] = command.input.get("owned_scope").cloned().unwrap_or(Value::Null);
         return outcome;
     }
+    if let Some(previous) = journal.state.operations.get(&command.operation_id) {
+        if let Some(result) = &previous.outcome {
+            return decode_outcome(result, &command.operation_id);
+        }
+        return unknown_shutdown(command, &journal.state, "SHUTDOWN_EFFECT_UNCERTAIN");
+    }
+    if native.writer.is_none() {
+        return rejected(command, "CODEX_CONNECTION_NOT_HELD", &journal.state);
+    }
+    let mut record = OperationRecord::intent(&command.method, "shutdown");
+    record.input_sha256 = command.input_sha256.clone();
+    record.native_scope_key = journal.state.native_scope_key.clone();
+    journal.state.operations.insert(command.operation_id.clone(), record);
+    if journal.save().is_err() {
+        return outcome(
+            &command.operation_id,
+            EffectOutcome::Rejected,
+            None,
+            None,
+            None,
+            None,
+            json!({"diagnostic_code":"CHECKPOINT_WRITE_FAILED","native_replay":false}),
+        );
+    }
     match release_owned_connection(native).await {
         Ok(disposition) => {
+            journal.state.native_retired = true;
             let mut details = base_details(&journal.state);
             details["diagnostic_code"] = json!("OWNED_CONNECTION_RELEASED");
             details["completion_condition"] = json!("owned_resource_released");
             details["disposition"] = json!(disposition);
             details["native_replay"] = json!(false);
-            outcome(&command.operation_id, EffectOutcome::Applied, None, journal.state.native_scope_key.as_deref(), None, None, details)
+            outcome(
+                &command.operation_id,
+                EffectOutcome::Applied,
+                None,
+                journal.state.native_scope_key.as_deref(),
+                None,
+                None,
+                details,
+            )
         }
-        Err(code) => rejected(command, code, &journal.state),
+        Err(code) => {
+            journal.state.native_retired = true;
+            unknown_shutdown(command, &journal.state, code)
+        }
     }
 }
-
 async fn build_normalized_result_page(
     command: &RuntimeCommand,
     journal: &Journal,
@@ -6491,6 +6562,9 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
     }
     let context = module_contract::load_runtime_context()?;
     let mut journal = Journal::open(context.state_dir.clone(), context.worker.boot_id.clone())?;
+    if journal.state.native_retired {
+        return Ok(());
+    }
     let ipc: IpcConfig =
         serde_json::from_value(config.ipc.clone()).map_err(|_| AdapterError::Configuration)?;
     let mut credential_unavailable = false;
@@ -6600,6 +6674,9 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
                     Ok(()) => {}
                     Err(AdapterError::Host) => break,
                     Err(error) => return Err(error),
+                }
+                if journal.state.native_retired {
+                    return Ok(());
                 }
             } else if captured_events {
                 match report_pending(&mut host, &mut journal, normalized_results).await {
@@ -7108,5 +7185,183 @@ mod agent_shutdown_tests {
         for input in [serde_json::json!({}), serde_json::json!({"owned_scope": "owned_sdk_transport"}), serde_json::json!({"owned_scope": "server"}), serde_json::json!({"owned_scope": ""})] {
             assert_eq!(shutdown_scope(&input), Err("SHUTDOWN_SCOPE_UNSUPPORTED"));
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_shutdown_loopback_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    async fn serve_once(
+        listener: tokio::net::TcpListener,
+        mode: &'static str,
+        closes_seen: Arc<AtomicUsize>,
+    ) {
+        let (stream, _) = listener.accept().await.expect("loopback accept");
+        if mode == "drop" {
+            return;
+        }
+        let mut ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("loopback handshake");
+        if mode == "ignore" {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            return;
+        }
+        while let Some(message) = futures_util::StreamExt::next(&mut ws).await {
+            if let tokio_tungstenite::tungstenite::Message::Close(_) = message.expect("loopback read") {
+                    closes_seen.fetch_add(1, Ordering::SeqCst);
+                    if mode == "echo" {
+                        let _ = futures_util::SinkExt::send(
+                            &mut ws,
+                            tokio_tungstenite::tungstenite::Message::Close(None),
+                        )
+                        .await;
+                    }
+                    return;
+            }
+        }
+    }
+    async fn loopback_pair(mode: &'static str) -> (NativeClient, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind");
+        let address = listener.local_addr().expect("loopback address");
+        let closes = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(serve_once(listener, mode, Arc::clone(&closes)));
+        let endpoint = format!("ws://{address}/");
+        let (socket, _) = tokio_tungstenite::connect_async(endpoint).await.expect("loopback connect");
+        let (writer_half, reader_half) = socket.split();
+        let writer = Arc::new(AsyncMutex::new(writer_half));
+        let demux = Arc::new(NativeRpcDemultiplexer::new(NativeEventSink::new()));
+        let reader_task = tokio::spawn(read_native_messages(reader_half, Arc::clone(&writer), Arc::clone(&demux)));
+        let native = NativeClient { writer: Some(writer), demux, events: NativeEventSink::new(), reader_task: Some(reader_task), native_scope_key: Some("test-scope".to_owned()), server_identity: None };
+        (native, closes)
+    }
+    #[tokio::test]
+    async fn echo_proves_release_and_never_replays() {
+        let (mut native, closes) = loopback_pair("echo").await;
+        let disposition = release_owned_connection(&mut native).await.expect("echoed close proves release");
+        assert_eq!(disposition, "owned_connection_closed");
+        assert!(native.writer.is_none());
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        let replay = release_owned_connection(&mut native).await;
+        assert_eq!(replay, Err("CODEX_CONNECTION_ALREADY_RELEASED"));
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn unconfirmed_close_is_unknown() {
+        let (mut native, _) = loopback_pair("ignore").await;
+        let outcome = release_owned_connection_with_timeout(&mut native, std::time::Duration::from_millis(200)).await;
+        assert_eq!(outcome, Err("CODEX_CONNECTION_CLOSE_UNKNOWN"));
+        assert!(native.writer.is_none());
+    }
+    #[tokio::test]
+    async fn peer_drop_is_observed_close() {
+        let (mut native, closes) = loopback_pair("read_then_drop").await;
+        let disposition = release_owned_connection(&mut native).await.expect("dropped peer is observed close");
+        assert_eq!(disposition, "owned_connection_closed");
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn handler_rejects_no_writer_before_effect() {
+        let directory = std::env::temp_dir().join(format!("codex-shutdown-nowriter-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("fixture journal");
+        let mut journal = Journal::open(directory, "boot-shutdown".to_owned()).expect("open fixture journal");
+        let claim: ModuleContractClaim = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "module_id": "codex",
+            "artifact": {"artifact_id": "codex-rust-controller.1", "version": "9", "build_id": null},
+            "protocol": {"major": 1, "minor": 0},
+            "capabilities": ["agent.open", "agent.reconcile", "agent.result", "agent.send", "agent.shutdown", "task.dispatch"], "config_schema": null,
+            "command_schemas": [], "event_schemas": []
+        })).expect("fixture claim");
+        let command = RuntimeCommand {
+            operation_id: "shutdown-nowriter".to_owned(),
+            method: "agent.shutdown".to_owned(),
+            created_at_ms: 1,
+            binding_id: "b".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: serde_json::json!({}),
+            input: serde_json::json!({"owned_scope": "external_attach"}),
+            input_sha256: Some("a".repeat(64)),
+            target_input_sha256: None,
+        };
+        let mut native = NativeClient { writer: None, demux: Arc::new(NativeRpcDemultiplexer::new(NativeEventSink::new())), events: NativeEventSink::new(), reader_task: None, native_scope_key: None, server_identity: None };
+        let outcome = shutdown_operation(&command, &mut journal, &mut native, &claim).await;
+        assert_eq!(outcome.outcome, EffectOutcome::Rejected);
+        assert_eq!(outcome.details["diagnostic_code"], "CODEX_CONNECTION_NOT_HELD");
+        assert!(!journal.state.operations.contains_key("shutdown-nowriter"));
+        assert!(!journal.state.native_retired);
+    }
+    fn full_claim() -> ModuleContractClaim {
+        serde_json::from_value(serde_json::json!({"schema_version": 1,
+            "module_id": "codex",
+            "artifact": {"artifact_id": "codex-rust-controller.1", "version": "9", "build_id": null},
+            "protocol": {"major": 1, "minor": 0},
+            "capabilities": ["agent.shutdown"], "config_schema": null,
+            "command_schemas": [], "event_schemas": []
+        })).expect("shutdown fixture claim")
+    }
+    fn shutdown_cmd(operation_id: &str, scope: &str) -> RuntimeCommand {
+        RuntimeCommand {
+            operation_id: operation_id.to_owned(),
+            method: "agent.shutdown".to_owned(),
+            created_at_ms: 1,
+            binding_id: "test-binding".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: serde_json::json!({}),
+            input: serde_json::json!({"owned_scope": scope}),
+            input_sha256: Some("b".repeat(64)),
+            target_input_sha256: None,
+        }
+    }
+    fn fixture_journal(tag: &str) -> (std::path::PathBuf, Journal) {
+        let directory = std::env::temp_dir().join(tag);
+        std::fs::remove_dir_all(&directory).ok();
+        std::fs::create_dir_all(&directory).expect("fixture journal dir");
+        let journal = Journal::open(directory.clone(), "boot-shutdown-test".to_owned()).expect("open fixture journal");
+        (directory, journal)
+    }
+    #[tokio::test]
+    async fn applied_marks_retired_and_survives_reopen_without_replay() {
+        let (mut native, closes) = loopback_pair("echo").await;
+        let (directory, mut journal) = fixture_journal("codex-shutdown-applied");
+        let claim = full_claim();
+        let command = shutdown_cmd("shutdown-applied-1", "external_attach");
+        let mut outcome = shutdown_operation(&command, &mut journal, &mut native, &claim).await;
+        assert!(matches!(outcome.outcome, EffectOutcome::Applied));
+        assert_eq!(outcome.details["completion_condition"], "owned_resource_released");
+        assert_eq!(outcome.details["disposition"], "owned_connection_closed");
+        assert_eq!(outcome.details["native_replay"], false);
+        assert!(journal.state.native_retired);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        journal.bind("test-binding", 1).expect("bind fixture binding");
+        attach_command_receipt(&mut outcome, &command, &claim).expect("attach receipt");
+        journal.store_outcome(&outcome, "agent.shutdown", "shutdown").expect("loop persists outcome");
+        drop(journal);
+        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned()).expect("reopen retired journal");
+        assert!(reopened.state.native_retired);
+        let again = shutdown_operation(&command, &mut reopened, &mut native, &claim).await;
+        assert!(matches!(again.outcome, EffectOutcome::Applied));
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+    #[tokio::test]
+    async fn unconfirmed_close_is_unknown_with_retained_intent() {
+        let (mut native, _) = loopback_pair("ignore").await;
+        let (directory, mut journal) = fixture_journal("codex-shutdown-uncertain");
+        let claim = full_claim();
+        let command = shutdown_cmd("shutdown-uncertain-1", "external_attach");
+        let outcome = shutdown_operation(&command, &mut journal, &mut native, &claim).await;
+        assert!(matches!(outcome.outcome, EffectOutcome::Unknown));
+        assert_eq!(outcome.details["diagnostic_code"], "CODEX_CONNECTION_CLOSE_UNKNOWN");
+        assert!(journal.state.native_retired);
+        let record = journal.state.operations.get("shutdown-uncertain-1").expect("intent retained");
+        assert!(record.outcome.is_none());
+        std::fs::remove_dir_all(&directory).ok();
     }
 }
