@@ -47,7 +47,7 @@ pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
 }
 /// Only for fresh directories created by this host or an exact workspace lease.
 /// Configured repositories/roots are inspected, never repaired through this API.
-pub(crate) fn private_owned_directory(path: &Path) -> Result<()> {
+pub fn private_owned_directory(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !path.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(Error::new(

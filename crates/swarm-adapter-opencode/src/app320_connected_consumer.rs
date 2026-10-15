@@ -18,7 +18,7 @@ use swarm_contracts::{
 use swarm_kernel_host::{
     config::{Config as HostConfig, McpProfileConfig, McpToolProfile, Route},
     forge::ForgeProject,
-    platform::{load_credential, private_permissions},
+    platform::{load_credential, private_owned_directory, private_permissions},
     workspace::WorkspaceProjectConfig,
 };
 
@@ -213,14 +213,18 @@ pub(super) async fn run_app299_case() -> std::result::Result<(), String> {
 
 async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> FixtureResult<()> {
     let scratch = unique_directory("eliot-app320-owned-connected")?;
-    private_permissions(&scratch, true).map_err(display)?;
+    private_owned_directory(&scratch).map_err(display)?;
     let host_data_dir = scratch.join("host");
     let repository = scratch.join("repository");
     let workspace_root = scratch.join("workspaces");
     let hooks = scratch.join("empty-hooks");
     for directory in [&host_data_dir, &repository, &workspace_root, &hooks] {
         fs::create_dir(directory).map_err(display)?;
-        private_permissions(directory, true).map_err(display)?;
+        // These are fresh fixture directories, not operator-configured roots.
+        // Elevated Windows tokens can default their owner to Administrators;
+        // a private DACL alone does not establish the exact-user owner that
+        // the unchanged workspace validator requires.
+        private_owned_directory(directory).map_err(display)?;
     }
     let git = fixture_git_executable()?;
     fixture_git(&git, &repository, &hooks, &["init", "--quiet"])?;
