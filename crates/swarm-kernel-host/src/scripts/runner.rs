@@ -1364,6 +1364,15 @@ pub fn completion(work: &Work, files: &ArtifactFiles) -> Result<Option<Completio
     }
     if let Some(process_facts) = completion.process_facts.as_ref() {
         validate_process_facts(process_facts, &worker["process"], false)?;
+        if completion.state == "completed"
+            && (process_facts["direct_exit"]["state"] != "observed"
+                || process_facts["direct_exit"]["exit_code"].as_i64()
+                    != completion.exit_code.map(i64::from))
+        {
+            return Err(Error::conflict(
+                "completed script receipt requires the matching observed interpreter exit",
+            ));
+        }
         if !capture_fact_matches_length(
             &process_facts["stdout_capture"],
             completion.stdout.byte_length,

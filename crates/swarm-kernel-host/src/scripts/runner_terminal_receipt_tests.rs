@@ -157,8 +157,8 @@ fn fixture_work(root: &std::path::Path) -> Work {
         "bundle_sha256":work.bundle_record.content_digest,
         "interpreter_sha256":work.interpreter.sha256,
     });
-    work.environment_sha256 = environment_sha256(&work.environment)
-        .expect("hash terminal receipt fixture environment");
+    work.environment_sha256 =
+        environment_sha256(&work.environment).expect("hash terminal receipt fixture environment");
     validate_work(&work).expect("fixture Work matches the retained completion contract");
     work
 }
@@ -189,9 +189,14 @@ fn publish_fixture_work(work: &Work) -> (PathBuf, String) {
 
 fn write_terminal_fixture(work: &Work, process: &Value, mode: &str) {
     let released = mode != "unknown";
+    let direct_state = match mode {
+        "direct_unknown" => "observation_unknown",
+        "direct_not_started" => "not_started",
+        _ => "observed",
+    };
     let facts = json!({
         "schema_version":1,
-        "direct_exit":{"state":"observed","exit_code":0},
+        "direct_exit":{"state":direct_state,"exit_code":if mode == "direct_wrong_code" {7} else {0}},
         "family_departure":{
             "state":if released {"confirmed"} else {"observation_unknown"},
             "process":process,
@@ -376,6 +381,14 @@ fn terminal_receipt_fallback_requires_valid_proof_and_child_exit() {
     for_negative_receipt_fixture("unknown", |result| {
         assert!(result.is_err(), "unknown family facts cannot be validated");
     });
+    for mode in ["direct_unknown", "direct_not_started", "direct_wrong_code"] {
+        for_negative_receipt_fixture(mode, |result| {
+            assert!(
+                result.is_err(),
+                "{mode} cannot validate a completed result or release custody"
+            );
+        });
+    }
 }
 
 fn for_negative_receipt_fixture(
