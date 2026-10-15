@@ -1133,7 +1133,7 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
             Some(native_root_id),
         );
     }
-    let reply_sha256 = digest_json(&reply)?;
+    let reply_sha256 = interactions::callback_digest_json(&reply)?;
     let native_intent = json!({
         "interaction_request_id":request.request_id,
         "interaction_kind":request.kind.as_str(),
@@ -3685,7 +3685,8 @@ mod failed_prepare_lifecycle_fixture {
             "input":callback_raw_input
         }))
         .expect("digest fixture callback");
-        let projection_digest = digest_json(&callback_input).expect("digest safe projection");
+        let projection_digest =
+            interactions::callback_digest_json(&callback_input).expect("digest safe projection");
         interactions
             .record_request(InteractionRequestEvidence {
                 schema_version: 2,
@@ -3974,7 +3975,8 @@ mod failed_prepare_lifecycle_fixture {
             request_id: "sdk-request-id".to_owned(),
             kind: InteractionKind::Question,
             tool_name: "AskUserQuestion".to_owned(),
-            input_sha256: digest_json(&input).expect("digest safe projection"),
+            input_sha256: interactions::callback_digest_json(&input)
+                .expect("digest safe projection"),
             input,
             request_sha256: "a".repeat(64),
         };

@@ -503,7 +503,7 @@ impl InteractionJournal {
         if operation_id.trim().is_empty()
             || operation_id.len() > 256
             || !valid_sha256(reply_sha256)
-            || digest_json(reply)? != reply_sha256
+            || interaction_reply_digest(&record.request, reply)? != reply_sha256
         {
             return Err(Error::new(
                 "INTERACTION_REPLY_IDENTITY",
@@ -607,7 +607,7 @@ impl InteractionJournal {
             && (record.reply_operation_id.as_deref() != Some(operation_id)
                 || record.reply_sha256.as_deref() != Some(reply_sha256)))
             || !valid_sha256(reply_sha256)
-            || digest_json(reply)? != reply_sha256
+            || interaction_reply_digest(&record.request, reply)? != reply_sha256
         {
             return Err(Error::new(
                 "INTERACTION_REPLY_IDENTITY",
@@ -1842,8 +1842,15 @@ impl InteractionJournal {
         ) {
             (None, None, None) => true,
             (Some(reply), Some(reply_sha256), Some(operation_id)) => {
-                digest_json(reply).ok().as_deref() == Some(reply_sha256)
-                    && valid_identity(operation_id, 256)
+                // A partially migrated legacy question still carries its old
+                // reply digest. Verify those bytes before scrubbing them below;
+                // only current projected replies use the Node wire ordering.
+                let digest = if is_legacy_question_reply(&record.request, reply) {
+                    digest_json(reply)
+                } else {
+                    interaction_reply_digest(&record.request, reply)
+                };
+                digest.ok().as_deref() == Some(reply_sha256) && valid_identity(operation_id, 256)
             }
             (None, Some(reply_sha256), Some(operation_id))
                 if record.request.schema_version == 2
@@ -2121,6 +2128,23 @@ fn legacy_request_payload(request: &InteractionRequest) -> Result<Value> {
     }))
 }
 
+// Node's schema-2 callback protocol sorts object keys recursively. Cargo feature
+// unification may enable serde_json/preserve_order; that must not change this
+// wire digest. Keep legacy interaction and OperationJournal hashes separate.
+pub(super) fn callback_digest_json(value: &Value) -> Result<String> {
+    let mut canonical = value.clone();
+    canonical.sort_all_objects();
+    digest_json(&canonical)
+}
+
+fn interaction_reply_digest(request: &InteractionRequest, reply: &Value) -> Result<String> {
+    if request.schema_version == 2 {
+        callback_digest_json(reply)
+    } else {
+        digest_json(reply)
+    }
+}
+
 fn validate_request(request: &InteractionRequest) -> Result<()> {
     let input_bytes = serde_json::to_vec(&request.input)?.len();
     let integrity_valid = match request.schema_version {
@@ -2130,7 +2154,7 @@ fn validate_request(request: &InteractionRequest) -> Result<()> {
         }
         2 => {
             valid_sha256(&request.input_sha256)
-                && digest_json(&request.input)? == request.input_sha256
+                && callback_digest_json(&request.input)? == request.input_sha256
                 && valid_sha256(&request.request_sha256)
         }
         _ => false,
@@ -2211,7 +2235,7 @@ fn redact_legacy_request(request: &mut InteractionRequest) -> Result<()> {
         }
     };
     request.schema_version = 2;
-    request.input_sha256 = digest_json(&request.input)?;
+    request.input_sha256 = callback_digest_json(&request.input)?;
     validate_request(request)
 }
 
@@ -2420,7 +2444,8 @@ mod recovery_regression_tests {
             "input":raw_input
         }))
         .expect("digest the raw SDK callback in its producer");
-        let input_sha256 = digest_json(&projected_input).expect("digest the safe projection");
+        let input_sha256 =
+            callback_digest_json(&projected_input).expect("digest the safe projection");
         let request = journal
             .record_request(InteractionRequestEvidence {
                 schema_version: 2,
@@ -2435,7 +2460,7 @@ mod recovery_regression_tests {
             })
             .expect("persist only the typed safe projection");
         let reply = json!({"type":"permission","decision":"allow"});
-        let reply_sha256 = digest_json(&reply).expect("digest projected reply");
+        let reply_sha256 = callback_digest_json(&reply).expect("digest projected reply");
         journal
             .begin_reply(request_id, "fixture-reply-operation", &reply, &reply_sha256)
             .expect("persist the exact projected reply intent");
@@ -2747,7 +2772,7 @@ mod recovery_regression_tests {
         }]);
         let safe_input = json!({"questions":safe_questions});
         let live_request_id = "current-schema-two-question-reply";
-        let input_sha256 = digest_json(&safe_input).expect("digest current safe input");
+        let input_sha256 = callback_digest_json(&safe_input).expect("digest current safe input");
         let live_request_sha256 = digest_json(&json!({
             "schema_version":2,
             "request_id":live_request_id,
@@ -2776,7 +2801,7 @@ mod recovery_regression_tests {
                 "answers":{"Which option should remain?":"Keep"}
             }
         });
-        let live_reply_sha256 = digest_json(&live_reply).expect("digest current reply");
+        let live_reply_sha256 = callback_digest_json(&live_reply).expect("digest current reply");
         journal
             .begin_reply(
                 live_request_id,
@@ -2816,7 +2841,7 @@ mod recovery_regression_tests {
             "input":raw_input
         }))
         .unwrap();
-        let input_sha256 = digest_json(&input).unwrap();
+        let input_sha256 = callback_digest_json(&input).unwrap();
         journal
             .record_request(InteractionRequestEvidence {
                 schema_version: 2,
