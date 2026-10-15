@@ -265,8 +265,97 @@ mod os {
         job: HANDLE,
         pub identity: Value,
         non_killing_owner: bool,
+        query_only: bool,
     }
+
+    // SAFETY: Windows Job handles are process-wide kernel handles and may be
+    // queried or closed from any thread. Access to this wrapper is serialized
+    // by its owner when it is retained across async lifecycle work.
+    unsafe impl Send for Group {}
+
+    fn expected_job_name(identity: &Value, token: &str) -> Result<String> {
+        let owner_name = match identity["purpose"].as_str() {
+            Some("module") => "Module".to_owned(),
+            Some("check" | "script") => "Check".to_owned(),
+            Some("bus_consumer") => "Service-BusConsumer".to_owned(),
+            Some("automation_scheduler") => "Service-AutomationScheduler".to_owned(),
+            _ => {
+                return Err(Error::new(
+                    "CHECK_RECOVERY_UNSUPPORTED",
+                    "process owner purpose is not supported",
+                ));
+            }
+        };
+        let expected = format!("Global\\EliotSwarm{owner_name}-{token}");
+        if identity["scope"] != "windows_job" || identity["job_name"] != expected {
+            return Err(Error::new(
+                "CHECK_RECOVERY_UNSUPPORTED",
+                "a named check Job is required; legacy unnamed Jobs are not guessed",
+            ));
+        }
+        Ok(expected)
+    }
+
+    fn open_query_job(expected: &str) -> Result<HANDLE> {
+        let name: Vec<u16> = expected.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: name is nul-terminated UTF-16; this handle is query-only.
+        let job = unsafe { OpenJobObjectW(JOB_QUERY_ACCESS, 0, name.as_ptr()) };
+        if job.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                return Err(Error::new(
+                    "PROCESS_FAMILY_UNKNOWN",
+                    format!("named Job {expected:?} is unavailable; family departure is unproven"),
+                ));
+            }
+            return Err(error.into());
+        }
+        Ok(job)
+    }
+
+    fn job_family_empty(job: HANDLE) -> Result<bool> {
+        // SAFETY: initialized output and a valid query-only Job handle.
+        unsafe {
+            let mut count: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+            if QueryInformationJobObject(
+                job,
+                JobObjectBasicAccountingInformation,
+                (&mut count as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                ptr::null_mut(),
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(count.ActiveProcesses == 0)
+        }
+    }
+
     impl Group {
+        /// Retain a query-only handle for the exact existing module Job.
+        /// This keeps authoritative accounting available after its owner exits.
+        pub fn open_module_query(identity: &Value, token: &str) -> Result<Self> {
+            if identity["purpose"] != "module" {
+                return Err(Error::new(
+                    "CHECK_RECOVERY_UNSUPPORTED",
+                    "a module owner Job is required for retained family observation",
+                ));
+            }
+            let expected = expected_job_name(identity, token)?;
+            let job = open_query_job(&expected)?;
+            Ok(Self {
+                job,
+                identity: identity.clone(),
+                non_killing_owner: true,
+                query_only: true,
+            })
+        }
+
+        /// Report exact zero-member Job evidence using this retained query handle.
+        pub fn family_empty(&self) -> Result<bool> {
+            job_family_empty(self.job)
+        }
+
         pub fn enter(token: &str) -> Result<Self> {
             Self::enter_owned(token, false, None)
         }
@@ -363,6 +452,7 @@ mod os {
                     job,
                     identity: json!({"pid":std::process::id(),"creation_filetime":((creation.dwHighDateTime as u64)<<32)|creation.dwLowDateTime as u64,"scope":"windows_job","purpose":purpose_label,"job_name":name,"disposition_source":"job_accounting"}),
                     non_killing_owner: module || service_purpose.is_some(),
+                    query_only: false,
                 })
             }
         }
@@ -472,6 +562,12 @@ mod os {
             Ok(sent) // Termination requests are not resource-release evidence.
         }
         pub fn disarm(&self) -> Result<()> {
+            if self.query_only {
+                return Err(Error::new(
+                    "PROCESS_GROUP_QUERY_ONLY",
+                    "a retained family query handle cannot change Job limits",
+                ));
+            }
             if !self.children_empty()? {
                 return Err(Error::new(
                     "CHECK_DESCENDANTS_ACTIVE",
@@ -549,25 +645,7 @@ mod os {
         }
     }
     pub fn departed_empty(identity: &Value, token: &str) -> Result<bool> {
-        let owner_name = match identity["purpose"].as_str() {
-            Some("module") => "Module".to_owned(),
-            Some("check" | "script") => "Check".to_owned(),
-            Some("bus_consumer") => "Service-BusConsumer".to_owned(),
-            Some("automation_scheduler") => "Service-AutomationScheduler".to_owned(),
-            _ => {
-                return Err(Error::new(
-                    "CHECK_RECOVERY_UNSUPPORTED",
-                    "process owner purpose is not supported",
-                ));
-            }
-        };
-        let expected = format!("Global\\EliotSwarm{owner_name}-{token}");
-        if identity["scope"] != "windows_job" || identity["job_name"] != expected {
-            return Err(Error::new(
-                "CHECK_RECOVERY_UNSUPPORTED",
-                "a named check Job is required; legacy unnamed Jobs are not guessed",
-            ));
-        }
+        let expected = expected_job_name(identity, token)?;
         let pid = u32::try_from(positive(identity, "pid")?)
             .map_err(|_| Error::invalid("invalid worker PID"))?;
         let birth = identity["creation_filetime"]
@@ -605,34 +683,10 @@ mod os {
                     return Err(error.into());
                 }
             }
-            let name: Vec<u16> = expected.encode_utf16().chain(Some(0)).collect();
-            let job = OpenJobObjectW(JOB_QUERY_ACCESS, 0, name.as_ptr());
-            if job.is_null() {
-                let error = std::io::Error::last_os_error();
-                return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
-                    Ok(true)
-                } else {
-                    Err(error.into())
-                };
-            }
-            let mut count: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
-            let ok = QueryInformationJobObject(
-                job,
-                JobObjectBasicAccountingInformation,
-                (&mut count as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                ptr::null_mut(),
-            );
-            let error = if ok == 0 {
-                Some(std::io::Error::last_os_error())
-            } else {
-                None
-            };
+            let job = open_query_job(&expected)?;
+            let result = job_family_empty(job);
             CloseHandle(job);
-            if let Some(error) = error {
-                return Err(error.into());
-            }
-            Ok(count.ActiveProcesses == 0)
+            result
         }
     }
     /// Prove that the exact declared-service owner process is still alive in

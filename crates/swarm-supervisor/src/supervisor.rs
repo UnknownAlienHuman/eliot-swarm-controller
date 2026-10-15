@@ -962,8 +962,17 @@ struct Service {
     /// Exact helper Child retained when process, receipt, or family
     /// observation is uncertain. This slot is bounded to one per scope.
     helper_child_custody: AsyncMutex<Option<RetainedHelperChild>>,
+    /// Query-only handle retained while the exact helper Child is unresolved.
+    /// On Windows this keeps Job accounting available after the name or owner
+    /// process can no longer be queried.
+    #[cfg(windows)]
+    owner_family_query: Mutex<Option<swarm_process::Group>>,
     #[cfg(test)]
     module_membership_probe: Mutex<Option<ModuleMembershipProbe>>,
+    #[cfg(test)]
+    prior_owner_timeout: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    final_owner_timeout: Mutex<Option<Duration>>,
 }
 
 struct RetainedHelperChild {
@@ -1092,9 +1101,81 @@ impl Service {
             unknown_operation_ids: Mutex::new(BTreeSet::new()),
             runner: AsyncMutex::new(None),
             helper_child_custody: AsyncMutex::new(None),
+            #[cfg(windows)]
+            owner_family_query: Mutex::new(None),
             #[cfg(test)]
             module_membership_probe: Mutex::new(None),
+            #[cfg(test)]
+            prior_owner_timeout: Mutex::new(None),
+            #[cfg(test)]
+            final_owner_timeout: Mutex::new(None),
         }
+    }
+
+    fn remember_owner_family_query(&self, identity: &Value, token: &str) {
+        #[cfg(windows)]
+        {
+            let mut query = lock(&self.owner_family_query);
+            if query
+                .as_ref()
+                .is_some_and(|query| query.identity != *identity)
+            {
+                *query = None;
+            }
+            if query.is_none()
+                && let Ok(opened) = swarm_process::Group::open_module_query(identity, token)
+            {
+                *query = Some(opened);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (identity, token);
+    }
+
+    fn observe_named_owner_family(
+        &self,
+        identity: &Value,
+        token: &str,
+    ) -> ProcessFamilyObservation {
+        observe_process_family(identity, token)
+    }
+
+    fn observe_owner_family(&self, identity: &Value, token: &str) -> ProcessFamilyObservation {
+        #[cfg(windows)]
+        {
+            let query = lock(&self.owner_family_query);
+            if let Some(query) = query.as_ref().filter(|query| query.identity == *identity) {
+                return match query.family_empty() {
+                    Ok(true) => ProcessFamilyObservation::ConfirmedEmpty,
+                    Ok(false) => ProcessFamilyObservation::Retained,
+                    Err(error) => ProcessFamilyObservation::Unknown(error),
+                };
+            }
+        }
+        self.observe_named_owner_family(identity, token)
+    }
+
+    fn release_owner_family_query(&self) {
+        #[cfg(windows)]
+        {
+            *lock(&self.owner_family_query) = None;
+        }
+    }
+
+    fn prior_owner_observation_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(timeout) = *lock(&self.prior_owner_timeout) {
+            return timeout;
+        }
+        PRIOR_OWNER_OBSERVATION_TIMEOUT
+    }
+
+    fn final_owner_observation_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(timeout) = *lock(&self.final_owner_timeout) {
+            return timeout;
+        }
+        OWNER_FINAL_OBSERVATION_TIMEOUT
     }
 
     async fn demand(
@@ -1282,7 +1363,7 @@ impl Service {
             return Ok(());
         };
 
-        let departure = self.wait_for_prior_owner_to_depart().await;
+        let departure = self.wait_for_prior_owner_to_depart_with_custody(true).await;
         let departed = match departure {
             Ok(Some(departed)) => departed,
             Ok(None) => {
@@ -1369,6 +1450,7 @@ impl Service {
                 status.worker_boot_id = retained.boot_id.clone();
             }
         });
+        self.release_owner_family_query();
         Ok(())
     }
 
@@ -2681,6 +2763,9 @@ impl Service {
                 owner_record = Some(owner);
                 owner_token = Some(token);
             }
+            if let (Some(owner), Some(token)) = (owner_record.as_ref(), owner_token.as_deref()) {
+                self.remember_owner_family_query(&owner["process"], token);
+            }
             if worker_record.is_none() {
                 worker_record = read_json_receipt_optional(&worker_path, OWNER_RECORD_LIMIT)?;
             }
@@ -2715,6 +2800,10 @@ impl Service {
                 {
                     owner_record = Some(owner);
                     owner_token = Some(token);
+                }
+                if let (Some(owner), Some(token)) = (owner_record.as_ref(), owner_token.as_deref())
+                {
+                    self.remember_owner_family_query(&owner["process"], token);
                 }
                 if worker_record.is_none() {
                     worker_record = read_json_receipt_optional(&worker_path, OWNER_RECORD_LIMIT)?;
@@ -2765,10 +2854,45 @@ impl Service {
                 let token = owner_token.as_deref().ok_or_else(|| {
                     Error::new("MODULE_OWNER_IDENTITY_INVALID", "owner token is missing")
                 })?;
-                let final_observation_deadline = Instant::now() + OWNER_FINAL_OBSERVATION_TIMEOUT;
+
+                if let Some(result) = launch_result.as_ref() {
+                    if worker_record.is_some() || worker_identity.is_some() {
+                        return Err(Error::new(
+                            "MODULE_LAUNCH_RESULT_INVALID",
+                            "certified pre-spawn result conflicts with worker process evidence",
+                        ));
+                    }
+                    let failure_code = result
+                        .get("error_code")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| Error::invalid("launch-result omitted error_code"))?
+                        .to_owned();
+                    let failure_stage = result
+                        .get("stage")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| Error::invalid("launch-result omitted stage"))?
+                        .to_owned();
+                    self.release_owner_family_query();
+                    return Ok(OwnerHelperExit {
+                        exit,
+                        worker: None,
+                        worker_diagnostic_code: None,
+                        safe_to_replace: true,
+                        // The exact validated receipt proves the owner observed
+                        // an empty family before any worker spawn.
+                        family_departure_proven: false,
+                        failure_code: Some(failure_code),
+                        failure_stage: Some(failure_stage),
+                        effect_certainty: ModuleEffectCertainty::NotStarted,
+                        healthy_duration: None,
+                    });
+                }
+
+                let final_observation_deadline =
+                    Instant::now() + self.final_owner_observation_timeout();
                 loop {
                     let family_observation_unknown =
-                        match observe_process_family(&owner["process"], token) {
+                        match self.observe_owner_family(&owner["process"], token) {
                             ProcessFamilyObservation::ConfirmedEmpty => break,
                             ProcessFamilyObservation::Retained => false,
                             ProcessFamilyObservation::Unknown(_) => true,
@@ -2802,63 +2926,34 @@ impl Service {
                 let healthy_duration = worker_started_at
                     .zip(worker_last_live_at)
                     .map(|(started, last_live)| last_live.saturating_duration_since(started));
-                let Some(result) = launch_result.as_ref() else {
-                    // worker.json is emitted only after Command::spawn succeeds
-                    // and the exact child image is captured. Its boot, artifact,
-                    // membership, and whole-family departure proofs are enough
-                    // to replace this failed adapter without replaying work.
-                    let worker = worker_identity.ok_or_else(|| {
-                        Error::new(
-                            "MODULE_LAUNCH_RESULT_MISSING",
-                            "helper exited without an exact worker receipt or certified pre-spawn result",
-                        )
-                    })?;
-                    let worker_diagnostic_code = if exit.success() {
-                        None
-                    } else {
-                        self.worker_diagnostic_code(boot_id)
-                    };
-                    return Ok(OwnerHelperExit {
-                        exit,
-                        worker: Some(worker),
-                        worker_diagnostic_code,
-                        safe_to_replace: true,
-                        // This is the only path with an exact worker receipt;
-                        // departed_empty has already succeeded above.
-                        family_departure_proven: true,
-                        failure_code: Some("MODULE_EXITED".to_owned()),
-                        failure_stage: None,
-                        effect_certainty: ModuleEffectCertainty::Unknown,
-                        healthy_duration,
-                    });
+                // worker.json is emitted only after Command::spawn succeeds
+                // and the exact child image is captured. Its boot, artifact,
+                // membership, and whole-family departure proofs are enough
+                // to replace this failed adapter without replaying work.
+                let worker = worker_identity.ok_or_else(|| {
+                    Error::new(
+                        "MODULE_LAUNCH_RESULT_MISSING",
+                        "helper exited without an exact worker receipt or certified pre-spawn result",
+                    )
+                })?;
+                let worker_diagnostic_code = if exit.success() {
+                    None
+                } else {
+                    self.worker_diagnostic_code(boot_id)
                 };
-                if worker_record.is_some() || worker_identity.is_some() {
-                    return Err(Error::new(
-                        "MODULE_LAUNCH_RESULT_INVALID",
-                        "certified pre-spawn result conflicts with worker process evidence",
-                    ));
-                }
-                let failure_code = result
-                    .get("error_code")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Error::invalid("launch-result omitted error_code"))?
-                    .to_owned();
-                let failure_stage = result
-                    .get("stage")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Error::invalid("launch-result omitted stage"))?
-                    .to_owned();
+                self.release_owner_family_query();
                 return Ok(OwnerHelperExit {
                     exit,
-                    worker: None,
-                    worker_diagnostic_code: None,
+                    worker: Some(worker),
+                    worker_diagnostic_code,
                     safe_to_replace: true,
-                    // Certified pre-spawn means no adapter family existed.
-                    family_departure_proven: false,
-                    failure_code: Some(failure_code),
-                    failure_stage: Some(failure_stage),
-                    effect_certainty: ModuleEffectCertainty::NotStarted,
-                    healthy_duration: None,
+                    // This is the only path with an exact worker receipt;
+                    // zero-member Job accounting has already succeeded above.
+                    family_departure_proven: true,
+                    failure_code: Some("MODULE_EXITED".to_owned()),
+                    failure_stage: None,
+                    effect_certainty: ModuleEffectCertainty::Unknown,
+                    healthy_duration,
                 });
             }
 
@@ -3094,7 +3189,15 @@ impl Service {
     }
 
     async fn wait_for_prior_owner_to_depart(&self) -> Result<Option<VerifiedDepartedOwner>> {
-        let observation_deadline = Instant::now() + PRIOR_OWNER_OBSERVATION_TIMEOUT;
+        self.wait_for_prior_owner_to_depart_with_custody(false)
+            .await
+    }
+
+    async fn wait_for_prior_owner_to_depart_with_custody(
+        &self,
+        keep_owner_query: bool,
+    ) -> Result<Option<VerifiedDepartedOwner>> {
+        let observation_deadline = Instant::now() + self.prior_owner_observation_timeout();
         let attempt_path = self.state_dir.join("launch-attempt.json");
         let attempt = read_json_receipt_optional(&attempt_path, LAUNCH_RECORD_LIMIT)?;
         let mut attempt_boot_id = None::<String>;
@@ -3185,6 +3288,9 @@ impl Service {
 
         let owner_path = self.state_dir.join("owner.json");
         let mut prior_owner = read_owner_receipt_optional(&owner_path)?;
+        if let Some((owner, token)) = prior_owner.as_ref() {
+            self.remember_owner_family_query(&owner["process"], token);
+        }
         if attempted_helper.is_none() && prior_owner.is_none() {
             let mut marker_present = false;
             for entry in fs::read_dir(&self.state_dir)? {
@@ -3220,6 +3326,7 @@ impl Service {
         }
 
         let mut prior_start_proved = attempt.is_none();
+        let mut final_owner_receipt_proves_empty = false;
         loop {
             if Instant::now() >= observation_deadline {
                 return Err(Error::new(
@@ -3296,6 +3403,9 @@ impl Service {
                         "persisted owner.json does not match the exact helper launch intent",
                     ));
                 }
+                if let Some((owner, token)) = prior_owner.as_ref() {
+                    self.remember_owner_family_query(&owner["process"], token);
+                }
             }
             let Some((owner, token)) = prior_owner.as_ref() else {
                 // A helper that started but never published its exact owner or
@@ -3332,6 +3442,7 @@ impl Service {
                     let _ = self.validate_worker_receipt(receipt, boot_id, owner)?;
                 } else if let Some(receipt) = launch_result.as_ref() {
                     self.validate_launch_result(receipt, boot_id, owner)?;
+                    final_owner_receipt_proves_empty = true;
                 } else {
                     return Err(Error::new(
                         "MODULE_LAUNCH_RESULT_MISSING",
@@ -3340,8 +3451,20 @@ impl Service {
                 }
                 prior_start_proved = true;
             }
-            let retained_reason = match observe_process_family(&owner["process"], token) {
+            if final_owner_receipt_proves_empty {
+                if !keep_owner_query {
+                    self.release_owner_family_query();
+                }
+                return Ok(Some(VerifiedDepartedOwner {
+                    receipt: owner.clone(),
+                    token: token.clone(),
+                }));
+            }
+            let retained_reason = match self.observe_owner_family(&owner["process"], token) {
                 ProcessFamilyObservation::ConfirmedEmpty => {
+                    if !keep_owner_query {
+                        self.release_owner_family_query();
+                    }
                     return Ok(Some(VerifiedDepartedOwner {
                         receipt: owner.clone(),
                         token: token.clone(),
@@ -4118,6 +4241,44 @@ fn unix_time_ms() -> Result<u64> {
     })
 }
 
+fn prune_starts(starts: &mut VecDeque<u64>, window_ms: u64, now_ms: u64) {
+    starts.retain(|started| *started > now_ms || now_ms.saturating_sub(*started) < window_ms);
+}
+
+fn jittered_delay(policy: &crate::RestartPolicy, failure_index: usize) -> Duration {
+    let shift = failure_index.min(31) as u32;
+    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let base_ms = policy
+        .initial_backoff_ms
+        .saturating_mul(multiplier)
+        .min(policy.max_backoff_ms);
+    if !policy.jitter {
+        return Duration::from_millis(base_ms);
+    }
+    let random = Uuid::new_v4().as_u128() as u64;
+    // Full-range bounded jitter: choose uniformly from [50%, 100%] of the
+    // exponential delay, then cap again at the descriptor's configured max.
+    let adjusted = (base_ms / 2).saturating_add(random % (base_ms / 2 + 1));
+    let adjusted = adjusted.clamp(1, policy.max_backoff_ms);
+    Duration::from_millis(adjusted)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4433,14 +4594,25 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     impl WorkerProcessFixture {
         fn new() -> Self {
-            Self::spawn(None)
+            Self::spawn(None, None)
         }
 
         fn new_with_release_file(path: &Path) -> Self {
-            Self::spawn(Some(path))
+            Self::spawn(Some(path), None)
         }
 
-        fn spawn(release_file: Option<&Path>) -> Self {
+        fn new_with_grandchild(
+            worker_release_path: &Path,
+            grandchild_release_path: &Path,
+            grandchild_ready_path: &Path,
+        ) -> Self {
+            Self::spawn(
+                Some(worker_release_path),
+                Some((grandchild_release_path, grandchild_ready_path)),
+            )
+        }
+
+        fn spawn(release_file: Option<&Path>, grandchild: Option<(&Path, &Path)>) -> Self {
             let mut command = StdCommand::new(std::env::current_exe().unwrap());
             command
                 .args([
@@ -4456,7 +4628,28 @@ mod tests {
             if let Some(path) = release_file {
                 command.env("ELIOT_SWARM_SUPERVISOR_WORKER_RELEASE_PATH", path);
             }
+            if let Some((release_path, ready_path)) = grandchild {
+                command
+                    .env(
+                        "ELIOT_SWARM_SUPERVISOR_GRANDCHILD_RELEASE_PATH",
+                        release_path,
+                    )
+                    .env("ELIOT_SWARM_SUPERVISOR_GRANDCHILD_READY_PATH", ready_path);
+            }
             let mut child = command.spawn().expect("start OS-backed worker fixture");
+            if let Some((_, ready_path)) = grandchild {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !ready_path.is_file() {
+                    if let Some(exit) = child.try_wait().expect("poll worker fixture") {
+                        panic!("worker exited before its grandchild started: {exit}");
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "worker fixture did not start its grandchild before deadline"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
             let pid = child.id();
             let stdin = child.stdin.take().expect("pipe worker fixture stdin");
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -4509,11 +4702,21 @@ mod tests {
         release_path: PathBuf,
         worker_release_path: PathBuf,
         owner_exit_path: PathBuf,
+        grandchild_release_path: PathBuf,
+        grandchild_identity: Option<ProcessIdentity>,
     }
 
     #[cfg(any(windows, target_os = "linux"))]
     impl ConnectedOwnerFixture {
         async fn new() -> Self {
+            Self::new_inner(false).await
+        }
+
+        async fn new_with_grandchild() -> Self {
+            Self::new_inner(true).await
+        }
+
+        async fn new_inner(with_grandchild: bool) -> Self {
             let startup = StartupFixture::new_with_current_executable();
             startup.prepare_accounting();
             let boot_id = Uuid::new_v4().to_string();
@@ -4521,7 +4724,11 @@ mod tests {
             let release_path = state_dir.join("projection-fixture-release");
             let worker_release_path = state_dir.join("projection-worker-release");
             let owner_exit_path = state_dir.join("projection-fixture-owner-exit");
-            let mut helper = Command::new(std::env::current_exe().unwrap())
+            let grandchild_release_path = std::env::temp_dir()
+                .join(format!("eliot-swarm-grandchild-{}.release", Uuid::new_v4()));
+            let grandchild_ready_path = state_dir.join("projection-grandchild-ready");
+            let mut owner_command = Command::new(std::env::current_exe().unwrap());
+            owner_command
                 .args([
                     "--exact",
                     "supervisor::tests::owner_group_fixture_waits_for_release",
@@ -4538,7 +4745,19 @@ mod tests {
                 .env(
                     "ELIOT_SWARM_SUPERVISOR_OWNER_GENERATION",
                     startup.service.scope.generation.to_string(),
-                )
+                );
+            if with_grandchild {
+                owner_command
+                    .env(
+                        "ELIOT_SWARM_SUPERVISOR_OWNER_GRANDCHILD_RELEASE_PATH",
+                        &grandchild_release_path,
+                    )
+                    .env(
+                        "ELIOT_SWARM_SUPERVISOR_OWNER_GRANDCHILD_READY_PATH",
+                        &grandchild_ready_path,
+                    );
+            }
+            let mut helper = owner_command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -4593,6 +4812,15 @@ mod tests {
                 .validate_worker_receipt(&worker_receipt, &boot_id, &owner_receipt)
                 .unwrap()
                 .expect("connected worker receipt identifies the live worker");
+            let grandchild_identity = if with_grandchild {
+                let pid = fs::read_to_string(&grandchild_ready_path)
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap();
+                Some(capture_identity(pid).expect("capture actual grandchild identity"))
+            } else {
+                None
+            };
             assert!(
                 startup
                     .service
@@ -4610,6 +4838,8 @@ mod tests {
                 release_path,
                 worker_release_path,
                 owner_exit_path,
+                grandchild_release_path,
+                grandchild_identity,
             }
         }
 
@@ -4633,6 +4863,10 @@ mod tests {
 
         fn release_worker(&self) {
             fs::write(&self.worker_release_path, b"release").unwrap();
+        }
+
+        fn release_grandchild(&self) {
+            fs::write(&self.grandchild_release_path, b"release").unwrap();
         }
 
         async fn prove_departure(&mut self) {
@@ -4673,6 +4907,7 @@ mod tests {
             let _ = fs::write(&self.release_path, b"release");
             let _ = fs::write(&self.worker_release_path, b"release");
             let _ = fs::write(&self.owner_exit_path, b"exit");
+            let _ = fs::write(&self.grandchild_release_path, b"release");
             if let Some(helper) = self.helper.as_mut() {
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
                 loop {
@@ -4685,6 +4920,27 @@ mod tests {
                         _ => thread::sleep(Duration::from_millis(10)),
                     }
                 }
+            }
+            let mut grandchild_exited = self.grandchild_identity.is_none();
+            if let Some(grandchild) = self.grandchild_identity.as_ref() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    match process_identity_is_live(grandchild) {
+                        Ok(false) => {
+                            grandchild_exited = true;
+                            break;
+                        }
+                        Err(error) if error.code == "PROCESS_GONE" => {
+                            grandchild_exited = true;
+                            break;
+                        }
+                        _ if std::time::Instant::now() >= deadline => break,
+                        _ => thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            }
+            if grandchild_exited {
+                let _ = fs::remove_file(&self.grandchild_release_path);
             }
         }
     }
@@ -4736,7 +4992,17 @@ mod tests {
         .unwrap();
 
         let worker_release_path = state_dir.join("projection-worker-release");
-        let mut worker = WorkerProcessFixture::new_with_release_file(&worker_release_path);
+        let mut worker = match (
+            std::env::var_os("ELIOT_SWARM_SUPERVISOR_OWNER_GRANDCHILD_RELEASE_PATH"),
+            std::env::var_os("ELIOT_SWARM_SUPERVISOR_OWNER_GRANDCHILD_READY_PATH"),
+        ) {
+            (Some(release_path), Some(ready_path)) => WorkerProcessFixture::new_with_grandchild(
+                &worker_release_path,
+                Path::new(&release_path),
+                Path::new(&ready_path),
+            ),
+            _ => WorkerProcessFixture::new_with_release_file(&worker_release_path),
+        };
         let worker_receipt = serde_json::json!({
             "version": 1,
             "boot_id": boot_id,
@@ -4780,6 +5046,218 @@ mod tests {
             "MODULE_MEMBERSHIP_UNKNOWN",
             "OpenJobObjectW failed: ERROR_ACCESS_DENIED (5); exact module Job membership is unknown",
         ))
+    }
+
+    #[cfg(windows)]
+    #[repr(C)]
+    struct TestAcl {
+        revision: u8,
+        sbz1: u8,
+        size: u16,
+        ace_count: u16,
+        sbz2: u16,
+    }
+
+    #[cfg(windows)]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+
+    #[cfg(windows)]
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn InitializeAcl(acl: *mut TestAcl, length: u32, revision: u32) -> i32;
+        fn SetSecurityInfo(
+            handle: *mut std::ffi::c_void,
+            object_type: i32,
+            security_info: u32,
+            owner: *mut std::ffi::c_void,
+            group: *mut std::ffi::c_void,
+            dacl: *const TestAcl,
+            sacl: *const TestAcl,
+        ) -> u32;
+    }
+
+    #[cfg(windows)]
+    fn deny_named_job_query(identity: &Value, token: &str) -> Result<()> {
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const SE_KERNEL_OBJECT: i32 = 6;
+        const DACL_SECURITY_INFORMATION: u32 = 4;
+        const ACL_REVISION: u32 = 2;
+
+        let expected = format!(r"Global\EliotSwarmModule-{token}");
+        if identity["job_name"].as_str() != Some(expected.as_str()) {
+            return Err(Error::new(
+                "PROCESS_FAMILY_IDENTITY_INVALID",
+                "test ACL target does not match the exact module Job receipt",
+            ));
+        }
+        let name: Vec<u16> = expected.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: the name is nul-terminated and the opened handle requests only WRITE_DAC.
+        let handle = unsafe { OpenJobObjectW(WRITE_DAC, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let result = (|| {
+            let mut acl = TestAcl {
+                revision: 0,
+                sbz1: 0,
+                size: 0,
+                ace_count: 0,
+                sbz2: 0,
+            };
+            // SAFETY: acl points to writable storage of the exact Windows ACL header size.
+            if unsafe {
+                InitializeAcl(
+                    &mut acl,
+                    std::mem::size_of::<TestAcl>() as u32,
+                    ACL_REVISION,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: handle is open and acl is a valid initialized empty DACL.
+            let status = unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &acl,
+                    std::ptr::null(),
+                )
+            };
+            if status != 0 {
+                return Err(std::io::Error::from_raw_os_error(status as i32).into());
+            }
+            Ok(())
+        })();
+        // SAFETY: handle was returned by OpenJobObjectW and is closed exactly once.
+        unsafe { CloseHandle(handle) };
+        result
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn owner_worker_grandchild_requires_authoritative_job_departure() {
+        let mut fixture = ConnectedOwnerFixture::new_with_grandchild().await;
+        let service = fixture.startup.service.clone();
+        let token = fixture.owner_receipt["token"].as_str().unwrap();
+        let grandchild = fixture
+            .grandchild_identity
+            .as_ref()
+            .expect("the fixture has a real grandchild process");
+        assert!(process_identity_is_live(grandchild).unwrap());
+
+        // The production monitor captures this query handle when owner.json
+        // first arrives, while the name is still openable.
+        service.remember_owner_family_query(&fixture.owner_receipt["process"], token);
+        assert!(lock(&service.owner_family_query).is_some());
+        deny_named_job_query(&fixture.owner_receipt["process"], token).unwrap();
+
+        let mut helper = fixture.helper.take().expect("owner Child is retained");
+        fs::write(&fixture.owner_exit_path, b"exit").unwrap();
+        assert_eq!(helper.wait().await.unwrap().code(), Some(23));
+        fixture.release_worker();
+        time::timeout(Duration::from_secs(5), async {
+            while process_identity_is_live(&fixture.worker_identity).unwrap() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker exits while the grandchild remains alive");
+        assert!(!process_identity_is_live(&fixture.worker_identity).unwrap());
+        assert!(process_identity_is_live(grandchild).unwrap());
+        assert!(matches!(
+            observe_process_family(&fixture.owner_receipt["process"], token),
+            ProcessFamilyObservation::Unknown(_)
+        ));
+
+        let missing_token = Uuid::new_v4().to_string();
+        let missing_identity = serde_json::json!({
+            "pid": u64::from(u32::MAX),
+            "creation_filetime": 1,
+            "scope": "windows_job",
+            "purpose": "module",
+            "job_name": format!(r"Global\EliotSwarmModule-{missing_token}"),
+        });
+        let missing = swarm_process::departed_empty(&missing_identity, &missing_token)
+            .expect_err("a missing named Job cannot prove family departure");
+        assert_eq!(missing.code, "PROCESS_FAMILY_UNKNOWN");
+
+        let helper_identity = fixture.helper_identity.clone();
+        let boot_id = fixture.boot_id.clone();
+        *lock(&service.final_owner_timeout) = Some(Duration::from_millis(100));
+        let monitor = service.monitor_owner_helper(
+            &mut helper,
+            &boot_id,
+            &helper_identity,
+            None,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let query_error = match monitor.await {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("monitor must retain custody while a real grandchild remains in the Job")
+            }
+        };
+        assert_eq!(query_error.code, "MODULE_FINAL_FAMILY_OBSERVATION_TIMEOUT");
+        assert!(matches!(
+            service.observe_owner_family(&fixture.owner_receipt["process"], token),
+            ProcessFamilyObservation::Retained
+        ));
+        service
+            .retain_helper_after_monitor_error(helper, helper_identity, &boot_id, query_error)
+            .await;
+
+        *lock(&service.prior_owner_timeout) = Some(Duration::from_millis(100));
+        let launch_attempt = fs::read(service.state_dir.join("launch-attempt.json")).unwrap();
+        time::timeout(Duration::from_secs(2), service.clone().run_lifecycle())
+            .await
+            .expect("bounded retained-family reconciliation");
+        assert!(service.helper_child_custody.lock().await.is_some());
+        assert!(process_identity_is_live(grandchild).unwrap());
+        assert_eq!(
+            service
+                .current_status()
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.code.as_str()),
+            Some("MODULE_PRIOR_OWNER_WAIT_TIMEOUT")
+        );
+        assert_eq!(
+            fs::read(service.state_dir.join("launch-attempt.json")).unwrap(),
+            launch_attempt,
+            "no replacement launch may be recorded while the grandchild lives"
+        );
+
+        fixture.release_grandchild();
+        time::timeout(Duration::from_secs(5), async {
+            while process_identity_is_live(grandchild).unwrap() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("grandchild exits only after explicit release");
+        assert!(matches!(
+            observe_process_family(&fixture.owner_receipt["process"], token),
+            ProcessFamilyObservation::Unknown(_)
+        ));
+        assert!(matches!(
+            service.observe_owner_family(&fixture.owner_receipt["process"], token),
+            ProcessFamilyObservation::ConfirmedEmpty
+        ));
+        service
+            .reconcile_retained_helper_child()
+            .await
+            .expect("retained Job accounting proves exact zero-member departure");
+        assert!(service.helper_child_custody.lock().await.is_none());
+        assert!(lock(&service.owner_family_query).is_none());
+        app369_supervisor_consumes_actual_spawn_receipt_fixture().await;
     }
 
     #[cfg(windows)]
@@ -5398,6 +5876,33 @@ mod tests {
         if std::env::var_os("ELIOT_SWARM_SUPERVISOR_WORKER_FIXTURE").is_none() {
             return;
         }
+        let _grandchild = match (
+            std::env::var_os("ELIOT_SWARM_SUPERVISOR_GRANDCHILD_RELEASE_PATH"),
+            std::env::var_os("ELIOT_SWARM_SUPERVISOR_GRANDCHILD_READY_PATH"),
+        ) {
+            (Some(release_path), Some(ready_path)) => {
+                let child = StdCommand::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "supervisor::tests::grandchild_process_fixture_waits_for_release",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("ELIOT_SWARM_SUPERVISOR_GRANDCHILD_FIXTURE", "1")
+                    .env(
+                        "ELIOT_SWARM_SUPERVISOR_GRANDCHILD_RELEASE_PATH",
+                        &release_path,
+                    )
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("start actual grandchild process fixture");
+                fs::write(ready_path, child.id().to_string()).unwrap();
+                Some(child)
+            }
+            _ => None,
+        };
         if let Some(path) = std::env::var_os("ELIOT_SWARM_SUPERVISOR_WORKER_RELEASE_PATH") {
             let path = PathBuf::from(path);
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -5411,6 +5916,26 @@ mod tests {
         }
         let mut byte = [0_u8; 1];
         let _ = std::io::stdin().read_exact(&mut byte);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "spawned by the supervisor owner-worker-grandchild custody regression"]
+    fn grandchild_process_fixture_waits_for_release() {
+        if std::env::var_os("ELIOT_SWARM_SUPERVISOR_GRANDCHILD_FIXTURE").is_none() {
+            return;
+        }
+        let path = PathBuf::from(
+            std::env::var_os("ELIOT_SWARM_SUPERVISOR_GRANDCHILD_RELEASE_PATH")
+                .expect("grandchild release path"),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[tokio::test]
@@ -5620,8 +6145,7 @@ mod tests {
     }
 
     #[cfg(any(windows, target_os = "linux"))]
-    #[tokio::test]
-    async fn app369_supervisor_consumes_actual_spawn_receipt_without_retry_or_budget_mutation() {
+    async fn app369_supervisor_consumes_actual_spawn_receipt_fixture() {
         let fixture = StartupFixture::new_with_current_executable();
         fixture.prepare_accounting();
         let service = &fixture.service;
@@ -5764,6 +6288,12 @@ mod tests {
     }
 
     #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn app369_supervisor_consumes_actual_spawn_receipt_without_retry_or_budget_mutation() {
+        app369_supervisor_consumes_actual_spawn_receipt_fixture().await;
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     #[ignore = "spawned by app369_supervisor_consumes_actual_spawn_receipt_without_retry_or_budget_mutation"]
     fn app369_spawn_failure_owner_helper_process() {
@@ -5814,42 +6344,4 @@ mod tests {
                 .expect_err("invalid native image must fail at the actual worker Command::spawn");
         assert_eq!(error.code, "MODULE_OWNER_SPAWN_FAILED");
     }
-}
-
-fn prune_starts(starts: &mut VecDeque<u64>, window_ms: u64, now_ms: u64) {
-    starts.retain(|started| *started > now_ms || now_ms.saturating_sub(*started) < window_ms);
-}
-
-fn jittered_delay(policy: &crate::RestartPolicy, failure_index: usize) -> Duration {
-    let shift = failure_index.min(31) as u32;
-    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let base_ms = policy
-        .initial_backoff_ms
-        .saturating_mul(multiplier)
-        .min(policy.max_backoff_ms);
-    if !policy.jitter {
-        return Duration::from_millis(base_ms);
-    }
-    let random = Uuid::new_v4().as_u128() as u64;
-    // Full-range bounded jitter: choose uniformly from [50%, 100%] of the
-    // exponential delay, then cap again at the descriptor's configured max.
-    let adjusted = (base_ms / 2).saturating_add(random % (base_ms / 2 + 1));
-    let adjusted = adjusted.clamp(1, policy.max_backoff_ms);
-    Duration::from_millis(adjusted)
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
