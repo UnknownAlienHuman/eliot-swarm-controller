@@ -1,5 +1,5 @@
-//! Bounded OpenCode V2 question, permission, history and background contracts.
-//! Native text stays data; history observations never copy transcript payloads.
+//! Bounded OpenCode 2.0.7 form (question), permission and session-log contracts.
+//! Native text stays data; session-log observations never copy transcript payloads.
 
 use crate::{
     config::NativeOptions,
@@ -9,20 +9,16 @@ use crate::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use swarm_contracts::{
     error::{Error, Result},
     runtime::RuntimeCommand,
 };
 
 const MAX_PENDING: usize = 64;
-const MAX_QUESTIONS: usize = 32;
 const MAX_OPTIONS: usize = 32;
-const MAX_ANSWERS: usize = 32;
 const HISTORY_PAGE_LIMIT: usize = 64;
 const MAX_HISTORY_PAGE_BYTES: usize = 512 * 1024;
-const MAX_REPLY_HISTORY_PAGES: usize = 16;
-const MAX_REPLY_HISTORY_BYTES: usize = MAX_HISTORY_PAGE_BYTES * MAX_REPLY_HISTORY_PAGES;
 const MAX_INTERACTION_BYTES: usize = 32 * 1024;
 const MAX_NATIVE_TEXT_BYTES: usize = 4096;
 
@@ -34,7 +30,7 @@ struct DataEnvelope<T> {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HistoryPage {
+struct SessionLogPage {
     data: Vec<Value>,
     #[serde(rename = "hasMore")]
     has_more: bool,
@@ -67,6 +63,7 @@ pub struct PreparedReply {
     pub action: &'static str,
     pub path: String,
     pub body: Option<Value>,
+    pub http_delete: bool,
     pub affected_request_ids: Vec<String>,
     pub request_fingerprint: String,
     pub effect_payload_sha256: Option<String>,
@@ -105,13 +102,6 @@ struct SavedReplyIdentity {
 }
 
 #[derive(Debug)]
-struct SavedReplyEvent {
-    sequence: u64,
-    event_type: &'static str,
-    effect_payload_sha256: Option<String>,
-}
-
-#[derive(Debug)]
 pub struct InteractionPage {
     pub event_id: String,
     pub observation: Value,
@@ -144,7 +134,7 @@ pub async fn prepare_reply(
     }
     let request = &input.reply;
     let id_prefix = if request.kind == "question" {
-        "que_"
+        "frm_"
     } else {
         "per_"
     };
@@ -174,28 +164,31 @@ pub async fn prepare_reply(
         ));
     }
 
-    let (action, path, body, affected_request_ids) = match request.kind.as_str() {
+    let (action, path, body, http_delete, affected_request_ids) = match request.kind.as_str() {
         "question" => {
-            let question_count = validate_question_request(found)?;
-            if is_question_reject(&request.body)? {
+            let question_count = crate::native_forms::validate_question_form(found)?;
+            if crate::native_forms::is_question_reject(&request.body)? {
                 (
                     "reject",
                     format!(
-                        "/api/session/{}/question/{}/reject",
+                        "/api/session/{}/form/{}",
                         request.session_id, request.request_id
                     ),
                     None,
+                    true,
                     vec![request.request_id.clone()],
                 )
             } else {
-                let answers = validate_question_answers(&request.body, found, question_count)?;
+                let (_eliot_answers, native_answer) =
+                    crate::native_forms::question_answers_to_native(&request.body, found, question_count)?;
                 (
                     "reply",
                     format!(
-                        "/api/session/{}/question/{}/reply",
+                        "/api/session/{}/form/{}/reply",
                         request.session_id, request.request_id
                     ),
-                    Some(json!({"answers":answers})),
+                    Some(json!({"answer": native_answer})),
+                    false,
                     vec![request.request_id.clone()],
                 )
             }
@@ -203,7 +196,7 @@ pub async fn prepare_reply(
         "permission" => {
             validate_permission_request(found)?;
             let (decision, message) = validate_permission_body(&request.body)?;
-            let mut body = json!({"reply":decision});
+            let mut body = json!({"decision": decision});
             if let Some(message) = message {
                 body["message"] = json!(message);
             }
@@ -228,6 +221,7 @@ pub async fn prepare_reply(
                     request.session_id, request.request_id
                 ),
                 Some(body),
+                false,
                 affected,
             )
         }
@@ -247,6 +241,7 @@ pub async fn prepare_reply(
         action,
         path,
         body,
+        http_delete,
         affected_request_ids,
         request_fingerprint: observed_fingerprint,
         effect_payload_sha256,
@@ -254,8 +249,13 @@ pub async fn prepare_reply(
     })
 }
 
-/// Reconcile a possibly-lost reply from complete, contiguous durable session
-/// history. This is read-only; pending-list disappearance alone is not proof.
+/// Reconcile a possibly-lost reply. Read-only; pending-list disappearance
+/// alone is never proof. Permission POSTs are ambiguous and can never be
+/// reconciled from absence or session-log: they stay unknown/nonreplay.
+/// Question (form) replies are proven only by exact Form.get detail state
+/// (fingerprinted native form + exact scope): answered with the exact
+/// native answer digest, or cancelled for exact reject. Ephemeral
+/// permission/form events are never fabricated into durable v2 history proof.
 pub async fn reconcile_reply(
     native: &NativeClient,
     command: &RuntimeCommand,
@@ -288,75 +288,122 @@ pub async fn reconcile_reply(
     native
         .verify_control_scope(command, options, &saved.session_id)
         .await?;
-
-    let (asked, replies) = read_complete_reply_history(native, &saved).await?;
-    let (asked_sequence, fingerprint) = asked
-        .get(&saved.request_id)
-        .ok_or_else(|| evidence_unavailable("exact native asked event is absent"))?;
-    if fingerprint != &saved.request_fingerprint {
+    if saved.kind == "permission" {
+        return Err(evidence_unavailable(
+            "ambiguous permission POST cannot be reconciled from absence or session-log",
+        ));
+    }
+    if saved.kind != "question" {
+        return Err(evidence_unavailable(
+            "saved native reply action is outside the readback subset",
+        ));
+    }
+    let only_target = saved.affected_request_ids.len() == 1
+        && saved.affected_request_ids.first() == Some(&saved.request_id);
+    if !only_target {
+        return Err(evidence_unavailable("saved reply identity is invalid"));
+    }
+    if !matches!(saved.action.as_str(), "reply" | "reject") {
+        return Err(evidence_unavailable(
+            "saved native reply action is unsupported",
+        ));
+    }
+    let detail = load_form_detail(native, &saved.session_id, &saved.request_id)
+        .await
+        .map_err(|_| evidence_unavailable("exact native form detail is absent"))?;
+    let info_fp = form_info_fingerprint(&detail)
+        .map_err(|_| evidence_unavailable("native form detail differs from the exact saved request"))?;
+    if info_fp != saved.request_fingerprint {
         return Err(evidence_unavailable(
             "native asked event differs from the exact saved request fingerprint",
         ));
     }
-
-    match (saved.kind.as_str(), saved.action.as_str()) {
-        ("question", "reply") | ("question", "reject") | ("permission", "once") => {
-            let event = replies
-                .get(&saved.request_id)
+    let state = detail
+        .get("state")
+        .filter(|v| v.is_object())
+        .ok_or_else(|| evidence_unavailable("native form detail state is absent"))?;
+    let status = state
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| evidence_unavailable("native form detail state is absent"))?;
+    match (saved.action.as_str(), status) {
+        ("reply", "answered") => {
+            let answer = state
+                .get("answer")
+                .filter(|v| v.is_object())
                 .ok_or_else(|| evidence_unavailable("exact native reply event is absent"))?;
-            let expected_type = match (saved.kind.as_str(), saved.action.as_str()) {
-                ("question", "reply") => "question.v2.replied",
-                ("question", "reject") => "question.v2.rejected",
-                ("permission", "once") => "permission.v2.replied",
-                _ => unreachable!(),
-            };
-            if event.sequence <= *asked_sequence
-                || event.event_type != expected_type
-                || event.effect_payload_sha256 != saved.effect_payload_sha256
-            {
+            let expected = digest_json(&json!({"answer": answer}))
+                .map_err(|_| evidence_unavailable("exact native reply event is absent"))?;
+            if Some(expected) != saved.effect_payload_sha256 {
                 return Err(evidence_unavailable(
                     "durable native event does not prove the exact saved reply effect",
                 ));
             }
+            Ok(())
         }
-        ("permission", "reject") => {
-            let expected = Some(digest_json(&json!({"reply":"reject"}))?);
-            if saved.effect_payload_sha256 != expected {
+        ("reject", "cancelled") => {
+            if saved.effect_payload_sha256.is_some() {
                 return Err(evidence_unavailable(
-                    "saved permission rejection payload is not the supported exact effect",
+                    "saved question rejection shape is invalid",
                 ));
             }
-            for request_id in &saved.affected_request_ids {
-                let (request_sequence, _) = asked.get(request_id).ok_or_else(|| {
-                    evidence_unavailable("affected permission asked event is absent")
-                })?;
-                let event = replies.get(request_id).ok_or_else(|| {
-                    evidence_unavailable("affected permission reply event is absent")
-                })?;
-                if event.sequence <= *request_sequence
-                    || event.event_type != "permission.v2.replied"
-                    || event.effect_payload_sha256 != expected
-                {
-                    return Err(evidence_unavailable(
-                        "permission rejection cascade is not fully confirmed by history",
-                    ));
-                }
-            }
+            Ok(())
         }
-        _ => {
-            return Err(evidence_unavailable(
-                "saved native reply action is outside the readback subset",
-            ));
-        }
+        _ => Err(evidence_unavailable("exact native reply event is absent")),
     }
-    Ok(())
 }
 
+async fn load_form_detail(
+    native: &NativeClient,
+    session_id: &str,
+    form_id: &str,
+) -> Result<Value> {
+    validate_id(session_id, "ses_")?;
+    validate_id(form_id, "frm_")?;
+    let raw = native
+        .control_get(
+            &format!("/api/session/{session_id}/form/{form_id}"),
+            &[],
+        )
+        .await
+        .map_err(|_| evidence_unavailable("exact native form detail is absent"))?;
+    let envelope: DataEnvelope<Value> = serde_json::from_value(raw)
+        .map_err(|_| evidence_unavailable("native form detail has an invalid schema"))?;
+    let detail = envelope.data;
+    if detail.get("id").and_then(Value::as_str) != Some(form_id) {
+        return Err(evidence_unavailable("native form detail names another request"));
+    }
+    if detail.get("sessionID").and_then(Value::as_str) != Some(session_id) {
+        return Err(evidence_unavailable("native form detail names another session"));
+    }
+    let _ = crate::native_forms::validate_question_form(&form_info_only(&detail)?)?;
+    Ok(detail)
+}
+
+fn form_info_only(detail: &Value) -> Result<Value> {
+    let obj = detail
+        .as_object()
+        .ok_or_else(|| evidence_unavailable("native form detail has an invalid schema"))?;
+    let mut info = serde_json::Map::new();
+    for key in ["id", "sessionID", "title", "metadata", "fields"] {
+        let value = obj
+            .get(key)
+            .cloned()
+            .ok_or_else(|| evidence_unavailable("native form detail has an invalid schema"))?;
+        info.insert(key.to_owned(), value);
+    }
+    Ok(Value::Object(info))
+}
+
+fn form_info_fingerprint(detail: &Value) -> Result<String> {
+    let info = form_info_only(detail)?;
+    native_fingerprint(&info)
+}
 fn validate_saved_reply_identity(saved: &SavedReplyIdentity) -> Result<()> {
     validate_id(&saved.session_id, "ses_")
         .map_err(|_| evidence_unavailable("saved reply session ID is invalid"))?;
     let prefix = if saved.kind == "question" {
-        "que_"
+        "frm_"
     } else if saved.kind == "permission" {
         "per_"
     } else {
@@ -425,277 +472,15 @@ fn validate_saved_reply_identity(saved: &SavedReplyIdentity) -> Result<()> {
     Ok(())
 }
 
-async fn read_complete_reply_history(
-    native: &NativeClient,
-    saved: &SavedReplyIdentity,
-) -> Result<(
-    BTreeMap<String, (u64, String)>,
-    BTreeMap<String, SavedReplyEvent>,
-)> {
-    let requested = saved
-        .affected_request_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let mut asked = BTreeMap::new();
-    let mut replies = BTreeMap::new();
-    let mut seen = BTreeMap::<u64, (String, String)>::new();
-    let mut after = 0u64;
-    let mut expected = 1u64;
-    let mut scanned_bytes = 0usize;
-
-    for _ in 0..MAX_REPLY_HISTORY_PAGES {
-        let raw = native
-            .control_get(
-                &format!("/api/session/{}/history", saved.session_id),
-                &[
-                    ("after", after.to_string()),
-                    ("limit", HISTORY_PAGE_LIMIT.to_string()),
-                ],
-            )
-            .await?;
-        scanned_bytes = scanned_bytes.saturating_add(canonical_json(&raw)?.len());
-        if scanned_bytes > MAX_REPLY_HISTORY_BYTES {
-            return Err(evidence_unavailable(
-                "durable reply history exceeds its configured read bound",
-            ));
-        }
-        let page: HistoryPage = serde_json::from_value(raw)
-            .map_err(|_| evidence_unavailable("durable reply history page schema is invalid"))?;
-        if page.data.len() > HISTORY_PAGE_LIMIT || (page.has_more && page.data.is_empty()) {
-            return Err(evidence_unavailable(
-                "durable reply history page is empty or exceeds its bound",
-            ));
-        }
-        let page_start = after;
-        for event in &page.data {
-            let event_id = text(event, "id", 256)?;
-            validate_id(event_id, "evt_")
-                .map_err(|_| evidence_unavailable("durable event ID is invalid"))?;
-            let event_type = text(event, "type", 128)?;
-            let durable = event
-                .get("durable")
-                .filter(|value| value.is_object())
-                .ok_or_else(|| evidence_unavailable("durable event identity is absent"))?;
-            if text(durable, "aggregateID", 256)? != saved.session_id {
-                return Err(evidence_unavailable(
-                    "durable history event belongs to another session aggregate",
-                ));
-            }
-            let sequence = durable
-                .get("seq")
-                .and_then(Value::as_u64)
-                .filter(|sequence| *sequence > 0)
-                .ok_or_else(|| evidence_unavailable("durable event sequence is invalid"))?;
-            if durable
-                .get("version")
-                .and_then(Value::as_u64)
-                .is_none_or(|version| version == 0)
-            {
-                return Err(evidence_unavailable("durable event version is invalid"));
-            }
-            let event_digest = digest_json(event)?;
-            if let Some((previous_id, previous_digest)) = seen.get(&sequence) {
-                if previous_id != event_id || previous_digest != &event_digest {
-                    return Err(evidence_unavailable(
-                        "conflicting durable events share one sequence",
-                    ));
-                }
-                continue;
-            }
-            if sequence <= after || sequence != expected {
-                return Err(evidence_unavailable(
-                    "durable reply history has a gap or nonadvancing cursor",
-                ));
-            }
-            seen.insert(sequence, (event_id.to_owned(), event_digest));
-            let data = event
-                .get("data")
-                .filter(|value| value.is_object())
-                .ok_or_else(|| evidence_unavailable("durable event data is invalid"))?;
-            match event_type {
-                "question.v2.asked" => {
-                    validate_question_request(data).map_err(|_| {
-                        evidence_unavailable("question asked event schema is invalid")
-                    })?;
-                    let request_id = text(data, "id", 256)?;
-                    if requested.contains(request_id) {
-                        if text(data, "sessionID", 256)? != saved.session_id {
-                            return Err(evidence_unavailable(
-                                "question asked event names another session",
-                            ));
-                        }
-                        let fingerprint = native_fingerprint(data)?;
-                        if asked
-                            .insert(request_id.to_owned(), (sequence, fingerprint))
-                            .is_some()
-                        {
-                            return Err(evidence_unavailable(
-                                "question request ID has multiple asked events",
-                            ));
-                        }
-                    }
-                }
-                "permission.v2.asked" => {
-                    validate_permission_request(data).map_err(|_| {
-                        evidence_unavailable("permission asked event schema is invalid")
-                    })?;
-                    let request_id = text(data, "id", 256)?;
-                    if requested.contains(request_id) {
-                        if text(data, "sessionID", 256)? != saved.session_id {
-                            return Err(evidence_unavailable(
-                                "permission asked event names another session",
-                            ));
-                        }
-                        let fingerprint = native_fingerprint(data)?;
-                        if asked
-                            .insert(request_id.to_owned(), (sequence, fingerprint))
-                            .is_some()
-                        {
-                            return Err(evidence_unavailable(
-                                "permission request ID has multiple asked events",
-                            ));
-                        }
-                    }
-                }
-                "question.v2.replied" => {
-                    exact_native_fields(data, &["sessionID", "requestID", "answers"], &[])
-                        .map_err(|_| {
-                            evidence_unavailable("question reply event schema is invalid")
-                        })?;
-                    let request_id = text(data, "requestID", 256)?;
-                    if requested.contains(request_id) {
-                        if text(data, "sessionID", 256)? != saved.session_id {
-                            return Err(evidence_unavailable(
-                                "question reply event names another session",
-                            ));
-                        }
-                        validate_history_answers(&data["answers"])?;
-                        insert_reply_event(
-                            &mut replies,
-                            request_id,
-                            SavedReplyEvent {
-                                sequence,
-                                event_type: "question.v2.replied",
-                                effect_payload_sha256: Some(digest_json(&json!({
-                                    "answers":data["answers"]
-                                }))?),
-                            },
-                        )?;
-                    }
-                }
-                "question.v2.rejected" => {
-                    exact_native_fields(data, &["sessionID", "requestID"], &[]).map_err(|_| {
-                        evidence_unavailable("question rejection event schema is invalid")
-                    })?;
-                    let request_id = text(data, "requestID", 256)?;
-                    if requested.contains(request_id) {
-                        if text(data, "sessionID", 256)? != saved.session_id {
-                            return Err(evidence_unavailable(
-                                "question rejection event names another session",
-                            ));
-                        }
-                        insert_reply_event(
-                            &mut replies,
-                            request_id,
-                            SavedReplyEvent {
-                                sequence,
-                                event_type: "question.v2.rejected",
-                                effect_payload_sha256: None,
-                            },
-                        )?;
-                    }
-                }
-                "permission.v2.replied" => {
-                    exact_native_fields(data, &["sessionID", "requestID", "reply"], &[]).map_err(
-                        |_| evidence_unavailable("permission reply event schema is invalid"),
-                    )?;
-                    let request_id = text(data, "requestID", 256)?;
-                    if requested.contains(request_id) {
-                        if text(data, "sessionID", 256)? != saved.session_id {
-                            return Err(evidence_unavailable(
-                                "permission reply event names another session",
-                            ));
-                        }
-                        let reply = text(data, "reply", 16)?;
-                        if !matches!(reply, "once" | "always" | "reject") {
-                            return Err(evidence_unavailable(
-                                "permission reply event contains an unknown decision",
-                            ));
-                        }
-                        insert_reply_event(
-                            &mut replies,
-                            request_id,
-                            SavedReplyEvent {
-                                sequence,
-                                event_type: "permission.v2.replied",
-                                effect_payload_sha256: Some(digest_json(&json!({"reply":reply}))?),
-                            },
-                        )?;
-                    }
-                }
-                _ => {}
-            }
-            after = sequence;
-            expected = sequence.checked_add(1).ok_or_else(|| {
-                evidence_unavailable("durable reply history sequence is exhausted")
-            })?;
-        }
-        if page.has_more {
-            if after <= page_start {
-                return Err(evidence_unavailable(
-                    "durable reply history page did not advance",
-                ));
-            }
-            continue;
-        }
-        return Ok((asked, replies));
-    }
-    Err(evidence_unavailable(
-        "durable reply history exceeds its complete-read page bound",
-    ))
-}
-
-fn insert_reply_event(
-    replies: &mut BTreeMap<String, SavedReplyEvent>,
-    request_id: &str,
-    event: SavedReplyEvent,
-) -> Result<()> {
-    if replies.insert(request_id.to_owned(), event).is_some() {
-        return Err(evidence_unavailable(
-            "native request has multiple durable reply events",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_history_answers(value: &Value) -> Result<()> {
-    let answers = value
-        .as_array()
-        .filter(|answers| answers.len() <= MAX_QUESTIONS)
-        .ok_or_else(|| evidence_unavailable("question answer event has an invalid shape"))?;
-    for group in answers {
-        let group = group
-            .as_array()
-            .filter(|group| group.len() <= MAX_ANSWERS)
-            .ok_or_else(|| evidence_unavailable("question answer group exceeds its bound"))?;
-        for answer in group {
-            if answer.as_str().is_none_or(|answer| {
-                answer.trim().is_empty() || answer.len() > MAX_NATIVE_TEXT_BYTES
-            }) {
-                return Err(evidence_unavailable(
-                    "question answer event contains invalid text",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn evidence_unavailable(message: &'static str) -> Error {
     Error::new("NATIVE_EVIDENCE_UNAVAILABLE", message)
 }
 
+/// Read one bounded interaction observation page from the actual durable
+/// session log (SSE `/api/experimental/session/:id/log?after=&follow=false`, via
+/// Root-owned NativeClient::session_log_page), plus exact pending form and
+/// permission projections. History observations never copy transcript
+/// payloads: durable events project to {event_id,type,sequence,version} only.
 pub async fn read_interaction_page(
     native: &NativeClient,
     command: &RuntimeCommand,
@@ -708,26 +493,23 @@ pub async fn read_interaction_page(
         .verify_control_scope(command, options, session_id)
         .await?;
 
-    let raw = native
-        .control_get(
-            &format!("/api/session/{session_id}/history"),
-            &[
-                ("after", after_sequence.to_string()),
-                ("limit", HISTORY_PAGE_LIMIT.to_string()),
-            ],
-        )
-        .await?;
-    let page: HistoryPage = serde_json::from_value(raw)
-        .map_err(|_| schema_error("durable history page has an unknown or invalid schema"))?;
+    let raw = native.session_log_page(session_id, after_sequence, HISTORY_PAGE_LIMIT).await?;
+    let page: SessionLogPage = serde_json::from_value(raw)
+        .map_err(|_| schema_error("durable session log page has an unknown or invalid schema"))?;
     if page.data.len() > HISTORY_PAGE_LIMIT
         || serde_json::to_vec(&page.data)
-            .map_err(|_| schema_error("history page cannot be represented as JSON"))?
+            .map_err(|_| schema_error("session log page cannot be represented as JSON"))?
             .len()
             > MAX_HISTORY_PAGE_BYTES
     {
         return Err(Error::new(
             "NATIVE_RESPONSE_LIMIT",
-            "durable history page exceeds its configured bound",
+            "durable session log page exceeds its configured bound",
+        ));
+    }
+    if page.has_more && page.data.is_empty() {
+        return Err(schema_error(
+            "session log hasMore page did not advance the cursor",
         ));
     }
 
@@ -738,24 +520,31 @@ pub async fn read_interaction_page(
     let mut seen = std::collections::BTreeMap::<u64, (String, String)>::new();
     for event in &page.data {
         let id = text(event, "id", 256)?;
+        validate_id(id, "evt_")
+            .map_err(|_| schema_error("durable event ID is invalid"))?;
         let kind = text(event, "type", 128)?;
+        if kind == "log.synced" {
+            return Err(schema_error(
+                "session log page carries a sync watermark, not session events",
+            ));
+        }
         let durable = event
             .get("durable")
             .filter(|value| value.is_object())
-            .ok_or_else(|| schema_error("history event lacks durable identity"))?;
+            .ok_or_else(|| schema_error("session log event lacks durable identity"))?;
         let aggregate = text(durable, "aggregateID", 256)?;
         let sequence = durable
             .get("seq")
             .and_then(Value::as_u64)
-            .ok_or_else(|| schema_error("history event sequence is invalid"))?;
+            .ok_or_else(|| schema_error("session log event sequence is invalid"))?;
         let version = durable
             .get("version")
             .and_then(Value::as_u64)
             .filter(|version| *version > 0)
-            .ok_or_else(|| schema_error("history event version is invalid"))?;
+            .ok_or_else(|| schema_error("session log event version is invalid"))?;
         if aggregate != session_id || !event.get("data").is_some_and(Value::is_object) {
             return Err(schema_error(
-                "history event is outside the exact session aggregate",
+                "session log event is outside the exact session aggregate",
             ));
         }
         let digest = digest_json(event)?;
@@ -770,7 +559,7 @@ pub async fn read_interaction_page(
         seen.insert(sequence, (id.to_owned(), digest));
         if sequence <= after_sequence {
             return Err(schema_error(
-                "history endpoint returned an event before the exclusive cursor",
+                "session log returned an event before the exclusive cursor",
             ));
         }
         if sequence != expected {
@@ -781,9 +570,9 @@ pub async fn read_interaction_page(
         through = sequence;
         expected = sequence.saturating_add(1);
     }
-    if page.has_more && (page.data.is_empty() || through <= after_sequence) {
+    if page.has_more && through <= after_sequence {
         return Err(schema_error(
-            "history hasMore page did not advance the cursor",
+            "session log hasMore page did not advance the cursor",
         ));
     }
 
@@ -819,7 +608,6 @@ pub async fn read_interaction_page(
         pending_permissions: permissions.len(),
     })
 }
-
 pub async fn background_capability(native: &NativeClient) -> Result<bool> {
     #[derive(Deserialize)]
     struct Capabilities {
@@ -862,7 +650,8 @@ async fn read_pending_projection(
     let mut projected = Vec::with_capacity(pending.len());
     for item in &pending {
         projected.push(if kind == "question" {
-            project_question(item, session_id)?
+            let fp = native_fingerprint(item)?;
+            crate::native_forms::project_question_form(item, session_id, &fp)?
         } else {
             project_permission(item, session_id)?
         });
@@ -878,7 +667,8 @@ async fn read_pending_projection(
 async fn load_pending(native: &NativeClient, session_id: &str, kind: &str) -> Result<Vec<Value>> {
     validate_id(session_id, "ses_")?;
     let path = match kind {
-        "question" | "permission" => format!("/api/session/{session_id}/{kind}"),
+        "question" => format!("/api/session/{session_id}/form"),
+        "permission" => format!("/api/session/{session_id}/permission"),
         _ => return Err(invalid("native interaction kind is unsupported")),
     };
     let value = native.control_get(&path, &[]).await?;
@@ -893,7 +683,7 @@ async fn load_pending(native: &NativeClient, session_id: &str, kind: &str) -> Re
     let mut request_ids = BTreeSet::new();
     for item in &envelope.data {
         let id = text(item, "id", 256)?;
-        validate_id(id, if kind == "question" { "que_" } else { "per_" })?;
+        validate_id(id, if kind == "question" { "frm_" } else { "per_" })?;
         if !request_ids.insert(id) {
             return Err(schema_error(
                 "pending interaction list contains duplicate request IDs",
@@ -905,7 +695,7 @@ async fn load_pending(native: &NativeClient, session_id: &str, kind: &str) -> Re
             ));
         }
         if kind == "question" {
-            validate_question_request(item)?;
+            crate::native_forms::validate_question_form(item)?;
         } else {
             validate_permission_request(item)?;
         }
@@ -921,52 +711,6 @@ async fn load_pending(native: &NativeClient, session_id: &str, kind: &str) -> Re
         }
     }
     Ok(envelope.data)
-}
-
-fn project_question(item: &Value, session_id: &str) -> Result<Value> {
-    let count = validate_question_request(item)?;
-    let mut questions = Vec::with_capacity(count);
-    for question in item["questions"].as_array().into_iter().flatten() {
-        let options = question["options"]
-            .as_array()
-            .ok_or_else(|| schema_error("question options are missing"))?;
-        if options.len() > MAX_OPTIONS {
-            return Err(Error::new(
-                "NATIVE_RESPONSE_LIMIT",
-                "question option list is too large",
-            ));
-        }
-        let mut projected_options = Vec::with_capacity(options.len());
-        for option in options {
-            projected_options.push(json!({
-                "label":text(option,"label",MAX_NATIVE_TEXT_BYTES)?,
-                "description":text(option,"description",MAX_NATIVE_TEXT_BYTES)?,
-            }));
-        }
-        questions.push(json!({
-            "question":text(question,"question",MAX_NATIVE_TEXT_BYTES)?,
-            "header":text(question,"header",MAX_NATIVE_TEXT_BYTES)?,
-            "options":projected_options,
-            "multiple":question.get("multiple").and_then(Value::as_bool).unwrap_or(false),
-            // OpenCode defaults custom answers to true when this field is absent.
-            "custom":question.get("custom").and_then(Value::as_bool).unwrap_or(true),
-        }));
-    }
-    let mut result = json!({
-        "session_id":session_id,
-        "request_id":item["id"],
-        "fingerprint":native_fingerprint(item)?,
-        "questions":questions,
-    });
-    if let Some(tool) = item.get("tool")
-        && !tool.is_null()
-    {
-        let message_id = text(tool, "messageID", 256)?;
-        let call_id = text(tool, "callID", 256)?;
-        result["tool"] = json!({"message_id":message_id,"call_id":call_id});
-    }
-    enforce_interaction_size(&result)?;
-    Ok(result)
 }
 
 fn project_permission(item: &Value, session_id: &str) -> Result<Value> {
@@ -993,118 +737,11 @@ fn project_permission(item: &Value, session_id: &str) -> Result<Value> {
     Ok(result)
 }
 
-fn validate_question_request(item: &Value) -> Result<usize> {
-    exact_native_fields(item, &["id", "sessionID", "questions"], &["tool"])?;
-    let questions = item["questions"]
-        .as_array()
-        .filter(|questions| !questions.is_empty() && questions.len() <= MAX_QUESTIONS)
-        .ok_or_else(|| schema_error("native question list is empty or too large"))?;
-    for question in questions {
-        exact_native_fields(
-            question,
-            &["question", "header", "options"],
-            &["multiple", "custom"],
-        )?;
-        text(question, "question", MAX_NATIVE_TEXT_BYTES)?;
-        text(question, "header", MAX_NATIVE_TEXT_BYTES)?;
-        let options = question["options"]
-            .as_array()
-            .filter(|options| options.len() <= MAX_OPTIONS)
-            .ok_or_else(|| schema_error("question options have an invalid shape"))?;
-        for option in options {
-            exact_native_fields(option, &["label", "description"], &[])?;
-            text(option, "label", MAX_NATIVE_TEXT_BYTES)?;
-            text(option, "description", MAX_NATIVE_TEXT_BYTES)?;
-        }
-        if question
-            .get("multiple")
-            .is_some_and(|value| !value.is_boolean())
-            || question
-                .get("custom")
-                .is_some_and(|value| !value.is_boolean())
-        {
-            return Err(schema_error("question option flags are invalid"));
-        }
-    }
-    if let Some(tool) = item.get("tool") {
-        exact_native_fields(tool, &["messageID", "callID"], &[])?;
-        text(tool, "messageID", 256)?;
-        text(tool, "callID", 256)?;
-    }
-    Ok(questions.len())
-}
-
-fn validate_question_answers(
-    body: &Value,
-    request: &Value,
-    question_count: usize,
-) -> Result<Vec<Vec<String>>> {
-    exact_object(body, &["answers"])?;
-    let answers = body["answers"]
-        .as_array()
-        .filter(|answers| answers.len() == question_count && answers.len() <= MAX_QUESTIONS)
-        .ok_or_else(|| invalid("answer groups must match the ordered native questions"))?;
-    let questions = request["questions"]
-        .as_array()
-        .ok_or_else(|| schema_error("native question list is invalid"))?;
-    let mut result = Vec::with_capacity(answers.len());
-    for (answers, question) in answers.iter().zip(questions) {
-        let selected = answers
-            .as_array()
-            .filter(|selected| selected.len() <= MAX_ANSWERS)
-            .ok_or_else(|| invalid("each native question requires a bounded answer list"))?;
-        let multiple = question
-            .get("multiple")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let custom = question
-            .get("custom")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if (!multiple && selected.len() > 1) || (multiple && selected.len() > MAX_OPTIONS) {
-            return Err(invalid(
-                "answer count conflicts with native multiple-selection rules",
-            ));
-        }
-        let options = question["options"]
-            .as_array()
-            .ok_or_else(|| schema_error("native question options are invalid"))?;
-        let labels = options
-            .iter()
-            .filter_map(|option| option["label"].as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut group = Vec::with_capacity(selected.len());
-        for answer in selected {
-            let answer = answer
-                .as_str()
-                .filter(|answer| !answer.trim().is_empty() && answer.len() <= MAX_NATIVE_TEXT_BYTES)
-                .ok_or_else(|| invalid("native answer is empty or too large"))?;
-            if !custom && !labels.contains(answer) {
-                return Err(invalid("answer is not an offered native option"));
-            }
-            if group.iter().any(|previous| previous == answer) {
-                return Err(invalid("duplicate answer is not allowed"));
-            }
-            group.push(answer.to_owned());
-        }
-        result.push(group);
-    }
-    Ok(result)
-}
-
-fn is_question_reject(body: &Value) -> Result<bool> {
-    if body.get("decision").and_then(Value::as_str) != Some("reject") {
-        return Ok(false);
-    }
-    exact_object(body, &["decision"])?;
-    Ok(true)
-}
-
 fn validate_permission_request(item: &Value) -> Result<()> {
     exact_native_fields(
         item,
         &["id", "sessionID", "action", "resources"],
-        &["save", "metadata", "source"],
+        &["save", "metadata", "source", "message"],
     )?;
     text(item, "action", MAX_NATIVE_TEXT_BYTES)?;
     let _ = bounded_string_array(item.get("resources"), MAX_OPTIONS, MAX_NATIVE_TEXT_BYTES)?;
@@ -1120,18 +757,21 @@ fn validate_permission_request(item: &Value) -> Result<()> {
     if let Some(source) = item.get("source") {
         let _ = project_permission_source(source)?;
     }
+    if let Some(message) = item.get("message") {
+        let _ = bounded_text_value(message, MAX_NATIVE_TEXT_BYTES)?;
+    }
     Ok(())
 }
 
 fn project_permission_source(source: &Value) -> Result<Value> {
-    exact_native_fields(source, &["type", "messageID", "callID"], &[])?;
+    exact_native_fields(source, &["type", "messageID", "id"], &[])?;
     if text(source, "type", 16)? != "tool" {
         return Err(schema_error("permission source kind is unsupported"));
     }
     Ok(json!({
         "type":"tool",
         "message_id":text(source,"messageID",256)?,
-        "call_id":text(source,"callID",256)?,
+        "call_id":text(source,"id",256)?,
     }))
 }
 
@@ -1218,6 +858,14 @@ fn text<'a>(value: &'a Value, field: &str, maximum: usize) -> Result<&'a str> {
         .get(field)
         .and_then(Value::as_str)
         .filter(|text| !text.trim().is_empty() && text.len() <= maximum)
+        .ok_or_else(|| schema_error("native interaction field is missing or invalid"))
+}
+
+fn bounded_text_value(value: &Value, maximum: usize) -> Result<String> {
+    value
+        .as_str()
+        .filter(|t| t.len() <= maximum && !t.chars().any(char::is_control))
+        .map(ToOwned::to_owned)
         .ok_or_else(|| schema_error("native interaction field is missing or invalid"))
 }
 

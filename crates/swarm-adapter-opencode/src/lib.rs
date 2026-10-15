@@ -11,6 +11,7 @@ mod module_link;
 mod module_receipt;
 mod module_runtime;
 mod native;
+mod native_forms;
 mod native_interactions;
 mod native_mcp;
 mod native_mcp_intake;
@@ -1992,9 +1993,13 @@ async fn handle_reply(
     intent.marker["native_opencode_reply"] = prepared.intent_identity();
     journal.write_intent(&intent)?;
 
-    let response = match prepared.body.clone() {
-        Some(body) => native.control_post(&prepared.path, body).await,
-        None => native.control_post_empty(&prepared.path).await,
+    let response = if prepared.http_delete {
+        native.control_delete(&prepared.path).await
+    } else {
+        match prepared.body.clone() {
+            Some(body) => native.control_post(&prepared.path, body).await,
+            None => native.control_post_empty(&prepared.path).await,
+        }
     };
     let result = match response {
         Ok(Value::Null) => outcome(

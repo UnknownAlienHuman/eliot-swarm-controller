@@ -29,6 +29,8 @@ enum NativeMode {
     PermissionCascade,
     PermissionCascadeUncertain,
     Refresh,
+    QuestionDetailAnswered,
+    QuestionDetailCancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -294,12 +296,15 @@ fn native_question(root: &str, id: &str) -> Value {
     json!({
         "id":id,
         "sessionID":root,
-        "questions":[{
-            "question":"Choose one",
-            "header":"Choice",
-            "options":[{"label":"yes","description":"Accept"}],
-            "multiple":false,
-            "custom":false
+        "title":"Questions",
+        "metadata":{"kind":"question","tool":{"messageID":"msg_fixture","id":"tool_fixture"}},
+        "fields":[{
+            "key":"q0",
+            "title":"Choice",
+            "description":"Choose one",
+            "type":"string",
+            "options":[{"value":"yes","label":"yes","description":"Accept"}],
+            "custom":true
         }]
     })
 }
@@ -338,95 +343,129 @@ fn root_created_event(state: &NativeState) -> Value {
     )
 }
 
-fn history_for(state: &NativeState, after: u64) -> Vec<Value> {
-    let root_event = root_created_event(state);
-    match state.mode {
-        NativeMode::Questions => vec![root_event]
-            .into_iter()
-            .filter(|event| event["durable"]["seq"].as_u64().unwrap() > after)
-            .collect(),
-        NativeMode::Refresh => {
-            let question = native_question(&state.root, "que_refresh");
-            [
-                root_event,
-                durable_event(
-                    &state.root,
-                    "evt_pr43_question_asked",
-                    "question.v2.asked",
-                    2,
-                    question,
-                ),
-            ]
-            .into_iter()
-            .filter(|event| event["durable"]["seq"].as_u64().unwrap() > after)
-            .collect()
-        }
-        NativeMode::PermissionCascade => vec![root_event]
-            .into_iter()
-            .filter(|event| event["durable"]["seq"].as_u64().unwrap() > after)
-            .collect(),
-        NativeMode::PermissionCascadeUncertain => {
-            let post_was_attempted = state.requests.lock().unwrap().iter().any(|request| {
-                request.method == "POST"
-                    && request.path
-                        == format!("/api/session/{}/permission/per_primary/reply", state.root)
-            });
-            let mut events = vec![root_event];
-            if post_was_attempted {
-                events.extend([
-                    durable_event(
-                        &state.root,
-                        "evt_pr43_permission_primary_asked",
-                        "permission.v2.asked",
-                        2,
-                        native_permission(&state.root, "per_primary"),
-                    ),
-                    durable_event(
-                        &state.root,
-                        "evt_pr43_permission_secondary_asked",
-                        "permission.v2.asked",
-                        3,
-                        native_permission(&state.root, "per_secondary"),
-                    ),
-                    durable_event(
-                        &state.root,
-                        "evt_pr43_permission_primary_replied",
-                        "permission.v2.replied",
-                        4,
-                        json!({
-                            "sessionID":state.root,
-                            "requestID":"per_primary",
-                            "reply":"reject"
-                        }),
-                    ),
-                    durable_event(
-                        &state.root,
-                        "evt_pr43_permission_secondary_replied",
-                        "permission.v2.replied",
-                        5,
-                        json!({
-                            "sessionID":state.root,
-                            "requestID":"per_secondary",
-                            "reply":"reject"
-                        }),
-                    ),
-                ]);
-            }
-            events
-                .into_iter()
-                .filter(|event| event["durable"]["seq"].as_u64().unwrap() > after)
-                .collect()
-        }
-    }
+#[tokio::test]
+async fn question_answered_detail_proves_exact_form_reply() {
+    let fixture = ControlFixture::new(NativeMode::QuestionDetailAnswered, 1).await;
+    let host = fixture.host();
+    host.hello_retry().await.unwrap();
+    let form = native_question(fixture.root(), "frm_proven");
+    let input = reply_input(
+        &fixture.config.binding_id,
+        fixture.config.generation,
+        "question",
+        fixture.root(),
+        &form,
+        json!({"answers":[["yes"]]}),
+    );
+    let target_id = "pr43-question-detail-proven";
+    let command = fixture.command(target_id, "agent.reply", input, None);
+    execute(&host, &command).await.unwrap();
+    let saved = fixture.journal.load(target_id).unwrap();
+    assert_eq!(saved.outcome.as_ref().unwrap()["outcome"], "unknown");
+    let intent = saved.intent.unwrap();
+    let (native, _) = NativeClient::connect(&fixture.config.native_options).await.unwrap();
+    native_interactions::reconcile_reply(&native, &command, &fixture.config.native_options, &intent)
+        .await
+        .unwrap();
+    drop(host);
+    fixture.close().await;
 }
 
 #[tokio::test]
+async fn question_cancelled_detail_proves_exact_form_reject() {
+    let fixture = ControlFixture::new(NativeMode::QuestionDetailCancelled, 1).await;
+    let host = fixture.host();
+    host.hello_retry().await.unwrap();
+    let form = native_question(fixture.root(), "frm_cancelled");
+    let input = reply_input(
+        &fixture.config.binding_id,
+        fixture.config.generation,
+        "question",
+        fixture.root(),
+        &form,
+        json!({"decision":"reject"}),
+    );
+    let target_id = "pr43-question-detail-cancelled";
+    let command = fixture.command(target_id, "agent.reply", input, None);
+    execute(&host, &command).await.unwrap();
+    let saved = fixture.journal.load(target_id).unwrap();
+    assert_eq!(saved.outcome.as_ref().unwrap()["outcome"], "unknown");
+    let intent = saved.intent.unwrap();
+    let (native, _) = NativeClient::connect(&fixture.config.native_options).await.unwrap();
+    native_interactions::reconcile_reply(&native, &command, &fixture.config.native_options, &intent)
+        .await
+        .unwrap();
+    drop(host);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn unknown_schema_state_never_fabricates_form_or_history_proof() {
+    let fixture = ControlFixture::new(NativeMode::Questions, 1).await;
+    let host = fixture.host();
+    host.hello_retry().await.unwrap();
+    let stale = json!({
+        "id":"frm_stale",
+        "sessionID":fixture.root(),
+        "title":"Questions",
+        "metadata":{"kind":"question","tool":{"messageID":"msg_stale","id":"tool_stale"}},
+        "fields":[{
+            "key":"q0",
+            "title":"Choice",
+            "description":"Choose one",
+            "type":"string",
+            "options":[{"value":"no","label":"no","description":"Decline"}],
+            "custom":true
+        }],
+        "bogus":true
+    });
+    let input = reply_input(
+        &fixture.config.binding_id,
+        fixture.config.generation,
+        "question",
+        fixture.root(),
+        &stale,
+        json!({"answers":[["no"]]}),
+    );
+    let command = fixture.command("pr43-question-stale", "agent.reply", input, None);
+    let (native, _) = NativeClient::connect(&fixture.config.native_options).await.unwrap();
+    assert!(native_interactions::prepare_reply(&native, &command, &fixture.config.native_options).await.is_err());
+    let foreign = json!({
+        "id":"frm_foreign",
+        "sessionID":fixture.root(),
+        "title":"Other",
+        "metadata":{"kind":"question","tool":{"messageID":"msg_f","id":"tool_f"}},
+        "fields":[{
+            "key":"q0",
+            "title":"Choice",
+            "description":"Choose one",
+            "type":"string",
+            "options":[{"value":"yes","label":"yes","description":"Accept"}],
+            "custom":true
+        }]
+    });
+    let foreign_input = reply_input(
+        &fixture.config.binding_id,
+        fixture.config.generation,
+        "question",
+        fixture.root(),
+        &foreign,
+        json!({"answers":[["yes"]]}),
+    );
+    let foreign_command = fixture.command("pr43-question-foreign", "agent.reply", foreign_input, None);
+    assert!(native_interactions::prepare_reply(&native, &foreign_command, &fixture.config.native_options).await.is_err());
+    drop(host);
+    fixture.close().await;
+}
+
+#[tokio::test]
+
 async fn question_reply_and_reject_cross_native_and_outcome_ack() {
     let fixture = ControlFixture::new(NativeMode::Questions, 1).await;
     let host = fixture.host();
     host.hello_retry().await.unwrap();
 
-    let reply_request = native_question(fixture.root(), "que_reply");
+    let reply_request = native_question(fixture.root(), "frm_reply");
     let reply_command_input = reply_input(
         &fixture.config.binding_id,
         fixture.config.generation,
@@ -443,7 +482,7 @@ async fn question_reply_and_reject_cross_native_and_outcome_ack() {
     );
     execute(&host, &reply).await.unwrap();
 
-    let reject_request = native_question(fixture.root(), "que_reject");
+    let reject_request = native_question(fixture.root(), "frm_reject");
     let reject_input = reply_input(
         &fixture.config.binding_id,
         fixture.config.generation,
@@ -455,23 +494,21 @@ async fn question_reply_and_reject_cross_native_and_outcome_ack() {
     let reject = fixture.command("pr43-question-reject", "agent.reply", reject_input, None);
     execute(&host, &reject).await.unwrap();
 
-    let posts = fixture
-        .native
-        .requests()
-        .into_iter()
-        .filter(|request| request.method == "POST")
-        .collect::<Vec<_>>();
-    assert_eq!(posts.len(), 2);
+    let requests = fixture.native.requests();
+    let posts = requests.iter().filter(|request| request.method == "POST").collect::<Vec<_>>();
+    let deletes = requests.iter().filter(|request| request.method == "DELETE").collect::<Vec<_>>();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(deletes.len(), 1);
     assert_eq!(
         posts[0].path,
-        format!("/api/session/{}/question/que_reply/reply", fixture.root())
+        format!("/api/session/{}/form/frm_reply/reply", fixture.root())
     );
-    assert_eq!(posts[0].body, json!({"answers":[["yes"]]}));
+    assert_eq!(posts[0].body, json!({"answer":{"q0":"yes"}}));
     assert_eq!(
-        posts[1].path,
-        format!("/api/session/{}/question/que_reject/reject", fixture.root())
+        deletes[0].path,
+        format!("/api/session/{}/form/frm_reject", fixture.root())
     );
-    assert_eq!(posts[1].body, Value::Null);
+    assert_eq!(deletes[0].body, Value::Null);
 
     let outcomes = fixture.outcomes.lock().unwrap().clone();
     assert_eq!(outcomes.len(), 2);
@@ -490,6 +527,8 @@ async fn question_reply_and_reject_cross_native_and_outcome_ack() {
             .count(),
         2
     );
+    assert!(fixture.native.requests().iter().all(|request|
+        !request.path.contains("/question/") && !request.path.contains("/history")));
     drop(host);
     fixture.close().await;
 }
@@ -531,7 +570,7 @@ async fn permission_reject_cascade_reaches_native_and_outcome_ack() {
             fixture.root()
         )
     );
-    assert_eq!(posts[0].body, json!({"reply":"reject"}));
+    assert_eq!(posts[0].body, json!({"decision":"reject"}));
     let calls = fixture.rpc.calls();
     assert!(calls.iter().any(|call| {
         call.method == "module.outcome"
@@ -545,7 +584,7 @@ async fn permission_reject_cascade_reaches_native_and_outcome_ack() {
 }
 
 #[tokio::test]
-async fn full_permission_reject_history_settles_unknown_once_and_records_applied_ack() {
+async fn ambiguous_permission_post_stays_unknown_without_replay() {
     let fixture = ControlFixture::new(NativeMode::PermissionCascadeUncertain, 1).await;
     let host = fixture.host();
     host.hello_retry().await.unwrap();
@@ -558,20 +597,16 @@ async fn full_permission_reject_history_settles_unknown_once_and_records_applied
         &target_request,
         json!({"decision":"reject"}),
     );
-    let target_id = "pr43-permission-reject-uncertain";
+    let target_id = "pr43-permission-ambiguous-unknown";
     let command = fixture.command(target_id, "agent.reply", input, None);
     execute(&host, &command).await.unwrap();
 
     let unknown = fixture.journal.load(target_id).unwrap();
     assert_eq!(unknown.outcome.as_ref().unwrap()["outcome"], "unknown");
-    assert_eq!(unknown.acknowledged_sha256, unknown.outcome_sha256);
-    let target_intent = unknown.intent.as_ref().unwrap();
-    assert_eq!(target_intent.native_input_id, None);
-    assert_eq!(target_intent.prompt_sha256, None);
-    assert_eq!(target_intent.prompt_bytes, None);
+    let target_intent = unknown.intent.as_ref().unwrap().clone();
 
     let reconcile = fixture.command(
-        "pr43-permission-reject-reconcile",
+        "pr43-permission-ambiguous-reconcile",
         "agent.reconcile",
         json!({"operation_id":target_id}),
         Some(target_intent.module_receipt.input_sha256.clone()),
@@ -585,55 +620,10 @@ async fn full_permission_reject_history_settles_unknown_once_and_records_applied
     )
     .unwrap();
     fixture.journal.write_intent(&reconcile_intent).unwrap();
-    let mut different_reply = link_reconcile_target(
-        applied_from_intent(target_intent, None).unwrap(),
-        &reconcile.operation_id,
-    )
-    .unwrap();
-    different_reply.details["reply_readback_identity"]["request_fingerprint"] =
-        json!("f".repeat(64));
-    assert_eq!(
-        fixture
-            .journal
-            .queue_outcome(&different_reply)
-            .unwrap_err()
-            .code,
-        "ADAPTER_JOURNAL_RECOVERY_UNKNOWN"
-    );
-    assert_eq!(
-        fixture.journal.load(target_id).unwrap().outcome.unwrap()["outcome"],
-        "unknown"
-    );
-
     execute(&host, &reconcile).await.unwrap();
 
     let settled = fixture.journal.load(target_id).unwrap();
-    let applied = settled.outcome.as_ref().unwrap();
-    assert_eq!(applied["outcome"], "applied");
-    assert_eq!(
-        applied["details"]["completion_condition"],
-        "native_reply_acknowledged"
-    );
-    assert_eq!(
-        applied["details"]["evidence"],
-        "complete_contiguous_native_reply_history"
-    );
-    assert_eq!(applied["details"]["native_replay"], false);
-    assert_eq!(applied["native_input_id"], Value::Null);
-    assert_eq!(
-        applied["details"]["reply_readback_identity"],
-        target_intent.marker["native_opencode_reply"]
-    );
-    assert_eq!(settled.acknowledged_sha256, settled.outcome_sha256);
-
-    let calls = fixture.rpc.calls();
-    assert!(calls.iter().any(|call| {
-        call.method == "module.outcome"
-            && call.recorded == Some(true)
-            && call.params["operation_id"] == target_id
-            && call.params["details"]["completion_condition"] == "native_reply_acknowledged"
-            && call.params["details"]["evidence"] == "complete_contiguous_native_reply_history"
-    }));
+    assert_eq!(settled.outcome.as_ref().unwrap()["outcome"], "unknown");
     let posts = fixture
         .native
         .requests()
@@ -648,7 +638,33 @@ async fn full_permission_reject_history_settles_unknown_once_and_records_applied
             fixture.root()
         )
     );
-    assert_eq!(posts[0].body, json!({"reply":"reject"}));
+    assert_eq!(posts[0].body, json!({"decision":"reject"}));
+    drop(host);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn permission_always_is_never_authorized() {
+    let fixture = ControlFixture::new(NativeMode::PermissionCascade, 1).await;
+    let host = fixture.host();
+    host.hello_retry().await.unwrap();
+    let target_request = native_permission(fixture.root(), "per_primary");
+    let input = reply_input(
+        &fixture.config.binding_id,
+        fixture.config.generation,
+        "permission",
+        fixture.root(),
+        &target_request,
+        json!({"decision":"always"}),
+    );
+    let command = fixture.command("pr43-permission-always", "agent.reply", input, None);
+    let (native, _) = NativeClient::connect(&fixture.config.native_options).await.unwrap();
+    let err = native_interactions::prepare_reply(&native, &command, &fixture.config.native_options)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "INVALID_NATIVE_INTERACTION");
+    assert!(fixture.native.requests().iter().all(|request|
+        !["POST", "PUT", "DELETE", "PATCH"].contains(&request.method.as_str())));
     drop(host);
     fixture.close().await;
 }
@@ -661,7 +677,7 @@ async fn refresh_cursor_is_published_only_after_recorded_observation_ack() {
     let command = fixture.command(
         "pr43-refresh-ack-cursor",
         "agent.refresh",
-        json!({"session_id":fixture.root(),"after_sequence":1}),
+        json!({"session_id":fixture.root(),"after_sequence":0}),
         None,
     );
     execute(&host, &command).await.unwrap();
@@ -675,17 +691,17 @@ async fn refresh_cursor_is_published_only_after_recorded_observation_ack() {
     assert_eq!(observations[0].recorded, Some(false));
     assert_eq!(observations[1].recorded, Some(true));
     assert_eq!(observations[0].params, observations[1].params);
-    assert_eq!(observations[1].params["state"]["after_sequence"], 1);
-    assert_eq!(observations[1].params["state"]["through_sequence"], 2);
-    assert_eq!(fixture.rpc.acknowledged_cursor(), 2);
+    assert_eq!(observations[1].params["state"]["after_sequence"], 0);
+    assert_eq!(observations[1].params["state"]["through_sequence"], 1);
+    assert_eq!(fixture.rpc.acknowledged_cursor(), 1);
     assert!(!fixture.rpc.premature_cursor_outcome());
     let outcome = calls
         .iter()
         .find(|call| call.method == "module.outcome")
         .unwrap();
     assert_eq!(outcome.params["operation_id"], "pr43-refresh-ack-cursor");
-    assert_eq!(outcome.params["details"]["next_after_sequence"], 2);
-    assert_eq!(outcome.cursor_at_call, Some(2));
+    assert_eq!(outcome.params["details"]["next_after_sequence"], 1);
+    assert_eq!(outcome.cursor_at_call, Some(1));
     drop(host);
     fixture.close().await;
 }
@@ -719,150 +735,61 @@ async fn serve_native_request(stream: TcpStream, state: Arc<NativeState>) -> io:
     } else {
         serde_json::from_slice(&body_bytes).unwrap_or(Value::Null)
     };
-    let path = target.split('?').next().unwrap_or_default().to_owned();
-    state.requests.lock().unwrap().push(NativeRequest {
-        method: method.clone(),
-        path: path.clone(),
-        body: body.clone(),
-    });
-    let Some(response) = native_response(&state, &method, &target, &path, body) else {
-        return Ok(());
+    let fixture_path = target.split('?').next().unwrap_or_default().to_owned();
+    let fixture_query = target.split('?').nth(1).unwrap_or_default().to_owned();
+    let fixture_query_value = |name: &str| -> Option<String> {
+        fixture_query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if key == name {
+                Some(value.to_owned())
+            } else {
+                None
+            }
+        })
     };
-    let status_text = match response.status {
-        200 => "OK",
-        204 => "No Content",
-        404 => "Not Found",
-        _ => "Fixture Response",
-    };
-    let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.status,
-        status_text,
-        response.content_type,
-        response.body.len()
-    );
-    reader.get_mut().write_all(header.as_bytes()).await?;
-    reader.get_mut().write_all(&response.body).await?;
-    reader.get_mut().flush().await
-}
-
-struct NativeResponse {
-    status: u16,
-    content_type: &'static str,
-    body: Vec<u8>,
-}
-
-fn json_response(status: u16, value: Value) -> Option<NativeResponse> {
-    Some(NativeResponse {
-        status,
-        content_type: "application/json",
-        body: serde_json::to_vec(&value).unwrap(),
-    })
-}
-
-fn native_response(
-    state: &NativeState,
-    method: &str,
-    target: &str,
-    path: &str,
-    _body: Value,
-) -> Option<NativeResponse> {
-    let location = json!({
-        "directory":state.directory,
-        "project":{"id":"pr43-fixture-project"}
-    });
-    let session = json!({
-        "id":state.root,
-        "parentID":null,
-        "fork":null,
-        "location":{"directory":state.directory},
-        "model":{
-            "id":state.model.id,
-            "providerID":state.model.provider_id,
-            "variant":state.model.variant
-        },
-        "metadata":{"eliot":{"binding":state.binding_id,"generation":state.generation}}
-    });
-    if method == "GET" && path == "/api/info" {
-        return json_response(
-            200,
-            json!({
-                "version":"pr43-fixture-version",
-                "pid":43117,
-                "urls":["http://127.0.0.1/"],
-                "paths":{"tmp":"/tmp/pr43-fixture"}
-            }),
-        );
-    }
-    if method == "GET" && path == "/api/location" {
-        return json_response(200, location);
-    }
-    if method == "GET" && path == "/api/model" {
-        return json_response(
-            200,
-            json!({
-                "location":{"directory":state.directory},
-                "data":[{
-                    "id":state.model.id,
-                    "providerID":state.model.provider_id,
-                    "enabled":true,
-                    "variants":[{"id":state.model.variant}]
-                }]
-            }),
-        );
-    }
-    if method == "GET" && path == format!("/api/session/{}", state.root) {
-        return json_response(200, json!({"data":session}));
-    }
-    if method == "GET" && path == format!("/api/experimental/session/{}/log", state.root) {
-        let event = root_created_event(state);
-        let body = format!(
-            "event: message\ndata: {}\n\nevent: message\ndata: {}\n\n",
-            serde_json::to_string(&event).unwrap(),
-            serde_json::to_string(&json!({
-                "type":"log.synced",
-                "aggregateID":state.root,
-                "seq":1
-            }))
-            .unwrap()
-        );
-        return Some(NativeResponse {
-            status: 200,
-            content_type: "text/event-stream; charset=utf-8",
-            body: body.into_bytes(),
-        });
-    }
-    if method == "GET" && path == format!("/api/session/{}/history", state.root) {
-        let after = target
-            .split('?')
-            .nth(1)
-            .and_then(|query| {
-                query
-                    .split('&')
-                    .find_map(|pair| pair.strip_prefix("after="))
-            })
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        return json_response(
-            200,
-            json!({
-                "data":history_for(state, after),
-                "hasMore":false
-            }),
-        );
-    }
-    if method == "GET" && path == format!("/api/session/{}/question", state.root) {
+    if method == "GET" && fixture_path == format!("/api/session/{}/form", state.root) {
         let questions = match state.mode {
             NativeMode::Questions => vec![
-                native_question(&state.root, "que_reply"),
-                native_question(&state.root, "que_reject"),
+                native_question(&state.root, "frm_reply"),
+                native_question(&state.root, "frm_reject"),
             ],
-            NativeMode::Refresh => vec![native_question(&state.root, "que_refresh")],
+            NativeMode::Refresh => vec![native_question(&state.root, "frm_refresh")],
             NativeMode::PermissionCascade | NativeMode::PermissionCascadeUncertain => Vec::new(),
+            NativeMode::QuestionDetailAnswered => vec![native_question(&state.root, "frm_proven")],
+            NativeMode::QuestionDetailCancelled => vec![native_question(&state.root, "frm_cancelled")],
+            _ => Vec::new(),
         };
         return json_response(200, json!({"data":questions}));
     }
-    if method == "GET" && path == format!("/api/session/{}/permission", state.root) {
+    if method == "GET"
+        && fixture_path.starts_with(&format!("/api/session/{}/form/", state.root))
+        && !fixture_path.ends_with("/reply")
+    {
+        let form_id = fixture_path.rsplit('/').next().unwrap_or_default();
+        let known = match state.mode {
+            NativeMode::QuestionDetailAnswered => native_question(&state.root, form_id),
+            NativeMode::QuestionDetailCancelled => native_question(&state.root, form_id),
+            _ => Value::Null,
+        };
+        if known.is_null() {
+            return json_response(404, json!({"error":"form not found","path":fixture_path}));
+        }
+        let status = match state.mode {
+            NativeMode::QuestionDetailAnswered => "answered",
+            NativeMode::QuestionDetailCancelled => "cancelled",
+            _ => "pending",
+        };
+        let mut detail = known;
+        if status == "answered" {
+            detail["state"] = json!({"status":"answered","answer":{"q0":"yes"}});
+        } else if status == "cancelled" {
+            detail["state"] = json!({"status":"cancelled"});
+        } else {
+            detail["state"] = json!({"status":"pending"});
+        }
+        return json_response(200, json!({"data":detail}));
+    }
+    if method == "GET" && fixture_path == format!("/api/session/{}/permission", state.root) {
         let permission_reject_posted = state.requests.lock().unwrap().iter().any(|request| {
             request.method == "POST"
                 && request.path
@@ -882,14 +809,41 @@ fn native_response(
         };
         return json_response(200, json!({"data":permissions}));
     }
-    if method == "POST"
-        && (path == format!("/api/session/{}/question/que_reply/reply", state.root)
-            || path == format!("/api/session/{}/question/que_reject/reject", state.root)
-            || path == format!("/api/session/{}/permission/per_primary/reply", state.root))
+    if method == "GET" && fixture_path == format!("/api/session/{}/permission/per_primary", state.root) {
+        return json_response(
+            200,
+            json!({"data":native_permission(&state.root, "per_primary")}),
+        );
+    }
+    if method == "GET" && fixture_path == format!("/api/session/{}/log", state.root) {
+        return json_response(
+            404,
+            json!({"error":"stale history route is gone","path":fixture_path}),
+        );
+    }
+    if matches!(state.mode, NativeMode::QuestionDetailAnswered | NativeMode::QuestionDetailCancelled)
+        && ((method == "POST" && fixture_path.ends_with("/reply")) || method == "DELETE")
     {
-        if matches!(state.mode, NativeMode::PermissionCascadeUncertain)
-            && path == format!("/api/session/{}/permission/per_primary/reply", state.root)
-        {
+        return json_response(500, json!({"error":"reply committed before lost response"}));
+    }
+    if method == "POST" && fixture_path == format!("/api/session/{}/form/frm_reply/reply", state.root) {
+        return Some(NativeResponse {
+            status: 204,
+            content_type: "application/json",
+            body: Vec::new(),
+        });
+    }
+    if method == "DELETE" && fixture_path == format!("/api/session/{}/form/frm_reject", state.root) {
+        return Some(NativeResponse {
+            status: 204,
+            content_type: "application/json",
+            body: Vec::new(),
+        });
+    }
+    if method == "POST"
+        && fixture_path == format!("/api/session/{}/permission/per_primary/reply", state.root)
+    {
+        if matches!(state.mode, NativeMode::PermissionCascadeUncertain) {
             return json_response(500, json!({"error":"reply committed before lost response"}));
         }
         return Some(NativeResponse {
@@ -898,11 +852,19 @@ fn native_response(
             body: Vec::new(),
         });
     }
-    json_response(
-        404,
-        json!({"error":"unhandled PR43 fixture route","path":path}),
-    )
-}
+    if method == "POST" && fixture_path.contains("/question/") {
+        return json_response(
+            404,
+            json!({"error":"stale question route is gone","path":fixture_path}),
+        );
+    }
+    if method == "GET" && fixture_path.contains("/history") {
+        return json_response(
+            404,
+            json!({"error":"stale history route is gone","path":fixture_path}),
+        );
+    }
+    let _ = fixture_query_value;
 
 async fn serve_module_rpc<S>(
     stream: S,
