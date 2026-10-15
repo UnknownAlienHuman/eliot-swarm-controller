@@ -7,8 +7,10 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
+    future::Future,
     io::Read,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -125,6 +127,7 @@ struct Capture {
     stderr_truncated: bool,
     stderr_error: Option<String>,
     protocol_error: Option<String>,
+    module_ipc_disconnected: bool,
     updates: u64,
     history_updates: u64,
     history_replaying: bool,
@@ -147,6 +150,7 @@ impl Capture {
         self.output_receipt_saved = false;
         self.stop_reason = None;
         self.protocol_error = None;
+        self.module_ipc_disconnected = false;
         self.updates = 0;
         self.tool_events.clear();
         self.agent_children.clear();
@@ -214,6 +218,7 @@ struct SessionModeConfigContext<'a> {
 struct CommandContext<'a> {
     connection: &'a ConnectionTo<Agent>,
     link: &'a mut Link,
+    recovery: &'a ModuleLinkRecovery<'a>,
     owner: &'a Owner,
     journal: &'a AcpJournal,
     features: &'a AgentFeatures,
@@ -224,6 +229,14 @@ struct CommandContext<'a> {
     permissions: &'a PermissionBroker,
     permission_wakeup: &'a Notify,
     observation_sequence: &'a Arc<Mutex<u64>>,
+}
+
+struct ModuleLinkRecovery<'a> {
+    config: &'a Config,
+    credential: &'a swarm_contracts::Credential,
+    owner: &'a Owner,
+    journal: &'a AcpJournal,
+    capture: &'a Arc<Mutex<Capture>>,
 }
 
 struct SessionRestoreContext<'a> {
@@ -427,6 +440,46 @@ impl AcpJournal {
             write_private_new(&path, &bytes)?;
         }
         Ok(())
+    }
+
+    fn read_effect(
+        &self,
+        command: &RuntimeCommand,
+        effect_id: &str,
+        phase: &str,
+    ) -> Result<Option<Value>> {
+        if effect_id.trim().is_empty()
+            || effect_id.len() > 256
+            || !matches!(phase, "intent" | "receipt")
+        {
+            return Err(invalid("ACP effect identity or phase is outside its bound"));
+        }
+        let path = self.operation_dir(&command.operation_id)?.join(format!(
+            "effect-{phase}-{}.json",
+            digest(effect_id.as_bytes())
+        ));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(invalid("saved ACP effect is not a regular file"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let bytes = read_bytes(&path, MAX_RECORD_BYTES as usize)?;
+        let saved: Value = serde_json::from_slice(&bytes)?;
+        if saved["schema_version"] != 1
+            || saved["operation_id"] != command.operation_id
+            || saved["effect_id"] != effect_id
+            || saved["phase"] != phase
+            || !saved["evidence"].is_object()
+        {
+            return Err(Error::new(
+                "ADAPTER_EVIDENCE_CONFLICT",
+                "saved ACP effect identity or evidence is invalid",
+            ));
+        }
+        Ok(Some(saved["evidence"].clone()))
     }
 
     fn pending_commands(&self) -> Result<Vec<RuntimeCommand>> {
@@ -1130,6 +1183,8 @@ pub(super) async fn run(
             let connection_active_operation = Arc::clone(&active_operation);
             let connection_journal = journal.clone();
             let connection_owner = owner.clone();
+            let connection_config = config.clone();
+            let connection_credential = credential.clone();
             let run = Client
                 .builder()
                 .name("eliot-command-acp")
@@ -1150,6 +1205,8 @@ pub(super) async fn run(
                 )
                 .connect_with(transport, move |connection| {
                     let mut link = link;
+                    let config = connection_config;
+                    let credential = connection_credential;
                     let owner = connection_owner;
                     let journal = connection_journal;
                     let capture = connection_capture;
@@ -1162,6 +1219,13 @@ pub(super) async fn run(
                     let workspace = workspace;
                     let model = model;
                     async move {
+                        let recovery = ModuleLinkRecovery {
+                            config: &config,
+                            credential: &credential,
+                            owner: &owner,
+                            journal: &journal,
+                            capture: &capture,
+                        };
                         let features = initialize(&connection).await?;
                         if let Some(saved) = journal.read_session().map_err(to_acp_error)? {
                             current_session = Some(
@@ -1190,12 +1254,11 @@ pub(super) async fn run(
                             } else {
                                 let next = match link.client.next().await {
                                     Ok(value) => value,
-                                    Err(error) => {
-                                        return Err(to_acp_error(Error::new(
-                                            "ACP_MODULE_LINK_LOST",
-                                            error.to_string(),
-                                        )));
+                                    Err(error) if super::is_transport_uncertain(&error) => {
+                                        recovery.reconnect(&mut link).await.map_err(to_acp_error)?;
+                                        continue;
                                     }
+                                    Err(error) => return Err(to_acp_error(error)),
                                 };
                                 if next["command"].is_null() { continue; }
                                 let command: RuntimeCommand = match serde_json::from_value(next["command"].clone()) {
@@ -1203,6 +1266,16 @@ pub(super) async fn run(
                                     Err(_) => return Err(agent_client_protocol::Error::invalid_params().data("module.next returned an invalid ACP command")),
                                 };
                                 journal.record_command(&command).map_err(to_acp_error)?;
+                                if let Some((saved, hash)) = journal
+                                    .read_outcome(&command.operation_id)
+                                    .map_err(to_acp_error)?
+                                {
+                                    recovery
+                                        .send_saved_outcome(&mut link, &saved, &hash)
+                                        .await
+                                        .map_err(to_acp_error)?;
+                                    continue;
+                                }
                                 command
                             };
                             *active_operation
@@ -1213,6 +1286,7 @@ pub(super) async fn run(
                                 let mut context = CommandContext {
                                     connection: &connection,
                                     link: &mut link,
+                                    recovery: &recovery,
                                     owner: &owner,
                                     journal: &journal,
                                     features: &features,
@@ -1276,11 +1350,10 @@ pub(super) async fn run(
                                 );
                                 module_host::attach_receipt_identity(&mut outcome, &command, &owner.host.claim).map_err(to_acp_error)?;
                                 let hash = journal.save_outcome(&outcome).map_err(to_acp_error)?;
-                                let payload = serde_json::to_value(&outcome).map_err(|_| agent_client_protocol::Error::internal_error())?;
-                                match link.client.outcome(payload).await {
-                                    Ok(ack) => journal.acknowledge(&outcome.operation_id, &hash, ack).map_err(to_acp_error)?,
-                                    Err(_) => return Ok(()),
-                                }
+                                recovery
+                                    .send_saved_outcome(&mut link, &outcome, &hash)
+                                    .await
+                                    .map_err(to_acp_error)?;
                             }
                             let last = json!({"operation_id":command.operation_id,"method":command.method,"state":"recorded"});
                             *last_operation.lock().map_err(|_| to_acp_error(invalid("ACP last-operation lock is poisoned")))? = last.clone();
@@ -1299,9 +1372,10 @@ pub(super) async fn run(
                                 )
                             };
                             let sequence = take_observation_sequence(&observation_sequence).map_err(to_acp_error)?;
-                            if super::send_observation(&mut link.client, &owner, sequence, state).await.is_err() {
-                                return Ok(());
-                            }
+                            recovery
+                                .send_observation(&mut link, sequence, state)
+                                .await
+                                .map_err(to_acp_error)?;
                             *active_operation.lock().map_err(|_| to_acp_error(invalid("ACP active-operation lock is poisoned")))? = None;
                             if link.recovery_required {
                                 return Ok(());
@@ -1350,7 +1424,8 @@ pub(super) async fn run(
                             "protocol_error":capture.protocol_error,
                             "session_updates":capture.updates,
                             "native_session_id":capture.native_session_id,
-                            "native_child_identity":capture.native_child_identity
+                            "native_child_identity":capture.native_child_identity,
+                            "module_ipc_disconnected":capture.module_ipc_disconnected
                         })
                 })
                 .unwrap_or(Value::Null);
@@ -1414,12 +1489,9 @@ pub(super) async fn run(
                     journal.save_outcome(&outcome)?;
                 }
             }
+            let module_ipc_disconnected = snapshot["module_ipc_disconnected"] == true;
             journal.mark_session_recovery(
-                if run.is_err() {
-                    "native_process_connection_lost_no_replay"
-                } else {
-                    "module_transport_ended_no_replay"
-                },
+                session_recovery_reason(run.is_err(), module_ipc_disconnected),
                 &snapshot,
             )?;
             return Err(Error::new(
@@ -1607,20 +1679,11 @@ async fn process_command(
                         .journal
                         .admit(command, &dispatch, Some(receipt.clone()))?;
                 if existing {
-                    if let Some((saved, _)) = context.journal.read_outcome(&command.operation_id)? {
-                        return Ok(vec![saved]);
-                    }
-                    let outcome = context.session.as_ref().map_or_else(
-                        || unknown(command, "native_prompt_may_have_started_no_replay"),
-                        |session| {
-                            unknown_in_session(
-                                command,
-                                session,
-                                "native_prompt_may_have_started_no_replay",
-                            )
-                        },
-                    );
-                    return Ok(vec![outcome]);
+                    return Ok(vec![retained_dispatch_outcome(
+                        context.journal,
+                        command,
+                        context.session.as_ref(),
+                    )?]);
                 }
                 Some((dispatch, receipt, directory))
             } else {
@@ -1926,21 +1989,7 @@ async fn process_command(
                 .as_str()
                 .filter(|id| !id.trim().is_empty())
                 .ok_or_else(|| Error::invalid("reconcile target Operation is missing"))?;
-            let details = if let Some((saved, hash)) = context.journal.read_outcome(target)? {
-                json!({
-                    "target_operation_id":target,
-                    "target_outcome_sha256":hash,
-                    "target_outcome":saved.outcome,
-                    "native_replay":false
-                })
-            } else {
-                json!({
-                    "target_operation_id":target,
-                    "completion_condition":"native_result_not_durably_known",
-                    "task_completion":"unknown",
-                    "native_replay":false
-                })
-            };
+            let details = reconciliation_details(context.journal, target)?;
             if let Some(session) = context.session.as_ref() {
                 Ok(vec![applied_in_session(command, session, details)])
             } else {
@@ -1962,74 +2011,125 @@ async fn process_command(
             )])
         }
         "native.command.close_session" => {
+            let (session_id, target) = {
+                let session = context.session.as_ref().ok_or_else(|| {
+                    Error::new("NATIVE_SESSION_MISSING", "ACP session is not open")
+                })?;
+                validate_session_control(command, context.link, session)?;
+                if !session.close_supported
+                    || !context
+                        .owner
+                        .host
+                        .claim
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == "native.command.close_session")
+                {
+                    return Err(Error::new(
+                        "CAPABILITY_UNAVAILABLE",
+                        "ACP agent did not advertise session/close",
+                    ));
+                }
+                let target = command.input["target_operation_id"]
+                    .as_str()
+                    .ok_or_else(|| Error::invalid("ACP close target Operation is missing"))?;
+                let (target_outcome, _) =
+                    context.journal.read_outcome(target)?.ok_or_else(|| {
+                        Error::new(
+                            "NATIVE_IDENTITY_MISMATCH",
+                            "ACP close target has no retained outcome",
+                        )
+                    })?;
+                if target_outcome.native_root_id.as_deref() != Some(session.id.to_string().as_str())
+                {
+                    return Err(Error::new(
+                        "NATIVE_IDENTITY_MISMATCH",
+                        "ACP close target does not name this exact session",
+                    ));
+                }
+                (session.id.clone(), target.to_owned())
+            };
+            cancel_pending_permissions(context.journal, context.permissions, command, &session_id)
+                .await?;
+            let expected_intent = json!({
+                "native_session_id":session_id,
+                "target_operation_id":target
+            });
+            let close_intent = context
+                .journal
+                .read_effect(command, "session/close", "intent")?;
+            if close_intent
+                .as_ref()
+                .is_some_and(|evidence| evidence != &expected_intent)
+            {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_CONFLICT",
+                    "saved ACP close intent differs from its exact session and target",
+                ));
+            }
+            let close_receipt = context
+                .journal
+                .read_effect(command, "session/close", "receipt")?;
+            if close_receipt.as_ref().is_some_and(|evidence| {
+                evidence["native_session_id"] != session_id.to_string()
+                    || evidence["response"] != "confirmed"
+            }) {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_CONFLICT",
+                    "saved ACP close receipt differs from its exact session",
+                ));
+            }
+            if close_receipt.is_none() {
+                if close_intent.is_some() {
+                    return Err(Error::new(
+                        "ACP_CLOSE_UNKNOWN",
+                        "ACP close intent exists without a confirmed receipt; native close will not be replayed",
+                    ));
+                }
+                context.journal.record_effect(
+                    command,
+                    "session/close",
+                    "intent",
+                    expected_intent,
+                )?;
+                context
+                    .connection
+                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await
+                    .map_err(|_| {
+                        Error::new(
+                            "ACP_CLOSE_UNKNOWN",
+                            "ACP session/close response was not confirmed",
+                        )
+                    })?;
+                context
+                    .journal
+                    .record_effect(
+                        command,
+                        "session/close",
+                        "receipt",
+                        json!({"native_session_id":session_id,"response":"confirmed"}),
+                    )
+                    .map_err(|error| {
+                        Error::new(
+                            "ACP_CLOSE_UNKNOWN",
+                            format!(
+                                "native session close was confirmed but its receipt failed: {}",
+                                error.code
+                            ),
+                        )
+                    })?;
+            } else if close_intent.is_none() {
+                return Err(Error::new(
+                    "ADAPTER_EVIDENCE_INVALID",
+                    "ACP close receipt has no recorded intent",
+                ));
+            }
             let session = context
                 .session
                 .as_mut()
                 .ok_or_else(|| Error::new("NATIVE_SESSION_MISSING", "ACP session is not open"))?;
-            validate_session_control(command, context.link, session)?;
-            if !session.close_supported
-                || !context
-                    .owner
-                    .host
-                    .claim
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability.as_str() == "native.command.close_session")
-            {
-                return Err(Error::new(
-                    "CAPABILITY_UNAVAILABLE",
-                    "ACP agent did not advertise session/close",
-                ));
-            }
-            let target = command.input["target_operation_id"]
-                .as_str()
-                .ok_or_else(|| Error::invalid("ACP close target Operation is missing"))?;
-            let (target_outcome, _) = context.journal.read_outcome(target)?.ok_or_else(|| {
-                Error::new(
-                    "NATIVE_IDENTITY_MISMATCH",
-                    "ACP close target has no retained outcome",
-                )
-            })?;
-            if target_outcome.native_root_id.as_deref() != Some(session.id.to_string().as_str()) {
-                return Err(Error::new(
-                    "NATIVE_IDENTITY_MISMATCH",
-                    "ACP close target does not name this exact session",
-                ));
-            }
-            context.journal.record_effect(
-                command,
-                "session/close",
-                "intent",
-                json!({"native_session_id":session.id,"target_operation_id":target}),
-            )?;
-            context
-                .connection
-                .send_request(CloseSessionRequest::new(session.id.clone()))
-                .block_task()
-                .await
-                .map_err(|_| {
-                    Error::new(
-                        "ACP_CLOSE_UNKNOWN",
-                        "ACP session/close response was not confirmed",
-                    )
-                })?;
-            context
-                .journal
-                .record_effect(
-                    command,
-                    "session/close",
-                    "receipt",
-                    json!({"native_session_id":session.id,"response":"confirmed"}),
-                )
-                .map_err(|error| {
-                    Error::new(
-                        "ACP_CLOSE_UNKNOWN",
-                        format!(
-                            "native session close was confirmed but its receipt failed: {}",
-                            error.code
-                        ),
-                    )
-                })?;
             session.closed = true;
             context.journal.save_session(&json!({
                 "schema_version":1,
@@ -2153,6 +2253,38 @@ async fn process_command(
         )),
     }
 }
+fn retained_dispatch_outcome(
+    journal: &AcpJournal,
+    command: &RuntimeCommand,
+    session: Option<&ActiveSession>,
+) -> Result<RuntimeOutcome> {
+    if let Some((saved, _)) = journal.read_outcome(&command.operation_id)? {
+        return Ok(saved);
+    }
+    Ok(session.map_or_else(
+        || unknown(command, "native_prompt_may_have_started_no_replay"),
+        |session| unknown_in_session(command, session, "native_prompt_may_have_started_no_replay"),
+    ))
+}
+
+fn reconciliation_details(journal: &AcpJournal, target: &str) -> Result<Value> {
+    if let Some((saved, hash)) = journal.read_outcome(target)? {
+        Ok(json!({
+            "target_operation_id":target,
+            "target_outcome_sha256":hash,
+            "target_outcome":saved.outcome,
+            "native_replay":false
+        }))
+    } else {
+        Ok(json!({
+            "target_operation_id":target,
+            "completion_condition":"native_result_not_durably_known",
+            "task_completion":"unknown",
+            "native_replay":false
+        }))
+    }
+}
+
 async fn open_session(
     context: SessionOpenContext<'_>,
     route: &SessionRouteConfiguration,
@@ -3198,6 +3330,156 @@ impl PermissionHandlerState {
     }
 }
 
+trait HostCommandSource {
+    fn next<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Value>> + 'a>>;
+    fn reconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+}
+
+impl ModuleLinkRecovery<'_> {
+    async fn reconnect(&self, link: &mut Link) -> Result<()> {
+        note_module_ipc_disconnect(self.capture)?;
+        let binding_id = link.binding_id.clone();
+        let generation = link.generation;
+        let route = link.route.clone();
+        let recovery_required = link.recovery_required;
+        let retained = self.journal.read_session()?;
+        let session_id = retained
+            .as_ref()
+            .and_then(|session| session["native_session_id"].as_str())
+            .map(str::to_owned);
+
+        loop {
+            match super::connect_module_with_native_state(
+                self.config,
+                self.credential,
+                self.owner,
+                session_id.as_deref(),
+                session_id.as_deref(),
+            )
+            .await
+            {
+                Ok(mut connected) => {
+                    if connected.binding_id != binding_id || connected.generation != generation {
+                        return Err(Error::new(
+                            "NATIVE_IDENTITY_MISMATCH",
+                            "reconnected module link changed its binding generation",
+                        ));
+                    }
+                    if connected.route != route {
+                        return Err(Error::new(
+                            "ROUTE_CHANGED",
+                            "ACP route changed while the native session remained owned",
+                        ));
+                    }
+                    connected.recovery_required |= recovery_required;
+                    *link = connected;
+                    return Ok(());
+                }
+                Err(error) if super::is_connect_retryable(&error) => {
+                    time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn send_observation(&self, link: &mut Link, sequence: u64, state: Value) -> Result<()> {
+        loop {
+            match super::send_observation(&mut link.client, self.owner, sequence, state.clone())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if super::is_transport_uncertain(&error) => {
+                    self.reconnect(link).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn send_saved_outcome(
+        &self,
+        link: &mut Link,
+        outcome: &RuntimeOutcome,
+        hash: &str,
+    ) -> Result<()> {
+        loop {
+            module_host::validate_saved_receipt(
+                outcome,
+                &self.owner.host.claim,
+                &link.binding_id,
+                link.generation,
+            )?;
+            match link.client.outcome(serde_json::to_value(outcome)?).await {
+                Ok(ack) => return self.journal.acknowledge(&outcome.operation_id, hash, ack),
+                Err(error) if super::is_transport_uncertain(&error) => {
+                    self.reconnect(link).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn deliver_outcome(
+        &self,
+        link: &mut Link,
+        command: RuntimeCommand,
+        mut outcome: RuntimeOutcome,
+    ) -> Result<()> {
+        module_host::attach_receipt_identity(&mut outcome, &command, &self.owner.host.claim)?;
+        let hash = self.journal.save_outcome(&outcome)?;
+        self.send_saved_outcome(link, &outcome, &hash).await
+    }
+}
+
+struct OwnedModuleLinkSource<'link, 'recovery, 'context> {
+    link: &'link mut Link,
+    recovery: &'recovery ModuleLinkRecovery<'context>,
+}
+
+impl HostCommandSource for OwnedModuleLinkSource<'_, '_, '_> {
+    fn next<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Value>> + 'a>> {
+        Box::pin(self.link.client.next())
+    }
+
+    fn reconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(self.recovery.reconnect(self.link))
+    }
+}
+
+enum PromptEvent {
+    Native(std::result::Result<PromptResponse, agent_client_protocol::Error>),
+    Host(Value),
+    HostLost(Error),
+    Permission,
+}
+
+async fn next_prompt_event<R>(
+    request: R,
+    host: &mut impl HostCommandSource,
+    permission_wakeup: &Notify,
+) -> PromptEvent
+where
+    R: Future<Output = std::result::Result<PromptResponse, agent_client_protocol::Error>> + Unpin,
+{
+    let mut request = request;
+    loop {
+        tokio::select! {
+            response = &mut request => return PromptEvent::Native(response),
+            next = host.next() => match next {
+                Ok(value) => return PromptEvent::Host(value),
+                Err(error) if super::is_transport_uncertain(&error) => {
+                    if let Err(reconnect_error) = host.reconnect().await {
+                        return PromptEvent::HostLost(reconnect_error);
+                    }
+                }
+                Err(error) => return PromptEvent::HostLost(error),
+            },
+            _ = permission_wakeup.notified() => return PromptEvent::Permission,
+        }
+    }
+}
+
 async fn prompt_with_cancel(
     context: &mut CommandContext<'_>,
     dispatch_command: &RuntimeCommand,
@@ -3207,29 +3489,42 @@ async fn prompt_with_cancel(
     let request = connection.send_request(prompt).block_task();
     tokio::pin!(request);
     loop {
-        tokio::select! {
-            response = &mut request => {
-                return response.map_err(|_| Error::new(
-                    "ACP_PROMPT_UNKNOWN",
-                    "ACP prompt response is uncertain after native admission",
-                ));
+        let event = {
+            let mut host = OwnedModuleLinkSource {
+                link: context.link,
+                recovery: context.recovery,
+            };
+            next_prompt_event(request.as_mut(), &mut host, context.permission_wakeup).await
+        };
+        match event {
+            PromptEvent::Native(response) => {
+                return response.map_err(|_| {
+                    Error::new(
+                        "ACP_PROMPT_UNKNOWN",
+                        "ACP prompt response is uncertain after native admission",
+                    )
+                });
             }
-            next = context.link.client.next() => {
-                let next = next.map_err(|_| Error::new(
-                    "ACP_PROMPT_UNKNOWN",
-                    "module transport failed while an ACP prompt was active",
-                ))?;
+            PromptEvent::Host(next) => {
                 if next["command"].is_null() {
                     continue;
                 }
                 let control: RuntimeCommand = serde_json::from_value(next["command"].clone())
-                    .map_err(|_| Error::new(
-                        "MODULE_COMMAND_INVALID",
-                        "module.next returned an invalid ACP control envelope",
-                    ))?;
+                    .map_err(|_| {
+                        Error::new(
+                            "MODULE_COMMAND_INVALID",
+                            "module.next returned an invalid ACP control envelope",
+                        )
+                    })?;
                 process_control_during_turn(context, dispatch_command, control).await?;
             }
-            _ = context.permission_wakeup.notified() => {
+            PromptEvent::HostLost(error) => {
+                return Err(Error::new(
+                    "ACP_MODULE_LINK_LOST",
+                    format!("module link could not be recovered: {}", error.code),
+                ));
+            }
+            PromptEvent::Permission => {
                 let last = json!({
                     "operation_id":dispatch_command.operation_id,
                     "method":dispatch_command.method,
@@ -3251,12 +3546,19 @@ async fn prompt_with_cancel(
                     )
                 };
                 let sequence = take_observation_sequence(context.observation_sequence)?;
-                super::send_observation(&mut context.link.client, context.owner, sequence, observation)
+                context
+                    .recovery
+                    .send_observation(context.link, sequence, observation)
                     .await
-                    .map_err(|_| Error::new(
-                        "ACP_PROMPT_UNKNOWN",
-                        "permission attention could not be durably published during the active turn",
-                    ))?;
+                    .map_err(|error| {
+                        Error::new(
+                            "ACP_MODULE_LINK_LOST",
+                            format!(
+                                "permission attention could not be published: {}",
+                                error.code
+                            ),
+                        )
+                    })?;
             }
         }
     }
@@ -3320,14 +3622,10 @@ async fn process_control_during_turn(
         }
     };
     let uncertain = outcome.outcome == EffectOutcome::Unknown;
-    deliver_outcome(
-        context.link,
-        context.owner,
-        context.journal,
-        control,
-        outcome,
-    )
-    .await?;
+    context
+        .recovery
+        .deliver_outcome(context.link, control, outcome)
+        .await?;
     if uncertain {
         return Err(Error::new(
             "ACP_CONTROL_EFFECT_UNKNOWN",
@@ -3349,6 +3647,25 @@ async fn cancel_active_turn(
         )
     })?;
     validate_session_control(control, context.link, session)?;
+    cancel_active_turn_effect(
+        context.connection,
+        context.journal,
+        context.permissions,
+        dispatch_command,
+        control,
+        session,
+    )
+    .await
+}
+
+async fn cancel_active_turn_effect(
+    connection: &ConnectionTo<Agent>,
+    journal: &AcpJournal,
+    permissions: &PermissionBroker,
+    dispatch_command: &RuntimeCommand,
+    control: &RuntimeCommand,
+    session: &ActiveSession,
+) -> Result<RuntimeOutcome> {
     let target = control.input["target_operation_id"]
         .as_str()
         .ok_or_else(|| Error::invalid("ACP cancel target Operation is missing"))?;
@@ -3364,19 +3681,61 @@ async fn cancel_active_turn(
             "ACP cancel does not identify the exact active session turn",
         ));
     }
-    context.journal.record_effect(
-        control,
-        "session/cancel",
-        "intent",
-        json!({
-            "native_session_id":session.id,
-            "target_operation_id":target,
-            "turn_id":dispatch_command.operation_id
-        }),
-    )?;
-    cancel_pending_permissions(context, control, &session.id).await?;
-    context
-        .connection
+    let expected_effect = json!({
+        "native_session_id":session.id,
+        "target_operation_id":target,
+        "turn_id":dispatch_command.operation_id
+    });
+    let intent = journal.read_effect(control, "session/cancel", "intent")?;
+    if intent
+        .as_ref()
+        .is_some_and(|evidence| evidence != &expected_effect)
+    {
+        return Err(Error::new(
+            "ADAPTER_EVIDENCE_CONFLICT",
+            "saved ACP cancel intent differs from its exact session and turn",
+        ));
+    }
+    let receipt = journal.read_effect(control, "session/cancel", "receipt")?;
+    if receipt.as_ref().is_some_and(|evidence| {
+        evidence["native_session_id"] != session.id.to_string()
+            || evidence["target_operation_id"] != target
+            || evidence["notification"] != "sent"
+    }) {
+        return Err(Error::new(
+            "ADAPTER_EVIDENCE_CONFLICT",
+            "saved ACP cancel receipt differs from its exact session and turn",
+        ));
+    }
+    if receipt.is_some() && intent.is_none() {
+        return Err(invalid("ACP cancel receipt has no recorded intent"));
+    }
+    if intent.is_none() {
+        journal.record_effect(control, "session/cancel", "intent", expected_effect)?;
+    }
+    cancel_pending_permissions(journal, permissions, control, &session.id).await?;
+    if receipt.is_some() {
+        let mut outcome = applied_in_session(
+            control,
+            session,
+            json!({
+                "target_operation_id":target,
+                "turn_id":dispatch_command.operation_id,
+                "cancel":"already_confirmed",
+                "completion_proved":false,
+                "family_departure_claimed":false
+            }),
+        );
+        outcome.turn_id = Some(dispatch_command.operation_id.clone());
+        return Ok(outcome);
+    }
+    if intent.is_some() {
+        return Err(Error::new(
+            "ACP_CANCEL_UNKNOWN",
+            "ACP cancel intent exists without a confirmed receipt; notification will not be replayed",
+        ));
+    }
+    connection
         .send_notification(CancelNotification::new(session.id.clone()))
         .map_err(|_| {
             Error::new(
@@ -3384,8 +3743,7 @@ async fn cancel_active_turn(
                 "ACP session/cancel notification delivery is uncertain",
             )
         })?;
-    context
-        .journal
+    journal
         .record_effect(
             control,
             "session/cancel",
@@ -3422,38 +3780,34 @@ async fn cancel_active_turn(
 }
 
 async fn cancel_pending_permissions(
-    context: &CommandContext<'_>,
+    journal: &AcpJournal,
+    permissions: &PermissionBroker,
     cancel_command: &RuntimeCommand,
     session_id: &SessionId,
 ) -> Result<()> {
-    let keys: Vec<String> = context
-        .permissions
+    let session_id = session_id.to_string();
+    let keys: Vec<String> = permissions
         .lock()
         .map_err(|_| invalid("ACP permission broker lock is poisoned"))?
         .iter()
-        .filter(|(_, pending)| pending.session_id == session_id.to_string())
+        .filter(|(_, pending)| pending.session_id == session_id)
         .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
         let effect_id = permission_cancel_effect_id(&key);
-        let pending = claim_pending_permission(
-            context.permissions,
-            &key,
-            &session_id.to_string(),
-            |pending| {
-                context.journal.record_effect(
-                    cancel_command,
-                    &effect_id,
-                    "intent",
-                    json!({
-                        "session_id":pending.session_id,
-                        "request_id":pending.request_id,
-                        "fingerprint":pending.fingerprint,
-                        "response":"cancelled"
-                    }),
-                )
-            },
-        )?;
+        let pending = claim_pending_permission(permissions, &key, &session_id, |pending| {
+            journal.record_effect(
+                cancel_command,
+                &effect_id,
+                "intent",
+                json!({
+                    "session_id":pending.session_id,
+                    "request_id":pending.request_id,
+                    "fingerprint":pending.fingerprint,
+                    "response":"cancelled"
+                }),
+            )
+        })?;
         let Some(pending) = pending else {
             // A reply may have won the exact-request claim. The turn cancel still
             // proceeds, but it cannot overwrite that already-claimed response.
@@ -3491,8 +3845,7 @@ async fn cancel_pending_permissions(
                 "ACP pending permission cancellation was not written to the native transport",
             ));
         }
-        context
-            .journal
+        journal
             .record_effect(
                 cancel_command,
                 &effect_id,
@@ -3814,6 +4167,24 @@ fn is_uncertain_control_error(error: &Error) -> bool {
     uncertain_acp_error(error)
 }
 
+fn note_module_ipc_disconnect(capture: &Arc<Mutex<Capture>>) -> Result<()> {
+    capture
+        .lock()
+        .map_err(|_| invalid("ACP capture lock is poisoned after module IPC disconnect"))?
+        .module_ipc_disconnected = true;
+    Ok(())
+}
+
+fn session_recovery_reason(run_failed: bool, module_ipc_disconnected: bool) -> &'static str {
+    if module_ipc_disconnected {
+        "module_ipc_disconnected_no_replay"
+    } else if run_failed {
+        "acp_connection_ended_no_replay"
+    } else {
+        "module_transport_ended_no_replay"
+    }
+}
+
 fn attach_saved_session_identity(
     outcome: &mut RuntimeOutcome,
     command: &RuntimeCommand,
@@ -3868,19 +4239,6 @@ fn attach_saved_session_identity(
             .entry("native_scope_key".to_owned())
             .or_insert_with(|| json!(session_id));
     }
-}
-
-async fn deliver_outcome(
-    link: &mut Link,
-    owner: &Owner,
-    journal: &AcpJournal,
-    command: RuntimeCommand,
-    mut outcome: RuntimeOutcome,
-) -> Result<()> {
-    module_host::attach_receipt_identity(&mut outcome, &command, &owner.host.claim)?;
-    let hash = journal.save_outcome(&outcome)?;
-    let ack = link.client.outcome(serde_json::to_value(&outcome)?).await?;
-    journal.acknowledge(&outcome.operation_id, &hash, ack)
 }
 
 fn session_config_options_snapshot(options: &[SessionConfigOption]) -> Result<Value> {
@@ -4488,7 +4846,9 @@ mod tests {
 
     use std::{
         fs,
+        future::Future,
         path::PathBuf,
+        pin::Pin,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -4499,10 +4859,10 @@ mod tests {
             ProtocolVersion,
             v1::{
                 AgentCapabilities, ContentBlock, ContentChunk, CurrentModeUpdate,
-                InitializeResponse, LoadSessionResponse, SessionConfigOption,
+                InitializeResponse, LoadSessionResponse, PromptResponse, SessionConfigOption,
                 SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionMode,
                 SessionModeState, SessionNotification, SessionUpdate,
-                SetSessionConfigOptionResponse, SetSessionModeResponse, TextContent,
+                SetSessionConfigOptionResponse, SetSessionModeResponse, StopReason, TextContent,
             },
         },
     };
@@ -4527,6 +4887,48 @@ mod tests {
     struct TestState {
         state_dir: PathBuf,
         journal: AcpJournal,
+    }
+
+    struct RecoveringHostFixture {
+        drop_after_prompt: Option<tokio::sync::oneshot::Receiver<()>>,
+        reconnected: Option<tokio::sync::oneshot::Sender<()>>,
+        control_after_reconnect: Option<Value>,
+        reconnect_count: usize,
+    }
+
+    impl super::HostCommandSource for RecoveringHostFixture {
+        fn next<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = super::Result<Value>> + 'a>> {
+            if let Some(drop_after_prompt) = self.drop_after_prompt.take() {
+                Box::pin(async move {
+                    drop_after_prompt.await.map_err(|_| {
+                        super::invalid("host drop fixture lost its prompt admission signal")
+                    })?;
+                    Err(super::Error::new(
+                        "DISCONNECTED",
+                        "fixture host IPC disconnected",
+                    ))
+                })
+            } else if let Some(control) = self.control_after_reconnect.take() {
+                Box::pin(async move { Ok(control) })
+            } else {
+                Box::pin(futures::future::pending())
+            }
+        }
+
+        fn reconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = super::Result<()>> + 'a>> {
+            self.reconnect_count += 1;
+            let Some(reconnected) = self.reconnected.take() else {
+                return Box::pin(async {
+                    Err(super::invalid("host recovery was attempted more than once"))
+                });
+            };
+            Box::pin(async move {
+                reconnected
+                    .send(())
+                    .map_err(|_| super::invalid("host recovery fixture receiver was dropped"))?;
+                Ok(())
+            })
+        }
     }
 
     impl TestState {
@@ -5290,6 +5692,184 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn pr44_command_acp_unknown_dispatch_reconciles_same_operation_without_native_replay()
+    -> super::Result<()> {
+        let state = TestState::new()?;
+        let (command, dispatch) = task_prompt_fixture()?;
+        state.journal.record_command(&command)?;
+        state.journal.admit(&command, &dispatch, None)?;
+
+        let unknown = super::retained_dispatch_outcome(&state.journal, &command, None)?;
+        assert_eq!(unknown.operation_id, command.operation_id);
+        assert_eq!(unknown.outcome, EffectOutcome::Unknown);
+        assert_eq!(unknown.details["native_replay"], false);
+        assert_eq!(journal_effect_count(&state, &command)?, 0);
+
+        let hash = state.journal.save_outcome(&unknown)?;
+        let retained = super::retained_dispatch_outcome(&state.journal, &command, None)?;
+        assert_eq!(
+            serde_json::to_value(retained)?,
+            serde_json::to_value(&unknown)?
+        );
+
+        let readback = super::reconciliation_details(&state.journal, &command.operation_id)?;
+        assert_eq!(readback["target_operation_id"], command.operation_id);
+        assert_eq!(readback["target_outcome_sha256"], hash);
+        assert_eq!(readback["target_outcome"], "unknown");
+        assert_eq!(readback["native_replay"], false);
+        let (saved, saved_hash) = state
+            .journal
+            .read_outcome(&command.operation_id)?
+            .expect("same operation's full Unknown receipt remains readable");
+        assert_eq!(saved_hash, hash);
+        assert_eq!(
+            serde_json::to_value(saved)?,
+            serde_json::to_value(&unknown)?
+        );
+        assert_eq!(journal_effect_count(&state, &command)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_host_ipc_recovery_retains_prompt_and_client() -> super::Result<()> {
+        let state = TestState::new().expect("ACP recovery journal opens");
+        let (dispatch_command, _) = task_prompt_fixture().expect("typed TaskPrompt fixture");
+        let session_id = SessionId::new("session-host-recovery-fixture");
+        let session = super::ActiveSession {
+            id: session_id.clone(),
+            owner_operation_id: dispatch_command.operation_id.clone(),
+            workspace: std::env::temp_dir(),
+            model_id: "fixture-model".to_owned(),
+            requested_effort: None,
+            effective_effort: None,
+            requested_mode: None,
+            effective_mode: None,
+            close_supported: true,
+            closed: false,
+        };
+        let mut cancel_command = permission_reply_command();
+        cancel_command.method = "native.command.cancel_turn".to_owned();
+        cancel_command.binding_id = dispatch_command.binding_id.clone();
+        cancel_command.generation = dispatch_command.generation;
+        cancel_command.input = json!({
+            "session_id":session_id,
+            "target_operation_id":dispatch_command.operation_id,
+            "turn_id":dispatch_command.operation_id
+        });
+        let control_operation = cancel_command.operation_id.clone();
+        let count_command = cancel_command.clone();
+        let journal = state.journal.clone();
+        let permissions: super::PermissionBroker = Arc::new(Mutex::new(Default::default()));
+        let (transport, mut peer) = Channel::duplex();
+        let (prompt_seen_sender, prompt_seen_receiver) = tokio::sync::oneshot::channel();
+        let (reconnected_sender, reconnected_receiver) = tokio::sync::oneshot::channel();
+        let client = Client
+            .builder()
+            .connect_with(transport, async move |connection| {
+                let request = connection
+                    .send_request(super::PromptRequest::new(
+                        session_id,
+                        vec![ContentBlock::Text(TextContent::new("fixture-only"))],
+                    ))
+                    .block_task();
+                tokio::pin!(request);
+                let permission_wakeup = tokio::sync::Notify::new();
+                let mut source = RecoveringHostFixture {
+                    drop_after_prompt: Some(prompt_seen_receiver),
+                    reconnected: Some(reconnected_sender),
+                    control_after_reconnect: Some(json!({"command":cancel_command})),
+                    reconnect_count: 0,
+                };
+                let event =
+                    super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup)
+                        .await;
+                let super::PromptEvent::Host(host_message) = event else {
+                    panic!("the same prompt remains pending while its host reconnects")
+                };
+                assert_eq!(host_message["command"]["operation_id"], control_operation);
+                let recovered_control: RuntimeCommand =
+                    serde_json::from_value(host_message["command"].clone())
+                        .expect("reconnected host delivers the exact cancel control");
+                let first_cancel = super::cancel_active_turn_effect(
+                    &connection,
+                    &journal,
+                    &permissions,
+                    &dispatch_command,
+                    &recovered_control,
+                    &session,
+                )
+                .await
+                .map_err(super::to_acp_error)?;
+                assert_eq!(first_cancel.outcome, EffectOutcome::Applied);
+                assert_eq!(first_cancel.details["cancel"], "notification_sent");
+                let repeated_cancel = super::cancel_active_turn_effect(
+                    &connection,
+                    &journal,
+                    &permissions,
+                    &dispatch_command,
+                    &recovered_control,
+                    &session,
+                )
+                .await
+                .map_err(super::to_acp_error)?;
+                assert_eq!(repeated_cancel.details["cancel"], "already_confirmed");
+
+                let event =
+                    super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup)
+                        .await;
+                assert!(matches!(
+                    event,
+                    super::PromptEvent::Native(Ok(response))
+                        if response.stop_reason == StopReason::Cancelled
+                ));
+                assert_eq!(source.reconnect_count, 1);
+                Ok::<(), agent_client_protocol::Error>(())
+            });
+        let peer = async move {
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(request))) =
+                peer.rx.next().await
+            else {
+                panic!("one active ACP prompt is admitted")
+            };
+            assert_eq!(request.method.as_ref(), "session/prompt");
+            let prompt_id = request.id;
+            prompt_seen_sender
+                .send(())
+                .expect("host disconnect follows the same prompt admission");
+            reconnected_receiver
+                .await
+                .expect("source recovers the existing module link");
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Notification(cancel))) =
+                peer.rx.next().await
+            else {
+                panic!("explicit cancel uses session/cancel on the retained client")
+            };
+            assert_eq!(cancel.method.as_ref(), "session/cancel");
+            let response = serde_json::to_value(PromptResponse::new(StopReason::Cancelled))
+                .expect("same prompt cancellation response serializes");
+            peer.tx
+                .unbounded_send(TransportFrame::Single(RawJsonRpcMessage::response(
+                    prompt_id,
+                    Ok(response),
+                )))
+                .expect("same ACP connection returns the original prompt result");
+            assert!(
+                peer.rx.next().await.is_none(),
+                "no cancellation request or prompt replay is emitted"
+            );
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("host recovery fixture remains bounded")
+        .expect("host recovery fixture succeeds");
+        assert_eq!(journal_effect_count(&state, &count_command)?, 2);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn pr44_command_acp_family_stays_unknown_after_direct_child_exit() {
         let owner = tokio::process::Command::new(
@@ -5668,6 +6248,97 @@ mod tests {
             super::PermissionOptionKind::AllowOnce,
         )?;
         assert_eq!(journal_effect_count(&state, &once_command)?, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_close_settles_its_pending_permission_once() -> super::Result<()> {
+        let state = TestState::new()?;
+        let mut close_command = permission_reply_command();
+        close_command.method = "native.command.close_session".to_owned();
+        let session_id = SessionId::new("session-close-permission-fixture");
+        let permissions: super::PermissionBroker =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let request_id = json!("permission-close-fixture");
+        let key = serde_json::to_string(&request_id)?;
+        let fingerprint = digest(b"close permission fixture");
+        let (reply_sender, reply_receiver) = tokio::sync::oneshot::channel();
+        let (ack_sender, acknowledgement) = tokio::sync::oneshot::channel();
+        permissions.lock().expect("permission broker lock").insert(
+            key.clone(),
+            super::PendingPermission {
+                session_id: session_id.to_string(),
+                request_id: request_id.clone(),
+                fingerprint: fingerprint.clone(),
+                options: vec![],
+                reply: reply_sender,
+                acknowledgement,
+            },
+        );
+
+        let other_id = json!("permission-other-session");
+        let other_key = serde_json::to_string(&other_id)?;
+        let (other_reply_sender, _other_reply_receiver) = tokio::sync::oneshot::channel();
+        let (_other_ack_sender, other_acknowledgement) = tokio::sync::oneshot::channel();
+        permissions.lock().expect("permission broker lock").insert(
+            other_key.clone(),
+            super::PendingPermission {
+                session_id: "session-other-fixture".to_owned(),
+                request_id: other_id,
+                fingerprint: digest(b"other session permission"),
+                options: vec![],
+                reply: other_reply_sender,
+                acknowledgement: other_acknowledgement,
+            },
+        );
+
+        let (cancel_result, response) = tokio::time::timeout(Duration::from_secs(3), async {
+            let response = async move {
+                let response = reply_receiver
+                    .await
+                    .expect("close sends the pending permission cancellation");
+                ack_sender
+                    .send(true)
+                    .expect("native transport confirms the cancellation response");
+                response
+            };
+            tokio::join!(
+                super::cancel_pending_permissions(
+                    &state.journal,
+                    &permissions,
+                    &close_command,
+                    &session_id
+                ),
+                response
+            )
+        })
+        .await
+        .expect("close permission settlement remains bounded");
+        cancel_result?;
+        assert!(matches!(
+            response,
+            super::RequestPermissionOutcome::Cancelled
+        ));
+        super::cancel_pending_permissions(
+            &state.journal,
+            &permissions,
+            &close_command,
+            &session_id,
+        )
+        .await?;
+
+        let pending = permissions.lock().expect("permission broker lock");
+        assert!(!pending.contains_key(&key));
+        assert!(pending.contains_key(&other_key));
+        drop(pending);
+        let effect_id = super::permission_cancel_effect_id(&key);
+        let directory = state.journal.operation_dir(&close_command.operation_id)?;
+        let effect_hash = digest(effect_id.as_bytes());
+        let receipt: Value = serde_json::from_slice(&fs::read(
+            directory.join(format!("effect-receipt-{effect_hash}.json")),
+        )?)?;
+        assert_eq!(receipt["evidence"]["response_written"], true);
+        assert_eq!(journal_effect_count(&state, &close_command)?, 2);
         Ok(())
     }
 
