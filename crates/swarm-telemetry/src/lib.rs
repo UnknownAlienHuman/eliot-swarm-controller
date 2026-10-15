@@ -501,6 +501,8 @@ struct Queued {
     observer_policy: Option<ScopedPolicyOverride>,
 }
 
+type RecordWriter = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send + 'static>;
+
 impl Queued {
     fn pending_bytes(&self) -> u64 {
         self.bytes.len() as u64
@@ -520,10 +522,11 @@ struct Counters {
     dropped_bytes: AtomicU64,
     pending_records: AtomicU64,
     pending_bytes: AtomicU64,
-    sink_failures: AtomicU64,
+    stderr_failures: AtomicU64,
+    worker_failures: AtomicU64,
     startup_failures: AtomicU64,
     observer_panics: AtomicU64,
-    sink_failed: AtomicBool,
+    stderr_failed: AtomicBool,
     idle_mutex: Mutex<()>,
     idle: Condvar,
 }
@@ -533,6 +536,7 @@ struct Inner {
     line_observer: Option<LineObserver>,
     scoped_filters: Mutex<Vec<ScopedFilter>>,
     sender: OnceLock<SyncSender<Queued>>,
+    write_record: Mutex<Option<RecordWriter>>,
     state: Arc<AtomicU8>,
     next_sequence: AtomicU64,
     counters: Arc<Counters>,
@@ -742,12 +746,29 @@ impl Producer {
     /// to an optional observer. The existing stderr sink and its accounting
     /// remain independent; an observer panic is counted and cannot disable it.
     pub fn with_line_observer(config: Config, line_observer: Option<LineObserver>) -> Self {
+        Self::with_line_observer_and_writer(
+            config,
+            line_observer,
+            Box::new(|bytes| {
+                let stderr = io::stderr();
+                let mut sink = stderr.lock();
+                sink.write_all(bytes).and_then(|_| sink.flush())
+            }),
+        )
+    }
+
+    fn with_line_observer_and_writer(
+        config: Config,
+        line_observer: Option<LineObserver>,
+        write_record: RecordWriter,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config,
                 line_observer,
                 scoped_filters: Mutex::new(Vec::new()),
                 sender: OnceLock::new(),
+                write_record: Mutex::new(Some(write_record)),
                 state: Arc::new(AtomicU8::new(STATE_UNSTARTED)),
                 next_sequence: AtomicU64::new(0),
                 counters: Arc::new(Counters::default()),
@@ -909,7 +930,9 @@ impl Producer {
             return EmitResult::Dropped(DropReason::RecordTooLarge);
         }
 
-        if self.inner.counters.sink_failed.load(Ordering::Acquire) {
+        if self.inner.counters.stderr_failed.load(Ordering::Acquire)
+            && self.inner.line_observer.is_none()
+        {
             record_drop(&self.inner.counters, 1, queued_bytes);
             return EmitResult::Dropped(DropReason::RecorderUnavailable);
         }
@@ -956,7 +979,7 @@ impl Producer {
             }
             Err(TrySendError::Disconnected(queued)) => {
                 finish_pending(&self.inner.counters, queued_bytes);
-                mark_failed(&self.inner.counters, &self.inner.state);
+                mark_worker_failed(&self.inner.counters, &self.inner.state);
                 record_drop(&self.inner.counters, 1, queued_bytes);
                 drop(queued);
                 EmitResult::Dropped(DropReason::RecorderUnavailable)
@@ -968,18 +991,31 @@ impl Producer {
     /// plus current in-flight bounds; snapshots are not a transactional cut.
     pub fn stats(&self) -> Stats {
         let state = self.inner.state.load(Ordering::Acquire);
+        let worker_state = if !self.inner.config.enabled {
+            SinkState::Disabled
+        } else {
+            match state {
+                STATE_UNSTARTED => SinkState::NotStarted,
+                STATE_STARTING => SinkState::Starting,
+                STATE_READY => SinkState::Ready,
+                _ => SinkState::Failed,
+            }
+        };
+        let stderr_state = if !self.inner.config.enabled {
+            SinkState::Disabled
+        } else if self.inner.counters.stderr_failed.load(Ordering::Acquire) {
+            SinkState::Failed
+        } else if worker_state == SinkState::Failed {
+            SinkState::Unavailable
+        } else {
+            worker_state
+        };
         Stats {
             enabled: self.inner.config.enabled,
-            sink_state: if !self.inner.config.enabled {
-                SinkState::Disabled
-            } else {
-                match state {
-                    STATE_UNSTARTED => SinkState::NotStarted,
-                    STATE_STARTING => SinkState::Starting,
-                    STATE_READY => SinkState::Ready,
-                    _ => SinkState::Failed,
-                }
-            },
+            // Keep the old field as an alias for the stderr destination state.
+            sink_state: stderr_state,
+            worker_state,
+            stderr_state,
             enqueued_records: load(&self.inner.counters.enqueued_records),
             written_records: load(&self.inner.counters.written_records),
             written_bytes: load(&self.inner.counters.written_bytes),
@@ -987,7 +1023,9 @@ impl Producer {
             dropped_bytes: load(&self.inner.counters.dropped_bytes),
             pending_records: load(&self.inner.counters.pending_records),
             pending_bytes: load(&self.inner.counters.pending_bytes),
-            sink_failures: load(&self.inner.counters.sink_failures),
+            sink_failures: load(&self.inner.counters.stderr_failures),
+            stderr_failures: load(&self.inner.counters.stderr_failures),
+            worker_failures: load(&self.inner.counters.worker_failures),
             startup_failures: load(&self.inner.counters.startup_failures),
             observer_panics: load(&self.inner.counters.observer_panics),
         }
@@ -1178,6 +1216,17 @@ impl Producer {
         }
 
         let (sender, receiver) = sync_channel(self.inner.config.queue_records);
+        let Some(mut write_record) = self
+            .inner
+            .write_record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            atomic_add(&self.inner.counters.startup_failures, 1);
+            mark_worker_failed(&self.inner.counters, &self.inner.state);
+            return Err(DropReason::RecorderUnavailable);
+        };
         let counters = Arc::clone(&self.inner.counters);
         let state = Arc::clone(&self.inner.state);
         let line_observer = self.inner.line_observer.clone();
@@ -1189,13 +1238,13 @@ impl Producer {
                     writer_loop(
                         &receiver,
                         &counters,
-                        &state,
                         line_observer,
+                        &mut write_record,
                         &mut active_bytes,
                     )
                 }));
                 if result.is_err() {
-                    mark_failed(&counters, &state);
+                    mark_worker_failed(&counters, &state);
                     if let Some(bytes) = active_bytes.take() {
                         finish_pending(&counters, bytes);
                         record_drop(&counters, 1, bytes);
@@ -1211,11 +1260,11 @@ impl Producer {
             });
         if spawned.is_err() {
             atomic_add(&self.inner.counters.startup_failures, 1);
-            mark_failed(&self.inner.counters, &self.inner.state);
+            mark_worker_failed(&self.inner.counters, &self.inner.state);
             return Err(DropReason::RecorderUnavailable);
         }
         if self.inner.sender.set(sender).is_err() {
-            mark_failed(&self.inner.counters, &self.inner.state);
+            mark_worker_failed(&self.inner.counters, &self.inner.state);
             return Err(DropReason::RecorderUnavailable);
         }
         if self
@@ -1261,12 +1310,20 @@ pub enum SinkState {
     Starting,
     Ready,
     Failed,
+    /// The stderr destination was not observed failing, but its producer
+    /// worker is unavailable so no write can be attempted.
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stats {
     pub enabled: bool,
+    /// Compatibility alias for `stderr_state`.
     pub sink_state: SinkState,
+    /// Health of the bounded producer worker that accepts and drains records.
+    pub worker_state: SinkState,
+    /// Health of the stderr destination, independent of the worker.
+    pub stderr_state: SinkState,
     pub enqueued_records: u64,
     pub written_records: u64,
     pub written_bytes: u64,
@@ -1274,7 +1331,10 @@ pub struct Stats {
     pub dropped_bytes: u64,
     pub pending_records: u64,
     pub pending_bytes: u64,
+    /// Compatibility alias for stderr write failures.
     pub sink_failures: u64,
+    pub stderr_failures: u64,
+    pub worker_failures: u64,
     pub startup_failures: u64,
     /// Observer callbacks that panicked. Recorder queue/sink losses are
     /// counted by the observer itself and reported separately.
@@ -1301,12 +1361,11 @@ impl TextCaptureComponents {
 fn writer_loop(
     receiver: &Receiver<Queued>,
     counters: &Counters,
-    state: &AtomicU8,
     line_observer: Option<LineObserver>,
+    write_record: &mut RecordWriter,
     active_bytes: &mut Option<u64>,
 ) {
-    let stderr = io::stderr();
-    let mut sink_failed = false;
+    let mut stderr_failed = false;
     while let Ok(item) = receiver.recv() {
         let byte_count = item.bytes.len() as u64;
         let pending_byte_count = item.pending_bytes();
@@ -1322,16 +1381,13 @@ fn writer_loop(
         {
             atomic_add(&counters.observer_panics, 1);
         }
-        if sink_failed {
+        if stderr_failed {
             finish_pending(counters, pending_byte_count);
             record_drop(counters, 1, pending_byte_count);
             *active_bytes = None;
             continue;
         }
-        let write_result = {
-            let mut sink = stderr.lock();
-            sink.write_all(&item.bytes).and_then(|_| sink.flush())
-        };
+        let write_result = write_record(&item.bytes);
         match write_result {
             Ok(()) => {
                 atomic_add(&counters.written_records, 1);
@@ -1339,8 +1395,8 @@ fn writer_loop(
                 finish_pending(counters, pending_byte_count);
             }
             Err(_) => {
-                mark_failed(counters, state);
-                sink_failed = true;
+                mark_stderr_failed(counters);
+                stderr_failed = true;
                 finish_pending(counters, pending_byte_count);
                 record_drop(counters, 1, pending_byte_count);
             }
@@ -1349,10 +1405,15 @@ fn writer_loop(
     }
 }
 
-fn mark_failed(counters: &Counters, state: &AtomicU8) {
-    state.store(STATE_FAILED, Ordering::Release);
-    if !counters.sink_failed.swap(true, Ordering::AcqRel) {
-        atomic_add(&counters.sink_failures, 1);
+fn mark_stderr_failed(counters: &Counters) {
+    if !counters.stderr_failed.swap(true, Ordering::AcqRel) {
+        atomic_add(&counters.stderr_failures, 1);
+    }
+}
+
+fn mark_worker_failed(counters: &Counters, state: &AtomicU8) {
+    if state.swap(STATE_FAILED, Ordering::AcqRel) != STATE_FAILED {
+        atomic_add(&counters.worker_failures, 1);
     }
 }
 
@@ -1425,4 +1486,233 @@ fn unix_time_ms_signed() -> i64 {
     unix_time_ms()
         .and_then(|value| i64::try_from(value).ok())
         .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::AtomicUsize,
+        mpsc::{Receiver, Sender, channel},
+    };
+
+    fn record(client_id: &str) -> Record {
+        Record::new(Severity::Info, Kind::ModuleStopped, Phase::ModuleExit)
+            .with_client_id(Some(client_id))
+    }
+
+    fn wait_for_idle(producer: &Producer) {
+        assert!(producer.wait_for_idle(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn stderr_failure_keeps_observer_admission_without_retrying_stderr() {
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observer_output = Arc::clone(&observed);
+        let observer: LineObserver = Arc::new(move |line, _| {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap();
+            observer_output
+                .lock()
+                .unwrap()
+                .push(value["client_id"].as_str().unwrap().to_owned());
+        });
+        let write_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&write_attempts);
+        let writer: RecordWriter = Box::new(move |_| {
+            if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::other("injected stderr failure"))
+            }
+        });
+        let producer =
+            Producer::with_line_observer_and_writer(Config::default(), Some(observer), writer);
+
+        assert_eq!(producer.emit(record("before")), EmitResult::Queued);
+        wait_for_idle(&producer);
+        assert_eq!(producer.emit(record("failure")), EmitResult::Queued);
+        wait_for_idle(&producer);
+        assert_eq!(producer.emit(record("after")), EmitResult::Queued);
+        wait_for_idle(&producer);
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.iter().filter(|id| *id == "after").count(), 1);
+        assert_eq!(
+            observed.as_slice(),
+            &[
+                "before".to_owned(),
+                "failure".to_owned(),
+                "after".to_owned()
+            ]
+        );
+        drop(observed);
+
+        let stats = producer.stats();
+        assert_eq!(stats.worker_state, SinkState::Ready);
+        assert_eq!(stats.stderr_state, SinkState::Failed);
+        assert_eq!(stats.sink_state, SinkState::Failed);
+        assert_eq!(stats.stderr_failures, 1);
+        assert_eq!(stats.sink_failures, 1);
+        assert_eq!(stats.worker_failures, 0);
+        assert_eq!(stats.enqueued_records, 3);
+        assert_eq!(stats.written_records, 1);
+        assert_eq!(stats.dropped_records, 2);
+        assert_eq!(stats.pending_records, 0);
+        assert_eq!(stats.pending_bytes, 0);
+        assert_eq!(write_attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn stderr_failure_without_observer_is_terminal_and_does_not_retry() {
+        let write_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&write_attempts);
+        let writer: RecordWriter = Box::new(move |_| {
+            if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::other("injected stderr failure"))
+            }
+        });
+        let producer = Producer::with_line_observer_and_writer(Config::default(), None, writer);
+
+        assert_eq!(producer.emit(record("before")), EmitResult::Queued);
+        wait_for_idle(&producer);
+        assert_eq!(producer.emit(record("failure")), EmitResult::Queued);
+        wait_for_idle(&producer);
+        assert_eq!(
+            producer.emit(record("after")),
+            EmitResult::Dropped(DropReason::RecorderUnavailable)
+        );
+
+        let stats = producer.stats();
+        assert_eq!(stats.worker_state, SinkState::Ready);
+        assert_eq!(stats.stderr_state, SinkState::Failed);
+        assert_eq!(stats.stderr_failures, 1);
+        assert_eq!(stats.enqueued_records, 2);
+        assert_eq!(stats.dropped_records, 2);
+        assert_eq!(stats.pending_records, 0);
+        assert_eq!(write_attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn observer_panic_does_not_disable_healthy_stderr() {
+        let observer: LineObserver = Arc::new(|_, _| panic!("injected observer panic"));
+        let write_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&write_attempts);
+        let writer: RecordWriter = Box::new(move |_| {
+            attempts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        });
+        let producer =
+            Producer::with_line_observer_and_writer(Config::default(), Some(observer), writer);
+
+        assert_eq!(producer.emit(record("first")), EmitResult::Queued);
+        wait_for_idle(&producer);
+        assert_eq!(producer.emit(record("second")), EmitResult::Queued);
+        wait_for_idle(&producer);
+
+        let stats = producer.stats();
+        assert_eq!(stats.observer_panics, 2);
+        assert_eq!(stats.stderr_state, SinkState::Ready);
+        assert_eq!(stats.worker_state, SinkState::Ready);
+        assert_eq!(stats.written_records, 2);
+        assert_eq!(stats.dropped_records, 0);
+        assert_eq!(write_attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn bounded_queue_rejects_overload_and_flush_waits_for_active_write() {
+        let (started_sender, started_receiver) = channel();
+        let (release_sender, release_receiver) = channel();
+        let writer = blocked_writer(started_sender, release_receiver);
+        let producer = Producer::with_line_observer_and_writer(
+            Config::with_limits(1, 1_024, 1_024).unwrap(),
+            None,
+            writer,
+        );
+
+        assert_eq!(producer.emit(record("first")), EmitResult::Queued);
+        assert!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok()
+        );
+        let overload = producer.emit(record("second"));
+        let drained_while_blocked = producer.wait_for_idle(Duration::from_millis(5));
+        let _ = release_sender.send(());
+        let drained_after_release = producer.wait_for_idle(Duration::from_secs(2));
+
+        assert_eq!(overload, EmitResult::Dropped(DropReason::QueueFull));
+        assert!(!drained_while_blocked);
+        assert!(drained_after_release);
+        let stats = producer.stats();
+        assert_eq!(stats.pending_records, 0);
+        assert_eq!(stats.pending_bytes, 0);
+        assert_eq!(stats.dropped_records, 1);
+    }
+
+    #[test]
+    fn bounded_queue_rejects_byte_overload_without_exceeding_capacity() {
+        let (started_sender, started_receiver) = channel();
+        let (release_sender, release_receiver) = channel();
+        let first_line_bytes = Arc::new(AtomicUsize::new(0));
+        let writer = blocked_writer_with_length(
+            started_sender,
+            release_receiver,
+            Arc::clone(&first_line_bytes),
+        );
+        let producer = Producer::with_line_observer_and_writer(
+            Config::with_limits(4, 512, 512).unwrap(),
+            None,
+            writer,
+        );
+        let long_client_id = "x".repeat(128);
+
+        assert_eq!(producer.emit(record(&long_client_id)), EmitResult::Queued);
+        assert!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok()
+        );
+        let pending_bytes = producer.stats().pending_bytes;
+        let overload = producer.emit(record(&long_client_id));
+        let _ = release_sender.send(());
+        let drained = producer.wait_for_idle(Duration::from_secs(2));
+
+        assert_eq!(overload, EmitResult::Dropped(DropReason::QueueFull));
+        assert!(drained);
+        assert!(pending_bytes <= 512);
+        assert_eq!(
+            pending_bytes,
+            first_line_bytes.load(Ordering::Acquire) as u64
+        );
+        assert_eq!(producer.stats().pending_bytes, 0);
+    }
+
+    fn blocked_writer(started: Sender<()>, release: Receiver<()>) -> RecordWriter {
+        let first_write = AtomicBool::new(false);
+        Box::new(move |_| {
+            if !first_write.swap(true, Ordering::AcqRel) {
+                started.send(()).expect("writer start receiver is present");
+                release.recv().expect("writer release was sent");
+            }
+            Ok(())
+        })
+    }
+
+    fn blocked_writer_with_length(
+        started: Sender<()>,
+        release: Receiver<()>,
+        first_line_bytes: Arc<AtomicUsize>,
+    ) -> RecordWriter {
+        let first_write = AtomicBool::new(false);
+        Box::new(move |line| {
+            if !first_write.swap(true, Ordering::AcqRel) {
+                first_line_bytes.store(line.len(), Ordering::Release);
+                started.send(()).expect("writer start receiver is present");
+                release.recv().expect("writer release was sent");
+            }
+            Ok(())
+        })
+    }
 }

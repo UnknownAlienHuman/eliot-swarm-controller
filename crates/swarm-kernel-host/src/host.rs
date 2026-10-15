@@ -430,9 +430,12 @@ fn report_observer_shutdown(
             "event": "observer.shutdown",
             "enabled": true,
             "recorder_started": stats.as_ref().map(|stats| stats.started),
+            "host_recorder_state": host_recorder_state(stats.as_ref(), error_code, producer_drained),
             "recorder_shutdown_attempted": shutdown_attempted,
             "recorder_stats_available": stats.is_some(),
             "producer_drained": producer_drained,
+            "producer_worker_state": producer.as_ref().map(|value| format!("{:?}", value.worker_state).to_lowercase()),
+            "producer_stderr_state": producer.as_ref().map(|value| format!("{:?}", value.stderr_state).to_lowercase()),
             "producer_pending_records": producer.as_ref().map(|value| value.pending_records),
             "producer_pending_bytes": producer.as_ref().map(|value| value.pending_bytes),
             "producer_enqueued_records": producer.as_ref().map(|value| value.enqueued_records),
@@ -440,7 +443,8 @@ fn report_observer_shutdown(
             "producer_written_bytes": producer.as_ref().map(|value| value.written_bytes),
             "producer_dropped_records": producer.as_ref().map(|value| value.dropped_records),
             "producer_dropped_bytes": producer.as_ref().map(|value| value.dropped_bytes),
-            "producer_sink_failures": producer.as_ref().map(|value| value.sink_failures),
+            "producer_stderr_failures": producer.as_ref().map(|value| value.stderr_failures),
+            "producer_worker_failures": producer.as_ref().map(|value| value.worker_failures),
             "producer_startup_failures": producer.as_ref().map(|value| value.startup_failures),
             "producer_observer_panics": producer.as_ref().map(|value| value.observer_panics),
             "accepted_records": stats.as_ref().map(|stats| stats.recorder.accepted_records),
@@ -465,6 +469,30 @@ fn report_observer_shutdown(
             "error_code": error_code
         })
     );
+}
+
+fn host_recorder_state(
+    stats: Option<&swarm_observer::host::HostRecorderStats>,
+    error_code: Option<&'static str>,
+    producer_drained: bool,
+) -> &'static str {
+    let Some(stats) = stats else {
+        return "unavailable";
+    };
+    if !producer_drained {
+        return "unknown";
+    }
+    if error_code.is_some()
+        || stats.startup_failures > 0
+        || stats.callback_errors > 0
+        || stats.recorder.sink_failures > 0
+    {
+        "failed"
+    } else if stats.started {
+        "healthy"
+    } else {
+        "not_started"
+    }
 }
 
 /// Before the Store is available, the foreground launcher receives a precise
