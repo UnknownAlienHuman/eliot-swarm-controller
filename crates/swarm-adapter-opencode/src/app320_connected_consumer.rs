@@ -67,18 +67,98 @@ async fn app320_host_startup_child() {
     let path = std::env::var_os("ELIOT_APP320_HOST_CONFIG")
         .map(PathBuf::from)
         .expect("APP320 host child requires its private config path");
+    let diagnostic = path.with_file_name("host-startup-diagnostic.json");
+    let stage = |phase: &str, code: Option<&str>| {
+        let safe_code = code.filter(|value| fixture_diagnostic_code(value));
+        fs::write(
+            &diagnostic,
+            serde_json::to_vec(&json!({"phase":phase,"code":safe_code})).unwrap(),
+        )
+        .expect("private bounded startup diagnostic");
+    };
+    stage("config_read", None);
     let mut config: HostConfig = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     // The public embedding accepts Config. Resolve the configured Forge/workspace
     // paths just as the foreground loader does; startup itself creates authority.
+    stage("forge_paths", None);
     config.forge.resolve_paths(path.parent().unwrap()).unwrap();
+    stage("workspace_paths", None);
     config
         .workspace
         .resolve_paths(path.parent().unwrap())
         .unwrap();
+    stage("workspace_validate", None);
     config.workspace.validate(&config.forge).unwrap();
-    swarm_kernel_host::host::run_on_stdin_eof(config)
-        .await
-        .unwrap();
+    stage("host_run", None);
+    match swarm_kernel_host::host::run_on_stdin_eof(config).await {
+        Ok(()) => stage("host_closed", None),
+        Err(error) => {
+            stage("host_failed", Some(&error.code));
+            panic!("APP320 host failed; bounded phase/code retained privately");
+        }
+    }
+}
+
+fn fixture_diagnostic_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn startup_diagnostic(root: &Path) -> String {
+    let diagnostic = fs::read(root.join("host-startup-diagnostic.json"))
+        .ok()
+        .filter(|bytes| bytes.len() <= 1024)
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let phase = diagnostic
+        .as_ref()
+        .and_then(|value| value["phase"].as_str())
+        .filter(|phase| {
+            [
+                "config_read",
+                "forge_paths",
+                "workspace_paths",
+                "workspace_validate",
+                "host_run",
+                "host_closed",
+                "host_failed",
+            ]
+            .contains(phase)
+        })
+        .unwrap_or("unobserved");
+    let code = diagnostic
+        .as_ref()
+        .and_then(|value| value["code"].as_str())
+        .filter(|code| fixture_diagnostic_code(code))
+        .unwrap_or("UNOBSERVED");
+    format!("phase={phase},code={code}")
+}
+
+async fn supervisor_diagnostic(root: &Path, operator: &Credential) -> String {
+    let status = tokio::time::timeout(
+        Duration::from_secs(2),
+        call_host(root, operator, "host.status", json!({})),
+    )
+    .await;
+    let Ok(Ok(status)) = status else {
+        return "supervisor_health=unobserved".to_owned();
+    };
+    let health = &status["host_lifecycle"]["optional_workers"]["module-supervisor"];
+    let state = health["state"]
+        .as_str()
+        .filter(|state| {
+            !state.is_empty()
+                && state.len() <= 64
+                && state.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        })
+        .unwrap_or("unobserved");
+    let code = health["last_error_code"]
+        .as_str()
+        .filter(|code| fixture_diagnostic_code(code))
+        .unwrap_or("UNOBSERVED");
+    format!("supervisor_state={state},code={code}")
 }
 
 #[tokio::test]
@@ -318,7 +398,7 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
         let operator = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if let Some(status) = host.try_wait().map_err(display)? {
-                    return Err(format!("public host startup exited before IPC readiness: {status}"));
+                    return Err(format!("public host startup exited before IPC readiness: {status}; {}", startup_diagnostic(&scratch)));
                 }
                 if let Ok(credential) = load_credential(&host_data_dir.join("operator.json"))
                     && call_host(&host_data_dir, &credential, "module.catalog.get", json!({})).await.is_ok()
@@ -345,7 +425,11 @@ async fn run_connected_case(invalid_model_catalog: bool, app299_tasks: bool) -> 
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.map_err(|_| "real supervisor descriptor registration was not available".to_owned())??;
+        }).await;
+        let catalog = match catalog {
+            Ok(result) => result?,
+            Err(_) => return Err(format!("real supervisor descriptor registration was not available; {}", supervisor_diagnostic(&host_data_dir, &operator).await)),
+        };
         if !catalog["catalog_revision"].is_number() {
             return Err("actual catalog omitted its revision".to_owned());
         }
