@@ -7052,18 +7052,9 @@ mod tests {
                     .await
             });
             let cache_worker_entered_at = tokio::select! {
-                joined = &mut failure_resolution_task => {
-                    match joined.expect("cache failure resolver task did not panic") {
-                        Ok(resolution) => panic!(
-                            "cache resolver returned before the exact worker panic hook: result_ok={}, cache_hit={}",
-                            resolution.result.is_ok(),
-                            resolution.cache_hit.is_some()
-                        ),
-                        Err(error) => panic!(
-                            "cache resolver failed before the exact worker panic hook: {error:?}"
-                        ),
-                    }
-                },
+                // The hook notifies before the resolver completes. If both
+                // are ready in one poll, observe entry before joining once.
+                biased;
                 entered = timeout(PR61_CACHE_INPUT_PREPARATION_BOUND, cache_worker_entry) => {
                     match entered {
                         Ok(Ok(at)) => at,
@@ -7081,6 +7072,18 @@ mod tests {
                                     - failure_probe_completed_before
                             )
                         }
+                    }
+                },
+                joined = &mut failure_resolution_task => {
+                    match joined.expect("cache failure resolver task did not panic") {
+                        Ok(resolution) => panic!(
+                            "cache resolver returned before the exact worker panic hook: result_ok={}, cache_hit={}",
+                            resolution.result.is_ok(),
+                            resolution.cache_hit.is_some()
+                        ),
+                        Err(error) => panic!(
+                            "cache resolver failed before the exact worker panic hook: {error:?}"
+                        ),
                     }
                 },
             };
