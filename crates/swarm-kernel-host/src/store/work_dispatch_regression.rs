@@ -104,6 +104,183 @@ async fn write(store: &Store, principal: &Principal, method: &str, mut value: Va
         .unwrap()
 }
 
+fn public_work_dispatch_settings(route_alias: &str) -> Value {
+    json!({
+        "route":route_alias,
+        "agent_profile":"regression-agent",
+        "mcp_profile":"work-participant",
+        "mcp_surface":"participant-core",
+        "workspace_policy":"manager_owned_worktree",
+        "requested_model":null,
+        "requested_effort":null,
+        "budget":{"max_turns":null,"max_duration_ms":null,"max_cost_units":null},
+        "stop_conditions":[],
+        "purpose":"implementation",
+    })
+}
+
+async fn create_public_work_dispatch_task(
+    store: &Store,
+    operator: &Principal,
+    project_id: &str,
+    objective: &str,
+) -> String {
+    let task = write(
+        store,
+        operator,
+        "task.create",
+        json!({
+            "project_id":project_id,
+            "spec":{
+                "objective":objective,
+                "phase":"implementation",
+                "requirements":[{"id":"R1","statement":"Keep WorkDispatch admission exact"}],
+                "scope":{"initial_paths":["src/target.rs"]},
+                "owner_policy_id":OWNER_POLICY_V1_ID,
+            }
+        }),
+    )
+    .await;
+    task["task_id"].as_str().unwrap().to_owned()
+}
+
+async fn apply_public_work_dispatch(
+    store: &Store,
+    manager: &Principal,
+    project_id: &str,
+    automation_id: &str,
+    route_alias: &str,
+) -> Value {
+    let changes = json!([{
+        "automation_id":automation_id,
+        "expected_revision":0,
+        "include_existing":true,
+        "patch":{
+            "enabled":true,
+            "steps":["work_dispatch"],
+            "work_dispatch":public_work_dispatch_settings(route_alias),
+        }
+    }]);
+    let preview = store
+        .call(
+            manager.clone(),
+            "automation.config.preview".to_owned(),
+            json!({"project_id":project_id,"changes":changes}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["valid"], true, "{preview}");
+    let applied = write(
+        store,
+        manager,
+        "automation.config.apply",
+        json!({
+            "project_id":project_id,
+            "changes":changes,
+            "preview_digest":preview["plan_sha256"],
+        }),
+    )
+    .await;
+    assert_eq!(applied["applied"], true, "{applied}");
+    applied
+}
+
+async fn public_work_dispatch_effect_snapshot(store: &Store) -> Value {
+    store
+        .run(|db| {
+            let launch_operations: i64 = db.query_row(
+                "SELECT COUNT(*) FROM operations WHERE method='swarm.launch'",
+                [],
+                |row| row.get(0),
+            )?;
+            let agent_open_operations: i64 = db.query_row(
+                "SELECT COUNT(*) FROM operations WHERE method='agent.open'",
+                [],
+                |row| row.get(0),
+            )?;
+            let semantic_slots: i64 = db.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key GLOB 'launch:v1:semantic-slot:*'",
+                [],
+                |row| row.get(0),
+            )?;
+            let operation_links: i64 = db.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key GLOB 'work-dispatch:v1:operation-link:*'",
+                [],
+                |row| row.get(0),
+            )?;
+            let entry_links: i64 = db.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key GLOB 'work-dispatch:v1:entry-operation:*'",
+                [],
+                |row| row.get(0),
+            )?;
+            let workspace_leases: i64 =
+                db.query_row("SELECT COUNT(*) FROM workspace_leases", [], |row| {
+                    row.get(0)
+                })?;
+            let attempts: i64 =
+                db.query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))?;
+            let bindings: i64 =
+                db.query_row("SELECT COUNT(*) FROM bindings", [], |row| row.get(0))?;
+            let native_operations: i64 = db.query_row(
+                "SELECT COUNT(*) FROM operations WHERE method GLOB 'native.*'",
+                [],
+                |row| row.get(0),
+            )?;
+            let native_observations: i64 = db.query_row(
+                "SELECT COUNT(*) FROM observations WHERE source_stream_id='native' \
+                 OR kind GLOB 'native.*' OR kind GLOB 'native_*'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(json!({
+                "launch_operations":launch_operations,
+                "agent_open_operations":agent_open_operations,
+                "semantic_slots":semantic_slots,
+                "operation_links":operation_links,
+                "entry_links":entry_links,
+                "workspace_leases":workspace_leases,
+                "attempts":attempts,
+                "bindings":bindings,
+                "native_operations":native_operations,
+                "native_observations":native_observations,
+            }))
+        })
+        .await
+        .unwrap()
+}
+
+async fn seed_existing_root_binding(store: &Store, route: Route) {
+    let route_json = model::canonical(&serde_json::to_value(&route).unwrap()).unwrap();
+    let state_json = model::canonical(&json!({
+        "execution":"not_observed",
+        "waiting_for":"runtime_adapter",
+        "family_completeness":"unknown",
+    }))
+    .unwrap();
+    let module_artifact_id = route.module_artifact_id;
+    store
+        .run_fixture(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,\
+                 state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) \
+                 VALUES(?1,1,?2,'pr64-root-instance',?3,'ready',NULL,NULL,?4,?5,?6)",
+                rusqlite::params![
+                    "pr64-existing-root-binding",
+                    "pr64-existing-root-lane",
+                    module_artifact_id,
+                    route_json,
+                    state_json,
+                    model::now_ms()?,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
 async fn reconcile_pending_fixture<F>(
     store: &Store,
     owner_manager_id: String,
@@ -631,6 +808,151 @@ async fn work_dispatch_and_manual_launch_share_one_immutable_manager_scoped_slot
         .unwrap();
     assert_eq!(launch_count, 1);
     assert_eq!(operation_caller, AUTOMATION_TECHNICAL_REQUESTER_ID);
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn work_dispatch_public_root_limit_refuses_before_reserving_launch_or_effects() {
+    const PROJECT_ID: &str = "pr64-public-root-limit-project";
+
+    let directory = std::env::temp_dir().join(format!(
+        "swarm-work-dispatch-public-root-limit-{}",
+        model::new_id()
+    ));
+    let mut config = regression_config(&directory);
+    config.routes[0].admission_policy = Some(RouteAdmissionPolicy {
+        max_concurrent_roots: 1,
+    });
+    let route = config.routes[0].clone();
+    let (owner, operator, _credential) = start_store_with_config(directory.clone(), config).await;
+    let manager = register_manager(&owner.store, &operator, "pr64-root-limit-manager").await;
+    write(
+        &owner.store,
+        &operator,
+        "gm.handover",
+        json!({"client_id":manager.client_id}),
+    )
+    .await;
+    select_regression_descriptor(&owner.store, &manager, &route.alias).await;
+    seed_existing_root_binding(&owner.store, route.clone()).await;
+
+    let route_for_claims = route.clone();
+    let claims_before = owner
+        .store
+        .run(move |db| super::capacity::root_claims_for_route(db, &route_for_claims, None, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        claims_before,
+        Some(1),
+        "fixture is exactly at the configured limit"
+    );
+
+    let task_id = create_public_work_dispatch_task(
+        &owner.store,
+        &operator,
+        PROJECT_ID,
+        "Refuse public WorkDispatch at the exact route root limit",
+    )
+    .await;
+    let before = public_work_dispatch_effect_snapshot(&owner.store).await;
+    let applied = apply_public_work_dispatch(
+        &owner.store,
+        &manager,
+        PROJECT_ID,
+        "pr64-public-root-limit",
+        &route.alias,
+    )
+    .await;
+    let dispatch = &applied["work_dispatch"][0];
+    assert_eq!(dispatch["processed"], 1, "{dispatch}");
+    assert_eq!(
+        dispatch["pending"].as_array().unwrap().len(),
+        1,
+        "{dispatch}"
+    );
+    assert_eq!(dispatch["pending"][0]["task_id"], task_id, "{dispatch}");
+    assert_eq!(
+        dispatch["pending"][0]["reason"], "ROUTE_ROOT_LIMIT_REACHED",
+        "{dispatch}"
+    );
+    let after = public_work_dispatch_effect_snapshot(&owner.store).await;
+    assert_eq!(
+        after, before,
+        "root-limit refusal must not reserve launch effects"
+    );
+
+    let route_for_claims = route.clone();
+    let claims_after = owner
+        .store
+        .run(move |db| super::capacity::root_claims_for_route(db, &route_for_claims, None, None))
+        .await
+        .unwrap();
+    assert_eq!(claims_after, Some(1));
+
+    owner.close().await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn work_dispatch_public_disabled_route_refuses_before_reserving_launch_or_effects() {
+    const PROJECT_ID: &str = "pr64-public-disabled-route-project";
+
+    let directory = std::env::temp_dir().join(format!(
+        "swarm-work-dispatch-public-disabled-route-{}",
+        model::new_id()
+    ));
+    let mut config = regression_config(&directory);
+    config.routes[0].enabled = false;
+    config.routes[0].admission_policy = Some(RouteAdmissionPolicy {
+        max_concurrent_roots: 1,
+    });
+    let route = config.routes[0].clone();
+    let (owner, operator, _credential) = start_store_with_config(directory.clone(), config).await;
+    let manager = register_manager(&owner.store, &operator, "pr64-disabled-route-manager").await;
+    write(
+        &owner.store,
+        &operator,
+        "gm.handover",
+        json!({"client_id":manager.client_id}),
+    )
+    .await;
+
+    let task_id = create_public_work_dispatch_task(
+        &owner.store,
+        &operator,
+        PROJECT_ID,
+        "Refuse public WorkDispatch for a disabled route",
+    )
+    .await;
+    let before = public_work_dispatch_effect_snapshot(&owner.store).await;
+    let applied = apply_public_work_dispatch(
+        &owner.store,
+        &manager,
+        PROJECT_ID,
+        "pr64-public-disabled-route",
+        &route.alias,
+    )
+    .await;
+    let dispatch = &applied["work_dispatch"][0];
+    assert_eq!(dispatch["processed"], 1, "{dispatch}");
+    assert_eq!(
+        dispatch["pending"].as_array().unwrap().len(),
+        1,
+        "{dispatch}"
+    );
+    assert_eq!(dispatch["pending"][0]["task_id"], task_id, "{dispatch}");
+    assert_eq!(
+        dispatch["pending"][0]["reason"], "route_disabled",
+        "{dispatch}"
+    );
+    let after = public_work_dispatch_effect_snapshot(&owner.store).await;
+    assert_eq!(
+        after, before,
+        "disabled-route refusal must precede launch effects"
+    );
 
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
