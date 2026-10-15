@@ -352,6 +352,8 @@ pub(crate) fn pending_probe_cleanup_owner_for_test(
             directory,
             family_identity: None,
             family_token: None,
+            #[cfg(windows)]
+            family_query: None,
             exit_status: None,
             status_observation_failed: false,
             capture_setup_failed: true,
@@ -384,6 +386,8 @@ struct ProbeHelperCustody {
     directory: PathBuf,
     family_identity: Option<Value>,
     family_token: Option<String>,
+    #[cfg(windows)]
+    family_query: Option<Group>,
     exit_status: Option<ExitStatus>,
     status_observation_failed: bool,
     capture_setup_failed: bool,
@@ -412,6 +416,8 @@ impl ProbeHelperCustody {
             }
         }
         self.load_family_identity();
+        #[cfg(windows)]
+        self.retain_family_query();
         if self
             .capture
             .as_ref()
@@ -471,7 +477,11 @@ impl ProbeHelperCustody {
     }
 
     fn load_response_group_state(&mut self) {
-        if self.response_group_empty.is_some() {
+        if self.response_group_empty.is_some()
+            || self.capture.as_ref().is_none_or(|capture| {
+                !capture.is_finished() || capture.truncated() || capture.reader_failed()
+            })
+        {
             return;
         }
         let response_path = self.directory.join(PROBE_HELPER_RESPONSE_FILE);
@@ -518,8 +528,25 @@ impl ProbeHelperCustody {
         let Ok(token) = probe_group_token(&identity) else {
             return;
         };
+        #[cfg(windows)]
+        if self.launch_identity.as_ref().is_some_and(|launch| {
+            launch["creation_filetime"].as_u64().is_none()
+                || launch["creation_filetime"] != identity["creation_filetime"]
+        }) {
+            return;
+        }
         self.family_identity = Some(identity);
         self.family_token = Some(token);
+    }
+
+    #[cfg(windows)]
+    fn retain_family_query(&mut self) {
+        if self.family_query.is_none()
+            && let (Some(identity), Some(token)) =
+                (self.family_identity.as_ref(), self.family_token.as_deref())
+        {
+            self.family_query = Group::open_check_query(identity, token).ok();
+        }
     }
 
     fn family_departed_once(&self) -> bool {
@@ -536,6 +563,19 @@ impl ProbeHelperCustody {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound
                 );
         };
+        #[cfg(windows)]
+        if self.exit_status.is_some() {
+            if let Some(query) = self.family_query.as_ref() {
+                return query.family_empty().is_ok_and(|empty| empty);
+            }
+            // A fast helper can publish its complete, bounded response and
+            // disarm before the first parent poll. That response is carried
+            // by this exact owned Child's pipe; it proves cleanup independently
+            // of a now-vanished name. Missing/partial/false responses never do.
+            if self.response_group_empty == Some(true) {
+                return true;
+            }
+        }
         let group_departed = departed_empty(identity, token).is_ok_and(|departed| departed);
         let launch_departed = match self.launch_identity.as_ref() {
             Some(launch) => spawned_departed(launch, token).is_ok_and(|departed| departed),
@@ -1287,6 +1327,8 @@ fn command_output_with_cleanup(
         directory: temp_guard.0.clone(),
         family_identity: None,
         family_token: None,
+        #[cfg(windows)]
+        family_query: None,
         exit_status: None,
         status_observation_failed: false,
         capture_setup_failed: false,
@@ -3320,6 +3362,8 @@ pub(crate) mod tests {
         helper_pid: u32,
         helper_launch_identity: Option<Value>,
         helper_family_token: Option<String>,
+        #[cfg(windows)]
+        helper_family_query: Option<Group>,
     }
 
     impl ProbeCustodyFixture {
@@ -3468,6 +3512,8 @@ pub(crate) mod tests {
             helper_pid,
             helper_launch_identity: None,
             helper_family_token: None,
+            #[cfg(windows)]
+            helper_family_query: None,
         };
         let helper_launch_identity =
             spawned_identity(helper_pid).expect("capture helper launch identity");
@@ -3483,6 +3529,8 @@ pub(crate) mod tests {
             directory: directory.clone(),
             family_identity: None,
             family_token: None,
+            #[cfg(windows)]
+            family_query: None,
             exit_status: None,
             status_observation_failed: false,
             capture_setup_failed: false,
@@ -3525,6 +3573,26 @@ pub(crate) mod tests {
             fixture.helper_family_token.is_some(),
             "capture the helper's exact native-family token before Store handoff"
         );
+        #[cfg(windows)]
+        {
+            // Store may release its owner before this fixture independently
+            // checks departure. Keep that exact Job observable throughout both
+            // observations instead of treating a vanished name as empty.
+            fixture.helper_family_query = Some(
+                Group::open_check_query(
+                    owner
+                        .custody
+                        .family_identity
+                        .as_ref()
+                        .expect("helper family"),
+                    fixture
+                        .helper_family_token
+                        .as_deref()
+                        .expect("helper token"),
+                )
+                .expect("retain the fixture's exact helper Job observation"),
+            );
+        }
         (owner, fixture)
     }
 

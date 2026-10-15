@@ -31,6 +31,13 @@ impl Group {
             .map_err(Into::into)
     }
 
+    #[cfg(windows)]
+    pub fn open_check_query(identity: &Value, token: &str) -> Result<Self> {
+        swarm_process::Group::open_check_query(identity, token)
+            .map(Self)
+            .map_err(Into::into)
+    }
+
     pub fn children_empty(&self) -> Result<bool> {
         self.0.children_empty().map_err(Into::into)
     }

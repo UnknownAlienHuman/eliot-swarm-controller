@@ -341,6 +341,22 @@ mod os {
                     "a module owner Job is required for retained family observation",
                 ));
             }
+            Self::open_named_query(identity, token)
+        }
+
+        /// Keep the exact probe helper's Job observable after its last
+        /// process exits; closing this query handle never requests termination.
+        pub fn open_check_query(identity: &Value, token: &str) -> Result<Self> {
+            if identity["purpose"] != "check" {
+                return Err(Error::new(
+                    "CHECK_RECOVERY_UNSUPPORTED",
+                    "a check owner Job is required for retained probe observation",
+                ));
+            }
+            Self::open_named_query(identity, token)
+        }
+
+        fn open_named_query(identity: &Value, token: &str) -> Result<Self> {
             let expected = expected_job_name(identity, token)?;
             let job = open_query_job(&expected)?;
             Ok(Self {
