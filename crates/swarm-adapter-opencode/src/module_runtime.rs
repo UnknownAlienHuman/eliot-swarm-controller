@@ -4,7 +4,6 @@ use crate::config::{
     ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, HostConnectionConfig, MODULE_ID, NativeOptions,
     OwnedNativeOptions, read_credential, read_host_config,
 };
-use crate::provider_auth::ProviderAuthOptions;
 use std::{
     env,
     path::{Path, PathBuf},
@@ -201,7 +200,6 @@ fn owned_native_options(native: &NativeOptions) -> Result<Option<OwnedNativeOpti
         password_file: absolute_config_path("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PASSWORD_FILE")?,
         port,
         model_catalog: required_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_MODEL_CATALOG")?,
-        provider_auth: provider_auth_options(native)?,
     };
     owner.validate_for(native)?;
     if owner.state_root == owner.password_file {
@@ -211,20 +209,6 @@ fn owned_native_options(native: &NativeOptions) -> Result<Option<OwnedNativeOpti
         ));
     }
     Ok(Some(owner))
-}
-
-fn provider_auth_options(native: &NativeOptions) -> Result<Option<ProviderAuthOptions>> {
-    let Some(source) = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PROVIDER_AUTH_FILE")? else {
-        return Ok(None);
-    };
-    let source_file = absolute_config_path_value(source)?;
-    let credential_ref = optional_env("ELIOT_SWARM_CONFIG_OPENCODE_OWNER_PROVIDER_CREDENTIAL_REF")?;
-    let auth = ProviderAuthOptions {
-        source_file,
-        credential_ref,
-    };
-    auth.validate_for(native)?;
-    Ok(Some(auth))
 }
 
 fn capabilities_match(claim: &ModuleContractClaim) -> bool {

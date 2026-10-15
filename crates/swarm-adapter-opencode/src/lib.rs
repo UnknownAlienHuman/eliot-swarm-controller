@@ -16,7 +16,6 @@ mod native_interactions;
 mod native_mcp;
 mod native_mcp_intake;
 mod native_owner;
-mod provider_auth;
 
 pub use config::{
     ARTIFACT_ID, ARTIFACT_VERSION, AdapterConfig, ModelRef, NativeOptions, OwnedNativeOptions,
@@ -1482,16 +1481,6 @@ async fn handle_open(
             return flush_outbox(host).await;
         }
     };
-    let provider_auth = match native_owner.bootstrap_provider_auth(&native, options).await {
-        Ok(proof) => proof,
-        Err(error) => {
-            let mut failure =
-                effect_failure(command, claim, options, Some(root), None, &error, true)?;
-            attach_owned_service_ready_only(&mut failure, owner_ready.as_ref(), options);
-            journal.queue_outcome(&failure)?;
-            return flush_outbox(host).await;
-        }
-    };
     let location = match native.preflight_open(options).await {
         Ok(location) => location,
         Err(failure) => {
@@ -1501,7 +1490,6 @@ async fn handle_open(
             {
                 details["catalog_failure_category"] = json!(category.as_str());
             }
-            attach_provider_auth_proof(&mut details, provider_auth.as_ref());
             let mut rejected = outcome(
                 command,
                 claim,
@@ -1529,9 +1517,6 @@ async fn handle_open(
             if let Some(receipt) = owner_ready.as_ref() {
                 details["owned_service_ready"] = receipt.clone();
             }
-            if let Some(proof) = provider_auth {
-                details["provider_auth"] = proof;
-            }
             outcome(
                 command,
                 claim,
@@ -1546,18 +1531,11 @@ async fn handle_open(
             let mut failure =
                 effect_failure(command, claim, options, Some(root), None, &error, true)?;
             attach_owned_service_ready_only(&mut failure, owner_ready.as_ref(), options);
-            attach_provider_auth_proof(&mut failure.details, provider_auth.as_ref());
             failure
         }
     };
     journal.queue_outcome(&outcome)?;
     flush_outbox(host).await
-}
-
-fn attach_provider_auth_proof(details: &mut Value, proof: Option<&Value>) {
-    if let Some(proof) = proof {
-        details["provider_auth"] = proof.clone();
-    }
 }
 
 fn attach_owned_service_ready_only(

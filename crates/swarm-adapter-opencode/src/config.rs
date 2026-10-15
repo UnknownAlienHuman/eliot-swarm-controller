@@ -1,4 +1,3 @@
-use crate::provider_auth::ProviderAuthOptions;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -68,8 +67,6 @@ pub struct OwnedNativeOptions {
     pub password_file: PathBuf,
     pub port: u16,
     pub model_catalog: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_auth: Option<ProviderAuthOptions>,
 }
 
 impl OwnedNativeOptions {
@@ -90,10 +87,6 @@ impl OwnedNativeOptions {
             || !matches!(self.model_catalog.as_str(), "offline" | "refresh")
             || !is_sha256(&self.bun_sha256)
             || !is_sha256(&self.server_program_sha256)
-            || self
-                .provider_auth
-                .as_ref()
-                .is_some_and(|auth| auth.validate_for(native).is_err())
         {
             return Err(Error::new(
                 "CONFIG_ERROR",

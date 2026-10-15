@@ -9,8 +9,6 @@
 use crate::{
     config::{NativeOptions, OwnedNativeOptions, is_loopback_endpoint},
     mcp_plugin,
-    native::NativeClient,
-    provider_auth,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -138,48 +136,6 @@ impl NativeOwnerController {
     /// The adapter must remain alive while this child has no confirmed exit.
     pub fn owns_child(&self) -> bool {
         self.active.is_some()
-    }
-
-    /// Bootstrap provider auth only for a route that also supplied a fresh
-    /// owner plan. External-attach configurations never receive a key path.
-    pub async fn bootstrap_provider_auth(
-        &self,
-        native: &NativeClient,
-        options: &NativeOptions,
-    ) -> Result<Option<Value>> {
-        let Some(config) = self.config.as_ref() else {
-            return Ok(None);
-        };
-        let Some(auth) = config.provider_auth.as_ref() else {
-            return Ok(None);
-        };
-        config.validate_for(options)?;
-        let ready = self.ready.as_ref().ok_or_else(|| {
-            Error::new(
-                "NATIVE_OWNER_RECEIPT_MISSING",
-                "provider authorization has no retained owned-service readiness receipt",
-            )
-        })?;
-        ready.validate().map_err(|_| {
-            Error::new(
-                "NATIVE_OWNER_RECEIPT_INVALID",
-                "provider authorization readiness receipt is invalid",
-            )
-        })?;
-        if ready.owner_nonce != config.owner_nonce
-            || ready.service_id != options.service_id
-            || ready.service_version != native.version()
-            || ready.process.pid != native.pid()
-        {
-            return Err(Error::new(
-                "NATIVE_OWNER_RECEIPT_MISMATCH",
-                "provider authorization connection differs from its owned-service receipt",
-            ));
-        }
-        let projection =
-            provider_auth::StoreProviderAuthProjection::from_ready(options, auth, ready)?;
-        let readback = provider_auth::bootstrap_once(native, options, auth).await?;
-        projection.bind_readback(readback).map(Some)
     }
 }
 
@@ -1044,7 +1000,6 @@ mod tests {
                 password_file: directory.join("unused-state/server.password"),
                 port: 0,
                 model_catalog: "offline".into(),
-                provider_auth: None,
             },
             options: NativeOptions {
                 service_id: "image-validator-fixture".into(),
