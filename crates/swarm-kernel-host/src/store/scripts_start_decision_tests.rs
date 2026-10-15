@@ -684,78 +684,240 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
         denied_ready["process"]["pid"]
     );
 
-    let (allow_waiting_tx, allow_waiting_rx) = std::sync::mpsc::channel();
-    let (release_allow_tx, release_allow_rx) = std::sync::mpsc::channel();
-    let late_allow_work = denied_work.clone();
-    let late_allow = thread::spawn(move || {
-        allow_waiting_tx
-            .send(())
-            .expect("report the live competing Allow publisher");
-        release_allow_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("release the Allow publisher after Deny wins");
-        crate::scripts::runner::allow(&late_allow_work)
+    let decision_path = denied_run_dir.join("start-decision.json");
+    assert!(
+        !decision_path.exists(),
+        "the source worker starts with no decision"
+    );
+    let marker_lines_before_race = fs::read_to_string(&marker_path)
+        .expect("read the first Work's interpreter marker")
+        .lines()
+        .count();
+    assert_eq!(marker_lines_before_race, 1);
+
+    // Both Store publishers prepare and sync their private temporary decision
+    // files, then rendezvous at the existing hook before either final name is
+    // published. Releasing both makes the existing no-replace primitive pick
+    // the sole winner while this exact source worker waits on the same Run.
+    let publication_gate = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let (publisher_armed_tx, publisher_armed_rx) = std::sync::mpsc::channel();
+    let allow_store = owner.store.clone();
+    let allow_work = denied_work.clone();
+    let allow_decision_path = decision_path.clone();
+    let allow_gate = std::sync::Arc::clone(&publication_gate);
+    let allow_armed_tx = publisher_armed_tx.clone();
+    let allow_attempt = tokio::spawn(async move {
+        allow_store
+            .file_io(move |_| {
+                let _prepublication =
+                    swarm_process::test_support::scoped_prepublication_fault(move |path| {
+                        if path == allow_decision_path {
+                            allow_armed_tx
+                                .send("allow")
+                                .expect("report the Allow publisher at the prepublication gate");
+                            allow_gate.wait();
+                        }
+                        Ok(())
+                    });
+                crate::scripts::runner::allow(&allow_work)
+            })
+            .await
     });
-    allow_waiting_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the opposite intent is ready to publish");
-    let deny_work_for_store = denied_work.clone();
-    owner
-        .store
-        .file_io(move |_| crate::scripts::runner::deny(&deny_work_for_store, "DENIED"))
-        .await
-        .expect("the real Store file-I/O publisher retains Deny first");
-    release_allow_tx
-        .send(())
-        .expect("release the losing Allow publisher");
+    let deny_store = owner.store.clone();
+    let deny_work = denied_work.clone();
+    let deny_decision_path = decision_path.clone();
+    let deny_gate = std::sync::Arc::clone(&publication_gate);
+    let deny_armed_tx = publisher_armed_tx.clone();
+    let deny_attempt = tokio::spawn(async move {
+        deny_store
+            .file_io(move |_| {
+                let _prepublication =
+                    swarm_process::test_support::scoped_prepublication_fault(move |path| {
+                        if path == deny_decision_path {
+                            deny_armed_tx
+                                .send("deny")
+                                .expect("report the Deny publisher at the prepublication gate");
+                            deny_gate.wait();
+                        }
+                        Ok(())
+                    });
+                crate::scripts::runner::deny(&deny_work, "DENIED")
+            })
+            .await
+    });
+    drop(publisher_armed_tx);
+
+    let armed_publishers = tokio::task::spawn_blocking(move || {
+        let first = publisher_armed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first publisher reaches the prepublication gate");
+        let second = publisher_armed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("opposite publisher reaches the prepublication gate");
+        [first, second]
+    })
+    .await
+    .expect("wait for both publishers without blocking the Store runtime");
+    assert!(armed_publishers.contains(&"allow"));
+    assert!(armed_publishers.contains(&"deny"));
+    assert!(
+        !decision_path.exists(),
+        "both publishers are armed while the final decision path is absent"
+    );
     assert_eq!(
-        late_allow
-            .join()
-            .expect("the competing Allow publisher exits")
-            .expect_err("Allow cannot replace the retained Deny")
-            .code,
-        "CONFLICT"
+        custody
+            .exit_observed(&denied_work.run_id, &denied_work.operation_id)
+            .unwrap(),
+        Some(false),
+        "the exact real source worker remains held while both intents are armed"
+    );
+    assert!(!denied_run_dir.join("execution-plan.json").exists());
+    assert!(!denied_run_dir.join("execution-plan-ready.json").exists());
+    assert!(!denied_run_dir.join("started.json").exists());
+    let release_gate = std::sync::Arc::clone(&publication_gate);
+    tokio::task::spawn_blocking(move || release_gate.wait())
+        .await
+        .expect("release both publishers into atomic no-replace publication");
+
+    let (allow_result, deny_result) = tokio::join!(allow_attempt, deny_attempt);
+    let allow_result = allow_result.expect("concurrent Allow publisher exits");
+    let deny_result = deny_result.expect("concurrent Deny publisher exits");
+    assert_ne!(
+        allow_result.is_ok(),
+        deny_result.is_ok(),
+        "exactly one concurrent intent is retained"
     );
 
-    let denied_completion_path = denied_run_dir.join("completion.json");
-    let denied_finish_deadline = Instant::now() + Duration::from_secs(10);
+    let retained = crate::scripts::runner::start_decision(&denied_work)
+        .expect("read the durable winner from the same source-worker Run");
+    let allow_won = match &retained {
+        swarm_script_worker::StartDecisionRead::Current(
+            swarm_script_worker::ScriptStartDecision::Allow {
+                run_id,
+                operation_id,
+                token,
+                ..
+            },
+        ) => {
+            assert_eq!(run_id, &denied_work.run_id);
+            assert_eq!(operation_id, &denied_work.operation_id);
+            assert_eq!(token, &denied_work.token);
+            true
+        }
+        swarm_script_worker::StartDecisionRead::Current(
+            swarm_script_worker::ScriptStartDecision::Deny {
+                run_id,
+                operation_id,
+                token,
+                error_code,
+                ..
+            },
+        ) => {
+            assert_eq!(run_id, &denied_work.run_id);
+            assert_eq!(operation_id, &denied_work.operation_id);
+            assert_eq!(token, &denied_work.token);
+            assert_eq!(error_code, "DENIED");
+            false
+        }
+        other => panic!("concurrent publishers retained no exact current decision: {other:?}"),
+    };
+    assert_eq!(allow_result.is_ok(), allow_won);
+    assert_eq!(deny_result.is_ok(), !allow_won);
+    if allow_won {
+        allow_result.expect("the retained Allow publisher succeeds");
+        assert_eq!(
+            deny_result
+                .expect_err("the losing Deny intent conflicts with retained Allow")
+                .code,
+            "CONFLICT"
+        );
+    } else {
+        deny_result.expect("the retained Deny publisher succeeds");
+        assert_eq!(
+            allow_result
+                .expect_err("the losing Allow intent conflicts with retained Deny")
+                .code,
+            "CONFLICT"
+        );
+    }
+
+    let retained_bytes = fs::read(&decision_path).expect("read the immutable race winner bytes");
+    let reopened_work = crate::scripts::runner::durable_authority_tests::fixture_work_with_identity(
+        &data_dir,
+        &denied_work.run_id,
+        &denied_work.operation_id,
+        &denied_work.token,
+        None,
+    );
+    assert_eq!(
+        crate::scripts::runner::start_decision(&reopened_work)
+            .expect("reopen the same Run and read its retained winner"),
+        retained
+    );
+    assert_eq!(
+        fs::read(&decision_path).expect("read unchanged winner bytes after reopen"),
+        retained_bytes
+    );
+
+    let completion_path = denied_run_dir.join("completion.json");
+    let finish_deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if custody
             .exit_observed(&denied_work.run_id, &denied_work.operation_id)
             .unwrap()
             == Some(true)
-            && denied_completion_path.is_file()
+            && completion_path.is_file()
         {
             break;
         }
         assert!(
-            Instant::now() < denied_finish_deadline,
-            "the real source worker finishes without passing the Deny gate"
+            Instant::now() < finish_deadline,
+            "the same source worker completes according to its retained decision"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let denied_completion: Value =
-        serde_json::from_slice(&fs::read(&denied_completion_path).unwrap()).unwrap();
-    assert_eq!(denied_completion["run_id"], denied_work.run_id);
-    assert_eq!(denied_completion["operation_id"], denied_work.operation_id);
-    assert_eq!(denied_completion["token"], denied_work.token);
-    assert_eq!(denied_completion["state"], "failed");
-    assert_eq!(denied_completion["error_code"], "DENIED");
-    assert!(!denied_run_dir.join("execution-plan.json").exists());
-    assert!(!denied_run_dir.join("execution-plan-ready.json").exists());
-    assert!(!denied_run_dir.join("started.json").exists());
+    let completion: Value = serde_json::from_slice(&fs::read(&completion_path).unwrap()).unwrap();
+    assert_eq!(completion["run_id"], denied_work.run_id);
+    assert_eq!(completion["operation_id"], denied_work.operation_id);
+    assert_eq!(completion["token"], denied_work.token);
     assert_eq!(
-        fs::read_to_string(&marker_path)
-            .expect("read the unchanged interpreter marker")
-            .lines()
-            .collect::<Vec<_>>(),
-        ["started"],
-        "the Deny-winning real worker never starts the interpreter"
+        fs::read(&decision_path).expect("read unchanged decision after worker completion"),
+        retained_bytes
     );
+    let marker_lines = fs::read_to_string(&marker_path)
+        .expect("read interpreter invocation count after race worker completion")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(marker_lines.iter().all(|line| line == "started"));
+    if allow_won {
+        assert_eq!(completion["state"], "completed");
+        assert_eq!(completion["exit_code"], 0);
+        assert!(completion["error_code"].is_null());
+        assert!(denied_run_dir.join("execution-plan.json").is_file());
+        assert!(denied_run_dir.join("execution-plan-ready.json").is_file());
+        assert!(denied_run_dir.join("started.json").is_file());
+        assert_eq!(
+            marker_lines.len(),
+            marker_lines_before_race + 1,
+            "the Allow-winning source worker starts the interpreter exactly once"
+        );
+    } else {
+        assert_eq!(completion["state"], "failed");
+        assert_eq!(completion["error_code"], "DENIED");
+        assert!(!denied_run_dir.join("execution-plan.json").exists());
+        assert!(!denied_run_dir.join("execution-plan-ready.json").exists());
+        assert!(!denied_run_dir.join("started.json").exists());
+        assert_eq!(
+            marker_lines.len(),
+            marker_lines_before_race,
+            "the Deny-winning source worker never starts the interpreter"
+        );
+    }
     assert!(
         custody
             .release_after_terminal(&denied_work.run_id, &denied_work.operation_id)
-            .expect("release the denied worker after its direct child exits")
+            .expect("release the race worker only after completion and child exit")
     );
     denied_cleanup.disarm();
     assert_eq!(
