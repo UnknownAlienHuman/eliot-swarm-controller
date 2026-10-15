@@ -107,22 +107,6 @@ impl ModuleSupervisorHostConfig {
                 ));
             }
         }
-        // Owned OpenCode auth sources are private host paths, not credential
-        // bytes. Carry the configured opaque reference through the supervisor
-        // bootstrap so the route mapper can retain the exact source path.
-        for (reference, source) in &config.opencode_provider_auth_sources {
-            let reference = ProtectedRef::new(reference.clone()).map_err(|error| {
-                Error::new("MODULE_SUPERVISOR_CONFIG_INVALID", error.to_string())
-            })?;
-            if let Some(previous) = protected_files.insert(reference, source.auth_file.clone())
-                && previous != source.auth_file
-            {
-                return Err(Error::new(
-                    "MODULE_SUPERVISOR_CONFIG_INVALID",
-                    "protected reference maps to conflicting host files",
-                ));
-            }
-        }
         let value = Self {
             install_root,
             descriptor_files: module_config.descriptor_files.clone(),

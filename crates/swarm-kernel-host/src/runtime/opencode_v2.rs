@@ -12,7 +12,6 @@ pub(crate) mod mcp_plugin;
 pub(crate) mod mcp_tools;
 pub(crate) mod owned_service;
 mod prerequisites;
-mod provider_auth;
 mod resource_paths;
 mod results;
 mod snapshot;

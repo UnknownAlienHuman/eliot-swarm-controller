@@ -6,7 +6,7 @@
 //! A process effect is one-shot; recovery reads exact owner evidence and never
 //! starts a replacement.
 
-use super::{ModelRef, Options, Service, mcp_plugin, provider_auth};
+use super::{ModelRef, Options, Service, mcp_plugin};
 use crate::{
     config::OwnedOpenCodeServiceConfig,
     error::{Error, Result},
@@ -95,7 +95,6 @@ pub(crate) struct OwnedServiceRoute {
     service_id: String,
     model: ModelRef,
     model_catalog: String,
-    credential_ref: Option<String>,
     bun_executable: PathBuf,
     bun_sha256: String,
     server_program: PathBuf,
@@ -115,13 +114,6 @@ impl OwnedServiceRoute {
         if config.origin != "fresh_owned_service"
             || config.model_catalog != "offline" && config.model_catalog != "refresh"
             || !config.model.valid()
-            || config
-                .credential_ref
-                .as_deref()
-                .is_some_and(|credential_ref| {
-                    provider_auth::validate_ref(credential_ref).is_err()
-                        || provider_auth::validate_provider_id(&config.model.provider_id).is_err()
-                })
         {
             return Err(config_error("invalid fresh-owned OpenCode declaration"));
         }
@@ -150,7 +142,6 @@ impl OwnedServiceRoute {
             service_id: config.service_id.clone(),
             model: config.model.clone(),
             model_catalog: config.model_catalog.clone(),
-            credential_ref: config.credential_ref.clone(),
             bun_executable,
             bun_sha256,
             server_program,
@@ -196,9 +187,6 @@ impl OwnedServiceRoute {
 
     pub(crate) fn service_id(&self) -> &str {
         &self.service_id
-    }
-    pub(crate) fn credential_ref(&self) -> Option<&str> {
-        self.credential_ref.as_deref()
     }
     pub(crate) fn model_ref(&self) -> &ModelRef {
         &self.model
@@ -249,10 +237,6 @@ impl OwnedServiceRoute {
             "password_file":path_text(&self.password_file)?,
             "connection_file":path_text(&self.connection_file)?, "config_file":path_text(&self.config_file)?,
         });
-        let mut value = value;
-        if let Some(credential_ref) = &self.credential_ref {
-            value["credential_ref"] = json!(credential_ref);
-        }
         Ok(model::digest(model::canonical(&value)?.as_bytes()))
     }
 
@@ -283,7 +267,6 @@ pub(crate) struct PreparedOwnedService {
     plugin: mcp_plugin::PreparedPluginConfig,
     config_digest: String,
     intent: OwnedServiceIntent,
-    provider_credential: Option<provider_auth::PreparedProviderCredential>,
 }
 
 impl PreparedOwnedService {
@@ -293,73 +276,10 @@ impl PreparedOwnedService {
 }
 
 pub(crate) fn prepare_owned_service(
-    route: &OwnedServiceRoute,
-    intent: &OwnedServiceIntent,
+    _route: &OwnedServiceRoute,
+    _intent: &OwnedServiceIntent,
 ) -> Result<PreparedOwnedService> {
-    prepare_owned_service_with_provider_auth(route, intent, None)
-}
-
-/// Prepare one owned route with its explicitly authorized host credential.
-/// The path is consumed only here and is never copied into route, plan or Store.
-pub(crate) fn prepare_owned_service_with_provider_auth(
-    route: &OwnedServiceRoute,
-    intent: &OwnedServiceIntent,
-    auth_source: Option<&Path>,
-) -> Result<PreparedOwnedService> {
-    match (route.credential_ref(), auth_source) {
-        (Some(_), Some(_)) | (None, None) => {}
-        (Some(_), None) => {
-            return Err(config_error(
-                "owned route credential reference has no authorized host source",
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(config_error(
-                "provider credentials cannot be supplied to a route without a reference",
-            ));
-        }
-    }
-    route.verify_files()?;
-    validate_directory_components(&route.state_root)?;
-    match fs::symlink_metadata(&route.state_root) {
-        Ok(_) => {
-            return Err(Error::new(
-                "OWNED_SERVICE_STATE_EXISTS",
-                "fresh owned service state already exists; uncertain launches are never replayed",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {
-            return Err(config_error(
-                "fresh owned service state cannot be safely inspected",
-            ));
-        }
-    }
-    let plugin = mcp_plugin::prepare_plugin_config(route, intent)?;
-    let config_digest = plugin.config_digest().to_owned();
-    let provider_credential = match (route.credential_ref(), auth_source) {
-        (Some(credential_ref), Some(path)) => Some(provider_auth::prepare_credential(
-            credential_ref,
-            &route.model,
-            path,
-            intent.owner_nonce(),
-            &route.route_digest()?,
-            intent.scope_digest(),
-        )?),
-        (None, None) => None,
-        _ => {
-            return Err(scope_error(
-                "provider credential source changed during preparation",
-            ));
-        }
-    };
-    Ok(PreparedOwnedService {
-        route: route.clone(),
-        plugin,
-        config_digest,
-        intent: intent.clone(),
-        provider_credential,
-    })
+    Err(native_harness_required())
 }
 
 /// Single-use in-process permit built from the exact Store admission. Store
@@ -370,53 +290,15 @@ pub(crate) struct OwnedServiceStartPermit {
     route_digest: String,
     config_digest: String,
     scope_digest: String,
-    provider_auth: Option<provider_auth::ProviderAuthPermit>,
     consumed: bool,
 }
 
 impl OwnedServiceStartPermit {
     pub(crate) fn from_store_admission(
-        intent: &OwnedServiceIntent,
-        prepared: &PreparedOwnedService,
+        _intent: &OwnedServiceIntent,
+        _prepared: &PreparedOwnedService,
     ) -> Result<Self> {
-        let route_digest = prepared.route.route_digest()?;
-        if intent.owner_nonce() != prepared.route.owner_nonce()
-            || intent.route_digest() != route_digest
-            || intent.scope_digest() != prepared.intent.scope_digest()
-            || prepared.intent.owner_nonce() != intent.owner_nonce()
-            || prepared.intent.route_digest() != intent.route_digest()
-            || prepared.intent.scope_digest() != intent.scope_digest()
-            || prepared.plugin.owner_nonce() != intent.owner_nonce()
-        {
-            return Err(scope_error(
-                "start permit does not match the exact Store-owned route",
-            ));
-        }
-        let provider_auth = prepared
-            .provider_credential
-            .as_ref()
-            .map(|credential| {
-                provider_auth::ProviderAuthPermit::from_start_scope(
-                    credential,
-                    intent.owner_nonce(),
-                    &route_digest,
-                    intent.scope_digest(),
-                )
-            })
-            .transpose()?;
-        if prepared.route.credential_ref().is_some() != provider_auth.is_some() {
-            return Err(scope_error(
-                "provider authorization permit does not match the owned route",
-            ));
-        }
-        Ok(Self {
-            owner_nonce: intent.owner_nonce().to_owned(),
-            route_digest,
-            config_digest: prepared.config_digest.clone(),
-            scope_digest: intent.scope_digest().to_owned(),
-            provider_auth,
-            consumed: false,
-        })
+        Err(native_harness_required())
     }
 }
 
@@ -462,9 +344,6 @@ pub(crate) enum OwnedServiceStartStage {
     FromRoute,
     ConnectOwned,
     RouteVerify,
-    ProviderScope,
-    Bootstrap,
-    ProviderProof,
 }
 
 impl OwnedServiceStartStage {
@@ -478,9 +357,6 @@ impl OwnedServiceStartStage {
             Self::FromRoute => "from_route",
             Self::ConnectOwned => "connect_owned",
             Self::RouteVerify => "route_verify",
-            Self::ProviderScope => "provider_scope",
-            Self::Bootstrap => "bootstrap",
-            Self::ProviderProof => "provider_proof",
         }
     }
 }
@@ -565,7 +441,7 @@ impl OwnedServiceReadback {
         value: &Value,
         route: &OwnedServiceRoute,
         owner_nonce: &str,
-        require_provider_auth: bool,
+        _legacy: bool,
     ) -> Result<Self> {
         let object = value
             .as_object()
@@ -589,11 +465,8 @@ impl OwnedServiceReadback {
             "plugin_loaded",
             "dispatch_permitted",
         ];
-        let has_provider_auth = object.contains_key("provider_auth");
-        if object.len() != expected.len() + usize::from(has_provider_auth)
-            || object
-                .keys()
-                .any(|key| !expected.contains(&key.as_str()) && key != "provider_auth")
+        if object.len() != expected.len()
+            || object.keys().any(|key| !expected.contains(&key.as_str()))
             || value["schema_version"] != 1
             || value["status"] != "ready"
             || value["service_id"] != route.service_id
@@ -645,70 +518,10 @@ impl OwnedServiceReadback {
         {
             return Err(readback_error("process proof is malformed"));
         }
-        match (route.credential_ref(), value.get("provider_auth")) {
-            (Some(credential_ref), Some(provider_proof)) => {
-                provider_auth::validate_proof(provider_proof, provider_auth_scope(route, value)?)?;
-                if provider_proof["credential_ref"] != credential_ref {
-                    return Err(readback_error(
-                        "provider proof differs from the route credential reference",
-                    ));
-                }
-            }
-            (Some(_), None) if require_provider_auth => {
-                return Err(readback_error(
-                    "owned service provider credential is not observed",
-                ));
-            }
-            (Some(_), None) => {}
-            (None, Some(_)) => {
-                return Err(readback_error(
-                    "provider proof is present for a route without a credential reference",
-                ));
-            }
-            (None, None) => {}
-        }
         Ok(Self {
             proof: value.clone(),
         })
     }
-
-    fn with_provider_auth(mut self, route: &OwnedServiceRoute, proof: Value) -> Result<Self> {
-        provider_auth::validate_proof(&proof, provider_auth_scope(route, &self.proof)?)?;
-        let object = self
-            .proof
-            .as_object_mut()
-            .ok_or_else(|| readback_error("owned service proof is malformed"))?;
-        object.insert("provider_auth".into(), proof);
-        Ok(self)
-    }
-}
-
-fn provider_auth_scope<'a>(
-    route: &'a OwnedServiceRoute,
-    proof: &'a Value,
-) -> Result<provider_auth::OwnedServiceAuthScope<'a>> {
-    let credential_ref = route
-        .credential_ref()
-        .ok_or_else(|| readback_error("owned route has no provider credential reference"))?;
-    let pid = proof["process"]["pid"]
-        .as_u64()
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value != 0)
-        .ok_or_else(|| readback_error("owned service process proof is malformed"))?;
-    let birth_token = proof["process"]["birth_token"]
-        .as_str()
-        .filter(|value| is_sha256(value))
-        .ok_or_else(|| readback_error("owned service process proof is malformed"))?;
-    Ok(provider_auth::OwnedServiceAuthScope {
-        credential_ref,
-        model_ref: &route.model,
-        service_id: &route.service_id,
-        service_version: VERSION,
-        owner_nonce: &route.owner_nonce,
-        pid,
-        birth_token,
-        directory: &route.workspace_directory,
-    })
 }
 
 /// Positive no-kill evidence that one exact owner process incarnation has
@@ -819,84 +632,14 @@ impl OwnedServiceHandle {
 /// Start one foreground helper only after Store has durably authorized the
 /// effect. The helper enters the non-killing process Job before spawning Bun.
 pub(crate) async fn start_foreground(
-    prepared: PreparedOwnedService,
-    mut permit: OwnedServiceStartPermit,
+    _prepared: PreparedOwnedService,
+    _permit: OwnedServiceStartPermit,
 ) -> std::result::Result<OwnedServiceHandle, OwnedServiceStartFailure> {
-    if permit.consumed
-        || permit.owner_nonce != prepared.route.owner_nonce()
-        || permit.route_digest != prepared.intent.route_digest()
-        || permit.config_digest != prepared.config_digest
-        || permit.scope_digest != prepared.intent.scope_digest()
-    {
-        return Err(start_failure(
-            scope_error("owned-service start permit is stale or mismatched"),
-            OwnedServiceStartStage::PermitValidation,
-            None,
-        ));
-    }
-    if prepared.provider_credential.is_some() != permit.provider_auth.is_some() {
-        return Err(start_failure(
-            scope_error("provider authorization permit differs from the prepared route"),
-            OwnedServiceStartStage::PermitValidation,
-            None,
-        ));
-    }
-    permit.consumed = true;
-    let startup_deadline = match SharedDeadline::after(START_TIMEOUT) {
-        Ok(deadline) => deadline,
-        Err(error) => {
-            return Err(start_failure(error, OwnedServiceStartStage::PreSpawn, None));
-        }
-    };
-    if prepared.route.verify_files().is_err() {
-        return Err(pre_spawn_failure(&prepared.route, &permit, false));
-    }
-    let plan_path = match materialize_launch(&prepared, startup_deadline) {
-        Ok(plan_path) => plan_path,
-        Err(failure) => {
-            return Err(pre_spawn_failure(
-                &prepared.route,
-                &permit,
-                failure.state_root_created,
-            ));
-        }
-    };
-    let executable = match std::env::current_exe() {
-        Ok(executable) => executable,
-        Err(_) => {
-            return Err(pre_spawn_failure(&prepared.route, &permit, true));
-        }
-    };
-    match startup_deadline.expired() {
-        Ok(false) => {}
-        Ok(true) => return Err(pre_spawn_failure(&prepared.route, &permit, true)),
-        Err(error) => {
-            return Err(start_failure(error, OwnedServiceStartStage::PreSpawn, None));
-        }
-    }
-    let child = AsyncCommand::new(executable)
-        .arg("owned-opencode-service")
-        .arg("--file")
-        .arg(&plan_path)
-        .env_clear()
-        .envs(safe_helper_environment())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(false)
-        .spawn()
-        .map_err(|error| {
-            // An OS spawn error is still an attempted effect. The process may
-            // have started even when the parent could not observe its handle.
-            start_failure(error.into(), OwnedServiceStartStage::HelperSpawn, None)
-        })?;
-    complete_foreground_start(
-        prepared,
-        child,
-        permit.provider_auth.take(),
-        startup_deadline,
-    )
-    .await
+    Err(start_failure(
+        native_harness_required(),
+        OwnedServiceStartStage::PreSpawn,
+        None,
+    ))
 }
 
 fn start_failure(
@@ -992,7 +735,6 @@ fn retain_helper_child(mut child: Child) {
 async fn complete_foreground_start(
     prepared: PreparedOwnedService,
     child: Child,
-    provider_auth_permit: Option<provider_auth::ProviderAuthPermit>,
     startup_deadline: SharedDeadline,
 ) -> std::result::Result<OwnedServiceHandle, OwnedServiceStartFailure> {
     let mut child = HelperChild::new(child);
@@ -1073,11 +815,10 @@ async fn complete_foreground_start(
             ));
         }
     };
-    let mut readback = match OwnedServiceReadback::from_route_value(
+    let readback = match OwnedServiceReadback::from_route_value(
         &value,
         &prepared.route,
         prepared.intent.owner_nonce(),
-        false,
     ) {
         Ok(readback) => readback,
         Err(error) => {
@@ -1157,94 +898,12 @@ async fn complete_foreground_start(
             child,
         ));
     }
-    match (prepared.provider_credential, provider_auth_permit) {
-        (Some(credential), Some(permit)) => {
-            let provider_scope = match provider_auth_scope(&prepared.route, &readback.proof) {
-                Ok(scope) => scope,
-                Err(error) => {
-                    return Err(start_failure_with_child(
-                        error,
-                        OwnedServiceStartStage::ProviderScope,
-                        Some(stdin),
-                        child,
-                    ));
-                }
-            };
-            let remaining = match startup_deadline.remaining() {
-                Ok(remaining) if !remaining.is_zero() => remaining,
-                Ok(_) => {
-                    return Err(start_failure_with_child(
-                        readback_error(
-                            "owned service startup deadline expired before provider bootstrap",
-                        ),
-                        OwnedServiceStartStage::Bootstrap,
-                        Some(stdin),
-                        child,
-                    ));
-                }
-                Err(error) => {
-                    return Err(start_failure_with_child(
-                        error,
-                        OwnedServiceStartStage::Bootstrap,
-                        Some(stdin),
-                        child,
-                    ));
-                }
-            };
-            let provider_proof = match timeout(
-                remaining,
-                provider_auth::bootstrap_once(&service, credential, permit, provider_scope),
-            )
-            .await
-            {
-                Ok(Ok(proof)) => proof,
-                Ok(Err(error)) => {
-                    return Err(start_failure_with_child(
-                        error,
-                        OwnedServiceStartStage::Bootstrap,
-                        Some(stdin),
-                        child,
-                    ));
-                }
-                Err(_) => {
-                    return Err(start_failure_with_child(
-                        readback_error(
-                            "owned service startup deadline expired during provider bootstrap",
-                        ),
-                        OwnedServiceStartStage::Bootstrap,
-                        Some(stdin),
-                        child,
-                    ));
-                }
-            };
-            readback = match readback.with_provider_auth(&prepared.route, provider_proof) {
-                Ok(readback) => readback,
-                Err(error) => {
-                    return Err(start_failure_with_child(
-                        error,
-                        OwnedServiceStartStage::ProviderProof,
-                        Some(stdin),
-                        child,
-                    ));
-                }
-            };
-        }
-        (None, None) => {}
-        _ => {
-            return Err(start_failure_with_child(
-                scope_error("provider credential and one-shot permission do not match"),
-                OwnedServiceStartStage::ProviderScope,
-                Some(stdin),
-                child,
-            ));
-        }
-    }
     match startup_deadline.expired() {
         Ok(false) => {}
         Ok(true) => {
             return Err(start_failure_with_child(
                 readback_error("owned service startup deadline expired before completion"),
-                OwnedServiceStartStage::ProviderProof,
+                OwnedServiceStartStage::ConnectOwned,
                 Some(stdin),
                 child,
             ));
@@ -1252,7 +911,7 @@ async fn complete_foreground_start(
         Err(error) => {
             return Err(start_failure_with_child(
                 error,
-                OwnedServiceStartStage::ProviderProof,
+                OwnedServiceStartStage::ConnectOwned,
                 Some(stdin),
                 child,
             ));
@@ -1342,7 +1001,7 @@ pub(crate) async fn readback_existing(
         }
         return Ok(None);
     };
-    let mut checked = OwnedServiceReadback::from_private_value(
+    let checked = OwnedServiceReadback::from_private_value(
         &readback.store_proof(),
         route,
         intent.owner_nonce(),
@@ -1372,14 +1031,6 @@ pub(crate) async fn readback_existing(
         checked.binary_sha256(),
         checked.birth_token(),
     )?;
-    if route.credential_ref().is_some() {
-        let auth_proof = provider_auth::verify_retained_connection(
-            &service,
-            provider_auth_scope(route, &checked.proof)?,
-        )
-        .await?;
-        checked = checked.with_provider_auth(route, auth_proof)?;
-    }
     if let Some(expected) = expected
         && model::canonical(&checked.store_proof())? != model::canonical(&expected.store_proof())?
     {
@@ -1406,15 +1057,12 @@ pub(crate) async fn readback_retained(
     let expected = OwnedServiceReadback::from_route_value(stored_proof, route, owner_nonce, true)?;
     let private_readback = read_owned_files(route)?
         .ok_or_else(|| readback_error("retained owned service owner is unavailable"))?;
-    let mut checked = OwnedServiceReadback::from_private_value(
+    let checked = OwnedServiceReadback::from_private_value(
         &private_readback.store_proof(),
         route,
         owner_nonce,
     )?;
-    let mut expected_base = expected.store_proof();
-    if let Some(object) = expected_base.as_object_mut() {
-        object.remove("provider_auth");
-    }
+    let expected_base = expected.store_proof();
     if model::canonical(&checked.store_proof())? != model::canonical(&expected_base)? {
         return Err(readback_error(
             "live owned service differs from its retained startup proof",
@@ -1437,20 +1085,6 @@ pub(crate) async fn readback_retained(
         checked.binary_sha256(),
     )
     .await?;
-    if route.credential_ref().is_some() {
-        let observed_auth = provider_auth::verify_retained_connection(
-            &service,
-            provider_auth_scope(route, &checked.proof)?,
-        )
-        .await?;
-        if model::canonical(&observed_auth)? != model::canonical(&expected.proof["provider_auth"])?
-        {
-            return Err(readback_error(
-                "live provider connection metadata differs from its retained proof",
-            ));
-        }
-        checked = checked.with_provider_auth(route, observed_auth)?;
-    }
     let identity = process_image_identity(pid)?;
     verify_process_identity(
         route,
@@ -1483,7 +1117,6 @@ struct HelperPlan {
     model: ModelRef,
     model_catalog: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    credential_ref: Option<String>,
     bun_executable: PathBuf,
     bun_sha256: String,
     server_program: PathBuf,
@@ -1555,7 +1188,6 @@ fn materialize_launch(
             version: VERSION.into(),
             model: route.model.clone(),
             model_catalog: route.model_catalog.clone(),
-            credential_ref: route.credential_ref.clone(),
             bun_executable: route.bun_executable.clone(),
             bun_sha256: route.bun_sha256.clone(),
             server_program: route.server_program.clone(),
@@ -3139,7 +2771,6 @@ fn read_owned_files(route: &OwnedServiceRoute) -> Result<Option<OwnedServiceRead
         version: VERSION.into(),
         model: route.model.clone(),
         model_catalog: route.model_catalog.clone(),
-        credential_ref: route.credential_ref.clone(),
         bun_executable: route.bun_executable.clone(),
         bun_sha256: route.bun_sha256.clone(),
         server_program: route.server_program.clone(),
@@ -3223,12 +2854,6 @@ fn validate_plan(plan: &HelperPlan, plan_path: &Path) -> Result<()> {
         || plan.model_catalog != "offline" && plan.model_catalog != "refresh"
         || !plan.model.valid()
         || plan
-            .credential_ref
-            .as_deref()
-            .is_some_and(|credential_ref| {
-                provider_auth::validate_ref(credential_ref).is_err()
-                    || provider_auth::validate_provider_id(&plan.model.provider_id).is_err()
-            })
         || !is_sha256(&plan.route_digest)
         || !is_sha256(&plan.config_digest)
         || !is_sha256(&plan.module_sha256)
@@ -3315,10 +2940,6 @@ fn route_digest_for_plan(plan: &HelperPlan) -> Result<String> {
         "port":plan.port,"owner_nonce":plan.owner_nonce,"workspace_directory":path_text(&plan.workspace_directory)?,
         "password_file":path_text(&plan.password_file)?,"connection_file":path_text(&plan.connection_file)?,"config_file":path_text(&plan.config_file)?,
     });
-    let mut value = value;
-    if let Some(credential_ref) = &plan.credential_ref {
-        value["credential_ref"] = json!(credential_ref);
-    }
     Ok(model::digest(model::canonical(&value)?.as_bytes()))
 }
 
@@ -3711,6 +3332,13 @@ fn write_private_new(path: &Path, body: &[u8]) -> Result<()> {
 fn config_error(message: &str) -> Error {
     Error::new("OWNED_SERVICE_CONFIG", message)
 }
+
+fn native_harness_required() -> Error {
+    Error::new(
+        "OWNED_SERVICE_NATIVE_HARNESS_REQUIRED",
+        "an already-running native OpenCode harness is required; fresh owned-service lifecycle is disabled",
+    )
+}
 fn scope_error(message: &str) -> Error {
     Error::new("OWNED_SERVICE_SCOPE", message)
 }
@@ -3931,7 +3559,6 @@ mod deadline_contract_tests {
                 variant: "explicit-test-variant".into(),
             },
             model_catalog: "offline".into(),
-            credential_ref: None,
             bun_sha256: hash_file(&bun_executable, 512 * 1024 * 1024).unwrap(),
             bun_executable,
             server_program_sha256: hash_file(&server_program, 512 * 1024).unwrap(),
@@ -3982,7 +3609,6 @@ mod deadline_contract_tests {
                 variant: "explicit-test-variant".into(),
             },
             model_catalog: "offline".into(),
-            credential_ref: None,
             bun_executable: PathBuf::new(),
             bun_sha256: String::new(),
             server_program: PathBuf::new(),
@@ -4040,7 +3666,6 @@ mod deadline_contract_tests {
                     variant: "fixture".into(),
                 },
                 model_catalog: model_catalog.into(),
-                credential_ref: None,
                 bun_executable: directory.path().join("bun.exe"),
                 bun_sha256: "a".repeat(64),
                 server_program: directory.path().join("serve.mjs"),
@@ -4136,7 +3761,7 @@ mod deadline_contract_tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(deadline.expired().unwrap());
 
-        let failure = complete_foreground_start(prepared, child, None, deadline)
+        let failure = complete_foreground_start(prepared, child, deadline)
             .await
             .err();
         let Some(OwnedServiceStartFailure::Unknown {
@@ -4170,7 +3795,6 @@ mod deadline_contract_tests {
         let startup = complete_foreground_start(
             prepared,
             child,
-            None,
             SharedDeadline::after(Duration::from_secs(5)).unwrap(),
         );
         assert!(
