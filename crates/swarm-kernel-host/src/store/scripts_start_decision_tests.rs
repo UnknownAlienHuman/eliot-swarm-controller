@@ -55,6 +55,7 @@ struct SourceWorkerCleanup {
     work: crate::scripts::runner::Work,
     data_dir: PathBuf,
     run_dir: PathBuf,
+    terminal_settlement_confirmed: bool,
     armed: bool,
 }
 
@@ -62,6 +63,34 @@ struct SourceWorkerCleanup {
 impl SourceWorkerCleanup {
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    fn confirm_terminal_settlement(
+        &mut self,
+        run_id: &str,
+        operation_id: &str,
+        operation_state: &str,
+        run_state: &str,
+        diagnostic: Option<&str>,
+    ) -> bool {
+        if run_id != self.work.run_id
+            || operation_id != self.work.operation_id
+            || operation_state != "settled"
+            || run_state != "completed"
+            || diagnostic.is_some()
+        {
+            return false;
+        }
+        self.terminal_settlement_confirmed = true;
+        true
+    }
+
+    fn release_after_terminal(&self) -> crate::error::Result<bool> {
+        if !self.terminal_settlement_confirmed {
+            return Ok(false);
+        }
+        self.custody
+            .release_after_terminal(&self.work.run_id, &self.work.operation_id)
     }
 }
 
@@ -71,7 +100,16 @@ impl Drop for SourceWorkerCleanup {
         if !self.armed {
             return;
         }
-        let _ = crate::scripts::runner::allow(&self.work);
+        if !self.terminal_settlement_confirmed {
+            eprintln!(
+                "source-worker fixture preserves unconfirmed custody at {}",
+                self.data_dir.display()
+            );
+            // Keep the shared owner map and its Child alive if this fixture exits
+            // before observing the exact Store terminal projection.
+            std::mem::forget(self.custody.clone());
+            return;
+        }
         let completion_path = self.run_dir.join("completion.json");
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut released = false;
@@ -82,12 +120,7 @@ impl Drop for SourceWorkerCleanup {
                 .ok()
                 .flatten()
                 == Some(true);
-            if exited
-                && completion_path.is_file()
-                && self
-                    .custody
-                    .release_after_terminal(&self.work.run_id, &self.work.operation_id)
-                    .unwrap_or(false)
+            if exited && completion_path.is_file() && self.release_after_terminal().unwrap_or(false)
             {
                 released = true;
                 break;
@@ -104,6 +137,7 @@ impl Drop for SourceWorkerCleanup {
                 "source-worker fixture preserves unconfirmed custody at {}",
                 self.data_dir.display()
             );
+            std::mem::forget(self.custody.clone());
         }
     }
 }
@@ -313,6 +347,7 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
         work: work.clone(),
         data_dir: data_dir.clone(),
         run_dir: run_dir.clone(),
+        terminal_settlement_confirmed: false,
         armed: true,
     };
 
@@ -791,6 +826,7 @@ $result = [ordered]@{
             work: work.clone(),
             data_dir: data_dir.clone(),
             run_dir: run_dir.clone(),
+            terminal_settlement_confirmed: false,
             armed: true,
         };
         assert_eq!(
@@ -983,6 +1019,50 @@ $result = [ordered]@{
             ["started"],
             "the real interpreter starts once across failed and recovered reconciliation"
         );
+
+        let worker_exit_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match custody.exit_observed(&run_id, &operation_id).unwrap() {
+                Some(true) => break,
+                Some(false) => {
+                    assert!(
+                        Instant::now() < worker_exit_deadline,
+                        "completed source worker departs while Store custody remains"
+                    );
+                    let _ = custody.poll_active_children(true);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                None => panic!("Store released the source worker before terminal settlement"),
+            }
+        }
+        let (operation_state, run_state, diagnostic, retained_identity) =
+            stored_state(&owner.store, &run_id, &operation_id).await;
+        assert_eq!(operation_state, "native_accepted");
+        assert_eq!(run_state, "running");
+        assert_eq!(retained_identity, identity_json);
+        assert!(
+            !cleanup.confirm_terminal_settlement(
+                &run_id,
+                &operation_id,
+                &operation_state,
+                &run_state,
+                diagnostic.as_deref(),
+            ),
+            "worker exit and completion bytes do not prove Store terminal settlement"
+        );
+        assert!(
+            !cleanup
+                .release_after_terminal()
+                .expect("unsettled ScriptRun keeps Store-owned custody"),
+            "cleanup cannot release a completed worker before reconciliation settles its rows"
+        );
+        assert_eq!(
+            custody.exit_observed(&run_id, &operation_id).unwrap(),
+            Some(true),
+            "the exact exited worker remains in custody until terminal projection"
+        );
+        assert!(data_dir.exists(), "unsettled evidence remains on disk");
+
         let settlement_deadline = Instant::now() + Duration::from_secs(10);
         loop {
             clear_single_subject_cursor(&owner.store).await;
@@ -994,6 +1074,16 @@ $result = [ordered]@{
             let (operation_state, run_state, diagnostic, _) =
                 stored_state(&owner.store, &run_id, &operation_id).await;
             if operation_state == "settled" && run_state == "completed" {
+                assert!(
+                    cleanup.confirm_terminal_settlement(
+                        &run_id,
+                        &operation_id,
+                        &operation_state,
+                        &run_state,
+                        diagnostic.as_deref(),
+                    ),
+                    "only the exact clean terminal Operation/ScriptRun projection permits release"
+                );
                 break;
             }
             assert!(
@@ -1007,8 +1097,8 @@ $result = [ordered]@{
         match custody.exit_observed(&run_id, &operation_id).unwrap() {
             None => cleanup.disarm(),
             Some(true) => assert!(
-                custody
-                    .release_after_terminal(&run_id, &operation_id)
+                cleanup
+                    .release_after_terminal()
                     .expect("release terminal worker after confirmed family departure")
             ),
             Some(false) => panic!("terminal ScriptRun still has a live Store-owned worker"),
