@@ -1086,6 +1086,7 @@ jobs:
             Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "ScriptWorker SHA-256: $workerHash"
             foreach ($case in @(
               'reusable_admission_requires_current_accepted_original_process_and_intact_outputs',
+              'public_check_run_consumes_a_healthy_native_child_receipt',
               'r48_owner_lost_store_results_hold_intent_and_process_capacity',
               'r48_owner_stale_callbacks_keep_old_receipt_out_of_current_host_status',
               'pr71_a2_pid_unavailable_keeps_exact_child_custody',
