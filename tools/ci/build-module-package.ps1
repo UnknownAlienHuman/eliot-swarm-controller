@@ -66,6 +66,34 @@ function Invoke-NativeText([string] $File, [string[]] $Arguments) {
     return $text.Trim()
 }
 
+function Invoke-NativeStdout([string] $File, [string[]] $Arguments) {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = (Get-Command $File -CommandType Application -ErrorAction Stop).Source
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add($argument) }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw "$File did not start." }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $outputText = $stdout.GetAwaiter().GetResult()
+        $errorText = $stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            throw ($File + ' failed with exit code ' + $process.ExitCode +
+                [Environment]::NewLine + $errorText + $outputText)
+        }
+        if (-not [string]::IsNullOrEmpty($errorText)) { [Console]::Error.Write($errorText) }
+        return $outputText.Trim()
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Assert-CleanCheckout([string] $Root, [string] $When) {
     $status = Invoke-NativeText 'git' @(
         '-C', $Root, 'status', '--porcelain=v1', '--untracked-files=all'
@@ -330,7 +358,7 @@ if (-not ([IO.Path]::GetFullPath($reportedRoot)).Equals(
 
 Push-Location $repoRoot
 try {
-    $metadataText = Invoke-NativeText 'cargo' @(
+    $metadataText = Invoke-NativeStdout 'cargo' @(
         'metadata', '--locked', '--format-version', '1'
     )
 } finally {

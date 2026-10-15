@@ -126,6 +126,11 @@ jobs:
         run: |
           & pwsh -NoProfile -File tools/ci/package-scope.ps1 -Stage ValidateTooling -BaseSha $env:BASE_SHA -HeadSha $env:HEAD_SHA
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native JSON stdout remains separate from diagnostics
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tools/ci/Test-NativeJsonOutput.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Rustfmt attribution classifier self-test
         shell: pwsh
         run: |
