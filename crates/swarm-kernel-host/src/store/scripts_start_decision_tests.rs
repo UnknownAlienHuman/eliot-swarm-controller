@@ -45,6 +45,7 @@ impl Drop for SourceWorkerCleanup {
         let _ = crate::scripts::runner::allow(&self.work);
         let completion_path = self.run_dir.join("completion.json");
         let deadline = Instant::now() + Duration::from_secs(20);
+        let mut released = false;
         loop {
             let exited = self
                 .custody
@@ -52,21 +53,29 @@ impl Drop for SourceWorkerCleanup {
                 .ok()
                 .flatten()
                 == Some(true);
-            if exited && completion_path.is_file() {
-                if self
+            if exited
+                && completion_path.is_file()
+                && self
                     .custody
                     .release_after_terminal(&self.work.run_id, &self.work.operation_id)
                     .unwrap_or(false)
-                {
-                    break;
-                }
+            {
+                released = true;
+                break;
             }
             if Instant::now() >= deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(25));
         }
-        let _ = fs::remove_dir_all(&self.data_dir);
+        if released {
+            let _ = fs::remove_dir_all(&self.data_dir);
+        } else {
+            eprintln!(
+                "source-worker fixture preserves unconfirmed custody at {}",
+                self.data_dir.display()
+            );
+        }
     }
 }
 
@@ -166,7 +175,8 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&root).expect("create isolated Store data root");
-    let _directory_cleanup = FixtureDirectory(root.clone());
+    // A failed native fixture must preserve its files until its exact family
+    // has departed. SourceWorkerCleanup owns cleanup after the spawn seam.
     let data_root = DataRoot::acquire(&root).expect("acquire the fixture Store root");
     let data_dir = data_root.path.clone();
     let credential = bootstrap_credential(&data_dir).expect("bootstrap fixture Operator");
@@ -319,7 +329,7 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
         }
     );
     let retained_worker =
-        fs::read(&run_dir.join("worker.json")).expect("read actual Worker ABI receipt");
+        fs::read(run_dir.join("worker.json")).expect("read actual Worker ABI receipt");
 
     let barrier_path = decision_path.clone();
     let allow_work = work.clone();
@@ -356,7 +366,7 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
     assert!(!marker_path.exists());
     assert_eq!(fs::read(&decision_path).unwrap(), visible_bytes);
     assert_eq!(
-        fs::read(&run_dir.join("worker.json")).unwrap(),
+        fs::read(run_dir.join("worker.json")).unwrap(),
         retained_worker
     );
     assert_eq!(
@@ -479,4 +489,5 @@ async fn store_source_worker_waits_for_durable_allow_and_runs_once_after_recover
         .close()
         .await
         .expect("close Store after worker family departure");
+    fs::remove_dir_all(data_dir).expect("remove fixture only after confirmed family departure");
 }

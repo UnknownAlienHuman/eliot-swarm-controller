@@ -36,7 +36,7 @@ on:
         description: Qualification scope
         type: choice
         default: full
-        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git]
+        options: [full, focused-recovery, focused-store, focused-publication, focused-isolation, focused-authority-release, focused-access, focused-legacy-host, focused-reconcile-boundaries, focused-runtime-remainders, focused-catalog, focused-operation, focused-start-decision, focused-probe, focused-workspace-git, focused-delivery]
 permissions:
   contents: read
 jobs:
@@ -896,6 +896,37 @@ jobs:
               'execution_paths_for_layout_selects_exact_legacy_and_compact_paths'
             )) {
               Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+          } elseif ($env:QUALIFICATION -ceq 'focused-delivery') {
+            & cargo build --locked --package swarm-script-worker --bin swarm-script-worker --target-dir $targetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $workerName = if ($IsWindows) { 'swarm-script-worker.exe' } else { 'swarm-script-worker' }
+            $worker = Join-Path (Join-Path $targetDir 'debug') $workerName
+            $deps = Join-Path $targetDir 'debug/deps'
+            [void][IO.Directory]::CreateDirectory($deps)
+            $stagedWorker = Join-Path $deps $workerName
+            [IO.File]::Copy($worker, $stagedWorker, $false)
+            $workerHash = (Get-FileHash -LiteralPath $worker -Algorithm SHA256).Hash
+            if ((Get-FileHash -LiteralPath $stagedWorker -Algorithm SHA256).Hash -cne $workerHash) {
+              throw 'Staged ScriptWorker differs from the binary built at the recorded source.'
+            }
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "ScriptWorker SHA-256: $workerHash"
+            foreach ($case in @(
+              'healthy_independent_resolve_check_plan_snapshots_overlap_during_external_probe',
+              'store_retained_unknown_scope_blocks_independent_preflight_until_exact_departure',
+              'reusable_admission_requires_current_accepted_original_process_and_intact_outputs',
+              'store_source_worker_waits_for_durable_allow_and_runs_once_after_recovery',
+              'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace'
+            )) {
+              Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+            }
+            if ($IsWindows) {
+              foreach ($case in @(
+                'windows_owned_workspace_directory_preserves_strict_acl_validation',
+                'normalized_git_image_rejects_a_different_regular_file_before_spawn'
+              )) {
+                Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter $case -Expected 1 -ExpectedNames @($case)
+              }
             }
           } elseif ($env:QUALIFICATION -ceq 'focused-workspace-git') {
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace' -Expected 1 -ExpectedNames @('work_dispatch_rechecks_root_admission_after_committing_a_verified_workspace')
