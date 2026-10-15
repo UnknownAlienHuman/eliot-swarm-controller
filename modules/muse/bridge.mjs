@@ -378,6 +378,38 @@ function sessionChanged(sessionId, reason = 'native_event_after_read') {
   sessionVersions.set(sessionId, (sessionVersions.get(sessionId)??0)+1);
   invalidateChildSnapshot(sessionId, reason);
 }
+function workFenceMatchesSession(fence, session) {
+  return session?.sessionId===fence.rootId
+    && session.modelId===fence.modelId
+    && session.providerId===fence.providerId
+    && session.status===fence.status
+    && session.activeTurnId===fence.activeTurnId;
+}
+function workFenceCurrent(fence, entry, eventVersion=fence.eventVersion) {
+  return rootId===fence.rootId
+    && entry.command.native_root_id===fence.rootId
+    && entry.params?.sessionId===fence.rootId
+    && (sessionVersions.get(fence.rootId)??0)===eventVersion
+    && routeDefaults.modelId===fence.modelId
+    && (routeDefaults.providerId===undefined || routeDefaults.providerId===fence.providerId);
+}
+async function readWorkFence(modelChangedCode) {
+  const sessionId=rootId;
+  if(!sessionId)throw new NativeCompatibilityError('NATIVE_ROOT_IDENTITY_UNAVAILABLE');
+  const eventVersion=sessionVersions.get(sessionId)??0;
+  const read=await readNativeSession(sessionId);
+  if(rootId!==sessionId || read.session.sessionId!==sessionId
+      || eventVersion!==(sessionVersions.get(sessionId)??0))
+    throw new NativeCompatibilityError('NATIVE_WORK_SNAPSHOT_CHANGED_DURING_READ');
+  if(!modelMatches(read.session,routeDefaults))throw new NativeCompatibilityError(modelChangedCode);
+  return {rootId:sessionId,eventVersion,modelId:read.session.modelId,providerId:read.session.providerId,
+    status:read.session.status,activeTurnId:read.session.activeTurnId};
+}
+function rejectWorkFence(entry, code) {
+  entry.workFenceRejected=true;
+  entry.workFenceRejectionCode=code;
+  changed();
+}
 function beginNativeUsageConnection() {
   nativeUsageConnectionId=randomUUID();
   nativeUsageGeneration=1;
@@ -807,11 +839,19 @@ async function completeNative(entry, ack) {
   }
 }
 
-async function submitNative(command, method, params, kind, setting, taskPrompt, beforeNativeRequest) {
-  const entry = {command,id:commandId(command),method,params,kind,setting,taskPrompt,ack:null,resolved:false,submission_boot_id:bootId};
+async function submitNative(command, method, params, kind, setting, taskPrompt, beforeNativeRequest, workFence) {
+  const entry = {command,id:commandId(command),method,params,kind,setting,taskPrompt,ack:null,resolved:false,
+    submission_boot_id:bootId,...(workFence?{workFence}:{})};
   nativePending.set(command.operation_id, entry);
   await checkpoint(true); // Native mutation must not precede its recoverable ID/payload.
-  beforeNativeRequest?.();
+  try { beforeNativeRequest?.(entry); }
+  catch(error) {
+    if(workFence) {
+      rejectWorkFence(entry,diagnosticCode(error,'NATIVE_WORK_SNAPSHOT_CHANGED_BEFORE_REQUEST'));
+      await checkpoint(true);
+    }
+    throw error;
+  }
   const ack = await msp.connection.command(method, params, {maxAttempts:1,commandId:entry.id});
   await completeNative(entry, ack);
 }
@@ -825,11 +865,30 @@ async function reconcileNative(target) {
     await completeNative(entry,entry.ack);
     return {target_operation_id:target,disposition:entry.resolved?'resolved':'pending_application',resubmitted:false};
   }
+  // This durable fact means the stored intent never reached MSP. Preserve it
+  // for inspection, but do not turn explicit reconciliation into a new send.
+  if(entry.workFenceRejected)return {target_operation_id:target,disposition:'work_fence_rejected_before_native_request',
+    resubmitted:false,diagnostic_code:entry.workFenceRejectionCode??'NATIVE_WORK_SNAPSHOT_CHANGED_BEFORE_REQUEST'};
   if(entry.method==='session/resume'&&latest.host_durability?.profile!=='durable')
     throw new NativeCompatibilityError(sessionResumeUnavailableCode());
   // This is an explicit reconciliation command, not a read-only healthcheck.
   // SDK/server idempotency joins the SAME command ID with byte-equivalent params.
   try {
+    if(entry.workFence) {
+      const fence=entry.workFence;
+      const eventVersion=sessionVersions.get(fence.rootId)??0;
+      const read=await readNativeSession(fence.rootId);
+      const snapshotMatches=workFenceMatchesSession(fence,read.session)
+        && modelMatches(read.session,routeDefaults);
+      // The read above yielded; recheck its event version immediately before
+      // the exact same-ID request, including on a recovered pending entry.
+      if(!snapshotMatches || !workFenceCurrent(fence,entry,eventVersion)) {
+        rejectWorkFence(entry,'NATIVE_WORK_SNAPSHOT_CHANGED_BEFORE_RECONCILIATION');
+        await checkpoint(true);
+        return {target_operation_id:target,disposition:'work_fence_rejected_before_native_request',resubmitted:false,
+          diagnostic_code:entry.workFenceRejectionCode};
+      }
+    }
     const ack = await msp.connection.command(entry.method, entry.params, {maxAttempts:1,commandId:entry.id});
     await completeNative(entry, ack);
   } catch (error) {
@@ -1028,14 +1087,16 @@ async function execute(command) {
       const p=command.input;
       if (command.method==='task.dispatch' || command.method==='agent.send') {
         const taskPrompt=command.method==='task.dispatch'?taskPromptFor(command):undefined;
-        const observed=await readNativeSession(rootId);
-        if(!modelMatches(observed.session,routeDefaults))throw new Error('MODEL_CHANGED_BEFORE_SEND');
+        const workFence=await readWorkFence('MODEL_CHANGED_BEFORE_SEND');
         const steer=p.delivery==='steer';
         const promptText=taskPrompt?taskPrompt.envelope.prompt:required(p,'text');
         const input={sessionId:rootId,input:[{type:'text',text:promptText}],reasoningEffort:routeDefaults.reasoningEffort};
         if(steer)input.expectedTurnId=required(p,'expected_turn_id');else input.ifBusy='queue';
-        nativeAdmissionPossible=true;
-        await submitNative(command,steer?'turn/steer':'turn/start',input,'input',undefined,taskPrompt);
+        await submitNative(command,steer?'turn/steer':'turn/start',input,'input',undefined,taskPrompt,entry=>{
+          if(!workFenceCurrent(workFence,entry))
+            throw new NativeCompatibilityError('NATIVE_WORK_SNAPSHOT_CHANGED_BEFORE_REQUEST');
+          nativeAdmissionPossible=true;
+        },workFence);
         return;
       } else if(command.method==='agent.reply') {
         const r=p.reply;
@@ -1053,13 +1114,17 @@ async function execute(command) {
         return;
       } else if (command.method === 'agent.goal') {
         const goal = goalCommand(p,rootId);
+        let workFence,beforeNativeRequest;
         if (goal.startsWork) {
           if (standingEffort !== routeDefaults.reasoningEffort) throw new Error('CONFIGURE_STANDING_EFFORT_BEFORE_GOAL');
-          const read = await readNativeSession(rootId);
-          if (!modelMatches(read.session,routeDefaults)) throw new Error('MODEL_CHANGED_BEFORE_GOAL');
-        }
-        nativeAdmissionPossible = true;
-        await submitNative(command,goal.method,goal.params,'goal');
+          workFence=await readWorkFence('MODEL_CHANGED_BEFORE_GOAL');
+          beforeNativeRequest=entry=>{
+            if(!workFenceCurrent(workFence,entry))
+              throw new NativeCompatibilityError('NATIVE_WORK_SNAPSHOT_CHANGED_BEFORE_REQUEST');
+            nativeAdmissionPossible=true;
+          };
+        } else nativeAdmissionPossible = true;
+        await submitNative(command,goal.method,goal.params,'goal',undefined,undefined,beforeNativeRequest,workFence);
         return;
       } else if (command.method === 'agent.result') {
         const page = await readResult(msp.connection,p,id=>id===rootId || children.has(id));

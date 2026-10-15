@@ -14,7 +14,7 @@ import net from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   commandIdFor, durabilityProfile, gapFillObservation, hostDeathObservation,
   failedReconcileOutcome,
@@ -847,5 +847,389 @@ process.stdin.on('end',()=>process.exit(0));
   }
   console.log('PASS ephemeral session-list fixture: unsupported readback rejects before native input or replay record');
 }
+
+// 8. Work-starting commands keep the exact session snapshot current across
+// preflight and durable submission. These are actual bridge subprocesses
+// against an account-free local MSP fixture, never a live model/session.
+async function runWorkFenceCase(scenario) {
+  const dir=await mkdtemp(path.join(os.tmpdir(),`muse-work-fence-${scenario}-`));
+  const stateDir=path.join(dir,'state');
+  const home=path.join(dir,'native-home');
+  await mkdir(stateDir);await mkdir(home);
+  const ownerFile=path.join(stateDir,'owner.json');
+  await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token:`fixture-work-fence-${scenario}`}));
+  const nativeScript=path.join(dir,'fake-native.mjs');
+  const gateScript=path.join(dir,'checkpoint-gate.mjs');
+  const fixturePath=path.join(dir,'native-fixture.json');
+  const auditPath=path.join(dir,'native-audit.json');
+  const gateSignal=path.join(dir,'checkpoint-durable.signal');
+  const gateRelease=path.join(dir,'checkpoint-gate.release');
+  const sessionId=`ses_work_fence_${scenario}`;
+  const identities={baseline:['000000000001','000000000002','000000000003'],
+    'read-race':['000000000011','000000000013','000000000012'],
+    'checkpoint-race':['000000000021','000000000022','000000000023'],
+    'goal-checkpoint-race':['000000000031','000000000033','000000000032']}[scenario];
+  if(!identities)throw new Error('UNKNOWN_WORK_FENCE_FIXTURE');
+  const isGoal=scenario==='read-race'||scenario==='goal-checkpoint-race';
+  const isCheckpointRace=scenario==='checkpoint-race'||scenario==='goal-checkpoint-race';
+  const openId=`60000000-0000-4000-8000-${identities[0]}`;
+  const workId=`60000000-0000-4000-8000-${identities[1]}`;
+  const configureId=`60000000-0000-4000-8000-${identities[2]}`;
+  const reconcileId='60000000-0000-4000-8000-000000000023';
+  const openAt=AT_MS+100,configureAt=AT_MS+101,workAt=AT_MS+102,reconcileAt=AT_MS+103;
+  const sentText=`fixture-only-${scenario}-payload`;
+  function command(operationId,createdAtMs,method,input,routeExtra={}) {
+    const inputSha256=createHash('sha256').update(canonicalFixtureJson(input),'utf8').digest('hex');
+    return {operation_id:operationId,created_at_ms:createdAtMs,method,binding_id:'fixture-binding',generation:1,
+      native_root_id:sessionId,route:{runtime:'muse',module_artifact_id:museDescriptor.artifact.artifact_id,...routeExtra},
+      input_sha256:inputSha256,input};
+  }
+  const openCommand=command(openId,openAt,'agent.open',{},
+    {native_options:{workspaceRoot:home,modelId:'fixture-model',providerId:'fixture-provider',reasoningEffort:'max'}});
+  const configureCommand=command(configureId,configureAt,'agent.configure',{settings:{reasoningEffort:'max'}});
+  const workCommand=isGoal
+    ?command(workId,workAt,'agent.goal',{action:'set',objective:'fixture goal must stay fenced'})
+    :command(workId,workAt,'agent.send',{delivery:'next_turn',text:sentText});
+  const reconcileCommand=command(reconcileId,reconcileAt,'agent.reconcile',{operation_id:workId});
+  const fixture={scenario,sessionId,home,auditPath,gateSignal,gateRelease,workId,
+    workMethod:workCommand.method,workText:sentText};
+  await writeFile(fixturePath,JSON.stringify(fixture));
+  await writeFile(nativeScript,String.raw`
+import { access, readFile, writeFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
+const arg=name=>{const i=process.argv.indexOf(name);return i<0?null:process.argv[i+1]};
+const home=arg('--home'),auditPath=arg('--audit'),fixturePath=arg('--fixtures');
+const fixture=JSON.parse(await readFile(fixturePath,'utf8'));
+const session={sessionId:fixture.sessionId,status:'idle',activeTurnId:null,modelId:'fixture-model',
+  providerId:'fixture-provider',turnCount:0,workspaceRoot:home};
+const audit={methods:[],session_start_params:null,session_list_count:0,session_list_params:null,
+  listed_session:null,session_read_count:0,session_resume_count:0,session_set_effort_count:0,
+  model_changed_notifications:0,checkpoint_gate_released:false,turn_start_count:0,turn_steer_count:0,
+  goal_set_count:0,goal_edit_count:0,goal_resume_count:0,turn_start_params:null,goal_set_params:null};
+const save=()=>writeFile(auditPath,JSON.stringify(audit));
+const send=frame=>process.stdout.write(JSON.stringify(frame)+'\n');
+const respond=(id,result,error,after)=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id,...(error?{error}:{result})})+'\n',()=>after?.());
+const sourceRange=(id,sequence)=>({first:{id,sequence},last:{id,sequence},stream:{id:fixture.sessionId,kind:'session'}});
+function modelChanged(){
+  audit.model_changed_notifications++;
+  return {jsonrpc:'2.0',method:'session/modelChanged',params:{sessionId:fixture.sessionId,
+    modelId:'changed-model',providerId:'changed-provider',source:'user',sourceRange:sourceRange('fixture_model_change',2),
+    viewCursor:'cursor_fixture_model_change'}};
+}
+function effortChanged(){
+  return {jsonrpc:'2.0',method:'session/reasoningEffortChanged',params:{sessionId:fixture.sessionId,
+    reasoningEffort:'max',source:'user',sourceRange:sourceRange('fixture_effort_change',1),
+    viewCursor:'cursor_fixture_effort_change'}};
+}
+const responseWaiters=new Map();
+function waitForResponse(id){return new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>{responseWaiters.delete(id);reject(new Error('CHECKPOINT_GATE_REQUEST_TIMEOUT'));},10000);
+  responseWaiters.set(id,frame=>{clearTimeout(timer);resolve(frame);});
+});}
+async function waitForFile(filename){
+  const deadline=Date.now()+10000;
+  while(Date.now()<deadline){
+    try{await access(filename);return;}
+    catch(error){if(error?.code!=='ENOENT')throw error;await delay(1);}
+  }
+  throw new Error('CHECKPOINT_GATE_SIGNAL_TIMEOUT');
+}
+async function checkpointRace(){
+  await waitForFile(fixture.gateSignal);
+  send(modelChanged());
+  const requestId=9001;
+  const ack=waitForResponse(requestId);
+  send({jsonrpc:'2.0',id:requestId,method:'approval/request',params:{
+    approvalId:'approval_checkpoint_fence_fixture',
+    availableChoices:[{choiceId:'allow-once',decision:'approved',label:'Allow once',scope:'once'}],
+    currentRequirementId:{approvalId:'approval_checkpoint_fence_fixture',sourceIndex:0},
+    itemId:'item_checkpoint_fence_fixture',judgeEscalated:false,protectedWrite:false,rawArgs:'',
+    sessionId:fixture.sessionId,
+    sourceRange:sourceRange('fixture_checkpoint_request',3),
+    subject:{kind:'tool',toolName:'fixture'},taskId:'task_checkpoint_fence_fixture',
+    toolCallId:'tool_checkpoint_fence_fixture',toolName:'fixture',turnId:'turn_checkpoint_fence_fixture',
+    viewCursor:'cursor_checkpoint_fence_fixture'}});
+  await ack;
+  await writeFile(fixture.gateRelease,'release');
+  audit.checkpoint_gate_released=true;await save();
+}
+async function handle(frame){
+  if(typeof frame.method!=='string'){
+    const resolve=responseWaiters.get(frame.id);
+    if(resolve){responseWaiters.delete(frame.id);resolve(frame);}
+    return;
+  }
+  if(!Object.hasOwn(frame,'id'))return;
+  audit.methods.push(frame.method);
+  if(frame.method==='initialize'){
+    await save();respond(frame.id,{museHome:home,serverInfo:{name:'fixture-muse',version:'1.4.0'},
+      schema:{fingerprint:'fixture-schema'},sessionDurability:'ephemeral',grantedCapabilities:[]});return;
+  }
+  if(frame.method==='usage/read'){
+    await save();respond(frame.id,null,{code:-32601,message:'Method not found',data:{kind:'methodNotFound'}});return;
+  }
+  if(frame.method==='session/start'){
+    audit.session_start_params=frame.params;await save();respond(frame.id,{session});return;
+  }
+  if(frame.method==='session/list'){
+    audit.session_list_count++;audit.session_list_params=frame.params;
+    audit.listed_session={sessionId:session.sessionId,modelId:session.modelId,providerId:session.providerId,
+      status:session.status,activeTurnId:session.activeTurnId};
+    await save();
+    if(fixture.scenario==='read-race'){send(modelChanged());await save();}
+    const after=fixture.scenario.endsWith('checkpoint-race')?()=>{void checkpointRace().catch(()=>process.exit(2));}:undefined;
+    respond(frame.id,{sessions:[session],nextCursor:null},undefined,after);return;
+  }
+  if(frame.method==='session/read')audit.session_read_count++;
+  if(frame.method==='session/resume')audit.session_resume_count++;
+  if(frame.method==='session/setReasoningEffort'){
+    audit.session_set_effort_count++;await save();send(effortChanged());
+    respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
+  }
+  if(frame.method==='turn/start'){
+    audit.turn_start_count++;audit.turn_start_params=frame.params;await save();
+    respond(frame.id,{commandId:frame.params.commandId,status:'accepted',turnId:'turn_fixture_started'});return;
+  }
+  if(frame.method==='turn/steer'){
+    audit.turn_steer_count++;await save();
+    respond(frame.id,{commandId:frame.params.commandId,status:'accepted',turnId:'turn_fixture_steered'});return;
+  }
+  if(frame.method==='goal/set'){
+    audit.goal_set_count++;audit.goal_set_params=frame.params;await save();
+    respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
+  }
+  if(frame.method==='goal/edit'){
+    audit.goal_edit_count++;await save();respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
+  }
+  if(frame.method==='goal/resume'){
+    audit.goal_resume_count++;await save();respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
+  }
+  if(frame.method==='approval/listPending'){await save();respond(frame.id,{approvals:[],userInputs:[]});return;}
+  await save();respond(frame.id,{});
+}
+process.stdin.setEncoding('utf8');
+let buffer='';
+process.stdin.on('data',chunk=>{
+  buffer+=chunk;let end;
+  while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;
+    try{void handle(JSON.parse(line)).catch(()=>process.exit(2));}catch{process.exit(2);}}
+});
+process.stdin.on('end',()=>process.exit(0));
+`);
+  if(isCheckpointRace)await writeFile(gateScript,String.raw`
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+const require=createRequire(import.meta.url);
+const fs=require('node:fs/promises');
+const originalRename=fs.rename;
+const checkpointPath=path.resolve(process.env.MUSE_FIXTURE_CHECKPOINT_PATH);
+const targetOperation=process.env.MUSE_FIXTURE_CHECKPOINT_OPERATION;
+let gateUsed=false;
+fs.rename=async (from,to)=>{
+  const result=await originalRename(from,to);
+  if(!gateUsed&&path.resolve(String(to))===checkpointPath){
+    let checkpoint;
+    try{checkpoint=JSON.parse(await fs.readFile(checkpointPath,'utf8'));}catch{return result;}
+    if(checkpoint.native_pending?.some(([id])=>id===targetOperation)){
+      gateUsed=true;
+      await fs.writeFile(process.env.MUSE_FIXTURE_GATE_SIGNAL,'durable');
+      const release=process.env.MUSE_FIXTURE_GATE_RELEASE;
+      const deadline=Date.now()+10000;
+      while(Date.now()<deadline){
+        try{await fs.access(release);return result;}
+        catch(error){if(error?.code!=='ENOENT')throw error;await delay(1);}
+      }
+      throw new Error('CHECKPOINT_GATE_RELEASE_TIMEOUT');
+    }
+  }
+  return result;
+};
+syncBuiltinESMExports();
+`);
+  const endpoint=process.platform==='win32'?`\\\\.\\pipe\\muse-work-fence-${scenario}-${randomUUID()}`:path.join(dir,'control.sock');
+  const sockets=new Set(),outcomes=new Map(),commands=[openCommand];
+  let workOutcomeCount=0,reconcileOutcomeCount=0,deferredWorkAck=null,reconcileCommandDelivered=false;
+  let finishedResolve,finishedReject,bridge,stderr='',teardownStarted=false,closed,closeResult;
+  let checkpointAtWorkOutcome;
+  const finished=new Promise((resolve,reject)=>{finishedResolve=resolve;finishedReject=reject;});
+  const server=net.createServer(socket=>{
+    sockets.add(socket);socket.setEncoding('utf8');let buffer='';
+    socket.on('close',()=>sockets.delete(socket));
+    socket.on('error',error=>{if(teardownStarted&&error?.code==='ECONNRESET')return;
+      finishedReject(new Error(`work-fence fixture socket: ${error?.code??error?.message??error}`));});
+    socket.on('data',chunk=>{
+      buffer+=chunk;let end;
+      while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;
+        let packet;try{packet=JSON.parse(line);}catch{finishedReject(new Error('work-fence fixture received invalid JSON'));return;}
+        void respondHost(socket,packet).catch(finishedReject);
+      }
+    });
+  });
+  function reply(socket,packet,result={}) {
+    socket.write(JSON.stringify({jsonrpc:'2.0',id:packet.id,result})+'\n');
+  }
+  async function respondHost(socket,packet) {
+    let result={};
+    if(packet.method==='client.hello')result={client_id:'muse-fixture-client'};
+    else if(packet.method==='module.hello'){
+      assert.deepEqual(packet.params.module_contract,museModuleContractClaim);
+      result={binding_id:'fixture-binding',generation:1,recovery_required:false,native_root_id:null,native_scope_key:null,
+        module_contract_negotiation:museModuleContractNegotiation};
+    } else if(packet.method==='module.next') {
+      if(!commands.length)await delay(10);
+      if(commands.length){
+        const command=commands.shift();result={command};
+        if(command.method==='agent.reconcile'){
+          reconcileCommandDelivered=true;
+          if(deferredWorkAck)setTimeout(()=>reply(deferredWorkAck.socket,deferredWorkAck.packet),40);
+        }
+      }
+    } else if(packet.method==='module.outcome') {
+      const outcome=packet.params;outcomes.set(outcome.operation_id,outcome);
+      if(outcome.operation_id===openId&&outcome.outcome==='applied'){
+        if(scenario==='read-race'||scenario==='goal-checkpoint-race')commands.push(configureCommand,workCommand);
+        else commands.push(workCommand);
+      }
+      if(outcome.operation_id===workId){
+        workOutcomeCount++;
+        assert.equal(workOutcomeCount,1,'the original work command produces one host outcome');
+        if(isCheckpointRace){
+          assert.equal(outcome.outcome,'rejected','checkpoint race rejects before native admission');
+          assert.equal(outcome.details.diagnostic_code,'NATIVE_WORK_SNAPSHOT_CHANGED_BEFORE_REQUEST');
+          const checkpoint=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
+          checkpointAtWorkOutcome=checkpoint.native_pending?.find(([id])=>id===workId)?.[1];
+          assert.ok(checkpointAtWorkOutcome,'the original durable work intent remains readable');
+          assert.equal(checkpointAtWorkOutcome.ack,null,'pre-request rejection does not forge a native ACK');
+          assert.equal(checkpointAtWorkOutcome.id,commandIdFor(workId,workAt),'same native command ID remains durable');
+          assert.equal(checkpointAtWorkOutcome.method,isGoal?'goal/set':'turn/start');
+          assert.deepEqual(checkpointAtWorkOutcome.params,isGoal
+            ?{sessionId,objective:'fixture goal must stay fenced'}
+            :{sessionId,input:[{type:'text',text:sentText}],reasoningEffort:'max',ifBusy:'queue'});
+          assert.equal(checkpointAtWorkOutcome.workFenceRejected,true);
+          assert.equal(checkpointAtWorkOutcome.workFenceRejectionCode,'NATIVE_WORK_SNAPSHOT_CHANGED_BEFORE_REQUEST');
+          assert.deepEqual(checkpointAtWorkOutcome.workFence,{rootId:sessionId,eventVersion:isGoal?1:0,modelId:'fixture-model',
+            providerId:'fixture-provider',status:'idle',activeTurnId:null});
+          deferredWorkAck={socket,packet};
+          setTimeout(()=>commands.push(reconcileCommand),25);
+          return;
+        }
+        reply(socket,packet);
+        finishedResolve(outcome);
+        return;
+      }
+      if(outcome.operation_id===reconcileId){
+        reconcileOutcomeCount++;
+        assert.equal(reconcileOutcomeCount,1,'the guarded explicit reconciliation runs once');
+        reply(socket,packet);
+        finishedResolve({work:outcomes.get(workId),reconcile:outcome});
+        return;
+      }
+    }
+    reply(socket,packet,result);
+  }
+  try {
+    await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
+    const credentialFile=path.join(dir,'credential.json');
+    const configFile=path.join(dir,'module.json');
+    await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.11',
+      command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',fixturePath]}));
+    const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
+      TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
+    if(isCheckpointRace){
+      env.NODE_OPTIONS=`--import=${pathToFileURL(gateScript).href}`;
+      env.MUSE_FIXTURE_CHECKPOINT_PATH=path.join(stateDir,'checkpoint.json');
+      env.MUSE_FIXTURE_CHECKPOINT_OPERATION=workId;
+      env.MUSE_FIXTURE_GATE_SIGNAL=gateSignal;
+      env.MUSE_FIXTURE_GATE_RELEASE=gateRelease;
+    }
+    bridge=spawn(process.execPath,[path.join(here,'bridge.mjs'),'--config',configFile],
+      {cwd:here,env,windowsHide:true,stdio:['ignore','ignore','pipe']});
+    bridge.stderr.setEncoding('utf8');bridge.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
+    closed=new Promise(resolve=>bridge.once('close',(code,signal)=>resolve({code,signal})));
+    const outcome=await Promise.race([finished,delay(15000).then(()=>{throw new Error(`work-fence fixture timed out: ${stderr}`);})]);
+    assert.equal(outcomes.get(openId)?.outcome,'applied','the fixture root opens before work preflight');
+    assert.ok(outcomes.has(workId),'the work command outcome is recorded');
+    if(scenario==='baseline'){
+      assert.equal(outcomes.get(workId)?.outcome,'applied');
+      assert.equal(outcome.outcome,'applied','a stable session/list snapshot admits one clean dispatch');
+      assert.equal(outcome.turn_id,'turn_fixture_started');
+      assert.equal(workOutcomeCount,1);
+    } else if(scenario==='read-race'){
+      assert.equal(outcomes.get(workId)?.outcome,'rejected');
+      assert.equal(outcome.outcome,'rejected','a model event during session/list rejects the work-starting goal');
+      assert.equal(outcome.details.diagnostic_code,'NATIVE_WORK_SNAPSHOT_CHANGED_DURING_READ');
+    } else {
+      assert.equal(outcome.work?.outcome,'rejected');
+      assert.equal(outcome.reconcile?.outcome,'applied');
+      assert.equal(outcome.reconcile?.details?.target_operation_id,workId);
+      assert.equal(outcome.reconcile?.details?.disposition,'work_fence_rejected_before_native_request');
+      assert.equal(outcome.reconcile?.details?.resubmitted,false);
+      assert.equal(reconcileCommandDelivered,true);
+    }
+  } finally {
+    teardownStarted=true;
+    if(bridge&&bridge.exitCode===null)bridge.kill('SIGTERM');
+    if(bridge&&closed)closeResult=await Promise.race([closed,delay(5000).then(()=>null)]);
+    for(const socket of sockets)socket.destroy();
+    if(server.listening)await new Promise(resolve=>server.close(resolve));
+    try {
+      const audit=JSON.parse(await readFile(auditPath,'utf8'));
+      assert.equal(audit.session_start_params?.workspaceRoot,home);
+      assert.equal(audit.session_start_params?.modelId,'fixture-model');
+      assert.equal(audit.session_start_params?.providerId,'fixture-provider');
+      assert.equal(audit.session_list_count,1,'one exact session/list row is used for work preflight');
+      assert.equal(audit.session_list_params?.workspaceRoot,home);
+      assert.equal(audit.session_list_params?.limit,200);
+      assert.deepEqual(audit.listed_session,{sessionId,modelId:'fixture-model',providerId:'fixture-provider',
+        status:'idle',activeTurnId:null});
+      assert.equal(audit.session_read_count,0,'ephemeral fixtures stay on the supported session/list API');
+      assert.equal(audit.session_resume_count,0,'work fencing never resumes a native session');
+      const nativeWorkMethods=audit.methods.filter(method=>['turn/start','turn/steer','goal/set','goal/edit','goal/resume'].includes(method));
+      if(scenario==='baseline'){
+        assert.deepEqual(nativeWorkMethods,['turn/start'],'the baseline sends exactly one clean native work command');
+        assert.equal(audit.turn_start_count,1);
+        assert.equal(audit.turn_steer_count,0);
+        assert.equal(audit.goal_set_count,0);
+        assert.equal(audit.turn_start_params?.commandId,commandIdFor(workId,workAt));
+        assert.equal(audit.turn_start_params?.sessionId,sessionId);
+        assert.equal(audit.turn_start_params?.reasoningEffort,'max');
+        assert.equal(audit.turn_start_params?.ifBusy,'queue');
+        assert.deepEqual(audit.turn_start_params?.input,[{type:'text',text:sentText}]);
+      } else {
+        assert.deepEqual(nativeWorkMethods,[],'a stale session snapshot causes no native work call');
+        assert.equal(audit.turn_start_count,0);
+        assert.equal(audit.turn_steer_count,0);
+        assert.equal(audit.goal_set_count,0);
+        assert.equal(audit.goal_edit_count,0);
+        assert.equal(audit.goal_resume_count,0);
+      }
+      if(scenario==='read-race'||scenario==='goal-checkpoint-race'){
+        assert.equal(audit.session_set_effort_count,1,'the work-starting goal reaches its own preflight boundary');
+        if(scenario==='read-race')
+          assert.equal(audit.model_changed_notifications,1,'the adversarial event lands while session/list is pending');
+      }
+      if(isCheckpointRace){
+        assert.equal(audit.checkpoint_gate_released,true,'the adversarial model event follows the durable pending checkpoint');
+        assert.equal(audit.model_changed_notifications,1);
+        assert.equal(checkpointAtWorkOutcome?.workFenceRejected,true);
+        assert.equal(checkpointAtWorkOutcome?.ack,null,'the rejected fence remains distinct from native ACK truth');
+      }
+      const retained=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
+      if(scenario==='read-race')
+        assert.equal(retained.native_pending?.some(([id])=>id===workId),false,'a changed preflight read creates no native intent');
+    } finally {
+      await rm(dir,{recursive:true,force:true});
+    }
+    assert.ok(closeResult,'the actual bridge subprocess stops after the account-free native fixture');
+  }
+  console.log(`PASS work fence ${scenario}: actual bridge preserves exact read/checkpoint and no-replay boundaries`);
+}
+
+await runWorkFenceCase('baseline');
+await runWorkFenceCase('read-race');
+await runWorkFenceCase('checkpoint-race');
+await runWorkFenceCase('goal-checkpoint-race');
 
 console.log('MUSE SELFTEST OK');
