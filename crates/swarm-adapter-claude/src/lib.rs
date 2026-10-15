@@ -79,6 +79,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         config.generation,
         &config.native_options.scope_key(),
     )?;
+    journal.recover_uncertain_with_code("ADAPTER_RESTART_AFTER_EFFECT_MARKER")?;
     if journal.has_terminal_shutdown()? {
         flush_outbox(&mut link, &journal, &interactions).await?;
         return Ok(());
@@ -484,7 +485,7 @@ fn retire_owned_harness(
 }
 
 fn shutdown_terminal_outcome(journal: &OperationJournal, operation_id: &str) -> bool {
-    matches!(journal.get(operation_id), Ok(Some(saved)) if saved.outcome.as_ref().is_some_and(|outcome| matches!(outcome["details"]["diagnostic_code"].as_str(), Some("OWNED_TRANSPORT_RELEASED" | "SHUTDOWN_STOP_UNCERTAIN"))))
+    matches!(journal.get(operation_id), Ok(Some(saved)) if saved.outcome.as_ref().is_some_and(|outcome| matches!(outcome["outcome"].as_str(), Some("applied" | "unknown"))))
 }
 
 fn shutdown_scope(input: &Value) -> Option<&str> {
@@ -5478,10 +5479,10 @@ mod agent_shutdown_handler_tests {
     fn terminal_predicate_only_matches_retired_shutdown() {
         let (root, _config, journal, _interactions) = shutdown_fixture("claude-shutdown-pred");
         assert!(!shutdown_terminal_outcome(&journal, "shutdown-absent"));
-        for (id, code, terminal, applied) in [("shutdown-pred-rejected", "SHUTDOWN_SCOPE_UNSUPPORTED", false, false), ("shutdown-pred-released", "OWNED_TRANSPORT_RELEASED", true, true), ("shutdown-pred-uncertain", "SHUTDOWN_STOP_UNCERTAIN", true, false)] {
+        for (id, code, terminal, applied, unknown) in [("shutdown-pred-rejected", "SHUTDOWN_SCOPE_UNSUPPORTED", false, false, false), ("shutdown-pred-released", "OWNED_TRANSPORT_RELEASED", true, true, false), ("shutdown-pred-uncertain", "SHUTDOWN_STOP_UNCERTAIN", true, false, true)] {
             let receipt: swarm_contracts::runtime::ModuleReceiptIdentity = serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": "claude-agent-sdk-rust-controller.6", "version": "6", "build_id": null}, "protocol": {"major": 1, "minor": 0}, "binding_id": "fixture-binding", "binding_generation": 1, "operation_id": id, "input_sha256": "e".repeat(64)})).expect("predicate receipt");
             journal.write_intent(id, &receipt, "agent.shutdown", &serde_json::json!({})).expect("predicate intent");
-            let outcome = RuntimeOutcome { operation_id: id.to_owned(), outcome: if applied { EffectOutcome::Applied } else { EffectOutcome::Rejected }, native_scope_key: None, native_root_id: None, turn_id: None, native_input_id: None, details: serde_json::json!({"diagnostic_code": code}) };
+            let outcome = RuntimeOutcome { operation_id: id.to_owned(), outcome: if applied { EffectOutcome::Applied } else if unknown { EffectOutcome::Unknown } else { EffectOutcome::Rejected }, native_scope_key: None, native_root_id: None, turn_id: None, native_input_id: None, details: serde_json::json!({"diagnostic_code": code}) };
             journal.save_outcome(id, &outcome).expect("predicate outcome");
             assert_eq!(shutdown_terminal_outcome(&journal, id), terminal);
         }
@@ -5516,7 +5517,7 @@ mod agent_shutdown_handler_tests {
     }
     #[test]
     fn startup_scan_finds_only_terminal_shutdown() {
-        let (root, _config, journal, _interactions) = shutdown_fixture("claude-shutdown-scan");
+        let (root, config, journal, _interactions) = shutdown_fixture("claude-shutdown-scan");
         assert!(!journal.has_terminal_shutdown().expect("empty scan"));
         for (id, code, terminal) in [("shutdown-scan-other", "agent.send", false), ("shutdown-scan-rejected", "SHUTDOWN_SCOPE_UNSUPPORTED", false), ("shutdown-scan-retired", "OWNED_TRANSPORT_RELEASED", true)] {
             let receipt: swarm_contracts::runtime::ModuleReceiptIdentity = serde_json::from_value(serde_json::json!({"schema_version": 1, "module_id": "claude", "artifact": {"artifact_id": "claude-agent-sdk-rust-controller.6", "version": "6", "build_id": null}, "protocol": {"major": 1, "minor": 0}, "binding_id": "fixture-binding", "binding_generation": 1, "operation_id": id, "input_sha256": "e".repeat(64)})).expect("scan receipt");
@@ -5526,6 +5527,14 @@ mod agent_shutdown_handler_tests {
             journal.save_outcome(id, &outcome).expect("scan outcome");
             assert_eq!(journal.has_terminal_shutdown().expect("terminal scan"), terminal);
         }
+        let crash_op = "shutdown-scan-crash";
+        let crash_command = shutdown_command(&config, crash_op, serde_json::json!("owned_sdk_transport"));
+        let crash_receipt = receipt::for_command(&shutdown_claim(), &crash_command).expect("crash receipt");
+        journal.write_intent(crash_op, &crash_receipt, "agent.shutdown", &serde_json::json!({})).expect("crash intent");
+        assert!(journal.get(crash_op).expect("crash record").expect("crash intent present").outcome.is_none());
+        journal.recover_uncertain_with_code("ADAPTER_RESTART_AFTER_EFFECT_MARKER").expect("recover crash intent");
+        assert!(journal.has_terminal_shutdown().expect("recovered scan"));
+        assert_eq!(journal.get(crash_op).expect("read").expect("record").outcome.as_ref().expect("unknown stored")["outcome"], "unknown");
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -6013,8 +6013,39 @@ async fn release_owned_connection_with_timeout(
         _ => Err("CODEX_CONNECTION_CLOSE_UNKNOWN"),
     }
 }
-fn unknown_shutdown(
-    command: &RuntimeCommand,
+fn shutdown_intent_without_outcome(state: &Checkpoint) -> bool {
+    state.operations.values().any(|record| record.method == "agent.shutdown" && record.kind == "shutdown" && record.outcome.is_none())
+}
+
+fn recover_intent_only_shutdown(
+    journal: &mut Journal,
+    claim: &ModuleContractClaim,
+) -> Result<(), AdapterError> {
+    let pending: Vec<(String, String)> = journal
+        .state
+        .operations
+        .iter()
+        .filter(|(_, record)| record.method == "agent.shutdown" && record.kind == "shutdown" && record.outcome.is_none())
+        .filter_map(|(operation_id, record)| record.input_sha256.as_deref().filter(|digest| valid_sha256(digest)).map(|digest| (operation_id.clone(), digest.to_owned())))
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let (binding_id, generation) = match (journal.state.binding_id.clone(), journal.state.generation) {
+        (Some(binding_id), Some(generation)) => (binding_id, generation),
+        _ => return Err(AdapterError::Checkpoint),
+    };
+    for (operation_id, digest) in pending {
+        let mut outcome = unknown_shutdown_for_id(&operation_id, &journal.state, "SHUTDOWN_EFFECT_UNCERTAIN");
+        attach_module_receipt(&mut outcome, claim, &binding_id, generation, &operation_id, &digest)?;
+        journal.store_outcome(&outcome, "agent.shutdown", "shutdown")?;
+    }
+    journal.state.native_retired = true;
+    journal.save()
+}
+
+fn unknown_shutdown_for_id(
+    operation_id: &str,
     state: &Checkpoint,
     code: &'static str,
 ) -> RuntimeOutcome {
@@ -6024,7 +6055,7 @@ fn unknown_shutdown(
     details["disposition"] = json!("unknown");
     details["native_replay"] = json!(false);
     outcome(
-        &command.operation_id,
+        operation_id,
         EffectOutcome::Unknown,
         None,
         state.native_scope_key.as_deref(),
@@ -6051,7 +6082,7 @@ async fn shutdown_operation(
         if let Some(result) = &previous.outcome {
             return decode_outcome(result, &command.operation_id);
         }
-        return unknown_shutdown(command, &journal.state, "SHUTDOWN_EFFECT_UNCERTAIN");
+        return unknown_shutdown_for_id(&command.operation_id, &journal.state, "SHUTDOWN_EFFECT_UNCERTAIN");
     }
     if native.writer.is_none() {
         return rejected(command, "CODEX_CONNECTION_NOT_HELD", &journal.state);
@@ -6091,7 +6122,7 @@ async fn shutdown_operation(
         }
         Err(code) => {
             journal.state.native_retired = true;
-            unknown_shutdown(command, &journal.state, code)
+            unknown_shutdown_for_id(&command.operation_id, &journal.state, code)
         }
     }
 }
@@ -6513,6 +6544,7 @@ async fn drain_retired_then_exit(
         };
         module_contract::validate_negotiated_hello(&hello_result, context)?;
         journal.bind(&context.binding_id, context.generation)?;
+        recover_intent_only_shutdown(journal, &context.claim)?;
         match report_pending(&mut host, journal, drain_results).await {
             Ok(()) => return Ok(()),
             Err(AdapterError::Host) => {
@@ -6624,7 +6656,7 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
     };
     let endpoint = config.endpoint.clone();
     let mut native: Option<NativeClient> = None;
-    if journal.state.native_retired {
+    if journal.state.native_retired || shutdown_intent_without_outcome(&journal.state) {
         drain_retired_then_exit(&config, &context, &ipc, &mut journal).await?;
         return Ok(());
     }
@@ -7407,6 +7439,37 @@ mod agent_shutdown_loopback_tests {
         assert!(journal.state.native_retired);
         let record = journal.state.operations.get("shutdown-uncertain-1").expect("intent retained");
         assert!(record.outcome.is_none());
+        std::fs::remove_dir_all(&directory).ok();
+    }
+    #[test]
+    fn crash_intent_only_recovers_unknown_without_io() {
+        let (directory, mut journal) = fixture_journal("codex-shutdown-crash");
+        journal.bind("test-binding", 1).expect("bind fixture binding");
+        let claim = full_claim();
+        let mut record = OperationRecord::intent("agent.shutdown", "shutdown");
+        record.input_sha256 = Some("c".repeat(64));
+        record.native_scope_key = Some("crash-scope".to_owned());
+        journal.state.operations.insert("shutdown-crash-1".to_owned(), record);
+        journal.save().expect("persist intent only");
+        drop(journal);
+        let mut reopened = Journal::open(directory.clone(), "boot-shutdown-reopen".to_owned()).expect("reopen after crash");
+        assert!(reopened.state.operations.get("shutdown-crash-1").expect("intent survived").outcome.is_none());
+        assert!(!reopened.state.native_retired);
+        assert!(shutdown_intent_without_outcome(&reopened.state));
+        recover_intent_only_shutdown(&mut reopened, &claim).expect("recover intent");
+        let stored = reopened.state.operations.get("shutdown-crash-1").expect("record").outcome.clone().expect("unknown stored");
+        let outcome: RuntimeOutcome = serde_json::from_value(stored).expect("stored outcome decodes");
+        assert!(matches!(outcome.outcome, EffectOutcome::Unknown));
+        assert_eq!(outcome.details["diagnostic_code"], "SHUTDOWN_EFFECT_UNCERTAIN");
+        assert_eq!(outcome.details["native_replay"], false);
+        assert!(reopened.state.native_retired);
+        drop(reopened);
+        let mut stable = Journal::open(directory.clone(), "boot-shutdown-stable".to_owned()).expect("stable reopen");
+        assert!(stable.state.native_retired);
+        recover_intent_only_shutdown(&mut stable, &claim).expect("second recovery no-op");
+        let rest = stable.state.operations.get("shutdown-crash-1").expect("record").outcome.clone().expect("outcome stable");
+        let rest: RuntimeOutcome = serde_json::from_value(rest).expect("stable outcome decodes");
+        assert!(matches!(rest.outcome, EffectOutcome::Unknown));
         std::fs::remove_dir_all(&directory).ok();
     }
 }

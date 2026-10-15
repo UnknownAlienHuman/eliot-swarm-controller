@@ -785,7 +785,7 @@ impl OperationJournal {
             if state.method.as_deref() != Some("agent.shutdown") {
                 continue;
             }
-            if state.outcome.as_ref().is_some_and(|outcome| matches!(outcome["details"]["diagnostic_code"].as_str(), Some("OWNED_TRANSPORT_RELEASED" | "SHUTDOWN_STOP_UNCERTAIN"))) {
+            if state.outcome.as_ref().is_some_and(|outcome| matches!(outcome["outcome"].as_str(), Some("applied" | "unknown"))) {
                 return Ok(true);
             }
         }
