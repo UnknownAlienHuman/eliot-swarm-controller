@@ -39,6 +39,6 @@ fn config_path() -> Result<PathBuf, Error> {
 }
 
 fn fail(error: Error) -> ! {
-    eprintln!("swarm-adapter-claude: {}", error.code);
+    eprintln!("{}", serde_json::json!({"error_code": error.code}));
     process::exit(2)
 }

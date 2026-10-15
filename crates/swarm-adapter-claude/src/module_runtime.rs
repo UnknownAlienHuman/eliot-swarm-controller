@@ -17,9 +17,9 @@ use swarm_process::module_owner::{VerifiedModuleWorker, verify_current_adapter_f
 const CAPABILITIES: [&str; 7] = [
     "agent.open",
     "agent.reconcile",
+    "agent.refresh",
     "agent.reply",
     "agent.result",
-    "agent.refresh",
     "agent.send/next_turn",
     "task.dispatch",
 ];
@@ -200,4 +200,35 @@ fn absolute_env_path(name: &'static str) -> Result<PathBuf> {
         ));
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod descriptor_claim_tests {
+    use super::*;
+    use swarm_contracts::module_catalog::ModuleDescriptor;
+
+    #[test]
+    fn installed_claude_descriptor_claim_matches_bootstrap_capabilities() {
+        let mut descriptor: ModuleDescriptor = serde_json::from_str(include_str!(
+            "../../../modules/claude-rust/module-descriptor.template.json"
+        ))
+        .expect("the shipped Claude descriptor is valid JSON");
+        descriptor.launch.executable = env::current_exe().expect("current test executable");
+        let claim = ModuleContractClaim::from_descriptor(
+            &descriptor,
+            ProtocolVersion { major: 1, minor: 0 },
+        )
+        .expect("the shipped descriptor produces a canonical claim");
+        claim.validate().expect("canonical claim validates");
+        assert!(capabilities_match(&claim));
+
+        let mut missing = claim.clone();
+        missing.capabilities.pop();
+        assert!(!capabilities_match(&missing));
+
+        let mut unsorted = claim;
+        unsorted.capabilities.swap(0, 1);
+        assert!(unsorted.validate().is_err());
+        assert!(!capabilities_match(&unsorted));
+    }
 }
