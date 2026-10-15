@@ -1835,11 +1835,27 @@ impl InteractionJournal {
             ));
         }
         validate_request(&record.request)?;
-        if record.reply.is_some() != record.reply_sha256.is_some()
-            || record.reply.is_some() != record.reply_operation_id.is_some()
-            || record.reply.as_ref().is_some_and(|reply| {
-                digest_json(reply).ok().as_deref() != record.reply_sha256.as_deref()
-            })
+        let reply_evidence_valid = match (
+            record.reply.as_ref(),
+            record.reply_sha256.as_deref(),
+            record.reply_operation_id.as_deref(),
+        ) {
+            (None, None, None) => true,
+            (Some(reply), Some(reply_sha256), Some(operation_id)) => {
+                digest_json(reply).ok().as_deref() == Some(reply_sha256)
+                    && valid_identity(operation_id, 256)
+            }
+            (None, Some(reply_sha256), Some(operation_id))
+                if record.request.schema_version == 2
+                    && record.status != InteractionStatus::Pending =>
+            {
+                // A migrated legacy reply can be unavailable while its exact
+                // digest and operation identity remain durable.
+                valid_sha256(reply_sha256) && valid_identity(operation_id, 256)
+            }
+            _ => false,
+        };
+        if !reply_evidence_valid
             || (record.status != InteractionStatus::Pending
                 && record.status != InteractionStatus::Retired
                 && record.reply_operation_id.is_none())
@@ -1851,6 +1867,14 @@ impl InteractionJournal {
         }
         if record.request.schema_version == 1 {
             redact_legacy_request(&mut record.request)?;
+            if record.reply.take().is_some() {
+                // The legacy payload may contain raw SDK input or a Node-only
+                // question mapping. Keep its exact identity, but do not retain
+                // data Rust cannot restore.
+                if record.status == InteractionStatus::Pending {
+                    record.status = InteractionStatus::Unknown;
+                }
+            }
             self.replace(path, &record)?;
         }
         Ok(record)
@@ -2462,6 +2486,119 @@ mod recovery_regression_tests {
         assert!(!persisted.contains(dynamic_key));
         assert!(!persisted.contains("legacy.txt"));
         assert!(persisted.contains("field_1"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reading_legacy_question_reply_removes_raw_keys_and_preserves_ack_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-legacy-question-reply-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create legacy question fixture directory");
+        let journal = InteractionJournal::open(&root, "fixture-binding", 1, "claude:fixture")
+            .expect("open callback journal");
+        let raw_question = "ghp_0123456789abcdef0123456789abcdef0123";
+        let raw_questions = json!([{
+            "question":raw_question,
+            "header":"Choice",
+            "options":[
+                {"label":"Keep","description":"Keep the current value"},
+                {"label":"Skip","description":"Leave it unchanged"}
+            ],
+            "multiSelect":false
+        }]);
+        let raw_input = json!({"questions":raw_questions});
+        let request_id = "legacy-private-question-reply-fixture";
+        let request_sha256 = digest_json(&json!({
+            "schema_version":1,
+            "request_id":request_id,
+            "kind":"question",
+            "tool_name":"AskUserQuestion",
+            "input":raw_input
+        }))
+        .expect("digest legacy raw question request");
+        let request = InteractionRequest {
+            schema_version: 1,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_scope_key: "claude:fixture".to_owned(),
+            bridge_boot_id: "retired-legacy-boot".to_owned(),
+            native_root_id: "fixture-root".to_owned(),
+            request_id: request_id.to_owned(),
+            kind: InteractionKind::Question,
+            tool_name: "AskUserQuestion".to_owned(),
+            input: raw_input,
+            input_sha256: String::new(),
+            request_sha256: request_sha256.clone(),
+        };
+        let mut answers = serde_json::Map::new();
+        answers.insert(
+            raw_question.to_owned(),
+            json!("legacy-private-answer-marker"),
+        );
+        let reply = json!({
+            "type":"question",
+            "updated_input":{
+                "questions":raw_questions,
+                "answers":Value::Object(answers)
+            }
+        });
+        let reply_sha256 = digest_json(&reply).expect("digest legacy question reply");
+        let reply_operation_id = "legacy-question-reply-operation";
+        let path = journal
+            .path(request_id)
+            .expect("resolve legacy question record path");
+        let legacy_bytes = serde_json::to_vec(&InteractionRecord {
+            schema_version: 1,
+            request,
+            sequence: Some(1),
+            status: InteractionStatus::Acknowledged,
+            reply_operation_id: Some(reply_operation_id.to_owned()),
+            reply_sha256: Some(reply_sha256.clone()),
+            reply: Some(reply),
+        })
+        .expect("serialize legacy question reply record");
+        let legacy_text = String::from_utf8(legacy_bytes.clone()).expect("legacy JSON is UTF-8");
+        assert_eq!(legacy_text.matches(raw_question).count(), 3);
+        write_private_new(&path, &legacy_bytes).expect("write private legacy question record");
+
+        let migrated = journal
+            .get(request_id)
+            .expect("read and migrate legacy question callback")
+            .expect("legacy question callback exists");
+        assert_eq!(migrated.schema_version, 2);
+        assert_eq!(migrated.request_sha256, request_sha256);
+        assert!(!migrated.input.to_string().contains(raw_question));
+
+        let persisted = fs::read_to_string(&path).expect("read migrated question record");
+        assert!(!persisted.contains(raw_question));
+        assert!(!persisted.contains("legacy-private-answer-marker"));
+        assert!(persisted.contains(&request_sha256));
+        assert!(persisted.contains(&reply_sha256));
+        let stored: InteractionRecord =
+            serde_json::from_str(&persisted).expect("decode migrated interaction record");
+        assert!(stored.reply.is_none());
+        assert_eq!(
+            stored.reply_operation_id.as_deref(),
+            Some(reply_operation_id)
+        );
+        assert_eq!(stored.reply_sha256.as_deref(), Some(reply_sha256.as_str()));
+        assert_eq!(stored.status, InteractionStatus::Acknowledged);
+
+        journal
+            .acknowledge_reply(request_id, reply_operation_id, &reply_sha256)
+            .expect("exact legacy acknowledgement remains idempotent");
+        let retry = journal
+            .begin_reply(
+                request_id,
+                "fresh-reply-operation",
+                &json!({}),
+                &reply_sha256,
+            )
+            .expect_err("acknowledged legacy reply cannot become a fresh intent");
+        assert_eq!(retry.code, "INTERACTION_NOT_PENDING");
+        assert_eq!(fs::read_to_string(&path).unwrap(), persisted);
         let _ = fs::remove_dir_all(root);
     }
 

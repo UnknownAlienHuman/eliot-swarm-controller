@@ -2612,7 +2612,81 @@ impl OperationJournal {
                 "operation record must be a bounded regular file",
             ));
         }
-        read_operation_state_bytes(&bytes, path, expected_operation_id)
+        drop(file);
+        let state = read_operation_state_bytes(&bytes, path, expected_operation_id)?;
+        if state.torn_tail_evidence.is_some() || state.method.as_deref() != Some("agent.reply") {
+            return Ok(state);
+        }
+        let Some(mut safe_intent) = state.intent.clone() else {
+            return Ok(state);
+        };
+        if !discard_question_reply_payload(&mut safe_intent) {
+            return Ok(state);
+        }
+        let rewritten_bytes =
+            rewrite_question_reply_frames(&bytes, &safe_intent)?.ok_or_else(|| {
+                Error::new(
+                    "ADAPTER_JOURNAL",
+                    "legacy question reply disappeared during privacy migration",
+                )
+            })?;
+        ensure_regular(path)?;
+        let mut current_file = File::open(path)
+            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation record cannot be read"))?;
+        let mut current_bytes = Vec::new();
+        Read::by_ref(&mut current_file)
+            .take(MAX_STATE_BYTES.saturating_add(1))
+            .read_to_end(&mut current_bytes)
+            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation record read failed"))?;
+        if current_bytes != bytes {
+            return Err(Error::new(
+                "ADAPTER_JOURNAL",
+                "operation record changed during privacy migration",
+            ));
+        }
+        drop(current_file);
+        replace_private_durable(path, &rewritten_bytes).map_err(|_| {
+            Error::new(
+                "ADAPTER_JOURNAL",
+                "legacy question reply privacy migration cannot be durably published",
+            )
+        })?;
+
+        let mut readback_file = File::open(path)
+            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation record cannot be read"))?;
+        let mut readback_bytes = Vec::new();
+        Read::by_ref(&mut readback_file)
+            .take(MAX_STATE_BYTES.saturating_add(1))
+            .read_to_end(&mut readback_bytes)
+            .map_err(|_| Error::new("ADAPTER_JOURNAL", "operation record read failed"))?;
+        if readback_bytes != rewritten_bytes || readback_bytes.len() as u64 > MAX_STATE_BYTES {
+            return Err(Error::new(
+                "ADAPTER_JOURNAL",
+                "legacy question reply privacy migration readback differs from its durable bytes",
+            ));
+        }
+        drop(readback_file);
+        let migrated = read_operation_state_bytes(&readback_bytes, path, expected_operation_id)?;
+        if migrated.intent.as_ref() != Some(&safe_intent)
+            || state.operation_key != migrated.operation_key
+            || state.operation_id != migrated.operation_id
+            || state.receipt != migrated.receipt
+            || state.method != migrated.method
+            || state.outcome != migrated.outcome
+            || state.outcome_sha256 != migrated.outcome_sha256
+            || state.acknowledged_sha256 != migrated.acknowledged_sha256
+            || state.outbox_sequence != migrated.outbox_sequence
+            || state.compacted != migrated.compacted
+            || state.torn_tail_evidence != migrated.torn_tail_evidence
+            || state.recovery_unknown() != migrated.recovery_unknown()
+            || state.native_replay_permitted() != migrated.native_replay_permitted()
+        {
+            return Err(Error::new(
+                "ADAPTER_JOURNAL",
+                "legacy question reply privacy migration changed operation custody",
+            ));
+        }
+        Ok(migrated)
     }
 }
 
@@ -2693,6 +2767,51 @@ fn read_operation_state_bytes(
         }
     }
     Ok(state)
+}
+
+fn discard_question_reply_payload(intent: &mut Value) -> bool {
+    let Some(native) = intent.get_mut("native").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(reply) = native.get("reply") else {
+        return false;
+    };
+    let is_question_reply = native.get("interaction_kind").and_then(Value::as_str)
+        == Some("question")
+        || reply["type"].as_str() == Some("question")
+        || (reply["updated_input"]["questions"].is_array()
+            && reply["updated_input"]["answers"].is_object());
+    let has_historical_digest = native
+        .get("reply_sha256")
+        .and_then(Value::as_str)
+        .is_some_and(valid_sha256);
+    is_question_reply && has_historical_digest && native.remove("reply").is_some()
+}
+
+fn rewrite_question_reply_frames(bytes: &[u8], safe_intent: &Value) -> Result<Option<Vec<u8>>> {
+    let mut rewritten = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    for frame in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if !frame.ends_with(b"\n") {
+            return Ok(None);
+        }
+        let mut record: JournalRecord = serde_json::from_slice(&frame[..frame.len() - 1])?;
+        let is_legacy_question_intent = record.kind == "intent"
+            && record.method.as_deref() == Some("agent.reply")
+            && record
+                .intent
+                .as_mut()
+                .is_some_and(discard_question_reply_payload);
+        if is_legacy_question_intent {
+            record.intent = Some(safe_intent.clone());
+            rewritten.extend_from_slice(&serde_json::to_vec(&record)?);
+            rewritten.push(b'\n');
+            changed = true;
+        } else {
+            rewritten.extend_from_slice(frame);
+        }
+    }
+    Ok(changed.then_some(rewritten))
 }
 
 fn apply_record(state: &mut OperationState, record: JournalRecord) -> Result<()> {
@@ -3258,6 +3377,212 @@ mod recovery_tests {
         );
         journal.acknowledge("result-operation", &unknown).unwrap();
         assert!(journal.pending_outcomes().unwrap().is_empty());
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_question_reply_migration_scrubs_payload_and_preserves_effect_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "swarm-claude-legacy-question-intent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let make_receipt = |operation_id: &str| -> ModuleReceiptIdentity {
+            let receipt: ModuleReceiptIdentity = serde_json::from_value(json!({
+                "schema_version":1,"module_id":"eliot.claude",
+                "artifact":{"artifact_id":crate::ARTIFACT_ID,"version":crate::ARTIFACT_VERSION},
+                "protocol":{"major":1,"minor":0},"binding_id":"binding-legacy-question",
+                "binding_generation":1,"operation_id":operation_id,"input_sha256":"d".repeat(64)
+            }))
+            .unwrap();
+            receipt.validate().unwrap();
+            receipt
+        };
+        let applied_outcome = json!({
+            "operation_id":"legacy-question-applied",
+            "outcome":"applied",
+            "details":{"completion_condition":"applied","replay_permitted":false}
+        });
+        let raw_question = "ghp_0123456789abcdef0123456789abcdef0123";
+        let raw_answer = "legacy-question-answer-private-marker";
+        let questions = json!([{
+            "question":raw_question,
+            "header":"Choice",
+            "options":[
+                {"label":"Keep","description":"Keep the current value"},
+                {"label":"Skip","description":"Leave it unchanged"}
+            ],
+            "multiSelect":false
+        }]);
+        let mut answers = serde_json::Map::new();
+        answers.insert(raw_question.to_owned(), json!(raw_answer));
+        let reply = json!({
+            "type":"question",
+            "updated_input":{
+                "questions":questions,
+                "answers":Value::Object(answers)
+            }
+        });
+        let reply_sha256 = digest_json(&reply).unwrap();
+        let applied_reply_intent = json!({
+            "bridge_boot_id":"legacy-boot",
+            "native_scope_key":"fixture-scope",
+            "native_root_id":"fixture-root",
+            "native":{
+                "interaction_request_id":"legacy-question-applied-request",
+                "interaction_kind":"question",
+                "tool_name":"AskUserQuestion",
+                "request_sha256":"b".repeat(64),
+                "input_sha256":"c".repeat(64),
+                "reply_sha256":reply_sha256,
+                "reply":reply,
+                "native_scope_key":"fixture-scope",
+                "native_root_id":"fixture-root"
+            }
+        });
+        let unknown_id = "legacy-question-unknown";
+        let mut unknown_intent = applied_reply_intent.clone();
+        unknown_intent["native"]["interaction_request_id"] =
+            json!("legacy-question-unknown-request");
+
+        let journal = OperationJournal::open(
+            &root,
+            "binding-legacy-question",
+            1,
+            "fixture-scope",
+            &"e".repeat(64),
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        for (operation_id, intent, outcome, acknowledged) in [
+            (
+                "legacy-question-applied",
+                applied_reply_intent,
+                Some(applied_outcome.clone()),
+                true,
+            ),
+            (unknown_id, unknown_intent, None, false),
+        ] {
+            let receipt = make_receipt(operation_id);
+            let intent_record = JournalRecord {
+                version: 1,
+                operation_id: operation_id.to_owned(),
+                kind: "intent".to_owned(),
+                receipt: Some(receipt.clone()),
+                method: Some("agent.reply".to_owned()),
+                intent: Some(intent.clone()),
+                outcome: None,
+                digest: None,
+                outbox_sequence: None,
+            };
+            let mut bytes = serde_json::to_vec(&intent_record).unwrap();
+            bytes.push(b'\n');
+            let outcome_sha256 = outcome
+                .as_ref()
+                .map(|outcome| digest_json(outcome).unwrap());
+            if let Some(outcome) = outcome.as_ref() {
+                let digest = outcome_sha256.clone().unwrap();
+                let outcome_record = JournalRecord {
+                    version: 1,
+                    operation_id: operation_id.to_owned(),
+                    kind: "outcome".to_owned(),
+                    receipt: None,
+                    method: None,
+                    intent: None,
+                    outcome: Some(outcome.clone()),
+                    digest: Some(digest.clone()),
+                    outbox_sequence: None,
+                };
+                bytes.extend(serde_json::to_vec(&outcome_record).unwrap());
+                bytes.push(b'\n');
+                if acknowledged {
+                    let acknowledgement = JournalRecord {
+                        version: 1,
+                        operation_id: operation_id.to_owned(),
+                        kind: "acknowledged".to_owned(),
+                        receipt: None,
+                        method: None,
+                        intent: None,
+                        outcome: None,
+                        digest: Some(digest),
+                        outbox_sequence: None,
+                    };
+                    bytes.extend(serde_json::to_vec(&acknowledgement).unwrap());
+                    bytes.push(b'\n');
+                }
+            }
+            assert_eq!(
+                String::from_utf8_lossy(&bytes)
+                    .matches(raw_question)
+                    .count(),
+                2
+            );
+            write_private_new(&journal.path(operation_id).unwrap(), &bytes).unwrap();
+            expected.push((operation_id, receipt, outcome_sha256, intent));
+        }
+        drop(journal);
+
+        let journal = OperationJournal::open(
+            &root,
+            "binding-legacy-question",
+            1,
+            "fixture-scope",
+            &"e".repeat(64),
+        )
+        .unwrap();
+        assert_eq!(
+            journal
+                .recover_startup_window("ADAPTER_RESTART_AFTER_EFFECT_MARKER")
+                .unwrap(),
+            2
+        );
+        assert!(journal.startup_recovery_complete().unwrap());
+
+        for (operation_id, receipt, old_outcome_sha256, old_intent) in expected {
+            let path = journal.path(operation_id).unwrap();
+            let persisted = std::fs::read_to_string(path).unwrap();
+            assert!(!persisted.contains(raw_question));
+            assert!(!persisted.contains(raw_answer));
+            let state = journal.get(operation_id).unwrap().unwrap();
+            assert_eq!(state.receipt.as_ref(), Some(&receipt));
+            assert!(!state.native_replay_permitted());
+            let native = state.intent.as_ref().unwrap().get("native").unwrap();
+            assert!(native.get("reply").is_none());
+            assert_eq!(
+                native["request_sha256"],
+                old_intent["native"]["request_sha256"]
+            );
+            assert_eq!(native["reply_sha256"], old_intent["native"]["reply_sha256"]);
+
+            if operation_id == "legacy-question-applied" {
+                let outcome_sha256 = old_outcome_sha256.unwrap();
+                assert_eq!(state.outcome, Some(applied_outcome.clone()));
+                assert_eq!(
+                    state.outcome_sha256.as_deref(),
+                    Some(outcome_sha256.as_str())
+                );
+                assert_eq!(
+                    state.acknowledged_sha256.as_deref(),
+                    Some(outcome_sha256.as_str())
+                );
+                journal.acknowledge(operation_id, &applied_outcome).unwrap();
+            } else {
+                let outcome = state.outcome.as_ref().unwrap();
+                assert_eq!(outcome["operation_id"], operation_id);
+                assert_eq!(outcome["outcome"], "unknown");
+                assert_eq!(outcome["details"]["replay_permitted"], false);
+                assert_eq!(state.acknowledged_sha256, None);
+                assert_eq!(
+                    state.outcome_sha256.as_deref(),
+                    Some(digest_json(outcome).unwrap().as_str())
+                );
+            }
+
+            let retry = journal
+                .write_intent(operation_id, &receipt, "agent.reply", &old_intent)
+                .expect_err("migrated question intent cannot authorize a fresh effect");
+            assert_eq!(retry.code, "ADAPTER_INTENT_EXISTS");
+        }
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
     }
