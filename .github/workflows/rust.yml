@@ -775,11 +775,13 @@ jobs:
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'attempt_control_requires_current_gm_scope_and_exact_live_attempt' -Expected 1 -ExpectedNames @('attempt_control_requires_current_gm_scope_and_exact_live_attempt')
           } elseif ($env:QUALIFICATION -ceq 'focused-isolation') {
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'invalid_operation_id_is_quarantined_and_waiting_deadline_survives' -Expected 1 -ExpectedNames @('invalid_operation_id_is_quarantined_and_waiting_deadline_survives')
-            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'legacy_worker_demand_poison_tests' -Expected 4 -ExpectedNames @(
+            Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'legacy_worker_demand_poison_tests' -Expected 6 -ExpectedNames @(
               'legacy_demand_poison_reaches_existing_check_and_launch_isolators',
               'legacy_demand_quarantined_launch_is_stable_and_changed_bytes_reactivate',
               'legacy_demand_corrupt_entry_and_route_activate_only_existing_owners',
-              'legacy_demand_valid_bits_and_actual_schema_failure_remain_distinct'
+              'legacy_demand_valid_bits_and_actual_schema_failure_remain_distinct',
+              'legacy_demand_valid_json_damaged_entry_activates_and_quarantine_stays_stable',
+              'legacy_demand_valid_schema_damage_checks_past_exact_quarantine'
             )
             Invoke-FocusedCohort -Package 'swarm-kernel-host' -Filter 'store_authenticated_task_list_delta_bounded_gap_tail_recovery' -Expected 1 -ExpectedNames @('store_authenticated_task_list_delta_bounded_gap_tail_recovery')
             Invoke-FocusedCohort -Package 'swarm-script-worker' -Filter 'script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256' -Expected 1 -ExpectedNames @('script_run_canonical_golden_v1_matches_exact_bytes_and_bare_sha256')
