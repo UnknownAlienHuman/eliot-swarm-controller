@@ -18,8 +18,9 @@ faithful port of the `swarm-client` semantics that matter to a client:
   object `{"client_id", "token"}` — the exact shape of
   `swarm-contracts::Credential` (unknown fields are rejected on both sides).
 - **Framing**: one JSON-RPC 2.0 object per line, compact UTF-8 bytes with a
-  1 MiB frame bound, 15 s write timeout per frame, and a 60 s reply timeout —
-  the `IpcConfig` defaults. Invalid outbound JSON is rejected before writing.
+  1 MiB frame bound, 15 s write timeout per frame, and a 60 s total deadline
+  for the complete reply frame, including partial reads — the `IpcConfig`
+  defaults. Invalid outbound JSON is rejected before writing.
 - **No blind retries**: a failed write, a missing reply, invalid UTF-8/JSON,
   unsupported JSON constants, or a mismatched response is `OUTCOME_UNKNOWN`.
   Malformed error envelopes (including non-`i64` error codes) also poison the

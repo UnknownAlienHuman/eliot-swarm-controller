@@ -45,6 +45,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import uuid
 
 MAX_FRAME_BYTES = 1_048_576
@@ -132,7 +133,8 @@ class _LineSocket:
                 "operation before retrying"
             )
 
-    def read_line(self) -> str:
+    def read_line(self, timeout_seconds: float) -> str:
+        deadline = time.monotonic() + timeout_seconds
         while True:
             idx = self._buf.find(b"\n")
             if idx >= 0:
@@ -146,7 +148,15 @@ class _LineSocket:
                     raise outcome_unknown("reply was not valid UTF-8") from exc
             if len(self._buf) > self._limit:
                 raise outcome_unknown("reply exceeded the frame bound")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise outcome_unknown(
+                    "reply deadline expired; inspect the operation before retrying"
+                )
             try:
+                # Socket timeouts apply to each recv. Reduce the timeout after
+                # every partial chunk so the complete reply has one deadline.
+                self._sock.settimeout(remaining)
                 chunk = self._sock.recv(65536)
             except socket.timeout:
                 raise outcome_unknown(
@@ -269,11 +279,7 @@ class SwarmClient:
             ) from exc
         self._usable = False
         self._io.send_line(data)
-        try:
-            self._io._sock.settimeout(READ_TIMEOUT_SECONDS)
-        except OSError as exc:
-            raise outcome_unknown("reply could not be read") from exc
-        frame = self._io.read_line()
+        frame = self._io.read_line(READ_TIMEOUT_SECONDS)
         try:
             response = json.loads(frame, parse_constant=_reject_json_constant)
         except ValueError:
@@ -437,6 +443,15 @@ def _fake_host(
                 return
             elif mode == "timeout":
                 return
+            elif mode == "slow-fragments":
+                for _ in range(8):
+                    time.sleep(0.04)
+                    conn.sendall(b" ")
+                reply = {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"method": request["method"], "params": request["params"]},
+                }
             elif mode == "wrong-id":
                 reply = {"jsonrpc": "2.0", "id": "someone-else", "result": {}}
             elif mode in ("bool-error-code", "overflow-error-code", "null-error-result"):
@@ -538,6 +553,8 @@ def _selftest_client(sock, credential: dict, limit: int = MAX_FRAME_BYTES):
 
 
 def selftest() -> int:
+    from unittest.mock import patch
+
     checks = []
 
     def record(name: str, ok: bool, detail: str = ""):
@@ -618,18 +635,16 @@ def selftest() -> int:
             if mode == "ok":
                 record(
                     "write/read timeouts reset around each frame",
-                    observed.timeout_values
-                    == [
-                        WRITE_TIMEOUT_SECONDS,
-                        READ_TIMEOUT_SECONDS,
-                        WRITE_TIMEOUT_SECONDS,
-                        READ_TIMEOUT_SECONDS,
-                    ]
+                    len(observed.timeout_values) == 4
+                    and observed.timeout_values[0] == WRITE_TIMEOUT_SECONDS
+                    and 0 < observed.timeout_values[1] <= READ_TIMEOUT_SECONDS
+                    and observed.timeout_values[2] == WRITE_TIMEOUT_SECONDS
+                    and 0 < observed.timeout_values[3] <= READ_TIMEOUT_SECONDS
                     and [value for event, value in observed.events if event == "send"]
                     == [WRITE_TIMEOUT_SECONDS, WRITE_TIMEOUT_SECONDS]
                     and sum(event == "recv" for event, _ in observed.events) >= 2
                     and all(
-                        value == READ_TIMEOUT_SECONDS
+                        0 < value <= READ_TIMEOUT_SECONDS
                         for event, value in observed.events
                         if event == "recv"
                     ),
@@ -748,8 +763,52 @@ def selftest() -> int:
             "read timeout poisons and refuses an implicit retry",
             read_timeout_unknown
             and read_retry_refused
-            and observed.timeout_values
-            == [WRITE_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS] * 2
+            and len(observed.timeout_values) == 4
+            and observed.timeout_values[0] == WRITE_TIMEOUT_SECONDS
+            and 0 < observed.timeout_values[1] <= READ_TIMEOUT_SECONDS
+            and observed.timeout_values[2] == WRITE_TIMEOUT_SECONDS
+            and 0 < observed.timeout_values[3] <= READ_TIMEOUT_SECONDS
+            and not thread.is_alive(),
+        )
+
+        client_sock, host_sock = socket.socketpair()
+        seen = []
+        wire = []
+        thread = threading.Thread(
+            target=_fake_host, args=(host_sock, "slow-fragments", seen, wire), daemon=True
+        )
+        thread.start()
+        observed = _ObservedSocket(client_sock)
+        read_timeout_seconds = 0.12
+        with patch(f"{__name__}.READ_TIMEOUT_SECONDS", read_timeout_seconds):
+            client = _selftest_client(observed, credential)
+            started = time.monotonic()
+            try:
+                client.request("host.status", {})
+                slow_frame_timed_out = False
+            except ConnectorError as exc:
+                slow_frame_timed_out = exc.code == "OUTCOME_UNKNOWN"
+            elapsed = time.monotonic() - started
+            try:
+                client.request("host.status", {})
+                slow_retry_refused = False
+            except ConnectorError as exc:
+                slow_retry_refused = exc.code == "DISCONNECTED"
+        status_read_timeouts = observed.timeout_values[3:]
+        shortened_timeout_used = any(
+            current < previous
+            for previous, current in zip(status_read_timeouts, status_read_timeouts[1:])
+        )
+        thread.join(timeout=5)
+        observed.close()
+        record(
+            "slow partial reply fragments share one absolute deadline",
+            slow_frame_timed_out
+            and elapsed < 0.25
+            and slow_retry_refused
+            and shortened_timeout_used
+            and [request["method"] for request in seen]
+            == ["client.hello", "host.status"]
             and not thread.is_alive(),
         )
 
@@ -778,15 +837,16 @@ def selftest() -> int:
             "write timeout poisons and refuses an implicit retry",
             write_timeout_unknown
             and write_retry_refused
-            and observed.timeout_values
-            == [WRITE_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS, WRITE_TIMEOUT_SECONDS]
+            and len(observed.timeout_values) == 3
+            and observed.timeout_values[0] == WRITE_TIMEOUT_SECONDS
+            and 0 < observed.timeout_values[1] <= READ_TIMEOUT_SECONDS
+            and observed.timeout_values[2] == WRITE_TIMEOUT_SECONDS
             and len(seen) == 1
             and not thread.is_alive(),
         )
 
         # The repository count check stays offline while exercising all pages.
         import urllib.parse
-        from unittest.mock import patch
 
         class _Response:
             def __init__(self, payload):

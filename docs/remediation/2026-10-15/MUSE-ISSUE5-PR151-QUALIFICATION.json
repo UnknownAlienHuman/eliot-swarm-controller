@@ -1,0 +1,104 @@
+{
+  "schema": "muse.issue5_pr151_qualification.v1",
+  "recorded_at_utc": "2026-10-15T00:47:29Z",
+  "overall_status": "PARTIAL_PROGRESS",
+  "branch": "codex/muse-current-native-qualification-20261015",
+  "source_head_before_changes": "9add2135fadbd081168b63da02a90cf1fd24c9ed",
+  "scope": {
+    "issue": {
+      "number": 5,
+      "state": "OPEN",
+      "latest_comment_id": 6125269561,
+      "latest_comment_at_utc": "2026-10-12T13:29:31Z"
+    },
+    "pull_request": {
+      "number": 151,
+      "state": "MERGED",
+      "merged_at_utc": "2026-10-14T09:03:41Z",
+      "merge_commit": "f1a05345dedb9a592a19269cc9bb90dfacfb294e",
+      "post_merge_finding": "P2 per-recv timeout renews the claimed 60 second reply deadline",
+      "finding_comment_at_utc": "2026-10-14T11:44:13Z"
+    },
+    "github_writes": false
+  },
+  "prior_muse_evidence": [
+    {
+      "path": "docs/remediation/2026-10-12/MUSE-CHECKPOINT-VERIFICATION.json",
+      "artifact": "muse-sdk-1.3.0-bridge.10",
+      "sdk_version": "1.3.0",
+      "scope": "checkpoint-corruption fixture and host-consumer verification; installed Muse/Max activation not performed"
+    },
+    {
+      "path": "docs/remediation/2026-10-12/MUSE-BOUNDED-OBSERVATION-VERIFICATION.json",
+      "artifact": "muse-sdk-1.3.0-bridge.11",
+      "sdk_version": "1.3.0",
+      "scope": "bounded observation fixtures and scoped host consumers; installed Muse/model activation not performed"
+    },
+    {
+      "path": "docs/remediation/2026-10-12/MUSE-ANTIGRAVITY-DOC-EVIDENCE-RECONCILIATION.json",
+      "scope": "documentation reconciliation only; no new builds or tests; full qualification false"
+    }
+  ],
+  "installed_runtime_preflight": {
+    "muse_cli": "Muse Code 1.4.0 (1.4.0-R4161.1)",
+    "muse_cli_advertised_provider_modes": ["meta", "echo"],
+    "muse_cli_advertised_reasoning_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    "muse_cli_model_selection": "accepts a model ID string; no native model catalog was advertised by help",
+    "muse_auth_read_only_status": "unavailable; `muse auth list` returned `expected auth set`",
+    "meta_api_key_environment_variable_present": false,
+    "native_authorization_status": "UNVERIFIED; no login or credential operation performed",
+    "node_version": "v25.6.1",
+    "eliot_cli": "swarm 0.1.0",
+    "source_module_artifact": "muse-sdk-1.3.0-bridge.11",
+    "source_module_sdk_requirement": "@muse-code/sdk@1.3.0",
+    "source_module_sdk_install_state": "UNMET DEPENDENCY in modules/muse; installation prohibited and not attempted",
+    "shipped_muse_route_enabled": false,
+    "eliot_status": "IO_ERROR: configured .swarm-controller state path does not exist",
+    "matching_eliot_or_muse_named_pipe_observed": false,
+    "running_swarm_or_muse_executable_observed": false,
+    "codebase_memory_mcp": "UNAVAILABLE in this session's tool/resource inventory"
+  },
+  "requested_native_route": {
+    "provider": "meta-muse",
+    "model_id": "muse-spark-1.3-contributor",
+    "reasoning_effort": "xhigh",
+    "disposition": "BLOCKED_PREPROMPT",
+    "blockers": [
+      "Installed Muse CLI advertises provider modes meta and echo; it does not advertise meta-muse.",
+      "The CLI accepts a model ID string but does not advertise the exact model as a native available option.",
+      "A read-only account/auth status is unavailable, so the selected authorized Meta account and route cannot be established.",
+      "The source bridge's pinned SDK dependency is absent in this worktree and the shipped ELIOT Muse route is disabled.",
+      "No ELIOT host state path or matching control pipe is present; no historical service was restarted."
+    ],
+    "proxy_catalog_used_as_native_evidence": false,
+    "model_prompt_sent": false
+  },
+  "native_execution": {
+    "status": "NOT_RUN",
+    "open_send_output": "NOT_RUN",
+    "resume": "NOT_RUN",
+    "current_boot_id": null,
+    "native_root_id": null,
+    "requested_model": "meta-muse/muse-spark-1.3-contributor",
+    "effective_model": null,
+    "observed_model": null,
+    "requested_effort": "xhigh",
+    "effective_effort": null,
+    "observed_effort": null,
+    "actual_output": null,
+    "module_run_owner_pid": null,
+    "named_pipe": null,
+    "job_membership": null,
+    "reason": "Route and authorization checks failed before prompt admission; no module or native process was started."
+  },
+  "pr151_connector_repair": {
+    "change": "Use one monotonic deadline for the complete reply frame, reducing the socket timeout before each recv; document that partial reads share the deadline.",
+    "regression": "The offline fake host sends eight spaced whitespace fragments before its complete reply; the client reports OUTCOME_UNKNOWN by the total deadline and refuses an implicit retry.",
+    "verification": {
+      "command": "python tools/muse-connector/swarm_connector.py selftest",
+      "status": "PASS",
+      "result": "45/45 passed",
+      "diff_check": "PASS"
+    }
+  }
+}
