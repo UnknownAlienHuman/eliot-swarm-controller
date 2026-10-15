@@ -842,7 +842,7 @@ async function launchConnection(options) {
     latest.host_death=hostDeathObservation(latest.host_durability?.profile,exit,Date.now());closeNativeUsageConnection();changed();},
     ()=>{nativeReady=false;nativeConnectionExited=true;latest.execution='native_failed';
     latest.host_death=hostDeathObservation(latest.host_durability?.profile,null,Date.now());closeNativeUsageConnection();changed();});
-  msp=await handshake.initialize({clientInfo:{name:'eliot-swarm-controller',version:'0.1.0'}});
+  msp=await handshake.initialize({clientInfo:{name:'eliot_swarm_controller',version:'0.1.0'}});
   beginNativeUsageConnection();
   const init=msp.initializeResult;
   const home=await realpath(required(init,'museHome'));

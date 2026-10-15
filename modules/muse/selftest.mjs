@@ -367,6 +367,9 @@ function handle(frame){
   }
   audit.methods.push(frame.method);
   if(frame.method==='initialize'){
+    if(!/^[a-z0-9_]+$/.test(frame.params?.clientInfo?.name??'')){
+      respond(frame.id,null,{code:-32602,message:'clientInfo.name must match ^[a-z0-9_]+$'});return;
+    }
     respond(frame.id,{museHome:home,serverInfo:{name:'fixture-muse',version:'1'},schema:{fingerprint:'fixture-schema'}});return;
   }
   if(frame.method==='session/read'){
