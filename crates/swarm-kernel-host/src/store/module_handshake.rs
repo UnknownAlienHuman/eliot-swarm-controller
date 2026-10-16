@@ -307,8 +307,8 @@ pub(super) fn reserve_descriptor_install(
         ));
     }
     let pending: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM operations WHERE method=?1 AND state='queued'",
-        ["module.descriptor.install"],
+        "SELECT COUNT(*) FROM operations WHERE method=?1 AND state='queued' AND operation_id != ?2",
+        params!["module.descriptor.install", operation_id],
         |row| row.get(0),
     )?;
     if pending >= MAX_PENDING_DESCRIPTOR_INSTALLS {
@@ -1515,7 +1515,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);\
-             CREATE TABLE operations(method TEXT NOT NULL,state TEXT NOT NULL);",
+             CREATE TABLE operations(operation_id TEXT NOT NULL,method TEXT NOT NULL,state TEXT NOT NULL);",
         )
         .unwrap();
         let tx = db.unchecked_transaction().unwrap();
@@ -1550,17 +1550,33 @@ mod tests {
             client_id: "local-operator".to_owned(),
             role: Role::Operator,
         };
+        // Production Store::call pre-inserts the current Operation as queued
+        // before reserve runs; the single-flight gate must exclude that self row.
+        tx.execute(
+            "INSERT INTO operations(operation_id,method,state) VALUES('op-install-1','module.descriptor.install','queued')",
+            [],
+        )
+        .unwrap();
         let (receipt, queued) =
             reserve_descriptor_install(&tx, &operator, &params, "op-install-1").unwrap();
         assert!(queued);
         assert_eq!(receipt["state"], "queued");
+        // Self replay with the same Operation ID stays accepted.
+        let (replay, replay_queued) =
+            reserve_descriptor_install(&tx, &operator, &params, "op-install-1").unwrap();
+        assert!(replay_queued);
+        assert_eq!(replay["operation_id"], "op-install-1");
         tx.execute(
-            "INSERT INTO operations(method,state) VALUES('module.descriptor.install','queued')",
+            "INSERT INTO operations(operation_id,method,state) VALUES('op-other-pending','module.descriptor.install','queued')",
             [],
         )
         .unwrap();
+        let other_params = json!({
+            "client_request_id":"descriptor-install-2",
+            "descriptor_file":params["descriptor_file"].clone(),
+        });
         assert_eq!(
-            reserve_descriptor_install(&tx, &operator, &params, "op-install-2")
+            reserve_descriptor_install(&tx, &operator, &other_params, "op-install-2")
                 .unwrap_err()
                 .code,
             "MODULE_INSTALL_IN_PROGRESS"
