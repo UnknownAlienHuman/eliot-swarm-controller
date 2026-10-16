@@ -218,6 +218,36 @@ Its status page remains a status/diagnostic readback with
 `task_completion: "unknown"`; version 4 is not a productive readback
 qualification.
 
+## Hot descriptor installation (Operator-only, no live restart)
+
+Source: branch `codex/swarm-hotupdate-20261016ah`, tip `78924754 fix(modules): normalize install-control failure at the exact actor boundary`, range `3552b434..78924754` (read via `git show`; no checkout, no build/run).
+
+Public input/API and finite effect:
+
+- Method `module.descriptor.install` (Mutation, MCP typed, participant None) admits one already-installed descriptor file. Input shape is `ModuleDescriptorInstallRequest { descriptor_file: absolute PathBuf }`; non-absolute or placeholder paths are rejected before any state change.
+- Operator-only: `Role::Operator` plus local-operator ownership (`require_local_operator`); Manager calls are rejected. Single-flight guard `MAX_PENDING_DESCRIPTOR_INSTALLS = 1` (`MODULE_INSTALL_IN_PROGRESS`); the current Operation row is excluded from its own guard (6e391ae9) because Store pre-inserts it as queued.
+- The call returns a durable queued Operation only. It does not select a route, create a binding, or start/spawn a worker. The live standalone supervisor settles it via `install_requests(false)` / `complete_install_request`, and Store completes it via `complete_descriptor_install` to `Settled` (`Installed`/`Unchanged`) or `Rejected`. Result projections never include local paths.
+
+Installed receipt/hash (exact match, no probing):
+
+- The file must already exist under the configured absolute `install_root` with its sibling `install-receipt.json` (`eliot.module_install_receipt.v1`, schema_version 1, 65_536-byte limits). `load_installed_descriptor(descriptor_path, install_root)` requires absolute paths, rejects link ancestors, canonicalizes under the root, validates the descriptor, and requires exact equality of module/artifact/version/build, `launch.executable` vs receipt `installed_file`, `executable_sha256` vs `installed_sha256`, `source_sha256 == staged_sha256 == installed_sha256`, and both file hashes. Mismatch is `MODULE_INSTALL_RECEIPT_MISMATCH`; oversize is `MODULE_DESCRIPTOR_LIMIT` / `MODULE_INSTALL_RECEIPT_LIMIT`.
+- Supervisor registration (`register_installed_descriptor`) re-validates the descriptor, requires `launch.executable_sha256`, canonicalizes the executable, re-hashes bytes, and rejects mismatch (`MODULE_ARTIFACT_MISMATCH`) or unavailable bytes (`MODULE_ARTIFACT_UNAVAILABLE`). The Store receipt is validated before the candidate catalog becomes visible; old versions are kept, new versions are added immutably (`extend_descriptor_catalog`).
+
+Active bindings/PIDs unchanged; manager selects route later:
+
+- A successful install only extends the descriptor catalog (bumping `catalog_revision`, receipt `registered`/`unchanged`) and retains the explicit absolute descriptor path for the next restart. It does not restart, rebind, or signal active bindings/workers; existing PIDs keep running.
+- Restart safety is checked before catalog publication: `ensure_hot_descriptor_restartable` proves the combined `SupervisorBootstrap` (spawn config + retained `descriptor_files`, max 512) still serializes into the 65_536-byte child frame; `check_hot_bootstrap_capacity` rejects oversize with `MODULE_BOOTSTRAP_LIMIT`, settling only its own Operation while catalog and live workers stay unchanged. Admitted paths accumulate in `hot_retained_paths` for cumulative accounting in the same supervisor lifetime.
+- Route selection is a separate manager step: reread `module.catalog.get`, then call `module.route.select` with exact `route_alias/module_id/artifact_id/version/expected_catalog_revision`. Selection applies only to that identity's future bindings, as documented above. Control-error conversion at host boundaries is exact-actor (31ed8f3e, 78924754); no broader retry/ownership change.
+
+Explicit paths retained for restart:
+
+- `[module_supervisor] install_root` (absolute, no reparse traversal) plus explicit `descriptor_files` entries. Hot installs append the validated absolute path via `append_retained_descriptor_files`; restart rebuilds the child bootstrap from that retained set.
+
+Qualification boundary (no invented runtime success):
+
+- Focused source-level tests added in this range (read, not run here; Root owns build/test): `descriptor_install_request_is_local_operator_owned_and_single_flight`, `completed_descriptor_install_is_idempotent_and_restores_its_explicit_path`, `descriptor_install_result_never_projects_local_paths`, `installed_descriptor_accepts_path_spellings_and_rejects_changed_bytes`, `candidate_catalog_keeps_old_version_and_adds_immutable_new_version`, `hot_update_byte_boundary_rejects_before_catalog_publish`. This edit ran no Cargo/rustc/build/test, no native harness, no live host.
+- Live qualification still PENDING: native harness ownership stays with `tools/qualification/New-NativeQualification.ps1` / `Invoke-CoreFailureQualification.ps1` and the four pinned process coordinates plus release/provenance builders; no hot-install live run, restart readback, or release-guard change is claimed here.
+
 ## Package executable workspace coordinates
 
 `tools/ci/module-package-policy.json` pins the package, manifest, and single
