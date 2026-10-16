@@ -438,19 +438,14 @@ impl Controller {
                 pending.dispatch_admission.clone(),
             )
         };
-        let (turn, disposition) = self.stream.terminal_for(&conversation_id)?;
+        let (turn, disposition) = self
+            .stream
+            .terminal_for_after_foreign(&conversation_id, result_ordinal_before)?;
         let turn = turn.clone();
-        // Headless emits one terminal result per prompt and the caller must
-        // await it before the next prompt, so the settled turn must be the
-        // exact next ordinal for this prompt. Accepting any greater ordinal
-        // would let a later turn's result settle this Operation and publish
-        // that turn's response text as this prompt's answer. A stale or absent
-        // ordinal simply is not the terminal readback this prompt is waiting
-        // for, so it stays pending rather than becoming an Unknown outcome.
-        let expected_ordinal = result_ordinal_before.checked_add(1)?;
-        if turn.result_ordinal != expected_ordinal {
-            return None;
-        }
+        // The stream predicate proves that this is the first own result after
+        // the prompt baseline and that every earlier global ordinal was an
+        // explicitly identified foreign conversation. Keep the generation
+        // fence below: a retained result from another stream cannot settle it.
         let stream_generation = self.pending.as_ref()?.stream_generation;
         if stream_generation != self.stream.stream_generation {
             return None;
