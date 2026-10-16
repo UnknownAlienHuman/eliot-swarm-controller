@@ -911,7 +911,15 @@ async fn automatic_publication_retains_exact_cause_and_reuses_slot_after_gm_hand
         )
         .await
         .unwrap();
-    assert_eq!(explanation["publication"]["status"], "ready");
+    assert_eq!(explanation["publication"]["status"], "waiting_on_outcome");
+    assert_eq!(
+        explanation["publication"]["pending"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "the admitted queued Forge Operation keeps publication pending"
+    );
     assert_eq!(explanation["publication"]["catch_up_until"], Value::Null);
     assert!(
         explanation["publication"]["cursor"].as_i64().unwrap()
