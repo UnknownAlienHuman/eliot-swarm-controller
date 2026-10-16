@@ -204,6 +204,8 @@ function compactSession(s) {
     modelId:s.modelId, providerId:s.providerId, approvalMode:s.approvalMode, attention:s.attention, turnCount:s.turnCount };
 }
 const SESSION_LIST_LIMIT=200;
+const RECOVERY_VIEW_PAGE_LIMIT=100;
+const RECOVERY_VIEW_PAGE_MAX_PAGES=10;
 class NativeCompatibilityError extends Error {
   constructor(diagnosticCode,nativeError) {
     super(diagnosticCode);
@@ -789,6 +791,28 @@ async function refreshRoot() {
     latest.last_refresh = {at_ms:Date.now(),metadata_applied:fresh,pending_inventory_applied:pendingApplied,
       readback_method:read.method,...(read.viewCursor?{viewCursor:read.viewCursor}:{}),
       coverage:'root_metadata_and_pending_requests'};
+    // Resume a previously truncated parent-view scan from its persisted opaque
+    // continuation through this existing refresh read path. No poller: each bounded
+    // pass advances at most RECOVERY_VIEW_PAGE_MAX_PAGES further toward the head.
+    // Pre-disconnect cursors are not durable in stored state and view cursors stay
+    // opaque, so a fresh scan starts at the beginning and each truncation persists
+    // its resume point per exact root until the head is reached.
+    if(isRecord(latest.recovery_discovery_cursor)&&latest.recovery_discovery_cursor.parent_session_id===rootId) {
+      const refreshRootId=rootId;
+      const refreshMsp=msp;
+      try {
+        const continued=await discoveryPassShared(refreshRootId);
+        if(msp===refreshMsp&&rootId===refreshRootId) {
+          for(const id of continued.discovered) {
+            if(!children.has(id))continue;
+            void followChild(id);
+          }
+        }
+      } catch {
+        latest.gaps++;
+        changed();
+      }
+    }
     changed();
     return latest.last_refresh;
   })();
@@ -815,6 +839,10 @@ async function completeNative(entry, ack) {
     if(current) {
       void refreshRoot().catch(()=>{latest.gaps++;changed();});
       for(const id of children.keys())void followChild(id);
+      // session/resume+session/read run with excludeItems:true, so a child born
+      // while disconnected leaves no inline item. Page the durable parent view
+      // for subagent/reminderChild childSessionId provenance before following.
+      void discoverAndFollowMissedRootChildren().catch(()=>{latest.gaps++;changed();});
     }
     return;
   }
@@ -991,6 +1019,119 @@ async function refreshChild(id) {
 async function followChild(id) {
   try {await refreshChild(id);} catch {latest.gaps++;changed();}
 }
+function extractRecoveredChildProvenance(event, parentSessionId) {
+  if(!isRecord(event)||typeof event.method!=='string')return null;
+  if(event.method!=='item/started'&&event.method!=='item/updated'&&event.method!=='item/completed')return null;
+  const params=event.params;
+  if(!isRecord(params)||params.sessionId!==parentSessionId)return null;
+  const item=params.item;
+  if(!isRecord(item))return null;
+  if(item.kind!=='subagent'&&item.kind!=='reminderChild')return null;
+  if(typeof item.childSessionId!=='string'||!item.childSessionId)return null;
+  if(typeof item.itemId!=='string'||!item.itemId)return null;
+  if(!Number.isSafeInteger(item.revision))return null;
+  if(item.childSessionId===parentSessionId)return null;
+  return {childSessionId:item.childSessionId,itemId:item.itemId,subagentId:item.subagentId,parentTurnId:item.turnId,status:item.status,controlStatus:item.controlStatus,revision:item.revision,kind:item.kind};
+}
+async function discoverMissedChildrenFromParentView(parentSessionId) {
+  if(!msp||!parentSessionId)throw new Error('NATIVE_NOT_OPEN');
+  if(parentSessionId!==rootId)throw new Error('RECOVERY_DISCOVERY_ROOT_ONLY');
+  // A truncated pass persists its opaque resume point per exact root; a fresh scan
+  // starts at the beginning. Pre-disconnect cursors are not durable in stored
+  // state and view cursors stay opaque, so continuation is the only contract
+  // available forward progress. A stale point for another root is reset here.
+  const storedContinuation=latest.recovery_discovery_cursor;
+  if(isRecord(storedContinuation)&&storedContinuation.parent_session_id!==parentSessionId)delete latest.recovery_discovery_cursor;
+  const resumeFrom=(isRecord(storedContinuation)&&storedContinuation.parent_session_id===parentSessionId&&typeof storedContinuation.cursor==='string'&&storedContinuation.cursor)?storedContinuation.cursor:undefined;
+  const mspAtEntry=msp;
+  const connectionAtEntry=msp.connection;
+  const bootAtEntry=bootId;
+  const rootAtEntry=rootId;
+  function fenced() {
+    if(msp!==mspAtEntry||!msp||msp.connection!==connectionAtEntry||rootId!==rootAtEntry||bootId!==bootAtEntry||parentSessionId!==rootAtEntry)throw new NativeCompatibilityError('NATIVE_WORK_SNAPSHOT_CHANGED_DURING_READ');
+  }
+  let cursor=resumeFrom;
+  const seen=new Set();
+  let pages=0;
+  let eventsScanned=0;
+  const discovered=[];
+  let truncated=true;
+  let resumeAt=null;
+  while(pages<RECOVERY_VIEW_PAGE_MAX_PAGES) {
+    let page;
+    try {
+      page=await msp.connection.request('view/page',{sessionId:parentSessionId,limit:RECOVERY_VIEW_PAGE_LIMIT,direction:'forward',...(cursor===undefined?{}:{cursor})});
+    } catch(error) {
+      if(methodNotFound(error))throw new NativeCompatibilityError('NATIVE_VIEW_PAGE_UNSUPPORTED',nativeErrorOf(error));
+      throw error;
+    }
+    fenced();
+    if(!isRecord(page)||!Array.isArray(page.events)||!(page.nextCursor===null||typeof page.nextCursor==='string'))throw new NativeCompatibilityError('NATIVE_VIEW_PAGE_RESPONSE_INVALID');
+    pages++;
+    for(const event of page.events) {
+      eventsScanned++;
+      const provenance=extractRecoveredChildProvenance(event,parentSessionId);
+      if(!provenance)continue;
+      const old=children.get(provenance.childSessionId);
+      if(!old&&children.size>=2000) {
+        latest.gaps++;
+        continue;
+      }
+      if(!old||provenance.itemId!==old.itemId||!Number.isSafeInteger(old.revision)||provenance.revision>old.revision) {
+        const wasFresh=old?.snapshot_freshness==='fresh';
+        children.set(provenance.childSessionId,{...old,sessionId:provenance.childSessionId,parentSessionId,itemId:provenance.itemId,subagentId:provenance.subagentId,parentTurnId:provenance.parentTurnId,status:provenance.status,controlStatus:provenance.controlStatus,revision:provenance.revision,kind:provenance.kind,snapshot_freshness:wasFresh?'stale':old?.snapshot_freshness??'unknown',snapshot_freshness_reason:wasFresh?'recovered_parent_provenance_after_read':old?.snapshot_freshness_reason??'recovered_parent_provenance_before_read',result_available:old?.result_available??false});
+        changed();
+        if(!old)discovered.push(provenance.childSessionId);
+      }
+    }
+    if(page.nextCursor===null) {
+      truncated=false;
+      break;
+    }
+    if(page.nextCursor===cursor||seen.has(page.nextCursor))throw new NativeCompatibilityError('NATIVE_PAGINATION_NOT_ADVANCING');
+    cursor=page.nextCursor;
+    seen.add(cursor);
+    resumeAt=cursor;
+    fenced();
+  }
+  fenced();
+  const atMs=Date.now();
+  if(truncated) {
+    if(typeof resumeAt!=='string'||!resumeAt)throw new NativeCompatibilityError('NATIVE_VIEW_PAGE_RESPONSE_INVALID');
+    latest.recovery_discovery_cursor={parent_session_id:parentSessionId,cursor:resumeAt,at_ms:atMs};
+    latest.gaps++;
+  } else if(latest.recovery_discovery_cursor?.parent_session_id===parentSessionId)delete latest.recovery_discovery_cursor;
+  latest.recovery_discovery={at_ms:atMs,parent_session_id:parentSessionId,pages,events_scanned:eventsScanned,discovered_count:discovered.length,discovered_child_session_ids:discovered.slice(0,100),truncated,continued_from_cursor:resumeFrom!==undefined,coverage:'root_view_page_child_provenance'};
+  changed();
+  return {pages,eventsScanned,discovered,truncated};
+}
+let discoveryInFlight;
+function discoveryPassShared(parentSessionId) {
+  if(discoveryInFlight)return discoveryInFlight;
+  discoveryInFlight=(async()=>{
+    try {
+      return await discoverMissedChildrenFromParentView(parentSessionId);
+    } finally {
+      discoveryInFlight=undefined;
+    }
+  })();
+  return discoveryInFlight;
+ }
+async function discoverAndFollowMissedRootChildren() {
+  if(!msp||!rootId)throw new Error('NATIVE_NOT_OPEN');
+  const rootAtEntry=rootId;
+  const mspAtEntry=msp;
+  const connectionAtEntry=msp.connection;
+  const bootAtEntry=bootId;
+  const outcome=await discoveryPassShared(rootAtEntry);
+  if(msp!==mspAtEntry||!msp||msp.connection!==connectionAtEntry||rootId!==rootAtEntry||bootId!==bootAtEntry)throw new NativeCompatibilityError('NATIVE_WORK_SNAPSHOT_CHANGED_DURING_READ');
+  for(const id of outcome.discovered) {
+    if(msp!==mspAtEntry||msp.connection!==connectionAtEntry||rootId!==rootAtEntry||bootId!==bootAtEntry)break;
+    if(!children.has(id))continue;
+    void followChild(id);
+  }
+  return outcome;
+}
 async function launchConnection(options) {
   if (handshake) throw new Error('NATIVE_ALREADY_OWNED');
   required(options,'workspaceRoot');
@@ -1094,6 +1235,8 @@ async function startNative(command,markNativeAdmissionPossible) {
   const r=await startNativeMcpSession(msp.connection,params,
     {maxAttempts:1,commandId:commandId(command)},mcpServers,latest,markNativeAdmissionPossible);
   rootId=required(r.session,'sessionId'); latest.session=compactSession(r.session);latest.execution=r.session.status;
+  // A new root resets any persisted discovery continuation for the previous one.
+  if(latest.recovery_discovery_cursor?.parent_session_id!==rootId)delete latest.recovery_discovery_cursor;
   // Persist the root identity before any further native work or readback
   // verdict: a crash after session/start must leave a recorded session that
   // explicit recovery can target, not an unrecorded one known only in memory.

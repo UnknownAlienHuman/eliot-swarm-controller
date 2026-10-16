@@ -1837,4 +1837,344 @@ process.stdin.on('end',()=>process.exit(0));
     'the admission acknowledgement records only the returned session identity');
   console.log('PASS native-mcp-servers: closed transport union admitted without invented defaults');
 }
+// 9. Recovery discovery through the actual bridge subprocess and fixture native view paging.
+// A resume with excludeItems true carries no inline items, so a child born while
+// disconnected is missed by metadata refresh plus known child follows. The bridge pages
+// the durable parent view for subagent and reminderChild provenance and follows each
+// newly proven child with an exact read. No session list family guess, no replay.
+{
+  async function runRecoveryDiscoveryScenario(scenario) {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "muse-recovery-discovery-"));
+    const stateDir = path.join(dir, "state");
+    const home = path.join(dir, "native-home");
+    await mkdir(stateDir);
+    await mkdir(home);
+    const canonicalHome = await realpath(home);
+    const nativeScope = "muse:" + process.platform + ":" + (process.platform === "win32" ? canonicalHome.toLowerCase() : canonicalHome);
+    const ownerFile = path.join(stateDir, "owner.json");
+    const token = "fixture-recovery-boot-" + scenario;
+    await writeFile(ownerFile, JSON.stringify({version: 1, process: {purpose: "module"}, token: token}));
+    const rootId = "ses_recovery_root";
+    const staleId = "ses_recovery_stale";
+    const missedId = "ses_recovery_missed";
+    const reminderId = "ses_recovery_reminder";
+    const rootSession = {sessionId: rootId, status: "idle", activeTurnId: null, modelId: "fixture-model", providerId: "fixture-provider", turnCount: 2};
+    const staleNative = {sessionId: staleId, status: "running", activeTurnId: "turn_stale_current", modelId: "fixture-model", providerId: "fixture-provider", turnCount: 1};
+    const missedNative = {sessionId: missedId, status: "running", activeTurnId: "turn_missed_current", modelId: "fixture-model", providerId: "fixture-provider", turnCount: 1};
+    const reminderNative = {sessionId: reminderId, status: "idle", activeTurnId: null, modelId: "fixture-model", providerId: "fixture-provider", turnCount: 0};
+    const staleCheckpoint = {sessionId: staleId, parentSessionId: rootId, itemId: "itm_stale_parent", subagentId: "sub_stale", parentTurnId: "turn_parent", status: "running", controlStatus: "running", revision: 1, snapshot: {sessionId: staleId, status: "running", activeTurnId: "turn_stale_old", modelId: "fixture-model", providerId: "fixture-provider", turnCount: 1}};
+    const savedChildren = scenario === "provenance-pagination-stale-fresh" ? [[staleId, staleCheckpoint]] : [];
+    const saved = {client_id: "muse-fixture-client", module_artifact_id: museDescriptor.artifact.artifact_id, boot_id: token, binding: {binding_id: "fixture-binding", generation: 1}, root_id: rootId, native_scope: nativeScope, route_defaults: {workspaceRoot: home, modelId: "fixture-model", providerId: "fixture-provider"}, latest: {execution: "recovery_required", family_completeness: "partial", gaps: 1, observed_children: [], pending_requests: []}, outcomes: [], native_pending: [], children: savedChildren, turns: []};
+    await writeFile(path.join(stateDir, "checkpoint.json"), JSON.stringify({version: 1, ...saved}));
+    const missedItem = {kind: "subagent", childSessionId: missedId, itemId: "itm_missed", revision: 2, subagentId: "sub_missed", turnId: "turn_parent", status: "running", controlStatus: "running"};
+    const reminderItem = {kind: "reminderChild", childSessionId: reminderId, itemId: "itm_reminder", revision: 1, turnId: "turn_parent", status: "running"};
+    const noteItem = {kind: "agentMessage", itemId: "itm_note", revision: 1, text: "not a child"};
+    const foreignItem = {kind: "subagent", childSessionId: "ses_foreign_child", itemId: "itm_foreign", revision: 1};
+    const nokeyItem = {kind: "subagent", itemId: "itm_nokey", revision: 3};
+    function viewEvent(item, cursor, seq, owner) {
+      return {method: "item/completed", params: {sessionId: owner, viewCursor: cursor, sourceRange: {first: {id: "e" + seq, sequence: seq}, last: {id: "e" + seq, sequence: seq}, stream: {id: owner, kind: "session"}}, item: item}};
+    }
+    const foreignEvent = viewEvent(foreignItem, "cur_foreign", 9, "ses_foreign_fixture");
+    const pagesFull = [{events: [viewEvent(missedItem, "cur_one", 1, rootId), viewEvent(noteItem, "cur_two", 2, rootId), foreignEvent, viewEvent(nokeyItem, "cur_four", 4, rootId), viewEvent(reminderItem, "cur_five", 5, rootId)], nextCursor: "cur_page_two"}, {events: [], nextCursor: null}];
+    let pagedEvents = [];
+    if (scenario === "beyond-first-pass") {
+      pagedEvents = [];
+      for (let i = 0; i < 1000; i++) pagedEvents.push(viewEvent({kind: "agentMessage", itemId: "itm_fill_" + i, revision: 1}, "cur_fill_" + i, 100 + i, rootId));
+      pagedEvents.push(viewEvent({kind: "subagent", childSessionId: missedId, itemId: "itm_far", revision: 3, subagentId: "sub_far", turnId: "turn_parent", status: "running", controlStatus: "running"}, "cur_far", 9999, rootId));
+    }
+    const nativeFixture = {scenario: scenario, home: home, rootId: rootId, staleId: staleId, missedId: missedId, reminderId: reminderId, sessions: {root: rootSession, stale: staleNative, missed: missedNative, reminder: reminderNative}, pagesFull: pagesFull, pagedEvents: pagedEvents};
+    const fixturePath = path.join(dir, "native-fixture.json");
+    const auditPath = path.join(dir, "native-audit.json");
+    await writeFile(fixturePath, JSON.stringify(nativeFixture));
+    const nativeScript = path.join(dir, "fake-native.mjs");
+    await writeFile(nativeScript, String.raw`
+import { readFile, writeFile } from "node:fs/promises";
+const arg = function(name) { const i = process.argv.indexOf(name); return i < 0 ? null : process.argv[i + 1]; };
+const home = arg("--home");
+const auditPath = arg("--audit");
+const fixturePath = arg("--fixtures");
+const fixture = JSON.parse(await readFile(fixturePath, "utf8"));
+const scenario = fixture.scenario;
+const audit = {methods: [], resumeExcludeItems: [], viewPageCalls: [], sessionReads: [], subscribes: [], forbidden: []};
+const save = function() { return writeFile(auditPath, JSON.stringify(audit)); };
+const respond = function(id, result, error) { process.stdout.write(JSON.stringify({jsonrpc: "2.0", id: id, ...(error ? {error: error} : {result: result})}) + "\n"); };
+function sessionFor(id) {
+  if (id === fixture.rootId) return fixture.sessions.root;
+  if (id === fixture.staleId) return fixture.sessions.stale;
+  if (id === fixture.missedId) return fixture.sessions.missed;
+  if (id === fixture.reminderId) return fixture.sessions.reminder;
+  return null;
+}
+async function handle(frame) {
+  if (typeof frame.method !== "string" || !Object.hasOwn(frame, "id")) return;
+  audit.methods.push(frame.method);
+  if (frame.method === "initialize") {
+    await save();
+    respond(frame.id, {museHome: home, serverInfo: {name: "fixture-muse", version: "1"}, schema: {fingerprint: "fixture-schema"}, sessionDurability: "durable", grantedCapabilities: []});
+    return;
+  }
+  if (frame.method === "usage/read") {
+    await save();
+    respond(frame.id, null, {code: -32601, message: "Method not found", data: {kind: "methodNotFound"}});
+    return;
+  }
+  if (frame.method === "session/read") {
+    audit.sessionReads.push(frame.params.sessionId);
+    await save();
+    const session = sessionFor(frame.params.sessionId);
+    if (!session) {
+      respond(frame.id, null, {code: -32004, message: "Fixture session is missing", data: {kind: "notFound"}});
+      return;
+    }
+    respond(frame.id, {session: session, viewCursor: "cursor_read_" + frame.params.sessionId});
+    return;
+  }
+  if (frame.method === "session/resume") {
+    audit.resumeExcludeItems.push(frame.params.excludeItems);
+    await save();
+    if (frame.params.sessionId !== fixture.rootId || frame.params.excludeItems !== true) {
+      respond(frame.id, null, {code: -32602, message: "Fixture resume identity violated", data: {kind: "invalidParams"}});
+      return;
+    }
+    respond(frame.id, {session: fixture.sessions.root, viewCursor: "cursor_resume_fixture"});
+    return;
+  }
+  if (frame.method === "view/page") {
+    audit.viewPageCalls.push({sessionId: frame.params.sessionId, limit: frame.params.limit, direction: frame.params.direction, cursor: frame.params.cursor === undefined ? null : frame.params.cursor});
+    await save();
+    if (scenario === "death-while-paging") {
+      process.exit(1);
+      return;
+    }
+    if (scenario === "nonadvancing") {
+      respond(frame.id, {events: [], nextCursor: "stuck_cursor"});
+      return;
+    }
+    if (scenario === "beyond-first-pass") {
+      const all = fixture.pagedEvents;
+      let start = 0;
+      const atCursor = frame.params.cursor === undefined ? null : frame.params.cursor;
+      if (atCursor !== null) {
+        const m = /^page_(\d+)$/.exec(atCursor);
+        if (!m) {
+          respond(frame.id, null, {code: -32602, message: "Fixture cursor unknown", data: {kind: "invalidParams"}});
+          return;
+        }
+        start = parseInt(m[1], 10) * 100;
+      }
+      const slice = all.slice(start, start + 100);
+      const pagesDone = (start / 100) + 1;
+      respond(frame.id, {events: slice, nextCursor: start + 100 < all.length ? "page_" + pagesDone : null});
+      return;
+    }
+    const index = audit.viewPageCalls.length - 1;
+    const page = fixture.pagesFull[index];
+    if (!page) {
+      respond(frame.id, null, {code: -32602, message: "Fixture page missing", data: {kind: "invalidParams"}});
+      return;
+    }
+    respond(frame.id, page);
+    return;
+  }
+  if (frame.method === "view/subscribe") {
+    audit.subscribes.push(frame.params.sessionId);
+    await save();
+    respond(frame.id, {});
+    return;
+  }
+  if (frame.method === "approval/listPending") {
+    await save();
+    respond(frame.id, {approvals: [], userInputs: []});
+    return;
+  }
+  if (frame.method === "session/list") {
+    await save();
+    respond(frame.id, {sessions: [fixture.sessions.root, fixture.sessions.stale, fixture.sessions.missed, fixture.sessions.reminder], nextCursor: null});
+    return;
+  }
+  const forbidden = ["turn/start", "turn/steer", "session/start", "session/fork", "approval/decide", "userInput/answer", "userInput/cancel", "userInput/clarify", "goal/set", "goal/edit", "goal/clear", "goal/pause", "goal/resume", "session/setModel", "session/setReasoningEffort", "session/setApprovalMode"];
+  if (forbidden.indexOf(frame.method) >= 0) audit.forbidden.push(frame.method);
+  await save();
+  respond(frame.id, {});
+}
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", function(chunk) {
+  buffer += chunk;
+  let end = -1;
+  while ((end = buffer.indexOf("\n")) >= 0) {
+    const line = buffer.slice(0, end);
+    buffer = buffer.slice(end + 1);
+    if (!line) continue;
+    try { void handle(JSON.parse(line)).catch(function() { process.exit(2); }); } catch (e) { process.exit(2); }
+  }
+});
+process.stdin.on("end", function() { process.exit(0); });
+`);
+    function storeRecoveryCommand(operationId, createdAtMs) {
+      const input = {expected_boot_id: token};
+      const inputSha256 = createHash("sha256").update(canonicalFixtureJson(input), "utf8").digest("hex");
+      return {operation_id: operationId, created_at_ms: createdAtMs, method: "agent.recover", binding_id: "fixture-binding", generation: 1, native_root_id: rootId, route: {runtime: "muse", module_artifact_id: museDescriptor.artifact.artifact_id}, input_sha256: inputSha256, input: input};
+    }
+    const recoverId = "80000000-0000-4000-8000-000000000001";
+    const commands = [storeRecoveryCommand(recoverId, AT_MS)];
+    const outcomes = new Map();
+    const observations = [];
+    function storeRefreshCommand(operationId, createdAtMs) {
+      const input = {};
+      const inputSha256 = createHash("sha256").update(canonicalFixtureJson(input), "utf8").digest("hex");
+      return {operation_id: operationId, created_at_ms: createdAtMs, method: "agent.refresh", binding_id: "fixture-binding", generation: 1, native_root_id: rootId, route: {runtime: "muse", module_artifact_id: museDescriptor.artifact.artifact_id}, input_sha256: inputSha256, input: input};
+    }
+    const refreshId = "80000000-0000-4000-8000-000000000002";
+    let refreshQueued = false;
+    let resolveFinished = null;
+    let rejectFinished = null;
+    const finished = new Promise(function(resolve, reject) { resolveFinished = resolve; rejectFinished = reject; });
+    function maybeAdvance() {
+      const state = observations[observations.length - 1];
+      const recoveryOutcome = outcomes.get(recoverId);
+      if (recoveryOutcome && recoveryOutcome.outcome !== "applied") {
+        rejectFinished(new Error("agent.recover did not apply in " + scenario + ": " + JSON.stringify(recoveryOutcome)));
+        return;
+      }
+      const ready = recoveryOutcome && recoveryOutcome.outcome === "applied" && state && state.recovery && state.recovery.status === "resumed";
+      if (!ready) return;
+      const kids = state.observed_children || [];
+      const byId = new Map(kids.map(function(c) { return [c.sessionId, c]; }));
+      if (scenario === "provenance-pagination-stale-fresh") {
+        const stale = byId.get(staleId);
+        const missed = byId.get(missedId);
+        const reminder = byId.get(reminderId);
+        if (stale && stale.snapshot_freshness === "fresh" && stale.snapshot && stale.snapshot.activeTurnId === "turn_stale_current" && missed && missed.snapshot_freshness === "fresh" && missed.snapshot && missed.snapshot.activeTurnId === "turn_missed_current" && missed.itemId === "itm_missed" && missed.revision === 2 && missed.parentSessionId === rootId && missed.parentTurnId === "turn_parent" && reminder && reminder.snapshot_freshness === "fresh" && reminder.itemId === "itm_reminder" && reminder.parentSessionId === rootId) resolveFinished();
+      } else if (scenario === "nonadvancing") {
+        if ((state.gaps || 0) >= 3 && kids.length === 0 && !state.recovery_discovery) resolveFinished();
+      } else if (scenario === "death-while-paging") {
+        if ((state.gaps || 0) >= 3 && !byId.has(missedId) && !state.recovery_discovery) resolveFinished();
+      } else if (scenario === "beyond-first-pass") {
+        if (!refreshQueued) {
+          if (state.recovery_discovery && state.recovery_discovery.truncated === true && (state.recovery_discovery.discovered_count || 0) === 0) {
+            refreshQueued = true;
+            commands.push(storeRefreshCommand(refreshId, AT_MS + 1));
+          }
+        } else {
+          const far = byId.get(missedId);
+          if (far && far.snapshot_freshness === "fresh" && far.itemId === "itm_far" && far.revision === 3 && outcomes.get(refreshId) && outcomes.get(refreshId).outcome === "applied") resolveFinished();
+        }
+      }
+    }
+    const pipeLead = String.fromCharCode(92, 92, 46, 92);
+    const endpoint = process.platform === "win32" ? pipeLead + "pipe" + String.fromCharCode(92) + "muse-recovery-" + scenario + "-" + randomUUID() : path.join(dir, "control.sock");
+    const server = net.createServer();
+    const sockets = new Set();
+    let teardownStarted = false;
+    async function respondHost(socket, packet) {
+      let result = {};
+      if (packet.method === "client.hello") result = {client_id: "muse-fixture-client"};
+      else if (packet.method === "module.hello") {
+        assert.deepEqual(packet.params.module_contract, museModuleContractClaim);
+        result = {binding_id: "fixture-binding", generation: 1, recovery_required: true, native_root_id: rootId, native_scope_key: nativeScope, module_contract_negotiation: museModuleContractNegotiation};
+      } else if (packet.method === "module.next") {
+        if (commands.length) result = {command: commands.shift()};
+        else await delay(10);
+      } else if (packet.method === "module.outcome") {
+        outcomes.set(packet.params.operation_id, packet.params);
+        maybeAdvance();
+      } else if (packet.method === "module.observe") {
+        observations.push(packet.params.state);
+        maybeAdvance();
+      }
+      socket.write(JSON.stringify({jsonrpc: "2.0", id: packet.id, result: result}) + "\n");
+    }
+    server.on("connection", function(socket) {
+      sockets.add(socket);
+      socket.setEncoding("utf8");
+      let buffer = "";
+      socket.on("close", function() { sockets.delete(socket); });
+      socket.on("error", function(error) {
+        if (teardownStarted && error && error.code === "ECONNRESET") return;
+        rejectFinished(new Error("recovery discovery host socket in " + scenario + ": " + ((error && error.code) || (error && error.message) || String(error))));
+      });
+      socket.on("data", function(chunk) {
+        buffer += chunk;
+        let end = -1;
+        while ((end = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, end);
+          buffer = buffer.slice(end + 1);
+          if (!line) continue;
+          let packet = null;
+          try { packet = JSON.parse(line); } catch (e) { rejectFinished(new Error("recovery discovery host received invalid JSON in " + scenario)); return; }
+          void respondHost(socket, packet).catch(rejectFinished);
+        }
+      });
+    });
+    let bridge = null;
+    let stderr = "";
+    let closed = null;
+    try {
+      await new Promise(function(resolve, reject) { server.once("error", reject); server.listen(endpoint, resolve); });
+      const credentialFile = path.join(dir, "credential.json");
+      const configFile = path.join(dir, "module.json");
+      await writeFile(credentialFile, JSON.stringify({client_id: "muse-fixture-client", token: "fixture-only"}));
+      await writeFile(configFile, JSON.stringify({endpoint: endpoint, credentialFile: credentialFile, moduleArtifactId: "muse-sdk-1.3.0-bridge.13", command: process.execPath, args: [nativeScript, "--home", home, "--audit", auditPath, "--fixtures", fixturePath]}));
+      const env = {PATH: process.env.PATH, ELIOT_SWARM_MODULE_STATE: stateDir, ELIOT_SWARM_MODULE_OWNER: ownerFile, TEMP: os.tmpdir(), TMP: os.tmpdir(), SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR};
+      bridge = spawn(process.execPath, [path.join(here, "bridge.mjs"), "--config", configFile], {cwd: here, env: env, windowsHide: true, stdio: ["ignore", "ignore", "pipe"]});
+      bridge.stderr.setEncoding("utf8");
+      bridge.stderr.on("data", function(chunk) { stderr = (stderr + chunk).slice(-4000); });
+      closed = new Promise(function(resolve) { bridge.once("close", function(code, signal) { resolve({code: code, signal: signal}); }); });
+      const deadline = Date.now() + 25000;
+      let done = false;
+      while (Date.now() < deadline) {
+        if (bridge.exitCode !== null) throw new Error("recovery discovery bridge exited early in " + scenario + " (" + bridge.exitCode + "): " + stderr);
+        const won = await Promise.race([finished.then(function() { return true; }), delay(50).then(function() { return false; })]);
+        if (won) { done = true; break; }
+      }
+      if (!done) throw new Error("recovery discovery timed out in " + scenario + ": " + stderr);
+      assert.equal(outcomes.get(recoverId).outcome, "applied", "explicit resume admits the retained root in " + scenario);
+    } finally {
+      teardownStarted = true;
+      if (bridge && bridge.exitCode === null) bridge.kill("SIGTERM");
+      if (closed) await Promise.race([closed, delay(5000).then(function() { return null; })]);
+      for (const socket of sockets) socket.destroy();
+      if (server.listening) await new Promise(function(resolve) { server.close(resolve); });
+      if (server.listening) await new Promise(function(resolve) { server.close(resolve); });
+      let audit = null;
+      try {
+        try {
+          audit = JSON.parse(await readFile(auditPath, "utf8"));
+        } catch (e) {
+          throw new Error("recovery discovery missing native audit in " + scenario + ": " + stderr + " outcomes=" + JSON.stringify([...outcomes.values()]) + " readError=" + ((e && e.code) || String(e)));
+        }
+        assert.ok(audit.resumeExcludeItems.length >= 1 && audit.resumeExcludeItems.every(function(v) { return v === true; }), "resume pages history separately with excludeItems true in " + scenario);
+        if (scenario === "provenance-pagination-stale-fresh") {
+          assert.equal(audit.viewPageCalls.length, 2, "bounded discovery pages twice");
+          assert.deepEqual(audit.viewPageCalls[0], {sessionId: rootId, limit: 100, direction: "forward", cursor: null}, "first page starts without cursor");
+          assert.deepEqual(audit.viewPageCalls[1], {sessionId: rootId, limit: 100, direction: "forward", cursor: "cur_page_two"}, "opaque cursor relayed forward");
+          for (const id of [staleId, missedId, reminderId]) assert.ok(audit.sessionReads.indexOf(id) >= 0, "exact child read follows provenance for " + id);
+          assert.ok(audit.subscribes.indexOf(missedId) >= 0 && audit.subscribes.indexOf(reminderId) >= 0, "newly proven children resubscribe");
+          assert.deepEqual(audit.forbidden, [], "no replay or new session during recovery");
+        } else if (scenario === "nonadvancing") {
+          assert.equal(audit.viewPageCalls.length, 2, "guard observes both pages before refusing");
+          assert.equal(audit.viewPageCalls[1].cursor, "stuck_cursor", "opaque cursor relayed before nonadvancing refusal");
+          assert.deepEqual(audit.forbidden, [], "no replay or new session during recovery");
+        } else if (scenario === "death-while-paging") {
+          assert.equal(audit.viewPageCalls.length, 1, "pending page never resolves after native death");
+          assert.deepEqual(audit.forbidden, [], "no replay or new session during recovery");
+        } else if (scenario === "beyond-first-pass") {
+          assert.equal(audit.viewPageCalls.length, 11, "continuation walks past the first bounded pass");
+          assert.equal(audit.viewPageCalls[10].cursor, "page_10", "refresh resumes from the persisted opaque continuation");
+          assert.ok(audit.sessionReads.indexOf(missedId) >= 0, "exact child read follows far provenance");
+          assert.ok(audit.subscribes.indexOf(missedId) >= 0, "far child resubscribes");
+          assert.deepEqual(audit.forbidden, [], "no replay or new session during recovery");
+        }
+      } finally {
+        await rm(dir, {recursive: true, force: true});
+      }
+    }
+    console.log("PASS recovery discovery " + scenario + ": actual bridge subprocess pages durable parent provenance bounded");
+  }
+  await runRecoveryDiscoveryScenario("provenance-pagination-stale-fresh");
+  await runRecoveryDiscoveryScenario("nonadvancing");
+  await runRecoveryDiscoveryScenario("death-while-paging");
+  await runRecoveryDiscoveryScenario("beyond-first-pass");
+}
 console.log('MUSE SELFTEST OK');
