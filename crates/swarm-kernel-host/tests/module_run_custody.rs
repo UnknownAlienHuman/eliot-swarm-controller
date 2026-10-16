@@ -414,6 +414,14 @@ fn public_module_run_returns_pending_and_retains_exact_family_custody() {
         .and_then(|pid| u32::try_from(pid).ok())
         .expect("owner record has an exact process PID");
     assert_process_birth_is_live(owner_pid, owner_process);
+    #[cfg(windows)]
+    let retained_module_job = swarm_process::process_group::Group::open_module_query(
+        owner_process,
+        owner["token"]
+            .as_str()
+            .expect("owner record has an exact Job token"),
+    )
+    .expect("retain exact module Job query handle across owner departure");
 
     let pending = read_json(&state_dir.join("cleanup-status.json"));
     assert_eq!(pending["disposition"], "CleanupPending");
@@ -471,10 +479,18 @@ fn public_module_run_returns_pending_and_retains_exact_family_custody() {
     let departed = wait_for_departed_receipt(&state_dir, &owner, Duration::from_secs(10));
     assert_eq!(departed["owner"], owner);
 
-    // The receipt is written immediately before lock release. Observe release
-    // through the same OS marker primitive so the final public launch has no
-    // timing race and remains a single native invocation.
+    // The owner drops its Job and lock immediately before its own process
+    // returns. Keep the exact query handle while waiting for that owner's PID
+    // birth to depart; lock release alone is not owner departure.
     wait_for_marker_release(&state_dir, Duration::from_secs(5));
+    wait_for_process_departure(owner_pid, owner_process, Duration::from_secs(5));
+    #[cfg(windows)]
+    assert!(
+        retained_module_job
+            .family_empty()
+            .expect("query exact module Job after old owner departure"),
+        "exact module Job still has active processes after old owner departure"
+    );
     let replacement = run_cli(
         &state_dir,
         "short",
@@ -483,8 +499,17 @@ fn public_module_run_returns_pending_and_retains_exact_family_custody() {
         &child_exit_path,
         Duration::from_secs(10),
     );
-    assert!(replacement.status.success());
+    assert!(
+        replacement.status.success(),
+        "replacement failed after exact family departure: status_code={:?}, elapsed={:?}, stdout={:?}, stderr={:?}",
+        replacement.status.code(),
+        replacement.elapsed,
+        String::from_utf8_lossy(&replacement.stdout[..replacement.stdout.len().min(2048)]),
+        String::from_utf8_lossy(&replacement.stderr[..replacement.stderr.len().min(2048)]),
+    );
     assert_eq!(event_lines(&events), vec!["long", "short"]);
+    #[cfg(windows)]
+    drop(retained_module_job);
 
     fs::remove_dir_all(&root).expect("remove isolated test data after all owners departed");
 }
