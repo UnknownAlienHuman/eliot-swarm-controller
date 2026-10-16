@@ -369,11 +369,11 @@ impl StreamState {
         Some((turn, disposition))
     }
 
-    /// Return the first own terminal after a prompt baseline only when every
-    /// intervening global result ordinal is retained and explicitly identifies
-    /// a different conversation. An own result before the candidate, an
-    /// unknown conversation, a missing ordinal, or ordinal overflow is
-    /// ambiguous and therefore cannot settle the prompt.
+    /// Return the unique own terminal after a prompt baseline only when the
+    /// complete retained global ordinal range through the current result is
+    /// contiguous. Every other result must explicitly identify a foreign
+    /// conversation; multiple own results, an own nonterminal, an unknown
+    /// conversation, a missing ordinal, or overflow is ambiguous.
     pub fn terminal_for_after_foreign(
         &self,
         expected_conversation: &str,
@@ -384,12 +384,16 @@ impl StreamState {
         }
 
         let first_ordinal = result_ordinal_before.checked_add(1)?;
+        let ordinal_after_current = self.result_ordinal.checked_add(1)?;
         let mut expected_ordinal = first_ordinal;
+        let mut own_terminal = None;
         for turn in &self.turns {
             if turn.result_ordinal < first_ordinal {
                 continue;
             }
-            if turn.result_ordinal != expected_ordinal {
+            if turn.result_ordinal >= ordinal_after_current
+                || turn.result_ordinal != expected_ordinal
+            {
                 return None;
             }
 
@@ -398,22 +402,25 @@ impl StreamState {
                 .as_deref()
                 .filter(|conversation_id| !conversation_id.is_empty())?;
             if conversation_id == expected_conversation {
+                if own_terminal.is_some() {
+                    return None;
+                }
                 let disposition = match turn.status.as_str() {
                     "SUCCESS" => TerminalDisposition::Applied,
                     "ERROR" | "CANCELED" | "INTERRUPTED" => TerminalDisposition::Rejected,
                     _ => return None,
                 };
-                // The reducer saturates its global counter. A candidate at the
-                // saturated boundary cannot prove a unique next result.
-                turn.result_ordinal.checked_add(1)?;
-                return Some((turn, disposition));
+                own_terminal = Some((turn, disposition));
             }
 
             // Only a result carrying an explicit, non-empty different
             // conversation ID can be certified as foreign.
             expected_ordinal = expected_ordinal.checked_add(1)?;
         }
-        None
+        if expected_ordinal != ordinal_after_current {
+            return None;
+        }
+        own_terminal
     }
 
     /// Retain one observed response body under its exact result ordinal. Only
@@ -1066,6 +1073,15 @@ mod terminal_prefix_tests {
                 .terminal_for_after_foreign(ROOT, 0)
                 .is_none()
         );
+
+        let mut missing_after_own = ready_stream(0);
+        consume_result(&mut missing_after_own, Some(ROOT), "SUCCESS", "own answer");
+        consume_result(&mut missing_after_own, None, "SUCCESS", "unknown answer");
+        assert!(
+            missing_after_own
+                .terminal_for_after_foreign(ROOT, 0)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1096,19 +1112,35 @@ mod terminal_prefix_tests {
     }
 
     #[test]
-    fn first_own_terminal_keeps_its_ordinal_and_response() {
+    fn multiple_own_terminals_block_without_selecting_either_response() {
         let mut stream = ready_stream(0);
         consume_result(&mut stream, Some(ROOT), "SUCCESS", "first answer");
         consume_result(&mut stream, Some(ROOT), "SUCCESS", "later answer");
 
+        assert_eq!(stream.turns.len(), 2);
+        assert_eq!(stream.turns[0].result_ordinal, 1);
+        assert_eq!(stream.turns[1].result_ordinal, 2);
+        assert!(stream.terminal_for_after_foreign(ROOT, 0).is_none());
+    }
+
+    #[test]
+    fn foreign_result_after_unique_own_terminal_keeps_complete_prefix_unambiguous() {
+        let mut stream = ready_stream(0);
+        consume_result(&mut stream, Some(ROOT), "SUCCESS", "own answer");
+        consume_result(
+            &mut stream,
+            Some("foreign-conversation"),
+            "SUCCESS",
+            "foreign answer",
+        );
+
         let (turn, disposition) = stream.terminal_for_after_foreign(ROOT, 0).unwrap();
         assert_eq!(turn.result_ordinal, 1);
         assert_eq!(disposition, TerminalDisposition::Applied);
-        assert_eq!(stream.latest_turn().unwrap().result_ordinal, 2);
         let body = stream
             .retained_response_for(turn.result_ordinal, ROOT, stream.stream_generation)
             .unwrap();
-        assert_eq!(body.body, "first answer");
+        assert_eq!(body.body, "own answer");
     }
 
     #[test]
