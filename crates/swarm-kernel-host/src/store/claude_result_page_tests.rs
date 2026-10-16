@@ -15,7 +15,7 @@ use std::{
     thread,
 };
 
-const ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.5";
+const ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.6";
 const BINDING_ID: &str = "bridge5-result-binding";
 const MODULE_CLIENT_ID: &str = "bridge5-result-module";
 const MODULE_LINK_ID: &str = "bridge5-result-link-1";
@@ -305,7 +305,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
                     "route_alias":fixture_route.alias,
                     "module_id":"claude",
                     "artifact_id":ARTIFACT_ID,
-                    "version":"5",
+                    "version":"6",
                     "expected_catalog_revision":registered["catalog_revision"]
                 }),
                 &fixture_config,
@@ -420,7 +420,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
             Ok(())
         })
         .await
-        .expect("select the shipped bridge.5 descriptor and seed one exact Task dispatch");
+        .expect("select the shipped bridge.6 descriptor and seed one exact Task dispatch");
 
     let module = Principal {
         link_id: MODULE_LINK_ID.to_owned(),
@@ -443,7 +443,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
     let module_receipt = json!({
         "schema_version":1,
         "module_id":"claude",
-        "artifact":{"artifact_id":ARTIFACT_ID,"version":"5","build_id":null},
+        "artifact":{"artifact_id":ARTIFACT_ID,"version":"6","build_id":null},
         "protocol":{"major":1,"minor":0},
         "binding_id":BINDING_ID,
         "binding_generation":1,

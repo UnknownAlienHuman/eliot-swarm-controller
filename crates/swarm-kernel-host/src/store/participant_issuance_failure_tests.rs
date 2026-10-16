@@ -288,7 +288,7 @@ async fn pre_registration_artifact_failure_is_manager_visible_and_cas_bound() {
     assert_eq!(visible["state"], "queued");
     assert_eq!(
         visible["result"],
-        json!({"operation_id":FIRST_LAUNCH_ID,"state":"queued"})
+        json!({"operation_id":FIRST_LAUNCH_ID,"state":"queued","launch_state":"awaiting_participant_credential"})
     );
     assert_eq!(
         launch_result_snapshot(&owner.store, FIRST_LAUNCH_ID).await,

@@ -1904,7 +1904,7 @@ mod muse_router_tests {
             routes: vec![Route {
                 alias: "muse-manager".into(),
                 runtime: "muse".into(),
-                module_artifact_id: "muse-sdk-1.3.0-bridge.12".into(),
+                module_artifact_id: "muse-sdk-1.3.0-bridge.13".into(),
                 enabled: true,
                 native_options: Value::Null,
                 workspace_option: None,

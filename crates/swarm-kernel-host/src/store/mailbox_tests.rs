@@ -246,6 +246,18 @@ async fn send_records_the_full_communication_identity() {
 
 #[tokio::test]
 async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() {
+    fn assert_directed_operation_receipt(mut caller: Value, recipient: &Value) {
+        assert!(
+            caller
+                .as_object_mut()
+                .unwrap()
+                .remove("client_request_id")
+                .is_some()
+        );
+        assert!(recipient.get("client_request_id").is_none());
+        assert_eq!(&caller, recipient);
+    }
+
     let (owner, operator) = start().await;
     let sender = register(&owner.store, &operator, "sender").await;
     let recipient = register_with_role(&owner.store, &operator, "recipient", "observer").await;
@@ -391,7 +403,8 @@ async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() 
         json!({"operation_id":own_first["operation_id"]}),
     )
     .await;
-    assert_eq!(sender_operation, own_operation);
+    // Exact-caller metadata stays private; all shared Operation facts match.
+    assert_directed_operation_receipt(sender_operation, &own_operation);
     let foreign_send = owner
         .store
         .call(
@@ -495,7 +508,7 @@ async fn report_delta_scopes_mail_to_its_recipient_and_paginates_visible_rows() 
         json!({"operation_id":cancellation["operation_id"]}),
     )
     .await;
-    assert_eq!(sender_cancel, recipient_cancel);
+    assert_directed_operation_receipt(sender_cancel, &recipient_cancel);
 
     let operator_receipt = read(
         &owner.store,

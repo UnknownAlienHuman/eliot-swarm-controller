@@ -587,13 +587,27 @@ fn assembled_record_cache_is_scoped_to_connection_and_reopen() {
             [artifact_id],
         )
         .unwrap();
+        let empty_digest = model::digest(b"");
         ArtifactRecord {
             kind: "native_result".to_owned(),
             artifact_id: artifact_id.to_owned(),
             relative_path: "artifacts/cache-scope-probe.bin".to_owned(),
             byte_length: 0,
-            content_digest: "cache-scope-digest".to_owned(),
-            metadata: json!({"assembly_operation_id":"cache-scope-operation","part_count":1}),
+            content_digest: empty_digest.clone(),
+            metadata: json!({
+                "assembly_operation_id":"cache-scope-operation",
+                "coverage":"complete",
+                "byte_length":0,
+                "sha256":empty_digest.clone(),
+                "expected_sha256":empty_digest.clone(),
+                "part_count":1,
+                "parts":[{
+                    "artifact_ref":"cache-scope-page",
+                    "offset_bytes":0,
+                    "byte_length":0,
+                    "sha256":empty_digest,
+                }],
+            }),
         }
     }
 

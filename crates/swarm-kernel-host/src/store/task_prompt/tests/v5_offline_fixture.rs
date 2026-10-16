@@ -12,7 +12,7 @@ const SOURCE_TEXT: &str = "Implement the pinned Task source: café 🐇";
 const BOOT_ID: &str = "claude-task-prompt-offline-boot";
 const INPUT_ID: &str = "d34d0055-5555-4555-8555-555555555555";
 const NATIVE_ROOT_ID: &str = "ses_claude_task_prompt_offline";
-const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.5";
+const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.6";
 
 #[test]
 fn rust_store_task_prompt_v1_crosses_into_claude_bridge5_offline_helpers() {
@@ -140,7 +140,7 @@ fn rust_store_task_prompt_v1_crosses_into_claude_bridge5_offline_helpers() {
         "expected_envelope_json_sha256":envelope_json_sha256,
         "moduleContract":{
             "module_id":"claude",
-            "artifact":{"artifact_id":CLAUDE_ARTIFACT_ID,"version":"5"},
+            "artifact":{"artifact_id":CLAUDE_ARTIFACT_ID,"version":"6"},
             "protocol":{"major":1,"minor":0}
         },
         "command":{
@@ -175,7 +175,7 @@ fn rust_store_task_prompt_v1_crosses_into_claude_bridge5_offline_helpers() {
     assert!(workspace_root.join(node_test).is_file());
     let output = Command::new("node")
         .arg("--test")
-        .arg("--test-name-pattern=Rust Store TaskPrompt v1 crosses into Claude bridge.5 consumer helpers")
+        .arg("--test-name-pattern=Rust Store TaskPrompt v1 crosses into Claude bridge.6 consumer helpers")
         .arg(node_test)
         .current_dir(&workspace_root)
         .env("ELIOT_TASK_PROMPT_V5_FIXTURE_DIR", &fixture_dir)
