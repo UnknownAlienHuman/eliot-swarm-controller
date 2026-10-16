@@ -1016,11 +1016,11 @@ mod tests {
                 service_id: "image-validator-fixture".into(),
                 connection_file: directory.join("unused-state/connection.json"),
                 directory: directory.clone(),
-                model: ModelRef {
+                model: Some(ModelRef {
                     id: "step-5-preview-free".into(),
                     provider_id: "opencode".into(),
                     variant: "high".into(),
-                },
+                }),
             },
             workspace: directory.clone(),
             config_digest: String::new(),

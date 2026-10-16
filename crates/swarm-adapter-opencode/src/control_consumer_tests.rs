@@ -82,7 +82,7 @@ impl NativeFixture {
             binding_id: binding_id.to_owned(),
             generation,
             directory: options.directory.to_string_lossy().into_owned(),
-            model: options.model.clone(),
+            model: options.model.clone().unwrap(),
             requests: Mutex::new(Vec::new()),
         });
         let (stop, mut stopped) = watch::channel(false);
@@ -163,11 +163,11 @@ impl ControlFixture {
             service_id: "pr43-loopback-fixture".to_owned(),
             connection_file: root_dir.join("connection.json"),
             directory: workspace,
-            model: ModelRef {
+            model: Some(ModelRef {
                 id: "fixture-model".to_owned(),
                 provider_id: "fixture-provider".to_owned(),
                 variant: "fixture-variant".to_owned(),
-            },
+            }),
         };
         let native = NativeFixture::start(
             &native_options.connection_file,

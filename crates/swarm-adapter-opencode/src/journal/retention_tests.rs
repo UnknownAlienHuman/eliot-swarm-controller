@@ -503,11 +503,11 @@ async fn run_owned_keeps_module_service_live_through_256_legacy_records_and_reco
         service_id: "pr69-startup-fixture".to_owned(),
         connection_file: root.0.join("no-native-service-connection.json"),
         directory: root.0.clone(),
-        model: crate::ModelRef {
+        model: Some(crate::ModelRef {
             id: "fixture-model".to_owned(),
             provider_id: "fixture-provider".to_owned(),
             variant: "fixture-variant".to_owned(),
-        },
+        }),
     };
     let native_scope = native_options.scope_key();
     let route_sha256 = digest_json(&serde_json::to_value(&native_options).unwrap()).unwrap();
@@ -1506,11 +1506,11 @@ async fn store_startup_connected_hello_recovers_current_root_and_exact_unresolve
         service_id: "store-front-connected".to_owned(),
         connection_file: root.0.join("no-native-service.json"),
         directory: root.0.clone(),
-        model: crate::ModelRef {
+        model: Some(crate::ModelRef {
             id: "fixture".to_owned(),
             provider_id: "fixture".to_owned(),
             variant: "fixture".to_owned(),
-        },
+        }),
     };
     let native_scope = native_options.scope_key();
     let route_sha256 = digest_json(&serde_json::to_value(&native_options).unwrap()).unwrap();

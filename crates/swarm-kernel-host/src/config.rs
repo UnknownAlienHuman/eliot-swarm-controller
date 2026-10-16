@@ -336,11 +336,11 @@ fn validate_codex_rust_options(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_opencode_rust_options(value: &Value) -> Result<()> {
+pub(crate) fn validate_opencode_rust_options(value: &Value) -> Result<()> {
     let options = exact_option_object(
         value,
-        &["service_id", "connection_file", "directory", "model"],
-        &[],
+        &["service_id", "connection_file", "directory"],
+        &["model"],
     )?;
     let service_id = required_option_string(options, "service_id", 128)?;
     if !service_id
@@ -351,10 +351,12 @@ fn validate_opencode_rust_options(value: &Value) -> Result<()> {
     }
     required_absolute_path(options, "connection_file", 4096)?;
     required_absolute_path(options, "directory", 4096)?;
-    let model = options
-        .get("model")
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::new("CONFIG_ERROR", "OpenCode model must be an object"))?;
+    let Some(model) = options.get("model") else {
+        return Ok(());
+    };
+    let model = model
+        .as_object()
+        .ok_or_else(|| Error::new("CONFIG_ERROR", "OpenCode model override must be an object"))?;
     ensure_exact_keys(model, &["id", "providerID", "variant"], &[])?;
     required_option_string(model, "id", 256)?;
     required_option_string(model, "providerID", 256)?;
@@ -917,6 +919,13 @@ mod owned_opencode_route_validation_tests {
                 "variant": "high"
             }
         });
+        let mut native_defaults = external_options.clone();
+        native_defaults.as_object_mut().unwrap().remove("model");
+        assert!(
+            route(native_defaults, None)
+                .validate_activation_contract()
+                .is_ok()
+        );
         assert!(
             route(external_options, None)
                 .validate_activation_contract()

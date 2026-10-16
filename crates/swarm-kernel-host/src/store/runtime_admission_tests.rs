@@ -432,6 +432,46 @@ fn idle_poll_stays_a_noop_and_store_errors_propagate() {
 }
 
 #[test]
+fn standalone_opencode_hello_accepts_current_native_connection_fields() {
+    for explicit_model in [false, true] {
+        let mut db = fixture();
+        let directory = std::env::temp_dir();
+        let mut options = json!({"service_id":"native-defaults","connection_file":directory.join("connection.json"),"directory":directory});
+        if explicit_model {
+            options["model"] = json!({"id":"requested-model","providerID":"native-provider","variant":"requested-variant"});
+        }
+        crate::config::validate_opencode_rust_options(&options).unwrap();
+        let route = json!({"alias":"native-current","runtime":"module","module_artifact_id":crate::config::OPENCODE_RUST_ARTIFACT_ID,"workspace_option":"directory","enabled":true,"native_options":options});
+        db.execute(
+            "UPDATE bindings SET module_artifact_id=?2,route_json=?3 WHERE binding_id=?1",
+            params![
+                BINDING_ID,
+                crate::config::OPENCODE_RUST_ARTIFACT_ID,
+                model::canonical(&route).unwrap()
+            ],
+        )
+        .unwrap();
+        let hello = json!({"boot_id":"current-native-hello","module_artifact_id":crate::config::OPENCODE_RUST_ARTIFACT_ID,"native_ready":true});
+        let plan = runtime::hello_plan(&db, &module_principal(), &hello).unwrap();
+        let reply = runtime::hello_with_config(
+            &mut db,
+            &module_principal(),
+            &hello,
+            &plan,
+            &Config::default(),
+        )
+        .unwrap();
+        assert_eq!(reply["route"]["native_options"], options);
+        let retained = operations::get_binding(&db, BINDING_ID, 1).unwrap();
+        assert_eq!(retained["route"], route);
+        assert_eq!(
+            retained["observation"]["bridge_boot_id"],
+            "current-native-hello"
+        );
+    }
+}
+
+#[test]
 fn standalone_opencode_hello_projects_v3_options_and_preserves_retained_route() {
     let mut db = fixture();
     let directory = std::env::temp_dir();

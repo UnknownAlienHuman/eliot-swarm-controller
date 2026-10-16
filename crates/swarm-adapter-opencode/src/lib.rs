@@ -1632,9 +1632,11 @@ fn task_prompt_for(
             || packet["task"]["attempt_id"].as_str() != Some(context.attempt_id.as_str())
             || packet["task"]["snapshot_digest"].as_str()
                 != Some(expected_snapshot_digest.as_str())
-            || packet["selection"]["provider"].as_str() != Some(options.model.provider_id.as_str())
-            || packet["selection"]["model"].as_str() != Some(options.model.id.as_str())
-            || packet["selection"]["variant"].as_str() != Some(options.model.variant.as_str()))
+            || options.model.as_ref().is_some_and(|model| {
+                packet["selection"]["provider"].as_str() != Some(model.provider_id.as_str())
+                    || packet["selection"]["model"].as_str() != Some(model.id.as_str())
+                    || packet["selection"]["variant"].as_str() != Some(model.variant.as_str())
+            }))
     {
         return Err(Error::new(
             "TASK_PROMPT_LAUNCH_PACKET_MISMATCH",
@@ -2546,8 +2548,10 @@ fn outcome(
     input: Option<String>,
     mut details: Value,
 ) -> Result<RuntimeOutcome> {
-    if let Some(object) = details.as_object_mut() {
-        object.insert("selected_model".into(), json!(options.model));
+    if let Some(object) = details.as_object_mut()
+        && let Some(model) = options.model.as_ref()
+    {
+        object.insert("selected_model".into(), json!(model));
     }
     let identity = module_receipt::for_command(claim, command)?;
     module_receipt::insert_into_details(&mut details, &identity)?;

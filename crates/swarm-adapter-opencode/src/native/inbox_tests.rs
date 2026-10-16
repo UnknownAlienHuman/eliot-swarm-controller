@@ -23,12 +23,7 @@ async fn live_registered_native_service_connects_without_provider_bootstrap() {
         service_id: "native-registered-read-only".into(),
         connection_file: path.into(),
         directory,
-        // Connection health does not select or execute a model.
-        model: crate::config::ModelRef {
-            id: "not-requested".into(),
-            provider_id: "not-requested".into(),
-            variant: "not-requested".into(),
-        },
+        model: None,
     };
     let (_, observation) = NativeClient::connect(&options).await.unwrap();
     assert!(observation.pid > 0);
@@ -186,12 +181,15 @@ async fn http_fixture(
             };
             let headers = String::from_utf8_lossy(&request[..header_end]);
             let mut line = headers.lines().next().unwrap().split_whitespace();
-            assert_eq!(line.next(), Some(method));
+            let expected_method = response["expected_method"].as_str().unwrap_or(method);
+            assert_eq!(line.next(), Some(expected_method));
             let path = line.next().unwrap();
-            if method == "POST" {
-                assert_eq!(path, "/api/session/ses_swarm_fixture/prompt");
-            } else if let Some(expected_path) = response["json_path"].as_str() {
+            if let Some(expected_path) = response["json_path"].as_str() {
                 assert_eq!(path, expected_path);
+            } else if let Some(prefix) = response["json_path_prefix"].as_str() {
+                assert!(path.starts_with(prefix));
+            } else if expected_method == "POST" {
+                assert_eq!(path, "/api/session/ses_swarm_fixture/prompt");
             } else {
                 let session = response["log_session"]
                     .as_str()
@@ -229,7 +227,7 @@ async fn http_fixture(
                     "application/json",
                     serde_json::to_vec(&response["json_payload"]).unwrap(),
                 )
-            } else if method == "POST" {
+            } else if expected_method == "POST" {
                 ("application/json", serde_json::to_vec(&response).unwrap())
             } else {
                 let events = response["events"].as_array().unwrap();
@@ -289,6 +287,49 @@ fn log_response(events: Vec<Value>, expected_after: u64) -> Value {
 
 fn root_event() -> Value {
     fixture()["events"]["rootCreated"].clone()
+}
+
+#[tokio::test]
+async fn native_defaults_create_a_root_without_model_catalog_or_model_override() {
+    let mut command = command();
+    command.method = "agent.open".into();
+    command.native_root_id = None;
+    let root = root_id(&command.binding_id, command.generation);
+    let directory = std::env::current_dir().unwrap();
+    let location = json!({"directory":directory});
+    let native_model =
+        json!({"id":"native-default","providerID":"native-configured","variant":"native-saved"});
+    let session = json!({"id":root,"parentID":null,"fork":null,"location":location,"model":native_model,"metadata":{"eliot":marker(&command)}});
+    let mut created = root_event();
+    created["durable"]["aggregateID"] = json!(root);
+    created["data"]["sessionID"] = json!(root);
+    created["data"]["location"] = location.clone();
+    created["data"]["model"] = native_model;
+    created["data"]["metadata"] = session["metadata"].clone();
+    let (client, server) = http_fixture(vec![
+        json!({"expected_method":"GET","json_path_prefix":"/api/location?","json_payload":{"directory":directory,"project":{"id":"global"}}}),
+        json!({"expected_method":"POST","json_path":"/api/session","json_payload":{"data":session}}),
+        json!({"expected_method":"GET","log_session":root,"sync_aggregate":root,"events":[created]})
+    ], "GET").await;
+    let options = NativeOptions {
+        service_id: "native-defaults".into(),
+        connection_file: directory.join("unused.json"),
+        directory,
+        model: None,
+    };
+    let resolved = client
+        .preflight_open(&options)
+        .await
+        .unwrap_or_else(|failure| panic!("{}", failure.error.code));
+    client
+        .create_root(&command, &options, &root, resolved)
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[1].as_object().unwrap().contains_key("model"));
+    assert_eq!(requests[1]["id"], root);
+    assert_eq!(requests[1]["metadata"]["eliot"], marker(&command));
 }
 
 #[tokio::test]

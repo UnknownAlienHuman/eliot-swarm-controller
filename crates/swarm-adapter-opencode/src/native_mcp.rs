@@ -1400,11 +1400,11 @@ mod tests {
             service_id: service_id.to_owned(),
             connection_file,
             directory,
-            model: ModelRef {
+            model: Some(ModelRef {
                 id: "model".into(),
                 provider_id: "provider".into(),
                 variant: "default".into(),
-            },
+            }),
         }
     }
 

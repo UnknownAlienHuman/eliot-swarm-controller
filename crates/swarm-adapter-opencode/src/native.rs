@@ -285,9 +285,10 @@ impl NativeClient {
         }
         if command.method == "task.dispatch"
             && let Some(packet) = command.input.get("launch_dispatch_packet")
-            && (packet["selection"]["provider"] != options.model.provider_id
-                || packet["selection"]["model"] != options.model.id
-                || packet["selection"]["variant"] != options.model.variant)
+            && let Some(model) = options.model.as_ref()
+            && (packet["selection"]["provider"] != model.provider_id
+                || packet["selection"]["model"] != model.id
+                || packet["selection"]["variant"] != model.variant)
         {
             return Err(Error::new(
                 "NATIVE_MODEL_MISMATCH",
@@ -315,12 +316,14 @@ impl NativeClient {
         root: &str,
         location: Value,
     ) -> Result<()> {
-        let body = json!({
+        let mut body = json!({
             "id":root,
             "location":location,
-            "model":options.model,
             "metadata":{"eliot":marker(command)}
         });
+        if let Some(model) = options.model.as_ref() {
+            body["model"] = serde_json::to_value(model)?;
+        }
         let value = self.post("/api/session", body).await?;
         let data = value.get("data").ok_or_else(|| {
             Error::new(
@@ -1016,6 +1019,11 @@ impl NativeClient {
         &self,
         options: &NativeOptions,
     ) -> std::result::Result<(), PreflightOpenFailure> {
+        let Some(requested_model) = options.model.as_ref() else {
+            // No model override was requested. The already configured native
+            // harness owns its defaults and provider readiness.
+            return Ok(());
+        };
         let value = self
             .get(
                 "/api/model",
@@ -1041,7 +1049,9 @@ impl NativeClient {
         let mut model_enabled_is_boolean = false;
         let mut matching_variants = 0usize;
         for model in models {
-            if model["id"] == options.model.id && model["providerID"] == options.model.provider_id {
+            if model["id"] == requested_model.id
+                && model["providerID"] == requested_model.provider_id
+            {
                 matching_models += 1;
                 let enabled = model["enabled"].as_bool();
                 model_enabled = enabled == Some(true);
@@ -1088,7 +1098,7 @@ impl NativeClient {
                             CatalogFailureCategory::CatalogUnavailable,
                         ));
                     }
-                    if id == options.model.variant {
+                    if id == requested_model.variant {
                         matching_variants += 1;
                     }
                 }
@@ -1315,7 +1325,7 @@ impl NativeClient {
                         .is_some_and(|parent| !parent.is_null())
                     || value["data"]["metadata"]["eliot"]["binding"] != binding
                     || value["data"]["metadata"]["eliot"]["generation"] != generation
-                    || value["data"]["model"] != *model
+                    || (!model.is_null() && value["data"]["model"] != *model)
                 {
                     return Err(Error::new(
                         "NATIVE_LOG_ORIGIN",
@@ -1817,8 +1827,10 @@ fn session_identity_matches(
         && session["parentID"].is_null()
         && session["fork"].is_null()
         && session.get("location") == Some(location)
-        && session["model"]
-            == json!({"id":options.model.id,"providerID":options.model.provider_id,"variant":options.model.variant})
+        && options
+            .model
+            .as_ref()
+            .is_none_or(|model| session["model"] == json!(model))
         && session["metadata"]["eliot"]["binding"] == binding
         && session["metadata"]["eliot"]["generation"] == generation
 }
@@ -2267,11 +2279,11 @@ mod catalog_readiness_tests {
             service_id: "loop-step-deactivated-fixture".into(),
             connection_file: directory.join("unused-connection.json"),
             directory: directory.clone(),
-            model: ModelRef {
+            model: Some(ModelRef {
                 id: "step-5-preview-free".into(),
                 provider_id: "opencode".into(),
                 variant: "high".into(),
-            },
+            }),
         };
         let client = NativeClient {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -2324,11 +2336,11 @@ mod catalog_readiness_tests {
             service_id: "catalog-readiness-fixture".into(),
             connection_file: directory.join("unused-connection.json"),
             directory: directory.clone(),
-            model: ModelRef {
+            model: Some(ModelRef {
                 id: "step-5-preview-free".into(),
                 provider_id: "opencode".into(),
                 variant: "high".into(),
-            },
+            }),
         };
         let server = tokio::spawn(async move {
             for data in responses {
@@ -2449,19 +2461,19 @@ mod catalog_readiness_tests {
             service_id: "reg09-reply-readback".into(),
             connection_file: directory.join("unused-connection.json"),
             directory: directory.clone(),
-            model: ModelRef {
+            model: Some(ModelRef {
                 id: "fixture-model".into(),
                 provider_id: "opencode".into(),
                 variant: "fixture-variant".into(),
-            },
+            }),
         };
         let binding_id = "reg09_binding".to_owned();
         let root = root_id(&binding_id, 1);
         let model_value = serde_json::to_value(&options.model).unwrap();
         let model_projection = json!({
-            "id":options.model.id,
-            "providerID":options.model.provider_id,
-            "variant":options.model.variant
+            "id":options.model.as_ref().unwrap().id,
+            "providerID":options.model.as_ref().unwrap().provider_id,
+            "variant":options.model.as_ref().unwrap().variant
         });
         let location = json!({
             "directory":directory.to_string_lossy(),
@@ -2516,9 +2528,9 @@ mod catalog_readiness_tests {
         let session_path = format!("/api/session/{root}");
 
         let log_path = format!("/api/experimental/session/{root}/log");
-        let model_id = options.model.id.clone();
-        let model_provider = options.model.provider_id.clone();
-        let model_variant = options.model.variant.clone();
+        let model_id = options.model.as_ref().unwrap().id.clone();
+        let model_provider = options.model.as_ref().unwrap().provider_id.clone();
+        let model_variant = options.model.as_ref().unwrap().variant.clone();
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             for _ in 0..4 {

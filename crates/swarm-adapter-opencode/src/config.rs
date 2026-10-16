@@ -286,13 +286,12 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod native_options_tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn base_options() -> NativeOptions {
         NativeOptions {
             service_id: "opencode-fixture".to_owned(),
-            connection_file: PathBuf::from("/tmp/eliot/connection.json"),
-            directory: PathBuf::from("/tmp/eliot/workspace"),
+            connection_file: std::env::current_dir().unwrap().join("connection.json"),
+            directory: std::env::current_dir().unwrap(),
             model: None,
         }
     }

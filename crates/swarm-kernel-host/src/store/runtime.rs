@@ -1063,8 +1063,9 @@ fn standalone_opencode_route(route: &Value) -> bool {
 }
 
 /// Hello and commands share the same authenticated route projection. The
-/// standalone v3 schema carries four native fields; the built-in adapter's
-/// expected_version is not a field in that module contract. This changes only
+/// standalone schema uses native connection fields and an optional invocation
+/// model override. The built-in adapter's expected_version is not a field in
+/// that module contract. This changes only
 /// the reply, never the retained binding route or original Operation digest.
 fn module_route_projection(
     db: &Connection,
@@ -1099,13 +1100,13 @@ fn module_route_projection(
         };
     }
     if standalone_opencode {
-        let options = crate::runtime::opencode_v2::Options::parse(&route["native_options"])?;
-        route["native_options"] = json!({
-            "service_id":options.service_id,
-            "connection_file":options.connection_file,
-            "directory":options.directory,
-            "model":options.model,
-        });
+        let options = route["native_options"].as_object_mut().ok_or_else(|| {
+            Error::new("CONFIG_ERROR", "OpenCode native options must be an object")
+        })?;
+        // Historical owned receipts may carry the built-in caller pin. It is
+        // not part of this module's invocation contract or its stored route.
+        options.remove("expected_version");
+        crate::config::validate_opencode_rust_options(&route["native_options"])?;
     }
     Ok(route)
 }
