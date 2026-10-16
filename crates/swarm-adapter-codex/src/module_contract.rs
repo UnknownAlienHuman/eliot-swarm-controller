@@ -11,22 +11,20 @@ use crate::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterError, MODULE_ID};
 
 pub(crate) const GOAL_CONTINUATION_ADMISSION_SCHEMA_ID: &str = "swarm.goal_continuation_admission";
 
-const CAPABILITIES: [&str; 7] = [
+const CAPABILITIES: [&str; 6] = [
     "agent.open",
     "agent.reconcile",
     "agent.send",
     "agent.shutdown",
-    "native.mcp.configure",
     "native.mcp.observe",
     "task.dispatch",
 ];
-const RESULT_CAPABILITIES: [&str; 8] = [
+const RESULT_CAPABILITIES: [&str; 7] = [
     "agent.open",
     "agent.reconcile",
     "agent.result",
     "agent.send",
     "agent.shutdown",
-    "native.mcp.configure",
     "native.mcp.observe",
     "task.dispatch",
 ];
@@ -145,9 +143,6 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
                 schema("swarm.task_dispatch_context"),
                 schema("swarm.normalized_result_context"),
                 swarm_contracts::module_contract::task_prompt_schema(),
-                swarm_contracts::module_contract::native_mcp_command_schema(),
-                swarm_contracts::module_contract::codex_native_mcp_command_schema(),
-                swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
             ],
         )
         && exact_schemas(
@@ -164,13 +159,9 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
 
 pub(crate) fn codex_native_mcp_enabled(claim: &ModuleContractClaim) -> bool {
     claim.capabilities.iter().any(|value| value.as_str() == "native.mcp.observe")
-        && claim.capabilities.iter().any(|value| value.as_str() == "native.mcp.configure")
         && claim
             .command_schemas
             .contains(&swarm_contracts::module_contract::codex_native_mcp_command_schema())
-        && claim
-            .command_schemas
-            .contains(&swarm_contracts::module_contract::native_mcp_command_schema())
         && claim.command_schemas.contains(
             &swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
         )
@@ -222,7 +213,6 @@ pub(crate) fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
     ];
     if codex_native_mcp_enabled(claim) {
         commands.extend([
-            swarm_contracts::module_contract::native_mcp_command_schema(),
             swarm_contracts::module_contract::codex_native_mcp_command_schema(),
             swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
         ]);

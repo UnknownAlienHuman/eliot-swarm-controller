@@ -792,8 +792,25 @@ impl Store {
 
     pub(crate) async fn legacy_worker_demand_snapshot(&self) -> Result<LegacyWorkerDemand> {
         let config = self.config.clone();
-        self.run(move |db| legacy_worker_demand::snapshot(db, &config))
-            .await
+        self.run(move |db| {
+            let mut demand = legacy_worker_demand::snapshot(db, &config)?;
+            // Keep the shared launch reconciler alive through Codex's
+            // post-open MCP Operation. It retains the exact root/scope
+            // readback before the one-shot native MCP worker consumes it.
+            let awaiting_codex_c8: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE method='swarm.launch' AND state='queued' \
+                 AND CASE WHEN json_valid(effective_request_json) THEN \
+                   json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
+                   AND json_extract(effective_request_json,'$.launch_manifest.runtime.route.runtime')='codex' \
+                   AND json_extract(effective_request_json,'$.launch_manifest.runtime.route.module_artifact_id')=?1 \
+                 ELSE 0 END)",
+                [swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID],
+                |row| row.get(0),
+            )?;
+            demand.launcher |= awaiting_codex_c8;
+            Ok(demand)
+        })
+        .await
     }
 
     pub(crate) fn automation_scheduler_worker_config_path(&self) -> std::path::PathBuf {

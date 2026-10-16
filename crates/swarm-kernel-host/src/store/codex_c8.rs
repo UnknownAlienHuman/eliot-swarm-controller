@@ -1,9 +1,9 @@
 //! Store-owned Codex C8 observation, readback validation, and dispatch gate.
 //!
-//! Each native observation is an immutable Operation. Unknown outcomes are
-//! terminal for that Operation and are never replayed. A fresh read-only
-//! observation gets a new Operation ID only after a prior applied readback
-//! expires.
+//! Each native observation is an immutable Operation queued after the exact
+//! launch open. Unknown outcomes are terminal for that Operation and are never
+//! replayed; an observed proof is rechecked against current Store assignment,
+//! lease, binding, and authorization facts before dispatch.
 use super::{
     Store, launcher_dispatch::{self, LaunchParent}, launcher_mcp_tools,
     launcher_participant, meta, operations, tasks, workspace,
@@ -20,17 +20,16 @@ use swarm_contracts::{
     module_catalog::Sha256Digest,
     module_contract::{
         CODEX_RUST_CONTROLLER_ARTIFACT_ID, CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION,
-        codex_native_mcp_command_schema, native_mcp_command_schema,
+        codex_native_mcp_command_schema,
     },
     native_mcp::{
         CODEX_NATIVE_MCP_COMMAND_SCHEMA_ID, CODEX_NATIVE_MCP_COMMAND_SCHEMA_VERSION,
         CodexNativeMcpCommand, CodexNativeMcpReadback, codex_native_mcp_server_name,
-        codex_participant_toolset, codex_profile_assignment_sha256,
+        codex_participant_toolset,
     },
 };
 
 const INTERNAL_NATIVE_MCP_CALLER: &str = "swarm.internal.c8.native_mcp";
-const MAX_READBACK_AGE_MS: i64 = 300_000;
 const MAX_FUTURE_SKEW_MS: i64 = 30_000;
 const MARKER_FIELD: &str = "codex_native_mcp_readback";
 const MAX_COMMAND_BYTES: usize = 32 * 1024;
@@ -54,7 +53,7 @@ pub(super) async fn reconcile_once(store: &Store) -> Result<Option<Value>> {
     let config = store.config.clone();
     let progress = store.run(move |db| {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(launch_id) = next_candidate(&tx, now)? else {
+        let Some(launch_id) = next_candidate(&tx)? else {
             tx.commit()?;
             return Ok(None);
         };
@@ -62,16 +61,8 @@ pub(super) async fn reconcile_once(store: &Store) -> Result<Option<Value>> {
         let marker = parent.manifest.get(MARKER_FIELD).cloned();
         let (value, changed) = match marker {
             None => {
-                let child_id = queue_observation(&tx, &config, &parent, None, now)?;
+                let child_id = queue_observation(&tx, &config, &parent, now)?;
                 (step_value(&launch_id, &child_id, "reading"), true)
-            }
-            Some(marker) if marker["state"] == "observed" => {
-                let previous = marker["module_operation_id"].as_str()
-                    .filter(|value| !value.is_empty()).ok_or_else(invalid_marker)?;
-                let child_id = queue_observation(&tx, &config, &parent, Some(previous), now)?;
-                let mut value = step_value(&launch_id, &child_id, "reading");
-                value["previous_module_operation_id"] = json!(previous);
-                (value, true)
             }
             Some(marker) if marker["state"] == "reading" => {
                 let child_id = marker["module_operation_id"].as_str()
@@ -119,20 +110,23 @@ fn step_value(launch_id: &str, child_id: &str, state: &str) -> Value {
     })
 }
 
-fn next_candidate(db: &Connection, now: i64) -> Result<Option<String>> {
+fn next_candidate(db: &Connection) -> Result<Option<String>> {
     db.query_row(
         "SELECT launch.operation_id FROM operations AS launch \
          WHERE launch.method='swarm.launch' AND launch.state='queued' \
            AND CASE WHEN json_valid(launch.effective_request_json) THEN \
-             json_extract(launch.effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
+              json_extract(launch.effective_request_json,'$.launch_manifest.state') IN ('awaiting_native_mcp','awaiting_capability') \
              AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.dispatch_permitted')=0 \
              AND json_extract(launch.effective_request_json,'$.launch_manifest.progress.task_dispatch')='not_started' \
              AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.route.runtime')='codex' \
              AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.route.module_artifact_id')=?1 \
+              AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.state')='ready' \
+              AND json_type(launch.effective_request_json,'$.launch_manifest.binding.native_root_id')='text' \
+              AND json_type(launch.effective_request_json,'$.launch_manifest.binding.native_scope_key')='text' \
               AND EXISTS(SELECT 1 FROM bindings AS selected_binding \
                          WHERE selected_binding.binding_id=json_extract(launch.effective_request_json,'$.launch_manifest.binding.binding_id') \
                            AND selected_binding.generation=json_extract(launch.effective_request_json,'$.launch_manifest.binding.generation') \
-                           AND json_extract(selected_binding.state_json,'$.module_contract_selector.artifact.version')=?3) \
+                            AND json_extract(selected_binding.state_json,'$.module_contract_selector.artifact.version')=?2) \
               AND EXISTS(SELECT 1 FROM operations AS native_open \
                          WHERE native_open.operation_id=json_extract(launch.effective_request_json,'$.launch_manifest.binding.operation_id') \
                            AND native_open.method='agent.open' AND native_open.state='settled' \
@@ -144,15 +138,12 @@ fn next_candidate(db: &Connection, now: i64) -> Result<Option<String>> {
                      OR EXISTS(SELECT 1 FROM operations AS child \
                                WHERE child.operation_id=json_extract(launch.effective_request_json,'$.launch_manifest.codex_native_mcp_readback.module_operation_id') \
                                  AND child.state IN ('settled','rejected','outcome_unknown','cancelled')))) \
-               OR (json_extract(launch.effective_request_json,'$.launch_manifest.codex_native_mcp_readback.state')='observed' \
-                   AND COALESCE(json_extract(launch.effective_request_json,'$.launch_manifest.codex_native_mcp_readback.readback.observed_at_ms'),0)<=?2) \
              ) \
            ELSE 0 END \
          ORDER BY launch.created_at_ms,launch.operation_id LIMIT 1",
          params![
-             CODEX_RUST_CONTROLLER_ARTIFACT_ID,
-             now.saturating_sub(MAX_READBACK_AGE_MS),
-             CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION,
+              CODEX_RUST_CONTROLLER_ARTIFACT_ID,
+              CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION,
          ],
         |row| row.get(0),
     ).optional().map_err(Into::into)
@@ -162,7 +153,6 @@ fn queue_observation(
     tx: &Transaction<'_>,
     config: &Config,
     parent: &LaunchParent,
-    previous_operation_id: Option<&str>,
     now: i64,
 ) -> Result<String> {
     let operation_id = model::new_id();
@@ -219,7 +209,6 @@ fn queue_observation(
         "kind":"codex_native_mcp_readback",
         "state":"reading",
         "module_operation_id":operation_id,
-        "previous_module_operation_id":previous_operation_id,
         "assignment_sha256":request.assignment_sha256,
         "started_at_ms":now,
         "dispatch_permitted":false,
@@ -380,13 +369,9 @@ fn readback_matches_command(
         && readback.attempt_id == command.attempt_id
         && readback.grant_revision == command.grant_revision
         && readback.participant_native_session_id == command.participant_native_session_id
-        && readback.profile_name == command.profile_name
         && readback.surface == command.surface
         && readback.server_id_sha256.as_str()
             == model::digest(command.server_name.as_bytes())
-        && readback.credential_ref == command.credential_ref
-        && readback.profile_config_ref == command.profile_config_ref
-        && readback.profile_assignment_sha256 == command.profile_assignment_sha256
         && readback.authorization_revision == command.expected_authorization_revision
         && readback.toolset_sha256 == command.expected_toolset_sha256
 }
@@ -556,20 +541,12 @@ fn current_command(
     let expected_authorization_revision = Sha256Digest::new(
         model::text(&authorization, "authorization_revision")?.to_owned(),
     ).map_err(|_| Error::new("NATIVE_MCP_CAPABILITY_UNAVAILABLE", "Participant authorization revision is invalid"))?;
-    let profile_assignment_sha256 = codex_profile_assignment_sha256(
-        participant_id,
-        credential_ref,
-        profile_config_ref,
-        profile_name,
-        surface,
-    )
-    .map_err(|_| Error::new("NATIVE_MCP_CAPABILITY_UNAVAILABLE", "Participant profile assignment is invalid"))?;
     let server_name = codex_native_mcp_server_name(&parent.operation_id)
         .map_err(|_| Error::new("NATIVE_MCP_CAPABILITY_UNAVAILABLE", "Codex MCP server identity is invalid"))?;
 
     let mut command = CodexNativeMcpCommand {
-        schema_version:2,
-        codex_schema_version:2,
+        schema_version:3,
+        codex_schema_version:3,
         kind:"codex_native_mcp_command".to_owned(),
         operation_id:operation_id.to_owned(),
         launch_operation_id:parent.operation_id.clone(),
@@ -590,12 +567,8 @@ fn current_command(
         participant_id:participant_id.to_owned(),
         grant_revision,
         participant_native_session_id:registration["native_session_id"].as_str().map(str::to_owned),
-        credential_ref:credential_ref.to_owned(),
-        profile_config_ref:profile_config_ref.to_owned(),
-        profile_name:profile_name.to_owned(),
         surface:surface.to_owned(),
         server_name,
-        profile_assignment_sha256,
         expected_authorization_revision,
         expected_toolset_sha256,
     };
@@ -612,9 +585,7 @@ pub(super) fn require_codex_descriptor(db: &Connection, binding: &Value) -> Resu
         binding["observation"].get("module_contract_selector"),
     )?.ok_or_else(stale_scope)?;
     let has_capability = identity.capabilities.iter().any(|value| value.as_str() == "native.mcp.observe");
-    let has_configure_capability = identity.capabilities.iter().any(|value| value.as_str() == "native.mcp.configure");
     let has_dispatch_capability = identity.capabilities.iter().any(|value| value.as_str() == "task.dispatch");
-    let has_common_schema = identity.command_schemas.contains(&native_mcp_command_schema());
     let has_codex_schema = identity.command_schemas.contains(&codex_native_mcp_command_schema());
     let has_launch_profile_schema = identity.command_schemas.contains(
         &swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
@@ -623,9 +594,7 @@ pub(super) fn require_codex_descriptor(db: &Connection, binding: &Value) -> Resu
         || identity.artifact.artifact_id.as_str() != CODEX_RUST_CONTROLLER_ARTIFACT_ID
         || identity.artifact.version.as_str() != CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
         || !has_capability
-        || !has_configure_capability
         || !has_dispatch_capability
-        || !has_common_schema
         || !has_codex_schema
         || !has_launch_profile_schema
         || identity.command_schemas.iter().any(|schema| {
@@ -726,10 +695,8 @@ pub(super) fn require_current_dispatch_capability(
     readback.validate()
         .map_err(|_| Error::new("NATIVE_MCP_READBACK_INVALID", "Codex C8 readback is invalid"))?;
     let now = model::now_ms()?;
-    if readback.observed_at_ms > now.saturating_add(MAX_FUTURE_SKEW_MS)
-        || now.saturating_sub(readback.observed_at_ms) > MAX_READBACK_AGE_MS
-    {
-        return Err(Error::new("NATIVE_MCP_CAPABILITY_UNAVAILABLE", "Codex C8 readback is stale"));
+    if readback.observed_at_ms > now.saturating_add(MAX_FUTURE_SKEW_MS) {
+        return Err(Error::new("NATIVE_MCP_READBACK_INVALID", "Codex C8 readback timestamp is in the future"));
     }
     let child_id = marker["module_operation_id"].as_str()
         .filter(|value| !value.is_empty()).ok_or_else(invalid_marker)?;

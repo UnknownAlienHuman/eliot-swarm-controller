@@ -12,8 +12,10 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
+use swarm_contracts::native_mcp::CodexNativeMcpLaunchProfile;
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -34,6 +36,79 @@ fn descriptor_pre_input_open(
         model::text(binding, "module_artifact_id")?,
         Some(selector),
     )
+}
+
+fn codex_swarm_mcp_sibling() -> Result<PathBuf> {
+    let current = std::env::current_exe().map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_LAUNCHER",
+            "kernel-host executable cannot be identified for Codex MCP launch",
+        )
+    })?;
+    let mut sibling = fs::canonicalize(&current).map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_LAUNCHER",
+            "kernel-host executable path cannot be resolved for Codex MCP launch",
+        )
+    })?;
+    sibling.set_file_name(if cfg!(windows) {
+        "swarm-mcp.exe"
+    } else {
+        "swarm-mcp"
+    });
+    let metadata = fs::symlink_metadata(&sibling).map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_LAUNCHER",
+            "installed swarm-mcp sibling is missing beside kernel-host",
+        )
+    })?;
+    #[cfg(windows)]
+    let is_reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse_point = metadata.file_type().is_symlink();
+    if !metadata.is_file() || is_reparse_point {
+        return Err(Error::new(
+            "NATIVE_MCP_LAUNCHER",
+            "swarm-mcp sibling must be a regular non-reparse file",
+        ));
+    }
+    fs::canonicalize(&sibling).map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_LAUNCHER",
+            "installed swarm-mcp sibling path cannot be resolved",
+        )
+    })
+}
+
+fn attach_codex_launch_profile_input(
+    input: &mut Value,
+    launch_operation_id: &str,
+    profile: &CodexNativeMcpLaunchProfile,
+) -> Result<()> {
+    profile
+        .validate()
+        .map_err(|_| Error::new("NATIVE_MCP_PROFILE_INVALID", "Codex launch profile is invalid"))?;
+    if profile.launch_operation_id != launch_operation_id {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "Codex launch profile names a different launch Operation",
+        ));
+    }
+    let input = input
+        .as_object_mut()
+        .ok_or_else(|| Error::invalid("Codex agent.open input is not an object"))?;
+    input.insert("launch_operation_id".into(), json!(launch_operation_id));
+    input.insert("task_id".into(), json!(profile.task_id));
+    input.insert("task_revision".into(), json!(profile.task_revision));
+    input.insert("attempt_id".into(), json!(profile.attempt_id));
+    input.insert(
+        "codex_native_mcp_launch_profile".into(),
+        serde_json::to_value(profile)?,
+    );
+    Ok(())
 }
 
 fn codex_goal_contract_complete(
@@ -1359,6 +1434,14 @@ fn next_internal(
                 {
                     return Err(error);
                 }
+                Err(error) if error.code == "LAUNCH_PARTICIPANT_PENDING" => {
+                    tx.commit()?;
+                    return Ok(json!({
+                        "command":null,
+                        "waiting_operation_id":op,
+                        "waiting_for_prerequisite":"participant_issuance"
+                    }));
+                }
                 Err(error) => {
                     // This validation precedes the ordinary dispatch guard.
                     // Retain a deterministic rejection instead of rolling back
@@ -1493,6 +1576,7 @@ fn next_internal(
         method == "agent.result" && effective["normalized_result_origin"].is_object();
     let mut trusted_launch_dispatch_packet: Option<Value> = None;
     let mut goal_continuation_context = None;
+    let mut codex_launch_profile_input: Option<(String, CodexNativeMcpLaunchProfile)> = None;
     let mut starts_native_work = false;
     let guard = (|| -> Result<()> {
         let o = operations::get_operation(&tx, &op)?;
@@ -1649,6 +1733,45 @@ fn next_internal(
             if b["state"] != "opening" || !b["native_root_id"].is_null() {
                 return Err(Error::conflict("root already opened or changed"));
             }
+            if opening_actor.is_some()
+                && b["route"]["runtime"] == "codex"
+                && b["module_artifact_id"]
+                    == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
+            {
+                let launch_operation_id = model::text(&o, "prerequisite_operation_id")?;
+                let parent = super::launcher_dispatch::load_parent(&tx, launch_operation_id)?;
+                if parent.manifest["state"]
+                    != super::launcher_participant::AWAITING_NATIVE_MCP
+                {
+                    return Err(Error::new(
+                        "LAUNCH_PARTICIPANT_PENDING",
+                        "Codex launch open waits for its pre-open Participant issuance receipt",
+                    ));
+                }
+                let config = config.ok_or_else(|| {
+                    Error::new(
+                        "NATIVE_MCP_PROFILE_UNAVAILABLE",
+                        "Codex launch profile resolution requires current controller configuration",
+                    )
+                })?;
+                let executable = codex_swarm_mcp_sibling()?;
+                let profile = super::launcher_participant::codex_launch_profile_for_open(
+                    &tx,
+                    opening_actor.as_ref().expect("launch actor was checked"),
+                    launch_operation_id,
+                    &op,
+                    config,
+                    &executable,
+                )?
+                .ok_or_else(|| {
+                    Error::new(
+                        "NATIVE_MCP_PROFILE_UNAVAILABLE",
+                        "Codex launch Participant profile is not available for this open",
+                    )
+                })?;
+                codex_launch_profile_input =
+                    Some((launch_operation_id.to_owned(), profile));
+            }
             if b["route"]
                 .get("owned_service")
                 .is_some_and(|v| !v.is_null())
@@ -1767,6 +1890,14 @@ fn next_internal(
         Ok(())
     })();
     if let Err(e) = guard {
+        if e.code == "LAUNCH_PARTICIPANT_PENDING" {
+            tx.commit()?;
+            return Ok(json!({
+                "command":null,
+                "waiting_operation_id":op,
+                "waiting_for_prerequisite":"participant_issuance"
+            }));
+        }
         let now = model::now_ms()?;
         tx.execute("UPDATE operations SET state='rejected',result_json=?2,settled_at_ms=?3,updated_at_ms=?3 WHERE operation_id=?1 AND state='queued'",params![op,model::canonical(&json!(e))?,now])?;
         tx.commit()?;
@@ -1816,6 +1947,11 @@ fn next_internal(
     }
     if let Some(packet) = trusted_launch_dispatch_packet {
         input["launch_dispatch_packet"] = packet;
+    }
+    if let Some((launch_operation_id, profile)) = codex_launch_profile_input {
+        // This profile contains private local paths. Enrich only the returned
+        // RuntimeCommand; the immutable Operation and its receipt stay opaque.
+        attach_codex_launch_profile_input(&mut input, &launch_operation_id, &profile)?;
     }
     let command_route = module_route_projection(&tx, config, &b)?;
     let now = model::now_ms()?;
@@ -6543,5 +6679,63 @@ mod agent_shutdown_validation_tests {
         assert!(validate_agent_shutdown_request(&stale, &input).is_err());
         let bad = json!({"binding_id": "b", "generation": 1, "owned_scope": "server"});
         assert!(validate_agent_shutdown_request(&b, &bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod codex_launch_profile_command_tests {
+    use super::*;
+
+    #[test]
+    fn private_profile_paths_are_added_only_to_the_transient_open_input() {
+        let root = std::env::temp_dir();
+        let profile = CodexNativeMcpLaunchProfile::new(
+            "launch-transient-test".into(),
+            "task-transient-test".into(),
+            1,
+            "attempt-transient-test".into(),
+            "binding-transient-test".into(),
+            1,
+            "participant-transient-test".into(),
+            1,
+            "participant-credential:00000000-0000-4000-8000-000000000011".into(),
+            "participant-mcp-config:00000000-0000-4000-8000-000000000012".into(),
+            "work-participant".into(),
+            "participant-core".into(),
+            root.join(if cfg!(windows) { "swarm-mcp.exe" } else { "swarm-mcp" })
+                .to_string_lossy()
+                .into_owned(),
+            root.join("transient-credential.json")
+                .to_string_lossy()
+                .into_owned(),
+            root.join("transient-profile.toml")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("valid transient launch profile");
+        let persisted_request = json!({
+            "client_request_id":"launch:open",
+            "lane_id":"launch-lease",
+            "route":"codex"
+        });
+        let mut runtime_input = persisted_request.clone();
+
+        attach_codex_launch_profile_input(
+            &mut runtime_input,
+            "launch-transient-test",
+            &profile,
+        )
+        .expect("enrich the RuntimeCommand only");
+
+        assert_eq!(persisted_request["route"], "codex");
+        assert!(persisted_request.get("codex_native_mcp_launch_profile").is_none());
+        assert!(serde_json::to_string(&persisted_request)
+            .unwrap()
+            .find("transient-profile.toml")
+            .is_none());
+        assert_eq!(
+            runtime_input["codex_native_mcp_launch_profile"]["profile_config_path"],
+            profile.profile_config_path
+        );
     }
 }

@@ -330,7 +330,7 @@ async fn read_current_thread(
     }
     let observed_at_ms = now_ms()?;
     let mut readback = CodexNativeMcpReadback {
-        schema_version: 1,
+        schema_version: 2,
         kind: CODEX_NATIVE_MCP_READBACK_KIND.to_owned(),
         operation_id: request.operation_id.clone(),
         launch_operation_id: request.launch_operation_id.clone(),
@@ -359,13 +359,7 @@ async fn read_current_thread(
         attempt_id: request.attempt_id.clone(),
         grant_revision: request.grant_revision,
         participant_native_session_id: request.participant_native_session_id.clone(),
-        profile_name: request.profile_name.clone(),
         surface: request.surface.clone(),
-        profile_application_state: "effective_thread_toolset_and_authenticated_assignment".to_owned(),
-        profile_reference_readback: "not_exposed_by_native_api".to_owned(),
-        credential_ref: request.credential_ref.clone(),
-        profile_config_ref: request.profile_config_ref.clone(),
-        profile_assignment_sha256: request.profile_assignment_sha256.clone(),
         authorization_revision: request.expected_authorization_revision.clone(),
         toolset_sha256: expected_digest,
         tool_count: u32::try_from(actual_tools.len())
@@ -373,8 +367,6 @@ async fn read_current_thread(
         observed_at_ms,
         evidence_sha256: Sha256Digest::new("0".repeat(64))
             .map_err(|_| ReadFailure::Rejected("CODEX_READBACK_DIGEST_INVALID"))?,
-        dispatch_permitted: false,
-        model_consumed: "unknown".to_owned(),
     };
     readback.evidence_sha256 = readback
         .computed_evidence_sha256()

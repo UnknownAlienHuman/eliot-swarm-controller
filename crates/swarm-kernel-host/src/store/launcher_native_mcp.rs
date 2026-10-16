@@ -1,9 +1,9 @@
 //! Bounded host-side readback for launches awaiting native MCP evidence.
 //!
 //! The Store validates the retained launch and authenticates the scoped
-//! Participant before the native adapter is contacted. Standalone observations
-//! use the same descriptor-bound child Operations as C8. This path only records
-//! the facts exposed by OpenCode's public read API; it cannot permit dispatch.
+//! Participant before the native adapter is contacted. OpenCode readback uses
+//! its existing public read API; Codex C8 uses the exact thread-scoped native
+//! MCP observer. This worker records evidence and cannot permit dispatch.
 
 use super::{
     Store,
@@ -234,9 +234,39 @@ enum ClaimOutcome {
 }
 
 impl Store {
-    /// Advance at most one due launch readback. Repeated host ticks use the
-    /// durable backoff marker and never contact OpenCode on every tick.
+    /// Advance a one-shot Codex C8 observation first, then one due OpenCode
+    /// readback. Durable Operation state prevents replay of an uncertain call.
     pub(crate) async fn reconcile_native_mcp_once(&self) -> Result<Value> {
+        if let Some(codex) = super::codex_c8::reconcile_once(self).await? {
+            if codex["state"] != "reading" {
+                let launch_operation_id = codex
+                    .get("operation_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "CODEX_C8_MARKER_INVALID",
+                            "Codex readback progress lacks its launch Operation",
+                        )
+                    })?
+                    .to_owned();
+                let config = self.config.clone();
+                self.run(move |db| {
+                    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    super::launcher::reconcile_launch(
+                        &tx,
+                        &config,
+                        &launch_operation_id,
+                        model::now_ms()?,
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
+                self.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+            }
+            return Ok(codex);
+        }
         let now = model::now_ms()?;
         let config = self.config.clone();
         let claim_outcome = self

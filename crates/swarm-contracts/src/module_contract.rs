@@ -357,11 +357,9 @@ impl ModuleContractTemplate {
             ArtifactVersion::new(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION)?;
         template.capabilities.extend([
             CapabilityId::new("agent.shutdown")?,
-            CapabilityId::new("native.mcp.configure")?,
             CapabilityId::new("native.mcp.observe")?,
         ]);
         template.command_schemas.extend([
-            native_mcp_command_schema(),
             codex_native_mcp_command_schema(),
             codex_native_mcp_launch_profile_schema(),
         ]);
@@ -570,8 +568,8 @@ mod tests {
         assert!(v8.event_schemas.contains(&continuation));
         assert!(v8.event_schemas.contains(&terminal));
         assert!(v8.capabilities.contains(&CapabilityId::new("native.mcp.observe").unwrap()));
-        assert!(v8.capabilities.contains(&CapabilityId::new("native.mcp.configure").unwrap()));
-        assert!(v8.command_schemas.contains(&native_mcp_command_schema()));
+        assert!(!v8.capabilities.contains(&CapabilityId::new("native.mcp.configure").unwrap()));
+        assert!(!v8.command_schemas.contains(&native_mcp_command_schema()));
         assert!(v8.command_schemas.contains(&codex_native_mcp_command_schema()));
         assert!(v8.command_schemas.contains(&codex_native_mcp_launch_profile_schema()));
     }

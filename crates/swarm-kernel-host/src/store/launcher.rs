@@ -38,6 +38,117 @@ const MAX_DECISION_CARD_LIST_ITEMS: usize = 16;
 const MAX_DECISION_CARD_OVERLAP_ITEMS: usize = 8;
 const MAX_LAUNCH_MANIFEST_BYTES: usize = 1_048_576;
 
+fn is_codex_c8_launch(manifest: &Value) -> bool {
+    manifest["runtime"]["route"]["runtime"] == "codex"
+        && manifest["runtime"]["route"]["module_artifact_id"]
+            == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
+}
+
+fn codex_preopen_participant_pending(manifest: &Value) -> bool {
+    is_codex_c8_launch(manifest)
+        && manifest["state"] != super::launcher_participant::AWAITING_NATIVE_MCP
+}
+
+fn codex_module_connected_for_preopen_issuance(
+    manifest: &Value,
+    open_operation: &Value,
+    binding: &Value,
+) -> bool {
+    is_codex_c8_launch(manifest)
+        && manifest["state"] == "awaiting_binding"
+        && open_operation["state"] == "queued"
+        && binding["state"] == "opening"
+        && binding["observation"]["connection"] == "connected"
+        && binding["observation"]["module_client_id"].as_str().is_some_and(|value| !value.is_empty())
+        && binding["observation"]["module_link_id"].as_str().is_some_and(|value| !value.is_empty())
+        && binding["observation"]["bridge_boot_id"].as_str().is_some_and(|value| !value.is_empty())
+        && binding["native_root_id"].is_null()
+}
+
+fn codex_c8_readback_pending(manifest: &Value) -> bool {
+    is_codex_c8_launch(manifest)
+        && matches!(
+            manifest["codex_native_mcp_readback"]["state"].as_str(),
+            None | Some("reading")
+        )
+}
+
+#[cfg(test)]
+mod codex_preopen_profile_tests {
+    use super::{
+        codex_module_connected_for_preopen_issuance, codex_c8_readback_pending,
+        codex_preopen_participant_pending, is_codex_c8_launch,
+    };
+    use serde_json::json;
+
+    fn manifest(runtime: &str, artifact_id: &str, state: &str) -> serde_json::Value {
+        json!({
+            "state":state,
+            "runtime":{"route":{"runtime":runtime,"module_artifact_id":artifact_id}}
+        })
+    }
+
+    #[test]
+    fn participant_preopen_gate_is_only_for_launch_owned_rust_codex() {
+        let awaiting = manifest("codex", "codex-rust-controller.1", "awaiting_binding");
+        assert!(is_codex_c8_launch(&awaiting));
+        assert!(codex_preopen_participant_pending(&awaiting));
+        let queued_open = json!({"state":"queued"});
+        let connected_binding = json!({
+            "state":"opening",
+            "native_root_id":null,
+            "observation":{
+                "connection":"connected",
+                "module_client_id":"codex-module",
+                "module_link_id":"link-1",
+                "bridge_boot_id":"boot-1"
+            }
+        });
+        assert!(codex_module_connected_for_preopen_issuance(
+            &awaiting,
+            &queued_open,
+            &connected_binding
+        ));
+        let settled_open = json!({"state":"settled"});
+        assert!(!codex_module_connected_for_preopen_issuance(
+            &awaiting,
+            &settled_open,
+            &connected_binding
+        ));
+        let mut disconnected_binding = connected_binding.clone();
+        disconnected_binding["observation"]["connection"] = json!("disconnected");
+        assert!(!codex_module_connected_for_preopen_issuance(
+            &awaiting,
+            &queued_open,
+            &disconnected_binding
+        ));
+        let mut fabricated_root = connected_binding.clone();
+        fabricated_root["native_root_id"] = json!("thread-not-created-yet");
+        assert!(!codex_module_connected_for_preopen_issuance(
+            &awaiting,
+            &queued_open,
+            &fabricated_root
+        ));
+
+        let issued = manifest("codex", "codex-rust-controller.1", "awaiting_native_mcp");
+        assert!(!codex_preopen_participant_pending(&issued));
+        assert!(codex_c8_readback_pending(&issued));
+        let mut observed = issued.clone();
+        observed["codex_native_mcp_readback"] = json!({"state":"observed"});
+        assert!(!codex_c8_readback_pending(&observed));
+        let mut observing = issued.clone();
+        observing["codex_native_mcp_readback"] = json!({"state":"reading"});
+        assert!(codex_c8_readback_pending(&observing));
+
+        let legacy = manifest("codex", "codex-sdk-18194bf-bridge.3", "awaiting_binding");
+        assert!(!is_codex_c8_launch(&legacy));
+        assert!(!codex_preopen_participant_pending(&legacy));
+
+        let other_runtime = manifest("command", "codex-rust-controller.1", "awaiting_binding");
+        assert!(!codex_preopen_participant_pending(&other_runtime));
+    }
+}
+
 /// Constructed only from one Store snapshot. Display detachment cannot change
 /// these effect facts or their digest; clients never supply this value.
 #[derive(Serialize)]
@@ -3970,6 +4081,12 @@ pub(crate) fn opening_actor_for_open(
             "launch child differs from its exact parent tuple",
         ));
     }
+    if codex_preopen_participant_pending(&manifest) {
+        return Err(Error::new(
+            "LAUNCH_PARTICIPANT_PENDING",
+            "Codex launch open waits for its exact pre-open Participant issuance",
+        ));
+    }
     let actor = launch_actor(db, &parent_id)?;
     actor.require_opening_launch_attempt(
         db,
@@ -4011,7 +4128,7 @@ pub(super) fn pending_launch_ceiling(db: &Connection) -> Result<Option<LaunchRec
            AND CASE WHEN json_valid(effective_request_json) \
             THEN json_extract(effective_request_json,'$.launch_manifest.state') \
              IN ('pending_workspace','awaiting_binding','awaiting_capability', \
-                 'awaiting_participant_credential','outcome_unknown') ELSE 0 END \
+                 'awaiting_participant_credential','awaiting_native_mcp','outcome_unknown') ELSE 0 END \
          ORDER BY created_at_ms DESC,operation_id DESC LIMIT 1",
         [],
         |row| {
@@ -4042,7 +4159,7 @@ pub(super) fn pending_launches(
            AND CASE WHEN json_valid(effective_request_json) \
             THEN json_extract(effective_request_json,'$.launch_manifest.state') \
              IN ('pending_workspace','awaiting_binding','awaiting_capability', \
-                 'awaiting_participant_credential','outcome_unknown') ELSE 0 END \
+                 'awaiting_participant_credential','awaiting_native_mcp','outcome_unknown') ELSE 0 END \
            AND (?1 IS NULL OR created_at_ms>?1 OR (created_at_ms=?1 AND operation_id>?2)) \
            AND (created_at_ms<?3 OR (created_at_ms=?3 AND operation_id<=?4)) \
          ORDER BY created_at_ms,operation_id LIMIT ?5",
@@ -5158,7 +5275,10 @@ pub(super) fn reconcile_launch(
     }
     if !matches!(
         launch_state,
-        "awaiting_binding" | "awaiting_participant_credential" | "awaiting_capability"
+        "awaiting_binding"
+            | "awaiting_participant_credential"
+            | "awaiting_native_mcp"
+            | "awaiting_capability"
     ) && !recovering_unknown_binding
     {
         return Ok(operation["result"].clone());
@@ -5247,6 +5367,51 @@ pub(super) fn reconcile_launch(
     if binding["released_at_ms"].is_number() || lease_view["state"] != "held" {
         return fail_launch(tx, operation_id, "workspace_stale_before_effect", now);
     }
+    let codex_preopen_participant = is_codex_c8_launch(&manifest);
+    if codex_module_connected_for_preopen_issuance(&manifest, &open_operation, &binding) {
+        // The module handshake is ready while the native root is still absent;
+        // keep the open queued and project only that connected Module state.
+        manifest["binding"]["state"] = json!("ready");
+        manifest["state"] = json!(launcher_participant::AWAITING_ISSUANCE);
+        manifest["runtime"]["state"] = json!(launcher_participant::AWAITING_ISSUANCE);
+        let result = json!({
+            "operation_id":operation_id,
+            "launch_state":launcher_participant::AWAITING_ISSUANCE,
+            "state":"queued",
+            "plan_digest":manifest["plan_digest"],
+            "workspace_manifest_digest":manifest["workspace"]["manifest_digest"],
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "binding":{
+                "operation_id":open_operation_id,
+                "binding_id":binding_id,
+                "generation":binding_generation,
+                "state":"ready",
+            },
+            "participant_issuance":"pending",
+            "task_dispatch":"not_started",
+            "native_effect":"not_observed",
+            "capability_state":"unknown",
+            "gaps":["exact_scoped_participant_issuance_pending_before_codex_thread_start"],
+        });
+        persist_launch_progress(
+            tx,
+            operation_id,
+            LaunchProgress {
+                manifest,
+                result: &result,
+                operation_state: "queued",
+                attempt_id: Some(&attempt_id),
+                binding: Some(LaunchBindingIdentity {
+                    id: &binding_id,
+                    generation: binding_generation,
+                }),
+                now,
+            },
+        )?;
+        return Ok(result);
+    }
     if open_operation["state"] != "settled" || binding["state"] != "ready" {
         return Ok(operation["result"].clone());
     }
@@ -5320,12 +5485,60 @@ pub(super) fn reconcile_launch(
         return Ok(result);
     }
 
-    // This reconciliation branch has no capability receipt of its own. The
-    // separate C8 host worker retains exact-scope native inventory,
-    // session-context, and provider-request observations; dispatch admission
-    // reads that current receipt without treating provider-before-transport
-    // as model consumption or changing this branch's authority.
+    if codex_c8_readback_pending(&manifest) {
+        manifest["state"] = json!(launcher_participant::AWAITING_NATIVE_MCP);
+        let result = json!({
+            "operation_id":operation_id,
+            "launch_state":launcher_participant::AWAITING_NATIVE_MCP,
+            "state":"queued",
+            "plan_digest":manifest["plan_digest"],
+            "workspace_manifest_digest":manifest["workspace"]["manifest_digest"],
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "binding":{"binding_id":binding_id,"generation":binding_generation,"state":"ready"},
+            "task_dispatch":"not_started",
+            "native_effect":"binding_ready_observed",
+            "capability_state":"unknown",
+            "gaps":["native_mcp_assignment_readback_pending_before_launch_dispatch"],
+        });
+        if operation["result"] == result
+            && manifest["binding"]["native_root_id"] == binding["native_root_id"]
+            && manifest["binding"]["native_scope_key"] == binding["native_scope_key"]
+            && manifest["progress"]["binding_open"] == "ready_readback"
+        {
+            return Ok(result);
+        }
+        persist_launch_progress(
+            tx,
+            operation_id,
+            LaunchProgress {
+                manifest,
+                result: &result,
+                operation_state: "queued",
+                attempt_id: Some(&attempt_id),
+                binding: Some(LaunchBindingIdentity {
+                    id: &binding_id,
+                    generation: binding_generation,
+                }),
+                now,
+            },
+        )?;
+        return Ok(result);
+    }
+
+    // The C8 worker owns the exact thread-scoped MCP observation. This launch
+    // receipt projects only whether that proof was observed; dispatch admission
+    // revalidates the stored proof and the current Task/Attempt/lease tuple.
+    let codex_c8_observed = is_codex_c8_launch(&manifest)
+        && manifest["codex_native_mcp_readback"]["state"] == "observed";
     manifest["state"] = json!("awaiting_capability");
+    manifest["progress"]["capability_readback"] = json!(if codex_c8_observed {
+        "observed"
+    } else {
+        "not_observed"
+    });
+    manifest["runtime"]["dispatch_permitted"] = json!(false);
     let result = json!({
         "operation_id":operation_id,
         "launch_state":"awaiting_capability",
@@ -5338,11 +5551,18 @@ pub(super) fn reconcile_launch(
         "binding":{"binding_id":binding_id,"generation":binding_generation,"state":"ready"},
         "task_dispatch":"not_started",
         "native_effect":"binding_ready_observed",
-        "capability_state":"unknown",
-        "gaps":[
-            "native_mcp_capability_readback_is_not_recorded",
-            "task_dispatch_is_held_until_required_core_capabilities_are_verified",
-        ],
+        "capability_state":if codex_c8_observed {"verified"} else {"unknown"},
+        "native_mcp_capability_state":if codex_c8_observed {"verified"} else {"unknown"},
+        "dispatch_permitted":false,
+        "model_consumed":"unknown",
+        "gaps":if codex_c8_observed {
+            vec!["task_dispatch_not_started"]
+        } else {
+            vec![
+                "native_mcp_capability_readback_is_not_recorded",
+                "task_dispatch_is_held_until_required_core_capabilities_are_verified",
+            ]
+        },
     });
     persist_launch_progress(
         tx,

@@ -96,10 +96,11 @@ complete family coverage or execute tools.
 The standalone Rust adapter is a separate registered artifact from the legacy
 Python bridge. Its route uses `runtime = "codex"` and the exact artifact
 `codex-rust-controller.1`; its descriptor is
-`crates/swarm-adapter-codex/module-descriptor.template.json`. New Store
-bindings require descriptor v10, which retains the normalized dispatch/result
-schema pair and adds TaskPrompt v1 plus Goal continuation admission/terminal
-evidence schemas. The route contract requires
+`crates/swarm-adapter-codex/module-descriptor.template.json`. Descriptor v10
+introduced the normalized dispatch/result schema pair, TaskPrompt v1, and Goal
+continuation admission/terminal evidence schemas. Launch-owned C8 requires the
+exact current v13 descriptor; existing v10/v11 bindings retain their original
+contract and are not upgraded by route selection. The route contract requires
 `workspace_option = "workspaceRoot"` and absolute `workspaceRoot`.
 `modelProvider` and `model` are an optional explicit override pair for
 `thread/start`: omit both to use the installed harness thread defaults, or
@@ -140,16 +141,18 @@ that legacy artifact. No v8 selector or descriptor row requires child ancestry;
 v8 must return an unsupported or unavailable result rather than infer child
 causality from session, cwd, turn order, or family enumeration.
 
-Descriptor v13 adds a per-thread native MCP profile consumer and the separate
-read-only C8 proof. The consumer sends the issued Participant server as
-dotted `mcp_servers.<launch-specific-name>.*` entries in `thread/start.config`:
-an absolute sibling `swarm-mcp` executable, the existing issued profile and
-credential paths, and the exact `--config`, `--credential`, and `--profile`
-argv. It sets only `enabled`, `required`, and live `connection` startup
-readiness for that unique server entry; it
-does not set a provider, model, global setting, or copied profile. The native
-`required` startup behavior keeps the new thread from opening if that MCP
-server cannot initialize.
+Descriptor v13 adds the launch-owned Codex MCP profile consumer and its
+read-only C8 proof. Only a Codex Task launch supplies a transient profile to
+that launch's `agent.open`; ordinary `agent.open` retains native behavior and
+does not require Participant MCP readiness. The profile uses dotted
+`mcp_servers.<launch-specific-name>.*` entries in `thread/start.config`: an
+absolute sibling `swarm-mcp` executable, the existing issued profile and
+credential paths, and `--config`, `--credential`, and `--profile` arguments.
+The first-party v0.161.0 config schema defines `command`, `args`, `enabled`,
+`required`, and `startup_readiness`; `connection` is the default startup
+readiness, so no override is sent for it. The profile sets `enabled` and
+`required`, but no provider, model, global setting, or copied profile. A
+required server failure prevents the launch-owned thread from opening.
 
 The installed Codex CLI is 0.161.0; the source audit used first-party release
 tag `rust-v0.161.0` at commit `979011409de0a60b52f179721948e65531d26144`. Its
@@ -161,32 +164,30 @@ thread's config loader, and the same release's MCP refresh test applies
 so this design consumes the profile at `thread/start`; it does not try a
 post-open global reload or an unload/archive workaround.
 
-The launch sequence must issue the Participant credential/profile while the
-exact Task/Attempt, ready binding, and held lease are current, but before
-`thread/start`. Its registration keeps `native_session_id` null because the
-Codex thread ID does not exist yet. The mutation guard keeps that pending
-Participant read-only until the real open receipt and lease are confirmed.
-After open, C8 binds the returned thread ID to the current Store root, filters
-`mcpServerStatus/list` by that exact thread and unique server key, compares
-the effective tool schemas with Participant core, and calls
-`swarm.tools.search`/`swarm.context.get` through that same thread. The latter
-must return the authenticated Participant role/client/grant and exact
-Task/Attempt/binding assignment. Model consumption remains `unknown`.
-The app-server does not echo the loaded profile path/reference; the receipt
-claims only the effective thread toolset and authenticated assignment.
+After claim and lease verification, the exact Module connection is held while
+the Participant credential/profile is issued. The queued launch `agent.open`
+remains undispatched until that receipt is retained. Registration
+keeps `native_session_id` null because Codex allocates the thread ID inside
+`thread/start`. The separate Participant mutation guard activates only after
+the applied open receipt and lease are confirmed; C8 dispatch proof remains a
+separate gate. After open, C8 filters `mcpServerStatus/list` by that exact
+thread and unique server key, compares the effective tool schemas with
+Participant core, then calls `swarm.tools.search` and `swarm.context.get`
+through the same thread. The latter must return the authenticated Participant
+role/client/grant and exact Task/Attempt/binding assignment. Model consumption
+and OS process-family evidence remain `unknown`. The app-server does not echo
+the loaded profile path or reference; the receipt claims the effective thread
+toolset and authenticated assignment, not profile-reference readback.
 
-Root-owned integration is still required: move Codex Participant issuance and
-its retained receipt before the queued `agent.open`, then have the runtime
-command builder resolve the opaque refs in memory and attach the typed launch
-profile to that one `agent.open` command without persisting the private paths.
-Resolve the executable as the absolute `swarm-mcp[.exe]` sibling of the
-`swarm-kernel-host` executable, following the existing host MCP launcher; fail
-before `thread/start` if that sibling is missing. The v13 adapter requires this
-typed profile for every `agent.open` and rejects a missing profile before its
-native effect marker.
-The launch profile is rejected if it invents a pre-open native session ID.
-Until this glue is present, dispatch stays unavailable; there is no
-new-thread-without-MCP fallback. The adapter does not write Codex config or
+The runtime command builder resolves the opaque refs in memory and attaches the
+typed profile only to that launch-owned `agent.open`; private paths are not
+persisted in Operations or receipts. The executable is the verified absolute
+`swarm-mcp[.exe]` sibling of `swarm-kernel-host`. Its `--config`, `--credential`,
+and `--profile` arguments are defined by the current `swarm-mcp` CLI; the
+issued config supplies `storage.data_dir`. A missing sibling fails before
+`thread/start`.
+No profile is fabricated for ordinary opens, and the launch profile cannot
+claim a pre-open native session ID. The adapter does not write Codex config or
 copy the issued profile.
 
 The current descriptor also declares `agent.shutdown` with only

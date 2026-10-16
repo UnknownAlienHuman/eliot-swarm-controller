@@ -47,13 +47,8 @@
       "version": "1"
     },
     {
-      "schema_id": "swarm.native_mcp_command",
-      "version": "2",
-      "sha256": null
-    },
-    {
       "schema_id": "swarm.codex_native_mcp_command",
-      "version": "2",
+      "version": "3",
       "sha256": null
     },
     {
@@ -99,7 +94,6 @@
     "agent.result",
     "agent.send",
     "agent.shutdown",
-    "native.mcp.configure",
     "native.mcp.observe",
     "task.dispatch"
   ],

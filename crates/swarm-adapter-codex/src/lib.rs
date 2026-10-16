@@ -5206,12 +5206,13 @@ fn adopt_verified_root(
 fn codex_native_mcp_launch_profile(
     command: &RuntimeCommand,
     claim: &ModuleContractClaim,
-) -> Result<swarm_contracts::native_mcp::CodexNativeMcpLaunchProfile, &'static str> {
-    let raw = command.input.get("codex_native_mcp_launch_profile");
+) -> Result<Option<swarm_contracts::native_mcp::CodexNativeMcpLaunchProfile>, &'static str> {
+    let Some(raw) = command.input.get("codex_native_mcp_launch_profile") else {
+        return Ok(None);
+    };
     if !module_contract::codex_native_mcp_enabled(claim) {
         return Err("CODEX_NATIVE_MCP_CONTRACT_UNAVAILABLE");
     }
-    let raw = raw.ok_or("CODEX_NATIVE_MCP_PROFILE_REQUIRED")?;
     let profile: swarm_contracts::native_mcp::CodexNativeMcpLaunchProfile =
         serde_json::from_value(raw.clone()).map_err(|_| "CODEX_NATIVE_MCP_PROFILE_INVALID")?;
     profile
@@ -5227,7 +5228,7 @@ fn codex_native_mcp_launch_profile(
     {
         return Err("CODEX_NATIVE_MCP_SCOPE_MISMATCH");
     }
-    Ok(profile)
+    Ok(Some(profile))
 }
 
 async fn open_operation(
@@ -5287,13 +5288,14 @@ async fn open_operation(
         Ok(profile) => profile,
         Err(code) => return rejected(command, code, &journal.state),
     };
-    let native_mcp_config = match swarm_contracts::native_mcp::codex_native_mcp_thread_config(
-        &native_mcp_profile,
-    ) {
-        Ok(config) => config,
-        Err(_) => {
-            return rejected(command, "CODEX_NATIVE_MCP_PROFILE_INVALID", &journal.state);
-        }
+    let native_mcp_config = match native_mcp_profile {
+        Some(profile) => match swarm_contracts::native_mcp::codex_native_mcp_thread_config(&profile) {
+            Ok(config) => Some(config),
+            Err(_) => {
+                return rejected(command, "CODEX_NATIVE_MCP_PROFILE_INVALID", &journal.state);
+            }
+        },
+        None => None,
     };
     let canonical_workspace = normalize_path(&workspace).expect("validated absolute workspace");
     if !native.identity_is_known() {
@@ -5357,7 +5359,9 @@ async fn open_operation(
     if let Some(model) = model.as_deref() {
         start_params.insert("model".to_owned(), json!(model));
     }
-    start_params.insert("config".to_owned(), native_mcp_config);
+    if let Some(config) = native_mcp_config {
+        start_params.insert("config".to_owned(), config);
+    }
     let response = native
         .request("thread/start", Value::Object(start_params))
         .await;
@@ -8078,5 +8082,41 @@ mod agent_shutdown_loopback_tests {
             );
             std::fs::remove_dir_all(&directory).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod codex_launch_profile_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_agent_open_does_not_require_a_launch_profile_or_c8_claim() {
+        let claim: ModuleContractClaim = serde_json::from_value(json!({
+            "schema_version":1,
+            "module_id":"codex",
+            "artifact":{"artifact_id":ARTIFACT_ID,"version":ARTIFACT_VERSION,"build_id":null},
+            "protocol":{"major":1,"minor":0},
+            "capabilities":[],
+            "config_schema":null,
+            "command_schemas":[],
+            "event_schemas":[]
+        }))
+        .expect("valid minimal module claim");
+        let command = RuntimeCommand {
+            operation_id: "ordinary-open".to_owned(),
+            method: "agent.open".to_owned(),
+            created_at_ms: 1,
+            binding_id: "binding".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: json!({}),
+            input: json!({"route":{}}),
+            input_sha256: None,
+            target_input_sha256: None,
+        };
+
+        assert!(codex_native_mcp_launch_profile(&command, &claim)
+            .expect("ordinary open does not activate launch C8")
+            .is_none());
     }
 }

@@ -16,10 +16,14 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+use std::path::Path;
+use swarm_contracts::{
+    module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID,
+    native_mcp::CodexNativeMcpLaunchProfile,
+};
 
-const AWAITING_ISSUANCE: &str = "awaiting_participant_credential";
-const AWAITING_NATIVE_MCP: &str = "awaiting_native_mcp";
+pub(super) const AWAITING_ISSUANCE: &str = "awaiting_participant_credential";
+pub(super) const AWAITING_NATIVE_MCP: &str = "awaiting_native_mcp";
 const LAUNCH_OUTCOME_UNKNOWN: &str = "outcome_unknown";
 
 struct LaunchIssuanceScope {
@@ -164,21 +168,6 @@ fn validated_scope(
         ));
     }
     let binding = super::operations::get_binding(db, &binding_id, binding_generation)?;
-    if binding["state"] != "ready" || binding["released_at_ms"].is_number() {
-        return Err(Error::new(
-            "BINDING_NOT_READY",
-            "participant issuance requires the exact ready, unreleased binding",
-        ));
-    }
-    actor.require_bound_launch_attempt(
-        db,
-        operation_id,
-        &task_id,
-        task_revision,
-        &attempt_id,
-        &binding_id,
-        binding_generation,
-    )?;
     let open_operation_id = model::text(&manifest["binding"], "operation_id")?;
     let open_operation = super::operations::get_operation(db, open_operation_id)?;
     let is_codex_c8 = manifest["runtime"]["route"]["runtime"] == "codex"
@@ -195,6 +184,34 @@ fn validated_scope(
         && (phase == AWAITING_ISSUANCE
             || (manifest["participant"]["credential_ref"].is_string()
                 && manifest["participant"]["native_session_id"].is_null()));
+    // The native root does not exist until agent.open is sent. At this point
+    // the binding row stays `opening`; the authenticated module connection is
+    // the readiness fence for issuing its launch Participant.
+    let module_connection_ready = binding["state"] == "opening"
+        && binding["observation"]["connection"] == "connected"
+        && binding["observation"]["module_client_id"].as_str().is_some_and(|value| !value.is_empty())
+        && binding["observation"]["module_link_id"].as_str().is_some_and(|value| !value.is_empty())
+        && binding["observation"]["bridge_boot_id"].as_str().is_some_and(|value| !value.is_empty());
+    let binding_ready = if codex_preopen_issuance {
+        module_connection_ready
+    } else {
+        binding["state"] == "ready"
+    };
+    if !binding_ready || binding["released_at_ms"].is_number() {
+        return Err(Error::new(
+            "BINDING_NOT_READY",
+            "Participant issuance requires the exact connected module binding before thread/start",
+        ));
+    }
+    actor.require_bound_launch_attempt(
+        db,
+        operation_id,
+        &task_id,
+        task_revision,
+        &attempt_id,
+        &binding_id,
+        binding_generation,
+    )?;
     if open_operation["method"] != "agent.open"
         || (!codex_preopen_issuance && open_operation["state"] != "settled")
         || (is_codex_c8 && !codex_preopen_issuance
@@ -457,6 +474,129 @@ pub(super) fn prepare_launch_issuance(
         }
     }
     Ok(request)
+}
+
+/// Resolve the existing launch-issued Participant artifacts only for the
+/// exact queued Codex launch open. The returned private paths are intended for
+/// one transient RuntimeCommand and must never be retained in an Operation.
+pub(super) fn codex_launch_profile_for_open(
+    tx: &Transaction<'_>,
+    actor: &LaunchActor,
+    launch_operation_id: &str,
+    open_operation_id: &str,
+    config: &Config,
+    executable: &Path,
+) -> Result<Option<CodexNativeMcpLaunchProfile>> {
+    let operation = super::operations::get_operation(tx, launch_operation_id)?;
+    let manifest = retained_manifest(tx, launch_operation_id)?;
+    if manifest["runtime"]["route"]["runtime"] != "codex"
+        || manifest["runtime"]["route"]["module_artifact_id"]
+            != CODEX_RUST_CONTROLLER_ARTIFACT_ID
+    {
+        return Ok(None);
+    }
+    if manifest["binding"]["operation_id"] != open_operation_id {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "Codex profile request does not name the launch's exact open Operation",
+        ));
+    }
+    let scope = validated_scope(
+        tx,
+        actor,
+        launch_operation_id,
+        config,
+        &[AWAITING_NATIVE_MCP],
+    )?;
+    if operation["method"] != "swarm.launch"
+        || operation["state"] != "queued"
+        || scope.manifest["binding"]["operation_id"] != open_operation_id
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "Codex profile requires the exact queued launch and open Operations",
+        ));
+    }
+
+    let participant = &scope.manifest["participant"];
+    let client_id = model::text(participant, "client_id")?.to_owned();
+    let credential_ref = model::text(participant, "credential_ref")?.to_owned();
+    let profile_config_ref = model::text(participant, "profile_config_ref")?.to_owned();
+    let registration_operation_id =
+        model::text(participant, "registration_operation_id")?.to_owned();
+    let registration_raw: String = tx.query_row(
+        "SELECT result_json FROM operations WHERE operation_id=?1 AND method='coordination.participant.register' AND state='settled'",
+        [&registration_operation_id],
+        |row| row.get(0),
+    )?;
+    let registration: Value = serde_json::from_str(&registration_raw)?;
+    let issued = IssuedParticipant {
+        credential_ref: credential_ref.clone(),
+        profile_config_ref: profile_config_ref.clone(),
+        registration,
+    };
+    let request = build_issue_request(&scope, launch_operation_id)?;
+    let (registered_client_id, stored_registration, _) = check_registered_participant(
+        tx,
+        actor,
+        &scope,
+        launch_operation_id,
+        &request,
+        &issued,
+    )?;
+    let grant_revision = model::positive(&stored_registration, "grant_revision")?;
+    if registered_client_id != client_id
+        || participant["role"] != "participant"
+        || participant["task_id"] != scope.task_id
+        || participant["task_revision"] != scope.task_revision
+        || participant["attempt_id"] != scope.attempt_id
+        || participant["binding_id"] != scope.binding_id
+        || participant["binding_generation"] != scope.binding_generation
+        || participant["grant_revision"] != grant_revision
+        || participant["native_session_id"].is_string()
+        || scope.native_session_id.is_some()
+        || scope.manifest["mcp"]["credential_ref"] != credential_ref
+        || scope.manifest["mcp"]["profile_config_ref"] != profile_config_ref
+    {
+        return Err(Error::new(
+            "STALE_PARTICIPANT",
+            "Codex launch profile differs from the exact pre-open Participant registration",
+        ));
+    }
+    let artifacts = crate::participant_credentials::resolve_refs(
+        config,
+        &credential_ref,
+        &profile_config_ref,
+    )?;
+    let path_text = |path: &Path, label: &str| {
+        path.to_str().map(str::to_owned).ok_or_else(|| {
+            Error::new(
+                "PRIVATE_ARTIFACT_REFERENCE",
+                format!("{label} path is not valid Unicode"),
+            )
+        })
+    };
+    let profile_name = scope.mcp_profile.clone();
+    let surface = scope.mcp_surface.clone();
+    let profile = CodexNativeMcpLaunchProfile::new(
+        launch_operation_id.to_owned(),
+        scope.task_id,
+        scope.task_revision,
+        scope.attempt_id,
+        scope.binding_id,
+        scope.binding_generation,
+        client_id,
+        grant_revision,
+        credential_ref,
+        profile_config_ref,
+        profile_name,
+        surface,
+        path_text(executable, "swarm-mcp executable")?,
+        path_text(artifacts.credential_path(), "Participant credential")?,
+        path_text(artifacts.profile_config_path(), "Participant profile")?,
+    )
+    .map_err(|_| Error::new("NATIVE_MCP_PROFILE_INVALID", "Codex launch profile is invalid"))?;
+    Ok(Some(profile))
 }
 
 fn validate_opaque_ref(value: &str, prefix: &str) -> Result<()> {

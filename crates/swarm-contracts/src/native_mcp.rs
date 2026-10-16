@@ -47,7 +47,7 @@ const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 pub const NATIVE_MCP_ASSIGNMENT_READBACK_KIND: &str = "native_mcp_assignment_readback";
 
 pub const CODEX_NATIVE_MCP_COMMAND_SCHEMA_ID: &str = "swarm.codex_native_mcp_command";
-pub const CODEX_NATIVE_MCP_COMMAND_SCHEMA_VERSION: &str = "2";
+pub const CODEX_NATIVE_MCP_COMMAND_SCHEMA_VERSION: &str = "3";
 pub const CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_ID: &str =
     "swarm.codex_native_mcp_launch_profile";
 pub const CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_VERSION: &str = "1";
@@ -70,32 +70,6 @@ pub fn codex_native_mcp_server_name(launch_operation_id: &str) -> Result<String,
     }
     let digest = format!("{:x}", Sha256::digest(launch_operation_id.as_bytes()));
     Ok(format!("eliot_swarm_{digest}"))
-}
-
-/// Digest only the issued assignment identity. Native paths are deliberately
-/// excluded so they never enter a receipt or MCP response.
-pub fn codex_profile_assignment_sha256(
-    participant_id: &str,
-    credential_ref: &str,
-    profile_config_ref: &str,
-    profile_name: &str,
-    surface: &str,
-) -> Result<Sha256Digest, &'static str> {
-    if !bounded_text(participant_id, MAX_PARTICIPANT_ID_BYTES)
-        || !opaque_assignment_ref(credential_ref, "participant-credential")
-        || !opaque_assignment_ref(profile_config_ref, "participant-mcp-config")
-        || !bounded_text(profile_name, MAX_PROFILE_NAME_BYTES)
-        || surface != "participant-core"
-    {
-        return Err("Codex Participant profile assignment is invalid");
-    }
-    codex_value_sha256(&json!({
-        "participant_id":participant_id,
-        "credential_ref":credential_ref,
-        "profile_config_ref":profile_config_ref,
-        "profile_name":profile_name,
-        "surface":surface,
-    }))
 }
 
 /// Transient input used only on the exact `agent.open` RuntimeCommand. Store
@@ -121,7 +95,6 @@ pub struct CodexNativeMcpLaunchProfile {
     pub profile_config_ref: String,
     pub profile_name: String,
     pub surface: String,
-    pub profile_assignment_sha256: Sha256Digest,
     pub server_name: String,
     pub executable: String,
     pub credential_path: String,
@@ -147,13 +120,6 @@ impl CodexNativeMcpLaunchProfile {
         credential_path: String,
         profile_config_path: String,
     ) -> Result<Self, &'static str> {
-        let profile_assignment_sha256 = codex_profile_assignment_sha256(
-            &participant_id,
-            &credential_ref,
-            &profile_config_ref,
-            &profile_name,
-            &surface,
-        )?;
         let value = Self {
             schema_version: 1,
             kind: "codex_native_mcp_launch_profile".to_owned(),
@@ -171,7 +137,6 @@ impl CodexNativeMcpLaunchProfile {
             profile_config_ref,
             profile_name,
             surface,
-            profile_assignment_sha256,
             executable,
             credential_path,
             profile_config_path,
@@ -199,16 +164,6 @@ impl CodexNativeMcpLaunchProfile {
             || !opaque_assignment_ref(&self.profile_config_ref, "participant-mcp-config")
             || !bounded_text(&self.profile_name, MAX_PROFILE_NAME_BYTES)
             || self.surface != "participant-core"
-            || !is_lower_sha256(&self.profile_assignment_sha256)
-            || self.profile_assignment_sha256.as_str()
-                != codex_profile_assignment_sha256(
-                    &self.participant_id,
-                    &self.credential_ref,
-                    &self.profile_config_ref,
-                    &self.profile_name,
-                    &self.surface,
-                )?
-                .as_str()
             || self.server_name != codex_native_mcp_server_name(&self.launch_operation_id)?
             || !private_absolute_path(&self.executable)
             || expected_executable != Some(CODEX_NATIVE_MCP_EXECUTABLE_NAME)
@@ -242,7 +197,6 @@ pub fn codex_native_mcp_thread_config(
     values.insert(format!("{prefix}.args"), args);
     values.insert(format!("{prefix}.enabled"), json!(true));
     values.insert(format!("{prefix}.required"), json!(true));
-    values.insert(format!("{prefix}.startup_readiness"), json!("connection"));
     Ok(Value::Object(values))
 }
 
@@ -332,8 +286,9 @@ fn ordered_json(value: &Value) -> Value {
 }
 
 /// Store-admitted, read-only Codex MCP observation for the exact current
-/// Participant assignment. It carries opaque local artifact references and
-/// digests only; it never carries a token, provider credential, or config body.
+/// Participant assignment. It carries current assignment identity and expected
+/// authorization/toolset digests, never profile refs, paths, tokens, or provider
+/// settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexNativeMcpCommand {
@@ -359,20 +314,16 @@ pub struct CodexNativeMcpCommand {
     pub participant_id: String,
     pub grant_revision: i64,
     pub participant_native_session_id: Option<String>,
-    pub credential_ref: String,
-    pub profile_config_ref: String,
-    pub profile_name: String,
     pub surface: String,
     pub server_name: String,
-    pub profile_assignment_sha256: Sha256Digest,
     pub expected_authorization_revision: Sha256Digest,
     pub expected_toolset_sha256: Sha256Digest,
 }
 
 impl CodexNativeMcpCommand {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != 2
-            || self.codex_schema_version != 2
+        if self.schema_version != 3
+            || self.codex_schema_version != 3
             || self.kind != "codex_native_mcp_command"
             || !bounded_text(&self.operation_id, MAX_OPERATION_ID_BYTES)
             || !bounded_text(&self.launch_operation_id, MAX_OPERATION_ID_BYTES)
@@ -398,12 +349,8 @@ impl CodexNativeMcpCommand {
                 .participant_native_session_id
                 .as_deref()
                 .is_some_and(|value| !bounded_native_text(value))
-            || !opaque_assignment_ref(&self.credential_ref, "participant-credential")
-            || !opaque_assignment_ref(&self.profile_config_ref, "participant-mcp-config")
-            || !bounded_text(&self.profile_name, MAX_PROFILE_NAME_BYTES)
             || self.surface != "participant-core"
             || self.server_name != codex_native_mcp_server_name(&self.launch_operation_id)?
-            || !is_lower_sha256(&self.profile_assignment_sha256)
             || !is_lower_sha256(&self.expected_authorization_revision)
             || !is_lower_sha256(&self.expected_toolset_sha256)
             || self.computed_assignment_sha256()?.as_str() != self.assignment_sha256.as_str()
@@ -433,7 +380,7 @@ impl CodexNativeMcpCommand {
     /// issued references separately when it constructs `thread/start.config`.
     pub fn effect_identity(&self) -> Value {
         json!({
-            "schema_version":2,
+            "schema_version":3,
             "kind":"codex_native_mcp_effect",
             "observation_kind":"assigned_session",
             "operation_id":self.operation_id,
@@ -451,12 +398,8 @@ impl CodexNativeMcpCommand {
             "participant_id":self.participant_id,
             "grant_revision":self.grant_revision,
             "participant_native_session_id":self.participant_native_session_id,
-            "credential_ref":self.credential_ref,
-            "profile_config_ref":self.profile_config_ref,
-            "profile_name":self.profile_name,
             "surface":self.surface,
             "server_name":self.server_name,
-            "profile_assignment_sha256":self.profile_assignment_sha256,
             "expected_authorization_revision":self.expected_authorization_revision,
             "expected_toolset_sha256":self.expected_toolset_sha256,
         })
@@ -478,12 +421,7 @@ impl CodexNativeMcpCommand {
             "participant_id":self.participant_id,
             "grant_revision":self.grant_revision,
             "participant_native_session_id":self.participant_native_session_id,
-            "credential_ref":self.credential_ref,
-            "profile_config_ref":self.profile_config_ref,
-            "profile_name":self.profile_name,
             "surface":self.surface,
-            "server_name":self.server_name,
-            "profile_assignment_sha256":self.profile_assignment_sha256,
             "expected_authorization_revision":self.expected_authorization_revision,
             "expected_toolset_sha256":self.expected_toolset_sha256,
         }))
@@ -521,25 +459,17 @@ pub struct CodexNativeMcpReadback {
     pub attempt_id: String,
     pub grant_revision: i64,
     pub participant_native_session_id: Option<String>,
-    pub profile_name: String,
     pub surface: String,
-    pub profile_application_state: String,
-    pub profile_reference_readback: String,
-    pub credential_ref: String,
-    pub profile_config_ref: String,
-    pub profile_assignment_sha256: Sha256Digest,
     pub authorization_revision: Sha256Digest,
     pub toolset_sha256: Sha256Digest,
     pub tool_count: u32,
     pub observed_at_ms: i64,
     pub evidence_sha256: Sha256Digest,
-    pub dispatch_permitted: bool,
-    pub model_consumed: String,
 }
 
 impl CodexNativeMcpReadback {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != 1
+        if self.schema_version != 2
             || self.kind != CODEX_NATIVE_MCP_READBACK_KIND
             || !bounded_text(&self.operation_id, MAX_OPERATION_ID_BYTES)
             || !bounded_text(&self.launch_operation_id, MAX_OPERATION_ID_BYTES)
@@ -567,20 +497,12 @@ impl CodexNativeMcpReadback {
                 .as_deref()
                 .is_some_and(|value| !bounded_native_text(value))
             || !bounded_text(&self.open_operation_id, MAX_OPERATION_ID_BYTES)
-            || !bounded_text(&self.profile_name, MAX_PROFILE_NAME_BYTES)
             || self.surface != "participant-core"
-            || self.profile_application_state != "effective_thread_toolset_and_authenticated_assignment"
-            || self.profile_reference_readback != "not_exposed_by_native_api"
-            || !opaque_assignment_ref(&self.credential_ref, "participant-credential")
-            || !opaque_assignment_ref(&self.profile_config_ref, "participant-mcp-config")
-            || !is_lower_sha256(&self.profile_assignment_sha256)
             || !is_lower_sha256(&self.authorization_revision)
             || !is_lower_sha256(&self.toolset_sha256)
             || self.tool_count == 0
             || self.observed_at_ms <= 0
             || !is_lower_sha256(&self.evidence_sha256)
-            || self.dispatch_permitted
-            || self.model_consumed != "unknown"
             || self.computed_evidence_sha256()?.as_str() != self.evidence_sha256.as_str()
         {
             return Err("Codex native MCP readback identity is invalid");
@@ -1059,5 +981,53 @@ mod tests {
         let mut value = serde_json::to_value(valid_readback()).unwrap();
         value["raw_error"] = json!("must not pass");
         assert!(serde_json::from_value::<NativeMcpAssignmentReadback>(value).is_err());
+    }
+
+    #[test]
+    fn codex_launch_config_is_thread_scoped_and_leaves_native_readiness_defaulted() {
+        let root = std::env::temp_dir();
+        let profile = CodexNativeMcpLaunchProfile::new(
+            "launch-config-test".into(),
+            "task-config-test".into(),
+            1,
+            "attempt-config-test".into(),
+            "binding-config-test".into(),
+            1,
+            "participant-config-test".into(),
+            1,
+            "participant-credential:00000000-0000-4000-8000-000000000001".into(),
+            "participant-mcp-config:00000000-0000-4000-8000-000000000002".into(),
+            "work-participant".into(),
+            "participant-core".into(),
+            root.join(CODEX_NATIVE_MCP_EXECUTABLE_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            root.join("codex-c8-credential.json")
+                .to_string_lossy()
+                .into_owned(),
+            root.join("codex-c8-profile.toml")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("valid launch-scoped Participant profile");
+        let config = codex_native_mcp_thread_config(&profile)
+            .expect("native thread config overrides validate");
+        let prefix = format!("mcp_servers.{}.", profile.server_name);
+        let command_key = format!("{prefix}command");
+        let enabled_key = format!("{prefix}enabled");
+        let required_key = format!("{prefix}required");
+        let args_key = format!("{prefix}args");
+        let startup_readiness_key = format!("{prefix}startup_readiness");
+
+        assert_eq!(config.get(command_key.as_str()).and_then(Value::as_str), Some(profile.executable.as_str()));
+        assert_eq!(config.get(enabled_key.as_str()).and_then(Value::as_bool), Some(true));
+        assert_eq!(config.get(required_key.as_str()).and_then(Value::as_bool), Some(true));
+        let args = config.get(args_key.as_str()).and_then(Value::as_array).unwrap();
+        assert_eq!(args.first().and_then(Value::as_str), Some("--config"));
+        assert_eq!(args.get(2).and_then(Value::as_str), Some("--credential"));
+        assert_eq!(args.get(4).and_then(Value::as_str), Some("--profile"));
+        assert!(config.get(startup_readiness_key.as_str()).is_none());
+        assert!(config.get("model").is_none());
+        assert!(config.get("model_provider").is_none());
     }
 }

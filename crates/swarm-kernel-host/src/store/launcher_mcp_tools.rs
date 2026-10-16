@@ -84,9 +84,6 @@ impl Store {
     /// `observed_partial` readback; C7's five-minute refresh delay is not
     /// reused as an installation delay.
     pub(crate) async fn reconcile_native_mcp_tools_once(&self) -> Result<Value> {
-        if let Some(codex) = super::codex_c8::reconcile_once(self).await? {
-            return Ok(codex);
-        }
         let now = model::now_ms()?;
         let config = self.config.clone();
         let outcome = self

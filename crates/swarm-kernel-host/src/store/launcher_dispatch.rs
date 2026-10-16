@@ -860,14 +860,9 @@ fn build_codex_dispatch_packet(
         || readback.native_root_id != parent.manifest["binding"]["native_root_id"]
         || readback.native_scope_key != binding["native_scope_key"]
         || readback.open_operation_id != parent.manifest["binding"]["operation_id"]
-        || readback.credential_ref != parent.manifest["participant"]["credential_ref"]
-        || readback.profile_config_ref != parent.manifest["participant"]["profile_config_ref"]
-        || readback.profile_name != parent.manifest["mcp"]["profile_name"]
         || readback.surface != parent.manifest["mcp"]["surface"]
         || readback.toolset_sha256 != expected_toolset
         || readback.tool_count as usize != tools.len()
-        || readback.dispatch_permitted
-        || readback.model_consumed != "unknown"
         || binding["state"] != "ready"
         || binding["released_at_ms"].is_number()
         || attempt["state"] != "reserved"
@@ -910,19 +905,12 @@ fn build_codex_dispatch_packet(
             "runtime_status":readback.runtime_status,
             "participant_id":readback.participant_id,
             "grant_revision":readback.grant_revision,
-            "profile_name":readback.profile_name,
             "surface":readback.surface,
-            "credential_ref":readback.credential_ref,
-            "profile_config_ref":readback.profile_config_ref,
-            "profile_assignment_sha256":readback.profile_assignment_sha256,
-            "profile_application_state":readback.profile_application_state,
-            "profile_reference_readback":readback.profile_reference_readback,
             "tool_count":readback.tool_count,
             "required_core_schemas":required_core_schemas,
             "adapter_boot_id":readback.adapter_boot_id,
             "native_root_id":readback.native_root_id,
             "native_scope_key":readback.native_scope_key,
-            "dispatch_permitted":false,
             "model_consumed":"unknown",
         },
     }))
