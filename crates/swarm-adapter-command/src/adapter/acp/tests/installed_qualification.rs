@@ -53,7 +53,7 @@ fn route_and_workspace() -> std::result::Result<(PathBuf, Value, PathBuf), Strin
     )
     .map_err(|_| "qualification route JSON is malformed".to_owned())?;
     let route = route_document["route"].clone();
-    acp::validate_acp_route(&route).map_err(|error| error.code)?;
+    acp::validate_acp_route_with_model_policy(&route, true).map_err(|error| error.code)?;
     let options = &route["native_options"];
     if options["modelId"] != "deepseek/deepseek-v4-flash"
         || options["effort"] != "default"
@@ -98,7 +98,7 @@ fn fixture_owner(state_dir: &Path, binding_id: &str) -> acp::Owner {
         record: json!({"qualification_only":true}),
         host: crate::module_host::ModuleHostIdentity {
             claim,
-            profile: crate::Profile::AcpV1,
+            profile: crate::Profile::AcpV2,
             boot_id: Uuid::new_v4().to_string(),
             binding_id: binding_id.to_owned(),
             generation: 1,
@@ -243,17 +243,15 @@ async fn run_installed_qualification() -> std::result::Result<(PathBuf, Value), 
     let state_dir = run_root.join("state");
     fs::create_dir_all(&state_dir).map_err(|error| error.to_string())?;
     let evidence_path = run_root.join("installed-acp-live-evidence.json");
-    let journal = acp::AcpJournal::new(&state_dir).map_err(|error| error.code)?;
+    let journal = acp::AcpJournal::new_for_profile(&state_dir, crate::Profile::AcpV2)
+        .map_err(|error| error.code)?;
     let binding_id = format!("binding-pr44-qualification-{}", Uuid::new_v4());
     let owner = fixture_owner(&state_dir, &binding_id);
     let open_command = qualification_command("open", &binding_id, &route);
     let restore_command = qualification_command("restore", &binding_id, &route);
     let native_options = &route["native_options"];
     let session_route = acp::SessionRouteConfiguration {
-        model_id: native_options["modelId"]
-            .as_str()
-            .ok_or_else(|| "route modelId is missing".to_owned())?
-            .to_owned(),
+        model_id: native_options["modelId"].as_str().map(str::to_owned),
         effort: native_options["effort"].as_str().map(str::to_owned),
         mode: native_options["mode"].as_str().map(str::to_owned),
     };
@@ -520,7 +518,8 @@ async fn run_installed_qualification() -> std::result::Result<(PathBuf, Value), 
                     Ok(session) => json!({
                         "status":"verified",
                         "operation_id":open_command.operation_id,
-                        "model_id":session.model_id,
+                        "requested_model":session.requested_model,
+                        "effective_model":session.effective_model,
                         "effective_effort":session.effective_effort,
                         "effective_mode":session.effective_mode,
                         "session_id_sha256":acp::digest(session.id.to_string().as_bytes()),
@@ -697,7 +696,10 @@ async fn pr44_command_acp_installed_open_setters_and_same_session_restore_withou
                 && receipt["readback_verified"] == true
         }));
     }
-    assert_eq!(evidence["open"]["model_id"], "deepseek/deepseek-v4-flash");
+    assert_eq!(
+        evidence["open"]["effective_model"],
+        "deepseek/deepseek-v4-flash"
+    );
     assert_eq!(evidence["open"]["effective_effort"], "default");
     assert_eq!(evidence["open"]["effective_mode"], "default");
 }

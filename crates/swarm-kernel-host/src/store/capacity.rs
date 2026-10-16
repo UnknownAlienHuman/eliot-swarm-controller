@@ -3345,8 +3345,53 @@ struct RootRouteIdentity {
     route_alias: String,
     runtime: String,
     module_artifact_id: String,
+    // These are route-recorded selectors only. Missing values stay absent and
+    // never act as wildcards or inferred native defaults during attribution.
     provider: Option<String>,
     model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootRouteIdentityMatch {
+    Exact,
+    Different,
+    Unknown,
+}
+
+fn compare_optional_route_component<T: PartialEq>(
+    left: Option<&T>,
+    right: Option<&T>,
+) -> RootRouteIdentityMatch {
+    match (left, right) {
+        (None, None) => RootRouteIdentityMatch::Exact,
+        (Some(left), Some(right)) if left == right => RootRouteIdentityMatch::Exact,
+        (Some(_), Some(_)) => RootRouteIdentityMatch::Different,
+        _ => RootRouteIdentityMatch::Unknown,
+    }
+}
+
+fn compare_root_route_identity(
+    left: &RootRouteIdentity,
+    right: &RootRouteIdentity,
+) -> RootRouteIdentityMatch {
+    if left.route_alias != right.route_alias
+        || left.runtime != right.runtime
+        || left.module_artifact_id != right.module_artifact_id
+    {
+        return RootRouteIdentityMatch::Different;
+    }
+    let provider =
+        compare_optional_route_component(left.provider.as_ref(), right.provider.as_ref());
+    let model = compare_optional_route_component(left.model.as_ref(), right.model.as_ref());
+    if provider == RootRouteIdentityMatch::Different || model == RootRouteIdentityMatch::Different {
+        RootRouteIdentityMatch::Different
+    } else if provider == RootRouteIdentityMatch::Unknown
+        || model == RootRouteIdentityMatch::Unknown
+    {
+        RootRouteIdentityMatch::Unknown
+    } else {
+        RootRouteIdentityMatch::Exact
+    }
 }
 
 enum LaunchRouteMatch {
@@ -3432,12 +3477,24 @@ fn root_route_identity(route: &Value) -> Option<RootRouteIdentity> {
             Some(root_route_text(options?.get("model"))?),
         ),
         ("command", "eliot-command.rust-headless.1" | "eliot-command.acp-rust.1") => {
-            let model_id = root_route_text(options?.get("modelId"))?;
-            let (provider, model) = model_id.split_once('/')?;
-            (
-                Some(root_route_component(provider)?),
-                Some(root_route_component(model)?),
-            )
+            let options = options?;
+            match options.get("modelId") {
+                None | Some(Value::Null) => (None, None),
+                Some(Value::String(value)) => {
+                    let model_id = root_route_component(value)?;
+                    if model_id.trim() != model_id.as_str() {
+                        return None;
+                    }
+                    match model_id.split_once('/') {
+                        Some((provider, model)) => (
+                            Some(root_route_component(provider)?),
+                            Some(root_route_component(model)?),
+                        ),
+                        None => (None, Some(model_id.clone())),
+                    }
+                }
+                Some(_) => return None,
+            }
         }
         ("antigravity", "eliot-antigravity.rust-headless.1") => (
             Some("google".to_owned()),
@@ -3461,8 +3518,103 @@ fn root_binding_matches_route(
     target_route: Option<&RootRouteIdentity>,
 ) -> bool {
     match target_route {
+        // Option fields compare exactly: an omitted model is not a wildcard
+        // for a route with a supplied model selector.
         Some(target) => binding.route_identity.as_ref() == Some(target),
         None => target_scope.is_some_and(|scope| same_route_scope_facts(&binding.scope, scope)),
+    }
+}
+
+#[cfg(test)]
+mod command_root_route_identity_tests {
+    use super::{
+        RootRouteIdentity, RootRouteIdentityMatch, compare_root_route_identity, root_route_identity,
+    };
+    use serde_json::{Value, json};
+
+    fn route(native_options: Value) -> Value {
+        json!({
+            "alias":"command-native-default",
+            "runtime":"command",
+            "module_artifact_id":"eliot-command.rust-headless.1",
+            "native_options":native_options
+        })
+    }
+
+    #[test]
+    fn command_identity_keeps_alias_and_artifact_when_model_is_unselected() {
+        for options in [
+            json!({"workspaceRoot":"C:/work"}),
+            json!({"workspaceRoot":"C:/work","modelId":null}),
+        ] {
+            assert_eq!(
+                root_route_identity(&route(options)),
+                Some(RootRouteIdentity {
+                    route_alias: "command-native-default".to_owned(),
+                    runtime: "command".to_owned(),
+                    module_artifact_id: "eliot-command.rust-headless.1".to_owned(),
+                    provider: None,
+                    model: None,
+                })
+            );
+        }
+        let acp = json!({
+            "alias":"command-native-default",
+            "runtime":"command",
+            "module_artifact_id":"eliot-command.acp-rust.1",
+            "native_options":{"workspaceRoot":"C:/work"}
+        });
+        let acp_identity = root_route_identity(&acp).expect("ACP default route is attributable");
+        assert_eq!(acp_identity.route_alias, "command-native-default");
+        assert_eq!(acp_identity.module_artifact_id, "eliot-command.acp-rust.1");
+        assert_eq!(acp_identity.provider, None);
+        assert_eq!(acp_identity.model, None);
+    }
+
+    #[test]
+    fn command_identity_records_only_model_dimensions_present_in_the_selector() {
+        let qualified = root_route_identity(&route(json!({"modelId":"provider/model"})))
+            .expect("qualified selector has an exact route identity");
+        assert_eq!(qualified.provider.as_deref(), Some("provider"));
+        assert_eq!(qualified.model.as_deref(), Some("model"));
+
+        let unqualified = root_route_identity(&route(json!({"modelId":"model-only"})))
+            .expect("unqualified selector has an exact route identity");
+        assert_eq!(unqualified.provider, None);
+        assert_eq!(unqualified.model.as_deref(), Some("model-only"));
+        assert_ne!(qualified, unqualified);
+    }
+
+    #[test]
+    fn missing_model_dimension_is_unknown_against_a_configured_model_not_a_wildcard() {
+        let native_default =
+            root_route_identity(&route(json!({}))).expect("native-default route has an identity");
+        let explicit = root_route_identity(&route(json!({"modelId":"provider/model"})))
+            .expect("explicit route has an identity");
+        assert_eq!(
+            compare_root_route_identity(&native_default, &native_default),
+            RootRouteIdentityMatch::Exact
+        );
+        assert_eq!(
+            compare_root_route_identity(&native_default, &explicit),
+            RootRouteIdentityMatch::Unknown
+        );
+        let different = root_route_identity(&route(json!({"modelId":"provider/other"})))
+            .expect("different explicit model has an identity");
+        assert_eq!(
+            compare_root_route_identity(&explicit, &different),
+            RootRouteIdentityMatch::Different
+        );
+    }
+
+    #[test]
+    fn malformed_model_selection_does_not_become_a_native_default() {
+        assert!(root_route_identity(&route(json!({"modelId":false}))).is_none());
+        assert!(root_route_identity(&route(json!({"modelId":"model\n"}))).is_none());
+        assert_ne!(
+            root_route_identity(&route(json!({}))),
+            root_route_identity(&route(json!({"modelId":"explicit"})))
+        );
     }
 }
 
@@ -3831,11 +3983,21 @@ pub(super) fn root_claims_for_route(
             if let Some(target) = target_route_identity.as_ref() {
                 let recorded_runtime = binding["route"]["runtime"].as_str();
                 let recorded_alias = binding["route"]["alias"].as_str();
+                let recorded_artifact = binding["route"]["module_artifact_id"].as_str();
                 let could_be_target = recorded_runtime
                     .is_none_or(|runtime| runtime == target.runtime)
-                    && recorded_alias.is_none_or(|alias| alias == target.route_alias);
-                if could_be_target && route_identity.is_none() {
-                    return Ok(None);
+                    && recorded_alias.is_none_or(|alias| alias == target.route_alias)
+                    && recorded_artifact
+                        .is_none_or(|artifact| artifact == target.module_artifact_id);
+                if could_be_target {
+                    let Some(identity) = route_identity.as_ref() else {
+                        return Ok(None);
+                    };
+                    if compare_root_route_identity(identity, target)
+                        == RootRouteIdentityMatch::Unknown
+                    {
+                        return Ok(None);
+                    }
                 }
             }
             let claim = RootBindingClaim {

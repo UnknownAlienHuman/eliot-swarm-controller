@@ -394,8 +394,18 @@ fn validate_owned_opencode_rust_options(value: &Value) -> Result<()> {
 }
 
 fn validate_command_rust_options(value: &Value) -> Result<()> {
-    let options = exact_option_object(value, &["modelId", "workspaceRoot"], &[])?;
-    required_option_string(options, "modelId", 256)?;
+    // Route config does not carry the selected descriptor version. Validate a
+    // supplied selector here; the versioned adapter enforces its own absence policy.
+    let options = exact_option_object(value, &["workspaceRoot"], &["modelId"])?;
+    if let Some(value) = options.get("modelId").filter(|value| !value.is_null()) {
+        let model_id = option_string(value, "modelId", 256)?;
+        if model_id.trim() != model_id {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "Command modelId must be an exact string",
+            ));
+        }
+    }
     required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
     Ok(())
 }

@@ -3,7 +3,7 @@
   "module_id": "runtime.command",
   "artifact": {
     "artifact_id": "eliot-command.acp-rust.1",
-    "version": "1",
+    "version": "2",
     "build_id": null
   },
   "launch": {

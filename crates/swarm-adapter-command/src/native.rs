@@ -155,7 +155,12 @@ pub async fn invoke(
         ));
     }
 
-    let native_args = native_arguments(config, &identity.requested_model, &pinned_mod_path, prompt);
+    let native_args = native_arguments(
+        config,
+        identity.requested_model.as_deref(),
+        &pinned_mod_path,
+        prompt,
+    );
     if !native_argument_length_supported(config.program.as_os_str(), &native_args) {
         let mut outcome = launch_rejected(
             command,
@@ -585,7 +590,23 @@ fn disposition(
         .unwrap_or_default();
     let request_models: Vec<_> = summary.model_names.iter().collect();
     let (request_model, request_model_status) = match request_models.as_slice() {
-        [only] => (json!(only), "observed"),
+        [only] if stream_complete => (json!(only), "observed"),
+        [only] => (json!(only), "partial"),
+        [] => (Value::Null, "unknown"),
+        _ => (Value::Null, "conflicting"),
+    };
+    let (effective_model, effective_model_status) = match request_models.as_slice() {
+        [only] if stream_complete => (
+            json!(only),
+            match identity.requested_model.as_deref() {
+                Some(requested) if requested == only.as_str() => {
+                    "verified_by_native_request_readback"
+                }
+                Some(_) => "native_request_model_mismatch",
+                None => "observed_by_native_request_readback",
+            },
+        ),
+        [_] => (Value::Null, "incomplete_native_request_readback"),
         [] => (Value::Null, "unknown"),
         _ => (Value::Null, "conflicting"),
     };
@@ -614,8 +635,8 @@ fn disposition(
         "batch_run_id":identity.batch_run_id,
         "input_sha256":identity.input_sha256,
         "requested_model":identity.requested_model,
-        "effective_model":Value::Null,
-        "effective_model_status":"unknown",
+        "effective_model":effective_model,
+        "effective_model_status":effective_model_status,
         "native_request_model":request_model,
         "native_request_model_status":request_model_status,
         "native_request_model_evidence":summary.model_evidence,
@@ -1048,7 +1069,7 @@ async fn drain_captures_after_stop(
 
 fn native_arguments(
     config: &InvocationConfig,
-    model: &str,
+    model: Option<&str>,
     mod_path: &Path,
     prompt: &str,
 ) -> Vec<OsString> {
@@ -1061,8 +1082,11 @@ fn native_arguments(
         OsString::from("-p"),
         OsString::from("--output-format"),
         OsString::from("json"),
-        OsString::from("--model"),
-        OsString::from(model),
+    ]);
+    if let Some(model) = model {
+        args.extend([OsString::from("--model"), OsString::from(model)]);
+    }
+    args.extend([
         OsString::from("--mod"),
         mod_path.as_os_str().to_os_string(),
         OsString::from(prompt),
@@ -1301,7 +1325,7 @@ pub fn prompt_for(command: &RuntimeCommand) -> Result<(String, DispatchIdentity)
         operation_id: command.operation_id.clone(),
         input_sha256: input_sha256.to_owned(),
         batch_run_id: format!("command-batch:{}", &digest_operation[..32]),
-        requested_model: model.to_owned(),
+        requested_model: Some(model.to_owned()),
         prompt_sha256: digest(prompt.as_bytes()),
         prompt_bytes: prompt.len(),
         task_snapshot_sha256: digest(canonical_snapshot.as_bytes()),
@@ -1325,7 +1349,7 @@ pub fn prompt_for(command: &RuntimeCommand) -> Result<(String, DispatchIdentity)
     Ok((prompt, identity))
 }
 
-/// Build the BatchV4 native identity from Store's exact TaskPrompt envelope.
+/// Build the BatchV4/V5 native identity from Store's exact TaskPrompt envelope.
 /// The legacy renderer remains available only to historical BatchV3 bindings.
 pub fn task_prompt_identity(
     command: &RuntimeCommand,
@@ -1416,14 +1440,14 @@ pub fn result_identity_matches(value: &Value, identity: &DispatchIdentity) -> bo
     value["operation_id"] == identity.operation_id
         && value["details"]["input_sha256"] == identity.input_sha256
         && value["details"]["batch_run_id"] == identity.batch_run_id
-        && value["details"]["requested_model"] == identity.requested_model
+        && value["details"]["requested_model"] == json!(identity.requested_model.as_deref())
         && value["details"]["prompt_sha256"] == identity.prompt_sha256
         && value["details"]["prompt_bytes"].as_u64() == u64::try_from(identity.prompt_bytes).ok()
 }
 
 pub fn open_preflight_outcome(
     command: &RuntimeCommand,
-    requested_model: &str,
+    requested_model: Option<&str>,
     ready: bool,
     code: Option<&str>,
 ) -> RuntimeOutcome {
@@ -1453,6 +1477,36 @@ pub fn open_preflight_outcome(
             "diagnostic_code":code,
             "task_acceptance_claimed":false
         }),
+    }
+}
+
+#[cfg(test)]
+mod model_selection_tests {
+    use super::*;
+
+    #[test]
+    fn batch_arguments_omit_model_for_the_native_default_and_keep_explicit_selection() {
+        let config = InvocationConfig {
+            program: PathBuf::from("command"),
+            fixed_args: Vec::new(),
+            mod_path: PathBuf::from("mod.ts"),
+            run_timeout: Duration::from_secs(1),
+            owner_token: "owner".to_owned(),
+        };
+        let native_default = native_arguments(&config, None, Path::new("mod.ts"), "prompt");
+        assert!(!native_default.iter().any(|argument| argument == "--model"));
+
+        let explicit = native_arguments(
+            &config,
+            Some("explicit-model"),
+            Path::new("mod.ts"),
+            "prompt",
+        );
+        let model_flag = explicit
+            .iter()
+            .position(|argument| argument == "--model")
+            .expect("explicit model flag is present");
+        assert_eq!(explicit[model_flag + 1], "explicit-model");
     }
 }
 
@@ -1567,7 +1621,7 @@ mod capture_release_fixture {
             operation_id: operation_id.to_owned(),
             input_sha256: input_sha256.clone(),
             batch_run_id: "fixture-batch".to_owned(),
-            requested_model: "fixture-model".to_owned(),
+            requested_model: Some("fixture-model".to_owned()),
             prompt_sha256: "b".repeat(64),
             prompt_bytes: 12,
             task_snapshot_sha256: "c".repeat(64),

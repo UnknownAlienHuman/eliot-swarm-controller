@@ -51,7 +51,7 @@ pub struct DispatchIdentity {
     /// Exact host digest of the retained Operation request, before enrichment.
     pub input_sha256: String,
     pub batch_run_id: String,
-    pub requested_model: String,
+    pub requested_model: Option<String>,
     pub prompt_sha256: String,
     pub prompt_bytes: usize,
     pub task_snapshot_sha256: String,
@@ -167,8 +167,8 @@ pub struct RunStore {
 impl RunStore {
     pub fn new_for_profile(module_state: &Path, profile: crate::Profile) -> Result<Self> {
         let state = fs::canonicalize(module_state)?;
-        // Each descriptor version owns an immutable journal namespace. In
-        // particular, BatchV4 must never reinterpret legacy BatchV3 receipts.
+        // Each descriptor version owns an immutable journal namespace. A
+        // newer Batch profile never reinterprets an older profile's receipts.
         let root = state.join(format!(
             "command-adapter-runs-v{}",
             profile.artifact_version()
@@ -271,7 +271,7 @@ impl RunStore {
             operation_id: operation_id.to_owned(),
             input_sha256: String::new(),
             batch_run_id: format!("command-batch:{}", &digest(operation_id.as_bytes())[..32]),
-            requested_model: String::new(),
+            requested_model: None,
             prompt_sha256: String::new(),
             prompt_bytes: 0,
             task_snapshot_sha256: String::new(),
@@ -960,6 +960,7 @@ impl RunStore {
 
         let receipt: Value = read_json(&receipt_path)?;
         let prompt_bytes = u64::try_from(identity.prompt_bytes).ok();
+        let requested_model = json!(identity.requested_model.as_deref());
         if !receipt.is_object()
             || receipt["operation_id"].as_str() != Some(operation_id)
             || receipt["input_sha256"].as_str() != Some(identity.input_sha256.as_str())
@@ -971,7 +972,7 @@ impl RunStore {
                 .is_some_and(|artifact| artifact.as_str() != Some(ARTIFACT_ID))
             || receipt
                 .get("requested_model")
-                .is_some_and(|model| model.as_str() != Some(identity.requested_model.as_str()))
+                .is_some_and(|model| model != &requested_model)
             || receipt
                 .get("prompt_sha256")
                 .is_some_and(|prompt| prompt.as_str() != Some(identity.prompt_sha256.as_str()))
@@ -3592,6 +3593,31 @@ fn identity_matches(saved: &DispatchIdentity, expected: &DispatchIdentity) -> bo
             || saved.task_snapshot_sha256 == expected.task_snapshot_sha256)
 }
 
+#[cfg(test)]
+mod optional_model_identity_tests {
+    use super::{DispatchIdentity, identity_matches};
+
+    #[test]
+    fn native_default_is_distinct_from_an_explicit_model_in_retained_identity() {
+        let native_default = DispatchIdentity {
+            operation_id: "fixture-operation".to_owned(),
+            input_sha256: "a".repeat(64),
+            batch_run_id: "fixture-batch".to_owned(),
+            requested_model: None,
+            prompt_sha256: "b".repeat(64),
+            prompt_bytes: 12,
+            task_snapshot_sha256: "c".repeat(64),
+        };
+        assert!(identity_matches(&native_default, &native_default.clone()));
+
+        let explicit = DispatchIdentity {
+            requested_model: Some("explicit-model".to_owned()),
+            ..native_default.clone()
+        };
+        assert!(!identity_matches(&native_default, &explicit));
+    }
+}
+
 fn canonical(value: &Value) -> Result<String> {
     fn ordered(value: &Value) -> Value {
         match value {
@@ -3831,7 +3857,7 @@ mod tests {
                 operation_id: target_id.to_owned(),
                 input_sha256: input_sha256.to_owned(),
                 batch_run_id: "fixture-batch".to_owned(),
-                requested_model: "fixture-model".to_owned(),
+                requested_model: Some("fixture-model".to_owned()),
                 prompt_sha256: "b".repeat(64),
                 prompt_bytes: 19,
                 task_snapshot_sha256: "c".repeat(64),
