@@ -338,21 +338,9 @@ impl Route {
 
 fn validate_codex_rust_options(value: &Value) -> Result<()> {
     let options = exact_option_object(value, &["workspaceRoot"], &["modelProvider", "model"])?;
-    let provider = options
-        .get("modelProvider")
-        .filter(|value| !value.is_null());
-    let model = options.get("model").filter(|value| !value.is_null());
-    match (provider, model) {
-        (None, None) => {}
-        (Some(provider), Some(model)) => {
-            option_string(provider, "modelProvider", 256)?;
-            option_string(model, "model", 256)?;
-        }
-        _ => {
-            return Err(Error::new(
-                "CONFIG_ERROR",
-                "Codex explicit override requires both provider and model",
-            ));
+    for field in ["modelProvider", "model"] {
+        if let Some(value) = options.get(field).filter(|value| !value.is_null()) {
+            option_string(value, field, 256)?;
         }
     }
     required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
@@ -1049,13 +1037,19 @@ mod native_model_default_tests {
         assert!(validate_codex_rust_options(&options).is_ok());
         assert!(validate_antigravity_rust_options(&options).is_ok());
         options["modelProvider"] = json!("native-provider");
-        assert!(validate_codex_rust_options(&options).is_err());
+        assert!(validate_codex_rust_options(&options).is_ok());
         options["model"] = json!("native-model");
         assert!(validate_codex_rust_options(&options).is_ok());
-        for invalid in [json!(false), json!(""), json!("bad\nmodel")] {
-            options["modelProvider"] = invalid.clone();
-            options["model"] = invalid;
-            assert!(validate_codex_rust_options(&options).is_err());
+        options["modelProvider"] = Value::Null;
+        assert!(validate_codex_rust_options(&options).is_ok());
+        options["model"] = Value::Null;
+        assert!(validate_codex_rust_options(&options).is_ok());
+        for field in ["modelProvider", "model"] {
+            for invalid in [json!(false), json!(""), json!("bad\nmodel")] {
+                let mut options = json!({"workspaceRoot":workspace});
+                options[field] = invalid;
+                assert!(validate_codex_rust_options(&options).is_err());
+            }
         }
         let mut options = json!({"workspaceRoot":workspace,"modelId":"explicit-model"});
         assert!(validate_antigravity_rust_options(&options).is_ok());

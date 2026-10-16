@@ -149,7 +149,7 @@ Each route must use the exact Rust artifact ID and workspace field enforced by `
 
 | Route | `runtime` | `module_artifact_id` | `workspace_option` | `native_options` |
 |---|---|---|---|---|
-| Codex | `codex` | `codex-rust-controller.1` | `workspaceRoot` | `workspaceRoot`; optional complete explicit `modelProvider` / `model` pair |
+| Codex | `codex` | `codex-rust-controller.1` | `workspaceRoot` | `workspaceRoot`; independently optional explicit `modelProvider` and `model` |
 | OpenCode | `module` | `eliot-opencode-v2.rust-http.1` | `directory` | `service_id`, `connection_file`, `directory`; optional explicit `model = { id, providerID, variant }` |
 | Command | `command` | `eliot-command.rust-headless.1` | `workspaceRoot` | exactly `modelId`, `workspaceRoot` |
 | Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` (select version 6) | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId`, `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
