@@ -87,12 +87,12 @@ schemas are unchanged from v11. The separate install coordinate preserves old
 installed bytes and bindings; it does not reconstruct proof already lost by an
 older journal or authorize input replay.
 
-Version 11.2 declares `experimentalApi: true` in the native app-server initialize
-request. The installed protocol requires this client capability for the
-paginated `thread/items/list` and `thread/turns/list` methods already used by
-dispatch/result readback. Without it, a native turn can run while its readback
-returns `-32601`, leaving the Operation unknown. This is a native transport
-capability; it does not configure provider authorization or model defaults.
+The private v11.2 qualification candidate also tried an experimental API opt-in.
+That opt-in did not resolve the observed history error: the same installed
+app-server accepted all three history reads with `experimentalApi: false`.
+The current source retains that native client default. A missing flag is not
+established as the cause of `-32601`; failed readback remains unknown and does
+not authorize input replay.
 
 The current controller retains the v6 result boundary described below; the
 descriptor version change does not add child-history or tool-item projection.

@@ -10,7 +10,7 @@ are documented separately below.
 
 ## Setup
 
-The Python setup below is historical donor tooling, not required by the current Rust controller. The Rust route attaches to an already configured native app-server; each omitted model/provider selector uses that harness's default. Version 11.2 retains v11's native defaults and v11.1's acknowledged opening proof, and declares the native experimental API capability required by its paginated history reads. Older bindings and receipts retain their original identity and installed bytes.
+The Python setup below is historical donor tooling, not required by the current Rust controller. The Rust route attaches to an already configured native app-server; each omitted model/provider selector uses that harness's default. The current candidate retains v11's native defaults and the acknowledged opening proof. Older bindings and receipts retain their original identity and installed bytes.
 
 Create a module-local Python environment and install only the pinned
 requirements:

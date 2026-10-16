@@ -46,7 +46,8 @@ use url::Url;
 use uuid::Uuid;
 
 pub const ARTIFACT_ID: &str = swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
-pub const ARTIFACT_VERSION: &str = "11.2";
+pub const ARTIFACT_VERSION: &str =
+    swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION;
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
@@ -2492,7 +2493,7 @@ impl NativeServerIdentity {
             "peer_report_only": true,
             "process_attestation": false,
             "server_capabilities": "not_reported_by_initialize_response",
-            "client_declared_capabilities": {"experimentalApi": true}
+            "client_declared_capabilities": {"experimentalApi": false}
         })
     }
 }
@@ -2920,9 +2921,7 @@ impl NativeClient {
                         "title": "ELIOT Swarm Codex Controller",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    // Paginated thread/items/list and thread/turns/list require
-                    // this native protocol opt-in on the installed app-server.
-                    "capabilities": {"experimentalApi": true}
+                    "capabilities": {"experimentalApi": false}
                 }),
             )
             .await?;
@@ -7342,7 +7341,7 @@ mod reg28_tests {
                 let method = packet["method"].as_str().expect("native method");
                 let result = match method {
                     "initialize" => {
-                        assert_eq!(packet["params"]["capabilities"]["experimentalApi"], true);
+                        assert_eq!(packet["params"]["capabilities"]["experimentalApi"], false);
                         serde_json::json!({
                             "userAgent":"Codex CLI/1.2.3",
                             "codexHome":codex_home,

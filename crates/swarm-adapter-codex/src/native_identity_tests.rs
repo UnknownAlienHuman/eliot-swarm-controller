@@ -44,7 +44,7 @@ fn codex_desktop_initialize_fixture_accepts_supported_contract_and_fails_closed(
     );
     assert_eq!(
         report["client_declared_capabilities"]["experimentalApi"],
-        true
+        false
     );
 
     let mcp_style_only = json!({

@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 pub const MODULE_PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const CODEX_RUST_CONTROLLER_ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "11";
+pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "11.2";
 pub const RUNTIME_COMMAND_SCHEMA_ID: &str = "swarm.runtime_command";
 pub const RUNTIME_OUTCOME_SCHEMA_ID: &str = "swarm.runtime_outcome";
 pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
@@ -521,7 +521,7 @@ mod tests {
             v8.artifact.version.as_str(),
             CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
         );
-        assert_eq!(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION, "11");
+        assert_eq!(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION, "11.2");
         assert!(
             v8.capabilities
                 .contains(&CapabilityId::new("agent.shutdown").unwrap())
