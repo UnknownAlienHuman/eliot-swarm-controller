@@ -43,10 +43,20 @@ pub const TASK_PROMPT_ARTIFACT_VERSION: &str = "2";
 pub const TASK_PROMPT_MODULE_ID: &str = "builtin.opencode-v2";
 pub const RUNTIME: &str = "opencode_v2";
 
-/// Internal foreground owner entry used by the controller's dedicated helper.
-/// It does not open the controller database or admit a launch request.
-pub fn run_owned_service_helper(plan_path: &std::path::Path) -> Result<()> {
-    owned_service::run_owned_service_helper(plan_path)
+/// The retired fresh-service helper is unavailable at the public production
+/// entrypoint. Retained services continue through their readback and close paths.
+pub fn run_owned_service_helper(_plan_path: &std::path::Path) -> Result<()> {
+    Err(owned_service::native_harness_required())
+}
+
+#[cfg(test)]
+mod owned_service_helper_entry_tests {
+    #[test]
+    fn public_helper_entry_rejects_before_reading_a_plan() {
+        let error =
+            super::run_owned_service_helper(std::path::Path::new("relative-plan")).unwrap_err();
+        assert_eq!(error.code, "OWNED_SERVICE_NATIVE_HARNESS_REQUIRED");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
