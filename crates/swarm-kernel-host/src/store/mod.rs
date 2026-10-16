@@ -25,6 +25,7 @@ mod checks;
 mod code_scopes;
 mod command_results;
 mod concilium;
+mod codex_c8;
 mod coordination;
 mod coordination_threads;
 mod coordination_watch;
@@ -7134,6 +7135,12 @@ fn apply(
             config,
             v,
         )?;
+    }
+    // Pending launch-issued Participant rights activate only after the exact
+    // open/binding/lease facts. The native MCP C8 proof is a separate gate
+    // checked by launch-linked task.dispatch before native input.
+    if p.role == Role::Participant {
+        launcher_participant::require_launch_activation_for_mutation(tx, p)?;
     }
     match method {
         "goal.create" | "goal.revise" | "goal.enable" | "goal.disable" | "goal.readback" => {

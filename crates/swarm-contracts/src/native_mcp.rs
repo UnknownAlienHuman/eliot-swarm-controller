@@ -11,7 +11,9 @@ use crate::{
     runtime::RuntimeCommand,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 
 pub const NATIVE_MCP_COMMAND_SCHEMA_ID: &str = "swarm.native_mcp_command";
 pub const NATIVE_MCP_COMMAND_SCHEMA_VERSION: &str = "2";
@@ -32,14 +34,590 @@ pub const NATIVE_MCP_METHODS: [&str; 4] = [
 const MAX_OPERATION_ID_BYTES: usize = 256;
 const MAX_BINDING_ID_BYTES: usize = 256;
 const MAX_SESSION_ID_BYTES: usize = 256;
+const MAX_TASK_ID_BYTES: usize = 512;
 const MAX_SERVICE_ID_BYTES: usize = 128;
 const MAX_SERVICE_VERSION_BYTES: usize = 128;
 const MAX_NATIVE_TEXT_BYTES: usize = 256;
+const MAX_PARTICIPANT_ID_BYTES: usize = 256;
+const MAX_PROFILE_NAME_BYTES: usize = 128;
 const MAX_NATIVE_MCP_SERVERS: usize = 256;
 #[cfg(test)]
 const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 
 pub const NATIVE_MCP_ASSIGNMENT_READBACK_KIND: &str = "native_mcp_assignment_readback";
+
+pub const CODEX_NATIVE_MCP_COMMAND_SCHEMA_ID: &str = "swarm.codex_native_mcp_command";
+pub const CODEX_NATIVE_MCP_COMMAND_SCHEMA_VERSION: &str = "2";
+pub const CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_ID: &str =
+    "swarm.codex_native_mcp_launch_profile";
+pub const CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_VERSION: &str = "1";
+pub const CODEX_NATIVE_MCP_READBACK_KIND: &str = "codex_native_mcp_assignment_readback";
+pub const CODEX_NATIVE_MCP_SERVER_INFO_NAME: &str = "eliot-swarm-controller";
+pub const CODEX_NATIVE_MCP_EXECUTABLE_NAME: &str = if cfg!(windows) {
+    "swarm-mcp.exe"
+} else {
+    "swarm-mcp"
+};
+
+const MAX_PRIVATE_PATH_BYTES: usize = 4096;
+
+/// Stable, launch-specific Codex MCP configuration key. Its name is separate
+/// from the MCP server's peer-reported `serverInfo.name` and avoids replacing
+/// any operator-configured server entry.
+pub fn codex_native_mcp_server_name(launch_operation_id: &str) -> Result<String, &'static str> {
+    if !bounded_text(launch_operation_id, MAX_OPERATION_ID_BYTES) {
+        return Err("Codex launch operation identity is invalid");
+    }
+    let digest = format!("{:x}", Sha256::digest(launch_operation_id.as_bytes()));
+    Ok(format!("eliot_swarm_{digest}"))
+}
+
+/// Digest only the issued assignment identity. Native paths are deliberately
+/// excluded so they never enter a receipt or MCP response.
+pub fn codex_profile_assignment_sha256(
+    participant_id: &str,
+    credential_ref: &str,
+    profile_config_ref: &str,
+    profile_name: &str,
+    surface: &str,
+) -> Result<Sha256Digest, &'static str> {
+    if !bounded_text(participant_id, MAX_PARTICIPANT_ID_BYTES)
+        || !opaque_assignment_ref(credential_ref, "participant-credential")
+        || !opaque_assignment_ref(profile_config_ref, "participant-mcp-config")
+        || !bounded_text(profile_name, MAX_PROFILE_NAME_BYTES)
+        || surface != "participant-core"
+    {
+        return Err("Codex Participant profile assignment is invalid");
+    }
+    codex_value_sha256(&json!({
+        "participant_id":participant_id,
+        "credential_ref":credential_ref,
+        "profile_config_ref":profile_config_ref,
+        "profile_name":profile_name,
+        "surface":surface,
+    }))
+}
+
+/// Transient input used only on the exact `agent.open` RuntimeCommand. Store
+/// resolves the opaque references to these two existing private files in
+/// memory; it must not persist either path in an Operation or receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexNativeMcpLaunchProfile {
+    pub schema_version: u16,
+    pub kind: String,
+    pub launch_operation_id: String,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub attempt_id: String,
+    pub binding_id: String,
+    pub binding_generation: i64,
+    pub participant_id: String,
+    pub grant_revision: i64,
+    /// The Codex thread does not exist yet. A caller must never fabricate a
+    /// prepared root or pre-bind this Participant to an unknown session ID.
+    pub participant_native_session_id: Option<String>,
+    pub credential_ref: String,
+    pub profile_config_ref: String,
+    pub profile_name: String,
+    pub surface: String,
+    pub profile_assignment_sha256: Sha256Digest,
+    pub server_name: String,
+    pub executable: String,
+    pub credential_path: String,
+    pub profile_config_path: String,
+}
+
+impl CodexNativeMcpLaunchProfile {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        launch_operation_id: String,
+        task_id: String,
+        task_revision: i64,
+        attempt_id: String,
+        binding_id: String,
+        binding_generation: i64,
+        participant_id: String,
+        grant_revision: i64,
+        credential_ref: String,
+        profile_config_ref: String,
+        profile_name: String,
+        surface: String,
+        executable: String,
+        credential_path: String,
+        profile_config_path: String,
+    ) -> Result<Self, &'static str> {
+        let profile_assignment_sha256 = codex_profile_assignment_sha256(
+            &participant_id,
+            &credential_ref,
+            &profile_config_ref,
+            &profile_name,
+            &surface,
+        )?;
+        let value = Self {
+            schema_version: 1,
+            kind: "codex_native_mcp_launch_profile".to_owned(),
+            server_name: codex_native_mcp_server_name(&launch_operation_id)?,
+            launch_operation_id,
+            task_id,
+            task_revision,
+            attempt_id,
+            binding_id,
+            binding_generation,
+            participant_id,
+            grant_revision,
+            participant_native_session_id: None,
+            credential_ref,
+            profile_config_ref,
+            profile_name,
+            surface,
+            profile_assignment_sha256,
+            executable,
+            credential_path,
+            profile_config_path,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let expected_executable = Path::new(&self.executable)
+            .file_name()
+            .and_then(|name| name.to_str());
+        if self.schema_version != 1
+            || self.kind != "codex_native_mcp_launch_profile"
+            || !bounded_text(&self.launch_operation_id, MAX_OPERATION_ID_BYTES)
+            || !bounded_text(&self.task_id, MAX_TASK_ID_BYTES)
+            || self.task_revision <= 0
+            || !bounded_text(&self.attempt_id, MAX_SESSION_ID_BYTES)
+            || !bounded_text(&self.binding_id, MAX_BINDING_ID_BYTES)
+            || self.binding_generation <= 0
+            || !bounded_text(&self.participant_id, MAX_PARTICIPANT_ID_BYTES)
+            || self.grant_revision <= 0
+            || self.participant_native_session_id.is_some()
+            || !opaque_assignment_ref(&self.credential_ref, "participant-credential")
+            || !opaque_assignment_ref(&self.profile_config_ref, "participant-mcp-config")
+            || !bounded_text(&self.profile_name, MAX_PROFILE_NAME_BYTES)
+            || self.surface != "participant-core"
+            || !is_lower_sha256(&self.profile_assignment_sha256)
+            || self.profile_assignment_sha256.as_str()
+                != codex_profile_assignment_sha256(
+                    &self.participant_id,
+                    &self.credential_ref,
+                    &self.profile_config_ref,
+                    &self.profile_name,
+                    &self.surface,
+                )?
+                .as_str()
+            || self.server_name != codex_native_mcp_server_name(&self.launch_operation_id)?
+            || !private_absolute_path(&self.executable)
+            || expected_executable != Some(CODEX_NATIVE_MCP_EXECUTABLE_NAME)
+            || !private_absolute_path(&self.credential_path)
+            || !private_absolute_path(&self.profile_config_path)
+            || self.credential_path == self.profile_config_path
+        {
+            return Err("Codex native MCP launch profile identity is invalid");
+        }
+        Ok(())
+    }
+}
+
+/// Build only the dotted thread config overrides supported by Codex's
+/// `thread/start` config map. No native user config is read or replaced.
+pub fn codex_native_mcp_thread_config(
+    profile: &CodexNativeMcpLaunchProfile,
+) -> Result<Value, &'static str> {
+    profile.validate()?;
+    let prefix = format!("mcp_servers.{}", profile.server_name);
+    let args = json!([
+        "--config",
+        profile.profile_config_path,
+        "--credential",
+        profile.credential_path,
+        "--profile",
+        profile.profile_name,
+    ]);
+    let mut values = serde_json::Map::new();
+    values.insert(format!("{prefix}.command"), json!(profile.executable));
+    values.insert(format!("{prefix}.args"), args);
+    values.insert(format!("{prefix}.enabled"), json!(true));
+    values.insert(format!("{prefix}.required"), json!(true));
+    values.insert(format!("{prefix}.startup_readiness"), json!("connection"));
+    Ok(Value::Object(values))
+}
+
+fn private_absolute_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PRIVATE_PATH_BYTES
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+        && Path::new(value).is_absolute()
+}
+
+/// The single canonical Codex C8 comparison set. The digest is over sorted
+/// native tool names and JavaScript-compatible input schemas, matching the
+/// representation returned by the app-server MCP status API.
+pub fn codex_participant_toolset() -> Result<(Vec<Value>, Sha256Digest), &'static str> {
+    let contracts = crate::mcp_catalog::participant_core_tool_contracts()
+        .map_err(|_| "Codex Participant core catalog is unavailable")?;
+    let mut tools = Vec::with_capacity(contracts.len());
+    let mut names = BTreeSet::new();
+    for contract in contracts {
+        let method = contract["method"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or("Codex Participant method is invalid")?;
+        let name = contract["name"]
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= MAX_NATIVE_TEXT_BYTES)
+            .ok_or("Codex Participant tool name is invalid")?;
+        let schema = contract["input_schema"]
+            .as_object()
+            .map(|_| javascript_schema(&contract["input_schema"]))
+            .transpose()?
+            .ok_or("Codex Participant input schema is invalid")?;
+        if crate::mcp_catalog::tool_name(method) != name || !names.insert(name.to_owned()) {
+            return Err("Codex Participant tool names are inconsistent");
+        }
+        tools.push(json!({"name":name,"input_schema":schema}));
+    }
+    if tools.is_empty() {
+        return Err("Codex Participant core catalog is empty");
+    }
+    tools.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["name"].as_str().unwrap_or_default())
+    });
+    let ordered = ordered_json(&Value::Array(tools.clone()));
+    let bytes = serde_json::to_vec(&ordered).map_err(|_| "Codex toolset serialization failed")?;
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    let digest = Sha256Digest::new(digest).map_err(|_| "Codex toolset digest is invalid")?;
+    Ok((tools, digest))
+}
+
+fn javascript_schema(value: &Value) -> Result<Value, &'static str> {
+    match value {
+        Value::Number(number) => number
+            .as_f64()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number)
+            .ok_or("Codex MCP schema number is not representable"),
+        Value::Array(values) => values
+            .iter()
+            .map(javascript_schema)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), javascript_schema(value)?)))
+            .collect::<Result<serde_json::Map<String, Value>, &'static str>>()
+            .map(Value::Object),
+        other => Ok(other.clone()),
+    }
+}
+
+fn ordered_json(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let fields: BTreeMap<_, _> = fields
+                .iter()
+                .map(|(key, value)| (key.clone(), ordered_json(value)))
+                .collect();
+            Value::Object(fields.into_iter().collect())
+        }
+        Value::Array(values) => Value::Array(values.iter().map(ordered_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Store-admitted, read-only Codex MCP observation for the exact current
+/// Participant assignment. It carries opaque local artifact references and
+/// digests only; it never carries a token, provider credential, or config body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexNativeMcpCommand {
+    pub schema_version: u16,
+    pub codex_schema_version: u16,
+    pub kind: String,
+    pub operation_id: String,
+    pub launch_operation_id: String,
+    pub phase: String,
+    pub observation_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_sha256: Option<Sha256Digest>,
+    pub assignment_sha256: Sha256Digest,
+    pub binding_id: String,
+    pub binding_generation: i64,
+    pub open_operation_id: String,
+    pub native_root_id: String,
+    pub native_scope_key: String,
+    pub expected_adapter_boot_id: String,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub attempt_id: String,
+    pub participant_id: String,
+    pub grant_revision: i64,
+    pub participant_native_session_id: Option<String>,
+    pub credential_ref: String,
+    pub profile_config_ref: String,
+    pub profile_name: String,
+    pub surface: String,
+    pub server_name: String,
+    pub profile_assignment_sha256: Sha256Digest,
+    pub expected_authorization_revision: Sha256Digest,
+    pub expected_toolset_sha256: Sha256Digest,
+}
+
+impl CodexNativeMcpCommand {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 2
+            || self.codex_schema_version != 2
+            || self.kind != "codex_native_mcp_command"
+            || !bounded_text(&self.operation_id, MAX_OPERATION_ID_BYTES)
+            || !bounded_text(&self.launch_operation_id, MAX_OPERATION_ID_BYTES)
+            || self.phase != "observe"
+            || self.observation_kind != "assigned_session"
+            || self
+                .input_sha256
+                .as_ref()
+                .is_some_and(|digest| !is_lower_sha256(digest))
+            || !is_lower_sha256(&self.assignment_sha256)
+            || !bounded_text(&self.binding_id, MAX_BINDING_ID_BYTES)
+            || self.binding_generation <= 0
+            || !bounded_text(&self.open_operation_id, MAX_OPERATION_ID_BYTES)
+            || !bounded_native_text(&self.native_root_id)
+            || !bounded_native_text(&self.native_scope_key)
+            || !bounded_text(&self.expected_adapter_boot_id, MAX_OPERATION_ID_BYTES)
+            || !bounded_text(&self.task_id, MAX_TASK_ID_BYTES)
+            || self.task_revision <= 0
+            || !bounded_text(&self.attempt_id, MAX_SESSION_ID_BYTES)
+            || !bounded_text(&self.participant_id, MAX_PARTICIPANT_ID_BYTES)
+            || self.grant_revision <= 0
+            || self
+                .participant_native_session_id
+                .as_deref()
+                .is_some_and(|value| !bounded_native_text(value))
+            || !opaque_assignment_ref(&self.credential_ref, "participant-credential")
+            || !opaque_assignment_ref(&self.profile_config_ref, "participant-mcp-config")
+            || !bounded_text(&self.profile_name, MAX_PROFILE_NAME_BYTES)
+            || self.surface != "participant-core"
+            || self.server_name != codex_native_mcp_server_name(&self.launch_operation_id)?
+            || !is_lower_sha256(&self.profile_assignment_sha256)
+            || !is_lower_sha256(&self.expected_authorization_revision)
+            || !is_lower_sha256(&self.expected_toolset_sha256)
+            || self.computed_assignment_sha256()?.as_str() != self.assignment_sha256.as_str()
+        {
+            return Err("Codex native MCP command identity is invalid");
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(&self, command: &RuntimeCommand) -> Result<(), &'static str> {
+        self.validate()?;
+        if command.method != "native.mcp.observe"
+            || self.operation_id != command.operation_id
+            || self.binding_id != command.binding_id
+            || self.binding_generation != command.generation
+            || self.input_sha256.as_ref().map(Sha256Digest::as_str)
+                != command.input_sha256.as_deref()
+            || self.input_sha256.is_none()
+        {
+            return Err("Codex native MCP command differs from its authenticated RuntimeCommand");
+        }
+        Ok(())
+    }
+
+    /// Private RuntimeCommand effect envelope. The token, paths, and profile
+    /// body are intentionally absent; the launch resolver consumes the exact
+    /// issued references separately when it constructs `thread/start.config`.
+    pub fn effect_identity(&self) -> Value {
+        json!({
+            "schema_version":2,
+            "kind":"codex_native_mcp_effect",
+            "observation_kind":"assigned_session",
+            "operation_id":self.operation_id,
+            "launch_operation_id":self.launch_operation_id,
+            "assignment_sha256":self.assignment_sha256,
+            "binding_id":self.binding_id,
+            "binding_generation":self.binding_generation,
+            "open_operation_id":self.open_operation_id,
+            "native_root_id":self.native_root_id,
+            "native_scope_key":self.native_scope_key,
+            "expected_adapter_boot_id":self.expected_adapter_boot_id,
+            "task_id":self.task_id,
+            "task_revision":self.task_revision,
+            "attempt_id":self.attempt_id,
+            "participant_id":self.participant_id,
+            "grant_revision":self.grant_revision,
+            "participant_native_session_id":self.participant_native_session_id,
+            "credential_ref":self.credential_ref,
+            "profile_config_ref":self.profile_config_ref,
+            "profile_name":self.profile_name,
+            "surface":self.surface,
+            "server_name":self.server_name,
+            "profile_assignment_sha256":self.profile_assignment_sha256,
+            "expected_authorization_revision":self.expected_authorization_revision,
+            "expected_toolset_sha256":self.expected_toolset_sha256,
+        })
+    }
+
+    pub fn computed_assignment_sha256(&self) -> Result<Sha256Digest, &'static str> {
+        codex_value_sha256(&json!({
+            "operation_id":self.operation_id,
+            "launch_operation_id":self.launch_operation_id,
+            "binding_id":self.binding_id,
+            "binding_generation":self.binding_generation,
+            "open_operation_id":self.open_operation_id,
+            "native_root_id":self.native_root_id,
+            "native_scope_key":self.native_scope_key,
+            "expected_adapter_boot_id":self.expected_adapter_boot_id,
+            "task_id":self.task_id,
+            "task_revision":self.task_revision,
+            "attempt_id":self.attempt_id,
+            "participant_id":self.participant_id,
+            "grant_revision":self.grant_revision,
+            "participant_native_session_id":self.participant_native_session_id,
+            "credential_ref":self.credential_ref,
+            "profile_config_ref":self.profile_config_ref,
+            "profile_name":self.profile_name,
+            "surface":self.surface,
+            "server_name":self.server_name,
+            "profile_assignment_sha256":self.profile_assignment_sha256,
+            "expected_authorization_revision":self.expected_authorization_revision,
+            "expected_toolset_sha256":self.expected_toolset_sha256,
+        }))
+    }
+}
+
+/// Sanitized output from the Codex app-server's per-thread MCP status and
+/// actual read-only Participant-core calls. No tool schema bodies, credentials,
+/// filesystem paths, or provider settings are retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexNativeMcpReadback {
+    pub schema_version: u16,
+    pub kind: String,
+    pub operation_id: String,
+    pub launch_operation_id: String,
+    pub assignment_sha256: Sha256Digest,
+    pub binding_id: String,
+    pub binding_generation: i64,
+    pub open_operation_id: String,
+    pub native_root_id: String,
+    pub native_scope_key: String,
+    pub adapter_boot_id: String,
+    pub reported_product: String,
+    pub reported_version: String,
+    pub effective_model_provider: String,
+    pub effective_model: String,
+    pub server_info_name: String,
+    pub server_info_version: String,
+    pub server_id_sha256: Sha256Digest,
+    pub runtime_status: String,
+    pub participant_id: String,
+    pub task_id: String,
+    pub task_revision: i64,
+    pub attempt_id: String,
+    pub grant_revision: i64,
+    pub participant_native_session_id: Option<String>,
+    pub profile_name: String,
+    pub surface: String,
+    pub profile_application_state: String,
+    pub profile_reference_readback: String,
+    pub credential_ref: String,
+    pub profile_config_ref: String,
+    pub profile_assignment_sha256: Sha256Digest,
+    pub authorization_revision: Sha256Digest,
+    pub toolset_sha256: Sha256Digest,
+    pub tool_count: u32,
+    pub observed_at_ms: i64,
+    pub evidence_sha256: Sha256Digest,
+    pub dispatch_permitted: bool,
+    pub model_consumed: String,
+}
+
+impl CodexNativeMcpReadback {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1
+            || self.kind != CODEX_NATIVE_MCP_READBACK_KIND
+            || !bounded_text(&self.operation_id, MAX_OPERATION_ID_BYTES)
+            || !bounded_text(&self.launch_operation_id, MAX_OPERATION_ID_BYTES)
+            || !is_lower_sha256(&self.assignment_sha256)
+            || !bounded_text(&self.binding_id, MAX_BINDING_ID_BYTES)
+            || self.binding_generation <= 0
+            || !bounded_native_text(&self.native_root_id)
+            || !bounded_native_text(&self.native_scope_key)
+            || !bounded_text(&self.adapter_boot_id, MAX_OPERATION_ID_BYTES)
+            || !bounded_native_text(&self.reported_product)
+            || !bounded_native_text(&self.reported_version)
+            || !bounded_native_text(&self.effective_model_provider)
+            || !bounded_native_text(&self.effective_model)
+            || self.server_info_name != CODEX_NATIVE_MCP_SERVER_INFO_NAME
+            || !bounded_native_text(&self.server_info_version)
+            || !is_lower_sha256(&self.server_id_sha256)
+            || self.runtime_status != "connected"
+            || !bounded_text(&self.participant_id, MAX_PARTICIPANT_ID_BYTES)
+            || !bounded_text(&self.task_id, MAX_TASK_ID_BYTES)
+            || self.task_revision <= 0
+            || !bounded_text(&self.attempt_id, MAX_SESSION_ID_BYTES)
+            || self.grant_revision <= 0
+            || self
+                .participant_native_session_id
+                .as_deref()
+                .is_some_and(|value| !bounded_native_text(value))
+            || !bounded_text(&self.open_operation_id, MAX_OPERATION_ID_BYTES)
+            || !bounded_text(&self.profile_name, MAX_PROFILE_NAME_BYTES)
+            || self.surface != "participant-core"
+            || self.profile_application_state != "effective_thread_toolset_and_authenticated_assignment"
+            || self.profile_reference_readback != "not_exposed_by_native_api"
+            || !opaque_assignment_ref(&self.credential_ref, "participant-credential")
+            || !opaque_assignment_ref(&self.profile_config_ref, "participant-mcp-config")
+            || !is_lower_sha256(&self.profile_assignment_sha256)
+            || !is_lower_sha256(&self.authorization_revision)
+            || !is_lower_sha256(&self.toolset_sha256)
+            || self.tool_count == 0
+            || self.observed_at_ms <= 0
+            || !is_lower_sha256(&self.evidence_sha256)
+            || self.dispatch_permitted
+            || self.model_consumed != "unknown"
+            || self.computed_evidence_sha256()?.as_str() != self.evidence_sha256.as_str()
+        {
+            return Err("Codex native MCP readback identity is invalid");
+        }
+        Ok(())
+    }
+
+    pub fn computed_evidence_sha256(&self) -> Result<Sha256Digest, &'static str> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|_| "Codex native MCP evidence serialization failed")?;
+        value
+            .as_object_mut()
+            .ok_or("Codex native MCP evidence is not an object")?
+            .remove("evidence_sha256");
+        codex_value_sha256(&value)
+    }
+}
+
+fn codex_value_sha256(value: &Value) -> Result<Sha256Digest, &'static str> {
+    let ordered = ordered_json(value);
+    let bytes = serde_json::to_vec(&ordered)
+        .map_err(|_| "Codex native MCP digest serialization failed")?;
+    Sha256Digest::new(format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|_| "Codex native MCP digest is invalid")
+}
+
+fn opaque_assignment_ref(value: &str, prefix: &str) -> bool {
+    let Some((actual, id)) = value.split_once(':') else {
+        return false;
+    };
+    actual == prefix
+        && id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

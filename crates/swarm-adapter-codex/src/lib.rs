@@ -2,6 +2,7 @@
 //! only on the shared host client/contracts and its native JSON-RPC transport.
 
 mod module_contract;
+mod native_mcp;
 mod native_usage;
 
 use std::{
@@ -46,7 +47,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub const ARTIFACT_ID: &str = swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
-pub const ARTIFACT_VERSION: &str = "11";
+pub const ARTIFACT_VERSION: &str = "13";
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
@@ -2117,6 +2118,7 @@ impl Journal {
             "task.dispatch",
             "agent.send",
             "agent.reconcile",
+            "native.mcp.observe",
         ];
         let mut unsupported = vec![
             "agent.recover",
@@ -3071,6 +3073,8 @@ impl NativeClient {
                 | "thread/read"
                 | "thread/items/list"
                 | "thread/turns/list"
+                | "mcpServerStatus/list"
+                | "mcpServer/tool/call"
                 | "turn/start"
                 | "turn/steer"
         ) {
@@ -5199,10 +5203,38 @@ fn adopt_verified_root(
     Ok(())
 }
 
+fn codex_native_mcp_launch_profile(
+    command: &RuntimeCommand,
+    claim: &ModuleContractClaim,
+) -> Result<swarm_contracts::native_mcp::CodexNativeMcpLaunchProfile, &'static str> {
+    let raw = command.input.get("codex_native_mcp_launch_profile");
+    if !module_contract::codex_native_mcp_enabled(claim) {
+        return Err("CODEX_NATIVE_MCP_CONTRACT_UNAVAILABLE");
+    }
+    let raw = raw.ok_or("CODEX_NATIVE_MCP_PROFILE_REQUIRED")?;
+    let profile: swarm_contracts::native_mcp::CodexNativeMcpLaunchProfile =
+        serde_json::from_value(raw.clone()).map_err(|_| "CODEX_NATIVE_MCP_PROFILE_INVALID")?;
+    profile
+        .validate()
+        .map_err(|_| "CODEX_NATIVE_MCP_PROFILE_INVALID")?;
+    if profile.binding_id != command.binding_id
+        || profile.binding_generation != command.generation
+        || command.input["launch_operation_id"].as_str()
+            != Some(profile.launch_operation_id.as_str())
+        || command.input["task_id"].as_str() != Some(profile.task_id.as_str())
+        || command.input["task_revision"].as_i64() != Some(profile.task_revision)
+        || command.input["attempt_id"].as_str() != Some(profile.attempt_id.as_str())
+    {
+        return Err("CODEX_NATIVE_MCP_SCOPE_MISMATCH");
+    }
+    Ok(profile)
+}
+
 async fn open_operation(
     command: &RuntimeCommand,
     journal: &mut Journal,
     native: &mut NativeClient,
+    claim: &ModuleContractClaim,
 ) -> RuntimeOutcome {
     if command.native_root_id.is_some() {
         return rejected(command, "OPEN_ROOT_ALREADY_ASSIGNED", &journal.state);
@@ -5250,6 +5282,18 @@ async fn open_operation(
     let (provider, model, workspace) = match validate_route(command) {
         Ok(route) => route,
         Err(code) => return rejected(command, code, &journal.state),
+    };
+    let native_mcp_profile = match codex_native_mcp_launch_profile(command, claim) {
+        Ok(profile) => profile,
+        Err(code) => return rejected(command, code, &journal.state),
+    };
+    let native_mcp_config = match swarm_contracts::native_mcp::codex_native_mcp_thread_config(
+        &native_mcp_profile,
+    ) {
+        Ok(config) => config,
+        Err(_) => {
+            return rejected(command, "CODEX_NATIVE_MCP_PROFILE_INVALID", &journal.state);
+        }
     };
     let canonical_workspace = normalize_path(&workspace).expect("validated absolute workspace");
     if !native.identity_is_known() {
@@ -5313,6 +5357,7 @@ async fn open_operation(
     if let Some(model) = model.as_deref() {
         start_params.insert("model".to_owned(), json!(model));
     }
+    start_params.insert("config".to_owned(), native_mcp_config);
     let response = native
         .request("thread/start", Value::Object(start_params))
         .await;
@@ -6079,7 +6124,7 @@ async fn handle_command(
         };
         match command.method.as_str() {
             "agent.open" => {
-                let mut result = open_operation(&command, journal, native).await;
+                let mut result = open_operation(&command, journal, native, claim).await;
                 attach_command_receipt(&mut result, &command, claim)?;
                 vec![result]
             }
@@ -6094,6 +6139,12 @@ async fn handle_command(
                         .await;
                 journal.capture_native_events()?;
                 result?
+            }
+            "native.mcp.observe" if module_contract::codex_native_mcp_enabled(claim) => {
+                let mut result =
+                    native_mcp::observe_operation(&command, journal, native, claim, boot_id).await?;
+                attach_command_receipt(&mut result, &command, claim)?;
+                vec![result]
             }
             "agent.result" if module_contract::normalized_result_enabled(claim) => {
                 match build_normalized_result_page(&command, journal, native, claim).await {
@@ -6132,6 +6183,7 @@ async fn handle_command(
                 "agent.reconcile" => String::from("reconcile"),
                 "agent.result" => String::from("result_page"),
                 "agent.shutdown" => String::from("shutdown"),
+                "native.mcp.observe" => String::from("native_mcp_observe"),
                 _ => String::from("receipt"),
             };
             (command.method.clone(), kind)

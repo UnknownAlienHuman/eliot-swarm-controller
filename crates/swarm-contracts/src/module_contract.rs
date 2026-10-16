@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 pub const MODULE_PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const CODEX_RUST_CONTROLLER_ARTIFACT_ID: &str = "codex-rust-controller.1";
-pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "11";
+pub const CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION: &str = "13";
 pub const RUNTIME_COMMAND_SCHEMA_ID: &str = "swarm.runtime_command";
 pub const RUNTIME_OUTCOME_SCHEMA_ID: &str = "swarm.runtime_outcome";
 pub const TASK_DISPATCH_CONTEXT_SCHEMA_ID: &str = "swarm.task_dispatch_context";
@@ -46,6 +46,10 @@ pub const MODULE_EVENT_METADATA_SCHEMA_ID: &str = "swarm.module_event_metadata";
 pub const RUNTIME_SCHEMA_VERSION: &str = "1";
 
 pub use crate::native_mcp::{NATIVE_MCP_COMMAND_SCHEMA_ID, NATIVE_MCP_COMMAND_SCHEMA_VERSION};
+pub use crate::native_mcp::{
+    CODEX_NATIVE_MCP_COMMAND_SCHEMA_ID, CODEX_NATIVE_MCP_COMMAND_SCHEMA_VERSION,
+    CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_ID, CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_VERSION,
+};
 
 /// Descriptor declaration for the bounded native MCP command carried inside
 /// the existing authenticated RuntimeCommand transport. Native outcomes keep
@@ -55,6 +59,28 @@ pub fn native_mcp_command_schema() -> SchemaDescriptor {
     SchemaDescriptor {
         schema_id: NATIVE_MCP_COMMAND_SCHEMA_ID.to_owned(),
         version: NATIVE_MCP_COMMAND_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Descriptor declaration for the read-only Codex per-thread MCP observer.
+/// It shares the established native.mcp.observe operation path while using a
+/// Codex-specific, versioned identity DTO.
+pub fn codex_native_mcp_command_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: CODEX_NATIVE_MCP_COMMAND_SCHEMA_ID.to_owned(),
+        version: CODEX_NATIVE_MCP_COMMAND_SCHEMA_VERSION.to_owned(),
+        sha256: None,
+    }
+}
+
+/// Per-thread Codex MCP profile consumed by `thread/start`. The paths refer to
+/// the existing issued private artifacts and are transient RuntimeCommand data,
+/// never part of a persisted Store receipt.
+pub fn codex_native_mcp_launch_profile_schema() -> SchemaDescriptor {
+    SchemaDescriptor {
+        schema_id: CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_ID.to_owned(),
+        version: CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_VERSION.to_owned(),
         sha256: None,
     }
 }
@@ -329,9 +355,16 @@ impl ModuleContractTemplate {
         let mut template = Self::codex_rust_controller_v6()?;
         template.artifact.version =
             ArtifactVersion::new(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION)?;
-        template
-            .capabilities
-            .insert(CapabilityId::new("agent.shutdown")?);
+        template.capabilities.extend([
+            CapabilityId::new("agent.shutdown")?,
+            CapabilityId::new("native.mcp.configure")?,
+            CapabilityId::new("native.mcp.observe")?,
+        ]);
+        template.command_schemas.extend([
+            native_mcp_command_schema(),
+            codex_native_mcp_command_schema(),
+            codex_native_mcp_launch_profile_schema(),
+        ]);
         Ok(template)
     }
 
@@ -521,7 +554,7 @@ mod tests {
             v8.artifact.version.as_str(),
             CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
         );
-        assert_eq!(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION, "11");
+        assert_eq!(CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION, "13");
         assert!(
             v8.capabilities
                 .contains(&CapabilityId::new("agent.shutdown").unwrap())
@@ -536,5 +569,10 @@ mod tests {
         assert!(v6.event_schemas.contains(&terminal));
         assert!(v8.event_schemas.contains(&continuation));
         assert!(v8.event_schemas.contains(&terminal));
+        assert!(v8.capabilities.contains(&CapabilityId::new("native.mcp.observe").unwrap()));
+        assert!(v8.capabilities.contains(&CapabilityId::new("native.mcp.configure").unwrap()));
+        assert!(v8.command_schemas.contains(&native_mcp_command_schema()));
+        assert!(v8.command_schemas.contains(&codex_native_mcp_command_schema()));
+        assert!(v8.command_schemas.contains(&codex_native_mcp_launch_profile_schema()));
     }
 }

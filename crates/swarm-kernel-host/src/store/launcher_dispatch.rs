@@ -41,16 +41,16 @@ pub(super) struct LaunchDispatchAdmission {
     pub(super) packet_digest: String,
 }
 
-struct LaunchParent {
-    operation_id: String,
-    state: String,
-    task_id: Option<String>,
-    attempt_id: Option<String>,
-    binding_id: Option<String>,
-    binding_generation: Option<i64>,
-    effective_request_json: String,
-    effective: Value,
-    manifest: Value,
+pub(super) struct LaunchParent {
+    pub(super) operation_id: String,
+    pub(super) state: String,
+    pub(super) task_id: Option<String>,
+    pub(super) attempt_id: Option<String>,
+    pub(super) binding_id: Option<String>,
+    pub(super) binding_generation: Option<i64>,
+    pub(super) effective_request_json: String,
+    pub(super) effective: Value,
+    pub(super) manifest: Value,
 }
 
 /// Resolve launch ownership and capture the C8 proof before a new
@@ -453,7 +453,7 @@ fn retained_parent_for_attempt(
     Ok(matches.pop())
 }
 
-fn load_parent(db: &Connection, operation_id: &str) -> Result<LaunchParent> {
+pub(super) fn load_parent(db: &Connection, operation_id: &str) -> Result<LaunchParent> {
     let (state, task_id, attempt_id, binding_id, binding_generation, raw): (
         String,
         Option<String>,
@@ -494,7 +494,7 @@ fn load_parent(db: &Connection, operation_id: &str) -> Result<LaunchParent> {
     })
 }
 
-fn validate_parent_tuple(
+pub(super) fn validate_parent_tuple(
     parent: &LaunchParent,
     attempt: &Value,
     task: &Value,
@@ -696,8 +696,9 @@ fn dispatch_capability_readback(ready: bool) -> Value {
 }
 
 /// Route-neutral, non-authorizing readback for the current launch dispatch
-/// capability. OpenCode delegates to its bounded C8 readback; Antigravity
-/// exposes only whether its strict current session predicate is satisfied.
+/// capability. OpenCode delegates to its bounded C8 readback, Codex validates
+/// its current thread-scoped Participant MCP receipt, and Antigravity exposes
+/// only whether its strict current session predicate is satisfied.
 pub(super) fn current_dispatch_capability_readback(
     db: &Connection,
     config: &Config,
@@ -724,6 +725,16 @@ pub(super) fn current_dispatch_capability_readback(
         return dispatch_capability_readback(muse["state"].as_str() == Some("ready"));
     }
 
+    if route.runtime == "codex"
+        && route.module_artifact_id == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
+    {
+        return dispatch_capability_readback(
+            super::codex_c8::require_current_dispatch_capability(
+                db, config, launch_operation_id, None,
+            )
+            .is_ok(),
+        );
+    }
     let ready = route.runtime == "antigravity"
         && route.module_artifact_id == antigravity_capability::ANTIGRAVITY_ARTIFACT_ID
         && require_current_dispatch_capability(db, config, launch_operation_id, None).is_ok();
@@ -731,8 +742,8 @@ pub(super) fn current_dispatch_capability_readback(
 }
 
 /// Select the current native capability from the trusted route retained by the
-/// launch binding. OpenCode keeps its existing C8 verifier; Antigravity uses
-/// only its same-process session/turn proof and cannot claim MCP readback.
+/// launch binding. OpenCode and Codex use their current native MCP readbacks;
+/// Antigravity uses only its same-process session/turn proof.
 pub(super) fn require_current_dispatch_capability(
     db: &Connection,
     config: &Config,
@@ -759,6 +770,13 @@ pub(super) fn require_current_dispatch_capability(
         );
     }
 
+    if route.runtime == "codex"
+        && route.module_artifact_id == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
+    {
+        return super::codex_c8::require_current_dispatch_capability(
+            db, config, launch_operation_id, dispatch_operation_id,
+        );
+    }
     if route.runtime != "antigravity"
         || route.module_artifact_id != antigravity_capability::ANTIGRAVITY_ARTIFACT_ID
     {
@@ -798,6 +816,9 @@ fn build_current_packet(
     if antigravity_capability::is_session_proof(proof) {
         return build_packet(parent, attempt, binding, proof, "");
     }
+    if proof["kind"] == swarm_contracts::native_mcp::CODEX_NATIVE_MCP_READBACK_KIND {
+        return build_packet(parent, attempt, binding, proof, "");
+    }
     let owned = super::opencode::owned_service_for_binding(
         db,
         config,
@@ -808,6 +829,104 @@ fn build_current_packet(
     build_packet(parent, attempt, binding, proof, owned.service_id())
 }
 
+fn build_codex_dispatch_packet(
+    parent: &LaunchParent,
+    attempt: &Value,
+    binding: &Value,
+    proof: &Value,
+) -> Result<Value> {
+    let readback: swarm_contracts::native_mcp::CodexNativeMcpReadback =
+        serde_json::from_value(proof.clone())
+            .map_err(|_| stale_capability("Codex C8 readback schema is invalid"))?;
+    readback.validate().map_err(|_| stale_capability("Codex C8 readback is invalid"))?;
+    let task_id = model::text(&parent.manifest["task"], "task_id")?;
+    let task_revision = model::positive(&parent.manifest["task"], "observed_revision")?;
+    let attempt_id = model::text(&parent.manifest["task"], "attempt_id")?;
+    let binding_id = model::text(&parent.manifest["binding"], "binding_id")?;
+    let generation = model::positive(&parent.manifest["binding"], "generation")?;
+    let participant_id = model::text(&parent.manifest["participant"], "client_id")?;
+    let grant_revision = model::positive(&parent.manifest["participant"], "grant_revision")?;
+    let route_alias = launch_manifest_route_alias(&parent.manifest)?;
+    let (tools, expected_toolset) = swarm_contracts::native_mcp::codex_participant_toolset()
+        .map_err(|_| stale_capability("Codex Participant tool catalog is invalid"))?;
+    if readback.launch_operation_id != parent.operation_id
+        || readback.task_id != task_id
+        || readback.task_revision != task_revision
+        || readback.attempt_id != attempt_id
+        || readback.binding_id != binding_id
+        || readback.binding_generation != generation
+        || readback.participant_id != participant_id
+        || readback.grant_revision != grant_revision
+        || readback.native_root_id != parent.manifest["binding"]["native_root_id"]
+        || readback.native_scope_key != binding["native_scope_key"]
+        || readback.open_operation_id != parent.manifest["binding"]["operation_id"]
+        || readback.credential_ref != parent.manifest["participant"]["credential_ref"]
+        || readback.profile_config_ref != parent.manifest["participant"]["profile_config_ref"]
+        || readback.profile_name != parent.manifest["mcp"]["profile_name"]
+        || readback.surface != parent.manifest["mcp"]["surface"]
+        || readback.toolset_sha256 != expected_toolset
+        || readback.tool_count as usize != tools.len()
+        || readback.dispatch_permitted
+        || readback.model_consumed != "unknown"
+        || binding["state"] != "ready"
+        || binding["released_at_ms"].is_number()
+        || attempt["state"] != "reserved"
+        || attempt["task_id"] != task_id
+        || attempt["task_revision"] != task_revision
+    {
+        return Err(stale_capability("Codex C8 proof is stale for this exact assignment"));
+    }
+    let required_core_schemas = tools.iter()
+        .map(|tool| model::text(tool, "name").map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "schema_version":1,
+        "launch_operation_id":parent.operation_id,
+        "plan_digest":parent.manifest["plan_digest"],
+        "task":{
+            "task_id":task_id,
+            "revision":task_revision,
+            "attempt_id":attempt_id,
+            "snapshot_digest":digest_value(&attempt["task_snapshot"])?,
+        },
+        "selection":{
+            "route":route_alias,
+            "provider":readback.effective_model_provider,
+            "model":readback.effective_model,
+            "variant":Value::Null,
+            "basis":"native_thread_readback",
+        },
+        "purpose":parent.manifest["runtime"]["purpose"],
+        "capability":{
+            "kind":"codex_native_mcp",
+            "schema_version":1,
+            "identity_digest":readback.assignment_sha256,
+            "evidence_digest":readback.evidence_sha256,
+            "native_discovered_digest":readback.toolset_sha256,
+            "authorization_revision":readback.authorization_revision,
+            "server_info_name":readback.server_info_name,
+            "server_info_version":readback.server_info_version,
+            "server_id_sha256":readback.server_id_sha256,
+            "runtime_status":readback.runtime_status,
+            "participant_id":readback.participant_id,
+            "grant_revision":readback.grant_revision,
+            "profile_name":readback.profile_name,
+            "surface":readback.surface,
+            "credential_ref":readback.credential_ref,
+            "profile_config_ref":readback.profile_config_ref,
+            "profile_assignment_sha256":readback.profile_assignment_sha256,
+            "profile_application_state":readback.profile_application_state,
+            "profile_reference_readback":readback.profile_reference_readback,
+            "tool_count":readback.tool_count,
+            "required_core_schemas":required_core_schemas,
+            "adapter_boot_id":readback.adapter_boot_id,
+            "native_root_id":readback.native_root_id,
+            "native_scope_key":readback.native_scope_key,
+            "dispatch_permitted":false,
+            "model_consumed":"unknown",
+        },
+    }))
+}
 fn build_packet(
     parent: &LaunchParent,
     attempt: &Value,
@@ -817,6 +936,9 @@ fn build_packet(
 ) -> Result<Value> {
     if antigravity_capability::is_session_proof(proof) {
         return antigravity_capability::build_packet(parent, attempt, binding, proof);
+    }
+    if proof["kind"] == swarm_contracts::native_mcp::CODEX_NATIVE_MCP_READBACK_KIND {
+        return build_codex_dispatch_packet(parent, attempt, binding, proof);
     }
     let capability_identity_digest =
         validate_capability_proof(parent, attempt, binding, proof, owned_service_id)?;

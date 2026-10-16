@@ -869,6 +869,7 @@ fn claim_next_readback(tx: &Transaction<'_>, now: i64, config: &Config) -> Resul
              WHERE method='swarm.launch' AND state='queued' \
                AND CASE WHEN json_valid(effective_request_json) THEN \
                  json_extract(effective_request_json,'$.launch_manifest.state')='awaiting_native_mcp' \
+                 AND COALESCE(json_extract(effective_request_json,'$.launch_manifest.runtime.route.runtime'),'')!='codex' \
                  AND ( \
                    json_type(effective_request_json,'$.launch_manifest.native_mcp_readback.state') IS NULL \
                    OR (json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state') \

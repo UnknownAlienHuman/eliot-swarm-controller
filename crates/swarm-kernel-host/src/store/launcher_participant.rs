@@ -16,9 +16,11 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
+use swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
 
 const AWAITING_ISSUANCE: &str = "awaiting_participant_credential";
 const AWAITING_NATIVE_MCP: &str = "awaiting_native_mcp";
+const LAUNCH_OUTCOME_UNKNOWN: &str = "outcome_unknown";
 
 struct LaunchIssuanceScope {
     manifest: Value,
@@ -179,8 +181,28 @@ fn validated_scope(
     )?;
     let open_operation_id = model::text(&manifest["binding"], "operation_id")?;
     let open_operation = super::operations::get_operation(db, open_operation_id)?;
+    let is_codex_c8 = manifest["runtime"]["route"]["runtime"] == "codex"
+        && manifest["runtime"]["route"]["module_artifact_id"]
+            == CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+    if is_codex_c8 {
+        super::codex_c8::require_codex_descriptor(db, &binding)?;
+    }
+    let codex_preopen_issuance = is_codex_c8
+        && (phase == AWAITING_ISSUANCE || phase == AWAITING_NATIVE_MCP)
+        && open_operation["state"] == "queued"
+        && binding["native_root_id"].is_null()
+        && manifest["binding"]["native_root_id"].is_null()
+        && (phase == AWAITING_ISSUANCE
+            || (manifest["participant"]["credential_ref"].is_string()
+                && manifest["participant"]["native_session_id"].is_null()));
     if open_operation["method"] != "agent.open"
-        || open_operation["state"] != "settled"
+        || (!codex_preopen_issuance && open_operation["state"] != "settled")
+        || (is_codex_c8 && !codex_preopen_issuance
+            && open_operation["result"]["outcome"] != "applied")
+        || (is_codex_c8 && !codex_preopen_issuance
+            && (open_operation["result"]["native_root_id"] != binding["native_root_id"]
+                || open_operation["result"]["native_scope_key"] != binding["native_scope_key"]
+                || manifest["binding"]["native_root_id"] != binding["native_root_id"]))
         || open_operation["caller_id"].as_str() != Some(actor_caller_id(actor))
         || open_operation["prerequisite_operation_id"].as_str() != Some(operation_id)
         || open_operation["task_id"].as_str() != Some(task_id.as_str())
@@ -191,6 +213,12 @@ fn validated_scope(
         return Err(Error::new(
             "STALE_LAUNCH",
             "ready binding does not come from the exact retained launch open Operation",
+        ));
+    }
+    if is_codex_c8 && phase == AWAITING_ISSUANCE && !codex_preopen_issuance {
+        return Err(Error::new(
+            "NATIVE_MCP_PROFILE_PREOPEN_REQUIRED",
+            "Codex Participant credential and native MCP profile must be issued before thread/start",
         ));
     }
 
@@ -248,7 +276,19 @@ fn validated_scope(
         ));
     }
 
-    let native_session_id = exact_native_session_id(&attempt, &binding);
+    let native_session_id = if codex_preopen_issuance {
+        // The app-server allocates the real thread ID inside thread/start. Keep
+        // this issued Participant unbound to a fabricated root; the exact
+        // post-open activation and C8 readback bind the Task/Attempt/binding to
+        // the returned native root before dispatch.
+        None
+    } else if is_codex_c8 && phase == AWAITING_NATIVE_MCP {
+        manifest["participant"]["native_session_id"]
+            .as_str()
+            .map(str::to_owned)
+    } else {
+        exact_native_session_id(&attempt, &binding)
+    };
     Ok(LaunchIssuanceScope {
         manifest,
         operation,
@@ -782,4 +822,245 @@ pub(super) fn commit_launch_issuance(
         },
     )?;
     Ok(result)
+}
+
+/// Hold mutations from a launch-issued Participant until the exact binding
+/// open and held Task workspace lease are present. This is deliberately a
+/// post-open credential activation gate; native MCP capability proof remains
+/// a separate launch-dispatch requirement.
+pub(super) fn require_launch_activation_for_mutation(
+    tx: &Transaction<'_>,
+    p: &model::Principal,
+) -> Result<()> {
+    if p.role != model::Role::Participant {
+        return Ok(());
+    }
+    let Some(registration) = super::meta(tx, &format!("client:{}", p.client_id))? else {
+        return Ok(());
+    };
+    if registration["role"] != "participant" || registration["disabled"] == true {
+        return Ok(());
+    }
+    let Some(register_operation_id) = registration
+        .get("created_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(launch_operation_id) = launch_operation_for_registration(tx, register_operation_id)?
+    else {
+        return Ok(());
+    };
+    let Some(manifest) = pending_manifest_for_client(
+        tx,
+        &launch_operation_id,
+        &p.client_id,
+        &registration,
+    )? else {
+        return Ok(());
+    };
+    let task_id = manifest["task"]["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(pending_launch_activation)?;
+    let attempt_id = manifest["task"]["attempt_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(pending_launch_activation)?;
+    let task_revision = manifest["task"]["observed_revision"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(pending_launch_activation)?;
+    let attempt = match super::tasks::get_attempt(tx, attempt_id) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    if attempt["task_id"].as_str() != Some(task_id)
+        || attempt["task_revision"] != task_revision
+        || !attempt["released_at_ms"].is_null()
+        || attempt["state"] != "reserved"
+        || !attempt["start_operation_id"].is_null()
+    {
+        return Ok(());
+    }
+    let task = match super::tasks::get_task(tx, task_id) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    if task["state"] != "open"
+        || task["revision"] != task_revision
+        || task["current_attempt_id"].as_str() != Some(attempt_id)
+    {
+        return Ok(());
+    }
+    require_launch_activation_facts(
+        tx,
+        &launch_operation_id,
+        &manifest,
+        task_revision,
+        &attempt,
+    )
+}
+
+fn launch_operation_for_registration(
+    tx: &Transaction<'_>,
+    register_operation_id: &str,
+) -> Result<Option<String>> {
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='coordination.participant.register'",
+            [register_operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let effective: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(effective
+        .get("launch_registration")
+        .and_then(|receipt| receipt.get("launch_operation_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned))
+}
+
+fn pending_manifest_for_client(
+    tx: &Transaction<'_>,
+    launch_operation_id: &str,
+    client_id: &str,
+    registration: &Value,
+) -> Result<Option<Value>> {
+    // An uncertain parent stays pending; outcome_unknown is never evidence of
+    // activation and must not make an issued Participant credential writable.
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1 AND method='swarm.launch' AND state IN ('queued','outcome_unknown')",
+            [launch_operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let effective: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(manifest) = effective.get("launch_manifest").filter(|value| value.is_object()) else {
+        return Ok(None);
+    };
+    if !matches!(
+        manifest.get("state").and_then(Value::as_str),
+        Some(AWAITING_ISSUANCE) | Some(AWAITING_NATIVE_MCP) | Some(LAUNCH_OUTCOME_UNKNOWN)
+    ) {
+        return Ok(None);
+    }
+    let participant = &manifest["participant"];
+    if participant.get("client_id").and_then(Value::as_str) != Some(client_id)
+        || participant.get("task_id").and_then(Value::as_str)
+            != registration.get("task_id").and_then(Value::as_str)
+        || participant.get("task_revision").and_then(Value::as_i64)
+            != registration.get("task_revision").and_then(Value::as_i64)
+        || participant.get("attempt_id").and_then(Value::as_str)
+            != registration.get("attempt_id").and_then(Value::as_str)
+        || participant.get("binding_id").and_then(Value::as_str)
+            != registration.get("binding_id").and_then(Value::as_str)
+        || participant.get("binding_generation").and_then(Value::as_i64)
+            != registration.get("binding_generation").and_then(Value::as_i64)
+    {
+        return Ok(None);
+    }
+    Ok(Some(manifest.clone()))
+}
+
+pub(super) fn require_launch_activation_facts(
+    tx: &Transaction<'_>,
+    launch_operation_id: &str,
+    manifest: &Value,
+    task_revision: i64,
+    attempt: &Value,
+) -> Result<()> {
+    let pending = || {
+        Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "launch-issued Participant credential is pending exact native open activation",
+        )
+    };
+    let task_id = manifest["task"]["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(pending)?;
+    let attempt_id = manifest["task"]["attempt_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(pending)?;
+    let binding_id = manifest["binding"]["binding_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(pending)?;
+    let binding_generation = manifest["binding"]["generation"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or_else(pending)?;
+    if attempt["binding_id"].as_str() != Some(binding_id)
+        || attempt["binding_generation"] != binding_generation
+    {
+        return Err(pending());
+    }
+    let binding = super::operations::get_binding(tx, binding_id, binding_generation)
+        .map_err(|_| pending())?;
+    if binding["state"] != "ready" || !binding["released_at_ms"].is_null() {
+        return Err(pending());
+    }
+    let open_operation_id = manifest["binding"]["operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(pending)?;
+    let open = super::operations::get_operation(tx, open_operation_id).map_err(|_| pending())?;
+    let is_codex_c8 = manifest["runtime"]["route"]["runtime"] == "codex"
+        && manifest["runtime"]["route"]["module_artifact_id"]
+            == CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+    if open["method"] != "agent.open"
+        || open["state"] != "settled"
+        || (is_codex_c8 && open["result"]["outcome"] != "applied")
+        || open["prerequisite_operation_id"].as_str() != Some(launch_operation_id)
+        || open["task_id"].as_str() != Some(task_id)
+        || open["attempt_id"].as_str() != Some(attempt_id)
+        || open["binding_id"].as_str() != Some(binding_id)
+        || open["binding_generation"] != binding_generation
+        || (is_codex_c8
+            && (open["result"]["native_root_id"] != binding["native_root_id"]
+                || open["result"]["native_scope_key"] != binding["native_scope_key"]
+                || manifest["binding"]["native_root_id"] != binding["native_root_id"]))
+    {
+        return Err(pending());
+    }
+    let authority: LeaseAuthorityRef =
+        serde_json::from_value(manifest["workspace"]["lease_authority"].clone())
+            .map_err(|_| pending())?;
+    if authority.operation_id != launch_operation_id
+        || authority.task_id != task_id
+        || authority.task_revision != task_revision
+        || authority.attempt_id.as_deref() != Some(attempt_id)
+        || authority.state != "held"
+        || authority.plan_digest.as_str() != manifest["plan_digest"].as_str().unwrap_or_default()
+    {
+        return Err(pending());
+    }
+    let lease = super::workspace::get_lease_view(tx, &authority).map_err(|_| pending())?;
+    if lease["state"] != "held"
+        || lease["operation_id"].as_str() != Some(launch_operation_id)
+        || lease["task_id"].as_str() != Some(task_id)
+        || lease["attempt_id"].as_str() != Some(attempt_id)
+        || lease["owner_client_id"] != attempt["owner_id"]
+        || lease["plan_digest"] != manifest["plan_digest"]
+    {
+        return Err(pending());
+    }
+    Ok(())
 }

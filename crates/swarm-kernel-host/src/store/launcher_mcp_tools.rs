@@ -84,6 +84,9 @@ impl Store {
     /// `observed_partial` readback; C7's five-minute refresh delay is not
     /// reused as an installation delay.
     pub(crate) async fn reconcile_native_mcp_tools_once(&self) -> Result<Value> {
+        if let Some(codex) = super::codex_c8::reconcile_once(self).await? {
+            return Ok(codex);
+        }
         let now = model::now_ms()?;
         let config = self.config.clone();
         let outcome = self
@@ -1902,7 +1905,7 @@ fn load_launch_facts(
 
 const INTERNAL_NATIVE_MCP_CALLER: &str = "swarm.internal.c8.native_mcp";
 
-fn require_internal_native_mcp_client(tx: &Connection) -> Result<()> {
+pub(super) fn require_internal_native_mcp_client(tx: &Connection) -> Result<()> {
     let registration = super::meta(tx, &format!("client:{INTERNAL_NATIVE_MCP_CALLER}"))?
         .ok_or_else(|| {
             Error::new(
@@ -2969,6 +2972,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                  AND json_extract(effective_request_json,'$.launch_manifest.runtime.dispatch_permitted')=0 \
                  AND json_extract(effective_request_json,'$.launch_manifest.progress.task_dispatch')='not_started' \
                  AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='observed_partial' \
+                 AND COALESCE(json_extract(effective_request_json,'$.launch_manifest.runtime.route.runtime'),'')!='codex' \
                  ELSE 0 END \
                AND operation_id>?1 \
              ORDER BY operation_id LIMIT ?2",
@@ -4021,6 +4025,21 @@ pub(crate) fn participant_capability_projection(
         "surface":surface,
         "coverage":"bounded_required_core_only",
         "presentation":"pull_only",
+        // This is derived from the authenticated Principal and current Store
+        // registration, never from request arguments. Native Codex C8 uses
+        // this read-only projection to prove which scoped local MCP identity
+        // the exact thread actually called.
+        "authenticated_assignment":{
+            "participant_id":participant_id,
+            "task_id":task_id,
+            "task_revision":task_revision,
+            "attempt_id":attempt_id,
+            "binding_id":binding_id,
+            "binding_generation":binding_generation,
+            "grant_revision":grant_revision,
+            "native_session_id":native_session_id,
+            "basis_kind":basis_kind,
+        },
         "scope":scope,
         "current_task":{
             "task_id":task_id,

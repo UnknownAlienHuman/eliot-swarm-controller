@@ -11,19 +11,23 @@ use crate::{ARTIFACT_ID, ARTIFACT_VERSION, AdapterError, MODULE_ID};
 
 pub(crate) const GOAL_CONTINUATION_ADMISSION_SCHEMA_ID: &str = "swarm.goal_continuation_admission";
 
-const CAPABILITIES: [&str; 5] = [
+const CAPABILITIES: [&str; 7] = [
     "agent.open",
     "agent.reconcile",
     "agent.send",
     "agent.shutdown",
+    "native.mcp.configure",
+    "native.mcp.observe",
     "task.dispatch",
 ];
-const RESULT_CAPABILITIES: [&str; 6] = [
+const RESULT_CAPABILITIES: [&str; 8] = [
     "agent.open",
     "agent.reconcile",
     "agent.result",
     "agent.send",
     "agent.shutdown",
+    "native.mcp.configure",
+    "native.mcp.observe",
     "task.dispatch",
 ];
 
@@ -141,6 +145,9 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
                 schema("swarm.task_dispatch_context"),
                 schema("swarm.normalized_result_context"),
                 swarm_contracts::module_contract::task_prompt_schema(),
+                swarm_contracts::module_contract::native_mcp_command_schema(),
+                swarm_contracts::module_contract::codex_native_mcp_command_schema(),
+                swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
             ],
         )
         && exact_schemas(
@@ -152,6 +159,20 @@ fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
                 swarm_contracts::module_contract::goal_continuation_admission_schema(),
                 swarm_contracts::module_contract::goal_terminal_evidence_schema(),
             ],
+        )
+}
+
+pub(crate) fn codex_native_mcp_enabled(claim: &ModuleContractClaim) -> bool {
+    claim.capabilities.iter().any(|value| value.as_str() == "native.mcp.observe")
+        && claim.capabilities.iter().any(|value| value.as_str() == "native.mcp.configure")
+        && claim
+            .command_schemas
+            .contains(&swarm_contracts::module_contract::codex_native_mcp_command_schema())
+        && claim
+            .command_schemas
+            .contains(&swarm_contracts::module_contract::native_mcp_command_schema())
+        && claim.command_schemas.contains(
+            &swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
         )
 }
 
@@ -193,30 +214,30 @@ pub(crate) fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
             sha256: None,
         }
     }
-    let runtime_command = schema("swarm.runtime_command", "1");
-    let runtime_outcome = schema("swarm.runtime_outcome", "1");
-    let dispatch_context = schema("swarm.task_dispatch_context", "1");
-    let dispatch_admission = schema("swarm.task_dispatch_admission", "1");
-    let result_context = schema("swarm.normalized_result_context", "1");
-    let result_page = schema("swarm.normalized_result_page", "1");
-    exact_schemas(
-        &claim.command_schemas,
-        &[
-            runtime_command,
-            dispatch_context,
-            result_context,
-            swarm_contracts::module_contract::task_prompt_schema(),
-        ],
-    ) && exact_schemas(
-        &claim.event_schemas,
-        &[
-            runtime_outcome,
-            dispatch_admission,
-            result_page,
-            swarm_contracts::module_contract::goal_continuation_admission_schema(),
-            swarm_contracts::module_contract::goal_terminal_evidence_schema(),
-        ],
-    )
+    let mut commands = vec![
+        schema("swarm.runtime_command", "1"),
+        schema("swarm.task_dispatch_context", "1"),
+        schema("swarm.normalized_result_context", "1"),
+        swarm_contracts::module_contract::task_prompt_schema(),
+    ];
+    if codex_native_mcp_enabled(claim) {
+        commands.extend([
+            swarm_contracts::module_contract::native_mcp_command_schema(),
+            swarm_contracts::module_contract::codex_native_mcp_command_schema(),
+            swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
+        ]);
+    }
+    exact_schemas(&claim.command_schemas, &commands)
+        && exact_schemas(
+            &claim.event_schemas,
+            &[
+                schema("swarm.runtime_outcome", "1"),
+                schema("swarm.task_dispatch_admission", "1"),
+                schema("swarm.normalized_result_page", "1"),
+                swarm_contracts::module_contract::goal_continuation_admission_schema(),
+                swarm_contracts::module_contract::goal_terminal_evidence_schema(),
+            ],
+        )
 }
 
 pub(crate) fn receipt_identity(

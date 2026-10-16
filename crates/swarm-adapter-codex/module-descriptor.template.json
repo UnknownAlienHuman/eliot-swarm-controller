@@ -3,7 +3,7 @@
   "module_id": "codex",
   "artifact": {
     "artifact_id": "codex-rust-controller.1",
-    "version": "11",
+    "version": "13",
     "build_id": null
   },
   "launch": {
@@ -45,6 +45,21 @@
     {
       "schema_id": "swarm.task_prompt",
       "version": "1"
+    },
+    {
+      "schema_id": "swarm.native_mcp_command",
+      "version": "2",
+      "sha256": null
+    },
+    {
+      "schema_id": "swarm.codex_native_mcp_command",
+      "version": "2",
+      "sha256": null
+    },
+    {
+      "schema_id": "swarm.codex_native_mcp_launch_profile",
+      "version": "1",
+      "sha256": null
     }
   ],
   "event_schemas": [
@@ -84,6 +99,8 @@
     "agent.result",
     "agent.send",
     "agent.shutdown",
+    "native.mcp.configure",
+    "native.mcp.observe",
     "task.dispatch"
   ],
   "lifecycle": "external_attach",

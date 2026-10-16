@@ -4,13 +4,13 @@ This module directory documents the passive observer and two separately
 versioned controller artifacts over an operator-owned Codex app-server. The
 legacy Python controller is artifact `codex-sdk-18194bf-bridge.3`; the
 standalone Rust controller is artifact `codex-rust-controller.1`, current
-descriptor version `11`, sourced from `crates/swarm-adapter-codex`. Both attach
+descriptor version `13`, sourced from `crates/swarm-adapter-codex`. Both attach
 to the existing app-server and never start or stop it. Their result contracts
 are documented separately below.
 
 ## Setup
 
-The Python setup below is historical donor tooling, not required by the current Rust controller. The Rust route attaches to an already configured native app-server; omitting the explicit model/provider pair uses that harness's defaults. Version 11 is a source candidate; old v10 bindings and receipts retain their original identity.
+The Python setup below is historical donor tooling, not required by the current Rust controller. The Rust route attaches to an already configured native app-server; omitting the explicit model/provider pair uses that harness's defaults. Descriptor v13 is current; older v11/v10 bindings and receipts retain their original identities.
 
 Create a module-local Python environment and install only the pinned
 requirements:
@@ -31,7 +31,7 @@ the config file or logged. The host injects `ELIOT_SWARM_MODULE_STATE` and
 
 The setup and observer commands in this section belong to the legacy Python
 bridge artifact `.3`. The standalone Rust artifact `.1`, current descriptor
-version `11`, uses its own package and descriptor under
+version `13`, uses its own package and descriptor under
 `crates/swarm-adapter-codex`; it does not use
 this module-local Python environment or `vendor_bridge`.
 
@@ -91,7 +91,7 @@ Pages in the legacy `.3` controller are capped at 64 KiB. This reports an
 allowlisted projection of observed native history only; it does not claim
 complete family coverage or execute tools.
 
-## Standalone Rust controller (`codex-rust-controller.1`, current descriptor version `11`)
+## Standalone Rust controller (`codex-rust-controller.1`, current descriptor version `13`)
 
 The standalone Rust adapter is a separate registered artifact from the legacy
 Python bridge. Its route uses `runtime = "codex"` and the exact artifact
@@ -139,6 +139,55 @@ legacy `.3` child/history/tool projection above remains available only through
 that legacy artifact. No v8 selector or descriptor row requires child ancestry;
 v8 must return an unsupported or unavailable result rather than infer child
 causality from session, cwd, turn order, or family enumeration.
+
+Descriptor v13 adds a per-thread native MCP profile consumer and the separate
+read-only C8 proof. The consumer sends the issued Participant server as
+dotted `mcp_servers.<launch-specific-name>.*` entries in `thread/start.config`:
+an absolute sibling `swarm-mcp` executable, the existing issued profile and
+credential paths, and the exact `--config`, `--credential`, and `--profile`
+argv. It sets only `enabled`, `required`, and live `connection` startup
+readiness for that unique server entry; it
+does not set a provider, model, global setting, or copied profile. The native
+`required` startup behavior keeps the new thread from opening if that MCP
+server cannot initialize.
+
+The installed Codex CLI is 0.161.0; the source audit used first-party release
+tag `rust-v0.161.0` at commit `979011409de0a60b52f179721948e65531d26144`. Its
+pinned protocol defines a
+generic per-thread config map; its thread processor sends that map to the
+thread's config loader, and the same release's MCP refresh test applies
+`mcp_servers.<name>.command` and `.enabled` dotted overrides. A running
+`thread/resume` returns through the running-thread path before config loading,
+so this design consumes the profile at `thread/start`; it does not try a
+post-open global reload or an unload/archive workaround.
+
+The launch sequence must issue the Participant credential/profile while the
+exact Task/Attempt, ready binding, and held lease are current, but before
+`thread/start`. Its registration keeps `native_session_id` null because the
+Codex thread ID does not exist yet. The mutation guard keeps that pending
+Participant read-only until the real open receipt and lease are confirmed.
+After open, C8 binds the returned thread ID to the current Store root, filters
+`mcpServerStatus/list` by that exact thread and unique server key, compares
+the effective tool schemas with Participant core, and calls
+`swarm.tools.search`/`swarm.context.get` through that same thread. The latter
+must return the authenticated Participant role/client/grant and exact
+Task/Attempt/binding assignment. Model consumption remains `unknown`.
+The app-server does not echo the loaded profile path/reference; the receipt
+claims only the effective thread toolset and authenticated assignment.
+
+Root-owned integration is still required: move Codex Participant issuance and
+its retained receipt before the queued `agent.open`, then have the runtime
+command builder resolve the opaque refs in memory and attach the typed launch
+profile to that one `agent.open` command without persisting the private paths.
+Resolve the executable as the absolute `swarm-mcp[.exe]` sibling of the
+`swarm-kernel-host` executable, following the existing host MCP launcher; fail
+before `thread/start` if that sibling is missing. The v13 adapter requires this
+typed profile for every `agent.open` and rejects a missing profile before its
+native effect marker.
+The launch profile is rejected if it invents a pre-open native session ID.
+Until this glue is present, dispatch stays unavailable; there is no
+new-thread-without-MCP fallback. The adapter does not write Codex config or
+copy the issued profile.
 
 The current descriptor also declares `agent.shutdown` with only
 `owned_scope = "external_attach"`. It releases the adapter-owned connection,
