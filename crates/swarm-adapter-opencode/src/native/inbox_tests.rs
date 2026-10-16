@@ -75,9 +75,11 @@ async fn live_existing_input_log_readback_is_exact_and_read_only() {
     client
         .require_durable_root_creation_inner(
             &session_id,
+            &options,
             binding,
             generation,
             &serde_json::to_value(&options.model).unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -222,7 +224,9 @@ async fn http_fixture(
             } else {
                 serde_json::from_slice(&request[header_end..header_end + length]).unwrap()
             });
-            let (content_type, body) = if response.get("json_payload").is_some() {
+            let (content_type, body) = if let Some(raw) = response["raw_stream"].as_str() {
+                ("text/event-stream", raw.as_bytes().to_vec())
+            } else if response.get("json_payload").is_some() {
                 (
                     "application/json",
                     serde_json::to_vec(&response["json_payload"]).unwrap(),
@@ -263,9 +267,15 @@ async fn http_fixture(
                 }
                 ("text/event-stream", stream_body.into_bytes())
             };
+            let content_length = body.len()
+                + if response["truncate_body"] == true {
+                    1
+                } else {
+                    0
+                };
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+                content_length
             );
             stream.write_all(headers.as_bytes()).await.unwrap();
             stream.write_all(&body).await.unwrap();
@@ -337,6 +347,13 @@ async fn native_207_root_durability_requires_valid_complete_message_log() {
     let binding = "fixture-binding";
     let root = root_id(binding, 1);
     let model = json!({"id":"fixture-model","providerID":"fixture","variant":"fixture-variant"});
+    let directory = std::env::current_dir().unwrap();
+    let options = NativeOptions {
+        service_id: "durable-log-fixture".into(),
+        connection_file: directory.join("unused.json"),
+        directory,
+        model: Some(serde_json::from_value(model.clone()).unwrap()),
+    };
     let mut created = root_event();
     created["durable"]["aggregateID"] = json!(root);
     created["data"]["sessionID"] = json!(root);
@@ -369,7 +386,7 @@ async fn native_207_root_durability_requires_valid_complete_message_log() {
     ] {
         let (client, server) = http_fixture(vec![response], "GET").await;
         let result = client
-            .require_durable_root_creation_inner(&root, binding, 1, &model)
+            .require_durable_root_creation_inner(&root, &options, binding, 1, &model, None)
             .await;
         if let Some(code) = expected_error {
             assert_eq!(result.unwrap_err().code, code);
@@ -377,6 +394,485 @@ async fn native_207_root_durability_requires_valid_complete_message_log() {
             result.unwrap();
         }
         server.await.unwrap();
+    }
+}
+
+// Native 2.0.31 may retain no session events. Root readback still needs the
+// exact HTTP projections; an empty log supplies no inbox admission or delivery.
+struct RootReadbackFixture {
+    command: RuntimeCommand,
+    options: NativeOptions,
+    root: String,
+    location: Value,
+    session: Value,
+}
+
+impl RootReadbackFixture {
+    fn new(pinned_model: bool) -> Self {
+        let mut command = command();
+        command.operation_id = "op071-open".into();
+        command.method = "agent.open".into();
+        command.native_root_id = None;
+        let root = root_id(&command.binding_id, command.generation);
+        let directory = std::env::current_dir().unwrap();
+        let location = json!({"directory":directory});
+        let model =
+            json!({"id":"native-model","providerID":"native-provider","variant":"native-variant"});
+        let session = json!({
+            "id":root,"parentID":null,"fork":null,"location":location,
+            "model":model,"metadata":{"eliot":marker(&command)}
+        });
+        let options = NativeOptions {
+            service_id: "empty-root-readback".into(),
+            connection_file: directory.join("unused.json"),
+            directory,
+            model: pinned_model.then(|| serde_json::from_value(model).unwrap()),
+        };
+        Self {
+            command,
+            options,
+            root,
+            location,
+            session,
+        }
+    }
+
+    fn session_response(&self, session: &Value) -> Value {
+        json!({"json_path":format!("/api/session/{}", self.root),"json_payload":{"data":session}})
+    }
+
+    fn location_response(&self) -> Value {
+        let mut url = Url::parse("http://fixture/api/location").unwrap();
+        url.query_pairs_mut().append_pair(
+            "location[directory]",
+            &self.options.directory.to_string_lossy(),
+        );
+        json!({
+            "json_path":format!("{}?{}", url.path(), url.query().unwrap()),
+            "json_payload":{"directory":self.options.directory,"project":{"id":"global"}}
+        })
+    }
+
+    fn raw_root_log(&self, stream: String) -> Value {
+        json!({
+            "json_path":format!("/api/experimental/session/{}/log?follow=false", self.root),
+            "raw_stream":stream
+        })
+    }
+
+    fn empty_log(&self, sequence: bool) -> Value {
+        let mut sync = json!({"type":"log.synced","aggregateID":self.root});
+        if sequence {
+            sync["seq"] = json!(0);
+        }
+        self.raw_root_log(format!("event: message\ndata: {sync}\n\n"))
+    }
+
+    fn creation_response(&self) -> Value {
+        json!({"expected_method":"POST","json_path":"/api/session","json_payload":{"data":self.session}})
+    }
+
+    fn saved_intent(&self, method: &str) -> OperationIntent {
+        let mut command = self.command.clone();
+        command.method = method.into();
+        command.operation_id = match method {
+            "task.dispatch" => "op071-dispatch",
+            "agent.send" => "op071-send",
+            _ => self.command.operation_id.as_str(),
+        }
+        .into();
+        let mut intent = intent();
+        intent.operation_id = command.operation_id.clone();
+        intent.module_receipt.operation_id = command.operation_id.clone();
+        intent.method = method.into();
+        intent.native_root_id = Some(self.root.clone());
+        intent.native_input_id =
+            native_delivery_for_method(method).map(|_| input_id(&command.operation_id));
+        intent.native_scope_key = self.options.scope_key();
+        intent.route_sha256 = digest_json(&serde_json::to_value(&self.options).unwrap()).unwrap();
+        intent.model = serde_json::to_value(&self.options.model).unwrap();
+        intent.marker = marker(&command);
+        if method == "agent.open" {
+            intent.prompt_sha256 = None;
+            intent.prompt_bytes = None;
+        }
+        intent
+    }
+}
+
+#[tokio::test]
+async fn native_071_empty_root_sync_requires_exact_session_location_marker_and_model_readback() {
+    for pinned_model in [false, true] {
+        for sequence in [false, true] {
+            let fixture = RootReadbackFixture::new(pinned_model);
+            let (client, server) = http_fixture(
+                vec![
+                    fixture.creation_response(),
+                    fixture.empty_log(sequence),
+                    fixture.session_response(&fixture.session),
+                    fixture.location_response(),
+                ],
+                "GET",
+            )
+            .await;
+            client
+                .create_root(
+                    &fixture.command,
+                    &fixture.options,
+                    &fixture.root,
+                    fixture.location.clone(),
+                )
+                .await
+                .unwrap();
+            let mut expected = json!({
+                "id":fixture.root,"location":fixture.location,
+                "metadata":{"eliot":marker(&fixture.command)}
+            });
+            if pinned_model {
+                expected["model"] = fixture.session["model"].clone();
+            }
+            assert_eq!(
+                server.await.unwrap(),
+                vec![expected, Value::Null, Value::Null, Value::Null]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_071_empty_root_sync_reconciles_the_exact_saved_open_without_post() {
+    for sequence in [false, true] {
+        let fixture = RootReadbackFixture::new(true);
+        let (client, server) = http_fixture(
+            vec![
+                fixture.session_response(&fixture.session),
+                fixture.location_response(),
+                fixture.empty_log(sequence),
+                fixture.session_response(&fixture.session),
+                fixture.location_response(),
+            ],
+            "GET",
+        )
+        .await;
+        client
+            .reconcile_open(&fixture.saved_intent("agent.open"), &fixture.options)
+            .await
+            .unwrap();
+        assert_eq!(server.await.unwrap(), vec![Value::Null; 5]);
+    }
+}
+
+#[tokio::test]
+async fn native_071_empty_root_sync_rejects_foreign_or_incomplete_readback() {
+    let fixture = RootReadbackFixture::new(true);
+    let mut extra_marker = marker(&fixture.command);
+    extra_marker["foreign"] = json!(true);
+    for (pointer, replacement) in [
+        ("/id", json!("ses_foreign")),
+        ("/parentID", json!("ses_parent")),
+        ("/fork", json!({"sessionID":"ses_foreign"})),
+        (
+            "/location/directory",
+            json!(fixture.options.directory.join("foreign")),
+        ),
+        ("/model/id", json!("other-model")),
+        ("/model/providerID", json!("other-provider")),
+        ("/model/variant", json!("other-variant")),
+        ("/model", Value::Null),
+        ("/metadata/eliot/binding", json!("foreign-binding")),
+        ("/metadata/eliot/generation", json!(2)),
+        ("/metadata/eliot/operation", json!("other-open")),
+        ("/metadata/eliot/input_sha256", json!("b".repeat(64))),
+        (
+            "/metadata/eliot",
+            json!({"binding":fixture.command.binding_id,"generation":1}),
+        ),
+        ("/metadata/eliot", extra_marker),
+    ] {
+        let mut session = fixture.session.clone();
+        *session.pointer_mut(pointer).unwrap() = replacement;
+        let mut responses = vec![
+            fixture.creation_response(),
+            fixture.empty_log(true),
+            fixture.session_response(&session),
+        ];
+        if pointer != "/id" {
+            responses.push(fixture.location_response());
+        }
+        let expected_requests = responses.len();
+        let (client, server) = http_fixture(responses, "GET").await;
+        let error = client
+            .create_root(
+                &fixture.command,
+                &fixture.options,
+                &fixture.root,
+                fixture.location.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            if pointer == "/id" {
+                "NATIVE_SCHEMA_ERROR"
+            } else {
+                "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE"
+            },
+            "readback mutation {pointer}"
+        );
+        assert_eq!(server.await.unwrap().len(), expected_requests);
+    }
+    for foreign_directory in [false, true] {
+        let mut location = fixture.location_response();
+        let expected = if foreign_directory {
+            location["json_payload"]["directory"] =
+                json!(fixture.options.directory.parent().unwrap());
+            "NATIVE_LOCATION_MISMATCH"
+        } else {
+            location["json_payload"]["project"] = json!({});
+            "NATIVE_LOCATION_UNAVAILABLE"
+        };
+        let (client, server) = http_fixture(
+            vec![
+                fixture.empty_log(true),
+                fixture.session_response(&fixture.session),
+                location,
+            ],
+            "GET",
+        )
+        .await;
+        let error = client
+            .require_durable_root_creation_inner(
+                &fixture.root,
+                &fixture.options,
+                &fixture.command.binding_id,
+                1,
+                &serde_json::to_value(&fixture.options.model).unwrap(),
+                Some(&marker(&fixture.command)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, expected);
+        assert_eq!(server.await.unwrap(), vec![Value::Null; 3]);
+    }
+}
+
+#[tokio::test]
+async fn native_071_open_reconciliation_rejects_a_foreign_full_marker_before_log_readback() {
+    let fixture = RootReadbackFixture::new(true);
+    for field in ["operation", "input_sha256"] {
+        let mut changed = fixture.session.clone();
+        changed["metadata"]["eliot"][field] = if field == "operation" {
+            json!("another-open")
+        } else {
+            json!("b".repeat(64))
+        };
+        let (client, server) = http_fixture(
+            vec![
+                fixture.session_response(&changed),
+                fixture.location_response(),
+            ],
+            "GET",
+        )
+        .await;
+        let error = client
+            .reconcile_open(&fixture.saved_intent("agent.open"), &fixture.options)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "NATIVE_EVIDENCE_UNAVAILABLE", "marker {field}");
+        assert_eq!(server.await.unwrap(), vec![Value::Null; 2]);
+    }
+}
+
+#[tokio::test]
+async fn native_071_empty_root_fallback_requires_a_complete_scoped_well_formed_sync() {
+    let fixture = RootReadbackFixture::new(true);
+    let mut invalid = vec![
+        (fixture.raw_root_log(String::new()), "NATIVE_LOG_NOT_SYNCED"),
+        (
+            fixture.raw_root_log("event: message\ndata: {\n\n".into()),
+            "NATIVE_LOG_SCHEMA",
+        ),
+        (
+            fixture.raw_root_log(format!(
+                "event: message\ndata: {}\n\n",
+                json!({"type":"log.synced","aggregateID":"ses_foreign","seq":0})
+            )),
+            "NATIVE_LOG_WATERMARK_SCOPE",
+        ),
+    ];
+    for sequence in [
+        Value::Null,
+        json!(-1),
+        json!(0.5),
+        json!("0"),
+        json!(9_007_199_254_740_992_u64),
+    ] {
+        invalid.push((
+            fixture.raw_root_log(format!(
+                "event: message\ndata: {}\n\n",
+                json!({"type":"log.synced","aggregateID":fixture.root,"seq":sequence})
+            )),
+            "NATIVE_LOG_WATERMARK_REGRESSED",
+        ));
+    }
+    // A watermark cannot hide a truncated HTTP tail, even after it was parsed.
+    let mut truncated = fixture.empty_log(true);
+    truncated["truncate_body"] = json!(true);
+    invalid.push((truncated, "NATIVE_LOG_STREAM_INCOMPLETE"));
+    let mut truncated_sync =
+        fixture.raw_root_log("event: message\ndata: {\"type\":\"log.synced\"".into());
+    truncated_sync["truncate_body"] = json!(true);
+    invalid.push((truncated_sync, "NATIVE_LOG_STREAM_INCOMPLETE"));
+    let sync = json!({"type":"log.synced","aggregateID":fixture.root,"seq":0});
+    invalid.push((
+        fixture.raw_root_log(format!(
+            "event: message\ndata: {sync}\n\nevent: message\ndata: {sync}\n\n"
+        )),
+        "NATIVE_LOG_AFTER_WATERMARK",
+    ));
+    let mut foreign = root_event();
+    foreign["data"]["sessionID"] = json!("ses_foreign");
+    foreign["durable"]["aggregateID"] = json!("ses_foreign");
+    invalid.push((
+        fixture.raw_root_log(format!("event: message\ndata: {foreign}\n\n")),
+        "NATIVE_LOG_SCOPE",
+    ));
+    let mut renamed = root_event();
+    renamed["type"] = json!("session.renamed");
+    renamed["durable"]["aggregateID"] = json!(fixture.root);
+    renamed["data"] = json!({"sessionID":fixture.root,"title":"Retained non-creation event"});
+    invalid.push((
+        fixture.raw_root_log(format!(
+            "event: message\ndata: {renamed}\n\nevent: message\ndata: {sync}\n\n"
+        )),
+        "NATIVE_LOG_ORIGIN",
+    ));
+    for (response, expected) in invalid {
+        let (client, server) = http_fixture(vec![response], "GET").await;
+        let error = client
+            .require_durable_root_creation_inner(
+                &fixture.root,
+                &fixture.options,
+                &fixture.command.binding_id,
+                1,
+                &serde_json::to_value(&fixture.options.model).unwrap(),
+                Some(&marker(&fixture.command)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, expected);
+        assert_eq!(server.await.unwrap(), vec![Value::Null]);
+    }
+}
+
+#[tokio::test]
+async fn native_071_nonempty_root_log_still_requires_a_numeric_sync_sequence() {
+    let fixture = RootReadbackFixture::new(true);
+    let mut created = root_event();
+    created["durable"]["aggregateID"] = json!(fixture.root);
+    created["data"]["sessionID"] = json!(fixture.root);
+    created["data"]["metadata"] = fixture.session["metadata"].clone();
+    created["data"]["model"] = fixture.session["model"].clone();
+    created["data"]["location"] = fixture.location.clone();
+    let sync = json!({"type":"log.synced","aggregateID":fixture.root});
+    let response = fixture.raw_root_log(format!(
+        "event: message\ndata: {created}\n\nevent: message\ndata: {sync}\n\n"
+    ));
+    let (client, server) = http_fixture(vec![response], "GET").await;
+    let error = client
+        .require_durable_root_creation_inner(
+            &fixture.root,
+            &fixture.options,
+            &fixture.command.binding_id,
+            1,
+            &serde_json::to_value(&fixture.options.model).unwrap(),
+            Some(&marker(&fixture.command)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "NATIVE_LOG_WATERMARK_REGRESSED");
+    assert_eq!(server.await.unwrap(), vec![Value::Null]);
+}
+
+#[tokio::test]
+async fn native_071_history_pages_never_accept_a_missing_sync_sequence() {
+    for (events, after) in [(vec![], 0), (vec![], 7), (vec![root_event()], 0)] {
+        let mut stream = events
+            .iter()
+            .map(|event| format!("event: message\ndata: {event}\n\n"))
+            .collect::<String>();
+        stream.push_str(
+            "event: message\ndata: {\"type\":\"log.synced\",\"aggregateID\":\"ses_swarm_fixture\"}\n\n",
+        );
+        let (client, server) = http_fixture(
+            vec![json!({
+                "json_path":format!("/api/experimental/session/ses_swarm_fixture/log?after={after}&follow=false"),
+                "raw_stream":stream
+            })],
+            "GET",
+        )
+        .await;
+        let error = client
+            .session_log_page("ses_swarm_fixture", after, 100)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "NATIVE_HISTORY_GAP");
+        assert_eq!(server.await.unwrap(), vec![Value::Null]);
+    }
+}
+
+#[tokio::test]
+async fn native_071_empty_root_readback_never_proves_input_admission_or_send_completion() {
+    let fixture = RootReadbackFixture::new(false);
+    for method in ["task.dispatch", "agent.send"] {
+        let intent = fixture.saved_intent(method);
+        let mut history = log_response(vec![], 0);
+        history["log_session"] = json!(fixture.root);
+        history["sync_aggregate"] = json!(fixture.root);
+        let (client, server) = http_fixture(vec![history.clone()], "GET").await;
+        let evidence = client
+            .read_input_history(
+                &fixture.root,
+                intent.native_input_id.as_deref().unwrap(),
+                &intent,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(evidence.admitted_sequence.is_none());
+        assert!(evidence.prompted_sequence.is_none());
+        assert_eq!(server.await.unwrap(), vec![Value::Null]);
+        for input_status in [false, true] {
+            let (client, server) = http_fixture(
+                vec![
+                    fixture.session_response(&fixture.session),
+                    fixture.location_response(),
+                    fixture.empty_log(true),
+                    fixture.session_response(&fixture.session),
+                    fixture.location_response(),
+                    history.clone(),
+                ],
+                "GET",
+            )
+            .await;
+            let result = if input_status {
+                client
+                    .read_input_status(&intent, &fixture.options)
+                    .await
+                    .map(|_| ())
+            } else {
+                client
+                    .reconcile_input(&intent, &fixture.options)
+                    .await
+                    .map(|_| ())
+            };
+            assert_eq!(
+                result.unwrap_err().code,
+                "NATIVE_EVIDENCE_UNAVAILABLE",
+                "{method}, input_status={input_status}"
+            );
+            assert_eq!(server.await.unwrap(), vec![Value::Null; 6]);
+        }
     }
 }
 

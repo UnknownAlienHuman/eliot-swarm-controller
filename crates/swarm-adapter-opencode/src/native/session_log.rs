@@ -29,14 +29,26 @@ pub(super) fn validate_durable_event(value: &Value) -> Result<()> {
     validate_wire(value, "Session.Event.Durable", &VALIDATOR)
 }
 
-pub(super) fn log_sync_matches(value: &Value, session: &str, last: u64) -> bool {
-    exact_fields(value, &["type", "aggregateID", "seq"], &[])
+pub(super) fn log_sync_matches(value: &Value, session: &str, last: Option<u64>) -> bool {
+    let watermark_covers_page = match (last, value.get("seq")) {
+        (Some(last), Some(sequence)) => sequence
+            .as_u64()
+            .is_some_and(|sequence| sequence >= last && sequence <= 9_007_199_254_740_991),
+        (Some(_), None) => false,
+        (None, Some(sequence)) => sequence
+            .as_u64()
+            .is_some_and(|sequence| sequence <= 9_007_199_254_740_991),
+        (None, None) => true,
+    };
+    exact_fields(value, &["type", "aggregateID"], &["seq"])
         && value["type"] == "log.synced"
         && value["aggregateID"] == session
         // The native session reader filters the aggregate bus. Other durable
         // event types occupy sequence numbers, including after the last
         // visible session event. SDK Bus.log captures the aggregate watermark.
-        && value["seq"].as_u64().is_some_and(|sequence| sequence >= last && sequence <= 9_007_199_254_740_991)
+        // A page with no visible session events may still have an aggregate
+        // watermark (or an empty watermark with no seq).
+        && watermark_covers_page
 }
 
 impl NativeClient {
@@ -129,7 +141,7 @@ impl NativeClient {
             let value: Value = serde_json::from_str(&item.data)
                 .map_err(|_| Error::new("NATIVE_HISTORY_SCHEMA", "native log item is not JSON"))?;
             if value["type"] == "log.synced" {
-                if !log_sync_matches(&value, session, last) {
+                if !log_sync_matches(&value, session, Some(last)) {
                     return Err(Error::new(
                         "NATIVE_HISTORY_GAP",
                         "native log watermark does not cover this exact page",

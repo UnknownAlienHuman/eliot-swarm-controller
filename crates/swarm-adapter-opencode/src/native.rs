@@ -296,7 +296,7 @@ impl NativeClient {
             ));
         }
         self.verify_binding_model(root, options, command).await?;
-        self.require_durable_root_creation(root, command, options)
+        self.require_durable_root_creation(root, command, options, None)
             .await?;
         let text = prompt(command)?;
         let request = input_payload(command, &input_id(&command.operation_id), &text)?;
@@ -316,10 +316,11 @@ impl NativeClient {
         root: &str,
         location: Value,
     ) -> Result<()> {
+        let root_marker = marker(command);
         let mut body = json!({
             "id":root,
             "location":location,
-            "metadata":{"eliot":marker(command)}
+            "metadata":{"eliot":root_marker.clone()}
         });
         if let Some(model) = options.model.as_ref() {
             body["model"] = serde_json::to_value(model)?;
@@ -337,7 +338,7 @@ impl NativeClient {
                 "session creation response did not prove exact identity",
             ));
         }
-        self.require_durable_root_creation(root, command, options)
+        self.require_durable_root_creation(root, command, options, Some(&root_marker))
             .await
     }
 
@@ -920,7 +921,7 @@ impl NativeClient {
             ));
         }
         self.verify_binding_model(root, options, command).await?;
-        self.require_durable_root_creation(root, command, options)
+        self.require_durable_root_creation(root, command, options, None)
             .await?;
 
         let mut current = target.to_owned();
@@ -1130,13 +1131,16 @@ impl NativeClient {
         root: &str,
         command: &RuntimeCommand,
         options: &NativeOptions,
+        expected_marker: Option<&Value>,
     ) -> Result<()> {
         let model = serde_json::to_value(&options.model)?;
         self.require_durable_root_creation_inner(
             root,
+            options,
             &command.binding_id,
             command.generation,
             &model,
+            expected_marker,
         )
         .await
     }
@@ -1148,11 +1152,15 @@ impl NativeClient {
         options: &NativeOptions,
     ) -> Result<()> {
         let model = serde_json::to_value(&options.model)?;
+        // Later input intents carry their own operation marker. Open
+        // reconciliation validates the full creation marker before this call.
         self.require_durable_root_creation_inner(
             root,
+            options,
             &intent.binding_id,
             intent.generation,
             &model,
+            None,
         )
         .await
     }
@@ -1160,9 +1168,11 @@ impl NativeClient {
     async fn require_durable_root_creation_inner(
         &self,
         root: &str,
+        options: &NativeOptions,
         binding: &str,
         generation: i64,
         model: &Value,
+        expected_marker: Option<&Value>,
     ) -> Result<()> {
         let expected = format!(
             "ses_swarm_{}",
@@ -1258,9 +1268,7 @@ impl NativeClient {
                         "native log watermark names another session",
                     ));
                 }
-                if last_sequence
-                    .is_none_or(|last| !session_log::log_sync_matches(&value, root, last))
-                {
+                if !session_log::log_sync_matches(&value, root, last_sequence) {
                     return Err(Error::new(
                         "NATIVE_LOG_WATERMARK_REGRESSED",
                         "native log watermark does not cover root creation",
@@ -1347,10 +1355,31 @@ impl NativeClient {
             ));
         }
         if !created {
-            return Err(Error::new(
-                "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE",
-                "exact native root has no retained session.created event",
-            ));
+            if count != 0 {
+                return Err(Error::new(
+                    "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE",
+                    "native root log omitted its creation event",
+                ));
+            }
+            let session = self.session(root).await?;
+            let location = self.location(options).await?;
+            if !session_identity_matches(&session, root, options, &location, binding, generation)
+                || expected_marker.is_some_and(|expected| {
+                    session
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("eliot"))
+                        != Some(expected)
+                })
+            {
+                return Err(Error::new(
+                    "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE",
+                    "exact session readback does not prove this binding's root",
+                ));
+            }
+            // Session.get is a durable projection of Session.create. It can
+            // prove this exact root only after the complete, scoped log page
+            // synchronized without any visible durable session events.
+            return Ok(());
         }
         Ok(())
     }
