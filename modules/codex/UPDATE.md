@@ -12,14 +12,14 @@
 | License | Apache-2.0 (`vendor_bridge/LICENSE`) |
 | Legacy Python bridge artifact | `codex-sdk-18194bf-bridge.3` |
 | Standalone Rust artifact | `codex-rust-controller.1` |
-| Standalone Rust descriptor version | `6` (current; v1–v5 remain historical contracts) |
+| Standalone Rust descriptor version | `11` (current; prior versions remain historical contracts) |
 | Standalone Rust package / binary | `swarm-adapter-codex` / `swarm-codex-adapter` |
 | Standalone Rust source | `crates/swarm-adapter-codex` |
 | Runtime dependencies | exact pins in `requirements.txt` |
 
 The donor and bridge.2/bridge.3 sections below describe only the legacy Python
 bridge artifact `.3` under `modules/codex`. The standalone Rust artifact
-`.1`, current descriptor version `6`, is a separate package and does not vendor
+`.1`, current descriptor version `11`, is a separate package and does not vendor
 or update this Python SDK unit.
 
 ## Legacy Python bridge artifact `.3`: ELIOT-owned changes in bridge.2
@@ -61,15 +61,17 @@ remains `openai-codex-cli-bin==0.153.4`. The
 [security patch record](VENDOR-SECURITY-PATCHES.md) retains the original and
 patched hashes; `verify_vendor.py` checks the complete patched unit.
 
-## Standalone Rust controller artifact `.1`, current descriptor version `6`
+## Standalone Rust controller artifact `.1`, current descriptor version `11`
 
 The Rust adapter is separate from the legacy Python bridge and is sourced from
 `crates/swarm-adapter-codex`, with artifact `codex-rust-controller.1` and
-descriptor version `6`. It retains the v4 normalized dispatch/result schema
+descriptor version `11`. It retains the v4 normalized dispatch/result schema
 pair, adds TaskPrompt v1 and Goal continuation admission/terminal evidence
 schemas, and uses the exact route contract `runtime = "codex"`,
 `workspace_option = "workspaceRoot"`, and native options `modelProvider`,
-`model`, and `workspaceRoot`. Provider/model values must be actual native
+`model`, and `workspaceRoot`. Model and provider overrides are independently
+optional: omitted values inherit the native harness settings, while explicit
+values are verified against native readback. Provider/model values must be actual native
 Codex options; proxy or delegation IDs are not interchangeable. The selector
 remains:
 
@@ -77,10 +79,13 @@ remains:
 {"kind":"codex_assistant_result","input_operation_id":"<exact task.dispatch operation ID>"}
 ```
 
+The current controller retains the v6 result boundary described below; the
+descriptor version change does not add child-history or tool-item projection.
+
 The v6 result path retains the v4 scope: it reads one root-thread final
 assistant response for the Store-sealed target `task.dispatch` Operation. It verifies the unique native
 user item, the exact root turn and completed status, then selects the final
-assistant response. The current v6 adapter does not enumerate child threads,
+assistant response. The v6 result path does not enumerate child threads,
 verify
 `parentThreadId` or `subAgentActivity`, project child history, or retain
 allowlisted tool-call items. The legacy `.3` child/history/tool behavior above
