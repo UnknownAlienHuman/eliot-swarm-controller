@@ -127,6 +127,32 @@ fn seed_retained_decision(
         "proposal_revision_id": REVISION_ID,
         "decision_operation_id": OPERATION_ID,
     });
+    // Seed the referenced Task and Attempt before the Operation. This private
+    // SQL fixture has no Store lifecycle to create them.
+    db.execute(
+        "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES(?1,?1,1,'open','{}',1,1)",
+        params![TASK_ID],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,state,created_at_ms,updated_at_ms) VALUES(?1,?2,1,'{}',?3,'controller','reserved',1,1)",
+        params![ATTEMPT_ID, TASK_ID, OWNER_ID],
+    )
+    .unwrap();
+    // observations.operation_id is a foreign key. Create its parent in a
+    // nonterminal state, then settle it with the result that names the child.
+    db.execute(
+        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,native_refs_json,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'{}','{}',?5,?6,'queued','{}',NULL,1,NULL,1,1)",
+        params![
+            OPERATION_ID,
+            OWNER_ID,
+            "contract-decision-req-1",
+            method,
+            TASK_ID,
+            ATTEMPT_ID,
+        ],
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
         params![
@@ -156,19 +182,14 @@ fn seed_retained_decision(
         "model_work_started": false,
         "native_execution": false,
     });
-    db.execute(
-        "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,native_refs_json,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'{}','{}',?5,?6,'settled','{}',?7,1,2,1,2)",
-        params![
-            OPERATION_ID,
-            OWNER_ID,
-            "contract-decision-req-1",
-            method,
-            TASK_ID,
-            ATTEMPT_ID,
-            model::canonical(&result).unwrap(),
-        ],
-    )
-    .unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE operations SET state='settled',result_json=?1,settled_at_ms=2,updated_at_ms=2 WHERE operation_id=?2 AND state='queued'",
+            params![model::canonical(&result).unwrap(), OPERATION_ID],
+        )
+        .unwrap(),
+        1
+    );
     let retained = json!({
         "schema_version": 1,
         "record_type": "contract_decision",
