@@ -1,5 +1,16 @@
 # Host startup and failure readback
 
+A superseded, reserved launch with no admitted native work may resolve its
+unknown workspace effect through the existing fenced Git readback. The exact
+path, branch and worktree must all be absent; current Operator roots must
+reconstruct the original reservation, and the Store rechecks the same actor,
+Task, Attempt, registration and Operation snapshot before committing the result.
+The result is blocked with `workspace_absent_after_readback`, never successful.
+It records current absence and preserves the first failure and the prior unknown
+result; it does not assert that the workspace never existed. Ordinary explicit
+Attempt release and lease reconciliation then apply. A present resource, pending
+Git custody, native linkage or changed snapshot keeps the launch unresolved.
+
 The controller records a lifecycle receipt in its existing Store after acquiring the exclusive data-directory lock. Startup records `starting`; binding the IPC endpoint records `running`. Graceful shutdown drains admitted work before recording `stopped`. A failed supervisor or startup records `failed` with a bounded controller error code. Diagnostic receipts contain no native response body, credential or raw error message.
 
 `host.status.host_lifecycle` returns the current receipt, the last exit and the latest failure. A later graceful exit updates `last_exit` but retains `latest_failure`; it does not acknowledge or erase the earlier failure. Failure history is factual, and does not block normal work. After a new host acquires the same exclusive lock, a previous `starting` or `running` marker produces `HOST_INTERRUPTED`. This proves that the earlier host did not record its exit; the cause remains unknown. The receipt belongs to the controller's host epoch and survives loss of a manager chat. A malformed optional lifecycle receipt produces a safe diagnostic without hiding the rest of host status. Database failures remain errors.

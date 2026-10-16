@@ -1283,6 +1283,12 @@ impl Store {
                 .run(move |db| launcher::launch_reconciliation_snapshot(db, &before_id))
                 .await?;
             'candidate: {
+                if self
+                    .reconcile_absent_workspace_launch(&operation_id)
+                    .await?
+                {
+                    break 'candidate;
+                }
                 let config = self.config.clone();
                 let intent = operation_id.clone();
                 let prepared = self.run(move |db| {

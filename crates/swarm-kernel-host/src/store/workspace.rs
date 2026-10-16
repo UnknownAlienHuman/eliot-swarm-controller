@@ -17,6 +17,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf, Prefix};
 
+pub(super) mod absence;
+
 const MAX_PENDING_LEASES: usize = 32;
 const MAX_ACTIVE_SCOPE_ROWS: i64 = 257;
 
@@ -1363,7 +1365,7 @@ fn unknown_workspace_operation_snapshot(
     if method != "swarm.launch"
         || state != "outcome_unknown"
         || task_id.as_deref() != Some(lease.task_id.as_str())
-        || attempt_id.is_some()
+        || attempt_id != lease.attempt_id
         || binding_id.is_some()
         || binding_generation.is_some()
         || original_raw.len() > 1_048_576
@@ -1399,7 +1401,7 @@ fn unknown_workspace_operation_snapshot(
         || manifest["task"]["project_id"] != lease.project_id
         || manifest["task"]["expected_revision"] != lease.task_revision
         || manifest["task"]["observed_revision"] != lease.task_revision
-        || !manifest["task"]["attempt_id"].is_null()
+        || manifest["task"]["attempt_id"] != json!(lease.attempt_id)
         || actor["client_id"] != caller_id
         || owner != Some(lease.owner_client_id.as_str())
         || manifest["failure"]["code"] != "workspace_effect_unknown"
@@ -1410,7 +1412,7 @@ fn unknown_workspace_operation_snapshot(
         || result["plan_digest"] != lease.plan_digest
         || result["task_id"] != lease.task_id
         || result["task_revision"] != lease.task_revision
-        || !result["attempt_id"].is_null()
+        || result["attempt_id"] != json!(lease.attempt_id)
         || result["native_effect"] != "unknown"
         || result["failure"]["code"] != "workspace_effect_unknown"
     {
@@ -1425,7 +1427,7 @@ fn unknown_workspace_operation_snapshot(
         "plan_digest":lease.plan_digest,
         "task_id":lease.task_id,
         "task_revision":lease.task_revision,
-        "attempt_id":Value::Null,
+        "attempt_id":lease.attempt_id,
         "binding_id":Value::Null,
         "binding_generation":Value::Null,
         "failure_code":"workspace_effect_unknown",

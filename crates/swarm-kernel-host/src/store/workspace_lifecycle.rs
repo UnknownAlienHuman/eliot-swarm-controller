@@ -243,11 +243,14 @@ fn candidates(
              )
            )
            OR (l.state='stale' AND l.attempt_id IS NOT NULL
-             AND COALESCE(
+             AND (COALESCE(
                json_extract(l.clean_state_json,'$.prior_lease_state'),
                json_extract(l.clean_state_json,'$.lease_lifecycle.latest.prior_lease_state'),
                json_extract(l.clean_state_json,'$.lease_lifecycle.prior_lease_state')
              ) IN ('held','preparing')
+               OR CASE WHEN json_valid(l.clean_state_json) THEN
+                 json_extract(l.clean_state_json,'$.status')='workspace_absence_verified'
+               ELSE 0 END)
              AND EXISTS (
              SELECT 1 FROM attempts a
              WHERE a.attempt_id=l.attempt_id AND a.task_id=l.task_id
@@ -465,6 +468,14 @@ fn closed_launch_has_no_native_effect(
     tx: &Transaction<'_>,
     lease: &LeaseCandidate,
 ) -> Result<bool> {
+    if super::workspace::absence::lease_has_absence_resolution(
+        tx,
+        &lease.lease_id,
+        lease.generation,
+        &lease.binding_digest,
+    )? {
+        return Ok(true);
+    }
     let Some(launch) = tx.query_row(
         "SELECT client_request_id,task_id,state,attempt_id,binding_id,binding_generation,
                 CASE WHEN length(CAST(original_request_json AS BLOB))<=1048576 THEN original_request_json ELSE '' END,

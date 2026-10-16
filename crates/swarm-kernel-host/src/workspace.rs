@@ -643,6 +643,129 @@ pub(crate) fn reconcile_workspace(
     })
 }
 
+/// Positive, current absence evidence. Only the fenced native Git reader can
+/// construct it; absence never asserts that a worktree did not exist earlier.
+pub(crate) struct WorkspaceAbsenceEvidence {
+    registration_digest: String,
+    lease_id: String,
+    generation: i64,
+    intent_digest: String,
+    workspace_path: PathBuf,
+    source_head: String,
+}
+
+impl WorkspaceAbsenceEvidence {
+    pub(crate) fn readback(
+        &self,
+        registration: &WorkspaceRegistration,
+        reservation: &LeaseReservation,
+    ) -> Result<Value> {
+        if self.registration_digest != registration.registration_digest
+            || self.lease_id != reservation.lease_id
+            || self.generation != reservation.generation
+            || self.intent_digest != reservation.intent_digest
+            || self.workspace_path != reservation.workspace_path
+        {
+            return Err(Error::new(
+                "WORKSPACE_EVIDENCE_MISMATCH",
+                "absence readback identity changed",
+            ));
+        }
+        Ok(json!({
+            "schema_version":1,
+            "kind":"workspace_absence_readback",
+            "lease_id":self.lease_id,
+            "lease_generation":self.generation,
+            "intent_digest":self.intent_digest,
+            "registration_digest":self.registration_digest,
+            "registration_id":reservation.registration_id,
+            "registration_generation":reservation.registration_generation,
+            "project_id":reservation.project_id,
+            "owner_client_id":reservation.owner_client_id,
+            "branch_ref":reservation.branch_ref,
+            "worktree_handle":reservation.worktree_handle,
+            "allowed_paths":reservation.allowed_paths,
+            "allowed_symbols":reservation.allowed_symbols,
+            "workspace_path_sha256":model::digest(path_string(&self.workspace_path)?.as_bytes()),
+            "source_head":self.source_head,
+            "path_absent":true,
+            "branch_absent":true,
+            "worktree_absent":true,
+            "historical_filesystem_effect":"unknown",
+        }))
+    }
+}
+
+/// Called only inside the existing exact-branch workspace_git_io lane. Any
+/// inspection failure remains unknown, including native Git output truncation.
+pub(crate) fn read_absent_workspace(
+    git: &mut ForgeGitRun,
+    forge_config: &ForgeConfig,
+    forge_project: &ForgeProject,
+    registration: &WorkspaceRegistration,
+    reservation: &LeaseReservation,
+    plan: &WorkspaceLeasePlan,
+) -> Result<WorkspaceAbsenceEvidence> {
+    plan.validate()?;
+    verify_registration_binding(registration, plan.project_id.as_str())?;
+    verify_reservation_binding(registration, reservation, plan)?;
+    verify_trusted_repository(git, forge_config, forge_project, registration)?;
+    let source_head = current_head(git, forge_config, forge_project)?;
+    let inspect = |git: &mut ForgeGitRun| -> Result<(String, String)> {
+        ensure_path_absent(reservation.workspace_path())?;
+        let refs = git_text(
+            git,
+            forge_config,
+            forge_project,
+            &[
+                "for-each-ref".into(),
+                "--format=%(refname)".into(),
+                "--".into(),
+                reservation.branch_ref.clone(),
+            ],
+        )?;
+        let worktrees = git_text(
+            git,
+            forge_config,
+            forge_project,
+            &["worktree".into(), "list".into(), "--porcelain".into()],
+        )?;
+        let expected_path = path_key(reservation.workspace_path());
+        let expected_branch = format!("branch {}", reservation.branch_ref);
+        if refs.lines().any(|line| line == reservation.branch_ref)
+            || worktrees.lines().any(|line| {
+                line == expected_branch
+                    || line
+                        .strip_prefix("worktree ")
+                        .is_some_and(|path| path_key(Path::new(path)) == expected_path)
+            })
+        {
+            return Err(Error::new(
+                "WORKSPACE_PATH_CONFLICT",
+                "reserved Git resource is still present",
+            ));
+        }
+        ensure_path_absent(reservation.workspace_path())?;
+        Ok((refs, worktrees))
+    };
+    let before = inspect(git)?;
+    verify_trusted_repository(git, forge_config, forge_project, registration)?;
+    if current_head(git, forge_config, forge_project)? != source_head || inspect(git)? != before {
+        return Err(Error::new(
+            "WORKSPACE_BASELINE_CHANGED",
+            "repository changed during absence readback",
+        ));
+    }
+    Ok(WorkspaceAbsenceEvidence {
+        registration_digest: registration.registration_digest.clone(),
+        lease_id: reservation.lease_id.clone(),
+        generation: reservation.generation,
+        intent_digest: reservation.intent_digest.clone(),
+        workspace_path: reservation.workspace_path.clone(),
+        source_head,
+    })
+}
+
 pub(crate) fn final_binding_digest(evidence: &LeaseEvidence) -> Result<String> {
     let canonical = model::canonical(&json!({
         "lease_id":evidence.lease_id,

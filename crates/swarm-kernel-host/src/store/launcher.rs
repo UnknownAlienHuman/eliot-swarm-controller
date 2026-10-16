@@ -393,7 +393,7 @@ impl LaunchActor {
     /// Permit only exact unknown workspace readback under a separate
     /// successor-GM capability. This never authorizes queued work or a new
     /// native effect; direct actors retain their ordinary current check.
-    fn require_workspace_readback_authority(
+    pub(super) fn require_workspace_readback_authority(
         &self,
         db: &Connection,
         operation_id: &str,
@@ -4024,6 +4024,70 @@ pub(crate) fn launch_actor(db: &Connection, operation_id: &str) -> Result<Launch
     let attempt_id = manifest["task"]["attempt_id"].as_str();
     actor.require_action_object(db, "swarm.launch", task_id, task_revision, attempt_id)?;
     Ok(actor)
+}
+
+/// Historical readback authority grants no queued effect or stale Task action.
+pub(super) fn workspace_readback_actor(db: &Connection, operation_id: &str) -> Result<LaunchActor> {
+    let (operation, manifest, actor) = retained_launch_actor(db, operation_id)?;
+    if operation["state"] != "outcome_unknown"
+        || operation["binding_id"].is_string()
+        || manifest["state"] != "outcome_unknown"
+        || manifest["failure"]["code"] != "workspace_effect_unknown"
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "launch is not an unknown pre-native workspace effect",
+        ));
+    }
+    actor.require_workspace_readback_authority(db, operation_id)?;
+    Ok(actor)
+}
+
+pub(super) fn settle_absent_workspace(
+    tx: &Transaction<'_>,
+    operation_id: &str,
+    readback: Value,
+    now: i64,
+) -> Result<Value> {
+    // The Store proof gate has rechecked the exact snapshot under this same
+    // transaction. Do not expose this result as a generic failure-code route.
+    let operation = super::operations::get_operation(tx, operation_id)?;
+    let mut manifest = retained_launch_manifest(tx, operation_id)?;
+    if operation["state"] != "outcome_unknown"
+        || operation["binding_id"].is_string()
+        || manifest["failure"]["code"] != "workspace_effect_unknown"
+        || readback["kind"] != "workspace_absence_readback"
+    {
+        return Err(Error::new(
+            "STALE_LAUNCH",
+            "absence settlement lost its exact unknown launch",
+        ));
+    }
+    manifest["workspace_absence_readback"] = readback.clone();
+    manifest["workspace_failure_before_absence_readback"] = operation["result"].clone();
+    manifest["state"] = json!("blocked");
+    manifest["failure"] = json!({"code":"workspace_absent_after_readback"});
+    manifest["runtime"]["native_effect"] = json!("not_attempted");
+    manifest["progress"]["workspace_lease"] = json!("stopped");
+    let mut result = operation["result"].clone();
+    result["state"] = json!("settled");
+    result["launch_state"] = json!("blocked");
+    result["failure"] = manifest["failure"].clone();
+    result["native_effect"] = json!("not_attempted");
+    result["workspace_absence_readback"] = readback;
+    persist_launch_progress(
+        tx,
+        operation_id,
+        LaunchProgress {
+            attempt_id: result["attempt_id"].as_str(),
+            manifest,
+            result: &result,
+            operation_state: "settled",
+            binding: None,
+            now,
+        },
+    )?;
+    Ok(result)
 }
 
 /// Rehydrate an actor only for the bound, ready dispatch stage. The ordinary
