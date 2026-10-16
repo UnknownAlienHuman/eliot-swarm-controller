@@ -6446,6 +6446,302 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_production_control_keeps_prompt_on_permission_cancel_unknown()
+    -> super::Result<()> {
+        let state = TestState::new()?;
+        let (dispatch_command, _) = task_prompt_fixture()?;
+        let session_id = SessionId::new("session-production-cancel-unknown-fixture");
+        let session = super::ActiveSession {
+            id: session_id.clone(),
+            owner_operation_id: dispatch_command.operation_id.clone(),
+            workspace: std::env::temp_dir(),
+            requested_model: Some("fixture-model".to_owned()),
+            effective_model: Some("fixture-model".to_owned()),
+            requested_effort: None,
+            effective_effort: None,
+            requested_mode: None,
+            effective_mode: None,
+            close_supported: true,
+            closed: false,
+        };
+        let exact_cancel = || {
+            let mut command = permission_reply_command();
+            command.method = "native.command.cancel_turn".to_owned();
+            command.binding_id = dispatch_command.binding_id.clone();
+            command.generation = dispatch_command.generation;
+            command.route = dispatch_command.route.clone();
+            command.native_root_id = Some(session_id.to_string());
+            command.input = json!({
+                "session_id": session_id,
+                "target_operation_id": dispatch_command.operation_id,
+                "turn_id": dispatch_command.operation_id
+            });
+            let input_bytes = serde_json::to_vec(&command.input).expect("cancel input serializes");
+            command.input_sha256 = Some(digest(input_bytes.as_slice()));
+            command
+        };
+        let first_cancel = exact_cancel();
+        let retry_cancel = exact_cancel();
+        let maybe_written_cancel = exact_cancel();
+        let request_id = json!("permission-request-production-unknown");
+        let key = serde_json::to_string(&request_id)?;
+        let fingerprint = digest(b"permission response may have been written");
+        let permissions: super::PermissionBroker =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (permission_reply, _permission_response) = tokio::sync::oneshot::channel();
+        let (acknowledgement_sender, acknowledgement) = tokio::sync::oneshot::channel();
+        acknowledgement_sender
+            .send(false)
+            .expect("fixture reports permission response not written");
+        permissions.lock().expect("permission broker lock").insert(
+            key.clone(),
+            super::PendingPermission {
+                session_id: session_id.to_string(),
+                request_id,
+                fingerprint,
+                options: Vec::new(),
+                reply: permission_reply,
+                acknowledgement,
+            },
+        );
+        let fake_host_dir =
+            std::env::temp_dir().join(format!("swarm-acp-fake-store-{}", Uuid::new_v4()));
+        fs::create_dir_all(&fake_host_dir)?;
+        let mut fake_listener = swarm_kernel_host::ipc::Listener::bind(&fake_host_dir)
+            .map_err(|_| super::invalid("fake Store IPC bind failed"))?;
+        let fake_server = tokio::spawn(async move {
+            use futures::{SinkExt as _, StreamExt as _};
+            let Ok(stream) = fake_listener.accept().await else {
+                return;
+            };
+            let (read, write) = tokio::io::split(stream);
+            let mut reader = tokio_util::codec::FramedRead::new(
+                read,
+                tokio_util::codec::LinesCodec::new_with_max_length(1024 * 1024),
+            );
+            let mut writer = tokio_util::codec::FramedWrite::new(
+                write,
+                tokio_util::codec::LinesCodec::new_with_max_length(1024 * 1024),
+            );
+            while let Some(line) = reader.next().await {
+                let Ok(line) = line else {
+                    break;
+                };
+                let request: Value = serde_json::from_str(&line).unwrap_or(json!({}));
+                let id = request["id"].clone();
+                let reply = json!({"jsonrpc": "2.0", "id": id, "result": {}});
+                let Ok(encoded) = serde_json::to_string(&reply) else {
+                    break;
+                };
+                if writer.send(encoded).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let fake_credential = swarm_contracts::Credential {
+            client_id: "fake-store-client".to_owned(),
+            token: "fake-store-token".to_owned(),
+        };
+        let fake_ipc_config = swarm_client::IpcConfig::default();
+        let fake_module_link =
+            swarm_client::ModuleLink::connect(&fake_host_dir, &fake_credential, &fake_ipc_config)
+                .await?;
+        let mut descriptor_value: Value =
+            serde_json::from_str(include_str!("../../module-descriptor-acp.template.json"))
+                .expect("maintained ACP descriptor parses");
+        descriptor_value["enabled"] = json!(true);
+        descriptor_value["launch"]["executable"] =
+            json!(std::env::current_exe().expect("test executable path"));
+        descriptor_value["launch"]["argv"] = json!([]);
+        descriptor_value["launch"]["credential_ref"] =
+            json!("qualification:pr44-production-cancel-unknown");
+        let descriptor: swarm_contracts::module_catalog::ModuleDescriptor =
+            serde_json::from_value(descriptor_value).expect("ACP descriptor is typed");
+        let claim = swarm_contracts::module_contract::ModuleContractClaim::from_descriptor(
+            &descriptor,
+            swarm_contracts::module_contract::MODULE_PROTOCOL_V1,
+        )
+        .expect("descriptor yields claim");
+        let owner = super::super::Owner {
+            state_dir: state.state_dir.clone(),
+            token: "production-cancel-unknown-token".to_owned(),
+            record: json!({"version": 1, "token": "production-cancel-unknown-token"}),
+            host: crate::module_host::ModuleHostIdentity {
+                claim,
+                profile: crate::Profile::AcpV2,
+                boot_id: Uuid::new_v4().to_string(),
+                binding_id: dispatch_command.binding_id.clone(),
+                generation: dispatch_command.generation,
+                module_client_id: fake_credential.client_id.clone(),
+                credential_file: fake_host_dir.join("fake-credential.json"),
+            },
+        };
+        let config = super::super::Config {
+            module_artifact_id: crate::ACP_ARTIFACT_ID.to_owned(),
+            command: std::env::temp_dir().join("unused-production-cancel"),
+            command_args: Vec::new(),
+            mod_path: None,
+            run_timeout_ms: None,
+            host_connection: None,
+        };
+        let mut link = super::super::Link {
+            client: fake_module_link,
+            binding_id: dispatch_command.binding_id.clone(),
+            generation: dispatch_command.generation,
+            route: dispatch_command.route.clone(),
+            profile: crate::Profile::AcpV2,
+            recovery_required: false,
+        };
+        let (transport, mut peer) = Channel::duplex();
+        let dispatch_for_client = dispatch_command.clone();
+        let permissions_for_client = Arc::clone(&permissions);
+        let first_for_client = first_cancel.clone();
+        let retry_for_client = retry_cancel.clone();
+        let maybe_for_client = maybe_written_cancel.clone();
+        let prompt_session_id = session_id.clone();
+        let key_for_client = key.clone();
+        let journal_for_client = state.journal.clone();
+        let session_for_client = session.clone();
+        let capture_for_client: Arc<Mutex<super::Capture>> =
+            Arc::new(Mutex::new(super::Capture::default()));
+        let features_for_client = super::AgentFeatures {
+            close_supported: true,
+            load_session_supported: false,
+            agent_info: None,
+            capabilities: json!({}),
+        };
+        let client = Client.builder().connect_with(transport, async move |connection| {
+            let mut link = link;
+            let owner = owner;
+            let config = config;
+            let capture = capture_for_client;
+            let journal = journal_for_client;
+            let recovery = super::ModuleLinkRecovery { config: &config, credential: &fake_credential, owner: &owner, journal: &journal, capture: &capture };
+            let request = connection.send_request(super::PromptRequest::new(prompt_session_id, vec![ContentBlock::Text(TextContent::new("fixture-only"))])).block_task();
+            tokio::pin!(request);
+            let permission_wakeup = tokio::sync::Notify::new();
+            let observation_sequence = Arc::new(Mutex::new(1_u64));
+            let workspace_buf = std::env::temp_dir();
+            let model_string = "fixture-model".to_owned();
+            let mut session_state = Some(session_for_client);
+            let mut source = PromptControlsFixture { controls: vec![json!({"command": first_for_client}), json!({"command": retry_for_client})].into_iter().collect() };
+            let super::PromptEvent::Host(first_message) = super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup).await else { panic!("active prompt receives first cancel") };
+            let first_control: RuntimeCommand = serde_json::from_value(first_message["command"].clone()).expect("control is RuntimeCommand");
+            {
+                let mut context = super::CommandContext { connection: &connection, link: &mut link, recovery: &recovery, owner: &owner, journal: &journal, features: &features_for_client, session: &mut session_state, workspace: Some(workspace_buf.as_path()), model: Some(model_string.as_str()), capture: &capture, permissions: &permissions_for_client, permission_wakeup: &permission_wakeup, observation_sequence: &observation_sequence };
+                super::process_control_during_turn(&mut context, &dispatch_for_client, first_control.clone()).await.map_err(super::to_acp_error)?;
+                assert!(!context.link.recovery_required, "pre-notification permission uncertainty keeps link");
+                let (first_outcome, _) = context.journal.read_outcome(&first_control.operation_id).map_err(super::to_acp_error)?.expect("first Unknown published");
+                assert_eq!(first_outcome.outcome, EffectOutcome::Unknown);
+                let permission_effect = super::permission_cancel_effect_id(&key_for_client);
+                assert!(context.journal.read_effect(&first_control, &permission_effect, "intent").map_err(super::to_acp_error)?.is_some());
+                assert!(context.journal.read_effect(&first_control, &permission_effect, "receipt").map_err(super::to_acp_error)?.is_none());
+                assert!(context.journal.read_effect(&first_control, "session/cancel", "intent").map_err(super::to_acp_error)?.is_none());
+            }
+            let super::PromptEvent::Host(retry_message) = super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup).await else { panic!("same prompt stays active for retry") };
+            let retry_control: RuntimeCommand = serde_json::from_value(retry_message["command"].clone()).expect("retry is RuntimeCommand");
+            assert_eq!(retry_control.input["target_operation_id"], dispatch_for_client.operation_id);
+            {
+                let mut context = super::CommandContext { connection: &connection, link: &mut link, recovery: &recovery, owner: &owner, journal: &journal, features: &features_for_client, session: &mut session_state, workspace: Some(workspace_buf.as_path()), model: Some(model_string.as_str()), capture: &capture, permissions: &permissions_for_client, permission_wakeup: &permission_wakeup, observation_sequence: &observation_sequence };
+                super::process_control_during_turn(&mut context, &dispatch_for_client, retry_control.clone()).await.map_err(super::to_acp_error)?;
+                assert!(!context.link.recovery_required);
+                let (retry_outcome, _) = context.journal.read_outcome(&retry_control.operation_id).map_err(super::to_acp_error)?.expect("retry Applied published");
+                assert_eq!(retry_outcome.outcome, EffectOutcome::Applied);
+                assert_eq!(retry_outcome.details["cancel"], "notification_sent");
+                assert!(context.journal.read_effect(&retry_control, "session/cancel", "intent").map_err(super::to_acp_error)?.is_some());
+                assert!(context.journal.read_effect(&retry_control, "session/cancel", "receipt").map_err(super::to_acp_error)?.is_some());
+            }
+            {
+                let expected_intent = json!({"native_session_id": session_state.as_ref().expect("session open").id, "target_operation_id": dispatch_for_client.operation_id, "turn_id": dispatch_for_client.operation_id});
+                journal.record_effect(&maybe_for_client, "session/cancel", "intent", expected_intent).map_err(super::to_acp_error)?;
+                let mut context = super::CommandContext { connection: &connection, link: &mut link, recovery: &recovery, owner: &owner, journal: &journal, features: &features_for_client, session: &mut session_state, workspace: Some(workspace_buf.as_path()), model: Some(model_string.as_str()), capture: &capture, permissions: &permissions_for_client, permission_wakeup: &permission_wakeup, observation_sequence: &observation_sequence };
+                let fenced = match super::process_control_during_turn(&mut context, &dispatch_for_client, maybe_for_client.clone()).await { Err(error) => error, Ok(()) => return Err(super::to_acp_error(super::invalid("possibly written cancel replayed"))) };
+                assert_eq!(fenced.code, "ACP_CONTROL_EFFECT_UNKNOWN");
+                assert!(context.link.recovery_required, "other uncertainty retires link");
+                let (fenced_outcome, _) = context.journal.read_outcome(&maybe_for_client.operation_id).map_err(super::to_acp_error)?.expect("fenced Unknown published");
+                assert_eq!(fenced_outcome.outcome, EffectOutcome::Unknown);
+            }
+            Ok::<(), agent_client_protocol::Error>(())
+        });
+        let peer = async move {
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(prompt))) =
+                peer.rx.next().await
+            else {
+                panic!("fixture starts one prompt")
+            };
+            assert_eq!(prompt.method.as_ref(), "session/prompt");
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Notification(cancel))) =
+                peer.rx.next().await
+            else {
+                panic!("later exact cancel reaches native once")
+            };
+            assert_eq!(cancel.method.as_ref(), "session/cancel");
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("production fixture bounded")
+        .expect("production fixture succeeds");
+        fake_server.abort();
+        let _ = fs::remove_dir_all(&fake_host_dir);
+        let permission_effect = super::permission_cancel_effect_id(&key);
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, "session/cancel", "intent")?
+                .is_none()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, &permission_effect, "intent")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, &permission_effect, "receipt")?
+                .is_none()
+        );
+        let (first_saved, _) = state
+            .journal
+            .read_outcome(&first_cancel.operation_id)?
+            .expect("first Unknown readable");
+        assert_eq!(first_saved.outcome, EffectOutcome::Unknown);
+        assert!(
+            state
+                .journal
+                .read_effect(&retry_cancel, "session/cancel", "intent")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&retry_cancel, "session/cancel", "receipt")?
+                .is_some()
+        );
+        let (retry_saved, _) = state
+            .journal
+            .read_outcome(&retry_cancel.operation_id)?
+            .expect("retry Applied readable");
+        assert_eq!(retry_saved.outcome, EffectOutcome::Applied);
+        assert!(
+            state
+                .journal
+                .read_effect(&maybe_written_cancel, "session/cancel", "receipt")?
+                .is_none()
+        );
+        let (fenced_saved, _) = state
+            .journal
+            .read_outcome(&maybe_written_cancel.operation_id)?
+            .expect("fenced Unknown readable");
+        assert_eq!(fenced_saved.outcome, EffectOutcome::Unknown);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pr44_command_acp_family_stays_unknown_after_direct_child_exit() {
         let owner = tokio::process::Command::new(
             std::env::current_exe().expect("test executable path is available"),
