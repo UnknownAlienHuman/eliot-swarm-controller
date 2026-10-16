@@ -1071,8 +1071,11 @@ async fn run_owned_case(host_path: &Path, case: &Value) -> FixtureResult<CaseEvi
     if !canonical_native_directory.starts_with(&allowed_workspace_root)
         || canonical_native_directory == allowed_workspace_root
         || native_options.connection_file != native_base.join("connection.json")
-        || !native_options.model.as_ref().is_some_and(|model| model.id == "fixture-model"
-            && model.provider_id == "openai" && model.variant == "fixture-variant")
+        || !native_options.model.as_ref().is_some_and(|model| {
+            model.id == "fixture-model"
+                && model.provider_id == "openai"
+                && model.variant == "fixture-variant"
+        })
         || native_registration.version != FAKE_NATIVE_VERSION
     {
         return Err(
