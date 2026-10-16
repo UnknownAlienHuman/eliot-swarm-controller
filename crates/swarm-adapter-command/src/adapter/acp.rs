@@ -3657,6 +3657,7 @@ async fn process_control_during_turn(
     control: RuntimeCommand,
 ) -> Result<()> {
     context.journal.record_command(&control)?;
+    let mut keep_prompt_after_permission_cancel_unknown = false;
     let expected_native_root_id = context
         .session
         .as_ref()
@@ -3671,7 +3672,11 @@ async fn process_control_during_turn(
                 match cancel_active_turn(context, dispatch_command, &control).await {
                     Ok(outcome) => outcome,
                     Err(error) if is_uncertain_control_error(&error) => {
-                        context.link.recovery_required = true;
+                        keep_prompt_after_permission_cancel_unknown =
+                            is_pre_notification_permission_cancel_uncertain(&error);
+                        if !keep_prompt_after_permission_cancel_unknown {
+                            context.link.recovery_required = true;
+                        }
                         unknown_in_session(
                             &control,
                             context.session.as_ref().ok_or_else(|| {
@@ -3719,7 +3724,7 @@ async fn process_control_during_turn(
         .recovery
         .deliver_outcome(context.link, control, outcome)
         .await?;
-    if uncertain {
+    if uncertain && !keep_prompt_after_permission_cancel_unknown {
         return Err(Error::new(
             "ACP_CONTROL_EFFECT_UNKNOWN",
             "ACP control effect is uncertain; the exact native connection must be retired",
@@ -3803,11 +3808,8 @@ async fn cancel_active_turn_effect(
     if receipt.is_some() && intent.is_none() {
         return Err(invalid("ACP cancel receipt has no recorded intent"));
     }
-    if intent.is_none() {
-        journal.record_effect(control, "session/cancel", "intent", expected_effect)?;
-    }
-    cancel_pending_permissions(journal, permissions, control, &session.id).await?;
     if receipt.is_some() {
+        cancel_pending_permissions(journal, permissions, control, &session.id).await?;
         let mut outcome = applied_in_session(
             control,
             session,
@@ -3828,6 +3830,10 @@ async fn cancel_active_turn_effect(
             "ACP cancel intent exists without a confirmed receipt; notification will not be replayed",
         ));
     }
+    // Permission settlement is a pre-notification prerequisite. Keep its
+    // uncertainty separate from the session/cancel no-replay fence.
+    cancel_pending_permissions(journal, permissions, control, &session.id).await?;
+    journal.record_effect(control, "session/cancel", "intent", expected_effect)?;
     connection
         .send_notification(CancelNotification::new(session.id.clone()))
         .map_err(|_| {
@@ -4239,6 +4245,10 @@ fn permission_effect_id(key: &str) -> String {
 
 fn permission_cancel_effect_id(key: &str) -> String {
     format!("permission-cancel:{}", digest(key.as_bytes()))
+}
+
+fn is_pre_notification_permission_cancel_uncertain(error: &Error) -> bool {
+    error.code == "ACP_PERMISSION_CANCEL_UNKNOWN"
 }
 
 fn uncertain_acp_error(error: &Error) -> bool {
@@ -5102,6 +5112,24 @@ mod tests {
                     .map_err(|_| super::invalid("host recovery fixture receiver was dropped"))?;
                 Ok(())
             })
+        }
+    }
+
+    struct PromptControlsFixture {
+        controls: std::collections::VecDeque<Value>,
+    }
+
+    impl super::HostCommandSource for PromptControlsFixture {
+        fn next<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = super::Result<Value>> + 'a>> {
+            Box::pin(async move {
+                self.controls
+                    .pop_front()
+                    .ok_or_else(|| super::invalid("prompt control fixture is exhausted"))
+            })
+        }
+
+        fn reconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = super::Result<()>> + 'a>> {
+            Box::pin(async { Err(super::invalid("prompt control fixture cannot reconnect")) })
         }
     }
 
@@ -6140,6 +6168,276 @@ mod tests {
         .expect("host recovery fixture remains bounded")
         .expect("host recovery fixture succeeds");
         assert_eq!(journal_effect_count(&state, &count_command)?, 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_permission_cancel_unknown_keeps_exact_turn_cancel_path()
+    -> super::Result<()> {
+        let state = TestState::new()?;
+        let (dispatch_command, _) = task_prompt_fixture()?;
+        let session_id = SessionId::new("session-permission-cancel-uncertain-fixture");
+        let session = super::ActiveSession {
+            id: session_id.clone(),
+            owner_operation_id: dispatch_command.operation_id.clone(),
+            workspace: std::env::temp_dir(),
+            requested_model: Some("fixture-model".to_owned()),
+            effective_model: Some("fixture-model".to_owned()),
+            requested_effort: None,
+            effective_effort: None,
+            requested_mode: None,
+            effective_mode: None,
+            close_supported: true,
+            closed: false,
+        };
+        let exact_cancel = || {
+            let mut command = permission_reply_command();
+            command.method = "native.command.cancel_turn".to_owned();
+            command.binding_id = dispatch_command.binding_id.clone();
+            command.generation = dispatch_command.generation;
+            command.input = json!({
+                "session_id":session_id,
+                "target_operation_id":dispatch_command.operation_id,
+                "turn_id":dispatch_command.operation_id
+            });
+            command
+        };
+        let first_cancel = exact_cancel();
+        let retry_cancel = exact_cancel();
+        let maybe_written_cancel = exact_cancel();
+
+        let request_id = json!("permission-request-uncertain");
+        let key = serde_json::to_string(&request_id)?;
+        let fingerprint = digest(b"permission response may have been written");
+        let permissions: super::PermissionBroker =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (permission_reply, _permission_response) = tokio::sync::oneshot::channel();
+        let (acknowledgement_sender, acknowledgement) = tokio::sync::oneshot::channel();
+        acknowledgement_sender
+            .send(false)
+            .expect("fixture reports that permission response was not confirmed written");
+        permissions.lock().expect("permission broker lock").insert(
+            key.clone(),
+            super::PendingPermission {
+                session_id: session_id.to_string(),
+                request_id,
+                fingerprint,
+                options: Vec::new(),
+                reply: permission_reply,
+                acknowledgement,
+            },
+        );
+
+        let (transport, mut peer) = Channel::duplex();
+        let journal = state.journal.clone();
+        let dispatch_for_client = dispatch_command.clone();
+        let session_for_client = session.clone();
+        let permissions_for_client = Arc::clone(&permissions);
+        let first_cancel_for_client = first_cancel.clone();
+        let retry_cancel_for_client = retry_cancel.clone();
+        let maybe_written_cancel_for_client = maybe_written_cancel.clone();
+        let prompt_session_id = session_id.clone();
+        let key_for_client = key.clone();
+        let client = Client::builder().connect_with(transport, async move |connection| {
+            let request = connection
+                .send_request(super::PromptRequest::new(
+                    prompt_session_id,
+                    vec![ContentBlock::Text(TextContent::new("fixture-only"))],
+                ))
+                .block_task();
+            tokio::pin!(request);
+            let permission_wakeup = tokio::sync::Notify::new();
+            let mut source = PromptControlsFixture {
+                controls: vec![
+                    json!({"command":first_cancel_for_client}),
+                    json!({"command":retry_cancel_for_client}),
+                ]
+                .into_iter()
+                .collect(),
+            };
+
+            let PromptEvent::Host(first_message) =
+                super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup).await
+            else {
+                panic!("the active prompt receives the first exact-turn cancel")
+            };
+            let first_control: RuntimeCommand =
+                serde_json::from_value(first_message["command"].clone())
+                    .expect("fixture control is a RuntimeCommand");
+            let permission_error = match super::cancel_active_turn_effect(
+                &connection,
+                &journal,
+                &permissions_for_client,
+                &dispatch_for_client,
+                &first_control,
+                &session_for_client,
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => {
+                    return Err(super::to_acp_error(super::invalid(
+                        "permission uncertainty was marked applied",
+                    )));
+                }
+            };
+            assert_eq!(permission_error.code, "ACP_PERMISSION_CANCEL_UNKNOWN");
+            assert!(super::is_pre_notification_permission_cancel_uncertain(
+                &permission_error
+            ));
+            let first_unknown = super::unknown_in_session(
+                &first_control,
+                &session_for_client,
+                &permission_error.code,
+            );
+            assert_eq!(first_unknown.outcome, EffectOutcome::Unknown);
+            assert!(
+                journal
+                    .read_effect(&first_control, "session/cancel", "intent")
+                    .map_err(super::to_acp_error)?
+                    .is_none()
+            );
+            let permission_effect = super::permission_cancel_effect_id(&key_for_client);
+            assert!(
+                journal
+                    .read_effect(&first_control, &permission_effect, "intent")
+                    .map_err(super::to_acp_error)?
+                    .is_some()
+            );
+            assert!(
+                journal
+                    .read_effect(&first_control, &permission_effect, "receipt")
+                    .map_err(super::to_acp_error)?
+                    .is_none()
+            );
+
+            let PromptEvent::Host(retry_message) =
+                super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup).await
+            else {
+                panic!("the same prompt remains active for a subsequent exact cancel")
+            };
+            let retry_control: RuntimeCommand =
+                serde_json::from_value(retry_message["command"].clone())
+                    .expect("fixture retry is a RuntimeCommand");
+            assert_eq!(
+                retry_control.input["target_operation_id"],
+                dispatch_for_client.operation_id
+            );
+            assert_eq!(
+                retry_control.input["session_id"],
+                session_for_client.id.to_string()
+            );
+            let retry_outcome = super::cancel_active_turn_effect(
+                &connection,
+                &journal,
+                &permissions_for_client,
+                &dispatch_for_client,
+                &retry_control,
+                &session_for_client,
+            )
+            .await
+            .map_err(super::to_acp_error)?;
+            assert_eq!(retry_outcome.outcome, EffectOutcome::Applied);
+            assert_eq!(retry_outcome.details["cancel"], "notification_sent");
+
+            let expected_intent = json!({
+                "native_session_id":session_for_client.id,
+                "target_operation_id":dispatch_for_client.operation_id,
+                "turn_id":dispatch_for_client.operation_id
+            });
+            journal
+                .record_effect(
+                    &maybe_written_cancel_for_client,
+                    "session/cancel",
+                    "intent",
+                    expected_intent,
+                )
+                .map_err(super::to_acp_error)?;
+            let fenced_error = match super::cancel_active_turn_effect(
+                &connection,
+                &journal,
+                &permissions_for_client,
+                &dispatch_for_client,
+                &maybe_written_cancel_for_client,
+                &session_for_client,
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => {
+                    return Err(super::to_acp_error(super::invalid(
+                        "possibly written cancel was replayed",
+                    )));
+                }
+            };
+            assert_eq!(fenced_error.code, "ACP_CANCEL_UNKNOWN");
+            let fenced_unknown = super::unknown_in_session(
+                &maybe_written_cancel_for_client,
+                &session_for_client,
+                &fenced_error.code,
+            );
+            assert_eq!(fenced_unknown.outcome, EffectOutcome::Unknown);
+            Ok::<(), agent_client_protocol::Error>(())
+        });
+        let peer = async move {
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(prompt))) =
+                peer.rx.next().await
+            else {
+                panic!("the fixture starts one native prompt")
+            };
+            assert_eq!(prompt.method.as_ref(), "session/prompt");
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Notification(cancel))) =
+                peer.rx.next().await
+            else {
+                panic!("the later exact-turn cancel reaches the native session")
+            };
+            assert_eq!(cancel.method.as_ref(), "session/cancel");
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("permission uncertainty fixture remains bounded")
+        .expect("permission uncertainty fixture succeeds");
+
+        let permission_effect = super::permission_cancel_effect_id(&key);
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, "session/cancel", "intent")?
+                .is_none()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, &permission_effect, "intent")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, &permission_effect, "receipt")?
+                .is_none()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&retry_cancel, "session/cancel", "intent")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&retry_cancel, "session/cancel", "receipt")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&maybe_written_cancel, "session/cancel", "receipt")?
+                .is_none()
+        );
         Ok(())
     }
 
