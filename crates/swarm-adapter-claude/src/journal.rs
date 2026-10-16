@@ -18,6 +18,7 @@ use swarm_process::{
     JsonlScanVerdict, private_permissions, remove_private_acknowledged, replace_private_durable,
     scan_jsonl, write_private_new,
 };
+use crate::receipt;
 
 const MAX_RECORD_BYTES: usize = 1_048_576;
 const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
@@ -1499,9 +1500,9 @@ impl OperationJournal {
             || item
                 .outcome_sha256
                 .as_deref()
-                .is_some_and(|digest| !valid_sha256(digest))
+                .is_some_and(|digest| !receipt::is_sha256(digest))
             || item.acknowledged_sha256.as_deref().is_some_and(|digest| {
-                !valid_sha256(digest) || item.outcome_sha256.as_deref() != Some(digest)
+                    !receipt::is_sha256(digest) || item.outcome_sha256.as_deref() != Some(digest)
             })
         {
             return Err(Error::new(
@@ -1550,12 +1551,12 @@ impl OperationJournal {
             || pointer
                 .outcome_sha256
                 .as_deref()
-                .is_some_and(|digest| !valid_sha256(digest))
+                .is_some_and(|digest| !receipt::is_sha256(digest))
             || pointer
                 .acknowledged_sha256
                 .as_deref()
                 .is_some_and(|digest| {
-                    !valid_sha256(digest) || pointer.outcome_sha256.as_deref() != Some(digest)
+                    !receipt::is_sha256(digest) || pointer.outcome_sha256.as_deref() != Some(digest)
                 })
         {
             return Err(Error::new(
@@ -2347,24 +2348,24 @@ impl OperationJournal {
             || marker.operation_key != hex_digest(marker.operation_id.as_bytes())
             || marker.binding_id.trim().is_empty()
             || marker.binding_generation < 1
-            || !valid_sha256(&marker.input_sha256)
+            || !receipt::is_sha256(&marker.input_sha256)
             || marker.bridge_boot_id.trim().is_empty()
             || marker.native_scope_key.trim().is_empty()
             || marker
                 .native_payload_sha256
                 .as_deref()
-                .is_some_and(|digest| !valid_sha256(digest))
+                .is_some_and(|digest| !receipt::is_sha256(digest))
             || marker.native_root_id.as_deref().is_some_and(str::is_empty)
             || marker.native_input_id.as_deref().is_some_and(str::is_empty)
             || marker.native_payload_sha256.is_some() != marker.native_payload_bytes.is_some()
             || marker
                 .outcome_sha256
                 .as_deref()
-                .is_some_and(|digest| !valid_sha256(digest))
+                .is_some_and(|digest| !receipt::is_sha256(digest))
             || marker
                 .acknowledged_sha256
                 .as_deref()
-                .is_some_and(|digest| !valid_sha256(digest))
+                .is_some_and(|digest| !receipt::is_sha256(digest))
             || marker.acknowledged_sha256.is_some()
                 && marker.acknowledged_sha256 != marker.outcome_sha256
             || path.file_stem().and_then(|value| value.to_str())
@@ -2413,8 +2414,8 @@ impl OperationJournal {
             || tombstone.operation_id != expected_operation_id
             || tombstone.operation_key != hex_digest(expected_operation_id.as_bytes())
             || tombstone.receipt.operation_id != expected_operation_id
-            || !valid_sha256(&tombstone.receipt.input_sha256)
-            || !valid_sha256(&tombstone.outcome_sha256)
+            || !receipt::is_sha256(&tombstone.receipt.input_sha256)
+            || !receipt::is_sha256(&tombstone.outcome_sha256)
             || tombstone.outcome["operation_id"] != expected_operation_id
             || tombstone.acknowledged_sha256 != tombstone.outcome_sha256
             || tombstone.outcome_sha256.is_empty()
@@ -2948,7 +2949,7 @@ fn discard_question_reply_payload(intent: &mut Value) -> bool {
     let has_historical_digest = native
         .get("reply_sha256")
         .and_then(Value::as_str)
-        .is_some_and(valid_sha256);
+        .is_some_and(receipt::is_sha256);
     is_question_reply && has_historical_digest && native.remove("reply").is_some()
 }
 
@@ -3330,13 +3331,6 @@ fn valid_operation_id(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= 256
         && !value.bytes().any(|byte| byte.is_ascii_control())
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
