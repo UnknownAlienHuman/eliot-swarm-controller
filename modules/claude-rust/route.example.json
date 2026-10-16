@@ -10,7 +10,7 @@
     "nodeExecutable": "<absolute-node-executable>",
     "nativeExecutable": null,
     "claudeConfigDir": "<absolute-claude-config-directory>",
-    "modelId": "<operator-selected-claude-sonnet-model-id>",
+    "modelId": null,
     "permissionMode": null,
     "allowDangerouslySkipPermissions": false
   }

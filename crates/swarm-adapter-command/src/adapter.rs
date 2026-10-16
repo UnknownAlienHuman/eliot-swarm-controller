@@ -56,6 +56,7 @@ struct Link {
     binding_id: String,
     generation: i64,
     route: Value,
+    profile: Profile,
     recovery_required: bool,
 }
 
@@ -80,7 +81,7 @@ pub async fn run() -> Result<()> {
             "module credential client differs from the supervisor binding identity",
         ));
     }
-    if owner.host.profile == Profile::AcpV1 {
+    if matches!(owner.host.profile, Profile::AcpV1 | Profile::AcpV2) {
         return acp::run(config, owner, credential).await;
     }
     let store = RunStore::new_for_profile(&owner.state_dir, owner.host.profile)?;
@@ -408,8 +409,10 @@ fn acp_dispatch_admission(
     command: &RuntimeCommand,
     dispatch: &PreparedAcpDispatch,
 ) -> Result<TaskDispatchAdmissionReceipt> {
-    if !matches!(owner.host.profile, Profile::AcpV1 | Profile::BatchV4)
-        || !module_host::task_prompt_v1_enabled(&owner.host.claim)
+    if !matches!(
+        owner.host.profile,
+        Profile::AcpV1 | Profile::AcpV2 | Profile::BatchV4 | Profile::BatchV5
+    ) || !module_host::task_prompt_v1_enabled(&owner.host.claim)
         || dispatch.identity.operation_id != command.operation_id
         || dispatch.identity.input_sha256 != command.input_sha256.as_deref().unwrap_or_default()
         || dispatch.identity.prompt_sha256 != dispatch.envelope.prompt_sha256
@@ -585,7 +588,7 @@ async fn process_command(
 ) -> Result<(Vec<RuntimeOutcome>, bool)> {
     match command.method.as_str() {
         "agent.open" => {
-            let model_id = route_model(command)?;
+            let model_id = route_model(command, link.profile)?;
             let workspace = native::route_workspace(command)?;
             let (_, existing) = store.admit(
                 &command.operation_id,
@@ -595,7 +598,7 @@ async fn process_command(
                 &command.route,
             )?;
             let outcome = if let Some((saved, _)) = store.read_outcome(&command.operation_id)? {
-                if saved.details["requested_model"] != model_id {
+                if saved.details["requested_model"] != json!(model_id) {
                     return Err(Error::new(
                         "ADAPTER_EVIDENCE_CONFLICT",
                         "saved preflight receipt differs from the current route model",
@@ -655,16 +658,19 @@ async fn process_command(
             Ok((vec![outcome], false))
         }
         "task.dispatch" => {
-            let (prompt, identity, dispatch_admission) = if owner.host.profile == Profile::BatchV4 {
-                let dispatch = acp_prompt::prepare(command)?;
-                let identity = native::task_prompt_identity(command, &dispatch)?;
-                let admission = acp_dispatch_admission(owner, command, &dispatch)?;
-                (dispatch.envelope.prompt.clone(), identity, Some(admission))
-            } else {
-                let (prompt, identity) = native::prompt_for(command)?;
-                let admission = normalized_dispatch_admission(owner, command, &identity, &prompt)?;
-                (prompt, identity, admission)
-            };
+            let (prompt, identity, dispatch_admission) =
+                if matches!(owner.host.profile, Profile::BatchV4 | Profile::BatchV5) {
+                    let dispatch =
+                        acp_prompt::prepare(command, owner.host.profile.model_optional())?;
+                    let identity = native::task_prompt_identity(command, &dispatch)?;
+                    let admission = acp_dispatch_admission(owner, command, &dispatch)?;
+                    (dispatch.envelope.prompt.clone(), identity, Some(admission))
+                } else {
+                    let (prompt, identity) = native::prompt_for(command)?;
+                    let admission =
+                        normalized_dispatch_admission(owner, command, &identity, &prompt)?;
+                    (prompt, identity, admission)
+                };
             let workspace = native::route_workspace(command)?;
             let (_dir, existing) = store.admit(
                 &command.operation_id,
@@ -767,7 +773,7 @@ async fn process_command(
             )?;
             Ok((vec![outcome], false))
         }
-        "agent.reconcile" => reconcile(store, command).await,
+        "agent.reconcile" => reconcile(store, command, link.profile).await,
         "agent.result" => {
             let (_, _existing) = store.admit(
                 &command.operation_id,
@@ -877,6 +883,7 @@ async fn process_command(
 async fn reconcile(
     store: &RunStore,
     command: &RuntimeCommand,
+    profile: Profile,
 ) -> Result<(Vec<RuntimeOutcome>, bool)> {
     let (_, _reconcile_existing) = store.admit(
         &command.operation_id,
@@ -902,7 +909,7 @@ async fn reconcile(
         ));
     }
     let (target_outcome, resolved, target_receipt_existed) = if target_method == "task.dispatch" {
-        let identity = target_dispatch_identity(command, target_id)?;
+        let identity = target_dispatch_identity(command, target_id, profile)?;
         let (_, target_existing) = store.admit(
             target_id,
             Some(&identity),
@@ -947,7 +954,7 @@ async fn reconcile(
         )?;
         match store.read_outcome(target_id)? {
             Some((saved, _)) => {
-                if saved.details["requested_model"] != route_model(command)? {
+                if saved.details["requested_model"] != json!(route_model(command, profile)?) {
                     return Err(Error::new(
                         "ADAPTER_EVIDENCE_CONFLICT",
                         "saved preflight receipt differs from the binding model",
@@ -970,7 +977,7 @@ async fn reconcile(
                     details: json!({
                         "execution_shape":EXECUTION_SHAPE,
                         "completion_condition":"executor_preflight_unconfirmed",
-                        "requested_model":route_model(command)?,
+                        "requested_model":route_model(command, profile)?,
                         "effective_model":Value::Null,
                         "effective_model_status":"unknown",
                         "native_session_state":"not_started",
@@ -1021,9 +1028,13 @@ async fn reconcile(
     Ok((receipts, false))
 }
 
-fn target_dispatch_identity(command: &RuntimeCommand, target_id: &str) -> Result<DispatchIdentity> {
-    let model_id = route_model(command)?;
-    if command.input["target_command_requested_model"] != model_id {
+fn target_dispatch_identity(
+    command: &RuntimeCommand,
+    target_id: &str,
+    profile: Profile,
+) -> Result<DispatchIdentity> {
+    let model_id = route_model(command, profile)?;
+    if command.input["target_command_requested_model"] != json!(model_id) {
         return Err(Error::new(
             "NATIVE_IDENTITY_MISMATCH",
             "Store-injected requested model differs from the immutable binding route",
@@ -1033,7 +1044,7 @@ fn target_dispatch_identity(command: &RuntimeCommand, target_id: &str) -> Result
     let input_sha256 = command
         .target_input_sha256
         .as_deref()
-        .filter(|value| is_sha256(value))
+        .filter(|value| crate::is_lower_sha256_hex(value))
         .ok_or_else(|| {
             Error::new(
                 "NATIVE_IDENTITY_MISMATCH",
@@ -1042,7 +1053,7 @@ fn target_dispatch_identity(command: &RuntimeCommand, target_id: &str) -> Result
         })?;
     let prompt_sha256 = core["prompt_sha256"]
         .as_str()
-        .filter(|value| is_sha256(value))
+        .filter(|value| crate::is_lower_sha256_hex(value))
         .ok_or_else(|| {
             Error::new(
                 "NATIVE_IDENTITY_MISMATCH",
@@ -1079,7 +1090,7 @@ fn target_dispatch_identity(command: &RuntimeCommand, target_id: &str) -> Result
         operation_id: target_id.to_owned(),
         input_sha256: input_sha256.to_owned(),
         batch_run_id: batch_run_id.to_owned(),
-        requested_model: model_id.to_owned(),
+        requested_model: model_id.map(str::to_owned),
         prompt_sha256: prompt_sha256.to_owned(),
         prompt_bytes,
         task_snapshot_sha256: String::new(),
@@ -1240,7 +1251,7 @@ async fn connect_module_with_native_state(
             "reserved route does not name this Rust Command adapter artifact",
         ));
     }
-    route_model_from_value(&route)?;
+    route_model_from_value(&route, owner.host.profile)?;
     let binding_id = hello["binding_id"]
         .as_str()
         .filter(|value| !value.is_empty())
@@ -1261,6 +1272,7 @@ async fn connect_module_with_native_state(
         binding_id,
         generation,
         route,
+        profile: owner.host.profile,
         recovery_required: hello["recovery_required"] == true,
     })
 }
@@ -1293,7 +1305,9 @@ fn module_state(
     last_operation: &Value,
     pending_results: usize,
 ) -> Value {
-    let model = route_model_from_value(&link.route).unwrap_or("");
+    let model = route_model_from_value(&link.route, link.profile)
+        .ok()
+        .flatten();
     json!({
         "phase":"sessionless",
         "native_root_id":Value::Null,
@@ -1412,7 +1426,7 @@ fn validate_command(
             || command
                 .target_input_sha256
                 .as_deref()
-                .is_none_or(|digest| !is_sha256(digest))
+                .is_none_or(|digest| !crate::is_lower_sha256_hex(digest))
             || missing_result_data)
     {
         return Err(Error::new(
@@ -1420,24 +1434,83 @@ fn validate_command(
             "Command result requires an exact Store status or output snapshot",
         ));
     }
-    route_model(command)?;
+    route_model(command, link.profile)?;
     Ok(())
 }
 
-fn route_model(command: &RuntimeCommand) -> Result<&str> {
-    route_model_from_value(&command.route)
+fn route_model(command: &RuntimeCommand, profile: Profile) -> Result<Option<&str>> {
+    route_model_from_value(&command.route, profile)
 }
 
-fn route_model_from_value(route: &Value) -> Result<&str> {
-    route["native_options"]["modelId"]
+fn route_model_from_value(route: &Value, profile: Profile) -> Result<Option<&str>> {
+    let options = route["native_options"]
+        .as_object()
+        .ok_or_else(|| Error::new("COMMAND_MODEL_REQUIRED", "native route options are missing"))?;
+    let value = match options.get("modelId") {
+        None if profile.model_optional() => return Ok(None),
+        Some(Value::Null) if profile.model_optional() => return Ok(None),
+        None | Some(Value::Null) => {
+            return Err(Error::new(
+                "COMMAND_MODEL_REQUIRED",
+                "this Command artifact requires an explicit route modelId",
+            ));
+        }
+        Some(value) => value,
+    };
+    value
         .as_str()
         .filter(|value| !value.is_empty() && *value == value.trim() && value.len() <= 256)
+        .map(Some)
         .ok_or_else(|| {
             Error::new(
                 "COMMAND_MODEL_REQUIRED",
                 "explicit route modelId is invalid",
             )
         })
+}
+
+#[cfg(test)]
+mod route_model_policy_tests {
+    use super::{Profile, route_model_from_value};
+    use serde_json::json;
+
+    #[test]
+    fn current_command_profiles_allow_absent_or_null_model_without_weakening_legacy_profiles() {
+        for native_options in [
+            json!({"workspaceRoot":"C:/work"}),
+            json!({"workspaceRoot":"C:/work","modelId":null}),
+        ] {
+            let route = json!({"native_options":native_options});
+            assert_eq!(
+                route_model_from_value(&route, Profile::BatchV5).unwrap(),
+                None
+            );
+            assert_eq!(
+                route_model_from_value(&route, Profile::AcpV2).unwrap(),
+                None
+            );
+            assert_eq!(
+                route_model_from_value(&route, Profile::BatchV4)
+                    .unwrap_err()
+                    .code,
+                "COMMAND_MODEL_REQUIRED"
+            );
+            assert_eq!(
+                route_model_from_value(&route, Profile::AcpV1)
+                    .unwrap_err()
+                    .code,
+                "COMMAND_MODEL_REQUIRED"
+            );
+        }
+
+        let explicit = json!({"native_options":{"modelId":"explicit-model"}});
+        assert_eq!(
+            route_model_from_value(&explicit, Profile::BatchV5).unwrap(),
+            Some("explicit-model")
+        );
+        let malformed = json!({"native_options":{"modelId":false}});
+        assert!(route_model_from_value(&malformed, Profile::BatchV5).is_err());
+    }
 }
 
 fn load_config(path: &Path, profile: Profile) -> Result<Config> {
@@ -1489,8 +1562,8 @@ fn load_config(path: &Path, profile: Profile) -> Result<Config> {
     if config.module_artifact_id != profile.artifact_id()
         || !config.command.is_absolute()
         || match profile {
-            Profile::BatchV3 | Profile::BatchV4 => !batch_config_valid,
-            Profile::AcpV1 => !acp_config_valid,
+            Profile::BatchV3 | Profile::BatchV4 | Profile::BatchV5 => !batch_config_valid,
+            Profile::AcpV1 | Profile::AcpV2 => !acp_config_valid,
         }
     {
         return Err(Error::new(
@@ -1763,13 +1836,6 @@ fn is_connect_retryable(error: &Error) -> bool {
     matches!(error.code.as_str(), "HOST_UNAVAILABLE" | "IO_ERROR")
 }
 
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 fn next_sequence(sequence: u64) -> Result<u64> {
     sequence.checked_add(1).ok_or_else(|| {
         Error::new(
@@ -1905,7 +1971,7 @@ mod capture_release_fixture {
                 operation_id: "fixture-crash-window".to_owned(),
                 input_sha256: "a".repeat(64),
                 batch_run_id: "fixture-batch".to_owned(),
-                requested_model: "fixture-model".to_owned(),
+                requested_model: Some("fixture-model".to_owned()),
                 prompt_sha256: "b".repeat(64),
                 prompt_bytes: 19,
                 task_snapshot_sha256: "c".repeat(64),
@@ -1994,7 +2060,7 @@ mod capture_release_fixture {
             operation_id: target_id.to_owned(),
             input_sha256: target_input_sha256.clone(),
             batch_run_id: "fixture-batch".to_owned(),
-            requested_model: "fixture-model".to_owned(),
+            requested_model: Some("fixture-model".to_owned()),
             prompt_sha256: "b".repeat(64),
             prompt_bytes: 12,
             task_snapshot_sha256: "c".repeat(64),

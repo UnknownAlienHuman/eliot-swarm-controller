@@ -39,7 +39,7 @@ pub fn build(command: &RuntimeCommand, claim: &ModuleContractClaim) -> Result<Va
     let result_input_sha256 = command
         .input_sha256
         .as_deref()
-        .filter(|digest| is_sha256(digest))
+        .filter(|digest| crate::is_lower_sha256_hex(digest))
         .ok_or_else(|| invalid("Store omitted the exact result Operation digest"))?;
     let target_id = command.input["selector"]["input_operation_id"]
         .as_str()
@@ -48,7 +48,7 @@ pub fn build(command: &RuntimeCommand, claim: &ModuleContractClaim) -> Result<Va
     let target_input_sha256 = command
         .target_input_sha256
         .as_deref()
-        .filter(|digest| is_sha256(digest))
+        .filter(|digest| crate::is_lower_sha256_hex(digest))
         .ok_or_else(|| invalid("Store omitted the exact target Operation digest"))?;
     let target = &command.input["target_operation_status"];
     validate_target(
@@ -141,7 +141,7 @@ pub fn build_output(
     let result_input_sha256 = command
         .input_sha256
         .as_deref()
-        .filter(|digest| is_sha256(digest))
+        .filter(|digest| crate::is_lower_sha256_hex(digest))
         .ok_or_else(|| invalid("Store omitted the exact result Operation digest"))?;
     let target_id = command.input["selector"]["input_operation_id"]
         .as_str()
@@ -154,7 +154,7 @@ pub fn build_output(
     let target_input_sha256 = command
         .target_input_sha256
         .as_deref()
-        .filter(|digest| is_sha256(digest))
+        .filter(|digest| crate::is_lower_sha256_hex(digest))
         .ok_or_else(|| invalid("Store omitted the exact target Operation digest"))?;
     let target = &command.input["target_command_output"];
     validate_target_output(
@@ -271,7 +271,7 @@ pub fn build_normalized_output(
     let result_input_sha256 = command
         .input_sha256
         .as_deref()
-        .filter(|digest| is_sha256(digest))
+        .filter(|digest| crate::is_lower_sha256_hex(digest))
         .ok_or_else(|| invalid("Store omitted the exact result Operation digest"))?;
     let target_id = origin.target_operation_id.as_str();
     let native_output = command.input["selector"]["native_output"]
@@ -281,7 +281,7 @@ pub fn build_normalized_output(
     let target_input_sha256 = command
         .target_input_sha256
         .as_deref()
-        .filter(|digest| is_sha256(digest))
+        .filter(|digest| crate::is_lower_sha256_hex(digest))
         .ok_or_else(|| invalid("Store omitted the exact target Operation digest"))?;
     if target_input_sha256 != origin.target_input_sha256 {
         return Err(invalid(
@@ -303,7 +303,7 @@ pub fn build_normalized_output(
     let payload_bytes = expected["byte_length"]
         .as_u64()
         .ok_or_else(|| invalid("Store omitted the sealed output byte length"))?;
-    if !is_sha256(payload_sha256)
+    if !crate::is_lower_sha256_hex(payload_sha256)
         || payload_sha256 != text(target, "stored_sha256")?
         || payload_bytes != target["stored_bytes"].as_u64().unwrap_or(u64::MAX)
         || expected["complete"].as_bool().is_none()
@@ -368,7 +368,7 @@ pub fn build_acp_output(
         .as_u64()
         .ok_or_else(|| invalid("Store omitted the sealed ACP output byte length"))?;
     if expected["complete"] != true
-        || !is_sha256(payload_sha256)
+        || !crate::is_lower_sha256_hex(payload_sha256)
         || payload_sha256 != sha256_hex(bytes)
         || payload_bytes != bytes.len() as u64
     {
@@ -379,7 +379,7 @@ pub fn build_acp_output(
     let result_input_sha256 = command
         .input_sha256
         .as_deref()
-        .filter(|digest| is_sha256(digest))
+        .filter(|digest| crate::is_lower_sha256_hex(digest))
         .ok_or_else(|| invalid("Store omitted the exact ACP result Operation digest"))?;
     build_normalized_page(command, claim, origin, result_input_sha256, bytes)
 }
@@ -866,10 +866,10 @@ fn validate_target_output(
             || context["source_text_bytes"].as_u64().is_none()
             || !context["task_snapshot_sha256"]
                 .as_str()
-                .is_some_and(is_sha256)
+                .is_some_and(crate::is_lower_sha256_hex)
             || !context["source_text_sha256"]
                 .as_str()
-                .is_some_and(is_sha256)
+                .is_some_and(crate::is_lower_sha256_hex)
         {
             return Err(invalid(
                 "Store dispatch context differs from target binding",
@@ -923,8 +923,8 @@ fn validate_target_output(
     if stored_bytes > limit
         || stream_bytes < stored_bytes
         || (stream_bytes > stored_bytes && !truncated)
-        || !is_sha256(stream_sha256)
-        || !is_sha256(stored_sha256)
+        || !crate::is_lower_sha256_hex(stream_sha256)
+        || !crate::is_lower_sha256_hex(stored_sha256)
         || (!truncated && !read_error && stream_bytes != stored_bytes)
         || (!truncated && !read_error && stream_sha256 != stored_sha256)
     {
@@ -1199,13 +1199,6 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 
 fn invalid(message: &str) -> Error {
     Error::new("RESULT_PROVENANCE_INVALID", message)
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

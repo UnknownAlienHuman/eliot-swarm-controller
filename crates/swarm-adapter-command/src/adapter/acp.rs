@@ -37,7 +37,7 @@ use tokio::{
 };
 use tokio_util::codec::{Decoder, FramedRead, FramedWrite, LinesCodec};
 
-use super::{Config, Link, Owner, is_sha256};
+use super::{Config, Link, Owner};
 use crate::{
     ACP_ARTIFACT_ID, ACP_EXECUTION_SHAPE, Profile,
     acp_prompt::{self, PreparedAcpDispatch},
@@ -53,7 +53,8 @@ const MAX_PERMISSION_BYTES: usize = 64 * 1024;
 const MAX_ACP_FRAME_BYTES: usize = 1024 * 1024;
 const CHILD_WAIT_GRACE: Duration = Duration::from_secs(2);
 const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
-const OUTPUT_ROOT: &str = "command-acp-runs-v1";
+const OUTPUT_ROOT_V1: &str = "command-acp-runs-v1";
+const OUTPUT_ROOT_V2: &str = "command-acp-runs-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +113,7 @@ struct ResultPageAck {
 #[derive(Clone)]
 struct AcpJournal {
     root: PathBuf,
+    session_schema_version: u8,
 }
 
 #[derive(Default)]
@@ -173,7 +175,8 @@ struct ActiveSession {
     id: SessionId,
     owner_operation_id: String,
     workspace: PathBuf,
-    model_id: String,
+    requested_model: Option<String>,
+    effective_model: Option<String>,
     requested_effort: Option<String>,
     effective_effort: Option<String>,
     requested_mode: Option<String>,
@@ -193,7 +196,7 @@ struct SessionOpenContext<'a> {
 }
 
 struct SessionRouteConfiguration {
-    model_id: String,
+    model_id: Option<String>,
     effort: Option<String>,
     mode: Option<String>,
 }
@@ -224,7 +227,7 @@ struct CommandContext<'a> {
     features: &'a AgentFeatures,
     session: &'a mut Option<ActiveSession>,
     workspace: Option<&'a Path>,
-    model: &'a str,
+    model: Option<&'a str>,
     capture: &'a Arc<Mutex<Capture>>,
     permissions: &'a PermissionBroker,
     permission_wakeup: &'a Notify,
@@ -254,7 +257,7 @@ struct RestoreIdentity {
     session_text: String,
     session_id: SessionId,
     workspace: PathBuf,
-    model_id: String,
+    requested_model: Option<String>,
     requested_effort: Option<String>,
     requested_mode: Option<String>,
     owner_operation_id: String,
@@ -335,8 +338,24 @@ struct PermissionHandlerState {
 
 impl AcpJournal {
     fn new(state_dir: &Path) -> Result<Self> {
+        Self::new_with_namespace(state_dir, OUTPUT_ROOT_V1, 1)
+    }
+
+    fn new_for_profile(state_dir: &Path, profile: Profile) -> Result<Self> {
+        match profile {
+            Profile::AcpV1 => Self::new(state_dir),
+            Profile::AcpV2 => Self::new_with_namespace(state_dir, OUTPUT_ROOT_V2, 2),
+            _ => Err(invalid("ACP journal requires an ACP artifact profile")),
+        }
+    }
+
+    fn new_with_namespace(
+        state_dir: &Path,
+        namespace: &str,
+        session_schema_version: u8,
+    ) -> Result<Self> {
         let state = fs::canonicalize(state_dir)?;
-        let root = state.join(OUTPUT_ROOT);
+        let root = state.join(namespace);
         match fs::symlink_metadata(&root) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(invalid("ACP evidence root is not a regular directory"));
@@ -352,7 +371,14 @@ impl AcpJournal {
         if root.parent() != Some(state.as_path()) {
             return Err(invalid("ACP evidence root escaped module state"));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            session_schema_version,
+        })
+    }
+
+    fn session_schema_version(&self) -> u8 {
+        self.session_schema_version
     }
 
     fn operation_dir(&self, operation_id: &str) -> Result<PathBuf> {
@@ -649,7 +675,7 @@ impl AcpJournal {
                 .as_deref()
                 .is_some_and(|session_id| session_id.trim().is_empty())
             || receipt.stored_bytes > MAX_CAPTURE_BYTES as u64
-            || !is_sha256(&receipt.stored_sha256)
+            || !crate::is_lower_sha256_hex(&receipt.stored_sha256)
             || (receipt.complete
                 && (receipt.session_id.is_none()
                     || receipt.truncated
@@ -967,7 +993,7 @@ pub(super) async fn run(
     owner: Owner,
     credential: swarm_contracts::Credential,
 ) -> Result<()> {
-    if owner.host.profile != Profile::AcpV1
+    if !matches!(owner.host.profile, Profile::AcpV1 | Profile::AcpV2)
         || !module_host::task_prompt_v1_enabled(&owner.host.claim)
     {
         return Err(Error::new(
@@ -975,7 +1001,7 @@ pub(super) async fn run(
             "ACP requires the registered TaskPrompt v1 command and admission schemas",
         ));
     }
-    let journal = AcpJournal::new(&owner.state_dir)?;
+    let journal = AcpJournal::new_for_profile(&owner.state_dir, owner.host.profile)?;
     let saved_session = journal.read_session()?;
     for command in journal.pending_commands()? {
         let mut outcome = unknown(
@@ -1022,7 +1048,7 @@ pub(super) async fn run(
             ));
         }
         expected_route = Some(link.route.clone());
-        validate_acp_route(&link.route)?;
+        validate_acp_route_for_profile(&link.route, owner.host.profile)?;
 
         let mut reconnect_required = false;
         for (outcome, hash) in journal.pending_outcomes()? {
@@ -1119,7 +1145,7 @@ pub(super) async fn run(
             let first = command.clone();
             let mut current_session: Option<ActiveSession> = None;
             let workspace = native::route_workspace(&first).ok();
-            let model = command_model(&link.route).unwrap_or_default().to_owned();
+            let model = command_model(&link.route).map(str::to_owned);
             let capture = Arc::new(Mutex::new(Capture::default()));
             let notification_capture = Arc::clone(&capture);
             let permission_broker: PermissionBroker = Arc::new(Mutex::new(HashMap::new()));
@@ -1293,7 +1319,7 @@ pub(super) async fn run(
                                     features: &features,
                                     session: &mut current_session,
                                     workspace: workspace.as_deref(),
-                                    model: &model,
+                                    model: model.as_deref(),
                                     capture: &capture,
                                     permissions: &permission_broker,
                                     permission_wakeup: &permission_wakeup,
@@ -1674,7 +1700,8 @@ async fn process_command(
             // Validate and admit the Store TaskPrompt before session creation
             // or any other native effect. A retained admission never replays.
             let prepared_dispatch = if command.method == "task.dispatch" {
-                let dispatch = acp_prompt::prepare(command)?;
+                let dispatch =
+                    acp_prompt::prepare(command, context.owner.host.profile.model_optional())?;
                 let receipt = adapter::acp_dispatch_admission(context.owner, command, &dispatch)?;
                 let (directory, existing) =
                     context
@@ -1699,7 +1726,7 @@ async fn process_command(
                     )
                 })?;
                 let route_configuration = SessionRouteConfiguration {
-                    model_id: context.model.to_owned(),
+                    model_id: context.model.map(str::to_owned),
                     effort: command_effort(&context.link.route).map(str::to_owned),
                     mode: command_mode(&context.link.route).map(str::to_owned),
                 };
@@ -1741,8 +1768,11 @@ async fn process_command(
                         "execution_shape":ACP_EXECUTION_SHAPE,
                         "native_session_id":session.id,
                         "requested_model":context.model,
-                        "effective_model":session.model_id,
-                        "effective_model_status":"verified_by_session_config_readback",
+                        "effective_model":session.effective_model,
+                        "effective_model_status":session_model_status(
+                            session.requested_model.as_deref(),
+                            session.effective_model.as_deref(),
+                        ),
                         "requested_effort":session.requested_effort,
                         "effective_effort":session.effective_effort,
                         "effort_readback_status":if session.requested_effort.is_none() || session.effective_effort.is_some() {"verified_or_unselected"}else{"unknown"},
@@ -2135,7 +2165,7 @@ async fn process_command(
                 .ok_or_else(|| Error::new("NATIVE_SESSION_MISSING", "ACP session is not open"))?;
             session.closed = true;
             context.journal.save_session(&json!({
-                "schema_version":1,
+                "schema_version":context.journal.session_schema_version(),
                 "artifact_id":ACP_ARTIFACT_ID,
                 "binding_id":command.binding_id,
                 "binding_generation":command.generation,
@@ -2144,12 +2174,12 @@ async fn process_command(
                 "native_root_id":session.id,
                 "native_scope_key":session.id,
                 "workspace":session.workspace,
-                "requested_model":session.model_id,
+                "requested_model":session.requested_model,
                 "requested_effort":session.requested_effort,
                 "effective_effort":session.effective_effort,
                 "requested_mode":session.requested_mode,
                 "effective_mode":session.effective_mode,
-                "effective_model":session.model_id,
+                "effective_model":session.effective_model,
                 "native_session_state":"closed",
                 "native_close_capability":"session/close",
                 "family_departure_claimed":false
@@ -2309,7 +2339,7 @@ async fn open_session_with_policy(
         features,
         capture,
     } = context;
-    let requested_model = route.model_id.as_str();
+    let requested_model = route.model_id.as_deref();
     let requested_effort = route.effort.as_deref();
     let requested_mode = route.mode.as_deref();
     if !workspace.is_absolute() || !workspace.is_dir() {
@@ -2357,7 +2387,8 @@ async fn open_session_with_policy(
         id: session_id.clone(),
         owner_operation_id: command.operation_id.clone(),
         workspace: workspace.to_path_buf(),
-        model_id: requested_model.to_owned(),
+        requested_model: route.model_id.clone(),
+        effective_model: None,
         requested_effort: requested_effort.map(str::to_owned),
         effective_effort: category_config_value(
             &options,
@@ -2386,7 +2417,7 @@ async fn open_session_with_policy(
     session.close_supported = close_supported;
     journal
         .save_session(&json!({
-            "schema_version":1,
+            "schema_version":journal.session_schema_version(),
             "artifact_id":ACP_ARTIFACT_ID,
             "binding_id":command.binding_id,
             "binding_generation":command.generation,
@@ -2451,7 +2482,7 @@ async fn open_session_with_policy(
             )
         })?;
     if require_initial_values
-        && (!model_current_value_matches(&options, requested_model)
+        && (requested_model.is_some_and(|model| !model_current_value_matches(&options, model))
             || requested_effort.is_some_and(|effort| {
                 !category_config_value_matches(
                     &options,
@@ -2476,42 +2507,45 @@ async fn open_session_with_policy(
             "ACP live qualification requires the exact route values to match initial typed current values; no selector was changed",
         ));
     }
-    if !model_value_available(&options, requested_model) {
-        return Err(Error::new(
-            "ACP_SESSION_OPEN_UNKNOWN",
-            "ACP created a session but did not advertise one unambiguous typed option with the exact routed model value; the retained session requires readback",
-        ));
-    }
-    let option_id = model_config_option_id(&options, requested_model).ok_or_else(|| {
-        Error::new(
-            "ACP_SESSION_OPEN_UNKNOWN",
-            "ACP model option identity is ambiguous; the retained session requires readback",
+    if let Some(requested_model) = requested_model {
+        if !model_value_available(&options, requested_model) {
+            return Err(Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP did not advertise one unambiguous typed option with the exact routed model value; the retained session requires readback",
+            ));
+        }
+        let option_id = model_config_option_id(&options, requested_model).ok_or_else(|| {
+            Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP model option identity is ambiguous; the retained session requires readback",
+            )
+        })?;
+        let option = config_option_by_id(&options, &option_id).ok_or_else(|| {
+            Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP model option ID is missing or ambiguous in the advertised configuration",
+            )
+        })?;
+        options = set_select_config_option(
+            connection,
+            journal,
+            command,
+            &session_id,
+            SelectConfigSetting {
+                field: "model",
+                option,
+                requested: requested_model,
+            },
         )
-    })?;
-    let option = config_option_by_id(&options, &option_id).ok_or_else(|| {
-        Error::new(
-            "ACP_SESSION_OPEN_UNKNOWN",
-            "ACP model option ID is missing or ambiguous in the advertised configuration",
-        )
-    })?;
-    options = set_select_config_option(
-        connection,
-        journal,
-        command,
-        &session_id,
-        SelectConfigSetting {
-            field: "model",
-            option,
-            requested: requested_model,
-        },
-    )
-    .await?;
-    if !model_current_value_matches(&options, requested_model) {
-        return Err(Error::new(
-            "ACP_SESSION_OPEN_UNKNOWN",
-            "ACP effective model did not match the requested model; the retained session requires readback",
-        ));
+        .await?;
+        if !model_current_value_matches(&options, requested_model) {
+            return Err(Error::new(
+                "ACP_SESSION_OPEN_UNKNOWN",
+                "ACP effective model did not match the requested model; the retained session requires readback",
+            ));
+        }
     }
+    session.effective_model = effective_model_value(&options, requested_model);
     if let Some(effort) = requested_effort {
         let option = category_config_option(&options, &SessionConfigOptionCategory::ThoughtLevel)
             .filter(|option| config_select_contains(option, effort))
@@ -2574,7 +2608,7 @@ async fn open_session_with_policy(
     })?;
     journal
         .save_session(&json!({
-            "schema_version":1,
+            "schema_version":journal.session_schema_version(),
             "artifact_id":ACP_ARTIFACT_ID,
             "binding_id":command.binding_id,
             "binding_generation":command.generation,
@@ -2586,8 +2620,8 @@ async fn open_session_with_policy(
             "requested_model":requested_model,
             "requested_effort":session.requested_effort,
             "requested_mode":session.requested_mode,
-            "effective_model":requested_model,
-            "model_readback":requested_model,
+            "effective_model":session.effective_model,
+            "model_readback":session.effective_model,
             "effective_effort":session.effective_effort,
             "effective_mode":session.effective_mode,
             "config_options":config_snapshot,
@@ -2856,11 +2890,31 @@ fn validate_restore_identity(
     route: &Value,
     load_session_supported: bool,
 ) -> Result<RestoreIdentity> {
+    validate_restore_identity_for_schema(
+        saved,
+        binding_id,
+        generation,
+        route,
+        load_session_supported,
+        1,
+        false,
+    )
+}
+
+fn validate_restore_identity_for_schema(
+    saved: &Value,
+    binding_id: &str,
+    generation: i64,
+    route: &Value,
+    load_session_supported: bool,
+    session_schema_version: u8,
+    model_optional: bool,
+) -> Result<RestoreIdentity> {
     let session_text = saved["native_session_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid("retained ACP session has no native ID"))?;
-    if saved["schema_version"] != 1
+    if saved["schema_version"].as_u64() != Some(u64::from(session_schema_version))
         || saved["artifact_id"] != ACP_ARTIFACT_ID
         || saved["binding_id"] != binding_id
         || saved["binding_generation"].as_i64() != Some(generation)
@@ -2898,15 +2952,23 @@ fn validate_restore_identity(
             "retained ACP session workspace differs from the immutable binding route",
         ));
     }
-    let model_id = command_model(route)
-        .filter(|model| saved["requested_model"] == *model)
-        .ok_or_else(|| {
-            Error::new(
-                "NATIVE_IDENTITY_MISMATCH",
-                "retained ACP session model differs from the immutable binding route",
-            )
-        })?
-        .to_owned();
+    let requested_model = command_model(route).map(str::to_owned);
+    let model_field_present = route["native_options"]
+        .get("modelId")
+        .is_some_and(|value| !value.is_null());
+    if (requested_model.is_none() && !model_optional)
+        || (model_field_present && requested_model.is_none())
+        || saved["requested_model"] != json!(requested_model)
+        || (session_schema_version >= 2
+            && saved.as_object().is_none_or(|fields| {
+                !fields.contains_key("requested_model") || !fields.contains_key("effective_model")
+            }))
+    {
+        return Err(Error::new(
+            "NATIVE_IDENTITY_MISMATCH",
+            "retained ACP session model differs from the immutable binding route",
+        ));
+    }
     let requested_effort = command_effort(route).map(str::to_owned);
     if saved["requested_effort"].as_str() != requested_effort.as_deref() {
         return Err(Error::new(
@@ -2930,7 +2992,7 @@ fn validate_restore_identity(
         session_text: session_text.to_owned(),
         session_id,
         workspace,
-        model_id,
+        requested_model,
         requested_effort,
         requested_mode,
         owner_operation_id,
@@ -2984,15 +3046,22 @@ fn validate_restore_configuration(
     options: &[SessionConfigOption],
     modes: Option<&SessionModeState>,
     observed_mode_id: Option<&str>,
-    requested_model: &str,
+    requested_model: Option<&str>,
     requested_effort: Option<&str>,
     requested_mode: Option<&str>,
     saved: &Value,
-) -> Result<(Option<String>, Option<String>)> {
-    if !model_current_value_matches(options, requested_model) {
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let effective_model = effective_model_value(options, requested_model);
+    let retained_observed_model = saved["effective_model"].as_str();
+    if requested_model.is_some_and(|requested| effective_model.as_deref() != Some(requested))
+        || (saved["schema_version"].as_u64() == Some(2)
+            && requested_model.is_none()
+            && retained_observed_model
+                .is_some_and(|retained| effective_model.as_deref() != Some(retained)))
+    {
         return Err(Error::new(
             "RECOVERY_REQUIRED",
-            "ACP session/load did not read back the retained exact model",
+            "ACP session/load did not read back the retained model selection",
         ));
     }
     let effective_effort =
@@ -3023,7 +3092,7 @@ fn validate_restore_configuration(
             "ACP session/load did not read back the retained exact mode",
         ));
     }
-    Ok((effective_effort, effective_mode))
+    Ok((effective_model, effective_effort, effective_mode))
 }
 
 async fn restore_session(
@@ -3045,17 +3114,29 @@ async fn restore_session(
         session_text,
         session_id,
         workspace,
-        model_id,
+        requested_model,
         requested_effort,
         requested_mode,
         owner_operation_id,
-    } = validate_restore_identity(
-        &saved,
-        binding_id,
-        generation,
-        route,
-        features.load_session_supported,
-    )?;
+    } = if journal.session_schema_version() == 1 {
+        validate_restore_identity(
+            &saved,
+            binding_id,
+            generation,
+            route,
+            features.load_session_supported,
+        )?
+    } else {
+        validate_restore_identity_for_schema(
+            &saved,
+            binding_id,
+            generation,
+            route,
+            features.load_session_supported,
+            journal.session_schema_version(),
+            owner.host.profile.model_optional(),
+        )?
+    };
     journal.record_effect(
         command,
         "session/load",
@@ -3065,7 +3146,7 @@ async fn restore_session(
             "native_root_id":session_id,
             "native_scope_key":session_id,
             "workspace":workspace,
-            "requested_model":model_id,
+            "requested_model":requested_model,
             "native_replay":false
         }),
     )?;
@@ -3077,11 +3158,11 @@ async fn restore_session(
         .history_updates;
     let config_options = loaded.config_options.unwrap_or_default();
     let observed_mode_id = capture_mode_readback(capture)?.0;
-    let (effective_effort, effective_mode) = validate_restore_configuration(
+    let (effective_model, effective_effort, effective_mode) = validate_restore_configuration(
         &config_options,
         loaded.modes.as_ref(),
         observed_mode_id.as_deref(),
-        &model_id,
+        requested_model.as_deref(),
         requested_effort.as_deref(),
         requested_mode.as_deref(),
         &saved,
@@ -3103,7 +3184,7 @@ async fn restore_session(
             "native_session_id":session_id,
             "native_root_id":session_id,
             "native_scope_key":session_id,
-            "model_readback":model_id.clone(),
+            "model_readback":effective_model,
             "effort_readback":effective_effort,
             "mode_readback":effective_mode,
             "config_options":config_snapshot.clone(),
@@ -3122,7 +3203,8 @@ async fn restore_session(
         id: session_id,
         owner_operation_id,
         workspace,
-        model_id,
+        requested_model,
+        effective_model,
         requested_effort,
         effective_effort,
         requested_mode,
@@ -3135,7 +3217,8 @@ async fn restore_session(
     updated["native_close_capability"] = json!(close_supported);
     updated["agent_info"] = features.agent_info.clone().unwrap_or(Value::Null);
     updated["agent_capabilities"] = features.capabilities.clone();
-    updated["model_readback"] = json!(session.model_id.clone());
+    updated["effective_model"] = json!(session.effective_model.clone());
+    updated["model_readback"] = json!(session.effective_model.clone());
     updated["effective_effort"] = json!(session.effective_effort.clone());
     updated["effective_mode"] = json!(session.effective_mode.clone());
     updated["config_options"] = config_snapshot;
@@ -3574,6 +3657,7 @@ async fn process_control_during_turn(
     control: RuntimeCommand,
 ) -> Result<()> {
     context.journal.record_command(&control)?;
+    let mut keep_prompt_after_permission_cancel_unknown = false;
     let expected_native_root_id = context
         .session
         .as_ref()
@@ -3588,7 +3672,11 @@ async fn process_control_during_turn(
                 match cancel_active_turn(context, dispatch_command, &control).await {
                     Ok(outcome) => outcome,
                     Err(error) if is_uncertain_control_error(&error) => {
-                        context.link.recovery_required = true;
+                        keep_prompt_after_permission_cancel_unknown =
+                            is_pre_notification_permission_cancel_uncertain(&error);
+                        if !keep_prompt_after_permission_cancel_unknown {
+                            context.link.recovery_required = true;
+                        }
                         unknown_in_session(
                             &control,
                             context.session.as_ref().ok_or_else(|| {
@@ -3636,7 +3724,7 @@ async fn process_control_during_turn(
         .recovery
         .deliver_outcome(context.link, control, outcome)
         .await?;
-    if uncertain {
+    if uncertain && !keep_prompt_after_permission_cancel_unknown {
         return Err(Error::new(
             "ACP_CONTROL_EFFECT_UNKNOWN",
             "ACP control effect is uncertain; the exact native connection must be retired",
@@ -3720,11 +3808,8 @@ async fn cancel_active_turn_effect(
     if receipt.is_some() && intent.is_none() {
         return Err(invalid("ACP cancel receipt has no recorded intent"));
     }
-    if intent.is_none() {
-        journal.record_effect(control, "session/cancel", "intent", expected_effect)?;
-    }
-    cancel_pending_permissions(journal, permissions, control, &session.id).await?;
     if receipt.is_some() {
+        cancel_pending_permissions(journal, permissions, control, &session.id).await?;
         let mut outcome = applied_in_session(
             control,
             session,
@@ -3745,6 +3830,10 @@ async fn cancel_active_turn_effect(
             "ACP cancel intent exists without a confirmed receipt; notification will not be replayed",
         ));
     }
+    // Permission settlement is a pre-notification prerequisite. Keep its
+    // uncertainty separate from the session/cancel no-replay fence.
+    cancel_pending_permissions(journal, permissions, control, &session.id).await?;
+    journal.record_effect(control, "session/cancel", "intent", expected_effect)?;
     connection
         .send_notification(CancelNotification::new(session.id.clone()))
         .map_err(|_| {
@@ -3958,7 +4047,7 @@ async fn reply_to_permission(
     let request_id = reply["request_id"].clone();
     let fingerprint = reply["fingerprint"]
         .as_str()
-        .filter(|value| is_sha256(value))
+        .filter(|value| crate::is_lower_sha256_hex(value))
         .ok_or_else(|| Error::invalid("ACP permission reply fingerprint is invalid"))?;
     let option_id = reply["body"]["option_id"]
         .as_str()
@@ -4156,6 +4245,10 @@ fn permission_effect_id(key: &str) -> String {
 
 fn permission_cancel_effect_id(key: &str) -> String {
     format!("permission-cancel:{}", digest(key.as_bytes()))
+}
+
+fn is_pre_notification_permission_cancel_uncertain(error: &Error) -> bool {
+    error.code == "ACP_PERMISSION_CANCEL_UNKNOWN"
 }
 
 fn uncertain_acp_error(error: &Error) -> bool {
@@ -4423,6 +4516,46 @@ fn model_current_value_matches(options: &[SessionConfigOption], requested: &str)
         .is_some_and(|option| config_select_current(option).as_deref() == Some(requested))
 }
 
+fn model_current_value(options: &[SessionConfigOption]) -> Option<String> {
+    let mut candidates = options.iter().filter(|option| {
+        option.category.as_ref() == Some(&SessionConfigOptionCategory::Model)
+            && matches!(&option.kind, SessionConfigKind::Select(_))
+    });
+    let option = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let current = config_select_current(option)?;
+    (!current.is_empty()
+        && current.len() <= 256
+        && !current.chars().any(char::is_control)
+        && config_select_contains(option, &current))
+    .then_some(current)
+}
+
+fn effective_model_value(
+    options: &[SessionConfigOption],
+    requested: Option<&str>,
+) -> Option<String> {
+    match requested {
+        Some(requested) => model_config_option(options, requested)
+            .and_then(config_select_current)
+            .filter(|current| current == requested),
+        None => model_current_value(options),
+    }
+}
+
+fn session_model_status(requested: Option<&str>, effective: Option<&str>) -> &'static str {
+    match (requested, effective) {
+        (Some(requested), Some(effective)) if requested == effective => {
+            "verified_by_session_config_readback"
+        }
+        (Some(_), Some(_)) => "session_config_readback_mismatch",
+        (None, Some(_)) => "observed_by_session_config_readback",
+        _ => "unknown",
+    }
+}
+
 fn command_model(route: &Value) -> Option<&str> {
     route["native_options"]["modelId"]
         .as_str()
@@ -4442,6 +4575,18 @@ fn command_mode(route: &Value) -> Option<&str> {
 }
 
 fn validate_acp_route(route: &Value) -> Result<()> {
+    validate_acp_route_with_model_policy(route, false)
+}
+
+fn validate_acp_route_for_profile(route: &Value, profile: Profile) -> Result<()> {
+    if profile.model_optional() {
+        validate_acp_route_with_model_policy(route, true)
+    } else {
+        validate_acp_route(route)
+    }
+}
+
+fn validate_acp_route_with_model_policy(route: &Value, model_optional: bool) -> Result<()> {
     let options = route["native_options"]
         .as_object()
         .ok_or_else(|| Error::new("CONFIGURATION_UNSUPPORTED", "ACP route options are missing"))?;
@@ -4465,10 +4610,15 @@ fn validate_acp_route(route: &Value) -> Result<()> {
             "Command ACP route requires an absolute workspaceRoot",
         ));
     }
-    if command_model(route).is_none() {
+    if (options.contains_key("modelId")
+        && !options["modelId"].is_null()
+        && command_model(route).is_none())
+        || (!options.contains_key("modelId") && !model_optional)
+        || (options.get("modelId").is_some_and(Value::is_null) && !model_optional)
+    {
         return Err(Error::new(
             "COMMAND_MODEL_REQUIRED",
-            "Command ACP route requires an exact modelId",
+            "Command ACP route modelId must be an exact string when supplied",
         ));
     }
     for key in ["effort", "mode"] {
@@ -4591,6 +4741,24 @@ fn acp_state(
                 .iter()
                 .any(|capability| capability.as_str() == "native.command.close_session")
     });
+    let model_selection_capability = if owner.host.profile.model_optional() {
+        "native_acp_session_new_with_optional_model_readback"
+    } else {
+        "native_acp_session_new_with_model_readback"
+    };
+    let model_configuration_capability = if owner.host.profile.model_optional() {
+        "route_optional_model_effort_mode_at_open; runtime_agent.configure_unavailable"
+    } else {
+        "route_model_effort_mode_at_open; runtime_agent.configure_unavailable"
+    };
+    let effective_model_status = if ready {
+        session_model_status(
+            session.and_then(|saved| saved["requested_model"].as_str()),
+            session.and_then(|saved| saved["effective_model"].as_str()),
+        )
+    } else {
+        "unknown"
+    };
     json!({
         "phase":if ready {"ready"} else if session.is_some() {"recovery_required"} else {"sessionless"},
         "native_root_id":if paired_identity {json!(root)} else {Value::Null},
@@ -4605,7 +4773,7 @@ fn acp_state(
             "execution_shape":ACP_EXECUTION_SHAPE,
             "requested_model":command_model(&link.route),
             "effective_model":session.and_then(|s|s["effective_model"].as_str()),
-            "effective_model_status":if ready {"verified_by_session_config_readback"}else{"unknown"},
+            "effective_model_status":effective_model_status,
             "requested_effort":command_effort(&link.route),
             "effective_effort":session.and_then(|s|s["effective_effort"].as_str()),
             "effort_readback_status":if ready && session.and_then(|s|s["effective_effort"].as_str()).is_some() {"verified_by_session_config_readback"}else{"unknown_or_unadvertised"},
@@ -4613,13 +4781,13 @@ fn acp_state(
             "effective_mode":session.and_then(|s|s["effective_mode"].as_str()),
             "mode_readback_status":if ready && session.and_then(|s|s["effective_mode"].as_str()).is_some() {"verified_by_session_new_or_mode_update"}else{"unknown_or_unadvertised"},
             "capabilities":{
-                "open":"native_acp_session_new_with_model_readback",
+                "open":model_selection_capability,
                 "task_dispatch":"exact_store_task_prompt_v1_acp_prompt",
                 "reconcile":"durable_receipt_readback_no_prompt_replay",
                 "refresh":"exact_session_and_capture_readback",
                 "send":"next_turn_only",
                 "steer":"unavailable",
-                "configure":"route_model_effort_mode_at_open; runtime_agent.configure_unavailable",
+                "configure":model_configuration_capability,
                 "reply":"exact_live_permission_fingerprint_and_one_time_native_option",
                 "close":if close_supported {"advertised_session_close_with_response"} else {"unavailable"},
                 "recover":"exact_session_load_if_advertised; no_prompt_replay",
@@ -4649,7 +4817,8 @@ fn session_state(session: Option<&ActiveSession>) -> Value {
             "native_scope_key":session.id,
             "native_session_state":if session.closed {"closed"} else {"open"},
             "workspace":session.workspace,
-            "requested_model":session.model_id,
+            "requested_model":session.requested_model,
+            "effective_model":session.effective_model,
             "requested_effort":session.requested_effort,
             "effective_effort":session.effective_effort,
             "requested_mode":session.requested_mode,
@@ -4895,7 +5064,8 @@ mod tests {
         AcpJournal, AcpLineCodec, MAX_ACP_FRAME_BYTES, PreparedAcpDispatch, SelectConfigSetting,
         acp_prompt, add_family_custody_facts, capture_session_notification, digest,
         load_retained_session, set_select_config_option, stop_direct_child, validate_acp_route,
-        validate_restore_identity,
+        validate_acp_route_with_model_policy, validate_restore_identity,
+        validate_restore_identity_for_schema,
     };
 
     struct TestState {
@@ -4942,6 +5112,24 @@ mod tests {
                     .map_err(|_| super::invalid("host recovery fixture receiver was dropped"))?;
                 Ok(())
             })
+        }
+    }
+
+    struct PromptControlsFixture {
+        controls: std::collections::VecDeque<Value>,
+    }
+
+    impl super::HostCommandSource for PromptControlsFixture {
+        fn next<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = super::Result<Value>> + 'a>> {
+            Box::pin(async move {
+                self.controls
+                    .pop_front()
+                    .ok_or_else(|| super::invalid("prompt control fixture is exhausted"))
+            })
+        }
+
+        fn reconnect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = super::Result<()>> + 'a>> {
+            Box::pin(async { Err(super::invalid("prompt control fixture cannot reconnect")) })
         }
     }
 
@@ -5011,8 +5199,30 @@ mod tests {
             input_sha256: Some(input_sha256),
             target_input_sha256: None,
         };
-        let prepared = acp_prompt::prepare(&command)?;
+        let prepared = acp_prompt::prepare(&command, false)?;
         Ok((command, prepared))
+    }
+
+    #[test]
+    fn pr44_task_prompt_keeps_absent_and_null_model_as_unrequested() -> super::Result<()> {
+        for use_null in [false, true] {
+            let (mut command, _) = task_prompt_fixture()?;
+            let native_options = command.route["native_options"]
+                .as_object_mut()
+                .expect("fixture route options are an object");
+            if use_null {
+                native_options.insert("modelId".to_owned(), Value::Null);
+            } else {
+                native_options.remove("modelId");
+            }
+            let prepared = acp_prompt::prepare(&command, true)?;
+            assert_eq!(prepared.identity.requested_model, None);
+            assert_error_code(
+                acp_prompt::prepare(&command, false),
+                "COMMAND_MODEL_REQUIRED",
+            );
+        }
+        Ok(())
     }
 
     fn assert_error_code<T>(result: super::Result<T>, expected: &str) {
@@ -5103,6 +5313,27 @@ mod tests {
         selected["native_options"]["mode"] = json!("plan");
         assert!(validate_acp_route(&selected).is_ok());
 
+        let mut native_default = route.clone();
+        native_default["native_options"]
+            .as_object_mut()
+            .expect("route options are an object")
+            .remove("modelId");
+        assert!(validate_acp_route_with_model_policy(&native_default, true).is_ok());
+        assert_eq!(
+            validate_acp_route_with_model_policy(&native_default, false)
+                .unwrap_err()
+                .code,
+            "COMMAND_MODEL_REQUIRED"
+        );
+        native_default["native_options"]["modelId"] = Value::Null;
+        assert!(validate_acp_route_with_model_policy(&native_default, true).is_ok());
+        assert_eq!(
+            validate_acp_route_with_model_policy(&native_default, false)
+                .unwrap_err()
+                .code,
+            "COMMAND_MODEL_REQUIRED"
+        );
+
         let mut effort = route.clone();
         effort["native_options"]["effort"] = json!(7);
         assert_eq!(
@@ -5176,7 +5407,7 @@ mod tests {
         let identity = validate_restore_identity(&saved, "binding-fixture", 1, &route, true)?;
         assert_eq!(identity.session_text, "session-retained");
         assert_eq!(identity.session_id.to_string(), "session-retained");
-        assert_eq!(identity.model_id, "fixture-model");
+        assert_eq!(identity.requested_model.as_deref(), Some("fixture-model"));
         assert_eq!(identity.requested_effort, None);
         assert_eq!(identity.requested_mode, None);
 
@@ -5196,6 +5427,26 @@ mod tests {
         );
         assert_eq!(state.journal.read_session()?, Some(saved));
         assert_eq!(journal_effect_count(&state, &restore_command())?, 0);
+
+        let mut optional_saved = retained_session_fixture(&state);
+        optional_saved["schema_version"] = json!(2);
+        optional_saved["requested_model"] = Value::Null;
+        optional_saved["effective_model"] = json!("fixture-default");
+        let mut optional_route = restore_route(&state);
+        optional_route["native_options"]
+            .as_object_mut()
+            .expect("route options are an object")
+            .remove("modelId");
+        let optional_identity = validate_restore_identity_for_schema(
+            &optional_saved,
+            "binding-fixture",
+            1,
+            &optional_route,
+            true,
+            2,
+            true,
+        )?;
+        assert_eq!(optional_identity.requested_model, None);
 
         let mut configured_saved = retained_session_fixture(&state);
         configured_saved["requested_effort"] = json!("high");
@@ -5272,20 +5523,21 @@ mod tests {
             &options,
             Some(&modes),
             None,
-            "model-a",
+            Some("model-a"),
             Some("high"),
             Some("plan"),
             &saved,
         )?;
-        assert_eq!(readback.0.as_deref(), Some("high"));
-        assert_eq!(readback.1.as_deref(), Some("plan"));
+        assert_eq!(readback.0.as_deref(), Some("model-a"));
+        assert_eq!(readback.1.as_deref(), Some("high"));
+        assert_eq!(readback.2.as_deref(), Some("plan"));
 
         assert_error_code(
             super::validate_restore_configuration(
                 &options,
                 Some(&modes),
                 None,
-                "model-a",
+                Some("model-a"),
                 Some("default"),
                 Some("plan"),
                 &saved,
@@ -5297,7 +5549,7 @@ mod tests {
                 &options,
                 Some(&modes),
                 None,
-                "model-a",
+                Some("model-a"),
                 Some("high"),
                 Some("default"),
                 &saved,
@@ -5312,23 +5564,23 @@ mod tests {
                 &options,
                 None,
                 None,
-                "model-a",
+                Some("model-a"),
                 None,
                 None,
                 &old_receipt,
             )?,
-            (Some("high".to_owned()), None)
+            (Some("model-a".to_owned()), Some("high".to_owned()), None)
         );
         let mode_from_replay = super::validate_restore_configuration(
             &options,
             None,
             Some("plan"),
-            "model-a",
+            Some("model-a"),
             None,
             Some("plan"),
             &saved,
         )?;
-        assert_eq!(mode_from_replay.1.as_deref(), Some("plan"));
+        assert_eq!(mode_from_replay.2.as_deref(), Some("plan"));
 
         let mut typed_mode_options = options.clone();
         typed_mode_options.push(
@@ -5347,12 +5599,46 @@ mod tests {
             &typed_mode_options,
             None,
             None,
-            "model-a",
+            Some("model-a"),
             Some("high"),
             Some("plan"),
             &saved,
         )?;
-        assert_eq!(typed_mode_readback.1.as_deref(), Some("plan"));
+        assert_eq!(typed_mode_readback.2.as_deref(), Some("plan"));
+
+        let optional_saved = json!({
+            "schema_version":2,
+            "effective_model":"model-a",
+            "effective_effort":"high",
+            "effective_mode":"plan"
+        });
+        let observed_default = super::validate_restore_configuration(
+            &options,
+            Some(&modes),
+            None,
+            None,
+            Some("high"),
+            Some("plan"),
+            &optional_saved,
+        )?;
+        assert_eq!(observed_default.0.as_deref(), Some("model-a"));
+        assert_eq!(observed_default.1.as_deref(), Some("high"));
+        assert_eq!(observed_default.2.as_deref(), Some("plan"));
+
+        let mut changed_default = optional_saved.clone();
+        changed_default["effective_model"] = json!("different-model");
+        assert_error_code(
+            super::validate_restore_configuration(
+                &options,
+                Some(&modes),
+                None,
+                None,
+                Some("high"),
+                Some("plan"),
+                &changed_default,
+            ),
+            "RECOVERY_REQUIRED",
+        );
 
         typed_mode_options[2] = SessionConfigOption::select(
             "mode",
@@ -5369,7 +5655,7 @@ mod tests {
                 &typed_mode_options,
                 None,
                 None,
-                "model-a",
+                Some("model-a"),
                 Some("high"),
                 Some("plan"),
                 &saved,
@@ -5754,7 +6040,8 @@ mod tests {
             id: session_id.clone(),
             owner_operation_id: dispatch_command.operation_id.clone(),
             workspace: std::env::temp_dir(),
-            model_id: "fixture-model".to_owned(),
+            requested_model: Some("fixture-model".to_owned()),
+            effective_model: Some("fixture-model".to_owned()),
             requested_effort: None,
             effective_effort: None,
             requested_mode: None,
@@ -5881,6 +6168,590 @@ mod tests {
         .expect("host recovery fixture remains bounded")
         .expect("host recovery fixture succeeds");
         assert_eq!(journal_effect_count(&state, &count_command)?, 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_permission_cancel_unknown_keeps_exact_turn_cancel_path()
+    -> super::Result<()> {
+        let state = TestState::new()?;
+        let (dispatch_command, _) = task_prompt_fixture()?;
+        let session_id = SessionId::new("session-permission-cancel-uncertain-fixture");
+        let session = super::ActiveSession {
+            id: session_id.clone(),
+            owner_operation_id: dispatch_command.operation_id.clone(),
+            workspace: std::env::temp_dir(),
+            requested_model: Some("fixture-model".to_owned()),
+            effective_model: Some("fixture-model".to_owned()),
+            requested_effort: None,
+            effective_effort: None,
+            requested_mode: None,
+            effective_mode: None,
+            close_supported: true,
+            closed: false,
+        };
+        let exact_cancel = || {
+            let mut command = permission_reply_command();
+            command.method = "native.command.cancel_turn".to_owned();
+            command.binding_id = dispatch_command.binding_id.clone();
+            command.generation = dispatch_command.generation;
+            command.input = json!({
+                "session_id":session_id,
+                "target_operation_id":dispatch_command.operation_id,
+                "turn_id":dispatch_command.operation_id
+            });
+            command
+        };
+        let first_cancel = exact_cancel();
+        let retry_cancel = exact_cancel();
+        let maybe_written_cancel = exact_cancel();
+
+        let request_id = json!("permission-request-uncertain");
+        let key = serde_json::to_string(&request_id)?;
+        let fingerprint = digest(b"permission response may have been written");
+        let permissions: super::PermissionBroker =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (permission_reply, _permission_response) = tokio::sync::oneshot::channel();
+        let (acknowledgement_sender, acknowledgement) = tokio::sync::oneshot::channel();
+        acknowledgement_sender
+            .send(false)
+            .expect("fixture reports that permission response was not confirmed written");
+        permissions.lock().expect("permission broker lock").insert(
+            key.clone(),
+            super::PendingPermission {
+                session_id: session_id.to_string(),
+                request_id,
+                fingerprint,
+                options: Vec::new(),
+                reply: permission_reply,
+                acknowledgement,
+            },
+        );
+
+        let (transport, mut peer) = Channel::duplex();
+        let journal = state.journal.clone();
+        let dispatch_for_client = dispatch_command.clone();
+        let session_for_client = session.clone();
+        let permissions_for_client = Arc::clone(&permissions);
+        let first_cancel_for_client = first_cancel.clone();
+        let retry_cancel_for_client = retry_cancel.clone();
+        let maybe_written_cancel_for_client = maybe_written_cancel.clone();
+        let prompt_session_id = session_id.clone();
+        let key_for_client = key.clone();
+        let client = Client
+            .builder()
+            .connect_with(transport, async move |connection| {
+                let request = connection
+                    .send_request(super::PromptRequest::new(
+                        prompt_session_id,
+                        vec![ContentBlock::Text(TextContent::new("fixture-only"))],
+                    ))
+                    .block_task();
+                tokio::pin!(request);
+                let permission_wakeup = tokio::sync::Notify::new();
+                let mut source = PromptControlsFixture {
+                    controls: vec![
+                        json!({"command":first_cancel_for_client}),
+                        json!({"command":retry_cancel_for_client}),
+                    ]
+                    .into_iter()
+                    .collect(),
+                };
+
+                let super::PromptEvent::Host(first_message) =
+                    super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup)
+                        .await
+                else {
+                    panic!("the active prompt receives the first exact-turn cancel")
+                };
+                let first_control: RuntimeCommand =
+                    serde_json::from_value(first_message["command"].clone())
+                        .expect("fixture control is a RuntimeCommand");
+                let permission_error = match super::cancel_active_turn_effect(
+                    &connection,
+                    &journal,
+                    &permissions_for_client,
+                    &dispatch_for_client,
+                    &first_control,
+                    &session_for_client,
+                )
+                .await
+                {
+                    Err(error) => error,
+                    Ok(_) => {
+                        return Err(super::to_acp_error(super::invalid(
+                            "permission uncertainty was marked applied",
+                        )));
+                    }
+                };
+                assert_eq!(permission_error.code, "ACP_PERMISSION_CANCEL_UNKNOWN");
+                assert!(super::is_pre_notification_permission_cancel_uncertain(
+                    &permission_error
+                ));
+                let first_unknown = super::unknown_in_session(
+                    &first_control,
+                    &session_for_client,
+                    &permission_error.code,
+                );
+                assert_eq!(first_unknown.outcome, EffectOutcome::Unknown);
+                assert!(
+                    journal
+                        .read_effect(&first_control, "session/cancel", "intent")
+                        .map_err(super::to_acp_error)?
+                        .is_none()
+                );
+                let permission_effect = super::permission_cancel_effect_id(&key_for_client);
+                assert!(
+                    journal
+                        .read_effect(&first_control, &permission_effect, "intent")
+                        .map_err(super::to_acp_error)?
+                        .is_some()
+                );
+                assert!(
+                    journal
+                        .read_effect(&first_control, &permission_effect, "receipt")
+                        .map_err(super::to_acp_error)?
+                        .is_none()
+                );
+
+                let super::PromptEvent::Host(retry_message) =
+                    super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup)
+                        .await
+                else {
+                    panic!("the same prompt remains active for a subsequent exact cancel")
+                };
+                let retry_control: RuntimeCommand =
+                    serde_json::from_value(retry_message["command"].clone())
+                        .expect("fixture retry is a RuntimeCommand");
+                assert_eq!(
+                    retry_control.input["target_operation_id"],
+                    dispatch_for_client.operation_id
+                );
+                assert_eq!(
+                    retry_control.input["session_id"],
+                    session_for_client.id.to_string()
+                );
+                let retry_outcome = super::cancel_active_turn_effect(
+                    &connection,
+                    &journal,
+                    &permissions_for_client,
+                    &dispatch_for_client,
+                    &retry_control,
+                    &session_for_client,
+                )
+                .await
+                .map_err(super::to_acp_error)?;
+                assert_eq!(retry_outcome.outcome, EffectOutcome::Applied);
+                assert_eq!(retry_outcome.details["cancel"], "notification_sent");
+
+                let expected_intent = json!({
+                    "native_session_id":session_for_client.id,
+                    "target_operation_id":dispatch_for_client.operation_id,
+                    "turn_id":dispatch_for_client.operation_id
+                });
+                journal
+                    .record_effect(
+                        &maybe_written_cancel_for_client,
+                        "session/cancel",
+                        "intent",
+                        expected_intent,
+                    )
+                    .map_err(super::to_acp_error)?;
+                let fenced_error = match super::cancel_active_turn_effect(
+                    &connection,
+                    &journal,
+                    &permissions_for_client,
+                    &dispatch_for_client,
+                    &maybe_written_cancel_for_client,
+                    &session_for_client,
+                )
+                .await
+                {
+                    Err(error) => error,
+                    Ok(_) => {
+                        return Err(super::to_acp_error(super::invalid(
+                            "possibly written cancel was replayed",
+                        )));
+                    }
+                };
+                assert_eq!(fenced_error.code, "ACP_CANCEL_UNKNOWN");
+                let fenced_unknown = super::unknown_in_session(
+                    &maybe_written_cancel_for_client,
+                    &session_for_client,
+                    &fenced_error.code,
+                );
+                assert_eq!(fenced_unknown.outcome, EffectOutcome::Unknown);
+                Ok::<(), agent_client_protocol::Error>(())
+            });
+        let peer = async move {
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(prompt))) =
+                peer.rx.next().await
+            else {
+                panic!("the fixture starts one native prompt")
+            };
+            assert_eq!(prompt.method.as_ref(), "session/prompt");
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Notification(cancel))) =
+                peer.rx.next().await
+            else {
+                panic!("the later exact-turn cancel reaches the native session")
+            };
+            assert_eq!(cancel.method.as_ref(), "session/cancel");
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("permission uncertainty fixture remains bounded")
+        .expect("permission uncertainty fixture succeeds");
+
+        let permission_effect = super::permission_cancel_effect_id(&key);
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, "session/cancel", "intent")?
+                .is_none()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, &permission_effect, "intent")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, &permission_effect, "receipt")?
+                .is_none()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&retry_cancel, "session/cancel", "intent")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&retry_cancel, "session/cancel", "receipt")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&maybe_written_cancel, "session/cancel", "receipt")?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr44_command_acp_production_control_keeps_prompt_on_permission_cancel_unknown()
+    -> super::Result<()> {
+        let state = TestState::new()?;
+        let (mut dispatch_command, _) = task_prompt_fixture()?;
+        dispatch_command.route["module_artifact_id"] = json!(crate::ACP_ARTIFACT_ID);
+        let session_id = SessionId::new("session-production-cancel-unknown-fixture");
+        let session = super::ActiveSession {
+            id: session_id.clone(),
+            owner_operation_id: dispatch_command.operation_id.clone(),
+            workspace: std::env::temp_dir(),
+            requested_model: Some("fixture-model".to_owned()),
+            effective_model: Some("fixture-model".to_owned()),
+            requested_effort: None,
+            effective_effort: None,
+            requested_mode: None,
+            effective_mode: None,
+            close_supported: true,
+            closed: false,
+        };
+        let exact_cancel = || {
+            let mut command = permission_reply_command();
+            command.method = "native.command.cancel_turn".to_owned();
+            command.binding_id = dispatch_command.binding_id.clone();
+            command.generation = dispatch_command.generation;
+            command.route = dispatch_command.route.clone();
+            command.native_root_id = Some(session_id.to_string());
+            command.input = json!({
+                "client_request_id": command.operation_id,
+                "binding_id": command.binding_id,
+                "generation": command.generation,
+                "session_id": session_id,
+                "target_operation_id": dispatch_command.operation_id,
+                "turn_id": dispatch_command.operation_id
+            });
+            let input_bytes = serde_json::to_vec(&command.input).expect("cancel input serializes");
+            command.input_sha256 = Some(digest(input_bytes.as_slice()));
+            command
+        };
+        let first_cancel = exact_cancel();
+        let retry_cancel = exact_cancel();
+        let maybe_written_cancel = exact_cancel();
+        let request_id = json!("permission-request-production-unknown");
+        let key = serde_json::to_string(&request_id)?;
+        let fingerprint = digest(b"permission response may have been written");
+        let permissions: super::PermissionBroker =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (permission_reply, _permission_response) = tokio::sync::oneshot::channel();
+        let (acknowledgement_sender, acknowledgement) = tokio::sync::oneshot::channel();
+        acknowledgement_sender
+            .send(false)
+            .expect("fixture reports permission response not written");
+        permissions.lock().expect("permission broker lock").insert(
+            key.clone(),
+            super::PendingPermission {
+                session_id: session_id.to_string(),
+                request_id,
+                fingerprint,
+                options: Vec::new(),
+                reply: permission_reply,
+                acknowledgement,
+            },
+        );
+        let fake_host_dir =
+            std::env::temp_dir().join(format!("swarm-acp-fake-store-{}", Uuid::new_v4()));
+        fs::create_dir_all(&fake_host_dir)?;
+        let mut fake_listener = swarm_kernel_host::ipc::Listener::bind(&fake_host_dir)
+            .map_err(|_| super::invalid("fake Store IPC bind failed"))?;
+        let fake_server = tokio::spawn(async move {
+            use futures::{SinkExt as _, StreamExt as _};
+            let Ok(stream) = fake_listener.accept().await else {
+                return;
+            };
+            let (read, write) = tokio::io::split(stream);
+            let mut reader = tokio_util::codec::FramedRead::new(
+                read,
+                tokio_util::codec::LinesCodec::new_with_max_length(1024 * 1024),
+            );
+            let mut writer = tokio_util::codec::FramedWrite::new(
+                write,
+                tokio_util::codec::LinesCodec::new_with_max_length(1024 * 1024),
+            );
+            while let Some(line) = reader.next().await {
+                let Ok(line) = line else {
+                    break;
+                };
+                let request: Value = serde_json::from_str(&line).unwrap_or(json!({}));
+                let id = request["id"].clone();
+                let reply = json!({"jsonrpc": "2.0", "id": id, "result": {}});
+                let Ok(encoded) = serde_json::to_string(&reply) else {
+                    break;
+                };
+                if writer.send(encoded).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let fake_credential = swarm_contracts::Credential {
+            client_id: "fake-store-client".to_owned(),
+            token: "fake-store-token".to_owned(),
+        };
+        let fake_ipc_config = swarm_client::IpcConfig::default();
+        let fake_module_link =
+            swarm_client::ModuleLink::connect(&fake_host_dir, &fake_credential, &fake_ipc_config)
+                .await?;
+        let mut descriptor_value: Value =
+            serde_json::from_str(include_str!("../../module-descriptor-acp.template.json"))
+                .expect("maintained ACP descriptor parses");
+        descriptor_value["enabled"] = json!(true);
+        descriptor_value["launch"]["executable"] =
+            json!(std::env::current_exe().expect("test executable path"));
+        descriptor_value["launch"]["argv"] = json!([]);
+        descriptor_value["launch"]["credential_ref"] =
+            json!("qualification:pr44-production-cancel-unknown");
+        let descriptor: swarm_contracts::module_catalog::ModuleDescriptor =
+            serde_json::from_value(descriptor_value).expect("ACP descriptor is typed");
+        let claim = swarm_contracts::module_contract::ModuleContractClaim::from_descriptor(
+            &descriptor,
+            swarm_contracts::module_contract::MODULE_PROTOCOL_V1,
+        )
+        .expect("descriptor yields claim");
+        let owner = super::super::Owner {
+            state_dir: state.state_dir.clone(),
+            token: "production-cancel-unknown-token".to_owned(),
+            record: json!({"version": 1, "token": "production-cancel-unknown-token"}),
+            host: crate::module_host::ModuleHostIdentity {
+                claim,
+                profile: crate::Profile::AcpV2,
+                boot_id: Uuid::new_v4().to_string(),
+                binding_id: dispatch_command.binding_id.clone(),
+                generation: dispatch_command.generation,
+                module_client_id: fake_credential.client_id.clone(),
+                credential_file: fake_host_dir.join("fake-credential.json"),
+            },
+        };
+        let config = super::super::Config {
+            module_artifact_id: crate::ACP_ARTIFACT_ID.to_owned(),
+            command: std::env::temp_dir().join("unused-production-cancel"),
+            command_args: Vec::new(),
+            mod_path: None,
+            run_timeout_ms: None,
+            host_connection: None,
+        };
+        let link = super::super::Link {
+            client: fake_module_link,
+            binding_id: dispatch_command.binding_id.clone(),
+            generation: dispatch_command.generation,
+            route: dispatch_command.route.clone(),
+            profile: crate::Profile::AcpV2,
+            recovery_required: false,
+        };
+        let (transport, mut peer) = Channel::duplex();
+        let dispatch_for_client = dispatch_command.clone();
+        let permissions_for_client = Arc::clone(&permissions);
+        let first_for_client = first_cancel.clone();
+        let retry_for_client = retry_cancel.clone();
+        let maybe_for_client = maybe_written_cancel.clone();
+        let prompt_session_id = session_id.clone();
+        let key_for_client = key.clone();
+        let journal_for_client = state.journal.clone();
+        let session_for_client = session.clone();
+        let capture_for_client: Arc<Mutex<super::Capture>> =
+            Arc::new(Mutex::new(super::Capture::default()));
+        let features_for_client = super::AgentFeatures {
+            close_supported: true,
+            load_session_supported: false,
+            agent_info: None,
+            capabilities: json!({}),
+        };
+        let client = Client.builder().connect_with(transport, async move |connection| {
+            let mut link = link;
+            let owner = owner;
+            let config = config;
+            let capture = capture_for_client;
+            let journal = journal_for_client;
+            let recovery = super::ModuleLinkRecovery { config: &config, credential: &fake_credential, owner: &owner, journal: &journal, capture: &capture };
+            let request = connection.send_request(super::PromptRequest::new(prompt_session_id, vec![ContentBlock::Text(TextContent::new("fixture-only"))])).block_task();
+            tokio::pin!(request);
+            let permission_wakeup = tokio::sync::Notify::new();
+            let observation_sequence = Arc::new(Mutex::new(1_u64));
+            let workspace_buf = std::env::temp_dir();
+            let model_string = "fixture-model".to_owned();
+            let mut session_state = Some(session_for_client);
+            let mut source = PromptControlsFixture { controls: vec![json!({"command": first_for_client}), json!({"command": retry_for_client})].into_iter().collect() };
+            let super::PromptEvent::Host(first_message) = super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup).await else { panic!("active prompt receives first cancel") };
+            let first_control: RuntimeCommand = serde_json::from_value(first_message["command"].clone()).expect("control is RuntimeCommand");
+            {
+                let mut context = super::CommandContext { connection: &connection, link: &mut link, recovery: &recovery, owner: &owner, journal: &journal, features: &features_for_client, session: &mut session_state, workspace: Some(workspace_buf.as_path()), model: Some(model_string.as_str()), capture: &capture, permissions: &permissions_for_client, permission_wakeup: &permission_wakeup, observation_sequence: &observation_sequence };
+                super::process_control_during_turn(&mut context, &dispatch_for_client, first_control.clone()).await.map_err(super::to_acp_error)?;
+                assert!(!context.link.recovery_required, "pre-notification permission uncertainty keeps link");
+                let (first_outcome, _) = context.journal.read_outcome(&first_control.operation_id).map_err(super::to_acp_error)?.expect("first Unknown published");
+                assert_eq!(first_outcome.outcome, EffectOutcome::Unknown);
+                let permission_effect = super::permission_cancel_effect_id(&key_for_client);
+                assert!(context.journal.read_effect(&first_control, &permission_effect, "intent").map_err(super::to_acp_error)?.is_some());
+                assert!(context.journal.read_effect(&first_control, &permission_effect, "receipt").map_err(super::to_acp_error)?.is_none());
+                assert!(context.journal.read_effect(&first_control, "session/cancel", "intent").map_err(super::to_acp_error)?.is_none());
+            }
+            let super::PromptEvent::Host(retry_message) = super::next_prompt_event(request.as_mut(), &mut source, &permission_wakeup).await else { panic!("same prompt stays active for retry") };
+            let retry_control: RuntimeCommand = serde_json::from_value(retry_message["command"].clone()).expect("retry is RuntimeCommand");
+            assert_eq!(retry_control.input["target_operation_id"], dispatch_for_client.operation_id);
+            {
+                let mut context = super::CommandContext { connection: &connection, link: &mut link, recovery: &recovery, owner: &owner, journal: &journal, features: &features_for_client, session: &mut session_state, workspace: Some(workspace_buf.as_path()), model: Some(model_string.as_str()), capture: &capture, permissions: &permissions_for_client, permission_wakeup: &permission_wakeup, observation_sequence: &observation_sequence };
+                super::process_control_during_turn(&mut context, &dispatch_for_client, retry_control.clone()).await.map_err(super::to_acp_error)?;
+                assert!(!context.link.recovery_required);
+                let (retry_outcome, _) = context.journal.read_outcome(&retry_control.operation_id).map_err(super::to_acp_error)?.expect("retry Applied published");
+                assert_eq!(retry_outcome.outcome, EffectOutcome::Applied);
+                assert_eq!(retry_outcome.details["cancel"], "notification_sent");
+                assert!(context.journal.read_effect(&retry_control, "session/cancel", "intent").map_err(super::to_acp_error)?.is_some());
+                assert!(context.journal.read_effect(&retry_control, "session/cancel", "receipt").map_err(super::to_acp_error)?.is_some());
+            }
+            {
+                let expected_intent = json!({"native_session_id": session_state.as_ref().expect("session open").id, "target_operation_id": dispatch_for_client.operation_id, "turn_id": dispatch_for_client.operation_id});
+                journal.record_effect(&maybe_for_client, "session/cancel", "intent", expected_intent).map_err(super::to_acp_error)?;
+                let mut context = super::CommandContext { connection: &connection, link: &mut link, recovery: &recovery, owner: &owner, journal: &journal, features: &features_for_client, session: &mut session_state, workspace: Some(workspace_buf.as_path()), model: Some(model_string.as_str()), capture: &capture, permissions: &permissions_for_client, permission_wakeup: &permission_wakeup, observation_sequence: &observation_sequence };
+                let fenced = match super::process_control_during_turn(&mut context, &dispatch_for_client, maybe_for_client.clone()).await { Err(error) => error, Ok(()) => return Err(super::to_acp_error(super::invalid("possibly written cancel replayed"))) };
+                assert_eq!(fenced.code, "ACP_CONTROL_EFFECT_UNKNOWN");
+                assert!(context.link.recovery_required, "other uncertainty retires link");
+                let (fenced_outcome, _) = context.journal.read_outcome(&maybe_for_client.operation_id).map_err(super::to_acp_error)?.expect("fenced Unknown published");
+                assert_eq!(fenced_outcome.outcome, EffectOutcome::Unknown);
+            }
+            Ok::<(), agent_client_protocol::Error>(())
+        });
+        let (connection_done_tx, connection_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let client = async move {
+            let result = client.await;
+            let _ = connection_done_tx.send(());
+            result
+        };
+        let peer = async move {
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Request(prompt))) =
+                peer.rx.next().await
+            else {
+                panic!("fixture starts one prompt")
+            };
+            assert_eq!(prompt.method.as_ref(), "session/prompt");
+            let Some(TransportFrame::Single(RawJsonRpcMessage::Notification(cancel))) =
+                peer.rx.next().await
+            else {
+                panic!("later exact cancel reaches native once")
+            };
+            assert_eq!(cancel.method.as_ref(), "session/cancel");
+            // The physical receiver must outlive the client's final control
+            // ACK and connection drain; EOF here would be a transport fault.
+            let _ = connection_done_rx.await;
+            drop(peer);
+            Ok::<(), agent_client_protocol::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::try_join!(client, peer)
+        })
+        .await
+        .expect("production fixture bounded")
+        .expect("production fixture succeeds");
+        fake_server.abort();
+        let _ = fs::remove_dir_all(&fake_host_dir);
+        let permission_effect = super::permission_cancel_effect_id(&key);
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, "session/cancel", "intent")?
+                .is_none()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, &permission_effect, "intent")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&first_cancel, &permission_effect, "receipt")?
+                .is_none()
+        );
+        let (first_saved, _) = state
+            .journal
+            .read_outcome(&first_cancel.operation_id)?
+            .expect("first Unknown readable");
+        assert_eq!(first_saved.outcome, EffectOutcome::Unknown);
+        assert!(
+            state
+                .journal
+                .read_effect(&retry_cancel, "session/cancel", "intent")?
+                .is_some()
+        );
+        assert!(
+            state
+                .journal
+                .read_effect(&retry_cancel, "session/cancel", "receipt")?
+                .is_some()
+        );
+        let (retry_saved, _) = state
+            .journal
+            .read_outcome(&retry_cancel.operation_id)?
+            .expect("retry Applied readable");
+        assert_eq!(retry_saved.outcome, EffectOutcome::Applied);
+        assert!(
+            state
+                .journal
+                .read_effect(&maybe_written_cancel, "session/cancel", "receipt")?
+                .is_none()
+        );
+        let (fenced_saved, _) = state
+            .journal
+            .read_outcome(&maybe_written_cancel.operation_id)?
+            .expect("fenced Unknown readable");
+        assert_eq!(fenced_saved.outcome, EffectOutcome::Unknown);
         Ok(())
     }
 

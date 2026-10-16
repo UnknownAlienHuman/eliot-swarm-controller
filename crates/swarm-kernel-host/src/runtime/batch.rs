@@ -14,9 +14,10 @@ use swarm_contracts::{runtime::TaskDispatchContext, task_prompt::TaskPromptEnvel
 
 pub const EXECUTION_SHAPE: &str = "sessionless_batch";
 pub const COMMAND_RUNTIME: &str = "command";
-pub const COMMAND_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.5";
-pub const COMMAND_PREVIOUS_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.4";
-pub const COMMAND_HISTORICAL_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.3";
+pub const COMMAND_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.6";
+pub const COMMAND_PREVIOUS_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.5";
+pub const COMMAND_HISTORICAL_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.4";
+pub const COMMAND_OLDER_HISTORICAL_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.3";
 pub const COMMAND_LEGACY_ARTIFACT_ID: &str = "command-mod-0.1.0-glue.2";
 pub const COMMAND_RUST_ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 pub const BATCH_OUTPUTS: [&str; 3] = ["result.json", "thread.md", "thread.json"];
@@ -33,6 +34,7 @@ pub fn is_command_route(route: &Value) -> bool {
                 COMMAND_ARTIFACT_ID
                     | COMMAND_PREVIOUS_ARTIFACT_ID
                     | COMMAND_HISTORICAL_ARTIFACT_ID
+                    | COMMAND_OLDER_HISTORICAL_ARTIFACT_ID
                     | COMMAND_RUST_ARTIFACT_ID
             )
         )
@@ -42,7 +44,11 @@ fn is_historical_command_route(route: &Value) -> bool {
     route["runtime"] == COMMAND_RUNTIME
         && matches!(
             route["module_artifact_id"].as_str(),
-            Some(COMMAND_PREVIOUS_ARTIFACT_ID | COMMAND_HISTORICAL_ARTIFACT_ID)
+            Some(
+                COMMAND_PREVIOUS_ARTIFACT_ID
+                    | COMMAND_HISTORICAL_ARTIFACT_ID
+                    | COMMAND_OLDER_HISTORICAL_ARTIFACT_ID
+            )
         )
 }
 
@@ -509,6 +515,20 @@ mod tests {
         assert!(is_sessionless_route(&zed_route()));
         assert!(supports(&zed_route(), "agent.result"));
         assert!(!supports(&zed_route(), "agent.send"));
+        let previous_zed = json!({
+            "runtime":crate::runtime::zed::RUNTIME,
+            "module_artifact_id":crate::runtime::zed::PREVIOUS_ARTIFACT_ID
+        });
+        assert!(is_sessionless_route(&previous_zed));
+        assert!(supports(&previous_zed, "task.dispatch"));
+        assert!(crate::runtime::zed::is_task_prompt_route(&previous_zed));
+        let legacy_zed = json!({
+            "runtime":crate::runtime::zed::RUNTIME,
+            "module_artifact_id":crate::runtime::zed::LEGACY_ARTIFACT_ID
+        });
+        assert!(is_sessionless_route(&legacy_zed));
+        assert!(supports(&legacy_zed, "agent.reconcile"));
+        assert!(!supports(&legacy_zed, "task.dispatch"));
         assert!(!is_sessionless_route(&json!({
             "runtime":"zed",
             "module_artifact_id":"unrecognized"

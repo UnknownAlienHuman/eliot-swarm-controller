@@ -14,8 +14,6 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
-const OPENCODE_VERSION: &str = "2.0.7";
-const MCP_API_CONTRACT: &str = "@opencode/protocol 2.0.7 mcp.list";
 const SERVICE_IDENTITY_BASIS: &str = "explicit_route_id_and_verified_connection_pid_version";
 type BindingRouteFacts = (String, String, Option<String>, Option<i64>, String);
 
@@ -375,7 +373,7 @@ fn valid_opaque_ref(value: &str, prefix: &str) -> bool {
 struct ReadbackRouteIdentity {
     directory: String,
     service_id: String,
-    expected_version: String,
+    expected_version: Option<String>,
     expected_process_id: Option<u32>,
 }
 
@@ -393,7 +391,7 @@ fn owned_readback_route_identity(
     })?;
     if process_id == 0
         || options.service_id != verified_service_id
-        || options.expected_version != verified_version
+        || options.expected_version.as_deref() != Some(verified_version)
     {
         return Err(Error::new(
             "NATIVE_MCP_ROUTE_MISMATCH",
@@ -403,7 +401,7 @@ fn owned_readback_route_identity(
     Ok(ReadbackRouteIdentity {
         directory: directory.to_owned(),
         service_id: verified_service_id.to_owned(),
-        expected_version: verified_version.to_owned(),
+        expected_version: Some(verified_version.to_owned()),
         expected_process_id: Some(process_id),
     })
 }
@@ -422,16 +420,25 @@ fn external_readback_route_identity(route: &Value) -> Result<ReadbackRouteIdenti
             "OpenCode binding has no explicit native service ID",
         )
     })?;
-    let expected_version = options["expected_version"].as_str().ok_or_else(|| {
-        Error::new(
-            "NATIVE_MCP_ROUTE_MISMATCH",
-            "OpenCode binding has no explicit native version",
-        )
-    })?;
+    let expected_version = options
+        .get("expected_version")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|version| !version.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    Error::new(
+                        "NATIVE_MCP_ROUTE_MISMATCH",
+                        "OpenCode version override is invalid",
+                    )
+                })
+        })
+        .transpose()?;
     Ok(ReadbackRouteIdentity {
         directory: directory.to_owned(),
         service_id: service_id.to_owned(),
-        expected_version: expected_version.to_owned(),
+        expected_version,
         expected_process_id: None,
     })
 }
@@ -470,14 +477,33 @@ fn validate_readback_source_identity(
                     .is_some_and(|id| !id.is_empty() && id.len() <= 256)
         }
     };
+    let source_version = source["service_version"]
+        .as_str()
+        .filter(|version| {
+            !version.is_empty()
+                && version.len() <= 128
+                && version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".+_-".contains(&byte))
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "NATIVE_MCP_ROUTE_MISMATCH",
+                "native service version fact is invalid",
+            )
+        })?;
+    let expected_api_contract =
+        crate::native_mcp::opencode_mcp_api_contract_for_version(source_version);
     if !source_matches
-        || identity.expected_version != OPENCODE_VERSION
-        || source["api_contract"] != MCP_API_CONTRACT
+        || identity
+            .expected_version
+            .as_deref()
+            .is_some_and(|expected| expected != source_version)
+        || source["api_contract"].as_str() != Some(expected_api_contract)
         || source["api_method"] != "GET /api/mcp"
         || source["api_scope"] != "configured_server_connection_status_only"
         || source["service_id"] != identity.service_id
         || source["service_identity_basis"] != SERVICE_IDENTITY_BASIS
-        || source["service_version"] != identity.expected_version
         || !expected_pid_matches
         || source["directory_sha256"] != directory_digest
     {

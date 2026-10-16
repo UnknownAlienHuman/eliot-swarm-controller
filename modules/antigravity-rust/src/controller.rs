@@ -181,10 +181,10 @@ impl Controller {
         }
         let requested_model = selected_model_id(&command.route)
             .map_err(|code| {
-                swarm_contracts::error::Error::new(code, "native route model ID is required")
+                swarm_contracts::error::Error::new(code, "native route model override is invalid")
             })?
-            .to_owned();
-        self.requested_model_id = Some(requested_model);
+            .map(str::to_owned);
+        self.requested_model_id = requested_model;
         self.model_readback_state = None;
         self.open_failure_code = None;
         self.stream
@@ -214,31 +214,37 @@ impl Controller {
                 "native session initialization has not been observed",
             )
         })?;
-        let Some(requested_model) = self.requested_model_id.clone() else {
-            self.open_failure_code = Some("NATIVE_MODEL_ID_UNAVAILABLE");
-            self.model_readback_state = Some("not_observed");
-            return Err(swarm_contracts::error::Error::new(
-                "NATIVE_MODEL_ID_UNAVAILABLE",
-                "the selected native route model is unavailable for init verification",
-            ));
-        };
-        let Some(observed_model) = init.model.as_deref() else {
-            self.open_failure_code = Some("NATIVE_MODEL_READBACK_MISSING");
-            self.model_readback_state = Some("not_observed");
-            return Err(swarm_contracts::error::Error::new(
-                "NATIVE_MODEL_READBACK_MISSING",
-                "native init did not report the explicitly selected model",
-            ));
-        };
-        if observed_model != requested_model {
-            self.open_failure_code = Some("NATIVE_MODEL_READBACK_MISMATCH");
-            self.model_readback_state = Some("mismatch");
-            return Err(swarm_contracts::error::Error::new(
-                "NATIVE_MODEL_READBACK_MISMATCH",
-                "native init model differs from the current native route selection",
-            ));
+        let requested_model = self.requested_model_id.clone();
+        match requested_model.as_deref() {
+            Some(requested_model) => {
+                let Some(observed_model) = init.model.as_deref() else {
+                    self.open_failure_code = Some("NATIVE_MODEL_READBACK_MISSING");
+                    self.model_readback_state = Some("not_observed");
+                    return Err(swarm_contracts::error::Error::new(
+                        "NATIVE_MODEL_READBACK_MISSING",
+                        "native init did not report the explicitly selected model",
+                    ));
+                };
+                if observed_model != requested_model {
+                    self.open_failure_code = Some("NATIVE_MODEL_READBACK_MISMATCH");
+                    self.model_readback_state = Some("mismatch");
+                    return Err(swarm_contracts::error::Error::new(
+                        "NATIVE_MODEL_READBACK_MISMATCH",
+                        "native init model differs from the current native route selection",
+                    ));
+                }
+                self.model_readback_state = Some("verified");
+            }
+            None => {
+                // No explicit route override was requested, so no --model flag
+                // was passed and the installed harness default applies.
+                // init.model is reported as observed when present and never
+                // guessed, so the effective model stays unknown unless the
+                // native stream observed it. A v2 dispatch proof can attest
+                // session identity without claiming verified model selection.
+                self.model_readback_state = Some("native_default");
+            }
         }
-        self.model_readback_state = Some("verified");
         if command
             .native_root_id
             .as_deref()
@@ -279,9 +285,9 @@ impl Controller {
                 "resumed_conversation": command.input.get("resume_conversation_id").is_some(),
                 "describe": {
                     "session_id": init.conversation_id,
-                    "model_requested": requested_model,
+                    "model_requested": self.requested_model_id,
                     "model_observed": init.model,
-                    "model_verification": "verified",
+                    "model_verification": self.model_readback_state,
                     "permission_mode_observed": init.permission_mode,
                     "agent_observed": init.agent,
                     "executor_version": serde_json::Value::Null,
@@ -432,19 +438,14 @@ impl Controller {
                 pending.dispatch_admission.clone(),
             )
         };
-        let (turn, disposition) = self.stream.terminal_for(&conversation_id)?;
+        let (turn, disposition) = self
+            .stream
+            .terminal_for_after_foreign(&conversation_id, result_ordinal_before)?;
         let turn = turn.clone();
-        // Headless emits one terminal result per prompt and the caller must
-        // await it before the next prompt, so the settled turn must be the
-        // exact next ordinal for this prompt. Accepting any greater ordinal
-        // would let a later turn's result settle this Operation and publish
-        // that turn's response text as this prompt's answer. A stale or absent
-        // ordinal simply is not the terminal readback this prompt is waiting
-        // for, so it stays pending rather than becoming an Unknown outcome.
-        let expected_ordinal = result_ordinal_before.checked_add(1)?;
-        if turn.result_ordinal != expected_ordinal {
-            return None;
-        }
+        // The stream predicate proves that this is the first own result after
+        // the prompt baseline and that every earlier global ordinal was an
+        // explicitly identified foreign conversation. Keep the generation
+        // fence below: a retained result from another stream cannot settle it.
         let stream_generation = self.pending.as_ref()?.stream_generation;
         if stream_generation != self.stream.stream_generation {
             return None;
@@ -693,8 +694,14 @@ impl Controller {
     ) -> Option<AntigravityDispatchSessionProof> {
         let init = self.stream.init.as_ref()?;
         let native_root_id = self.native_root_id.as_deref()?;
-        let requested_model_id = self.requested_model_id.as_deref()?;
-        let observed_model_id = init.model.as_deref()?;
+        // Model selection is independent of session/Task identity. A native
+        // default has no requested model and may have no model observation;
+        // v2 preserves those unknowns without claiming verified selection.
+        let requested_model_id = self.requested_model_id.as_deref();
+        let observed_model_id = init.model.as_deref();
+        if requested_model_id.is_some() && observed_model_id.is_none() {
+            return None;
+        }
         let model_readback_state = self.model_readback_state?;
         let stream_phase = match self.stream.phase {
             Phase::AwaitingInit => "awaiting_init",
@@ -704,8 +711,13 @@ impl Controller {
             Phase::StreamFailed => "stream_failed",
         };
         Some(AntigravityDispatchSessionProof {
-            schema_version: 1,
-            kind: ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND.to_owned(),
+            schema_version: if requested_model_id.is_some() { 1 } else { 2 },
+            kind: if requested_model_id.is_some() {
+                ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND
+            } else {
+                swarm_contracts::runtime::ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND
+            }
+            .to_owned(),
             refresh_operation_id: identity.operation_id.clone(),
             binding_id: self.binding_id.clone(),
             binding_generation: self.generation,
@@ -716,8 +728,8 @@ impl Controller {
                 Sha256::digest(self.native_scope_key.as_bytes())
             ),
             conversation_id: init.conversation_id.clone(),
-            requested_model_id: requested_model_id.to_owned(),
-            observed_model_id: observed_model_id.to_owned(),
+            requested_model_id: requested_model_id.map(str::to_owned),
+            observed_model_id: observed_model_id.map(str::to_owned),
             model_readback_state: model_readback_state.to_owned(),
             stream_phase: stream_phase.to_owned(),
             native_events_seen: self.stream.native_events_seen,

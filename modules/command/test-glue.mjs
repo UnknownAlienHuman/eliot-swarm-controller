@@ -244,6 +244,53 @@ try {
     assert.equal("completion_condition" in mismatch.details, false);
   });
 
+  await test("open omission omits --model argv and records native default without inventing effective model", async () => {
+    const dir = join(scratch, "omission");
+    process.env.FAKE_CMD_SCENARIO = "success";
+    const operationId = "omission-op";
+    const prompt = "run on the native default model";
+    const command = fixtureTaskDispatchCommand(operationId, prompt, prompt);
+    const record = await openRun(config, {
+      operationId,
+      requestedModel: null,
+      prompt,
+      command,
+      bootId: FIXTURE_WORKER_BOOT_ID,
+      moduleContract: FIXTURE_MODULE_CONTRACT,
+      coreBinding: command.input.command_core_binding,
+      controlDir: dir,
+    });
+    // Actual argv omission: the fixture only prints model_request evidence
+    // for an explicit --model; omission yields no model evidence.
+    assert.equal(record.requested_model, null);
+    assert.equal(record.native_request_model, null);
+    assert.equal(record.native_request_model_status, "unknown");
+    assert.deepEqual(record.native_request_model_evidence, []);
+    assert.equal(record.effective_model, null);
+    assert.equal(record.effective_model_status, "unknown");
+    assert.equal(record.disposition, "completed");
+    assert.match(record.stderr.text, /fixture observed native default \(no --model\)/);
+    assert.equal(record.events.by_type.model_request_start ?? 0, 0);
+    assert.equal(record.events.by_type.model_request_end ?? 0, 0);
+    const snapshot = snapshotRun(dir);
+    assert.equal(snapshot.evidence.valid, true);
+    assert.equal(snapshot.run.requested_model, null);
+    const terminal = outcomeFromRun(record);
+    assert.equal(terminal.outcome, "applied");
+    assert.equal(terminal.details.requested_model, null);
+    assert.equal(terminal.details.native_request_model, null);
+    assert.equal(terminal.details.native_request_model_status, "unknown");
+    assert.equal(terminal.details.effective_model, null);
+    assert.equal(terminal.details.effective_model_status, "unknown");
+    // Explicit override still rides verbatim (unchanged behavior).
+    const explicitDir = join(scratch, "omission-explicit");
+    const explicitRecord = await openFixtureRun("omission-explicit-op", "read the readme", explicitDir);
+    assert.equal(explicitRecord.requested_model, FIXTURE_REQUESTED_MODEL);
+    assert.equal(explicitRecord.native_request_model, FIXTURE_REQUESTED_MODEL);
+    assert.equal(explicitRecord.native_request_model_status, "observed");
+    assert.match(explicitRecord.stderr.text, /fixture observed --model fixture-model/);
+  });
+
   await test("reconcile rejects a saved result projection that disagrees with its raw frame and does not replay", async () => {
     const dir = join(scratch, "tampered-result-stream");
     const invocationFile = join(scratch, "tampered-result-invocations.ndjson");

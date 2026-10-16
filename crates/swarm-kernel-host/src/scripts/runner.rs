@@ -2142,6 +2142,19 @@ mod child_identity_recovery_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        // Retain the exact fixture Job so exit can be followed by a real
+        // family-departure query rather than an unavailable named Job.
+        #[cfg(windows)]
+        let _family_query = platform::process_group::Group::open_check_query(
+            &json!({
+                "scope":"windows_job",
+                "purpose":"check",
+                "job_name":format!("Global\\EliotSwarmCheck-{token}")
+            }),
+            &token,
+        )
+        .expect("retain query access to the fixture's exact process Job");
+
         let pid = child.id();
         let custody = ScriptChildCustody::default();
         custody.owners.lock().unwrap().insert(

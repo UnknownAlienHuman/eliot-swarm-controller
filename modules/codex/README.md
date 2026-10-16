@@ -4,11 +4,13 @@ This module directory documents the passive observer and two separately
 versioned controller artifacts over an operator-owned Codex app-server. The
 legacy Python controller is artifact `codex-sdk-18194bf-bridge.3`; the
 standalone Rust controller is artifact `codex-rust-controller.1`, current
-descriptor version `10`, sourced from `crates/swarm-adapter-codex`. Both attach
+descriptor version `11.4`, sourced from `crates/swarm-adapter-codex`. Both attach
 to the existing app-server and never start or stop it. Their result contracts
 are documented separately below.
 
 ## Setup
+
+The Python setup below is historical donor tooling, not required by the current Rust controller. The Rust route attaches to an already configured native app-server; each omitted model/provider selector uses that harness's default. The current candidate retains v11's native defaults and the acknowledged opening proof. Older bindings and receipts retain their original identity and installed bytes.
 
 Create a module-local Python environment and install only the pinned
 requirements:
@@ -29,7 +31,7 @@ the config file or logged. The host injects `ELIOT_SWARM_MODULE_STATE` and
 
 The setup and observer commands in this section belong to the legacy Python
 bridge artifact `.3`. The standalone Rust artifact `.1`, current descriptor
-version `10`, uses its own package and descriptor under
+version `11.4`, uses its own package and descriptor under
 `crates/swarm-adapter-codex`; it does not use
 this module-local Python environment or `vendor_bridge`.
 
@@ -89,20 +91,27 @@ Pages in the legacy `.3` controller are capped at 64 KiB. This reports an
 allowlisted projection of observed native history only; it does not claim
 complete family coverage or execute tools.
 
-## Standalone Rust controller (`codex-rust-controller.1`, current descriptor version `10`)
+## Standalone Rust controller (`codex-rust-controller.1`, current descriptor version `11.4`)
 
 The standalone Rust adapter is a separate registered artifact from the legacy
 Python bridge. Its route uses `runtime = "codex"` and the exact artifact
 `codex-rust-controller.1`; its descriptor is
-`crates/swarm-adapter-codex/module-descriptor.template.json`. New Store
-bindings require descriptor v10, which retains the normalized dispatch/result
-schema pair and adds TaskPrompt v1 plus Goal continuation admission/terminal
-evidence schemas. The route contract requires
-`workspace_option = "workspaceRoot"` and exactly three native options:
-`modelProvider`, `model`, and absolute `workspaceRoot`. Provider and model must
-be the exact values registered by the native Codex app-server; the adapter
-does not infer a provider from a model string or substitute a proxy/delegation
-model ID. The result selector remains:
+`crates/swarm-adapter-codex/module-descriptor.template.json`. The current
+v11.4 descriptor retains v11's normalized dispatch/result schema pair,
+TaskPrompt v1 and Goal continuation admission/terminal evidence schemas.
+The route contract requires
+`workspace_option = "workspaceRoot"` and absolute `workspaceRoot`.
+For current v11.4 bindings, `modelProvider` and `model` are independently optional
+`thread/start` overrides. Omit either field to use its installed harness default;
+each supplied field must match native readback. The pinned native
+`ThreadStartParams` permits independent omission
+(`model: str | None = None`, `modelProvider: str | None = None`);
+per-turn `model` is likewise omitted when no override was requested. The
+adapter never infers a provider from a model string, never reconfigures the
+provider, and never substitutes a proxy/delegation model ID. `agent.open`
+records each requested selector (null when omitted) separately from the
+effective pair from native `thread/read` readback; served model and billing
+remain `unknown` unless native evidence says otherwise. The result selector remains:
 
 ```json
 {"kind":"codex_assistant_result","input_operation_id":"<exact task.dispatch operation ID>"}

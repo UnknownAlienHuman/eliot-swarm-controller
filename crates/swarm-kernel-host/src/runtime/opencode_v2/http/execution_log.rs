@@ -223,6 +223,7 @@ impl Service {
         let (synced, gap) = self.stream_log(&mut input).await?;
         Ok(ExecutionRead {
             scan: input.scan,
+            service_version: self.version.clone(),
             synced,
             gap,
         })

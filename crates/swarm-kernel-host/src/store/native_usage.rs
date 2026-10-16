@@ -41,6 +41,7 @@ pub(super) fn parse(
                     | "muse-sdk-1.3.0-bridge.10"
                     | "muse-sdk-1.3.0-bridge.11"
                     | "muse-sdk-1.3.0-bridge.12"
+                    | "muse-sdk-1.3.0-bridge.13"
             ) && matches!(
                 binding["route"]["runtime"].as_str(),
                 Some("muse" | "module")

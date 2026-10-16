@@ -264,8 +264,11 @@ async function prepare(command) {
       || !Number.isSafeInteger(command.generation) || command.generation < 1) {
     throw Object.assign(new Error(), { diagnosticCode: 'PREPARE_IDENTITY_REQUIRED' });
   }
-  if (typeof command.model_id !== 'string' || !command.model_id.trim() || command.model_id !== command.model_id.trim()) {
-    throw Object.assign(new Error(), { diagnosticCode: 'MODEL_ID_REQUIRED' });
+  if (command.model_id !== undefined && command.model_id !== null) {
+    if (typeof command.model_id !== 'string' || !command.model_id.trim() || command.model_id !== command.model_id.trim()
+        || command.model_id.length > 256 || /[\u0000-\u001f\u007f]/.test(command.model_id)) {
+      throw Object.assign(new Error(), { diagnosticCode: 'MODEL_ID_REQUIRED' });
+    }
   }
   if (command.permission_mode !== null && !PERMISSION_MODES.includes(command.permission_mode)) {
     throw Object.assign(new Error(), { diagnosticCode: 'INVALID_PERMISSION_MODE' });
@@ -289,12 +292,17 @@ async function prepare(command) {
   const sdk = await import(pathToFileURL(sdkEntry).href);
   if (typeof sdk.startup !== 'function') throw Object.assign(new Error(), { diagnosticCode: 'SDK_STARTUP_UNAVAILABLE' });
 
-  const modelOption = { model: command.model_id };
+  // Pinned SDK Options.model is optional and defaults to the CLI default
+  // model (sdk.d.ts: `model?: string`). Omit it when the route carries no
+  // explicit override; the installed configured harness owns its default.
+  const modelOption = (command.model_id === undefined || command.model_id === null)
+    ? {}
+    : { model: command.model_id };
   const sess = {
     input: new InputQueue(),
     query: null,
     preparedQuery: null,
-    requestedModel: modelOption.model,
+    requestedModel: modelOption.model ?? null,
     bridgeBootId: command.bridge_boot_id,
     nativeScopeKey: command.native_scope_key,
     bindingId: command.binding_id,

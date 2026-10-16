@@ -26,9 +26,16 @@ fn exists(db: &Connection, query: &str) -> Result<bool> {
     Ok(db.query_row(query, [], |row| row.get(0))?)
 }
 
-fn route_enabled(config: &Config, runtime: &str, artifact: &str) -> bool {
+fn zed_route_enabled(config: &Config) -> bool {
     config.routes.iter().any(|route| {
-        route.enabled && route.runtime == runtime && route.module_artifact_id == artifact
+        route.enabled
+            && route.runtime == crate::runtime::zed::RUNTIME
+            && matches!(
+                route.module_artifact_id.as_str(),
+                crate::runtime::zed::ARTIFACT_ID
+                    | crate::runtime::zed::PREVIOUS_ARTIFACT_ID
+                    | crate::runtime::zed::LEGACY_ARTIFACT_ID
+            )
     })
 }
 
@@ -175,11 +182,7 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
                 && crate::config::opencode_route_kind(&route.runtime, &route.module_artifact_id)
                     == Some(crate::config::OpenCodeRouteKind::Builtin)
         }),
-        zed: route_enabled(
-            config,
-            crate::runtime::zed::RUNTIME,
-            crate::runtime::zed::ARTIFACT_ID,
-        ),
+        zed: zed_route_enabled(config),
         scheduler: config.schedules.iter().any(|schedule| schedule.enabled),
         forge: config.forge.enabled,
         ..LegacyWorkerDemand::default()
@@ -220,12 +223,14 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
     )?;
     demand.zed |= db.query_row(
         "SELECT EXISTS(SELECT 1 FROM bindings WHERE released_at_ms IS NULL \
-         AND module_artifact_id=?2 \
+         AND module_artifact_id IN (?2,?3,?4) \
          AND CASE WHEN json_valid(route_json) THEN json_extract(route_json,'$.runtime')=?1 \
                   ELSE 1 END)",
         params![
             crate::runtime::zed::RUNTIME,
-            crate::runtime::zed::ARTIFACT_ID
+            crate::runtime::zed::ARTIFACT_ID,
+            crate::runtime::zed::PREVIOUS_ARTIFACT_ID,
+            crate::runtime::zed::LEGACY_ARTIFACT_ID
         ],
         |row| row.get::<_, bool>(0),
     )?;

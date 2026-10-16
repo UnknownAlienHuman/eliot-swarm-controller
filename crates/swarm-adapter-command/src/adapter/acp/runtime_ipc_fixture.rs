@@ -438,7 +438,7 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
     )?;
     let module_host = module_host::ModuleHostIdentity {
         claim,
-        profile: crate::Profile::AcpV1,
+        profile: crate::Profile::AcpV2,
         boot_id: Uuid::new_v4().to_string(),
         binding_id: binding_id.clone(),
         generation,
@@ -514,18 +514,19 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
         false,
     )
     .await?;
-    validate_acp_route(&link.route)?;
+    validate_acp_route_with_model_policy(&link.route, owner.host.profile.model_optional())?;
     let open_command: RuntimeCommand =
         serde_json::from_value(link.client.next().await?["command"].clone())?;
     assert_eq!(open_command.operation_id, open["operation_id"]);
     crate::adapter::validate_command(&open_command, &link, None)?;
 
-    let journal = AcpJournal::new(&owner.state_dir)?;
+    let journal = AcpJournal::new_for_profile(&owner.state_dir, owner.host.profile)?;
     let capture = Arc::new(Mutex::new(Capture::default()));
     let (transport, peer) = Channel::duplex();
     let (active_tx, active_rx) = oneshot::channel();
     let (expected_prompt_tx, expected_prompt_rx) = oneshot::channel();
     let (prompt_seen_tx, prompt_seen_rx) = oneshot::channel();
+    let (callback_complete_tx, mut callback_complete_rx) = oneshot::channel();
     let expected_workspace = workspace.clone();
     let peer_workspace = workspace.clone();
     let store_for_adapter = store.clone();
@@ -557,9 +558,7 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
             let features = initialize(&connection).await?;
             let open_workspace = expected_workspace.as_path();
             let route = SessionRouteConfiguration {
-                model_id: command_model(&adapter_link.route)
-                    .expect("Store route carries a scripted model")
-                    .to_owned(),
+                model_id: command_model(&adapter_link.route).map(str::to_owned),
                 effort: command_effort(&adapter_link.route).map(str::to_owned),
                 mode: command_mode(&adapter_link.route).map(str::to_owned),
             };
@@ -671,7 +670,9 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
             adapter_journal
                 .record_command(&dispatch_command)
                 .map_err(to_acp_error)?;
-            let prepared = acp_prompt::prepare(&dispatch_command).map_err(to_acp_error)?;
+            let prepared =
+                acp_prompt::prepare(&dispatch_command, adapter_link.profile.model_optional())
+                    .map_err(to_acp_error)?;
             assert!(prepared.envelope.prompt.starts_with(DISPATCH_TEXT));
             assert!(prepared.envelope.prompt.contains("ELIOT Task identity v1:"));
             let active_prompt = ActivePrompt {
@@ -705,7 +706,7 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
                 features: &features,
                 session: &mut session,
                 workspace: Some(open_workspace),
-                model: &route.model_id,
+                model: route.model_id.as_deref(),
                 capture: &adapter_capture,
                 permissions: &permissions,
                 permission_wakeup: &permission_wakeup,
@@ -730,6 +731,9 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
                 .map_err(to_acp_error)?;
             assert_eq!(adapter_link.binding_id, active_prompt.binding_id);
             assert_eq!(adapter_link.generation, active_prompt.generation);
+            callback_complete_tx
+                .send(())
+                .expect("peer observes acknowledged adapter callback completion");
             Ok::<(), agent_client_protocol::Error>(())
         });
 
@@ -848,10 +852,27 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
                 ),
             )))
             .expect("the original prompt receives its cancellation result");
+        // The callback retains and acknowledges the outcome before SDK shutdown.
+        // Reject extra wire traffic while it finishes under the outer deadline.
+        tokio::select! {
+            biased;
+            frame = peer.rx.next() => {
+                assert!(
+                    frame.is_none(),
+                    "no prompt replay, session/load fallback, or $/cancel_request is sent"
+                );
+                callback_complete_rx
+                    .await
+                    .expect("adapter callback completes after the outcome ACK");
+            }
+            completed = &mut callback_complete_rx => {
+                completed.expect("adapter callback completes after the outcome ACK");
+            }
+        }
         assert!(
             tokio::time::timeout(Duration::from_secs(3), peer.rx.next())
                 .await
-                .expect("ACP client closes after the one prompt")
+                .expect("ACP client closes after the acknowledged outcome callback completes")
                 .is_none(),
             "no prompt replay, session/load fallback, or $/cancel_request is sent"
         );

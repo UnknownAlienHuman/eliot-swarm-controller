@@ -2,8 +2,8 @@
   "schema_version": 1,
   "module_id": "muse",
   "artifact": {
-    "artifact_id": "muse-sdk-1.3.0-bridge.12",
-    "version": "12",
+    "artifact_id": "muse-sdk-1.3.0-bridge.13",
+    "version": "13",
     "build_id": null
   },
   "launch": {

@@ -42,6 +42,8 @@ const PROBE_CUSTODY_CONTROL_ENV: &str = "ELIOT_PROBE_CUSTODY_CONTROL_DIR";
 #[cfg(test)]
 const PROBE_CUSTODY_FIXTURE_GRACE_ENV: &str = "ELIOT_PROBE_CUSTODY_FIXTURE_GRACE";
 #[cfg(test)]
+const PROBE_CUSTODY_EXPLICIT_RELEASE_ENV: &str = "ELIOT_PROBE_CUSTODY_EXPLICIT_RELEASE";
+#[cfg(test)]
 const PROBE_CUSTODY_MEMBER_OBSERVED_FILE: &str = "helper-live-member-observed.json";
 pub(crate) const PROBE_STDOUT_CAPTURE_FILE: &str = "probe-stdout.capture";
 pub(crate) const PROBE_STDERR_CAPTURE_FILE: &str = "probe-stderr.capture";
@@ -1934,6 +1936,14 @@ fn execute_probe(request: ProbeRequest, owner_path: &Path) -> ProbeResponse {
     };
 
     let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+    // The Store custody fixture holds its real command tree until the test
+    // releases it. Keep this test-only mode independent of suite scheduling;
+    // production builds always enforce the request deadline.
+    #[cfg(test)]
+    let explicit_release_fixture =
+        std::env::var(PROBE_CUSTODY_EXPLICIT_RELEASE_ENV).as_deref() == Ok("1");
+    #[cfg(not(test))]
+    let explicit_release_fixture = false;
     let mut timed_out = false;
     let mut output_limited = false;
     let mut status_observation_failed = false;
@@ -1943,7 +1953,7 @@ fn execute_probe(request: ProbeRequest, owner_path: &Path) -> ProbeResponse {
         stderr_capture.poll();
         output_limited |= stdout_capture.truncated() || stderr_capture.truncated();
         let capture_failed = stdout_capture.reader_failed() || stderr_capture.reader_failed();
-        if !timed_out && Instant::now() >= deadline {
+        if !timed_out && !explicit_release_fixture && Instant::now() >= deadline {
             timed_out = true;
         }
         let cancel_requested = timed_out || output_limited || capture_failed;
@@ -3311,6 +3321,19 @@ pub(crate) mod tests {
         path.exists()
     }
 
+    fn wait_probe_custody_release(path: &Path) {
+        if std::env::var(PROBE_CUSTODY_EXPLICIT_RELEASE_ENV).as_deref() == Ok("1") {
+            while !path.exists() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            assert!(
+                wait_probe_custody_file(path, Duration::from_secs(60)),
+                "nested probe process did not receive its release marker"
+            );
+        }
+    }
+
     #[test]
     fn probe_nested_helper_entry() {
         let Some(request) = std::env::var_os(PROBE_CUSTODY_REQUEST_ENV) else {
@@ -3357,10 +3380,7 @@ pub(crate) mod tests {
         ));
         fs::write(probe_custody_file(&control, "target.ready"), b"ready")
             .expect("publish target readiness");
-        assert!(wait_probe_custody_file(
-            &probe_custody_file(&control, "target.exit"),
-            Duration::from_secs(60)
-        ));
+        wait_probe_custody_release(&probe_custody_file(&control, "target.exit"));
         std::io::stdout()
             .write_all(b"probe-nested-direct-output\n")
             .expect("write direct probe bytes");
@@ -3377,10 +3397,7 @@ pub(crate) mod tests {
         );
         fs::write(probe_custody_file(&control, "descendant.ready"), b"ready")
             .expect("publish nested descendant readiness");
-        assert!(wait_probe_custody_file(
-            &probe_custody_file(&control, "descendant.exit"),
-            Duration::from_secs(60)
-        ));
+        wait_probe_custody_release(&probe_custody_file(&control, "descendant.exit"));
         std::io::stdout()
             .write_all(b"probe-nested-descendant-output\n")
             .expect("write nested descendant bytes");
@@ -3447,6 +3464,94 @@ pub(crate) mod tests {
             self.release_descendant();
         }
 
+        pub(crate) fn readiness_diagnostic(
+            &self,
+            owner: &ProbeCleanupOwner,
+            explicit_release: bool,
+        ) -> String {
+            let target_identity =
+                probe_custody_file(&self.control, "target.identity.json").is_file();
+            let descendant_identity =
+                probe_custody_file(&self.control, "descendant.identity.json").is_file();
+            let identity_pid = |name: &str| {
+                File::open(probe_custody_file(&self.control, name))
+                    .ok()
+                    .and_then(|file| read_bounded(file, 16 * 1024).ok())
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|identity| identity["pid"].as_u64())
+            };
+            let target_pid = identity_pid("target.identity.json");
+            let descendant_pid = identity_pid("descendant.identity.json");
+            let target_ready = probe_custody_file(&self.control, "target.ready").is_file();
+            let descendant_ready = probe_custody_file(&self.control, "descendant.ready").is_file();
+            let target_exit = probe_custody_file(&self.control, "target.exit").is_file();
+            let descendant_exit = probe_custody_file(&self.control, "descendant.exit").is_file();
+            let owner_record = self.directory.join("probe-owner.json").is_file();
+            let response_path = self.directory.join(PROBE_HELPER_RESPONSE_FILE);
+            let response_bytes = fs::metadata(&response_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let response = File::open(&response_path)
+                .ok()
+                .and_then(|file| read_bounded(file, PROBE_RESPONSE_LIMIT).ok())
+                .and_then(|bytes| decode_probe_response(&bytes).ok())
+                .map(|response| {
+                    let message_kind = if response
+                        .message
+                        .starts_with("unable to start input probe:")
+                    {
+                        "launch_failed"
+                    } else if response.message == "invalid internal CheckRunner probe request" {
+                        "invalid_request"
+                    } else if response
+                        .message
+                        .starts_with("input probe process group membership check failed")
+                    {
+                        "membership_failed"
+                    } else if response.message == "input probe left descendants after its command exited" {
+                        "descendants_remained"
+                    } else if response.message.is_empty() {
+                        "empty"
+                    } else {
+                        "other"
+                    };
+                    format!(
+                        "decoded(success={},timed_out={},exit_code={:?},group_empty={},message_kind={},stdout_bytes={},stderr_bytes={})",
+                        response.success,
+                        response.timed_out,
+                        response.exit_code,
+                        response.group_empty,
+                        message_kind,
+                        response.stdout.len(),
+                        response.stderr.len(),
+                    )
+                })
+                .unwrap_or_else(|| "unavailable".to_string());
+            let capture = owner.custody.capture.as_ref();
+            let helper_pid = self.helper_pid;
+            let helper_running = owner.custody.exit_status.is_none();
+            let helper_exit_code = owner
+                .custody
+                .exit_status
+                .as_ref()
+                .and_then(|status| status.code());
+            let helper_exit_success = owner
+                .custody
+                .exit_status
+                .as_ref()
+                .map(|status| status.success());
+            let owner_pending = owner.is_pending();
+            let status_observation_failed = owner.custody.status_observation_failed;
+            let capture_setup_failed = owner.custody.capture_setup_failed;
+            let capture_started = capture.is_some();
+            let capture_finished = capture.is_some_and(CaptureStream::is_finished);
+            let capture_reader_failed = capture.is_some_and(CaptureStream::reader_failed);
+            let capture_truncated = capture.is_some_and(CaptureStream::truncated);
+            format!(
+                "fixture_producer={{helper_pid={helper_pid},target_pid={target_pid:?},descendant_pid={descendant_pid:?},target_identity={target_identity},descendant_identity={descendant_identity},target_ready={target_ready},descendant_ready={descendant_ready},target_exit={target_exit},descendant_exit={descendant_exit},owner_record={owner_record},explicit_release={explicit_release},helper_running={helper_running},helper_exit_code={helper_exit_code:?},helper_exit_success={helper_exit_success:?},owner_pending={owner_pending},status_observation_failed={status_observation_failed},capture_setup_failed={capture_setup_failed},capture_started={capture_started},capture_finished={capture_finished},capture_reader_failed={capture_reader_failed},capture_truncated={capture_truncated},response_bytes={response_bytes},response={response}}}"
+            )
+        }
+
         fn cleanup(&self) {
             self.release_all();
             let owner_path = self.directory.join("probe-owner.json");
@@ -3487,6 +3592,23 @@ pub(crate) mod tests {
     pub(crate) fn pending_probe_custody_fixture(
         scope: ProbeCleanupScope,
     ) -> (ProbeCleanupOwner, ProbeCustodyFixture) {
+        pending_probe_custody_fixture_with_release(scope, false)
+    }
+
+    /// Keep the production probe's nested family live until Store assertions
+    /// release it; test scheduling cannot turn the command deadline into exit.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn pending_probe_custody_fixture_with_explicit_release(
+        scope: ProbeCleanupScope,
+    ) -> (ProbeCleanupOwner, ProbeCustodyFixture) {
+        pending_probe_custody_fixture_with_release(scope, true)
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn pending_probe_custody_fixture_with_release(
+        scope: ProbeCleanupScope,
+        explicit_release: bool,
+    ) -> (ProbeCleanupOwner, ProbeCustodyFixture) {
         let directory =
             std::env::temp_dir().join(format!("swarm-probe-custody-{}", model::new_id()));
         let control = std::env::temp_dir().join(format!("swarm-probe-control-{}", model::new_id()));
@@ -3519,7 +3641,8 @@ pub(crate) mod tests {
             .open(&response_path)
             .expect("create helper response capture");
         let executable = std::env::current_exe().expect("test executable path");
-        let mut child = Command::new(executable)
+        let mut helper = Command::new(executable);
+        helper
             .args([
                 "--exact",
                 "checks::inputs::tests::probe_nested_helper_entry",
@@ -3530,6 +3653,11 @@ pub(crate) mod tests {
             .env(PROBE_CUSTODY_CONTROL_ENV, &control)
             .env(PROBE_CUSTODY_TARGET_ENV, "1")
             .env("ELIOT_PROBE_CUSTODY_FIXTURE_GRACE", "nested")
+            .env_remove(PROBE_CUSTODY_EXPLICIT_RELEASE_ENV);
+        if explicit_release {
+            helper.env(PROBE_CUSTODY_EXPLICIT_RELEASE_ENV, "1");
+        }
+        let mut child = helper
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -3586,12 +3714,15 @@ pub(crate) mod tests {
             owner.poll();
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(
-            target_identity_path.exists()
-                && descendant_identity_path.exists()
-                && target_ready_path.exists(),
-            "real target and nested process publish identities and become ready"
-        );
+        if !target_identity_path.exists()
+            || !descendant_identity_path.exists()
+            || !target_ready_path.exists()
+        {
+            panic!(
+                "real target and nested process publish identities and become ready; {}",
+                fixture.readiness_diagnostic(&owner, explicit_release)
+            );
+        }
         assert!(
             owner.custody.capture.is_some() && !owner.custody.capture_setup_failed,
             "the real helper stdout capture is active at Store handoff"

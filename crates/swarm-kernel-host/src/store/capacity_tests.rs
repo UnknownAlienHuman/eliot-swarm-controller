@@ -2919,3 +2919,72 @@ async fn store_admission_records_and_cancel_releases_the_reservation() {
     assert_eq!(item["entries"][0]["release_reason"], "operation_cancelled");
     owner.close().await.unwrap();
 }
+
+#[test]
+fn direct_agent_open_permits_manager_and_denies_unscoped_roles() {
+    // Role gate regression for direct agent.open: the ordinary registered
+    // Manager shares the explicit Operator-or-Manager allowlist (modularity
+    // sections 1, 3, and 4). Scoped non-planner roles stay denied even though
+    // the broader require_writer predicate would admit Module. Route,
+    // descriptor, admission, and binding guards are unchanged.
+    let mut db = fixture_db();
+    db.execute_batch(WORKSPACE_SCHEMA).unwrap();
+    db.execute_batch(OWNED_SERVICE_SCHEMA).unwrap();
+    let route = root_admission_route();
+    let config = Config {
+        routes: vec![route],
+        ..Config::default()
+    };
+
+    let manager_id = "direct-open-manager";
+    insert_read_scope_manager(&db, manager_id, false);
+    let manager = current_principal(
+        &db,
+        read_scope_principal(manager_id, crate::model::Role::Manager),
+    )
+    .unwrap();
+    let request = json!({
+        "client_request_id": "direct-open-manager-request",
+        "lane_id": "direct-open-manager-lane",
+        "route": "oc",
+    });
+    let opened = super::mutate(&mut db, &manager, "agent.open", &request, &config)
+        .expect("registered Manager opens directly under the Operator-or-Manager allowlist");
+    assert_eq!(opened["state"], "queued");
+
+    for (client_id, role, role_name) in [
+        (
+            "direct-open-observer",
+            crate::model::Role::Observer,
+            "observer",
+        ),
+        ("direct-open-module", crate::model::Role::Module, "module"),
+    ] {
+        db.execute(
+            "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
+            params![
+                format!("client:{client_id}"),
+                model::canonical(&json!({"role": role_name, "disabled": false})).unwrap()
+            ],
+        )
+        .unwrap();
+        let principal = current_principal(&db, read_scope_principal(client_id, role)).unwrap();
+        let denied_request = json!({
+            "client_request_id": format!("{client_id}-request"),
+            "lane_id": format!("{client_id}-lane"),
+            "route": "oc",
+        });
+        let error = super::mutate(&mut db, &principal, "agent.open", &denied_request, &config)
+            .expect_err("unscoped roles must not open directly");
+        assert_eq!(error.code, "FORBIDDEN");
+    }
+
+    let bindings: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM bindings WHERE lane_id='direct-open-manager-lane'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bindings, 1);
+}

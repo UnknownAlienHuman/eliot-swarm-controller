@@ -2,6 +2,8 @@
 //! only on the shared host client/contracts and its native JSON-RPC transport.
 
 mod module_contract;
+#[cfg(test)]
+mod native_history_frame_tests;
 mod native_usage;
 
 use std::{
@@ -52,6 +54,9 @@ pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
 const PAGE_SIZE: u64 = 100;
+// Tool-output items can make a 100-item history page exceed the native frame
+// bound. Keep item pages small without expanding the bounded page walk.
+const ITEM_PAGE_SIZE: u64 = 10;
 const MAX_NORMALIZED_RESULT_PAGE_BYTES: usize = 24 * 1024;
 const MAX_NORMALIZED_RESULT_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
@@ -508,14 +513,18 @@ impl Checkpoint {
         &self,
         root: &str,
         scope: &str,
-        provider: &str,
-        model: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
         workspace: &str,
     ) -> bool {
         self.native_root_phase == Some(NativeRootPhase::Active)
             && self.root_context_matches(root, scope, provider, model, workspace)
-            && self.effective_model_provider.as_deref() == Some(provider)
-            && self.effective_model.as_deref() == Some(model)
+            && requested_model_selection_matches(
+                provider,
+                model,
+                self.effective_model_provider.as_deref(),
+                self.effective_model.as_deref(),
+            )
             && self.verified_open_operation_matches(root, scope, provider, model, workspace)
     }
 
@@ -523,8 +532,8 @@ impl Checkpoint {
         &self,
         root: &str,
         scope: &str,
-        provider: &str,
-        model: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
         workspace: &str,
     ) -> bool {
         let Some(operation_id) = self.root_operation_id.as_deref() else {
@@ -537,26 +546,31 @@ impl Checkpoint {
             && record.kind == "open"
             && record.native_root_id.as_deref() == Some(root)
             && record.native_scope_key.as_deref() == Some(scope)
-            && record.requested_model_provider.as_deref() == Some(provider)
-            && record.requested_model.as_deref() == Some(model)
+            && record.requested_model_provider.as_deref() == provider
+            && record.requested_model.as_deref() == model
             && record.workspace_root.as_deref().and_then(normalize_path)
                 == normalize_path(workspace)
             && record.thread_configuration_readback.as_deref() == Some("verified")
     }
 
     fn active_root_proof_matches(&self) -> bool {
-        let (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) = (
+        let (Some(root), Some(scope), Some(workspace)) = (
             self.native_root_id.as_deref(),
             self.native_scope_key.as_deref(),
-            self.requested_model_provider.as_deref(),
-            self.requested_model.as_deref(),
             self.workspace_root.as_deref(),
         ) else {
             return false;
         };
+        let provider = self.requested_model_provider.as_deref();
+        let model = self.requested_model.as_deref();
+        let effective_matches = requested_model_selection_matches(
+            provider,
+            model,
+            self.effective_model_provider.as_deref(),
+            self.effective_model.as_deref(),
+        );
         self.root_context_matches(root, scope, provider, model, workspace)
-            && self.effective_model_provider.as_deref() == Some(provider)
-            && self.effective_model.as_deref() == Some(model)
+            && effective_matches
             && self.verified_open_operation_matches(root, scope, provider, model, workspace)
     }
 
@@ -564,14 +578,14 @@ impl Checkpoint {
         &self,
         root: &str,
         scope: &str,
-        provider: &str,
-        model: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
         workspace: &str,
     ) -> bool {
         self.native_root_id.as_deref() == Some(root)
             && self.native_scope_key.as_deref() == Some(scope)
-            && self.requested_model_provider.as_deref() == Some(provider)
-            && self.requested_model.as_deref() == Some(model)
+            && self.requested_model_provider.as_deref() == provider
+            && self.requested_model.as_deref() == model
             && self.workspace_root.as_deref().and_then(normalize_path) == normalize_path(workspace)
     }
 
@@ -586,12 +600,10 @@ impl Checkpoint {
         ) else {
             return Ok(None);
         };
-        let (Some(provider), Some(model)) = (
-            outcome.details["requested_model_provider"].as_str(),
-            outcome.details["requested_model"].as_str(),
-        ) else {
-            return Ok(None);
-        };
+        // `null` details mean no explicit override was requested; the native
+        // thread defaults apply. Requested stays distinct from effective.
+        let provider = outcome.details["requested_model_provider"].as_str();
+        let model = outcome.details["requested_model"].as_str();
         if record
             .native_root_id
             .as_deref()
@@ -600,14 +612,8 @@ impl Checkpoint {
                 .native_scope_key
                 .as_deref()
                 .is_some_and(|saved| saved != scope)
-            || record
-                .requested_model_provider
-                .as_deref()
-                .is_some_and(|saved| saved != provider)
-            || record
-                .requested_model
-                .as_deref()
-                .is_some_and(|saved| saved != model)
+            || record.requested_model_provider.as_deref() != provider
+            || record.requested_model.as_deref() != model
         {
             return Err(AdapterError::Checkpoint);
         }
@@ -628,8 +634,8 @@ impl Checkpoint {
             ("agent.open", "open") | ("agent.send", "send") | ("task.dispatch", "send")
         ) && record.native_root_id.as_deref() == Some(root)
             && record.native_scope_key.as_deref() == Some(scope)
-            && record.requested_model_provider.as_deref() == Some(provider)
-            && record.requested_model.as_deref() == Some(model)
+            && record.requested_model_provider.as_deref() == provider
+            && record.requested_model.as_deref() == model
             && record.thread_configuration_readback.as_deref() == Some("verified")
             && record
                 .workspace_root
@@ -1846,14 +1852,14 @@ impl Journal {
         if dispatch_admission.is_none() && continuation_admission.is_none() {
             return Ok(());
         }
-        let (Some(scope), Some(provider), Some(model), Some(workspace)) = (
+        let (Some(scope), Some(workspace)) = (
             outcome.native_scope_key.as_deref(),
-            outcome.details["requested_model_provider"].as_str(),
-            outcome.details["requested_model"].as_str(),
             self.state.workspace_root.as_deref(),
         ) else {
             return Err(AdapterError::Checkpoint);
         };
+        let provider = outcome.details["requested_model_provider"].as_str();
+        let model = outcome.details["requested_model"].as_str();
         if !self
             .state
             .is_current_root(root, scope, provider, model, workspace)
@@ -2054,8 +2060,16 @@ impl Journal {
             // result. Publish the durable dedupe marker before removing the
             // record from the current full snapshot.
             self.write_operation_tombstone(operation_id, &record)?;
-            self.state.operations.remove(operation_id);
-            self.state.acknowledged_outcomes.remove(operation_id);
+            if self.state.root_operation_id.as_deref() == Some(operation_id) {
+                // Current-root validation still needs the verified opening
+                // record. It becomes compactable when another root replaces it.
+                self.state
+                    .acknowledged_outcomes
+                    .insert(operation_id.to_owned());
+            } else {
+                self.state.operations.remove(operation_id);
+                self.state.acknowledged_outcomes.remove(operation_id);
+            }
         } else {
             if self.state.acknowledged_outcomes.contains(operation_id) {
                 return Ok(());
@@ -2151,15 +2165,15 @@ impl Journal {
     }
 
     fn active_root_id(&self) -> Option<&str> {
-        let (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) = (
+        let (Some(root), Some(scope), Some(workspace)) = (
             self.state.native_root_id.as_deref(),
             self.state.native_scope_key.as_deref(),
-            self.state.requested_model_provider.as_deref(),
-            self.state.requested_model.as_deref(),
             self.state.workspace_root.as_deref(),
         ) else {
             return None;
         };
+        let provider = self.state.requested_model_provider.as_deref();
+        let model = self.state.requested_model.as_deref();
         self.state
             .is_current_root(root, scope, provider, model, workspace)
             .then_some(root)
@@ -3310,7 +3324,7 @@ impl NativeClient {
         for _ in 0..MAX_HISTORY_PAGES {
             let mut params = json!({
                 "threadId":thread_id,
-                "limit":PAGE_SIZE,
+                "limit":ITEM_PAGE_SIZE,
                 "sortDirection":"desc",
             });
             if let Some(value) = cursor.as_ref() {
@@ -3377,6 +3391,7 @@ impl NativeClient {
                 "threadId":thread_id,
                 "limit":PAGE_SIZE,
                 "sortDirection":"desc",
+                "itemsView":"notLoaded",
             });
             if let Some(value) = cursor.as_ref() {
                 params["cursor"] = json!(value);
@@ -3437,7 +3452,7 @@ impl NativeClient {
             let mut params = json!({
                 "threadId":thread_id,
                 "turnId":turn_id,
-                "limit":PAGE_SIZE,
+                "limit":ITEM_PAGE_SIZE,
                 "sortDirection":"asc",
             });
             if let Some(value) = cursor.as_ref() {
@@ -3695,19 +3710,43 @@ fn normalize_unix_path_identity(value: &str) -> Option<String> {
     })
 }
 
-fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), &'static str> {
+fn validate_route(
+    command: &RuntimeCommand,
+) -> Result<(Option<String>, Option<String>, String), &'static str> {
     if command.route["runtime"] != "codex" || command.route["module_artifact_id"] != ARTIFACT_ID {
         return Err("ROUTE_ARTIFACT_MISMATCH");
     }
     let options = &command.route["native_options"];
+    // Pinned native `ThreadStartParams` permits omission of both fields
+    // (`model: str | None = None`, `modelProvider: str | None = None` in
+    // `modules/codex/vendor_bridge/src/openai_codex/generated/v2_all.py:10213-10214`;
+    // resume/fork overrides at `:5906` and fork overrides nearby are likewise
+    // optional). Omission selects the installed harness thread defaults.
+    // Native model and provider selectors are independent. Missing selectors
+    // remain native-owned and are never inferred from the other value.
+    for (field, invalid) in [
+        ("modelProvider", "EXPLICIT_MODEL_PROVIDER_REQUIRED"),
+        ("model", "EXPLICIT_MODEL_REQUIRED"),
+    ] {
+        if let Some(value) = options.get(field).filter(|value| !value.is_null()) {
+            let selected = value.as_str().ok_or(invalid)?;
+            if selected.is_empty()
+                || selected != selected.trim()
+                || selected.len() > 256
+                || selected.chars().any(char::is_control)
+            {
+                return Err(invalid);
+            }
+        }
+    }
     let provider = options["modelProvider"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
-        .ok_or("EXPLICIT_MODEL_PROVIDER_REQUIRED")?;
+        .map(str::to_owned);
     let model = options["model"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
-        .ok_or("EXPLICIT_MODEL_REQUIRED")?;
+        .map(str::to_owned);
     let workspace = options["workspaceRoot"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
@@ -3715,7 +3754,46 @@ fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), 
     if normalize_path(workspace).is_none() {
         return Err("ABSOLUTE_WORKSPACE_REQUIRED");
     }
-    Ok((provider.to_owned(), model.to_owned(), workspace.to_owned()))
+    Ok((provider, model, workspace.to_owned()))
+}
+
+fn requested_model_selection_matches(
+    requested_provider: Option<&str>,
+    requested_model: Option<&str>,
+    observed_provider: Option<&str>,
+    observed_model: Option<&str>,
+) -> bool {
+    let (Some(observed_provider), Some(observed_model)) = (observed_provider, observed_model)
+    else {
+        return false;
+    };
+    !observed_provider.is_empty()
+        && !observed_model.is_empty()
+        && requested_provider.is_none_or(|requested| requested == observed_provider)
+        && requested_model.is_none_or(|requested| requested == observed_model)
+}
+
+fn requested_model_selection_matches_frozen(
+    requested_provider: Option<&str>,
+    requested_model: Option<&str>,
+    observed_provider: Option<&str>,
+    observed_model: Option<&str>,
+    effective_provider: Option<&str>,
+    effective_model: Option<&str>,
+) -> bool {
+    let (Some(observed_provider), Some(observed_model)) = (observed_provider, observed_model)
+    else {
+        return false;
+    };
+    requested_model_selection_matches(
+        requested_provider,
+        requested_model,
+        Some(observed_provider),
+        Some(observed_model),
+    ) && (requested_provider.is_some()
+        || effective_provider.is_some_and(|effective| effective == observed_provider))
+        && (requested_model.is_some()
+            || effective_model.is_some_and(|effective| effective == observed_model))
 }
 
 fn prompt_for(
@@ -3776,7 +3854,7 @@ fn prompt_for(
 fn native_send_payload(
     root: &str,
     prompt: &str,
-    model: &str,
+    model: Option<&str>,
     operation_id: &str,
     steer: bool,
     expected_turn_id: Option<&str>,
@@ -3789,11 +3867,19 @@ fn native_send_payload(
             "input": input,
             "clientUserMessageId": operation_id,
         })
-    } else {
+    } else if let Some(model) = model {
         json!({
             "threadId": root,
             "input": input,
             "model": model,
+            "clientUserMessageId": operation_id,
+        })
+    } else {
+        // No explicit per-call model override: omit `model` so the native
+        // thread default applies (`TurnStartParams.model: str | None = None`).
+        json!({
+            "threadId": root,
+            "input": input,
             "clientUserMessageId": operation_id,
         })
     }
@@ -4348,6 +4434,8 @@ impl ThreadConfigurationReadback {
         requested_provider: Option<&str>,
         requested_model: Option<&str>,
         workspace: Option<&str>,
+        effective_provider: Option<&str>,
+        effective_model: Option<&str>,
     ) -> Self {
         let Some(thread) = response.get("thread") else {
             return Self::unavailable("THREAD_CONFIGURATION_READBACK_UNAVAILABLE");
@@ -4379,11 +4467,11 @@ impl ThreadConfigurationReadback {
             _ => false,
         };
 
-        let (Some(provider), Some(model), Some(requested_provider), Some(requested_model)) = (
+        // Each requested selector constrains only its observed field. Both
+        // effective fields always come from native thread readback.
+        let (Some(provider), Some(model)) = (
             observed_model_provider.as_deref(),
             observed_model.as_deref(),
-            requested_provider,
-            requested_model,
         ) else {
             return Self {
                 observed_model_provider,
@@ -4391,7 +4479,16 @@ impl ThreadConfigurationReadback {
                 ..Self::unavailable("THREAD_CONFIGURATION_READBACK_UNAVAILABLE")
             };
         };
-        if provider != requested_provider || model != requested_model || !workspace_matches {
+        if !workspace_matches
+            || !requested_model_selection_matches_frozen(
+                requested_provider,
+                requested_model,
+                Some(provider),
+                Some(model),
+                effective_provider,
+                effective_model,
+            )
+        {
             return Self {
                 native_thread_readback: "mismatch",
                 observed_model_provider,
@@ -4399,7 +4496,6 @@ impl ThreadConfigurationReadback {
                 ..Self::unavailable("THREAD_CONFIGURATION_MISMATCH")
             };
         }
-
         Self {
             native_thread_readback: "verified",
             effective_model_provider: Some(provider.to_owned()),
@@ -4430,6 +4526,7 @@ async fn reconcile_send(
     native: &mut NativeClient,
     record: &OperationRecord,
     operation_id: &str,
+    checkpoint: &Checkpoint,
 ) -> RuntimeOutcome {
     let (Some(root), Some(client_id), Some(expected_digest), Some(expected_bytes)) = (
         record.native_root_id.as_deref(),
@@ -4604,6 +4701,17 @@ async fn reconcile_send(
             "contradictory",
         );
     }
+    let (effective_provider, effective_model) = if checkpoint.native_root_id.as_deref()
+        == Some(root)
+        && checkpoint.native_scope_key == record.native_scope_key
+    {
+        (
+            checkpoint.effective_model_provider.as_deref(),
+            checkpoint.effective_model.as_deref(),
+        )
+    } else {
+        (None, None)
+    };
     let mut thread_read_error = None;
     let thread_configuration = match native.read_thread(root).await {
         Ok(response) => ThreadConfigurationReadback::from_response(
@@ -4612,6 +4720,8 @@ async fn reconcile_send(
             record.requested_model_provider.as_deref(),
             record.requested_model.as_deref(),
             record.workspace_root.as_deref(),
+            effective_provider,
+            effective_model,
         ),
         Err(error) => {
             let diagnostic_code = error.diagnostic_code();
@@ -4728,11 +4838,9 @@ async fn reconcile_open(
     record: &OperationRecord,
     operation_id: &str,
 ) -> RuntimeOutcome {
-    let (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) = (
+    let (Some(root), Some(scope), Some(workspace)) = (
         record.native_root_id.as_deref(),
         record.native_scope_key.as_deref(),
-        record.requested_model_provider.as_deref(),
-        record.requested_model.as_deref(),
         record.workspace_root.as_deref(),
     ) else {
         let mut details = json!({
@@ -4754,6 +4862,8 @@ async fn reconcile_open(
             details,
         );
     };
+    let provider = record.requested_model_provider.as_deref();
+    let model = record.requested_model.as_deref();
     if native.scope_key() != Some(scope) || !native.identity_is_known() {
         return outcome(
             operation_id,
@@ -4992,13 +5102,12 @@ fn adopt_verified_root(
         .operations
         .get(operation_id)
         .ok_or("OPEN_OPERATION_MISMATCH")?;
-    let (Some(provider), Some(model), Some(workspace)) = (
-        journal.state.requested_model_provider.as_deref(),
-        journal.state.requested_model.as_deref(),
-        journal.state.workspace_root.as_deref(),
-    ) else {
+    let Some(workspace) = journal.state.workspace_root.as_deref() else {
         return Err("THREAD_CONFIGURATION_MISMATCH");
     };
+    let workspace = workspace.to_owned();
+    let provider = journal.state.requested_model_provider.clone();
+    let model = journal.state.requested_model.clone();
     if record.method != "agent.open"
         || record.kind != "open"
         || record.native_root_id.as_deref() != Some(root)
@@ -5010,17 +5119,41 @@ fn adopt_verified_root(
     {
         return Err("NATIVE_SCOPE_CHANGED");
     }
-    if record.requested_model_provider.as_deref() != Some(provider)
-        || record.requested_model.as_deref() != Some(model)
-        || record.workspace_root.as_deref().and_then(normalize_path) != normalize_path(workspace)
+    if record.requested_model_provider != provider
+        || record.requested_model != model
+        || record.workspace_root.as_deref().and_then(normalize_path) != normalize_path(&workspace)
     {
         return Err("THREAD_CONFIGURATION_MISMATCH");
     }
-    if thread["id"].as_str() != Some(root)
-        || thread["modelProvider"].as_str() != Some(provider)
-        || thread["model"].as_str() != Some(model)
-        || thread["cwd"].as_str().and_then(normalize_path) != normalize_path(workspace)
-    {
+    let observed_provider = thread["modelProvider"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let observed_model = thread["model"].as_str().filter(|value| !value.is_empty());
+    let has_prior_verified_readback =
+        record.thread_configuration_readback.as_deref() == Some("verified");
+    let thread_selection_matches = if has_prior_verified_readback {
+        (provider.is_some() || journal.state.effective_model_provider.as_deref().is_some())
+            && (model.is_some() || journal.state.effective_model.as_deref().is_some())
+            && requested_model_selection_matches_frozen(
+                provider.as_deref(),
+                model.as_deref(),
+                observed_provider,
+                observed_model,
+                journal.state.effective_model_provider.as_deref(),
+                journal.state.effective_model.as_deref(),
+            )
+    } else {
+        requested_model_selection_matches(
+            provider.as_deref(),
+            model.as_deref(),
+            observed_provider,
+            observed_model,
+        )
+    };
+    let thread_matches = thread["id"].as_str() == Some(root)
+        && thread["cwd"].as_str().and_then(normalize_path) == normalize_path(&workspace)
+        && thread_selection_matches;
+    if !thread_matches {
         return Err("THREAD_CONFIGURATION_MISMATCH");
     }
     // This is the sole Pending/Candidate -> Active transition. Its inputs are
@@ -5036,13 +5169,19 @@ fn adopt_verified_root(
     if let Some(record) = journal.state.operations.get_mut(operation_id) {
         record.thread_configuration_readback = Some("verified".into());
     }
-    journal.state.effective_model_provider = Some(provider.to_owned());
-    journal.state.effective_model = Some(model.to_owned());
+    // Effective values are always the native readback, never the request.
+    // For an explicit override the two coincide; for omission the observed
+    // harness defaults become effective while requested stays `None`.
+    journal.state.effective_model_provider = observed_provider.map(str::to_owned);
+    journal.state.effective_model = observed_model.map(str::to_owned);
     journal.state.native_root_phase = Some(NativeRootPhase::Active);
-    if !journal
-        .state
-        .is_current_root(root, scope, provider, model, workspace)
-    {
+    if !journal.state.is_current_root(
+        root,
+        scope,
+        provider.as_deref(),
+        model.as_deref(),
+        &workspace,
+    ) {
         journal.state.native_root_phase = prior_phase;
         journal.state.effective_model_provider = prior_effective_provider;
         journal.state.effective_model = prior_effective_model;
@@ -5122,8 +5261,8 @@ async fn open_operation(
             &journal.state,
             &NativeError::IdentityUnverified,
             "server_identity",
-            Some(&provider),
-            Some(&model),
+            provider.as_deref(),
+            model.as_deref(),
         );
     }
     let scope = native
@@ -5138,11 +5277,11 @@ async fn open_operation(
     let mut record = OperationRecord::intent("agent.open", "open");
     record.input_sha256 = command.input_sha256.clone();
     record.native_scope_key = Some(scope.clone());
-    record.requested_model_provider = Some(provider.clone());
-    record.requested_model = Some(model.clone());
+    record.requested_model_provider = provider.clone();
+    record.requested_model = model.clone();
     record.workspace_root = Some(canonical_workspace.clone());
-    journal.state.requested_model_provider = Some(provider.clone());
-    journal.state.requested_model = Some(model.clone());
+    journal.state.requested_model_provider = provider.clone();
+    journal.state.requested_model = model.clone();
     journal.state.workspace_root = Some(canonical_workspace);
     journal.state.native_scope_key = Some(scope.clone());
     journal.state.effective_model_provider = None;
@@ -5167,11 +5306,18 @@ async fn open_operation(
             details,
         );
     }
+    let mut start_params = serde_json::Map::new();
+    start_params.insert("cwd".to_owned(), json!(workspace));
+    // Omit both keys when no explicit override was requested so the native
+    // harness thread defaults apply; never infer a provider.
+    if let Some(provider) = provider.as_deref() {
+        start_params.insert("modelProvider".to_owned(), json!(provider));
+    }
+    if let Some(model) = model.as_deref() {
+        start_params.insert("model".to_owned(), json!(model));
+    }
     let response = native
-        .request(
-            "thread/start",
-            json!({"cwd":workspace,"modelProvider":provider,"model":model}),
-        )
+        .request("thread/start", Value::Object(start_params))
         .await;
     let response = match response {
         Ok(response) => response,
@@ -5189,8 +5335,8 @@ async fn open_operation(
             });
             details["native_replay"] = json!(false);
             with_native_failure_details(&mut details, &error, "thread_start_after_effect_marker");
-            details["requested_model_provider"] = json!(provider);
-            details["requested_model"] = json!(model);
+            details["requested_model_provider"] = json!(provider.as_deref());
+            details["requested_model"] = json!(model.as_deref());
             details["native_server_report"] = native_server_report.clone();
             return outcome(
                 &command.operation_id,
@@ -5316,13 +5462,15 @@ async fn send_operation(
         let previous_is_current = match (
             previous.native_root_id.as_deref(),
             previous.native_scope_key.as_deref(),
-            previous.requested_model_provider.as_deref(),
-            previous.requested_model.as_deref(),
             previous.workspace_root.as_deref(),
         ) {
-            (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
-                .state
-                .is_current_root(root, scope, provider, model, workspace),
+            (Some(root), Some(scope), Some(workspace)) => journal.state.is_current_root(
+                root,
+                scope,
+                previous.requested_model_provider.as_deref(),
+                previous.requested_model.as_deref(),
+                workspace,
+            ),
             _ => false,
         };
         if !previous_is_current {
@@ -5353,7 +5501,7 @@ async fn send_operation(
         if journal.state.native_scope_key.as_deref() != native.scope_key() {
             return unknown_send(previous, &command.operation_id, "NATIVE_SCOPE_CHANGED");
         }
-        return reconcile_send(native, previous, &command.operation_id).await;
+        return reconcile_send(native, previous, &command.operation_id, &journal.state).await;
     }
     let (provider, model, workspace) = match validate_route(command) {
         Ok(route) => route,
@@ -5367,10 +5515,13 @@ async fn send_operation(
     let Some(root_scope) = journal.state.native_scope_key.as_deref() else {
         return rejected(command, "NATIVE_SCOPE_CHANGED", &journal.state);
     };
-    if !journal
-        .state
-        .is_current_root(&root, root_scope, &provider, &model, &workspace)
-    {
+    if !journal.state.is_current_root(
+        &root,
+        root_scope,
+        provider.as_deref(),
+        model.as_deref(),
+        &workspace,
+    ) {
         return rejected(command, "ROUTE_CONFIGURATION_MISMATCH", &journal.state);
     }
     let prompt = match prompt_for(command, claim) {
@@ -5401,8 +5552,8 @@ async fn send_operation(
             &journal.state,
             &NativeError::IdentityUnverified,
             "server_identity",
-            Some(&provider),
-            Some(&model),
+            provider.as_deref(),
+            model.as_deref(),
         );
     }
     let scope = native
@@ -5422,16 +5573,22 @@ async fn send_operation(
                 &journal.state,
                 &error,
                 "thread_read_preflight",
-                Some(&provider),
-                Some(&model),
+                provider.as_deref(),
+                model.as_deref(),
             );
         }
     };
-    if thread["id"].as_str() != Some(root.as_str())
-        || thread["modelProvider"].as_str() != Some(provider.as_str())
-        || thread["model"].as_str() != Some(model.as_str())
-        || thread["cwd"].as_str().and_then(normalize_path) != normalize_path(&workspace)
-    {
+    let preflight_matches = thread["id"].as_str() == Some(root.as_str())
+        && thread["cwd"].as_str().and_then(normalize_path) == normalize_path(&workspace)
+        && requested_model_selection_matches_frozen(
+            provider.as_deref(),
+            model.as_deref(),
+            thread["modelProvider"].as_str(),
+            thread["model"].as_str(),
+            journal.state.effective_model_provider.as_deref(),
+            journal.state.effective_model.as_deref(),
+        );
+    if !preflight_matches {
         return rejected(command, "THREAD_CONFIGURATION_MISMATCH", &journal.state);
     }
     if !steer && thread["status"]["type"] != "idle" {
@@ -5440,7 +5597,7 @@ async fn send_operation(
     let native_payload = native_send_payload(
         &root,
         &prompt,
-        &model,
+        model.as_deref(),
         &command.operation_id,
         steer,
         expected_turn.as_deref(),
@@ -5461,8 +5618,8 @@ async fn send_operation(
     record.input_sha256 = command.input_sha256.clone();
     record.native_root_id = Some(root.clone());
     record.native_scope_key = Some(scope.clone());
-    record.requested_model_provider = Some(provider.clone());
-    record.requested_model = Some(model.clone());
+    record.requested_model_provider = provider.clone();
+    record.requested_model = model.clone();
     record.workspace_root = Some(canonical_workspace);
     record.thread_configuration_readback = Some("verified".into());
     record.client_user_message_id = Some(command.operation_id.clone());
@@ -5541,7 +5698,7 @@ async fn send_operation(
         .operations
         .get(&command.operation_id)
         .expect("send marker persisted");
-    reconcile_send(native, record, &command.operation_id).await
+    reconcile_send(native, record, &command.operation_id, &journal.state).await
 }
 
 async fn reconcile_operation(
@@ -5650,25 +5807,29 @@ async fn reconcile_operation(
     let target_context_matches = match (
         target.native_root_id.as_deref(),
         target.native_scope_key.as_deref(),
-        target.requested_model_provider.as_deref(),
-        target.requested_model.as_deref(),
         target.workspace_root.as_deref(),
     ) {
-        (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
-            .state
-            .root_context_matches(root, scope, provider, model, workspace),
+        (Some(root), Some(scope), Some(workspace)) => journal.state.root_context_matches(
+            root,
+            scope,
+            target.requested_model_provider.as_deref(),
+            target.requested_model.as_deref(),
+            workspace,
+        ),
         _ => false,
     };
     let target_is_current = match (
         target.native_root_id.as_deref(),
         target.native_scope_key.as_deref(),
-        target.requested_model_provider.as_deref(),
-        target.requested_model.as_deref(),
         target.workspace_root.as_deref(),
     ) {
-        (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
-            .state
-            .is_current_root(root, scope, provider, model, workspace),
+        (Some(root), Some(scope), Some(workspace)) => journal.state.is_current_root(
+            root,
+            scope,
+            target.requested_model_provider.as_deref(),
+            target.requested_model.as_deref(),
+            workspace,
+        ),
         _ => false,
     };
     if target.kind == "send" && !prior_resolved {
@@ -5679,7 +5840,7 @@ async fn reconcile_operation(
             {
                 reconciled = Some(unknown_send(&target, target_id, "NATIVE_SCOPE_CHANGED"));
             } else {
-                reconciled = Some(reconcile_send(native, &target, target_id).await);
+                reconciled = Some(reconcile_send(native, &target, target_id, &journal.state).await);
             }
         }
         let mut result = reconciled.unwrap_or_else(|| {
@@ -6219,8 +6380,8 @@ async fn build_normalized_result_page(
         || command.generation != origin.binding_generation
         || target_operation_id != origin.target_operation_id
         || target_input_sha256 != origin.target_input_sha256
-        || journal.state.requested_model_provider.as_deref() != Some(route_provider.as_str())
-        || journal.state.requested_model.as_deref() != Some(route_model.as_str())
+        || journal.state.requested_model_provider.as_deref() != route_provider.as_deref()
+        || journal.state.requested_model.as_deref() != route_model.as_deref()
         || journal
             .state
             .workspace_root
@@ -6416,8 +6577,8 @@ async fn build_normalized_result_page(
     if !journal.state.is_current_root(
         native_root_id,
         native_scope_key,
-        &route_provider,
-        &route_model,
+        route_provider.as_deref(),
+        route_model.as_deref(),
         &route_workspace,
     ) {
         return Err("CODEX_RESULT_NATIVE_SCOPE_CHANGED");
@@ -6430,16 +6591,22 @@ async fn build_normalized_result_page(
         .await
         .map_err(|error| error.diagnostic_code())?;
     let thread = &thread["thread"];
-    if thread["id"].as_str() != Some(native_root_id)
-        || thread["modelProvider"].as_str() != journal.state.requested_model_provider.as_deref()
-        || thread["model"].as_str() != journal.state.requested_model.as_deref()
-        || thread["cwd"].as_str().and_then(normalize_path)
-            != journal
+    let result_thread_matches = thread["id"].as_str() == Some(native_root_id)
+        && thread["cwd"].as_str().and_then(normalize_path)
+            == journal
                 .state
                 .workspace_root
                 .as_deref()
                 .and_then(normalize_path)
-    {
+        && requested_model_selection_matches_frozen(
+            journal.state.requested_model_provider.as_deref(),
+            journal.state.requested_model.as_deref(),
+            thread["modelProvider"].as_str(),
+            thread["model"].as_str(),
+            journal.state.effective_model_provider.as_deref(),
+            journal.state.effective_model.as_deref(),
+        );
+    if !result_thread_matches {
         return Err("CODEX_RESULT_THREAD_CONFIGURATION_MISMATCH");
     }
     let history = match native
@@ -6678,6 +6845,45 @@ async fn report_pending(
     Ok(())
 }
 
+/// Reconnect a terminal demux before admitted reconcile/result: persist the old fault
+/// via capture_native_events, then swap in a fresh client on the same endpoint/token
+/// without replay. A fresh scope differing from the retained scope is contained, never
+/// adopted: readback stays Unknown through the existing identity checks.
+async fn reconnect_native_for_readback(
+    journal: &mut Journal,
+    native: &mut NativeClient,
+    endpoint: &str,
+    token: Option<&str>,
+    credential_unavailable: bool,
+) -> Result<bool, AdapterError> {
+    if let Ok(None) = native.demux.terminal_error() {
+        return Ok(false);
+    }
+    journal.capture_native_events()?;
+    let expected_scope = journal.state.native_scope_key.clone();
+    let fresh_events = NativeEventSink::new();
+    let fresh = match NativeClient::attach(
+        endpoint,
+        token,
+        credential_unavailable,
+        fresh_events.clone(),
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(error) => NativeClient::unavailable(error, fresh_events.clone()),
+    };
+    if fresh.identity_is_known() && fresh.scope_key() != expected_scope.as_deref() {
+        drop(fresh);
+        let clean = NativeEventSink::new();
+        *native = NativeClient::unavailable(NativeError::IdentityUnverified, clean.clone());
+        journal.native_events = clean;
+        return Ok(true);
+    }
+    journal.native_events = fresh.events.clone();
+    *native = fresh;
+    Ok(true)
+}
 /// Run the module protocol. The app-server is only contacted with WebSocket
 /// client operations; this adapter contains no process start/stop code.
 pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
@@ -6778,6 +6984,19 @@ pub async fn run(config: AdapterConfig) -> Result<(), AdapterError> {
                     Ok(command) => command,
                     Err(_) => return Err(AdapterError::HostProtocol),
                 };
+                if matches!(command.method.as_str(), "agent.reconcile" | "agent.result")
+                    && journal.state.binding_id.as_deref() == Some(command.binding_id.as_str())
+                    && journal.state.generation == Some(command.generation)
+                {
+                    reconnect_native_for_readback(
+                        &mut journal,
+                        native,
+                        &endpoint,
+                        token.as_deref(),
+                        credential_unavailable,
+                    )
+                    .await?;
+                }
                 let outcomes = handle_command(
                     command,
                     &mut journal,
@@ -6842,6 +7061,8 @@ mod reg28_tests {
             Some(requested_provider),
             Some(requested_model),
             Some(workspace),
+            None,
+            None,
         );
         assert_eq!(mismatch.effective_model_status, "unknown");
         assert_eq!(mismatch.native_thread_readback, "mismatch");
@@ -6875,6 +7096,8 @@ mod reg28_tests {
             Some(requested_provider),
             Some(requested_model),
             Some(workspace),
+            None,
+            None,
         );
         assert_eq!(
             exact.effective_model_status,
@@ -6907,6 +7130,8 @@ mod reg28_tests {
                 Some(requested_provider),
                 Some(requested_model),
                 Some("/workspace/project"),
+                None,
+                None,
             );
             assert!(!different_case.verified);
             assert_eq!(different_case.effective_model, None);
@@ -6930,6 +7155,8 @@ mod reg28_tests {
             Some(requested_provider),
             Some(requested_model),
             Some(workspace),
+            None,
+            None,
         );
         assert_eq!(unknown.effective_model_status, "unknown");
         assert_eq!(unknown.native_thread_readback, "unavailable");
@@ -6942,6 +7169,516 @@ mod reg28_tests {
         assert!(matches!(
             reconcile_send_outcome(true, unknown.verified),
             EffectOutcome::Unknown
+        ));
+    }
+
+    #[test]
+    fn native_defaults_omission_uses_thread_defaults_without_inference() {
+        let workspace_path = std::env::current_dir().expect("fixture workspace");
+        let workspace = workspace_path.to_str().expect("UTF-8 fixture workspace");
+        let native_defaults = serde_json::json!({
+            "thread": {
+                "id": "thread-1",
+                "modelProvider": "provider-native-default",
+                "model": "model-native-default",
+                "cwd": workspace
+            }
+        });
+        // Omission selects the installed harness thread defaults: requested
+        // stays `None` while the observed native values become effective.
+        let omitted = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            None,
+            None,
+            Some(workspace),
+            Some("provider-native-default"),
+            Some("model-native-default"),
+        );
+        assert!(omitted.verified);
+        assert_eq!(omitted.native_thread_readback, "verified");
+        assert_eq!(
+            omitted.effective_model_provider.as_deref(),
+            Some("provider-native-default")
+        );
+        assert_eq!(
+            omitted.effective_model.as_deref(),
+            Some("model-native-default")
+        );
+        assert_eq!(
+            omitted.effective_model_status,
+            "thread_configuration_verified"
+        );
+        // An explicit matching override still verifies against itself.
+        let explicit = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            Some("provider-native-default"),
+            Some("model-native-default"),
+            Some(workspace),
+            None,
+            None,
+        );
+        assert!(explicit.verified);
+        assert_eq!(
+            explicit.effective_model_provider,
+            omitted.effective_model_provider
+        );
+        assert_eq!(explicit.effective_model, omitted.effective_model);
+        // An explicit mismatch never adopts the native values as requested.
+        let mismatch = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            Some("provider-other"),
+            Some("model-other"),
+            Some(workspace),
+            None,
+            None,
+        );
+        assert!(!mismatch.verified);
+        assert_eq!(mismatch.effective_model_provider, None);
+        let provider_only = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            Some("provider-native-default"),
+            None,
+            Some(workspace),
+            Some("provider-native-default"),
+            Some("model-native-default"),
+        );
+        assert!(provider_only.verified);
+        assert_eq!(
+            provider_only.effective_model_provider.as_deref(),
+            Some("provider-native-default")
+        );
+        assert_eq!(
+            provider_only.effective_model.as_deref(),
+            Some("model-native-default")
+        );
+
+        let model_only = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            None,
+            Some("model-native-default"),
+            Some(workspace),
+            Some("provider-native-default"),
+            Some("model-native-default"),
+        );
+        assert!(model_only.verified);
+        assert_eq!(
+            model_only.effective_model_provider.as_deref(),
+            Some("provider-native-default")
+        );
+        assert_eq!(
+            model_only.effective_model.as_deref(),
+            Some("model-native-default")
+        );
+
+        let wrong_provider = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            Some("provider-other"),
+            None,
+            Some(workspace),
+            Some("provider-native-default"),
+            Some("model-native-default"),
+        );
+        assert!(!wrong_provider.verified);
+        let wrong_model = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            None,
+            Some("model-other"),
+            Some(workspace),
+            Some("provider-native-default"),
+            Some("model-native-default"),
+        );
+        assert!(!wrong_model.verified);
+
+        let empty_observation = serde_json::json!({
+            "thread": {
+                "id": "thread-1",
+                "modelProvider": "",
+                "model": "model-native-default",
+                "cwd": workspace
+            }
+        });
+        let empty = ThreadConfigurationReadback::from_response(
+            &empty_observation,
+            "thread-1",
+            None,
+            None,
+            Some(workspace),
+            Some("provider-native-default"),
+            Some("model-native-default"),
+        );
+        assert!(!empty.verified);
+        assert_eq!(
+            empty.diagnostic_code,
+            Some("THREAD_CONFIGURATION_READBACK_UNAVAILABLE")
+        );
+        // Per-call payload: omission leaves `model` unset (thread default),
+        // explicit override sends the exact model string.
+        let omitted_payload = native_send_payload("thread-1", "prompt", None, "op-1", false, None);
+        assert!(omitted_payload.get("model").is_none());
+        let explicit_payload = native_send_payload(
+            "thread-1",
+            "prompt",
+            Some("model-native-default"),
+            "op-1",
+            false,
+            None,
+        );
+        assert_eq!(explicit_payload["model"], "model-native-default");
+    }
+    async fn connected_partial_selector_case(
+        case: &'static str,
+        requested_provider: Option<&'static str>,
+        requested_model: Option<&'static str>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let directory =
+            std::env::temp_dir().join(format!("codex-partial-selector-{case}-{}", Uuid::new_v4()));
+        let workspace_path = directory.join("workspace");
+        let codex_home_path = directory.join("codex-home");
+        std::fs::create_dir_all(&workspace_path).expect("fixture workspace");
+        std::fs::create_dir_all(&codex_home_path).expect("fixture Codex home");
+        let workspace = std::fs::canonicalize(&workspace_path)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+        let codex_home = std::fs::canonicalize(&codex_home_path)
+            .expect("canonical Codex home")
+            .to_string_lossy()
+            .into_owned();
+        let observed_provider = requested_provider.unwrap_or("provider-native-default");
+        let observed_model = requested_model.unwrap_or("model-native-default");
+        let thread_id = format!("thread-partial-{case}");
+        let thread = serde_json::json!({
+            "id": thread_id,
+            "modelProvider": observed_provider,
+            "model": observed_model,
+            "cwd": workspace,
+            "status": {"type":"idle"}
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let address = listener.local_addr().expect("loopback address");
+        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let server_requests = std::sync::Arc::clone(&requests);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("loopback accept");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("loopback WebSocket handshake");
+            let mut start_sender = Some(start_sender);
+            while let Some(message) = socket.next().await {
+                let message = match message {
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+                let packet = match message {
+                    Message::Text(text) => serde_json::from_str::<Value>(text.as_str())
+                        .expect("native JSON-RPC packet"),
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+                server_requests
+                    .lock()
+                    .expect("request log")
+                    .push(packet.clone());
+                let Some(id) = packet.get("id").cloned() else {
+                    continue;
+                };
+                let method = packet["method"].as_str().expect("native method");
+                let result = match method {
+                    "initialize" => {
+                        assert_eq!(packet["params"]["capabilities"]["experimentalApi"], false);
+                        serde_json::json!({
+                            "userAgent":"Codex CLI/1.2.3",
+                            "codexHome":codex_home,
+                            "platformFamily":std::env::consts::FAMILY,
+                            "platformOs":std::env::consts::OS
+                        })
+                    }
+                    "thread/start" => {
+                        start_sender
+                            .take()
+                            .expect("one thread start")
+                            .send(packet["params"].clone())
+                            .expect("start parameter receiver");
+                        serde_json::json!({"thread":thread})
+                    }
+                    "thread/read" | "thread/resume" => serde_json::json!({"thread":thread}),
+                    "thread/turns/list" | "thread/items/list" => {
+                        serde_json::json!({"data":[],"nextCursor":null})
+                    }
+                    "turn/start" => serde_json::json!({
+                        "turn":{"id":"turn-partial-fixture","status":"inProgress"}
+                    }),
+                    other => panic!("unexpected fixture native method: {other}"),
+                };
+                let response = serde_json::json!({"id":id,"result":result});
+                if socket
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let endpoint = format!("ws://{address}/");
+        let mut native =
+            NativeClient::attach_inner(&endpoint, None, false, NativeEventSink::new(), false)
+                .await
+                .expect("attach to local native protocol fixture");
+        assert!(native.identity_is_known());
+
+        let boot_id = format!("boot-partial-{case}");
+        let journal_dir = directory.join("journal");
+        let mut journal =
+            Journal::open(journal_dir.clone(), boot_id.clone()).expect("open fixture journal");
+        let mut native_options = serde_json::json!({"workspaceRoot":workspace});
+        if let Some(provider) = requested_provider {
+            native_options["modelProvider"] = serde_json::json!(provider);
+        }
+        if let Some(model) = requested_model {
+            native_options["model"] = serde_json::json!(model);
+        }
+        let route = serde_json::json!({
+            "runtime":"codex",
+            "module_artifact_id":ARTIFACT_ID,
+            "native_options":native_options
+        });
+        let open_id = format!("open-partial-{case}");
+        let open_command = RuntimeCommand {
+            operation_id: open_id.clone(),
+            method: "agent.open".to_owned(),
+            created_at_ms: 1,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: route.clone(),
+            input: serde_json::json!({}),
+            input_sha256: Some("a".repeat(64)),
+            target_input_sha256: None,
+        };
+        let open_outcome = open_operation(&open_command, &mut journal, &mut native).await;
+        assert_eq!(
+            open_outcome.outcome,
+            EffectOutcome::Applied,
+            "{open_outcome:?}"
+        );
+        let start_params = start_receiver.await.expect("thread/start parameters");
+        assert_eq!(
+            start_params.get("modelProvider").is_some(),
+            requested_provider.is_some(),
+            "an omitted provider key remains absent"
+        );
+        assert_eq!(
+            start_params.get("modelProvider").and_then(Value::as_str),
+            requested_provider,
+            "only an explicit provider is forwarded"
+        );
+        assert_eq!(
+            start_params.get("model").is_some(),
+            requested_model.is_some(),
+            "an omitted model key remains absent"
+        );
+        assert_eq!(
+            start_params.get("model").and_then(Value::as_str),
+            requested_model,
+            "only an explicit model is forwarded"
+        );
+        assert_eq!(
+            journal.state.requested_model_provider.as_deref(),
+            requested_provider
+        );
+        assert_eq!(journal.state.requested_model.as_deref(), requested_model);
+        assert_eq!(
+            journal.state.effective_model_provider.as_deref(),
+            Some(observed_provider)
+        );
+        assert_eq!(
+            journal.state.effective_model.as_deref(),
+            Some(observed_model)
+        );
+        assert!(journal.state.active_root_proof_matches());
+
+        let open_record = journal
+            .state
+            .operations
+            .get(&open_id)
+            .expect("retained open operation")
+            .clone();
+        journal.state.native_root_phase = Some(NativeRootPhase::Candidate);
+        let recovered = reconcile_open(&mut journal, &mut native, &open_record, &open_id).await;
+        assert_eq!(recovered.outcome, EffectOutcome::Applied, "{recovered:?}");
+        assert!(journal.state.active_root_proof_matches());
+
+        let claim: ModuleContractClaim = serde_json::from_value(serde_json::json!({
+            "schema_version":1,
+            "module_id":"codex",
+            "artifact":{"artifact_id":ARTIFACT_ID,"version":ARTIFACT_VERSION,"build_id":null},
+            "protocol":{"major":1,"minor":0},
+            "capabilities":["agent.send"],
+            "config_schema":null,
+            "command_schemas":[],
+            "event_schemas":[]
+        }))
+        .expect("fixture module claim");
+        journal
+            .bind(&open_command.binding_id, open_command.generation)
+            .expect("bind opening receipt");
+        let mut acknowledged_open = open_outcome;
+        attach_command_receipt(&mut acknowledged_open, &open_command, &claim)
+            .expect("attach opening receipt");
+        journal
+            .store_outcome(&acknowledged_open, "agent.open", "open")
+            .expect("persist opening outcome before host ACK");
+        journal
+            .acknowledge_outcome(&open_id)
+            .expect("host accepted opening outcome");
+        assert!(
+            journal.state.active_root_proof_matches(),
+            "acknowledging the open must retain its current-root proof"
+        );
+        journal = Journal::open(journal_dir.clone(), boot_id.clone())
+            .expect("reopen acknowledged current root before dispatch");
+        assert!(journal.state.active_root_proof_matches());
+        assert!(
+            journal
+                .pending_outcomes()
+                .expect("pending outcomes")
+                .is_empty()
+        );
+        let send_id = format!("send-partial-{case}");
+        let send_command = RuntimeCommand {
+            operation_id: send_id.clone(),
+            method: "agent.send".to_owned(),
+            created_at_ms: 2,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_root_id: Some(thread_id),
+            route,
+            input: serde_json::json!({"delivery":"next_turn","text":"fixture prompt"}),
+            input_sha256: Some("b".repeat(64)),
+            target_input_sha256: None,
+        };
+        let send_outcome =
+            send_operation(&send_command, &mut journal, &mut native, &claim, &boot_id).await;
+        assert_ne!(
+            send_outcome.outcome,
+            EffectOutcome::Rejected,
+            "partial selector must pass dispatch preflight: {send_outcome:?}"
+        );
+        let requests = requests.lock().expect("request log").clone();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["method"] == "thread/resume")
+        );
+        let turn_start = requests
+            .iter()
+            .find(|request| request["method"] == "turn/start")
+            .expect("connected partial-selector dispatch");
+        assert_eq!(
+            turn_start["params"].get("model").is_some(),
+            requested_model.is_some(),
+            "an omitted per-turn model remains absent"
+        );
+        assert_eq!(
+            turn_start["params"].get("model").and_then(Value::as_str),
+            requested_model,
+            "dispatch forwards only an explicit per-turn model"
+        );
+        assert!(
+            turn_start["params"].get("modelProvider").is_none(),
+            "provider is selected at thread start, never inferred or duplicated on turn/start"
+        );
+        let send_record = journal
+            .state
+            .operations
+            .get(&send_id)
+            .expect("journaled partial-selector dispatch");
+        assert_eq!(
+            send_record.requested_model_provider.as_deref(),
+            requested_provider
+        );
+        assert_eq!(send_record.requested_model.as_deref(), requested_model);
+        assert!(journal.state.active_root_proof_matches());
+
+        drop(native);
+        drop(journal);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+        let reopened =
+            Journal::open(journal_dir, boot_id).expect("reopen partial-selector journal");
+        assert!(reopened.state.active_root_proof_matches());
+        drop(reopened);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[tokio::test]
+    async fn connected_model_only_and_provider_only_overrides_survive_lifecycle() {
+        connected_partial_selector_case("model-only", None, Some("requested-model")).await;
+        connected_partial_selector_case("provider-only", Some("requested-provider"), None).await;
+    }
+
+    #[test]
+    fn partial_result_readback_rejects_empty_and_drifted_native_fields() {
+        assert!(!requested_model_selection_matches(
+            None,
+            None,
+            Some(""),
+            Some("native-model"),
+        ));
+        assert!(!requested_model_selection_matches(
+            None,
+            None,
+            Some("native-provider"),
+            Some(""),
+        ));
+
+        assert!(requested_model_selection_matches_frozen(
+            None,
+            Some("explicit-model"),
+            Some("native-provider"),
+            Some("explicit-model"),
+            Some("native-provider"),
+            Some("explicit-model"),
+        ));
+        assert!(!requested_model_selection_matches_frozen(
+            None,
+            Some("explicit-model"),
+            Some("changed-provider"),
+            Some("explicit-model"),
+            Some("native-provider"),
+            Some("explicit-model"),
+        ));
+
+        assert!(requested_model_selection_matches_frozen(
+            Some("explicit-provider"),
+            None,
+            Some("explicit-provider"),
+            Some("native-model"),
+            Some("explicit-provider"),
+            Some("native-model"),
+        ));
+        assert!(!requested_model_selection_matches_frozen(
+            Some("explicit-provider"),
+            None,
+            Some("explicit-provider"),
+            Some("changed-model"),
+            Some("explicit-provider"),
+            Some("native-model"),
         ));
     }
 }
@@ -7755,5 +8492,614 @@ mod agent_shutdown_loopback_tests {
             );
             std::fs::remove_dir_all(&directory).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod readback_reconnect_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    fn frozen_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../fixtures/codex-readback-reconnect-frozen-20261016.json"
+        ))
+        .expect("frozen reconnect fixture is valid JSON")
+    }
+    fn fixture_claim() -> ModuleContractClaim {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "module_id": "codex",
+            "artifact": {"artifact_id": ARTIFACT_ID, "version": ARTIFACT_VERSION, "build_id": null},
+            "protocol": {"major": 1, "minor": 0},
+            "capabilities": ["agent.reconcile"],
+            "config_schema": null,
+            "command_schemas": [],
+            "event_schemas": []
+        }))
+        .expect("reconnect fixture claim")
+    }
+    struct ReadbackFixture {
+        home: String,
+        workspace: String,
+        thread_id: String,
+        client_id: String,
+        turn_id: String,
+        input_id: String,
+        prompt_text: String,
+        observed_provider: String,
+        observed_model: String,
+    }
+
+    async fn serve_readback(
+        listener: tokio::net::TcpListener,
+        fixture: ReadbackFixture,
+        methods: Arc<std::sync::Mutex<Vec<String>>>,
+        forbidden: Arc<AtomicUsize>,
+    ) {
+        let ReadbackFixture {
+            home,
+            workspace,
+            thread_id,
+            client_id,
+            turn_id,
+            input_id,
+            prompt_text,
+            observed_provider,
+            observed_model,
+        } = fixture;
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(_) => return,
+            };
+            let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(_) => continue,
+            };
+            let thread = serde_json::json!({
+                "id": thread_id.clone(),
+                "modelProvider": observed_provider.clone(),
+                "model": observed_model.clone(),
+                "cwd": workspace.clone(),
+                "status": {"type": "idle"}
+            });
+            while let Some(message) = futures_util::StreamExt::next(&mut ws).await {
+                let message = match message {
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+                let text = match message {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => text,
+                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    _ => continue,
+                };
+                let packet: serde_json::Value = match serde_json::from_str(text.as_str()) {
+                    Ok(packet) => packet,
+                    Err(_) => break,
+                };
+                let Some(id) = packet.get("id").cloned() else {
+                    continue;
+                };
+                let method = packet["method"].as_str().unwrap_or("").to_owned();
+                methods.lock().expect("method log").push(method.clone());
+                if method == "thread/start" || method == "turn/start" || method == "turn/steer" {
+                    forbidden.fetch_add(1, Ordering::SeqCst);
+                }
+                let params = packet
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let result = if method == "initialize" {
+                    serde_json::json!({
+                        "userAgent": "Codex CLI/1.2.3",
+                        "codexHome": home.clone(),
+                        "platformFamily": std::env::consts::FAMILY,
+                        "platformOs": std::env::consts::OS
+                    })
+                } else if method == "thread/read" || method == "thread/resume" {
+                    serde_json::json!({"thread": thread.clone()})
+                } else if method == "thread/items/list"
+                    && params.get("turnId").and_then(|v| v.as_str()).is_some()
+                {
+                    serde_json::json!({"data": [], "nextCursor": null})
+                } else if method == "thread/items/list" {
+                    serde_json::json!({"data": [{"item": {"type": "userMessage", "id": input_id.clone(), "clientId": client_id.clone(), "content": [{"type": "text", "text": prompt_text.clone()}]}, "turnId": turn_id.clone()}], "nextCursor": null})
+                } else if method == "thread/turns/list" {
+                    serde_json::json!({"data": [{"id": turn_id.clone(), "status": "completed", "error": null}], "nextCursor": null})
+                } else {
+                    serde_json::json!({"error": {"code": -32601, "message": "unsupported"}})
+                };
+                let response = if result.get("error").is_some() {
+                    serde_json::json!({"id": id, "error": result["error"]})
+                } else {
+                    serde_json::json!({"id": id, "result": result})
+                };
+                let send = futures_util::SinkExt::send(
+                    &mut ws,
+                    tokio_tungstenite::tungstenite::Message::Text(response.to_string().into()),
+                )
+                .await;
+                if send.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn frozen_reconcile_after_terminal_fault_reconnects_without_replay() {
+        let fixture = frozen_fixture();
+        let thread_id = fixture["thread_id"].as_str().expect("thread").to_owned();
+        let open_id = fixture["open_operation_id"]
+            .as_str()
+            .expect("open")
+            .to_owned();
+        let client_id = fixture["client_id"].as_str().expect("client").to_owned();
+        let reconcile_id = fixture["reconcile_operation_id"]
+            .as_str()
+            .expect("reconcile")
+            .to_owned();
+        let turn_id = fixture["turn_id"].as_str().expect("turn").to_owned();
+        let input_id = fixture["native_input_id"]
+            .as_str()
+            .expect("input")
+            .to_owned();
+        let prompt_text = fixture["prompt_text"].as_str().expect("prompt").to_owned();
+        let observed_provider = fixture["observed_model_provider"]
+            .as_str()
+            .expect("provider")
+            .to_owned();
+        let observed_model = fixture["observed_model"]
+            .as_str()
+            .expect("model")
+            .to_owned();
+        let prompt_sha = digest_hex(prompt_text.as_bytes());
+        let prompt_bytes = prompt_text.len() as u64;
+        let base = std::env::temp_dir().join(format!("codex-reconnect-{}", uuid::Uuid::new_v4()));
+        let workspace_path = base.join("workspace");
+        let home_path = base.join("codex-home");
+        std::fs::create_dir_all(&workspace_path).expect("workspace");
+        std::fs::create_dir_all(&home_path).expect("home");
+        let workspace = std::fs::canonicalize(&workspace_path)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+        let home = std::fs::canonicalize(&home_path)
+            .expect("canonical home")
+            .to_string_lossy()
+            .into_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let endpoint = format!("ws://{address}/");
+        let methods = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let forbidden = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_readback(
+            listener,
+            ReadbackFixture {
+                home: home.clone(),
+                workspace: workspace.clone(),
+                thread_id: thread_id.clone(),
+                client_id: client_id.clone(),
+                turn_id: turn_id.clone(),
+                input_id: input_id.clone(),
+                prompt_text: prompt_text.clone(),
+                observed_provider: observed_provider.clone(),
+                observed_model: observed_model.clone(),
+            },
+            Arc::clone(&methods),
+            Arc::clone(&forbidden),
+        ));
+        let probe = NativeClient::attach(&endpoint, None, false, NativeEventSink::new())
+            .await
+            .expect("probe attach");
+        let expected_scope = probe.scope_key().expect("probe scope").to_owned();
+        assert!(probe.identity_is_known());
+        drop(probe);
+        let journal_dir = base.join("journal");
+        let mut journal = Journal::open(journal_dir.clone(), "boot-reconnect-test".to_owned())
+            .expect("open journal");
+        journal.state.binding_id = Some("fixture-binding".to_owned());
+        journal.state.generation = Some(1);
+        journal.state.native_root_id = Some(thread_id.clone());
+        journal.state.native_scope_key = Some(expected_scope.clone());
+        journal.state.workspace_root = Some(workspace.clone());
+        journal.state.requested_model_provider = None;
+        journal.state.requested_model = None;
+        journal.state.effective_model_provider = Some(observed_provider.clone());
+        journal.state.effective_model = Some(observed_model.clone());
+        journal.state.native_root_phase = Some(NativeRootPhase::Active);
+        journal.state.root_operation_id = Some(open_id.clone());
+        let mut open_record = OperationRecord::intent("agent.open", "open");
+        open_record.input_sha256 = Some("a".repeat(64));
+        open_record.native_root_id = Some(thread_id.clone());
+        open_record.native_scope_key = Some(expected_scope.clone());
+        open_record.workspace_root = Some(workspace.clone());
+        open_record.thread_configuration_readback = Some("verified".to_owned());
+        journal
+            .state
+            .operations
+            .insert(open_id.clone(), open_record);
+        let mut send_record = OperationRecord::intent("agent.send", "send");
+        send_record.input_sha256 = Some("b".repeat(64));
+        send_record.native_root_id = Some(thread_id.clone());
+        send_record.native_scope_key = Some(expected_scope.clone());
+        send_record.workspace_root = Some(workspace.clone());
+        send_record.thread_configuration_readback = Some("verified".to_owned());
+        send_record.client_user_message_id = Some(client_id.clone());
+        send_record.prompt_sha256 = Some(prompt_sha.clone());
+        send_record.prompt_bytes = Some(prompt_bytes);
+        send_record.delivery = Some("next_turn".to_owned());
+        send_record.returned_turn_id = Some(turn_id.clone());
+        journal
+            .state
+            .operations
+            .insert(client_id.clone(), send_record.clone());
+        journal.save().expect("persist frozen journal");
+        let old_sink = journal.native_event_sink();
+        old_sink
+            .set_scope(expected_scope.clone())
+            .expect("bind the production-shared old sink");
+        old_sink
+            .queue_event(NativeRpcEvent::NativeNotification {
+                method: "test/old-observer".to_owned(),
+                params: serde_json::json!({}),
+            })
+            .expect("queue old");
+        let old_demux = Arc::new(NativeRpcDemultiplexer::new(old_sink.clone()));
+        old_demux.fail(NativeError::DemultiplexerCapacity);
+        let mut native = NativeClient {
+            writer: None,
+            demux: old_demux,
+            events: old_sink,
+            reader_task: None,
+            native_scope_key: Some(expected_scope.clone()),
+            server_identity: None,
+        };
+        assert!(
+            native
+                .demux
+                .terminal_error()
+                .expect("old terminal")
+                .is_some()
+        );
+        let reconnected =
+            reconnect_native_for_readback(&mut journal, &mut native, &endpoint, None, false)
+                .await
+                .expect("reconnect");
+        assert!(reconnected);
+        assert!(native.demux.terminal_error().expect("fresh live").is_none());
+        assert_eq!(native.scope_key(), Some(expected_scope.as_str()));
+        assert_eq!(
+            journal.state.native_scope_key.as_deref(),
+            Some(expected_scope.as_str())
+        );
+        assert!(!journal.state.pending_native_events.is_empty());
+        let retained = journal
+            .state
+            .operations
+            .get(&client_id)
+            .expect("retained send");
+        assert_eq!(retained.input_sha256, send_record.input_sha256);
+        assert_eq!(retained.prompt_sha256, send_record.prompt_sha256);
+        assert_eq!(retained.prompt_bytes, send_record.prompt_bytes);
+        assert_eq!(
+            journal.state.native_root_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        let claim = fixture_claim();
+        let command = RuntimeCommand {
+            operation_id: reconcile_id.clone(),
+            method: "agent.reconcile".to_owned(),
+            created_at_ms: 3,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: serde_json::json!({}),
+            input: serde_json::json!({"operation_id": client_id}),
+            input_sha256: Some("c".repeat(64)),
+            target_input_sha256: Some("b".repeat(64)),
+        };
+        let target = journal
+            .operation_record(&client_id)
+            .expect("target lookup")
+            .expect("target present");
+        let results =
+            reconcile_operation(&command, &mut journal, &mut native, Some(target), &claim)
+                .await
+                .expect("reconcile");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].outcome, EffectOutcome::Applied);
+        assert_eq!(
+            results[0].details["native_input_readback"],
+            serde_json::json!("verified")
+        );
+        assert_eq!(
+            results[0].details["completion_condition"],
+            serde_json::json!("native_turn_completed")
+        );
+        assert_eq!(results[0].turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(
+            results[0].native_input_id.as_deref(),
+            Some(input_id.as_str())
+        );
+        assert_eq!(results[1].outcome, EffectOutcome::Applied);
+        assert_eq!(results[1].details["resolved"], serde_json::json!(true));
+        assert_eq!(forbidden.load(Ordering::SeqCst), 0);
+        let seen = methods.lock().expect("methods").clone();
+        assert!(seen.iter().any(|m| m == "thread/items/list"));
+        assert!(seen.iter().any(|m| m == "thread/turns/list"));
+        assert!(
+            !seen
+                .iter()
+                .any(|m| m == "thread/start" || m == "turn/start" || m == "turn/steer")
+        );
+        server.abort();
+        std::fs::remove_dir_all(&base).ok();
+    }
+    #[tokio::test]
+    async fn drifted_scope_after_reconnect_stays_unknown() {
+        let fixture = frozen_fixture();
+        let thread_id = fixture["thread_id"].as_str().expect("thread").to_owned();
+        let open_id = fixture["open_operation_id"]
+            .as_str()
+            .expect("open")
+            .to_owned();
+        let client_id = fixture["client_id"].as_str().expect("client").to_owned();
+        let reconcile_id = fixture["reconcile_operation_id"]
+            .as_str()
+            .expect("reconcile")
+            .to_owned();
+        let turn_id = fixture["turn_id"].as_str().expect("turn").to_owned();
+        let input_id = fixture["native_input_id"]
+            .as_str()
+            .expect("input")
+            .to_owned();
+        let prompt_text = fixture["prompt_text"].as_str().expect("prompt").to_owned();
+        let observed_provider = fixture["observed_model_provider"]
+            .as_str()
+            .expect("provider")
+            .to_owned();
+        let observed_model = fixture["observed_model"]
+            .as_str()
+            .expect("model")
+            .to_owned();
+        let prompt_sha = digest_hex(prompt_text.as_bytes());
+        let prompt_bytes = prompt_text.len() as u64;
+        let base =
+            std::env::temp_dir().join(format!("codex-reconnect-drift-{}", uuid::Uuid::new_v4()));
+        let workspace_path = base.join("workspace");
+        let home_path = base.join("codex-home");
+        let drift_path = base.join("codex-home-drift");
+        std::fs::create_dir_all(&workspace_path).expect("workspace");
+        std::fs::create_dir_all(&home_path).expect("home");
+        std::fs::create_dir_all(&drift_path).expect("drift home");
+        let workspace = std::fs::canonicalize(&workspace_path)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+        let home = std::fs::canonicalize(&home_path)
+            .expect("canonical home")
+            .to_string_lossy()
+            .into_owned();
+        let drift_home = std::fs::canonicalize(&drift_path)
+            .expect("canonical drift")
+            .to_string_lossy()
+            .into_owned();
+        assert_ne!(home, drift_home);
+        let expected_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind expected");
+        let expected_addr = expected_listener.local_addr().expect("addr");
+        let expected_endpoint = format!("ws://{expected_addr}/");
+        let expected_methods = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let expected_forbidden = Arc::new(AtomicUsize::new(0));
+        let expected_server = tokio::spawn(serve_readback(
+            expected_listener,
+            ReadbackFixture {
+                home: home.clone(),
+                workspace: workspace.clone(),
+                thread_id: thread_id.clone(),
+                client_id: client_id.clone(),
+                turn_id: turn_id.clone(),
+                input_id: input_id.clone(),
+                prompt_text: prompt_text.clone(),
+                observed_provider: observed_provider.clone(),
+                observed_model: observed_model.clone(),
+            },
+            Arc::clone(&expected_methods),
+            Arc::clone(&expected_forbidden),
+        ));
+        let probe = NativeClient::attach(&expected_endpoint, None, false, NativeEventSink::new())
+            .await
+            .expect("probe attach");
+        let expected_scope = probe.scope_key().expect("probe scope").to_owned();
+        drop(probe);
+        expected_server.abort();
+        let drift_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind drift");
+        let drift_addr = drift_listener.local_addr().expect("addr");
+        let drift_endpoint = format!("ws://{drift_addr}/");
+        let drift_methods = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let drift_forbidden = Arc::new(AtomicUsize::new(0));
+        let drift_server = tokio::spawn(serve_readback(
+            drift_listener,
+            ReadbackFixture {
+                home: drift_home.clone(),
+                workspace: workspace.clone(),
+                thread_id: thread_id.clone(),
+                client_id: client_id.clone(),
+                turn_id: turn_id.clone(),
+                input_id: input_id.clone(),
+                prompt_text: prompt_text.clone(),
+                observed_provider: observed_provider.clone(),
+                observed_model: observed_model.clone(),
+            },
+            Arc::clone(&drift_methods),
+            Arc::clone(&drift_forbidden),
+        ));
+        let journal_dir = base.join("journal");
+        let mut journal = Journal::open(journal_dir.clone(), "boot-reconnect-drift".to_owned())
+            .expect("open journal");
+        journal.state.binding_id = Some("fixture-binding".to_owned());
+        journal.state.generation = Some(1);
+        journal.state.native_root_id = Some(thread_id.clone());
+        journal.state.native_scope_key = Some(expected_scope.clone());
+        journal.state.workspace_root = Some(workspace.clone());
+        journal.state.effective_model_provider = Some(observed_provider.clone());
+        journal.state.effective_model = Some(observed_model.clone());
+        journal.state.native_root_phase = Some(NativeRootPhase::Active);
+        journal.state.root_operation_id = Some(open_id.clone());
+        let mut open_record = OperationRecord::intent("agent.open", "open");
+        open_record.input_sha256 = Some("a".repeat(64));
+        open_record.native_root_id = Some(thread_id.clone());
+        open_record.native_scope_key = Some(expected_scope.clone());
+        open_record.workspace_root = Some(workspace.clone());
+        open_record.thread_configuration_readback = Some("verified".to_owned());
+        journal
+            .state
+            .operations
+            .insert(open_id.clone(), open_record);
+        let mut send_record = OperationRecord::intent("agent.send", "send");
+        send_record.input_sha256 = Some("b".repeat(64));
+        send_record.native_root_id = Some(thread_id.clone());
+        send_record.native_scope_key = Some(expected_scope.clone());
+        send_record.workspace_root = Some(workspace.clone());
+        send_record.thread_configuration_readback = Some("verified".to_owned());
+        send_record.client_user_message_id = Some(client_id.clone());
+        send_record.prompt_sha256 = Some(prompt_sha.clone());
+        send_record.prompt_bytes = Some(prompt_bytes);
+        send_record.delivery = Some("next_turn".to_owned());
+        send_record.returned_turn_id = Some(turn_id.clone());
+        journal
+            .state
+            .operations
+            .insert(client_id.clone(), send_record.clone());
+        journal.save().expect("persist frozen journal");
+        let old_sink = journal.native_event_sink();
+        old_sink
+            .set_scope(expected_scope.clone())
+            .expect("bind the production-shared old sink");
+        let old_demux = Arc::new(NativeRpcDemultiplexer::new(old_sink.clone()));
+        old_demux.fail(NativeError::DemultiplexerCapacity);
+        let mut native = NativeClient {
+            writer: None,
+            demux: old_demux,
+            events: old_sink,
+            reader_task: None,
+            native_scope_key: Some(expected_scope.clone()),
+            server_identity: None,
+        };
+        let reconnected =
+            reconnect_native_for_readback(&mut journal, &mut native, &drift_endpoint, None, false)
+                .await
+                .expect("drift reconnect");
+        assert!(reconnected);
+        assert!(matches!(
+            native.demux.terminal_error(),
+            Ok(Some(NativeError::IdentityUnverified))
+        ));
+        assert!(
+            !native.identity_is_known(),
+            "drifted client must not present a known identity"
+        );
+        assert_eq!(
+            native.scope_key(),
+            None,
+            "drifted scope must not be adopted"
+        );
+        assert_eq!(
+            journal.state.native_scope_key.as_deref(),
+            Some(expected_scope.as_str())
+        );
+        assert_eq!(
+            journal.state.native_root_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            journal.active_root_id(),
+            Some(thread_id.as_str()),
+            "retained root stays current in journal"
+        );
+        for record in &journal.state.pending_native_events {
+            assert!(
+                record
+                    .appserver_scope
+                    .as_deref()
+                    .is_none_or(|scope| scope == expected_scope.as_str()),
+                "no foreign-scoped metadata may enter the journal"
+            );
+        }
+        let claim = fixture_claim();
+        let command = RuntimeCommand {
+            operation_id: reconcile_id.clone(),
+            method: "agent.reconcile".to_owned(),
+            created_at_ms: 3,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: serde_json::json!({}),
+            input: serde_json::json!({"operation_id": client_id}),
+            input_sha256: Some("c".repeat(64)),
+            target_input_sha256: Some("b".repeat(64)),
+        };
+        let target = journal
+            .operation_record(&client_id)
+            .expect("target lookup")
+            .expect("target present");
+        let results =
+            reconcile_operation(&command, &mut journal, &mut native, Some(target), &claim)
+                .await
+                .expect("drift reconcile");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].outcome, EffectOutcome::Unknown);
+        assert_eq!(
+            results[0].details["diagnostic_code"],
+            serde_json::json!("NATIVE_SCOPE_CHANGED")
+        );
+        assert_eq!(results[1].details["resolved"], serde_json::json!(false));
+        assert_eq!(
+            journal.state.native_scope_key.as_deref(),
+            Some(expected_scope.as_str())
+        );
+        assert!(
+            !native.identity_is_known(),
+            "drifted client still cannot advertise the old root as ready"
+        );
+        assert_eq!(journal.active_root_id(), Some(thread_id.as_str()));
+        assert_eq!(native.scope_key(), None);
+        let observation = journal
+            .next_observation(false, false)
+            .expect("observation renders");
+        assert_eq!(
+            observation["state"]["native"]["root_id"],
+            serde_json::json!(thread_id.as_str())
+        );
+        assert_eq!(
+            observation["state"]["native"]["scope_key"],
+            serde_json::json!(expected_scope.as_str())
+        );
+        assert_eq!(
+            observation["state"]["native"]["ready"],
+            serde_json::json!(false)
+        );
+        assert!(journal.state.pending_observation.is_some());
+        assert_eq!(drift_forbidden.load(Ordering::SeqCst), 0);
+        let seen = drift_methods.lock().expect("methods").clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|m| m == "thread/start" || m == "turn/start" || m == "turn/steer")
+        );
+        assert!(
+            !seen.iter().any(|m| m.starts_with("thread/")),
+            "drifted home must see no readback at all"
+        );
+        drift_server.abort();
+        std::fs::remove_dir_all(&base).ok();
     }
 }

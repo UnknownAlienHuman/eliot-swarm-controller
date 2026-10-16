@@ -51,7 +51,7 @@ pub struct DispatchIdentity {
     /// Exact host digest of the retained Operation request, before enrichment.
     pub input_sha256: String,
     pub batch_run_id: String,
-    pub requested_model: String,
+    pub requested_model: Option<String>,
     pub prompt_sha256: String,
     pub prompt_bytes: usize,
     pub task_snapshot_sha256: String,
@@ -167,8 +167,8 @@ pub struct RunStore {
 impl RunStore {
     pub fn new_for_profile(module_state: &Path, profile: crate::Profile) -> Result<Self> {
         let state = fs::canonicalize(module_state)?;
-        // Each descriptor version owns an immutable journal namespace. In
-        // particular, BatchV4 must never reinterpret legacy BatchV3 receipts.
+        // Each descriptor version owns an immutable journal namespace. A
+        // newer Batch profile never reinterprets an older profile's receipts.
         let root = state.join(format!(
             "command-adapter-runs-v{}",
             profile.artifact_version()
@@ -271,7 +271,7 @@ impl RunStore {
             operation_id: operation_id.to_owned(),
             input_sha256: String::new(),
             batch_run_id: format!("command-batch:{}", &digest(operation_id.as_bytes())[..32]),
-            requested_model: String::new(),
+            requested_model: None,
             prompt_sha256: String::new(),
             prompt_bytes: 0,
             task_snapshot_sha256: String::new(),
@@ -960,6 +960,7 @@ impl RunStore {
 
         let receipt: Value = read_json(&receipt_path)?;
         let prompt_bytes = u64::try_from(identity.prompt_bytes).ok();
+        let requested_model = json!(identity.requested_model.as_deref());
         if !receipt.is_object()
             || receipt["operation_id"].as_str() != Some(operation_id)
             || receipt["input_sha256"].as_str() != Some(identity.input_sha256.as_str())
@@ -971,7 +972,7 @@ impl RunStore {
                 .is_some_and(|artifact| artifact.as_str() != Some(ARTIFACT_ID))
             || receipt
                 .get("requested_model")
-                .is_some_and(|model| model.as_str() != Some(identity.requested_model.as_str()))
+                .is_some_and(|model| model != &requested_model)
             || receipt
                 .get("prompt_sha256")
                 .is_some_and(|prompt| prompt.as_str() != Some(identity.prompt_sha256.as_str()))
@@ -1066,14 +1067,14 @@ impl RunStore {
         route: &Value,
         evidence: &CommandCaptureReleaseEvidence,
     ) -> Result<RuntimeOutcome> {
-        if !is_sha256(release_input_sha256)
+        if !crate::is_lower_sha256_hex(release_input_sha256)
             || release_operation_id.is_empty()
             || binding_id.is_empty()
             || generation <= 0
             || evidence.schema_version != 1
             || evidence.target_operation_id.is_empty()
-            || !is_sha256(&evidence.target_input_sha256)
-            || !is_sha256(&evidence.target_outcome_sha256)
+            || !crate::is_lower_sha256_hex(&evidence.target_input_sha256)
+            || !crate::is_lower_sha256_hex(&evidence.target_outcome_sha256)
             || evidence.outputs.len() != 2
         {
             return Err(Error::new(
@@ -1311,7 +1312,7 @@ impl RunStore {
                     "release tombstone name has no releasing prefix",
                 )
             })?;
-            if !is_sha256(target_digest) {
+            if !crate::is_lower_sha256_hex(target_digest) {
                 return Err(Error::new(
                     "ADAPTER_EVIDENCE_INVALID",
                     "release tombstone name does not contain a canonical target digest",
@@ -1739,10 +1740,10 @@ fn read_saved_release_result_page(
 
 fn validate_release_result_page_descriptor(artifact: &CommandCaptureArtifactPage) -> Result<()> {
     if artifact.result_operation_id.is_empty()
-        || !is_sha256(&artifact.result_input_sha256)
+        || !crate::is_lower_sha256_hex(&artifact.result_input_sha256)
         || artifact.artifact_ref.is_empty()
-        || !is_sha256(&artifact.artifact_sha256)
-        || !is_sha256(&artifact.page_sha256)
+        || !crate::is_lower_sha256_hex(&artifact.artifact_sha256)
+        || !crate::is_lower_sha256_hex(&artifact.page_sha256)
         || artifact.artifact_sha256 != artifact.page_sha256
         || artifact.artifact_byte_length != artifact.byte_length
     {
@@ -1765,7 +1766,7 @@ fn read_release_result_page_record(
         || saved.module_artifact_id != ARTIFACT_ID
         || saved.operation_id != artifact.result_operation_id
         || saved.params["operation_id"] != artifact.result_operation_id
-        || !is_sha256(&saved.result_page_sha256)
+        || !crate::is_lower_sha256_hex(&saved.result_page_sha256)
         || saved.result_page_sha256 != hash
     {
         return Err(Error::new(
@@ -1803,7 +1804,7 @@ fn validate_release_result_page_body(
     if STANDARD.encode(&bytes) != encoded
         || bytes.len() as u64 != artifact.byte_length
         || digest(&bytes) != artifact.page_sha256
-        || !is_sha256(hash)
+        || !crate::is_lower_sha256_hex(hash)
     {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_INVALID",
@@ -1836,7 +1837,7 @@ fn validate_release_result_page_acknowledgement_at(
         || acknowledgement.result_page_sha256 != hash
         || acknowledgement.acknowledgement["recorded"] != true
         || acknowledgement.acknowledgement["artifact_ref"] != artifact.artifact_ref
-        || !is_sha256(hash)
+        || !crate::is_lower_sha256_hex(hash)
         || artifact.artifact_sha256 != artifact.page_sha256
         || artifact.artifact_byte_length != artifact.byte_length
     {
@@ -1895,7 +1896,7 @@ struct ResultPageCleanupEntries {
 fn result_page_cleanup_ack_hash(name: &str) -> Option<&str> {
     name.strip_prefix(RESULT_PAGE_CLEANUP_ACK_PREFIX)
         .and_then(|name| name.strip_suffix(".json"))
-        .filter(|hash| is_sha256(hash))
+        .filter(|hash| crate::is_lower_sha256_hex(hash))
 }
 
 fn inspect_result_page_cleanup_entries(directory: &Path) -> Result<ResultPageCleanupEntries> {
@@ -2324,7 +2325,7 @@ fn read_release_tombstone_intent_if_present(
             "release tombstone name has no releasing prefix",
         )
     })?;
-    if !is_sha256(expected_digest) {
+    if !crate::is_lower_sha256_hex(expected_digest) {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_INVALID",
             "release tombstone name does not contain a canonical target digest",
@@ -2559,7 +2560,7 @@ fn read_result_page_cleanup_markers(store: &RunStore) -> Result<Vec<ResultPageCl
         let Some(operation_digest) = name.strip_prefix(RESULT_PAGE_CLEANUP_PREFIX) else {
             continue;
         };
-        if !is_sha256(operation_digest) {
+        if !crate::is_lower_sha256_hex(operation_digest) {
             return Err(Error::new(
                 "ADAPTER_EVIDENCE_INVALID",
                 "result-page cleanup marker name is not a canonical Operation digest",
@@ -2794,7 +2795,7 @@ fn read_release_operation_cleanup_marker(
                 "release cleanup marker has an invalid namespace",
             )
         })?;
-    if !is_sha256(suffix) {
+    if !crate::is_lower_sha256_hex(suffix) {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_INVALID",
             "release cleanup marker name is not a canonical Operation digest",
@@ -2916,7 +2917,7 @@ fn finalize_acknowledged_release(
             || output.target_command_output["native_output"] != output.native_output
             || output.target_command_output["operation_id"] != intent.target_operation_id
             || output.target_command_output["input_sha256"] != intent.evidence.target_input_sha256
-            || !is_sha256(
+            || !crate::is_lower_sha256_hex(
                 output.target_command_output["stored_sha256"]
                     .as_str()
                     .unwrap_or_default(),
@@ -2943,10 +2944,10 @@ fn finalize_acknowledged_release(
             if artifact.result_operation_id.is_empty()
                 || artifact.result_operation_id == intent.target_operation_id
                 || artifact.result_operation_id == intent.release_operation_id
-                || !is_sha256(&artifact.result_input_sha256)
+                || !crate::is_lower_sha256_hex(&artifact.result_input_sha256)
                 || artifact.artifact_ref.is_empty()
-                || !is_sha256(&artifact.artifact_sha256)
-                || !is_sha256(&artifact.page_sha256)
+                || !crate::is_lower_sha256_hex(&artifact.artifact_sha256)
+                || !crate::is_lower_sha256_hex(&artifact.page_sha256)
                 || artifact.artifact_sha256 != artifact.page_sha256
                 || artifact.artifact_byte_length != artifact.byte_length
             {
@@ -3077,17 +3078,17 @@ fn validate_capture_release_intent(
     if intent.schema != 1
         || intent.module_artifact_id != ARTIFACT_ID
         || intent.release_operation_id.is_empty()
-        || !is_sha256(&intent.release_input_sha256)
+        || !crate::is_lower_sha256_hex(&intent.release_input_sha256)
         || intent.target_operation_id != target_operation_id
         || intent.evidence.target_operation_id != target_operation_id
         || intent.evidence_sha256
             != digest(canonical_release_evidence(&intent.evidence)?.as_bytes())
         || intent.evidence.target_input_sha256.is_empty()
-        || !is_sha256(&intent.evidence.target_input_sha256)
-        || !is_sha256(&intent.evidence.target_outcome_sha256)
+        || !crate::is_lower_sha256_hex(&intent.evidence.target_input_sha256)
+        || !crate::is_lower_sha256_hex(&intent.evidence.target_outcome_sha256)
         || intent.binding_id.is_empty()
         || intent.generation <= 0
-        || !is_sha256(&intent.route_sha256)
+        || !crate::is_lower_sha256_hex(&intent.route_sha256)
         || intent.checksum != capture_release_intent_checksum(intent)?
     {
         return Err(Error::new(
@@ -3422,7 +3423,7 @@ fn remove_empty_release_operation_cleanup_marker(
                 "release cleanup marker has an invalid namespace",
             )
         })?;
-    if !is_sha256(suffix) {
+    if !crate::is_lower_sha256_hex(suffix) {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_INVALID",
             "release cleanup marker name is not a canonical Operation digest",
@@ -3450,12 +3451,6 @@ fn remove_empty_release_operation_cleanup_marker(
         "empty release cleanup marker coexists with its Operation directory",
     )?;
     remove_empty_directory(&canonical)
-}
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn receipt_capture_fact<'a>(
@@ -3486,12 +3481,12 @@ impl NativeStreamFacts {
             .ok_or_else(invalid)?;
         let sha256 = receipt_capture_fact(receipt, stream, "sha256", "sha256")
             .and_then(Value::as_str)
-            .filter(|value| is_sha256(value))
+            .filter(|value| crate::is_lower_sha256_hex(value))
             .ok_or_else(invalid)?
             .to_owned();
         let stored_sha256 = receipt_capture_fact(receipt, stream, "stored_sha256", "stored_sha256")
             .and_then(Value::as_str)
-            .filter(|value| is_sha256(value))
+            .filter(|value| crate::is_lower_sha256_hex(value))
             .ok_or_else(invalid)?
             .to_owned();
         let truncated = receipt_capture_fact(receipt, stream, "truncated", "truncated")
@@ -3590,6 +3585,31 @@ fn identity_matches(saved: &DispatchIdentity, expected: &DispatchIdentity) -> bo
         && saved.prompt_bytes == expected.prompt_bytes
         && (expected.task_snapshot_sha256.is_empty()
             || saved.task_snapshot_sha256 == expected.task_snapshot_sha256)
+}
+
+#[cfg(test)]
+mod optional_model_identity_tests {
+    use super::{DispatchIdentity, identity_matches};
+
+    #[test]
+    fn native_default_is_distinct_from_an_explicit_model_in_retained_identity() {
+        let native_default = DispatchIdentity {
+            operation_id: "fixture-operation".to_owned(),
+            input_sha256: "a".repeat(64),
+            batch_run_id: "fixture-batch".to_owned(),
+            requested_model: None,
+            prompt_sha256: "b".repeat(64),
+            prompt_bytes: 12,
+            task_snapshot_sha256: "c".repeat(64),
+        };
+        assert!(identity_matches(&native_default, &native_default.clone()));
+
+        let explicit = DispatchIdentity {
+            requested_model: Some("explicit-model".to_owned()),
+            ..native_default.clone()
+        };
+        assert!(!identity_matches(&native_default, &explicit));
+    }
 }
 
 fn canonical(value: &Value) -> Result<String> {
@@ -3831,7 +3851,7 @@ mod tests {
                 operation_id: target_id.to_owned(),
                 input_sha256: input_sha256.to_owned(),
                 batch_run_id: "fixture-batch".to_owned(),
-                requested_model: "fixture-model".to_owned(),
+                requested_model: Some("fixture-model".to_owned()),
                 prompt_sha256: "b".repeat(64),
                 prompt_bytes: 19,
                 task_snapshot_sha256: "c".repeat(64),

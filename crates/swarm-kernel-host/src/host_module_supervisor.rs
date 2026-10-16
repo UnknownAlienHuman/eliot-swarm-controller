@@ -1563,7 +1563,7 @@ async fn spawn_supervisor_child(
     shutdown_custody: &ShutdownCustody,
 ) -> Result<(Child, ChildStdin, SupervisorChildIdentity)> {
     let mut command = Command::new(executable);
-    swarm_process::module_owner::apply_launch_environment(command.as_std_mut());
+    swarm_process::module_owner::apply_native_launch_environment(command.as_std_mut());
     spawn_supervisor_child_with_identity_reader(
         store,
         executable,
@@ -2226,9 +2226,39 @@ mod tests {
     // the Cargo test harness is not a stable image-size assumption. Identity is
     // still captured through the production OS readers.
     fn spawn_identity_mismatch_fixture_child(release: &Path) -> Child {
-        identity_mismatch_fixture_command(release)
-            .spawn()
-            .expect("start compact real child for image-mismatch fixture")
+        #[cfg(windows)]
+        {
+            identity_mismatch_fixture_command(release)
+                .spawn()
+                .expect("start compact real child for image-mismatch fixture")
+        }
+        #[cfg(not(windows))]
+        {
+            let ready =
+                release.with_file_name(format!("mismatch-ready-{}", crate::model::new_id()));
+            let child = identity_mismatch_fixture_command(release, &ready)
+                .spawn()
+                .expect("start compact real child for image-mismatch fixture");
+            // spawn can return before the child's exec completes. Wait for this
+            // exact shell to publish its unique marker before the production
+            // identity readers inspect /proc/<pid>/exe; a pre-exec read can
+            // observe the parent image or fail as UNKNOWN and mask the
+            // deliberate IMAGE_MISMATCH assertion.
+            let deadline = std::time::Instant::now() + StdDuration::from_secs(3);
+            loop {
+                match fs::read(&ready) {
+                    Ok(bytes) if bytes == b"ready" => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("read mismatch fixture readiness marker: {error}"),
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("mismatch fixture shell did not publish readiness");
+                }
+                thread::sleep(StdDuration::from_millis(1));
+            }
+            child
+        }
     }
 
     #[cfg(windows)]
@@ -2252,12 +2282,15 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    fn identity_mismatch_fixture_command(release: &Path) -> Command {
-        const WAIT_FOR_RELEASE: &str =
-            "while [ ! -e \"$ELIOT_SWARM_UNKNOWN362_CHILD_RELEASE\" ]; do sleep 0.02; done";
+    fn identity_mismatch_fixture_command(release: &Path, ready: &Path) -> Command {
+        // Publish readiness from inside the exec'd shell so identity capture
+        // cannot race fork-before-exec. The release wait stays env-based to
+        // preserve the existing custody drain contract.
+        const WAIT_FOR_RELEASE: &str = "printf ready > \"$1\"; while [ ! -e \"$ELIOT_SWARM_UNKNOWN362_CHILD_RELEASE\" ]; do sleep 0.02; done";
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", WAIT_FOR_RELEASE])
+            .args(["-c", WAIT_FOR_RELEASE, "eliot-mismatch-fixture"])
+            .arg(ready)
             .env(CHILD_RELEASE_ENV, release)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2444,6 +2477,9 @@ mod tests {
                 return Ok(None);
             }
             #[cfg(target_os = "linux")]
+            let ready =
+                release.with_file_name(format!("identity-ready-{}", crate::model::new_id()));
+            #[cfg(target_os = "linux")]
             let (executable, command) = {
                 // A debug libtest image can exceed the production executable
                 // hash boundary. Use a real small OS executable for this
@@ -2453,10 +2489,11 @@ mod tests {
                 command
                     .args([
                         "-c",
-                        "while [ ! -e \"$1\" ]; do sleep 0.02; done",
+                        "printf ready > \"$2\"; while [ ! -e \"$1\" ]; do sleep 0.02; done",
                         "eliot-identity-fixture",
                     ])
                     .arg(release)
+                    .arg(&ready)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
@@ -2473,7 +2510,31 @@ mod tests {
                 b"",
                 custody,
                 command,
-                read_identity,
+                move |child, executable| {
+                    #[cfg(target_os = "linux")]
+                    {
+                        // spawn can return before the child's exec completes.
+                        // Wait for this exact shell to publish its unique marker
+                        // before injecting faults into the production readers.
+                        let deadline = std::time::Instant::now() + StdDuration::from_secs(3);
+                        loop {
+                            match fs::read(&ready) {
+                                Ok(bytes) if bytes == b"ready" => break,
+                                Ok(_) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                return Err(Error::new(
+                                    "FIXTURE_CHILD_NOT_READY",
+                                    "identity fixture did not publish readiness",
+                                ));
+                            }
+                            std::thread::sleep(StdDuration::from_millis(1));
+                        }
+                    }
+                    read_identity(child, executable)
+                },
             )
             .await
             .map(Some)
@@ -2713,6 +2774,59 @@ mod tests {
 
         #[tokio::test]
         async fn unknown362_verified_departure_after_health_failure_allows_only_exact_successor() {
+            let capture_with_image_diagnostic = |child: &Child, executable: &Path| {
+                capture_supervisor_child_identity_with_readers(
+                    child,
+                    executable,
+                    Child::id,
+                    process_birth_identity,
+                    |pid| {
+                        process_image_identity(pid).inspect_err(|source| {
+                            let code = match source.code.as_str() {
+                                "PROCESS_GONE" => "PROCESS_GONE",
+                                "PROCESS_IDENTITY" => "PROCESS_IDENTITY",
+                                "IO_ERROR" => "IO_ERROR",
+                                _ => "OTHER",
+                            };
+                            // Only fixed producer reasons and numeric OS codes may reach CI.
+                            let reason = source.message.as_str();
+                            let reason = if [
+                                "process executable path is not valid Unicode",
+                                "process executable path is outside the supported boundary",
+                                "process executable is outside the supported file boundary",
+                                "process image size overflow",
+                                "process executable exceeds the supported hash boundary",
+                                "process executable changed during bounded hashing",
+                                "process exited during inventory",
+                                "invalid proc stat",
+                                "incomplete proc stat",
+                                "invalid process group",
+                                "cannot observe process pidfd",
+                                "kernel boot identity is unavailable",
+                                "process is no longer live",
+                                "kernel executable path is not absolute",
+                                "process executable disappeared",
+                                "process birth changed while opening its executable",
+                                "process birth or executable image changed during bounded hashing",
+                            ]
+                            .contains(&reason)
+                            {
+                                reason
+                            } else {
+                                "producer reason redacted"
+                            };
+                            let os_error = source
+                                .message
+                                .rsplit_once("(os error ")
+                                .and_then(|(_, value)| value.strip_suffix(')'))
+                                .and_then(|value| value.parse::<i32>().ok());
+                            eprintln!(
+                                "unknown362_identity_reader stage=image pid={pid} source_code={code} source_reason={reason:?} os_error={os_error:?}"
+                            );
+                        })
+                    },
+                )
+            };
             let root = std::env::temp_dir().join(format!(
                 "eliot-unknown362-successor-{}",
                 crate::model::new_id()
@@ -2727,7 +2841,7 @@ mod tests {
             let (child, stdin, identity) =
                 guarded_fixture_spawn(&runtime, &release, &custody, |child, executable| {
                     observe_acquired_child(child, &mut launches);
-                    capture_supervisor_child_identity(child, executable)
+                    capture_with_image_diagnostic(child, executable)
                 })
                 .await
                 .unwrap()
@@ -2769,7 +2883,7 @@ mod tests {
             assert!(
                 guarded_fixture_spawn(&runtime, &release, &custody, |child, executable| {
                     observe_acquired_child(child, &mut launches);
-                    capture_supervisor_child_identity(child, executable)
+                    capture_with_image_diagnostic(child, executable)
                 })
                 .await
                 .unwrap()
@@ -2834,7 +2948,7 @@ mod tests {
                 &next_custody,
                 |child, executable| {
                     observe_acquired_child(child, &mut launches);
-                    capture_supervisor_child_identity(child, executable)
+                    capture_with_image_diagnostic(child, executable)
                 },
             )
             .await

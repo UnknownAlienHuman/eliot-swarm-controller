@@ -1141,3 +1141,402 @@ async fn attempt_release_fresh_request_noop_retains_public_operation_task_scope(
 
     f.close().await;
 }
+
+#[tokio::test]
+async fn current_attempt_owner_reads_manager_source_and_native_candidates_via_store() {
+    let f = start().await;
+    let store = &f.owner.store;
+
+    let task = create(store, &f.manager_a, "native-candidate-read").await;
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+    let attempt = claim(store, &f.manager_a, &task).await;
+    let attempt_id = attempt["attempt_id"].as_str().unwrap().to_owned();
+
+    let foreign_task = create(store, &f.manager_b, "native-candidate-foreign").await;
+    let foreign_task_id = foreign_task["task_id"].as_str().unwrap().to_owned();
+    let foreign_attempt = claim(store, &f.manager_b, &foreign_task).await;
+    let foreign_attempt_id = foreign_attempt["attempt_id"].as_str().unwrap().to_owned();
+
+    let manager_id = f.manager_a.client_id.clone();
+    let foreign_manager_id = f.manager_b.client_id.clone();
+    let binding_id = format!("bind-{}", model::new_id());
+    let binding_generation = 1i64;
+    let source_operation_id = format!("op-{}", model::new_id());
+    let source_candidate_ref = format!("source-{}", model::digest(source_operation_id.as_bytes()));
+    let dispatch_operation_id = format!("op-{}", model::new_id());
+    let result_operation_id = format!("op-{}", model::new_id());
+    let page_id = format!("result-{}", model::digest(result_operation_id.as_bytes()));
+    let foreign_operation_id = format!("op-{}", model::new_id());
+    let foreign_candidate_ref =
+        format!("source-{}", model::digest(foreign_operation_id.as_bytes()));
+    let submission_id = format!("submission-{}", model::new_id());
+    let now = model::now_ms().unwrap();
+
+    store
+        .run({
+            let task_id = task_id.clone();
+            let attempt_id = attempt_id.clone();
+            let foreign_task_id = foreign_task_id.clone();
+            let foreign_attempt_id = foreign_attempt_id.clone();
+            let manager_id = manager_id.clone();
+            let foreign_manager_id = foreign_manager_id.clone();
+            let binding_id = binding_id.clone();
+            let source_operation_id = source_operation_id.clone();
+            let source_candidate_ref = source_candidate_ref.clone();
+            let dispatch_operation_id = dispatch_operation_id.clone();
+            let result_operation_id = result_operation_id.clone();
+            let page_id = page_id.clone();
+            let foreign_operation_id = foreign_operation_id.clone();
+            let foreign_candidate_ref = foreign_candidate_ref.clone();
+            let submission_id = submission_id.clone();
+            move |db| {
+                db.execute(
+                    "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,route_json,state_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,'ready','{}','{}',?6)",
+                    params![
+                        binding_id,
+                        binding_generation,
+                        format!("lane-{binding_id}"),
+                        "native-candidate-module-instance",
+                        "native-candidate-module-artifact",
+                        now
+                    ],
+                )?;
+                db.execute(
+                    "UPDATE attempts SET binding_id=?1,binding_generation=?2 WHERE attempt_id=?3",
+                    params![binding_id, binding_generation, attempt_id],
+                )?;
+                let source_metadata = model::canonical(&json!({
+                    "task_id": task_id,
+                    "attempt_id": attempt_id,
+                    "task_revision": 1,
+                }))
+                .unwrap();
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'source_snapshot',?3,?4,?5,?6)",
+                    params![
+                        source_candidate_ref,
+                        format!("artifacts/{source_candidate_ref}.bin"),
+                        18i64,
+                        model::digest(b"native-candidate-bytes"),
+                        now,
+                        source_metadata
+                    ],
+                )?;
+                let page_metadata = model::canonical(&json!({
+                    "operation_id": dispatch_operation_id,
+                    "binding_id": binding_id,
+                    "binding_generation": binding_generation,
+                    "native_output": "result.json",
+                }))
+                .unwrap();
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'native_result_page',?3,?4,?5,?6)",
+                    params![
+                        page_id,
+                        format!("artifacts/{page_id}.bin"),
+                        16i64,
+                        model::digest(b"native-candidate-page"),
+                        now,
+                        page_metadata
+                    ],
+                )?;
+                let source_result = model::canonical(&json!({
+                    "outcome": "applied",
+                    "candidate_ref": source_candidate_ref,
+                }))
+                .unwrap();
+                db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'source.capture','{}','{}',?4,?5,'settled',?6,?7,?7,?7,?7)",
+                    params![
+                        source_operation_id,
+                        manager_id,
+                        model::new_id(),
+                        task_id,
+                        attempt_id,
+                        source_result,
+                        now
+                    ],
+                )?;
+                db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,binding_id,binding_generation,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'task.dispatch','{}','{}',?4,?5,?6,?7,'settled','{}',?8,?8,?8,?8)",
+                    params![
+                        dispatch_operation_id,
+                        manager_id,
+                        model::new_id(),
+                        task_id,
+                        attempt_id,
+                        binding_id,
+                        binding_generation,
+                        now
+                    ],
+                )?;
+                let native_result = model::canonical(&json!({
+                    "outcome": "applied",
+                    "details": {
+                        "completion_condition": "batch_output_artifacts_selected",
+                        "dispatch_operation_id": dispatch_operation_id,
+                        "artifact_refs": [page_id],
+                    },
+                }))
+                .unwrap();
+                db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,binding_id,binding_generation,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'agent.result','{}','{}',?4,?5,?6,?7,'settled',?8,?9,?9,?9,?9)",
+                    params![
+                        result_operation_id,
+                        manager_id,
+                        model::new_id(),
+                        task_id,
+                        attempt_id,
+                        binding_id,
+                        binding_generation,
+                        native_result,
+                        now
+                    ],
+                )?;
+                let foreign_metadata = model::canonical(&json!({
+                    "task_id": foreign_task_id,
+                    "attempt_id": foreign_attempt_id,
+                    "task_revision": 1,
+                }))
+                .unwrap();
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'source_snapshot',?3,?4,?5,?6)",
+                    params![
+                        foreign_candidate_ref,
+                        format!("artifacts/{foreign_candidate_ref}.bin"),
+                        18i64,
+                        model::digest(b"foreign-candidate-bytes"),
+                        now,
+                        foreign_metadata
+                    ],
+                )?;
+                let foreign_result = model::canonical(&json!({
+                    "outcome": "applied",
+                    "candidate_ref": foreign_candidate_ref,
+                }))
+                .unwrap();
+                db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,'source.capture','{}','{}',?4,?5,'settled',?6,?7,?7,?7,?7)",
+                    params![
+                        foreign_operation_id,
+                        foreign_manager_id,
+                        model::new_id(),
+                        foreign_task_id,
+                        foreign_attempt_id,
+                        foreign_result,
+                        now
+                    ],
+                )?;
+                let submission_metadata = model::canonical(&json!({
+                    "task_id": task_id,
+                    "attempt_id": attempt_id,
+                    "task_revision": 1,
+                }))
+                .unwrap();
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,?2,'task_submission',?3,?4,?5,?6)",
+                    params![
+                        submission_id,
+                        format!("artifacts/{submission_id}.bin"),
+                        12i64,
+                        model::digest(b"native-candidate-submission"),
+                        now,
+                        submission_metadata
+                    ],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    // CURRENT attempt_owner Participant sponsored by the exact Attempt owner.
+    let participant_token = format!("native-candidate-token-{}", model::new_id());
+    let participant_id = format!("native-candidate-{}", model::new_id());
+    store
+        .call(
+            f.manager_a.clone(),
+            "coordination.participant.register".into(),
+            json!({
+                "client_request_id": model::new_id(),
+                "client_id": participant_id.clone(),
+                "token_hash": model::digest(participant_token.as_bytes()),
+                "task_id": task_id.clone(),
+                "task_revision": 1,
+                "attempt_id": attempt_id.clone(),
+                "participation_basis": {"kind": "attempt_owner"},
+                "binding_id": binding_id.clone(),
+                "binding_generation": binding_generation,
+            }),
+        )
+        .await
+        .unwrap();
+    let participant = store
+        .authenticate(Credential {
+            client_id: participant_id.clone(),
+            token: participant_token,
+        })
+        .await
+        .unwrap();
+
+    // Manager-produced source candidate is readable with bounded projection.
+    let source = call(
+        store,
+        &participant,
+        "operation.get",
+        json!({"operation_id": source_operation_id.clone()}),
+    )
+    .await;
+    assert_eq!(source["method"], "source.capture");
+    assert_eq!(source["state"], "settled");
+    assert_eq!(source["task_id"], task_id.as_str());
+    assert_eq!(source["attempt_id"], attempt_id.as_str());
+    assert_eq!(source["candidate_ref"], source_candidate_ref.as_str());
+    assert_eq!(source["result"]["outcome"], "applied");
+    assert!(source.get("caller_id").is_none());
+
+    // Manager-produced native candidate pages are readable with bounded projection.
+    let native = call(
+        store,
+        &participant,
+        "operation.get",
+        json!({"operation_id": result_operation_id.clone()}),
+    )
+    .await;
+    assert_eq!(native["method"], "agent.result");
+    assert_eq!(native["state"], "settled");
+    assert_eq!(native["candidate_refs"], json!([page_id.as_str()]));
+    assert_eq!(native["result"]["artifact_refs"], json!([page_id.as_str()]));
+    assert!(native.get("caller_id").is_none());
+
+    // Exact-caller Manager receipt stays bounded: outcome only, no details/pages.
+    let manager_receipt = call(
+        store,
+        &f.manager_a,
+        "operation.get",
+        json!({"operation_id": result_operation_id.clone()}),
+    )
+    .await;
+    assert_eq!(manager_receipt["result"]["outcome"], "applied");
+    assert!(manager_receipt["result"].get("details").is_none());
+    assert!(manager_receipt["result"].get("artifact_refs").is_none());
+    assert!(manager_receipt.get("diagnostic").is_none());
+
+    // Participant mutation on agent.result remains forbidden.
+    let mutation = store
+        .call(
+            participant.clone(),
+            "agent.result".into(),
+            json!({"client_request_id": model::new_id()}),
+        )
+        .await
+        .expect_err("Participant agent.result mutation stays forbidden");
+    assert_eq!(mutation.code, "FORBIDDEN");
+
+    // Foreign Task/Attempt stays outside the participant scope.
+    let foreign = store
+        .call(
+            participant.clone(),
+            "operation.get".into(),
+            json!({"operation_id": foreign_operation_id}),
+        )
+        .await
+        .expect_err("foreign Task candidate stays outside participant scope");
+    assert_eq!(foreign.code, "NOT_FOUND");
+
+    // Submit the current Attempt so a sponsored reviewer can be registered;
+    // the reviewer keeps its exact scope but never enters the narrow
+    // ordinary-Participant native projection.
+    store
+        .run({
+            let attempt_id = attempt_id.clone();
+            let submission_id = submission_id.clone();
+            let source_candidate_ref = source_candidate_ref.clone();
+            move |db| {
+                db.execute(
+                    "UPDATE attempts SET state='submitted',submission_ref=?1,candidate_ref=?2 WHERE attempt_id=?3",
+                    params![submission_id, source_candidate_ref, attempt_id],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    let reviewer_token = format!("native-reviewer-token-{}", model::new_id());
+    let reviewer_id = format!("native-reviewer-{}", model::new_id());
+    store
+        .call(
+            f.manager_a.clone(),
+            "coordination.participant.register".into(),
+            json!({
+                "client_request_id": model::new_id(),
+                "client_id": reviewer_id.clone(),
+                "token_hash": model::digest(reviewer_token.as_bytes()),
+                "task_id": task_id.clone(),
+                "task_revision": 1,
+                "attempt_id": attempt_id.clone(),
+                "participation_basis": {
+                    "kind": "sponsored_reviewer",
+                    "review_scope": {
+                        "review_assignment_id": null,
+                        "task_id": task_id.clone(),
+                        "attempt_id": attempt_id,
+                        "task_revision": 1,
+                        "submission_ref": submission_id,
+                        "candidate_ref": source_candidate_ref,
+                    },
+                },
+                "binding_id": binding_id,
+                "binding_generation": binding_generation,
+            }),
+        )
+        .await
+        .unwrap();
+    let reviewer = store
+        .authenticate(Credential {
+            client_id: reviewer_id,
+            token: reviewer_token,
+        })
+        .await
+        .unwrap();
+    for operation_id in [&source_operation_id, &result_operation_id] {
+        let denied = store
+            .call(
+                reviewer.clone(),
+                "operation.get".into(),
+                json!({"operation_id": operation_id}),
+            )
+            .await
+            .expect_err("sponsored reviewer stays outside the native candidate projection");
+        assert_eq!(denied.code, "NOT_FOUND");
+    }
+
+    // A Task revision bump makes the ordinary Participant stale; the narrow
+    // path falls back to the existing generic denial without leaking refs.
+    let mut revised_spec = task_spec("native-candidate-revised");
+    revised_spec["objective"] = json!("Revised native candidate fixture");
+    store
+        .call(
+            f.operator.clone(),
+            "task.revise".into(),
+            json!({
+                "client_request_id": model::new_id(),
+                "task_id": task_id,
+                "expected_revision": 1,
+                "spec": revised_spec,
+            }),
+        )
+        .await
+        .unwrap();
+    let stale = store
+        .call(
+            participant.clone(),
+            "operation.get".into(),
+            json!({"operation_id": source_operation_id}),
+        )
+        .await
+        .expect_err("stale participant loses the narrow candidate read");
+    assert_eq!(stale.code, "NOT_FOUND");
+
+    f.close().await;
+}

@@ -188,10 +188,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
         if retire_requested {
             // The parent owner retains the process-family identity and gates
             // replacement on exact departure proof.
-            return Err(Error::new(
-                "SDK_HARNESS_RETIRED",
-                "retired bridge requires parent-owned process-family readback before replacement",
-            ));
+            return Err(retired_bridge_error());
         }
         let command_value = response.get("command").ok_or_else(|| {
             Error::new(
@@ -208,7 +205,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     )
                 })?;
             verify_command_scope(&config, &command, &contract)?;
-            reconnect_requested |= handle_command(CommandInvocation {
+            let command_reconnect = handle_command(CommandInvocation {
                 config: &config,
                 claim: &contract,
                 journal: &journal,
@@ -224,9 +221,11 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                 native_root_id: session_root.as_deref(),
                 native_control: &mut native_control,
                 bridge_path: &bridge_path,
+                retire_requested: &mut retire_requested,
                 command: &command,
             })
             .await?;
+            reconnect_requested |= command_dispatch_result(command_reconnect, retire_requested)?;
             if command.method == "agent.shutdown"
                 && shutdown_terminal_outcome(&journal, &command.operation_id)
             {
@@ -246,10 +245,7 @@ pub async fn run_owned(bootstrap: OwnedBootstrap) -> Result<()> {
                     });
                     flush_before_reconnect(&mut link, &journal, &interactions, reconnect).await?;
                 }
-                return Err(Error::new(
-                    "SDK_HARNESS_RETIRED",
-                    "retired bridge requires parent-owned process-family readback before replacement",
-                ));
+                return Err(retired_bridge_error());
             }
         } else {
             sleep(Duration::from_millis(IDLE_POLL_MS)).await;
@@ -435,6 +431,7 @@ struct CommandInvocation<'a> {
     native_root_id: Option<&'a str>,
     native_control: &'a mut NativeControl,
     bridge_path: &'a Path,
+    retire_requested: &'a mut bool,
     command: &'a RuntimeCommand,
 }
 
@@ -456,6 +453,7 @@ struct InteractionReplyInvocation<'a> {
     interactions: &'a InteractionJournal,
     harness: &'a mut Option<NativeHarness>,
     harness_alive: &'a mut bool,
+    retire_requested: &'a mut bool,
     native_prepared: bool,
     boot_id: &'a str,
     native_root_id: Option<&'a str>,
@@ -489,6 +487,20 @@ fn retire_owned_harness(
     interactions.retire_bridge(boot_id, journal)?;
     drop(harness.take());
     Ok(())
+}
+
+fn retired_bridge_error() -> Error {
+    Error::new(
+        "SDK_HARNESS_RETIRED",
+        "retired bridge requires parent-owned process-family readback before replacement",
+    )
+}
+
+fn command_dispatch_result(reconnect_requested: bool, retire_requested: bool) -> Result<bool> {
+    if retire_requested {
+        return Err(retired_bridge_error());
+    }
+    Ok(reconnect_requested)
 }
 
 fn shutdown_terminal_outcome(journal: &OperationJournal, operation_id: &str) -> bool {
@@ -697,6 +709,7 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
         native_root_id,
         native_control,
         bridge_path,
+        retire_requested,
         command,
     } = invocation;
     let receipt = receipt::for_command(claim, command)?;
@@ -818,6 +831,8 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                             &config.native_options.scope_key(),
                         )?;
                         journal.save_outcome(&command.operation_id, &outcome)?;
+                        retire_owned_harness(harness, interactions, boot_id, journal)?;
+                        *retire_requested = true;
                     }
                     Ok(true)
                 }
@@ -1109,6 +1124,8 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                     &config.native_options.scope_key(),
                 )?;
                 journal.save_outcome(&command.operation_id, &outcome)?;
+                retire_owned_harness(harness, interactions, boot_id, journal)?;
+                *retire_requested = true;
                 return Ok(true);
             }
             Ok(false)
@@ -1167,6 +1184,7 @@ async fn handle_command(invocation: CommandInvocation<'_>) -> Result<bool> {
                 interactions,
                 harness,
                 harness_alive,
+                retire_requested,
                 native_prepared,
                 boot_id,
                 native_root_id,
@@ -1223,6 +1241,7 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
         interactions,
         harness,
         harness_alive,
+        retire_requested,
         native_prepared,
         boot_id,
         native_root_id,
@@ -1406,8 +1425,8 @@ async fn handle_interaction_reply(invocation: InteractionReplyInvocation<'_>) ->
         )?;
         journal.save_outcome(&command.operation_id, &outcome)?;
         interactions.mark_unknown(&request.request_id, &command.operation_id)?;
-        interactions.retire_bridge(boot_id, journal)?;
-        harness.take();
+        retire_owned_harness(harness, interactions, boot_id, journal)?;
+        *retire_requested = true;
         return Ok(true);
     }
     Ok(false)
@@ -2685,6 +2704,18 @@ fn handle_frame(
                 retire_bridge: true,
             })
         }
+        HarnessFrame::StdoutEof => {
+            *harness_alive = false;
+            *native_prepared = false;
+            *latest_state = Value::Null;
+            *session_root = None;
+            journal.recover_uncertain_with_code("SDK_HARNESS_STDOUT_EOF")?;
+            native_control.clear_pending();
+            Ok(FrameAction {
+                reconnect: false,
+                retire_bridge: true,
+            })
+        }
         HarnessFrame::ReadFailure => {
             *harness_alive = false;
             *native_prepared = false;
@@ -2945,7 +2976,7 @@ mod route_option_semantics {
             node_executable: root.join("node.exe"),
             native_executable: None,
             claude_config_dir: root.join("claude"),
-            model_id: "sonnet".to_owned(),
+            model_id: Some("sonnet".to_owned()),
             permission_mode: None,
             allow_dangerously_skip_permissions: false,
         };
@@ -2986,6 +3017,60 @@ mod route_option_semantics {
         options.remove("permissionMode");
         options.remove("nativeExecutable");
         validate_route(&config, &command).expect("omitted options represent the same values");
+    }
+
+    #[test]
+    fn omitted_model_matches_native_default_route() {
+        let root = std::env::temp_dir().join("claude-route-option-unit");
+        let options = NativeOptions {
+            workspace_root: root.join("workspace"),
+            sdk_runtime_root: root.join("sdk"),
+            node_executable: root.join("node.exe"),
+            native_executable: None,
+            claude_config_dir: root.join("claude"),
+            model_id: None,
+            permission_mode: None,
+            allow_dangerously_skip_permissions: false,
+        };
+        options
+            .validate()
+            .expect("omitted model uses the native configured default");
+        let command: RuntimeCommand = serde_json::from_value(json!({
+            "operation_id":"route-option-unit",
+            "method":"agent.open",
+            "created_at_ms":1,
+            "binding_id":"route-option-binding",
+            "generation":1,
+            "native_root_id":null,
+            "route":{
+                "runtime":RUNTIME,
+                "module_artifact_id":ARTIFACT_ID,
+                "workspace_option":"workspaceRoot",
+                "native_options":serde_json::to_value(&options).unwrap(),
+            },
+            "input":{},
+        }))
+        .unwrap();
+        let config = AdapterConfig {
+            host_data_dir: root.join("host"),
+            credential_file: root.join("credential.json"),
+            state_dir: root.join("state"),
+            sdk_harness_dir: root.join("harness"),
+            binding_id: "route-option-binding".to_owned(),
+            generation: 1,
+            native_options: options,
+            ipc: Default::default(),
+        };
+        validate_route(&config, &command).expect("omitted model matches the native default route");
+        let mut with_null = command.clone();
+        with_null.route["native_options"]["modelId"] = json!(null);
+        validate_route(&config, &with_null).expect("explicit null model matches omission");
+        let mut with_missing = command.clone();
+        with_missing.route["native_options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelId");
+        validate_route(&config, &with_missing).expect("missing model key matches omission");
     }
 
     #[test]
@@ -3698,7 +3783,7 @@ mod failed_prepare_lifecycle_fixture {
             node_executable: root.join("node.exe"),
             native_executable: None,
             claude_config_dir: root.join("claude-config"),
-            model_id: "fixture-model".to_owned(),
+            model_id: Some("fixture-model".to_owned()),
             permission_mode: None,
             allow_dangerously_skip_permissions: false,
         };
@@ -3982,6 +4067,95 @@ mod failed_prepare_lifecycle_fixture {
                 .is_err(),
             "a callback from the retired bridge cannot be answered"
         );
+    }
+
+    #[test]
+    fn clean_stdout_eof_retires_idempotently_and_preserves_first_cause() {
+        let (_directory, config, journal, interactions) = fixture_context();
+        write_fixture_intent(
+            &journal,
+            &config,
+            "stdout-eof-pending",
+            "agent.send/next_turn",
+            Some("fixture-root"),
+        );
+        let mut harness_alive = true;
+        let mut native_prepared = true;
+        let mut latest_state = json!({"stale_snapshot":true});
+        let mut session_root = Some("fixture-root".to_owned());
+        let mut native_control = NativeControl::default();
+
+        let eof = handle_frame(
+            HarnessFrame::StdoutEof,
+            &config,
+            "fixture-boot",
+            &journal,
+            &interactions,
+            &mut harness_alive,
+            &mut native_prepared,
+            &mut latest_state,
+            &mut session_root,
+            &mut native_control,
+        )
+        .expect("handle clean stdout EOF");
+        assert!(!eof.reconnect && eof.retire_bridge);
+        assert!(!harness_alive && !native_prepared);
+        assert_eq!(latest_state, Value::Null);
+        assert_eq!(session_root, None);
+
+        let first_outcome = journal
+            .get("stdout-eof-pending")
+            .expect("read Unknown after stdout EOF")
+            .expect("fixture operation is retained")
+            .outcome
+            .expect("stdout EOF resolves the uncertain operation");
+        assert_eq!(first_outcome["outcome"], "unknown");
+        assert_eq!(
+            first_outcome["details"]["diagnostic_code"],
+            "SDK_HARNESS_STDOUT_EOF"
+        );
+
+        let child_exit = handle_frame(
+            HarnessFrame::Exited { code: Some(0) },
+            &config,
+            "fixture-boot",
+            &journal,
+            &interactions,
+            &mut harness_alive,
+            &mut native_prepared,
+            &mut latest_state,
+            &mut session_root,
+            &mut native_control,
+        )
+        .expect("handle the later direct child exit");
+        assert!(!child_exit.reconnect && child_exit.retire_bridge);
+        assert_eq!(
+            journal
+                .get("stdout-eof-pending")
+                .expect("read first terminal outcome")
+                .unwrap()
+                .outcome
+                .unwrap(),
+            first_outcome,
+            "later terminal frames preserve the first Unknown cause"
+        );
+
+        let mut no_harness = None;
+        retire_owned_harness(&mut no_harness, &interactions, "fixture-boot", &journal)
+            .expect("retire the bridge after stdout EOF");
+        retire_owned_harness(&mut no_harness, &interactions, "fixture-boot", &journal)
+            .expect("repeat retirement idempotently for the child exit");
+    }
+
+    #[test]
+    fn uncertain_write_retirement_prevents_reconnect_but_keeps_result_recovery() {
+        assert!(
+            command_dispatch_result(true, false)
+                .expect("result recovery may reconnect without a live harness")
+        );
+        let error = command_dispatch_result(true, true)
+            .expect_err("uncertain bridge write retires before reconnect");
+        assert_eq!(error.code, "SDK_HARNESS_RETIRED");
     }
 
     #[test]
@@ -4530,6 +4704,9 @@ mod failed_prepare_lifecycle_fixture {
                     HarnessFrame::Exited { .. } => {
                         break;
                     }
+                    // The explicit stop closes stdout before or beside the
+                    // child-exit notification. EOF alone is not exit proof.
+                    HarnessFrame::StdoutEof => {}
                     HarnessFrame::ReadFailure => panic!("fake SDK bridge output pipe failed"),
                     HarnessFrame::Message(_) => {}
                 }
@@ -5105,7 +5282,7 @@ mod module_family_replacement_fixture {
             node_executable: node,
             native_executable: None,
             claude_config_dir: root.join("claude-config"),
-            model_id: "fixture-model".to_owned(),
+            model_id: Some("fixture-model".to_owned()),
             permission_mode: None,
             allow_dangerously_skip_permissions: false,
         };
@@ -5539,7 +5716,7 @@ mod agent_shutdown_handler_tests {
             node_executable: root.join("node.exe"),
             native_executable: None,
             claude_config_dir: root.join("claude-config"),
-            model_id: "fixture-model".to_owned(),
+            model_id: Some("fixture-model".to_owned()),
             permission_mode: None,
             allow_dangerously_skip_permissions: false,
         };

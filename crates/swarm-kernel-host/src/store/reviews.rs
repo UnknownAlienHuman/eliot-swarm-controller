@@ -395,12 +395,26 @@ fn assignment_observation(db: &Connection, assignment_id: &str) -> Result<Value>
     let operation = operations::get_operation(db, &operation_id)?;
     if operation["method"] != "review.assign"
         || operation["state"] != "settled"
+        || operation["operation_id"] != operation_id
+        || operation["task_id"] != record["identity"]["task_id"]
+        || operation["attempt_id"] != record["identity"]["attempt_id"]
+        || operation["caller_id"] != record["technical_requester_id"]
+        || operation["result"] != record["result"]
         || operation["result"]["review_assignment_id"] != assignment_id
+        || operation["result"]["operation_id"] != operation_id
         || operation["result"]["identity"] != record["identity"]
+        || operation["result"]["sponsor_client_id"] != record["sponsor_client_id"]
+        || operation["result"]["technical_requester_id"] != record["technical_requester_id"]
+        || operation["result"]["reviewer_client_id"] != record["reviewer_client_id"]
+        || operation["result"]["review_profile"] != record["review_profile"]
+        || operation["result"]["supersedes_review_assignment_id"]
+            != record["supersedes_review_assignment_id"]
+        || operation["result"]["replacement_context"] != record["replacement_context"]
+        || operation["result"]["on_behalf"] != record["on_behalf"]
     {
         return Err(Error::new(
             "REVIEW_ASSIGNMENT_DAMAGED",
-            "assignment has no matching settled review.assign Operation",
+            "assignment has no matching settled review.assign Operation and exact receipt",
         ));
     }
     Ok(record)
@@ -507,10 +521,17 @@ fn result_observation(db: &Connection, assignment_id: &str) -> Result<Option<Val
     let assignment = assignment_observation(db, assignment_id)?;
     if record["operation_id"] != operation_id
         || record["review_assignment_id"] != assignment_id
+        || record["identity"] != assignment["identity"]
         || operation["method"] != "review.submit"
         || operation["state"] != "settled"
+        || operation["operation_id"] != operation_id
+        || operation["task_id"] != assignment["identity"]["task_id"]
+        || operation["attempt_id"] != assignment["identity"]["attempt_id"]
         || operation["caller_id"] != assignment["reviewer_client_id"]
+        || operation["result"] != record["result"]
         || operation["result"]["review_assignment_id"] != assignment_id
+        || record["result"]["reviewer_client_id"] != assignment["reviewer_client_id"]
+        || record["result"]["sponsor_client_id"] != assignment["sponsor_client_id"]
     {
         return Err(Error::new(
             "REVIEW_RESULT_DAMAGED",
@@ -1092,8 +1113,8 @@ pub(crate) fn actionable_review_result(
     })?;
     if assignment["identity"] != json!(retained.identity) {
         return Err(Error::new(
-            "REVIEW_FINDING_NOT_ACTIONABLE",
-            "current assigned result is not an applicable changes_requested verdict",
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "current review assignment differs from its exact retained slot identity",
         ));
     }
     let validated = review_contract::validate_result(&result["result"]).map_err(|error| {
@@ -1117,6 +1138,89 @@ pub(crate) fn actionable_review_result(
         "identity":retained.identity,
         "review_result":result["result"],
     }))
+}
+
+/// Check whether a committed result still owns the current actionable review
+/// slot. A newer assignment makes the old result historical; malformed
+/// retained review evidence remains an error.
+pub(crate) fn current_actionable_review_result_matches(
+    db: &Connection,
+    identity: &ReviewSlotIdentity,
+    assignment_id: &str,
+    result_operation_id: &str,
+) -> Result<bool> {
+    let retained = load_submission_context(
+        db,
+        &identity.attempt_id,
+        identity.task_revision,
+        &identity.submission_ref,
+        &identity.candidate_ref,
+        true,
+    )?;
+    if &retained.identity != identity {
+        return Err(Error::new(
+            "REVIEW_ANCHOR_MISMATCH",
+            "current submission identity differs from the committed review anchor",
+        ));
+    }
+    let Some((_, current_assignment_id)) = current_slot_pointer(db, &retained.identity)? else {
+        return Err(Error::new(
+            "REVIEW_SLOT_DAMAGED",
+            "current candidate has no retained review slot pointer",
+        ));
+    };
+    let current_assignment =
+        assignment_observation(db, &current_assignment_id).map_err(|error| {
+            if error.code == "REVIEW_ASSIGNMENT_NOT_FOUND" {
+                Error::new(
+                    "REVIEW_SLOT_DAMAGED",
+                    "current review slot points to an unretained assignment",
+                )
+                .with_secondary_error(error)
+            } else {
+                error
+            }
+        })?;
+    if current_assignment["identity"] != json!(retained.identity) {
+        return Err(Error::new(
+            "REVIEW_ASSIGNMENT_DAMAGED",
+            "current assignment identity differs from the exact review slot",
+        ));
+    }
+    // A replacement is historical only after its exact settled assignment
+    // Operation is validated and any submitted result is read back in full.
+    let current_result = result_observation(db, &current_assignment_id)?;
+    if current_assignment_id != assignment_id {
+        return Ok(false);
+    }
+    let current_result = current_result.ok_or_else(|| {
+        Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            "current committed review assignment has no retained result",
+        )
+    })?;
+    if current_result["operation_id"] != result_operation_id {
+        return Err(Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            "current review result Operation differs from its committed event",
+        ));
+    }
+    let validated =
+        review_contract::validate_result(&current_result["result"]).map_err(|error| {
+            Error::new(
+                "REVIEW_RESULT_DAMAGED",
+                format!("retained review result is invalid: {error}"),
+            )
+        })?;
+    if validated.verdict != review_contract::ReviewVerdict::ChangesRequested
+        || validated.applicability != review_contract::ReviewApplicability::CurrentCandidate
+    {
+        return Err(Error::new(
+            "REVIEW_RESULT_DAMAGED",
+            "current committed result is not an actionable changes_requested result",
+        ));
+    }
+    Ok(true)
 }
 
 /// Find one exact actionable finding for legacy single-finding feedback.

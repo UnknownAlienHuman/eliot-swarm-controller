@@ -2,12 +2,12 @@
 
 This source binds the Rust controller to the generic selected-module
 path. The descriptor is disabled. The route example is inert and contains only
-operator-supplied local paths and model selection; it does not change the active
+operator-supplied local paths and an optional model override; it does not change the active
 Claude configuration or install, register, or launch the artifact.
 
 Install the built `swarm-adapter-claude` executable with the repository's
 standard `Install-ModuleArtifact.ps1` and this descriptor template. This is
-artifact version 7; versions 2 through 6 remain separate retained artifacts.
+artifact version 8; versions 2 through 7 remain separate retained artifacts.
 The Rust binary embeds the pinned `bridge.mjs` and `prepared-query.mjs` bytes and writes
 them to the binding owner's private state directory on demand. Its typed
 `module_host_config_path` launch argument is preserved by the generic installer
@@ -33,7 +33,12 @@ a damaged delivery pointer or missing ACK cannot become successful drain.
 This does not prove Task completion, shared-service shutdown or native family
 departure. See the [scope contract](../../docs/agent_swarm.module-contract-v2.md).
 
-`claude-native-options.schema.json` documents the route option shape. The
+`claude-native-options.schema.json` documents the route option shape. `modelId`
+is an optional explicit override: when omitted or null, SDK `Options.model` is
+omitted and the installed configured harness uses its native CLI default model
+(pinned SDK 0.3.287 `sdk.d.ts`: `model?: string`). An explicit `modelId` is
+passed verbatim as SDK `Options.model`; effective model stays observed only
+from native `system/init.model`. The
 descriptor intentionally keeps `config_schema` null; Store admission does not
 interpret this file, and the adapter validates the options returned by the
 authenticated route.

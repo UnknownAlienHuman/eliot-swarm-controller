@@ -2508,10 +2508,15 @@ fn validate_connection_record(
         "process_birth_token":owned_service.process_birth_token(),
         "executable_sha256":owned_service.executable_sha256(),
     }))?;
+    let selected_model = facts
+        .options
+        .model
+        .as_ref()
+        .ok_or_else(|| record_error("retained owned-service model identity is missing"))?;
     let model = json!({
-        "id":facts.options.model.id,
-        "provider_id":facts.options.model.provider_id,
-        "variant":facts.options.model.variant,
+        "id":selected_model.id,
+        "provider_id":selected_model.provider_id,
+        "variant":selected_model.variant,
     });
     let projection = json!({
         "schema_version":1,
@@ -4485,7 +4490,7 @@ fn record_error(message: &str) -> Error {
 /// to the OpenCode arm (and vice versa) is refused by both sides. No model
 /// consumption is claimed; `dispatch_permitted` stays false and dispatch
 /// selection for the `muse` runtime is a later slice.
-const MUSE_BRIDGE_ARTIFACT_ID: &str = "muse-sdk-1.3.0-bridge.12";
+const MUSE_BRIDGE_ARTIFACT_ID: &str = "muse-sdk-1.3.0-bridge.13";
 const MUSE_VERSION: &str = "1.4.0";
 const MUSE_MCP_INSTALL_KIND: &str = "muse_mcp_install_intent";
 const MUSE_MCP_PROOF_CONTRACT: &str = "muse-native-mcp-proof-v1";
@@ -5226,7 +5231,7 @@ mod muse_grant_contract_tests {
         let intent = json!({
             "schema_version":1,"kind":"muse_mcp_install_intent",
             "registration":"session_scoped_in_memory",
-            "expected_bridge_artifact":"muse-sdk-1.3.0-bridge.12",
+            "expected_bridge_artifact":"muse-sdk-1.3.0-bridge.13",
             "granted_capability":"sessionMcp",
             "assignment":assignment,
             "native_tool_set":"unknown","provider_request_context":"unknown",

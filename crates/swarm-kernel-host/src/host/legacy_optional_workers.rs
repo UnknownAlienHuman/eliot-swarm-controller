@@ -1378,6 +1378,7 @@ mod tests {
         directory: ScratchDir,
         owner: StoreOwner,
         operator: Principal,
+        credential: model::Credential,
     }
 
     impl Fixture {
@@ -1390,13 +1391,14 @@ mod tests {
                 .expect("start real Store fixture");
             let operator = owner
                 .store
-                .authenticate(credential)
+                .authenticate(credential.clone())
                 .await
                 .expect("authenticate fixture operator");
             Self {
                 directory,
                 owner,
                 operator,
+                credential,
             }
         }
 
@@ -1417,6 +1419,7 @@ mod tests {
                 directory,
                 owner,
                 operator: _,
+                credential: _,
             } = self;
             owner.close().await.expect("close fixture StoreOwner");
             drop(directory);
@@ -1658,6 +1661,174 @@ mod tests {
             .record_legacy_worker_status(worker.name(), state, 0, error_code, retry_in_ms)
             .await
             .expect("write initial worker status through Store");
+    }
+
+    #[tokio::test]
+    async fn damaged_optional_launch_json_is_quarantined_while_host_serves_valid_ipc_work() {
+        let fixture = Fixture::new().await;
+        let operation_id = format!("issue153-poison-launch-{}", model::new_id());
+        let raw_request = "{broken-launch-json".to_owned();
+        let insert_operation_id = operation_id.clone();
+        let insert_raw_request = raw_request.clone();
+        fixture
+            .owner
+            .store
+            .run_fixture(move |db| {
+                db.pragma_update(None, "ignore_check_constraints", true)?;
+                let inserted = db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,state,due_at_ms,created_at_ms,updated_at_ms) \
+                     VALUES(?1,'operator',?1,'swarm.launch','{}',?2,'queued',1,1,1)",
+                    rusqlite::params![insert_operation_id, insert_raw_request],
+                );
+                db.pragma_update(None, "ignore_check_constraints", false)?;
+                inserted?;
+                Ok(())
+            })
+            .await
+            .expect("retain one queued launch with damaged optional JSON");
+
+        let mut listener = crate::ipc::Listener::bind(&fixture.directory.0)
+            .expect("bind the host IPC endpoint while Store owns the data root");
+        let ipc_store = fixture.owner.store.clone();
+        let ipc_config = Arc::new(Config::default().ipc);
+        let (ipc_stop, ipc_stopping) = watch::channel(false);
+        let ipc_server = tokio::spawn(async move {
+            let stream = listener.accept().await?;
+            crate::ipc::serve(stream, ipc_store, ipc_config, ipc_stopping).await
+        });
+
+        let store = fixture.owner.store.clone();
+        let custody = ShutdownCustody::new(store.clone());
+        let (coordinator_stop, coordinator_stopping) = watch::channel(false);
+        let coordinator = tokio::spawn(super::run(store.clone(), coordinator_stopping, custody));
+
+        let running = fixture
+            .wait_for_states(&[(Worker::Launcher, "running")])
+            .await;
+        assert_eq!(
+            Fixture::optional_workers(&running)[Worker::Launcher.name()]["state"],
+            "running",
+            "the retained launch damage activates its existing Launcher owner"
+        );
+        let dormant = fixture
+            .wait_for_states(&[(Worker::Launcher, "dormant")])
+            .await;
+        assert_eq!(
+            Fixture::optional_workers(&dormant)[Worker::Launcher.name()]["state"],
+            "dormant",
+            "Launcher returns to dormant after isolating the damaged source"
+        );
+        assert!(
+            !coordinator.is_finished(),
+            "subject-local launch damage must not terminate the host coordinator"
+        );
+
+        let operation_for_read = operation_id.clone();
+        let (marker_count, marker_json, retained_request) = store
+            .run_fixture(move |db| {
+                let marker_count = db.query_row(
+                    "SELECT count(*) FROM meta WHERE key LIKE 'launcher:v1:quarantine:native_mcp:%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let marker_json = db.query_row(
+                    "SELECT value_json FROM meta WHERE key LIKE 'launcher:v1:quarantine:native_mcp:%' LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let retained_request = db.query_row(
+                    "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                    [operation_for_read],
+                    |row| row.get::<_, String>(0),
+                )?;
+                Ok((marker_count, marker_json, retained_request))
+            })
+            .await
+            .expect("read the retained launch and its exact owner quarantine");
+        assert_eq!(marker_count, 1, "one exact Launcher quarantine is retained");
+        assert_eq!(retained_request, raw_request);
+        let marker = crate::automation::config::open_record(
+            serde_json::from_str(&marker_json).expect("decode quarantine envelope"),
+            "launcher quarantine fixture",
+        )
+        .expect("verify and open the producer's retained quarantine record");
+        assert_eq!(marker["code"], "NATIVE_MCP_RECORD_CORRUPT");
+        assert_eq!(
+            marker["evidence"]["subject_identity"],
+            format!("launch-operation:{operation_id}")
+        );
+        assert_eq!(
+            marker["evidence"]["source_pointer"],
+            format!("operations:{operation_id}")
+        );
+        assert_eq!(
+            marker["evidence"]["source_digest"],
+            model::digest(raw_request.as_bytes())
+        );
+        let demand = store
+            .legacy_worker_demand_snapshot()
+            .await
+            .expect("read demand after exact source quarantine");
+        assert!(!demand.launcher && !demand.native_mcp && !demand.native_mcp_tools);
+
+        let mut client = crate::ipc::Client::connect(
+            &fixture.directory.0,
+            &fixture.credential,
+            &Config::default().ipc,
+        )
+        .await
+        .expect("connect through the host IPC endpoint after quarantine");
+        let status = client
+            .request("host.status", json!({}))
+            .await
+            .expect("host remains available after optional JSON damage");
+        assert_eq!(
+            status["host_lifecycle"]["optional_workers"][Worker::Launcher.name()]["state"],
+            "dormant"
+        );
+        let created = client
+            .request(
+                "task.create",
+                json!({
+                    "client_request_id":model::new_id(),
+                    "project_id":"issue153-owner-isolation",
+                    "spec":{
+                        "objective":"Create valid work while damaged optional JSON is isolated.",
+                        "phase":"implementation",
+                        "requirements":[{
+                            "id":"R1",
+                            "statement":"The host continues serving valid work after subject-local quarantine."
+                        }]
+                    }
+                }),
+            )
+            .await
+            .expect("host IPC accepts valid work while its coordinator remains alive");
+        assert!(
+            created["task_id"]
+                .as_str()
+                .is_some_and(|task_id| !task_id.is_empty()),
+            "valid task creation must return its durable Task ID"
+        );
+        assert!(
+            !coordinator.is_finished(),
+            "serving valid work must not depend on stopping the optional-worker coordinator"
+        );
+        drop(client);
+        ipc_server
+            .await
+            .expect("host IPC server task joins")
+            .expect("host IPC server completes the client connection");
+        drop(ipc_stop);
+
+        coordinator_stop
+            .send(true)
+            .expect("signal graceful optional-worker shutdown");
+        coordinator
+            .await
+            .expect("optional-worker coordinator joins")
+            .expect("optional-worker coordinator stops cleanly");
+        fixture.close().await;
     }
 
     #[tokio::test]

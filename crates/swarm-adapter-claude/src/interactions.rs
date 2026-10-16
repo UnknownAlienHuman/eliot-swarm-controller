@@ -5,6 +5,7 @@
 //! bridge; this journal never authorizes replay after an uncertain delivery.
 
 use crate::journal::{OperationJournal, digest_bytes, digest_json, is_item_local_operation_damage};
+use crate::receipt;
 use atlas_redact::redact_auto;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -502,7 +503,7 @@ impl InteractionJournal {
         }
         if operation_id.trim().is_empty()
             || operation_id.len() > 256
-            || !valid_sha256(reply_sha256)
+            || !receipt::is_sha256(reply_sha256)
             || interaction_reply_digest(&record.request, reply)? != reply_sha256
         {
             return Err(Error::new(
@@ -606,7 +607,7 @@ impl InteractionJournal {
         ) || (record.status == InteractionStatus::ReplyIntent
             && (record.reply_operation_id.as_deref() != Some(operation_id)
                 || record.reply_sha256.as_deref() != Some(reply_sha256)))
-            || !valid_sha256(reply_sha256)
+            || !receipt::is_sha256(reply_sha256)
             || interaction_reply_digest(&record.request, reply)? != reply_sha256
         {
             return Err(Error::new(
@@ -1038,7 +1039,7 @@ impl InteractionJournal {
         if !operation.compacted {
             return Ok(InteractionRetentionDecision::Referenced);
         }
-        if !valid_sha256(outcome_sha256) {
+        if !receipt::is_sha256(outcome_sha256) {
             return Ok(InteractionRetentionDecision::Damage);
         }
         Ok(InteractionRetentionDecision::Ready(
@@ -1300,7 +1301,7 @@ impl InteractionJournal {
             || item.sequence == u64::MAX
             || !valid_identity(&item.request_id, 128)
             || item.request_key != request_key(&item.request_id)
-            || !valid_sha256(&item.request_sha256)
+            || !receipt::is_sha256(&item.request_sha256)
         {
             return Err(Error::new(
                 "ADAPTER_INTERACTION_RETENTION",
@@ -1370,10 +1371,10 @@ impl InteractionJournal {
             || !valid_identity(&tombstone.bridge_boot_id, 256)
             || !valid_identity(&tombstone.native_root_id, 512)
             || !valid_identity(&tombstone.tool_name, 256)
-            || !valid_sha256(&tombstone.request_sha256)
+            || !receipt::is_sha256(&tombstone.request_sha256)
             || !valid_identity(&tombstone.reply_operation_id, 256)
-            || !valid_sha256(&tombstone.reply_sha256)
-            || !valid_sha256(&tombstone.outcome_sha256)
+            || !receipt::is_sha256(&tombstone.reply_sha256)
+            || !receipt::is_sha256(&tombstone.outcome_sha256)
             || tombstone.acknowledged_sha256 != tombstone.outcome_sha256
             || !matches!(
                 tombstone.status,
@@ -1577,7 +1578,7 @@ impl InteractionJournal {
             || index.entries.iter().any(|entry| {
                 !valid_identity(&entry.request_id, 128)
                     || entry.request_key != request_key(&entry.request_id)
-                    || !valid_sha256(&entry.request_sha256)
+                    || !receipt::is_sha256(&entry.request_sha256)
                     || !ids.insert(entry.request_id.as_str())
             })
             || path.file_name().and_then(|name| name.to_str()) != Some(expected_file_name.as_str())
@@ -1858,7 +1859,7 @@ impl InteractionJournal {
             {
                 // A migrated legacy reply can be unavailable while its exact
                 // digest and operation identity remain durable.
-                valid_sha256(reply_sha256) && valid_identity(operation_id, 256)
+                receipt::is_sha256(reply_sha256) && valid_identity(operation_id, 256)
             }
             _ => false,
         };
@@ -2000,7 +2001,7 @@ fn interaction_tombstone(
     if !matches!(
         record.status,
         InteractionStatus::Acknowledged | InteractionStatus::Rejected
-    ) || !valid_sha256(acknowledged_sha256)
+    ) || !receipt::is_sha256(acknowledged_sha256)
     {
         return Err(Error::new(
             "ADAPTER_INTERACTION_RETENTION",
@@ -2153,9 +2154,9 @@ fn validate_request(request: &InteractionRequest) -> Result<()> {
                 && digest_json(&legacy_request_payload(request)?)? == request.request_sha256
         }
         2 => {
-            valid_sha256(&request.input_sha256)
+            receipt::is_sha256(&request.input_sha256)
                 && callback_digest_json(&request.input)? == request.input_sha256
-                && valid_sha256(&request.request_sha256)
+                && receipt::is_sha256(&request.request_sha256)
         }
         _ => false,
     };
@@ -2317,13 +2318,6 @@ fn valid_identity(value: &str, maximum: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= maximum
         && !value.bytes().any(|byte| byte.is_ascii_control())
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn validate_reply(request: &InteractionRequest, reply: &Value) -> Result<()> {

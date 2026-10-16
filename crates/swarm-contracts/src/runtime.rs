@@ -167,6 +167,8 @@ impl TaskDispatchContext {
 /// idle native session identity; it carries no MCP inventory or model-use
 /// assertion.
 pub const ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND: &str = "antigravity_dispatch_session_proof_v1";
+pub const ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND: &str =
+    "antigravity_dispatch_session_proof_v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,8 +184,8 @@ pub struct AntigravityDispatchSessionProof {
     /// copy of a workspace path in the proof packet.
     pub native_scope_key_sha256: String,
     pub conversation_id: String,
-    pub requested_model_id: String,
-    pub observed_model_id: String,
+    pub requested_model_id: Option<String>,
+    pub observed_model_id: Option<String>,
     pub model_readback_state: String,
     pub stream_phase: String,
     pub native_events_seen: u64,
@@ -196,8 +198,25 @@ pub struct AntigravityDispatchSessionProof {
 
 impl AntigravityDispatchSessionProof {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != 1
-            || self.kind != ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND
+        let model_matches = match (self.schema_version, self.kind.as_str()) {
+            (1, ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND) => {
+                self.model_readback_state == "verified"
+                    && self.requested_model_id.as_deref().is_some_and(|requested| {
+                        valid_bounded_identity(requested, 256)
+                            && self.observed_model_id.as_deref() == Some(requested)
+                    })
+            }
+            (2, ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND) => {
+                self.model_readback_state == "native_default"
+                    && self.requested_model_id.is_none()
+                    && self
+                        .observed_model_id
+                        .as_deref()
+                        .is_none_or(|observed| valid_bounded_identity(observed, 256))
+            }
+            _ => false,
+        };
+        if !model_matches
             || !valid_bounded_identity(&self.refresh_operation_id, 256)
             || !valid_bounded_identity(&self.binding_id, 256)
             || self.binding_generation <= 0
@@ -206,10 +225,6 @@ impl AntigravityDispatchSessionProof {
             || !is_lower_sha256(&self.native_scope_key_sha256)
             || !valid_bounded_identity(&self.conversation_id, 512)
             || self.native_root_id != self.conversation_id
-            || !valid_bounded_identity(&self.requested_model_id, 256)
-            || !valid_bounded_identity(&self.observed_model_id, 256)
-            || self.requested_model_id != self.observed_model_id
-            || self.model_readback_state != "verified"
             || self.stream_phase != "ready"
             || self.native_events_seen == 0
             || self.native_events_seen > i64::MAX as u64

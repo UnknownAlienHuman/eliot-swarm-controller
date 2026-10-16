@@ -20,6 +20,14 @@ use super::LaunchParent;
 pub(super) const ANTIGRAVITY_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
 pub(super) const ANTIGRAVITY_PROOF_KIND: &str = ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND;
 
+pub(super) fn is_session_proof(value: &Value) -> bool {
+    matches!(
+        value["kind"].as_str(),
+        Some(ANTIGRAVITY_PROOF_KIND)
+            | Some(swarm_contracts::runtime::ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND)
+    )
+}
+
 pub(super) fn unavailable() -> Error {
     Error::new(
         "LAUNCH_DISPATCH_CAPABILITY_UNAVAILABLE",
@@ -45,7 +53,7 @@ pub(super) fn validate_retained_descriptor(
     };
     if identity.module_id.as_str() != "antigravity"
         || identity.artifact.artifact_id.as_str() != ANTIGRAVITY_ARTIFACT_ID
-        || identity.artifact.version.as_str() != "5"
+        || !matches!(identity.artifact.version.as_str(), "5" | "6")
         || identity.protocol.major != 1
         || identity.protocol.minor != 0
         || !has_capability("agent.refresh")
@@ -133,13 +141,15 @@ fn validate_proof_matches_binding(
         || result.details["completion_condition"] != "current_process_native_observation"
         || result.details["target"].as_str() != Some(root_id)
         || opening["native_conversation_id"].as_str() != Some(root_id)
-        || opening_description["model_requested"].as_str()
-            != Some(proof.requested_model_id.as_str())
-        || opening_description["model_observed"].as_str() != Some(proof.observed_model_id.as_str())
-        || opening_description["model_verification"] != "verified"
+        || opening_description["model_requested"].as_str() != proof.requested_model_id.as_deref()
+        || opening_description["model_observed"].as_str() != proof.observed_model_id.as_deref()
+        || opening_description["model_verification"].as_str()
+            != Some(proof.model_readback_state.as_str())
+        || (proof.requested_model_id.is_none()
+            && binding["route"]["native_options"].get("modelId").is_some())
         || snapshot["phase"].as_str() != Some(proof.stream_phase.as_str())
         || init["conversation_id"].as_str() != Some(proof.conversation_id.as_str())
-        || init["model"].as_str() != Some(proof.observed_model_id.as_str())
+        || init["model"].as_str() != proof.observed_model_id.as_deref()
         || snapshot["native_events_seen"].as_u64() != Some(proof.native_events_seen)
         || snapshot["result_ordinal"].as_u64() != Some(proof.result_ordinal)
         || snapshot["gaps"].as_u64() != Some(proof.gap_count)
@@ -202,7 +212,7 @@ pub(super) fn build_packet(
         },
         "purpose":parent.manifest["runtime"]["purpose"],
         "capability":{
-            "kind":ANTIGRAVITY_PROOF_KIND,
+            "kind":proof.kind,
             "identity_digest":identity_digest,
             "assignment_digest":assignment_digest,
             "lease_authority_digest":lease_authority_digest,
@@ -228,6 +238,8 @@ fn validate_proof_binding_only(
         || proof.conversation_id != root_id
         || proof.native_scope_key_sha256 != model::digest(scope_key.as_bytes())
         || Some(proof.worker_boot_id.as_str()) != binding["observation"]["bridge_boot_id"].as_str()
+        || (proof.requested_model_id.is_none()
+            && binding["route"]["native_options"].get("modelId").is_some())
     {
         return Err(stale_proof());
     }
@@ -257,8 +269,8 @@ mod tests {
             native_root_id: ROOT_ID.to_owned(),
             native_scope_key_sha256: model::digest(SCOPE_KEY.as_bytes()),
             conversation_id: ROOT_ID.to_owned(),
-            requested_model_id: MODEL_ID.to_owned(),
-            observed_model_id: MODEL_ID.to_owned(),
+            requested_model_id: Some(MODEL_ID.to_owned()),
+            observed_model_id: Some(MODEL_ID.to_owned()),
             model_readback_state: "verified".to_owned(),
             stream_phase: "ready".to_owned(),
             native_events_seen: 1,
@@ -380,6 +392,69 @@ mod tests {
         .expect("insert newer refresh");
 
         assert!(require_current_session_proof(&db, &binding()).is_err());
+    }
+
+    #[test]
+    fn native_default_session_proof_preserves_unknown_model_and_exact_binding() {
+        let mut proof = session_proof_fixture();
+        proof.schema_version = 2;
+        proof.kind = swarm_contracts::runtime::ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND.into();
+        proof.requested_model_id = None;
+        proof.observed_model_id = None;
+        proof.model_readback_state = "native_default".into();
+        assert!(proof.validate().is_ok());
+        let mut current_binding = binding();
+        current_binding["observation"]["opening_evidence"]["describe"] = json!({
+            "model_requested":null,"model_observed":null,"model_verification":"native_default"
+        });
+        let mut result = refresh_result(&proof);
+        result["details"]["snapshot"]["init"]["model"] = Value::Null;
+        let db = db_with_refresh("settled", 10, Some(&result));
+        let retained = require_current_session_proof(&db, &current_binding)
+            .expect("same current native-default session is dispatchable");
+        assert_eq!(retained["schema_version"], 2);
+        assert!(retained["requested_model_id"].is_null());
+        assert!(retained["observed_model_id"].is_null());
+        assert_eq!(retained["native_root_id"], ROOT_ID);
+
+        // Missing selection cannot relabel a route that actually requested a
+        // model. All boot/identity and current-refresh fences still apply.
+        current_binding["route"]["native_options"]["modelId"] = json!(MODEL_ID);
+        assert!(require_current_session_proof(&db, &current_binding).is_err());
+        current_binding["route"]["native_options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelId");
+        current_binding["observation"]["bridge_boot_id"] = json!("another-boot");
+        assert!(require_current_session_proof(&db, &current_binding).is_err());
+        proof.turn_pending = true;
+        assert!(proof.validate().is_err());
+    }
+
+    #[test]
+    fn native_default_model_state_cannot_bypass_explicit_or_legacy_proof_contract() {
+        let mut proof = session_proof_fixture();
+        proof.requested_model_id = None;
+        proof.model_readback_state = "native_default".into();
+        assert!(
+            proof.validate().is_err(),
+            "v1 still requires explicit model verification"
+        );
+        proof.schema_version = 2;
+        assert!(
+            proof.validate().is_err(),
+            "schema and kind must identify the same contract"
+        );
+        proof.kind = swarm_contracts::runtime::ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND.into();
+        assert!(
+            proof.validate().is_ok(),
+            "an observed default may remain a fact"
+        );
+        proof.requested_model_id = Some(MODEL_ID.into());
+        assert!(
+            proof.validate().is_err(),
+            "explicit requests cannot use the default state"
+        );
     }
 
     #[test]

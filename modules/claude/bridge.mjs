@@ -289,7 +289,7 @@ async function startNative(command) {
   let modelOption;
   try { modelOption = explicitQueryModel(nativeOptions); }
   catch (error) { throw codedError(error.message); }
-  const requestedModel = modelOption.model;
+  const requestedModel = modelOption.model ?? null;
   let permissionMode;
   if (nativeOptions.permissionMode !== undefined) {
     if (!PERMISSION_MODES.includes(nativeOptions.permissionMode)) throw codedError('INVALID_PERMISSION_MODE');

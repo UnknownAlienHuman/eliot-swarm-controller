@@ -1712,15 +1712,15 @@ fn git_output_from_probe(outcome: GitProbeOutcome) -> Result<GitOutput> {
         ));
     }
     if !outcome.probe_success && outcome.exit_code == Some(0) {
-        return Err(Error::new(
-            "HOOK_GIT_OUTPUT",
+        return Err(git_probe_output_error(
             "Git helper reported a failed capture despite a successful direct exit",
+            &outcome.message,
         ));
     }
     if !outcome.message.is_empty() && !outcome.message.starts_with("input probe exited with ") {
-        return Err(Error::new(
-            "HOOK_GIT_OUTPUT",
+        return Err(git_probe_output_error(
             "the bounded Git helper could not complete a clean readback",
+            &outcome.message,
         ));
     }
     let Some(code) = outcome.exit_code else {
@@ -1733,6 +1733,38 @@ fn git_output_from_probe(outcome: GitProbeOutcome) -> Result<GitOutput> {
         status: GitStatus { code: Some(code) },
         stdout: outcome.stdout,
     })
+}
+
+fn git_probe_output_error(summary: &str, message: &str) -> Error {
+    // Match the input-probe cleanup diagnostic policy; never include pipe bytes.
+    let message = if message.contains('/')
+        || message.contains('\\')
+        || message
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_alphabetic() && pair[1] == b':')
+    {
+        if message.starts_with("input probe process group membership check failed; ") {
+            "input probe process group membership check failed; OS diagnostic redacted"
+        } else {
+            "OS diagnostic redacted"
+        }
+    } else {
+        message
+    };
+    let diagnostic = message
+        .chars()
+        .filter(|character| character.is_ascii() && !character.is_ascii_control())
+        .take(CHECK_PROBE_MESSAGE_BYTES)
+        .collect::<String>();
+    Error::new(
+        "HOOK_GIT_OUTPUT",
+        if diagnostic.is_empty() {
+            summary.to_owned()
+        } else {
+            format!("{summary}; helper diagnostic: {diagnostic}")
+        },
+    )
 }
 
 #[derive(Debug)]
@@ -2363,7 +2395,7 @@ impl GitHelperCustody {
         if !status.success() {
             return Err(Error::new(
                 "HOOK_GIT_HELPER_FAILED",
-                "bounded Git helper exited without a successful response",
+                format!("bounded Git helper exited without a successful response ({status})"),
             ));
         }
         if self.capture_setup_failed {
@@ -3780,6 +3812,27 @@ mod tests {
     const PROBE_FIXTURE_MODE_ENV: &str = "HOOK_GIT_PROBE_FIXTURE_MODE";
     const PROBE_FIXTURE_MARKER_ENV: &str = "HOOK_GIT_PROBE_FIXTURE_MARKER";
 
+    /// Publish a fixture identity so destination visibility is the
+    /// complete-publication signal. A direct `fs::write` creates or truncates
+    /// the destination before its bytes land, so an exists-then-read observer
+    /// can read empty or partial bytes and fail JSON decode with EOF (seen at
+    /// `pending_git_owner_keeps_live_descendant_and_pipe_until_exact_departure`).
+    /// A sibling temporary file plus atomic replacement keeps the destination
+    /// absent until every identity byte is durable on the same volume.
+    fn publish_fixture_identity(destination: &Path, identity: &Value) {
+        let parent = destination
+            .parent()
+            .expect("fixture identity destination has a parent directory");
+        let temporary = parent.join(format!(".probe-identity-{}", model::new_id()));
+        let bytes = serde_json::to_vec(identity).expect("encode the fixture identity");
+        let staged = write_new(&temporary, &bytes, None);
+        let published = staged.and_then(|()| atomic_replace(&temporary, destination));
+        if let Err(error) = published {
+            let _ = fs::remove_file(&temporary);
+            panic!("publish the exact fixture identity: {error:?}");
+        }
+    }
+
     /// Test-binary entry point used in place of the production `check-worker`
     /// CLI route. It runs the existing probe and exits before libtest writes a
     /// footer onto the framed response stream.
@@ -3803,11 +3856,7 @@ mod tests {
         let direct_identity = platform::process_group::process_birth_identity(std::process::id())
             .expect("capture the direct command birth identity")
             .expect("the direct command is still live");
-        fs::write(
-            marker.with_extension("direct-id"),
-            serde_json::to_vec(&direct_identity).expect("encode direct command identity"),
-        )
-        .expect("publish the exact direct command identity");
+        publish_fixture_identity(&marker.with_extension("direct-id"), &direct_identity);
         let executable = std::env::current_exe().expect("test executable path");
         let mut descendant = Command::new(executable)
             .args([
@@ -3861,11 +3910,7 @@ mod tests {
         let identity = platform::process_group::process_birth_identity(std::process::id())
             .expect("capture the live pipe-holder birth identity")
             .expect("the pipe holder is still live");
-        std::fs::write(
-            marker,
-            serde_json::to_vec(&identity).expect("encode pipe-holder identity"),
-        )
-        .expect("publish live pipe-holder marker");
+        publish_fixture_identity(&marker, &identity);
         thread::sleep(Duration::from_secs(30));
     }
 
@@ -4216,6 +4261,60 @@ mod tests {
         haystack
             .windows(needle.len())
             .any(|window| window == needle)
+    }
+
+    #[test]
+    fn failed_git_probe_with_zero_exit_retains_bounded_producer_diagnostic() {
+        let reason = "input probe output capture ended without natural EOF or complete bytes";
+        let membership_reason = concat!(
+            "input probe process group membership check failed; ",
+            "cleanup_error[PROCESS_IDENTITY]: invalid proc stat"
+        );
+        for (message, expected) in [
+            (reason.to_owned(), reason),
+            (membership_reason.to_owned(), membership_reason),
+            (
+                concat!(
+                    "input probe process group membership check failed; ",
+                    "cleanup_error[PROCESS_IDENTITY]: /private-path/credential.json"
+                )
+                .to_owned(),
+                "input probe process group membership check failed; OS diagnostic redacted",
+            ),
+            (
+                format!("{reason}\n\t{}", "x".repeat(CHECK_PROBE_MESSAGE_BYTES)),
+                reason,
+            ),
+            (
+                "input probe failed at /private-path/credential.json".to_owned(),
+                "OS diagnostic redacted",
+            ),
+            (
+                r"input probe failed at C:\private-path\credential.json".to_owned(),
+                "OS diagnostic redacted",
+            ),
+        ] {
+            let error = git_output_from_probe(GitProbeOutcome {
+                exit_code: Some(0),
+                timed_out: false,
+                output_limited: false,
+                group_empty: true,
+                family_departed: true,
+                had_descendants: false,
+                probe_success: false,
+                stdout: b"sensitive-git-stdout".to_vec(),
+                stderr: b"sensitive-git-stderr".to_vec(),
+                message,
+            })
+            .expect_err("a failed probe remains an error despite a zero direct exit");
+            assert_eq!(error.code, "HOOK_GIT_OUTPUT");
+            assert!(error.message.contains(expected));
+            assert!(!error.message.chars().any(char::is_control));
+            assert!(error.message.len() <= CHECK_PROBE_MESSAGE_BYTES + 128);
+            assert!(!error.message.contains("sensitive-git-stdout"));
+            assert!(!error.message.contains("sensitive-git-stderr"));
+            assert!(!error.message.contains("private-path"));
+        }
     }
 
     #[test]

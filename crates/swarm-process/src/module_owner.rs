@@ -127,10 +127,8 @@ fn parse_closed_worker_error_code(stderr: &[u8]) -> Option<String> {
     String::from_utf8(code.to_vec()).ok()
 }
 
-/// Only these non-secret Windows values are carried into the adapter child.
-/// Descriptor literals and late protected-reference paths are installed after
-/// this baseline; arbitrary provider, API, bearer, or user environment values
-/// are deliberately excluded.
+/// OS baseline for deliberately scoped workers. Native harness launches use
+/// `apply_native_launch_environment` instead of this allowlist.
 #[cfg(windows)]
 const WINDOWS_LAUNCH_ENVIRONMENT: &[&str] = &[
     "SystemRoot",
@@ -525,7 +523,7 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
     if stderr_drain.is_some() {
         command.stderr(Stdio::piped());
     }
-    apply_launch_environment(&mut command);
+    apply_native_launch_environment(&mut command);
     command
         .args(&resolved.argv)
         .env_remove("ELIOT_SWARM_MODULE_BOOT_ID")
@@ -645,16 +643,29 @@ pub fn run_module_with_resolver<R: ProtectedRefResolver>(
     }
 }
 
-/// Prepare the owner helper or adapter with the same bounded environment. The Windows
-/// baseline is limited to OS launch, home, and configuration discovery values;
-/// all module-specific literals and protected-reference file paths come from
-/// the validated plan/resolver below. This is an environment boundary, not a
-/// same-user sandbox or a provider/account authorization boundary.
+/// Prepare a deliberately scoped worker, such as Forge, with an OS baseline.
+/// Native harness owner and adapter launches use the inherited environment
+/// helper below instead.
 pub fn apply_launch_environment(command: &mut Command) {
     command.env_clear();
     #[cfg(windows)]
     for name in WINDOWS_LAUNCH_ENVIRONMENT {
         if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+/// Carry the operator's native harness environment through the supervisor,
+/// owner and adapter hops. Provider variables and profile discovery belong to
+/// that harness; do not enumerate, persist or replace them here. Only inherited
+/// controller coordination variables are removed before this launch installs
+/// its own binding-scoped values.
+pub fn apply_native_launch_environment(command: &mut Command) {
+    command.env_clear();
+    for (name, value) in env::vars_os() {
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        if !upper.starts_with("ELIOT_") && !upper.starts_with("SWARM_") {
             command.env(name, value);
         }
     }
@@ -1434,6 +1445,37 @@ mod tests {
 
     #[test]
     fn spawn_failure_publishes_exact_not_started_receipt_with_artifact_version() {
+        // The real owner joins a process-wide Job/group. Running it in this
+        // parallel harness would also capture unrelated fixture children.
+        let module = module_path!()
+            .split_once("::")
+            .expect("fixture module has a crate prefix")
+            .1;
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                &format!("{module}::spawn_failure_receipt_isolated_child"),
+                "--nocapture",
+            ])
+            .output()
+            .expect("run the isolated module-owner spawn-failure fixture");
+        assert!(
+            output.status.success(),
+            "isolated module-owner fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "MODULE_SPAWN_FAILURE_RECEIPT_ASSERTIONS_COMPLETE"),
+            "successful exit without completed launch-receipt assertions is not a pass"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned by the launch-receipt regression in an isolated process-owned Job/group"]
+    fn spawn_failure_receipt_isolated_child() {
         let root = env::temp_dir().join(format!(
             "swarm-module-owner-spawn-failure-{}",
             uuid::Uuid::new_v4()
@@ -1471,9 +1513,17 @@ mod tests {
         };
 
         let error = run_module_with_resolver(plan.clone(), &EmptyRefResolver).unwrap_err();
-        let receipt: Value =
-            serde_json::from_slice(&fs::read(state_dir.join("launch-result.json")).unwrap())
-                .unwrap();
+        let launch_path = state_dir.join("launch-result.json");
+        assert!(
+            launch_path.is_file(),
+            "missing launch-result.json after run_module_with_resolver error: code={} message={} owner_exists={} worker_exists={} state_dir={}",
+            error.code,
+            error.message,
+            state_dir.join("owner.json").exists(),
+            state_dir.join("worker.json").exists(),
+            state_dir.display()
+        );
+        let receipt: Value = serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
         let owner: Value =
             serde_json::from_slice(&fs::read(state_dir.join("owner.json")).unwrap()).unwrap();
         let actual_fields = receipt
@@ -1534,6 +1584,7 @@ mod tests {
         assert!(!state_dir.join("worker.json").exists());
 
         fs::remove_dir_all(root).unwrap();
+        println!("MODULE_SPAWN_FAILURE_RECEIPT_ASSERTIONS_COMPLETE");
     }
 
     #[test]
@@ -1706,6 +1757,79 @@ mod tests {
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("ENV_BOTH_HOPS_VERIFIED"));
         println!("ENV_BOTH_HOPS_VERIFIED");
+    }
+
+    #[test]
+    fn native_environment_survives_owner_and_adapter_hops() {
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "module_owner::tests::native_environment_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ELIOT_NATIVE_TEST_HOP", "supervisor")
+            .env("NATIVE_HARNESS_TEST_VALUE", "native-value-sentinel")
+            .env("XDG_CONFIG_HOME", env::temp_dir())
+            .env("ELIOT_NATIVE_TEST_STALE", "stale-controller-value")
+            .env("SWARM_NATIVE_TEST_STALE", "stale-controller-value")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("NATIVE_ENV_BOTH_HOPS_VERIFIED"));
+    }
+
+    #[test]
+    #[ignore = "child entry point exercised by the native two-hop environment regression"]
+    fn native_environment_child() {
+        let hop = env::var("ELIOT_NATIVE_TEST_HOP").unwrap();
+        assert_eq!(
+            env::var("NATIVE_HARNESS_TEST_VALUE").unwrap(),
+            "native-value-sentinel"
+        );
+        assert_eq!(
+            env::var_os("XDG_CONFIG_HOME"),
+            Some(env::temp_dir().into_os_string())
+        );
+        if hop != "supervisor" {
+            assert!(env::var_os("ELIOT_NATIVE_TEST_STALE").is_none());
+            assert!(env::var_os("SWARM_NATIVE_TEST_STALE").is_none());
+        }
+        if hop == "adapter" {
+            println!("NATIVE_ENV_BOTH_HOPS_VERIFIED");
+            return;
+        }
+        assert!(matches!(hop.as_str(), "supervisor" | "helper"));
+        let mut child = Command::new(env::current_exe().unwrap());
+        apply_native_launch_environment(&mut child);
+        let output = child
+            .args([
+                "--exact",
+                "module_owner::tests::native_environment_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(
+                "ELIOT_NATIVE_TEST_HOP",
+                if hop == "supervisor" {
+                    "helper"
+                } else {
+                    "adapter"
+                },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("NATIVE_ENV_BOTH_HOPS_VERIFIED"));
+        println!("NATIVE_ENV_BOTH_HOPS_VERIFIED");
     }
 
     struct PathFixture {

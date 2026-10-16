@@ -36,13 +36,13 @@ fn actual_mcp_producer_roundtrips_through_store_consumer_and_admission() {
     let options = Options {
         service_id: context["service"]["id"].as_str().unwrap().into(),
         connection_file: directory.join("offline-unused-connection.json"),
-        expected_version: "2.0.7".into(),
+        expected_version: Some("2.0.7".into()),
         directory,
-        model: ModelRef {
+        model: Some(ModelRef {
             id: context["model"]["id"].as_str().unwrap().into(),
             provider_id: context["model"]["provider_id"].as_str().unwrap().into(),
             variant: context["model"]["variant"].as_str().unwrap().into(),
-        },
+        }),
     };
     let pid = u32::try_from(context["service"]["pid"].as_u64().unwrap()).unwrap();
     let server_name = context["install"]["server_name"].as_str().unwrap();
@@ -108,7 +108,10 @@ fn actual_mcp_producer_roundtrips_through_store_consumer_and_admission() {
     let packet = offline_mcp_packet_fixture(Some(capability)).unwrap();
     assert_eq!(packet["capability"]["session_context_state"], "unknown");
     assert_eq!(packet["capability"]["provider_request_state"], "unknown");
-    assert_eq!(packet["selection"]["model"], facts.options.model.id);
+    assert_eq!(
+        packet["selection"]["model"],
+        facts.options.model.as_ref().unwrap().id
+    );
 
     // A producer-field regression must fail before admission, even with a
     // valid recomputed enclosing evidence digest.

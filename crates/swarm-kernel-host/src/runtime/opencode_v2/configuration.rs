@@ -107,11 +107,11 @@ impl ConfigurationExpectation {
 
     pub(crate) fn ensure_route(&self, options: &Options) -> Result<()> {
         if let Self::SessionModel { model, .. } = self
-            && model != &options.model
+            && options.model.as_ref() != Some(model)
         {
             return Err(Error::new(
                 "NATIVE_MODEL_ROUTE_MISMATCH",
-                "session model control must select the route's exact provider/model/variant",
+                "session model control must select the route's exact provider/model/variant; routes on native harness defaults carry no pin to restore",
             ));
         }
         Ok(())
@@ -1113,8 +1113,17 @@ impl Service {
     }
 
     pub(super) async fn check_route_model_available(&self, options: &Options) -> Result<()> {
+        // No model override was requested. The already configured native
+        // harness owns its defaults and provider readiness: no catalog
+        // admission gate is applied. (Standalone adapter schema 4 parity.)
+        if options.model.is_none() {
+            return Ok(());
+        }
         let catalog = self.model_catalog(&options.directory).await?;
-        Self::checked_model(&catalog, &options.model)?;
+        Self::checked_model(
+            &catalog,
+            options.model.as_ref().expect("route model override"),
+        )?;
         Ok(())
     }
 
@@ -1129,6 +1138,10 @@ impl Service {
                 "the exact requested agent is not registered in this location",
             )
         })?;
+        // An agent-level model override is accepted only when it exactly
+        // equals the route's pinned trio. On native harness defaults
+        // (no route pin, serialized as null) any native override is a
+        // billing-route change and is rejected rather than adopted.
         if definition
             .model
             .as_ref()

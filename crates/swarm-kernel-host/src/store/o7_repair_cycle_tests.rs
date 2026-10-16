@@ -932,13 +932,8 @@ async fn same_attempt_return_repair_fresh_review_and_acceptance_bind_to_candidat
         "o7-candidate-a-reviewer-token",
     )
     .await;
-    let mut result_a_request =
+    let result_a_request =
         review_result_request(&submission_a, &assignment_a, "review-o7-candidate-a");
-    result_a_request["requirement_reviews"] = json!([{
-        "requirement_id":"R1",
-        "rationale":"Candidate A omits the retained implementation evidence for R1.",
-        "evidence":[candidate_a],
-    }]);
     let result_a = owner
         .store
         .call(reviewer_a, "review.submit".into(), result_a_request)

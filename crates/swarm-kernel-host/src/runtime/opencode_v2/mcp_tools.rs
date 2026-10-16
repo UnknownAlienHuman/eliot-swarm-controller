@@ -36,7 +36,9 @@ pub(crate) struct NativeMcpChallenge {
     service_pid: u32,
     service_version: String,
     directory: String,
-    model: ModelRef,
+    /// Optional exact route invocation override. Absent means the native
+    /// harness owns the session model; the challenge then binds scope only.
+    model: Option<ModelRef>,
     module_path: PathBuf,
     module_sha256: String,
 }
@@ -160,7 +162,14 @@ pub(crate) fn challenge_metadata(challenge: &NativeMcpChallenge) -> Value {
 /// Exact local plugin config for the pinned service. The host owns where this
 /// config is installed; this helper only projects the verified source identity.
 pub(crate) fn plugin_config_value(options: &Options) -> Result<Value> {
-    if options.expected_version != PINNED_VERSION {
+    // The observer plugin is qualified only for the pinned native build. An
+    // explicit route pin is optional; a wrong explicit pin fails here while
+    // an absent pin defers to the observed-service check at use.
+    if options
+        .expected_version
+        .as_deref()
+        .is_some_and(|version| version != PINNED_VERSION)
+    {
         return Err(source_error_code(
             "NATIVE_MCP_PROOF_PLUGIN_CONFIG_MISMATCH",
             "native MCP observer requires OpenCode 2.0.7",
@@ -365,6 +374,16 @@ pub(crate) fn prepare_arm(
     challenge: &NativeMcpChallenge,
 ) -> Result<PreparedNativeMcpArm> {
     validate_challenge(challenge, service, options)?;
+    // The pinned observer plugin schema requires a model record
+    // (native-mcp-proof.mjs challenge-input validation): the observer binds
+    // an exact invocation trio, so a route on native harness defaults cannot
+    // arm it. This fails before any native RPC rather than after a plugin
+    // schema rejection.
+    if challenge.model.is_none() {
+        return Err(challenge_error(
+            "native MCP observer requires an exact route provider/model/variant; routes on native harness defaults cannot arm it",
+        ));
+    }
 
     let expected_plugin_config = expected_plugin_config(options, challenge)?;
     let request_path = rpc_path("arm", &challenge.directory)?;
@@ -606,7 +625,7 @@ struct StoredChallengeMetadata {
     service_pid: u32,
     service_version: String,
     directory: String,
-    model: ModelRef,
+    model: Option<ModelRef>,
     module_path: String,
     module_sha256: String,
 }
@@ -659,7 +678,7 @@ struct PluginReadback {
     issued_at_ms: i64,
     expires_at_ms: i64,
     assignment: Value,
-    expected_model: ModelRef,
+    expected_model: Option<ModelRef>,
     session_id: String,
     receipt_observed_at_ms: i64,
     observation_sequence: u64,
@@ -740,10 +759,13 @@ fn validate_challenge(
         || challenge.service_pid != service.pid
         || challenge.service_version != PINNED_VERSION
         || challenge.service_version != service.version
-        || options.expected_version != PINNED_VERSION
+        || options
+            .expected_version
+            .as_deref()
+            .is_some_and(|pin| pin != service.version)
         || challenge.directory != options.directory.to_str().unwrap_or_default()
         || challenge.model != options.model
-        || !challenge.model.valid()
+        || challenge.model.as_ref().is_some_and(|model| !model.valid())
         || !module_hash_valid(&challenge.module_sha256)
         || service.pid == 0
     {
@@ -1149,7 +1171,11 @@ fn validate_provider_evidence(
                     .agent
                     .as_deref()
                     .is_some_and(|agent| bounded_label(agent, 256))
-                && evidence.model.as_ref() == Some(&challenge.model) =>
+                // An explicit route invocation override must be the exact
+                // model on the observed provider request. On native harness
+                // defaults the native model is observed, never gated.
+                && (challenge.model.is_none()
+                    || evidence.model.as_ref() == challenge.model.as_ref()) =>
         {
             if evidence.status == "observed" && evidence.reason_code.is_none() {
                 validate_context_tools(&evidence.tools)
@@ -1450,13 +1476,13 @@ mod plugin_package_path_tests {
         let options = Options {
             service_id: "plugin_path_fixture".to_owned(),
             connection_file: root.join("unused-connection.json"),
-            expected_version: "2.0.7".to_owned(),
+            expected_version: Some("2.0.7".to_owned()),
             directory: root.clone(),
-            model: ModelRef {
+            model: Some(ModelRef {
                 id: "fixture-model".to_owned(),
                 provider_id: "fixture-provider".to_owned(),
                 variant: "fixture-variant".to_owned(),
-            },
+            }),
         };
 
         let config = plugin_config_value(&options).unwrap();

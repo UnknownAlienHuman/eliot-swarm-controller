@@ -4,7 +4,7 @@
   "properties": {
     "allowDangerouslySkipPermissions": { "type": "boolean" },
     "claudeConfigDir": { "type": "string", "minLength": 1 },
-    "modelId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "modelId": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
     "nativeExecutable": { "type": ["string", "null"] },
     "nodeExecutable": { "type": "string", "minLength": 1 },
     "permissionMode": {
@@ -16,7 +16,6 @@
   "required": [
     "allowDangerouslySkipPermissions",
     "claudeConfigDir",
-    "modelId",
     "nativeExecutable",
     "nodeExecutable",
     "permissionMode",

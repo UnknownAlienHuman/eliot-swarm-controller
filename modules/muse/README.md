@@ -1,17 +1,22 @@
 # Muse SDK bridge — native integration
 
-Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The `muse-sdk-1.3.0-bridge.12` source retains bridge.11 TaskPrompt/checkpoint behavior and bounded observation, and adds grant-aware session MCP configuration with an explicit native-inventory boundary. The [APP399 verification record](../../docs/remediation/2026-10-12/MUSE-BOUNDED-OBSERVATION-VERIFICATION.json) is for bridge.11 and its recorded source hashes; its scoped syntax, SDK import, fixture and Store-consumer checks do not qualify bridge.12. Retain and accept the exact descriptor before selecting new bindings. Live Muse/Max inference and Windows native launch remain unqualified.
+Uses the complete locked `@muse-code/sdk` **1.3.0** and pinned [MSP schema](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts). The current `muse-sdk-1.3.0-bridge.13` source candidate permits omitted model, provider and effort overrides so the installed harness supplies its defaults. Observed values remain session facts and never become controller route defaults. It retains bridge.12's bounded observation and grant-aware session MCP behavior. The [APP399 verification record](../../docs/remediation/2026-10-12/MUSE-BOUNDED-OBSERVATION-VERIFICATION.json) is for bridge.11 and does not qualify bridge.13. SDK 1.3.0 stays pinned; provider authorization and settings stay native. Installed Muse/Max inference and Windows ownership qualification remain pending.
 
-Before activation, register and retain the exact bridge.12 descriptor before
+Before activation, register and retain the exact bridge.13 descriptor before
 selecting it for a new binding. Existing bindings keep their original artifact
 identity and code; an artifact ID must never be relabelled or cross-served.
+
+This package remains an existing compatibility bridge around the official Node
+SDK. Its stateful checkpoint, recovery and native-control code is still Node;
+the Rust adapter migration required by the [modular architecture](../../docs/agent-operations/modularity.md#6-implementation-sequence-and-completion-criteria)
+remains incomplete. The bridge's fixture results apply to this implementation.
 
 ## Ownership and setup
 
 The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next/outcome/observe/result`; its credential is scoped to the reserved binding/generation and cannot accept Tasks or become GM. Native subscription/auth, tools and model loop remain in Muse.
 
 1. Run `npm ci --ignore-scripts` here for the locked local SDK, not global packages or a model login.
-2. Enable a private controller route with the actual workspace, native model and explicit effort. The shipped route stays disabled. Run the host and reserve `agent.open` with lane_id/route; retain binding_id/generation.
+2. Enable a private controller route with the actual workspace. Model, provider, and effort are optional: omission selects the installed native default (installed `msp.d.ts` `SessionStartParams.modelId` 'server default when omitted', `providerId` 'server default when omitted or explicit null', `TurnStartParams.reasoningEffort` optional per-turn override of the standing default). An explicit `modelId`, `providerId`, or `reasoningEffort` is forwarded verbatim and must read back exactly; no provider keys, settings, handshakes, or duplicated defaults are configured by the controller. The shipped route stays disabled. Run the host and reserve `agent.open` with lane_id/route; retain binding_id/generation.
 3. Register the scoped module credential: `swarm client-create muse-MC --role module --binding-id BINDING --generation 1 --out PRIVATE_FILE`. Use normal host/data-dir arguments and preserve request IDs.
 4. Copy `module.example.json` outside Git, set the actual host endpoint, credential file and native executable/argv. Select a real Windows `.exe`, not `.cmd`/`.bat`. Match moduleArtifactId to the route.
 5. Start the module independently with the guarded launcher below. Only its admitted open/recovery operation starts the native executable. No PATH, UAC or vendor service configuration is changed.
@@ -20,16 +25,20 @@ The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next
 [[routes]]
 alias = 'muse-manager'
 runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.12'
+module_artifact_id = 'muse-sdk-1.3.0-bridge.13'
 enabled = true
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
-modelId = 'muse-spark-1.3-contributor'
-reasoningEffort = 'max'
+# Optional explicit overrides; omit all three for the native default.
+# modelId = 'muse-spark-1.3-contributor'
+# providerId = 'native'
+# reasoningEffort = 'max'
 approvalMode = 'allowAll'
 ```
 
-Optional session-scoped native MCP servers (bridge.12): `mcpServers` maps a server name to one closed-union entry. The bridge requests the documented `sessionMcp` grant at initialize and forwards the validated map as `session/start` config over the raw Connection (the pinned facade omits `config` until its grant check lands). Retained installed CLI 1.4.0 observations show the grant in durable and ephemeral profiles and show `session/start` accepting config even when a required stdio executable is unavailable; that admission ACK does not establish server liveness. The bridge rejects transports outside its closed union before forwarding; a separate direct native decode refused an unknown transport (`-32602`). The documented reads (`session/read`, `view/subscribe`, `view/page`, `skill/list`, `session/list`) exposed no native tool inventory, and the view watch delivered only `session/started`. The Store gate continues to refuse dispatch; no native inventory is claimed.
+Omission evidence: the installed schema at `.local/muse-installed-native-schema/msp.d.ts` (`SessionStartParams` modelId/providerId, `TurnStartParams`/`TurnSteerParams` reasoningEffort) marks each field optional with server/standing-default semantics when omitted. The bridge omits unset fields from `session/start` and `turn/start` payloads and records `requested_* = null` with `*_status = 'omitted_native_default'`; the observed model is recorded only from the `session/start` readback (`observed:{modelId,providerId}`), never synthesized. Explicit values ride verbatim and must match readback (`MODEL_READBACK_MISMATCH`/`PROVIDER_READBACK_MISMATCH`).
+
+Optional session-scoped native MCP servers (introduced in bridge.12 and retained in the bridge.13 source candidate): `mcpServers` maps a server name to one closed-union entry. The bridge requests the documented `sessionMcp` grant at initialize and forwards the validated map as `session/start` config over the raw Connection (the pinned facade omits `config` until its grant check lands). Retained installed CLI 1.4.0 observations show the grant in durable and ephemeral profiles and show `session/start` accepting config even when a required stdio executable is unavailable; that admission ACK does not establish server liveness. The bridge rejects transports outside its closed union before forwarding; a separate direct native decode refused an unknown transport (`-32602`). The documented reads (`session/read`, `view/subscribe`, `view/page`, `skill/list`, `session/list`) exposed no native tool inventory, and the view watch delivered only `session/started`. The Store gate continues to refuse dispatch; no native inventory is claimed.
 
 ```toml
 [routes.native_options.mcpServers.probe-unreachable]
@@ -47,7 +56,7 @@ Use a dedicated initially empty module-state directory, separate from host data.
 
 `node bridge.mjs --config FILE` remains an unguarded legacy entrypoint: it has host-reconnect behavior, but no recorded process ownership/checkpoint for automatic bridge-loss recovery. Do not retrofit proof into a running bridge.4 or overwrite its executable/scripts in place. Use a new artifact/binding for changed module code. The managed path uses the SDK's public Connection with a non-detached child transport so ownership follows the launcher; MSP framing and routing remain in the SDK.
 
-Inspect `agent.state`, then claim a controller-start Task with binding-id/generation and send `task.dispatch`. Native-manager claims can delegate children without receiving a second controller prompt. Requested effort, applied defaults and actual inference evidence remain distinct. Max is explicit on turns; no silent alternate provider or reduced effort.
+Inspect `agent.state`, then claim a controller-start Task with binding-id/generation and send `task.dispatch`. Native-manager claims can delegate children without receiving a second controller prompt. Requested effort/model/provider, observed readback, and actual inference evidence remain distinct. An omitted per-turn effort means the native default applies, not a reset; `max` remains explicit only when configured or sent per turn. No silent alternate provider or reduced effort.
 
 ## Pending-request refresh (introduced in bridge.8)
 
@@ -65,18 +74,17 @@ This follows the pinned SDK's [approval update field ownership](https://github.c
 No SDK approval handler or automatic decision is installed. Presentation still
 returns `{}`; an answer remains an explicit addressed `agent.reply` Operation.
 
-This code requires artifact `muse-sdk-1.3.0-bridge.12` and refuses to announce a
-previous artifact ID. Stage it for new bindings only. Existing bridge.9 and
-bridge.10 bindings and checkpoints retain their original code and identity; they
-are not migrated.
+This code requires artifact `muse-sdk-1.3.0-bridge.13` and refuses to announce a
+previous artifact ID. Stage it for new bindings only. Existing bridge.9 through
+bridge.12 bindings and checkpoints retain their original code and identity; they
+are not migrated or hot-upgraded.
 The SDK pin is unchanged. The APP399 verification record binds bridge.11 source
 hashes to its scoped syntax, SDK import, fixture and Store-consumer checks; it
-does not qualify bridge.12.
-Changed source requires its own checks before activation; installed native
-behavior requires separate qualification. Earlier artifact evidence retains
-its original hashes and scope.
+does not qualify bridge.12 or bridge.13. The bridge.13 source candidate has not
+been checked or qualified; installed native behavior requires separate
+qualification. Earlier artifact evidence retains its original hashes and scope.
 
-The bridge.12 observation projection measures the complete serialized
+The historical bridge.12 observation projection measures the complete serialized
 `module.observe` JSON-RPC line against the existing 1 MiB control cap. When
 request details are too large, it retains exact session/native request IDs and
 marks details unknown. If some identities themselves cannot fit, fitting
@@ -116,6 +124,16 @@ command schemas and `swarm.task_dispatch_admission@1` as an event schema, with
 the existing runtime command/outcome schemas and `task.dispatch` capability.
 
 ## Recorded-session recovery — bridge.5
+
+The current bridge.13 source also discovers children created while disconnected
+by reading the exact root's durable `view/page` events. Each pass reads at most
+ten pages of 100 events; an incomplete pass checkpoints the opaque continuation
+for the next explicit root refresh. Every page is fenced to the same connection,
+boot and root. Parent provenance identifies a child; a separate exact child read
+and subscription establish freshness. Partial scans retain gaps and never claim
+complete family coverage. The offline selftest drives the actual bridge,
+including a child beyond event 1000, without replaying native input. Live resume
+and family qualification remain open in Issues #4 and #5.
 
 The local checkpoint persists known session/namespace, relevant settings, compact family observations, pending native command identities/payloads/ACKs and unacknowledged outcomes/result pages. It does not copy credentials or the full native transcript. Writes are serialized and atomically published; a failed checkpoint blocks subsequent native mutations rather than silently losing the recovery boundary. The OS owner serializes this directory, not a second task database.
 
@@ -176,13 +194,23 @@ One boundary stays explicit: transport EOF without process exit is not separatel
 | agent.send | text, delivery:next_turn | Native admission, possibly queued. |
 | agent.send | text, delivery:steer, expected_turn_id | Correction of the exact active turn, not another Task. |
 | agent.reply | reply:{method,params} | approval/decide or userInput/answer, cancel, clarify with current native IDs. |
-| agent.configure | settings:{reasoningEffort:max} | Durable native default for subsequent turns; explicit per-turn input remains. |
-| agent.configure | settings:{model:{modelId,providerId}} | Waits for matching readback/event, not just ACK. |
+| agent.configure | settings:{reasoningEffort:max} | Durable native default for subsequent turns; explicit per-turn input remains. Omission leaves the native default untouched. |
+| agent.configure | settings:{model:{modelId,providerId}} | Explicit override only; waits for matching readback/event, not just ACK. No model is synthesized when omitted. |
 | agent.configure | settings:{approvalMode:allowAll} | Effective mode in ACK; does not answer an existing question. |
 | agent.goal | action:set/edit, objective | May begin work immediately; context and standing effort must already be set. |
 | agent.goal | action:pause/resume/clear | Native continuation, not Task acceptance. |
 | agent.refresh | Optional session_id of an observed child | Metadata, questions and subscription; no writer lease/resume. |
 | agent.reconcile | operation_id of unresolved command | Targeted same-command reconciliation, not blanket retry. |
+
+An unresolved model configure fences `agent.send`, `task.dispatch`, and
+work-starting goal actions, even after `session/setModel` returns an ACK. The
+fence remains across checkpoint restore until a fresh native read matches every
+requested model selector. `agent.reply`, `agent.refresh`, and targeted
+`agent.reconcile` remain available. Reconciliation of an ACK-backed configure
+reads again without resending the setter; an unknown no-ACK command keeps the
+existing explicit same-ID reconciliation path. Requested route constraints
+remain separate from observed session values, and an omitted provider stays
+unconstrained.
 
 Use quoted JSON values through `swarm call METHOD --file FILE`. Configure one setter per Operation because the native setters are separate. Await standing effort before starting/resuming a goal. Pause/clear remain usable while new work is disabled and cancel only locally queued old goal starts. Already admitted effects still need native disposition.
 

@@ -31,6 +31,7 @@ use swarm_contracts::{
 use swarm_process::process_group::{ProcessFamilyObservation, observe_process_family};
 use swarm_process::{
     module_child_belongs_to_owner, process_birth_identity, process_image_identity,
+    read_private_durable, replace_private_durable,
 };
 use tokio::{
     process::{Child, Command},
@@ -44,6 +45,9 @@ const OWNER_RECORD_LIMIT: u64 = 65_536;
 const LAUNCH_RECORD_LIMIT: u64 = 65_536;
 const MODULE_PLAN_LIMIT: u64 = 65_536;
 const RESTART_HISTORY_LIMIT: u64 = 16_384;
+const OWNER_DEPARTURE_FILE: &str = "owner-departure.json";
+const OWNER_DEPARTURE_OBSERVER_RETAINED: &str = "retained_owner_family_query";
+const OWNER_DEPARTURE_OBSERVER_FRESH: &str = "fresh_open";
 const MODULE_CONFIG_ENV_PREFIX: &str = "ELIOT_SWARM_CONFIG_";
 const OWNER_DRAIN_POLL: Duration = Duration::from_millis(500);
 const HELPER_START_POLL: Duration = Duration::from_millis(100);
@@ -1038,6 +1042,39 @@ impl VerifiedDepartedOwner {
     fn matches(&self, receipt: &Value, token: &str) -> bool {
         self.receipt == *receipt && self.token.as_str() == token
     }
+}
+
+/// Durable post-worker exact-family departure proof, supervisor-owned.
+/// Binds descriptor fingerprint, module/artifact/version, scope binding/gen,
+/// launch boot, owner receipt (pid/birth/job/purpose/token) plus helper
+/// image, and verified zero ActiveProcesses. Published via the shared
+/// private-file authority (`replace_private_durable`: synced temp +
+/// write-through replace on Windows, parent sync on Unix) BEFORE the retained
+/// query is released; consumed only via `read_private_durable` with a
+/// successful read barrier plus exact full-tuple match. Visible bytes after a
+/// failed write or read barrier are durability-UNKNOWN and never authority;
+/// a failed write never deletes the final path (only its temp), so a later
+/// durable read may still promote the genuine proof. `observer` is diagnostic
+/// only (retained query vs fresh open at write time), not a security gate;
+/// both values are accepted. MissingJob UNKNOWN is preserved: a missing named
+/// Job never counts as empty; only this genuine previous receipt bridges a
+/// restart that lost the in-memory query handle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerDepartureReceipt {
+    version: u64,
+    module_id: String,
+    artifact_id: String,
+    artifact_version: String,
+    build_id: Option<String>,
+    descriptor_fingerprint: String,
+    scope: ServiceScope,
+    boot_id: String,
+    owner: Value,
+    owner_helper: ProcessIdentity,
+    active_processes: u64,
+    family_empty: bool,
+    observer: String,
 }
 
 impl Service {
@@ -2548,7 +2585,7 @@ impl Service {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        swarm_process::module_owner::apply_launch_environment(command.as_std_mut());
+        swarm_process::module_owner::apply_native_launch_environment(command.as_std_mut());
         let child = command.spawn().map_err(|error| {
             Error::new(
                 "MODULE_OWNER_SPAWN_FAILED",
@@ -2941,6 +2978,12 @@ impl Service {
                 } else {
                     self.worker_diagnostic_code(boot_id)
                 };
+                // Durable post-worker handoff: fsync exact departure proof BEFORE
+                // releasing the retained query. No retroactive proof: this write
+                // happens only after genuine ConfirmedEmpty above for this exact
+                // boot/owner/helper. A restart that lost the query consumes the
+                // fsynced receipt instead of reusing a missing Job as empty.
+                self.write_owner_departure_receipt(boot_id, owner, token, helper_identity)?;
                 self.release_owner_family_query();
                 return Ok(OwnerHelperExit {
                     exit,
@@ -3462,6 +3505,28 @@ impl Service {
             }
             let retained_reason = match self.observe_owner_family(&owner["process"], token) {
                 ProcessFamilyObservation::ConfirmedEmpty => {
+                    // Durable post-worker handoff: fsync exact proof BEFORE releasing query.
+                    // Pre-spawn certified path already returned above via its durable
+                    // launch-result; reaching here means a validated worker receipt was
+                    // required (prior_start_proved) when an attempt is present. Never
+                    // manufacture retroactive proof for old launches.
+                    if let Some(boot) = attempt_boot_id.as_deref() {
+                        let helper = attempted_helper.as_ref().ok_or_else(|| {
+                            Error::new(
+                                "MODULE_LAUNCH_RESULT_MISSING",
+                                "prior helper identity is missing for departure proof",
+                            )
+                        })?;
+                        self.write_owner_departure_receipt(boot, owner, token, helper)?;
+                    } else {
+                        // Attempt-less owner: preserve the legacy contract. A genuine
+                        // fresh ConfirmedEmpty from the OS is itself authority; no
+                        // prior durable receipt is required. A stale mismatched
+                        // receipt, if present, is ignored only here under this fresh
+                        // real empty proof; it never authorizes on its own (see the
+                        // Unknown arm, where MissingJob without genuine proof stays
+                        // UNKNOWN and stale mismatch stays UNKNOWN).
+                    }
                     if !keep_owner_query {
                         self.release_owner_family_query();
                     }
@@ -3472,7 +3537,40 @@ impl Service {
                 }
                 ProcessFamilyObservation::Retained => OwnerRetainedReason::OwnerFamilyNotEmpty,
                 ProcessFamilyObservation::Unknown(_) => {
-                    OwnerRetainedReason::OwnerFamilyObservationUnknown
+                    // Restart handoff: fresh missing-Job stays UNKNOWN without genuine
+                    // proof, but an exact durable receipt from the previous retained-query
+                    // proof bridges it. Retained never consumes; live helper never
+                    // reaches here; timeout still fences. Visible bytes after a failed
+                    // write or read barrier (PRIVATE_FILE_DURABILITY_UNKNOWN) stay
+                    // UNKNOWN here and never authorize; a later successful durable
+                    // read may still promote the genuine proof. Corrupt shape blocks;
+                    // stale boot/owner mismatch keeps UNKNOWN so genuine fresh
+                    // ConfirmedEmpty can fsync its own exact receipt. Neither path
+                    // starts replacement on wrong proof.
+                    match self.read_owner_departure_receipt_for(
+                        attempt_boot_id.as_deref(),
+                        owner,
+                        token,
+                        attempted_helper.as_ref(),
+                    ) {
+                        Ok(Some(_)) => {
+                            if !keep_owner_query {
+                                self.release_owner_family_query();
+                            }
+                            return Ok(Some(VerifiedDepartedOwner {
+                                receipt: owner.clone(),
+                                token: token.clone(),
+                            }));
+                        }
+                        Ok(None) => OwnerRetainedReason::OwnerFamilyObservationUnknown,
+                        Err(error)
+                            if error.code == "MODULE_OWNER_DEPARTURE_INVALID"
+                                || error.code == "MODULE_OWNER_DEPARTURE_MISSING" =>
+                        {
+                            return Err(error);
+                        }
+                        Err(_) => OwnerRetainedReason::OwnerFamilyObservationUnknown,
+                    }
                 }
             };
             let owner_pid = prior_owner
@@ -3598,6 +3696,189 @@ impl Service {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn departure_receipt_path(&self) -> PathBuf {
+        self.state_dir.join(OWNER_DEPARTURE_FILE)
+    }
+
+    fn write_owner_departure_receipt(
+        &self,
+        boot_id: &str,
+        owner: &Value,
+        token: &str,
+        helper: &ProcessIdentity,
+    ) -> Result<()> {
+        Uuid::parse_str(boot_id).map_err(|_| Error::invalid("departure boot is not a UUID"))?;
+        Uuid::parse_str(token).map_err(|_| Error::invalid("departure token is invalid"))?;
+        if owner.get("version").and_then(Value::as_u64) != Some(1)
+            || owner.get("token").and_then(Value::as_str) != Some(token)
+            || owner
+                .get("process")
+                .and_then(|process| process.get("purpose"))
+                .and_then(Value::as_str)
+                != Some("module")
+        {
+            return Err(Error::new(
+                "MODULE_OWNER_DEPARTURE_INVALID",
+                "prior owner receipt is not a valid v1 module envelope",
+            ));
+        }
+        if helper.pid == 0 {
+            return Err(Error::invalid("departure helper PID is invalid"));
+        }
+        if owner["process"]["pid"].as_u64() != Some(u64::from(helper.pid)) {
+            return Err(Error::new(
+                "MODULE_OWNER_DEPARTURE_MISMATCH",
+                "departure helper does not match the prior owner process",
+            ));
+        }
+        #[cfg(windows)]
+        let observer = if lock(&self.owner_family_query).is_some() {
+            OWNER_DEPARTURE_OBSERVER_RETAINED
+        } else {
+            OWNER_DEPARTURE_OBSERVER_FRESH
+        };
+        #[cfg(not(windows))]
+        let observer = OWNER_DEPARTURE_OBSERVER_FRESH;
+        let receipt = OwnerDepartureReceipt {
+            version: 1,
+            module_id: self.descriptor.module_id.to_string(),
+            artifact_id: self.descriptor.artifact.artifact_id.to_string(),
+            artifact_version: self.descriptor.artifact.version.to_string(),
+            build_id: self.descriptor.artifact.build_id.clone(),
+            descriptor_fingerprint: self.descriptor_fingerprint.clone(),
+            scope: self.scope.clone(),
+            boot_id: boot_id.to_owned(),
+            owner: owner.clone(),
+            owner_helper: helper.clone(),
+            active_processes: 0,
+            family_empty: true,
+            observer: observer.to_owned(),
+        };
+        let data = serde_json::to_vec(&receipt)?;
+        if data.len() as u64 > OWNER_RECORD_LIMIT {
+            return Err(Error::invalid("departure receipt exceeds size limit"));
+        }
+        // Durable publication via the shared private-file authority: synced
+        // temp plus write-through replace (Windows) and parent sync (Unix).
+        // On barrier failure the target may already be visible; that visible
+        // but durability-UNKNOWN data is never authority (see read barrier).
+        // Only the temp is cleaned by the helper; the final path is never
+        // deleted here because it may still be durable.
+        replace_private_durable(&self.departure_receipt_path(), &data)
+    }
+
+    fn read_owner_departure_receipt_for(
+        &self,
+        boot_id: Option<&str>,
+        owner: &Value,
+        token: &str,
+        helper: Option<&ProcessIdentity>,
+    ) -> Result<Option<OwnerDepartureReceipt>> {
+        let path = self.departure_receipt_path();
+        // Fast missing check preserves Ok(None) for absent proof without
+        // touching the durability barrier. All present data goes through the
+        // shared read barrier below: file sync plus parent barrier plus
+        // opened-identity recheck. Visible bytes after a failed write or read
+        // barrier surface as PRIVATE_FILE_DURABILITY_UNKNOWN and must stay
+        // UNKNOWN upstream, never Verified.
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(Error::new(
+                    "MODULE_OWNER_DEPARTURE_INVALID",
+                    "departure receipt is not a regular file",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let bytes = read_private_durable(&path, OWNER_RECORD_LIMIT).map_err(|error| {
+            if error.code == "PRIVATE_FILE_INVALID" {
+                Error::new(
+                    "MODULE_OWNER_DEPARTURE_INVALID",
+                    "departure receipt is not a regular file",
+                )
+            } else {
+                error
+            }
+        })?;
+        let receipt: OwnerDepartureReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+            Error::new(
+                "MODULE_OWNER_DEPARTURE_INVALID",
+                "departure receipt has an invalid shape",
+            )
+        })?;
+        if receipt.version != 1
+            || receipt.module_id != self.descriptor.module_id.as_str()
+            || receipt.artifact_id != self.descriptor.artifact.artifact_id.as_str()
+            || receipt.artifact_version != self.descriptor.artifact.version.as_str()
+            || receipt.build_id != self.descriptor.artifact.build_id
+            || receipt.descriptor_fingerprint != self.descriptor_fingerprint
+            || receipt.scope != self.scope
+            || receipt.active_processes != 0
+            || !receipt.family_empty
+            // `observer` is diagnostic only (which query state was present at
+            // write time), not a security gate; both labels are accepted.
+            || (receipt.observer != OWNER_DEPARTURE_OBSERVER_RETAINED
+                && receipt.observer != OWNER_DEPARTURE_OBSERVER_FRESH)
+        {
+            return Err(Error::new(
+                "MODULE_OWNER_DEPARTURE_MISMATCH",
+                "departure receipt does not match this exact descriptor, scope, and empty-family proof",
+            ));
+        }
+        Uuid::parse_str(&receipt.boot_id).map_err(|_| {
+            Error::new(
+                "MODULE_OWNER_DEPARTURE_INVALID",
+                "departure receipt boot is not a UUID",
+            )
+        })?;
+        if let Some(expected) = boot_id {
+            Uuid::parse_str(expected).map_err(|_| {
+                Error::new(
+                    "MODULE_OWNER_DEPARTURE_INVALID",
+                    "launch boot is not a UUID",
+                )
+            })?;
+            if receipt.boot_id != expected {
+                return Err(Error::new(
+                    "MODULE_OWNER_DEPARTURE_MISMATCH",
+                    "departure receipt belongs to another boot; no reuse across boots",
+                ));
+            }
+        }
+        if receipt.owner != *owner {
+            return Err(Error::new(
+                "MODULE_OWNER_DEPARTURE_MISMATCH",
+                "departure receipt does not match the prior owner receipt",
+            ));
+        }
+        if receipt.owner.get("version").and_then(Value::as_u64) != Some(1)
+            || receipt.owner.get("token").and_then(Value::as_str) != Some(token)
+            || owner.get("token").and_then(Value::as_str) != Some(token)
+            || receipt
+                .owner
+                .get("process")
+                .and_then(|process| process.get("purpose"))
+                .and_then(Value::as_str)
+                != Some("module")
+        {
+            return Err(Error::new(
+                "MODULE_OWNER_DEPARTURE_INVALID",
+                "departure owner envelope is invalid",
+            ));
+        }
+        if let Some(expected_helper) = helper
+            && !same_process_identity(&receipt.owner_helper, expected_helper)
+        {
+            return Err(Error::new(
+                "MODULE_OWNER_DEPARTURE_MISMATCH",
+                "departure helper image does not match the prior helper",
+            ));
+        }
+        Ok(Some(receipt))
     }
 
     fn read_restart_history(&self) -> Result<VecDeque<u64>> {
@@ -4879,7 +5160,18 @@ mod tests {
                     "MODULE_WORKER_EXITED",
                 )
                 .await;
+            self.service().remember_owner_family_query(
+                &self.owner_receipt["process"],
+                self.owner_receipt["token"].as_str().unwrap(),
+            );
             self.release();
+            {
+                let mut custody = self.service().helper_child_custody.lock().await;
+                let retained = custody
+                    .as_mut()
+                    .expect("exact owner Child remains retained");
+                assert_eq!(retained.child.wait().await.unwrap().code(), Some(23));
+            }
             self.service()
                 .reconcile_retained_helper_child()
                 .await
@@ -6343,5 +6635,228 @@ mod tests {
             swarm_process::module_owner::run_module_with_resolver(plan, &App369EmptyRefResolver)
                 .expect_err("invalid native image must fail at the actual worker Command::spawn");
         assert_eq!(error.code, "MODULE_OWNER_SPAWN_FAILED");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn owner_departure_restart_handoff_with_missing_corrupt_mismatched_guards() {
+        // Real-Job restart regression: prove exact family departure with the
+        // retained query, lose the query (restart), then bridge via the fsynced
+        // durable receipt. Missing/corrupt/mismatched proofs must never start a
+        // replacement. Uses the existing ConnectedOwnerFixture (real Job/group).
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        let service = fixture.startup.service.clone();
+        fixture.prove_departure().await;
+        let boot = fixture.boot_id.clone();
+        let owner = fixture.owner_receipt.clone();
+        let token = owner["token"].as_str().unwrap().to_owned();
+        let helper = fixture.helper_identity.clone();
+        let path = service.departure_receipt_path();
+        assert!(
+            path.is_file(),
+            "durable departure receipt must exist after proven exit"
+        );
+        let proved = service
+            .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+            .unwrap()
+            .expect("valid departure must be consumable");
+        assert_eq!(proved.version, 1);
+        assert_eq!(proved.module_id, service.descriptor.module_id.as_str());
+        assert_eq!(
+            proved.artifact_id,
+            service.descriptor.artifact.artifact_id.as_str()
+        );
+        assert_eq!(
+            proved.artifact_version,
+            service.descriptor.artifact.version.as_str()
+        );
+        assert_eq!(proved.build_id, service.descriptor.artifact.build_id);
+        assert_eq!(
+            proved.descriptor_fingerprint,
+            service.descriptor_fingerprint
+        );
+        assert_eq!(proved.scope, service.scope);
+        assert_eq!(proved.boot_id, boot);
+        assert_eq!(proved.owner, owner);
+        assert!(same_process_identity(&proved.owner_helper, &helper));
+        assert_eq!(proved.active_processes, 0);
+        assert!(proved.family_empty);
+        assert!(
+            proved.observer == OWNER_DEPARTURE_OBSERVER_RETAINED
+                || proved.observer == OWNER_DEPARTURE_OBSERVER_FRESH
+        );
+        // Restart handoff: query already released; fresh missing-Job stays
+        // UNKNOWN on Windows, but the exact durable receipt bridges it.
+        let restarted = service
+            .wait_for_prior_owner_to_depart()
+            .await
+            .unwrap()
+            .expect("restart must consume exact durable departure");
+        assert_eq!(restarted.receipt, owner);
+        assert_eq!(restarted.token, token);
+        // Missing guard: no file is never a proof.
+        fs::remove_file(&path).unwrap();
+        assert!(
+            service
+                .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+                .unwrap()
+                .is_none()
+        );
+        // Restore valid for corrupt/mismatch guards.
+        service
+            .write_owner_departure_receipt(&boot, &owner, &token, &helper)
+            .unwrap();
+        // Corrupt guard: invalid shape must block.
+        fs::write(&path, b"{not-json").unwrap();
+        let corrupt =
+            service.read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper));
+        assert!(corrupt.is_err(), "corrupt receipt must not be consumable");
+        assert_eq!(corrupt.unwrap_err().code, "MODULE_OWNER_DEPARTURE_INVALID");
+        // Wrong-boot guard: no reuse across boots.
+        service
+            .write_owner_departure_receipt(&boot, &owner, &token, &helper)
+            .unwrap();
+        let mut wrong_boot: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        wrong_boot["boot_id"] = serde_json::json!(Uuid::new_v4().to_string());
+        fs::write(&path, serde_json::to_vec(&wrong_boot).unwrap()).unwrap();
+        assert!(
+            service
+                .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+                .is_err(),
+            "wrong-boot receipt must not be consumable"
+        );
+        // Wrong-owner guard.
+        service
+            .write_owner_departure_receipt(&boot, &owner, &token, &helper)
+            .unwrap();
+        let mut wrong_owner: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        wrong_owner["owner"]["token"] = serde_json::json!(Uuid::new_v4().to_string());
+        fs::write(&path, serde_json::to_vec(&wrong_owner).unwrap()).unwrap();
+        assert!(
+            service
+                .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+                .is_err(),
+            "wrong-owner receipt must not be consumable"
+        );
+        // Stale-scope guard.
+        service
+            .write_owner_departure_receipt(&boot, &owner, &token, &helper)
+            .unwrap();
+        let mut stale_scope: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        stale_scope["scope"]["generation"] = serde_json::json!(999999u64);
+        fs::write(&path, serde_json::to_vec(&stale_scope).unwrap()).unwrap();
+        assert!(
+            service
+                .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+                .is_err(),
+            "stale-scope receipt must not be consumable"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn owner_departure_visible_but_undurable_never_authorizes() {
+        use std::{cell::Cell, rc::Rc};
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        let service = fixture.startup.service.clone();
+        fixture.prove_departure().await;
+        let boot = fixture.boot_id.clone();
+        let owner = fixture.owner_receipt.clone();
+        let token = owner["token"].as_str().unwrap().to_owned();
+        let helper = fixture.helper_identity.clone();
+        let path = service.departure_receipt_path();
+        assert!(
+            path.is_file(),
+            "durable receipt must exist after proven exit"
+        );
+        let failing = Rc::new(Cell::new(true));
+        let failing_clone = Rc::clone(&failing);
+        let target_path = path.clone();
+        let _barrier = swarm_process::test_support::scoped_durability_barrier(move |target| {
+            if *target == target_path && failing_clone.get() {
+                Err(swarm_contracts::error::Error::new(
+                    "PRIVATE_FILE_DURABILITY_UNKNOWN",
+                    "fixture failed at the departure durability boundary",
+                ))
+            } else {
+                swarm_process::sync_parent_directory(target)
+            }
+        });
+        let write_err = service
+            .write_owner_departure_receipt(&boot, &owner, &token, &helper)
+            .expect_err("failed barrier must not report durable publication");
+        assert_eq!(write_err.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+        assert!(
+            path.is_file(),
+            "failed barrier must not delete possibly-durable proof"
+        );
+        let read_err = service
+            .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+            .expect_err("visible but undurable bytes must not be consumable");
+        assert_eq!(read_err.code, "PRIVATE_FILE_DURABILITY_UNKNOWN");
+        failing.set(false);
+        let promoted = service
+            .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+            .unwrap()
+            .expect("genuine proof promotes after durable barrier succeeds");
+        assert_eq!(promoted.boot_id, boot);
+        assert_eq!(promoted.owner, owner);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn owner_departure_fresh_service_restart_bridges_exact_proof() {
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        let old = fixture.startup.service.clone();
+        fixture.prove_departure().await;
+        let boot = fixture.boot_id.clone();
+        let owner = fixture.owner_receipt.clone();
+        let token = owner["token"].as_str().unwrap().to_owned();
+        let helper = fixture.helper_identity.clone();
+        let path = old.departure_receipt_path();
+        assert!(path.is_file());
+        fn fresh_service_from(old: &Service) -> Arc<Service> {
+            let (admission, _) = watch::channel(AdmissionState::Open);
+            Arc::new(Service::new(ServiceInitialization {
+                descriptor: old.descriptor.clone(),
+                descriptor_fingerprint: old.descriptor_fingerprint.clone(),
+                scope: old.scope.clone(),
+                state_dir: old.state_dir.clone(),
+                state_root: old.state_root.clone(),
+                host_data_dir: old.host_data_dir.clone(),
+                ipc: old.ipc.clone(),
+                launch_config: old.launch_config.clone(),
+                module_client_id: old.module_client_id.clone(),
+                protocol: old.protocol,
+                module_contract_json: old.module_contract_json.clone(),
+                owner_executable: old.owner_executable.clone(),
+                resolver: old.resolver.clone(),
+                admission,
+                demand_gate: Arc::new(AsyncMutex::new(())),
+            }))
+        }
+        let fresh = fresh_service_from(&old);
+        #[cfg(windows)]
+        assert!(
+            lock(&fresh.owner_family_query).is_none(),
+            "fresh restart has no retained query"
+        );
+        let bridged = fresh
+            .wait_for_prior_owner_to_depart()
+            .await
+            .unwrap()
+            .expect("fresh restart must consume exact durable departure");
+        assert_eq!(bridged.receipt, owner);
+        assert_eq!(bridged.token, token);
+        fs::remove_file(&path).unwrap();
+        assert!(
+            fresh
+                .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+                .unwrap()
+                .is_none(),
+            "missing file is never proof"
+        );
+        old.write_owner_departure_receipt(&boot, &owner, &token, &helper)
+            .unwrap();
     }
 }

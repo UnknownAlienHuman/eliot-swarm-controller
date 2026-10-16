@@ -67,7 +67,7 @@ function storeShapedDispatch() {
   return { bootId, sourceText, envelope, context, command };
 }
 
-test('bridge.5 carries Store TaskPrompt bytes through a native UUID frame into admission', () => {
+test('bridge.6 carries Store TaskPrompt bytes through a native UUID frame into admission', () => {
   const { bootId, envelope, context, command } = storeShapedDispatch();
   const taskPrompt = taskPromptFor(command, bootId);
   const inputId = 'd34d0055-5555-4555-8555-555555555555';
@@ -148,7 +148,7 @@ test('bridge.5 carries Store TaskPrompt bytes through a native UUID frame into a
   });
 });
 
-test('bridge.5 rejects altered or legacy snapshot input and admission without the exact native echo', () => {
+test('bridge.6 rejects altered or legacy snapshot input and admission without the exact native echo', () => {
   const { bootId, command, envelope, context } = storeShapedDispatch();
   const altered = {
     ...command,
@@ -184,7 +184,7 @@ test('bridge.5 rejects altered or legacy snapshot input and admission without th
 });
 const connectedFixtureDir = process.env.ELIOT_TASK_PROMPT_V5_FIXTURE_DIR;
 if (connectedFixtureDir) {
-  test('Rust Store TaskPrompt v1 crosses into Claude bridge.5 consumer helpers unchanged and correlates echo UUID', async () => {
+  test('Rust Store TaskPrompt v1 crosses into Claude bridge.6 consumer helpers unchanged and correlates echo UUID', async () => {
     const envelopeBytes = await readFile(join(connectedFixtureDir, 'envelope.json'));
     const dispatch = JSON.parse(await readFile(join(connectedFixtureDir, 'dispatch.json'), 'utf8'));
     assert.equal(sha256(envelopeBytes), dispatch.expected_envelope_json_sha256);

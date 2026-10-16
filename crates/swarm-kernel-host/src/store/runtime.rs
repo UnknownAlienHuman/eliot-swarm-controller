@@ -172,14 +172,11 @@ fn selected_task_dispatch_admission(db: &Connection, binding: &Value) -> Result<
     if selected_codex_controller_contract(db, binding)?.is_some() {
         return Ok(true);
     }
-    let builtin_opencode = crate::config::is_task_prompt_builtin_route(
+    let builtin_opencode = crate::config::is_opencode_task_prompt_builtin_route(
         binding["route"]["runtime"].as_str().unwrap_or_default(),
         binding["module_artifact_id"].as_str().unwrap_or_default(),
     );
-    if (zed::is_current_route(&binding["route"])
-        && binding["module_artifact_id"] == zed::ARTIFACT_ID)
-        || builtin_opencode
-    {
+    if zed::is_task_prompt_route(&binding["route"]) || builtin_opencode {
         return Ok(true);
     }
     let Some(selector) = binding["observation"].get("module_contract_selector") else {
@@ -1326,8 +1323,9 @@ fn next_internal(
     {
         return Ok(json!({"command":null}));
     }
-    // Readback, replies and continuation-stop controls stay available while an
-    // ordinary mutation awaits application. They do not spawn another executor.
+    // Readback, replies, continuation-stop controls, and exact-scope resource
+    // shutdowns stay available while an ordinary mutation awaits application.
+    // These controls do not admit a competing model input.
     let (op, method, raw, created, opening_actor) = {
         let row:Option<(String,String,String,i64)>=tx.query_row(
             "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
@@ -1335,7 +1333,7 @@ fn next_internal(
                AND (?5=0 OR (method='agent.result' AND json_type(candidate.effective_request_json,'$.normalized_result_origin')='object'))
                AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
                AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','agent.shutdown','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
-               AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
+               AND (method IN ('agent.reply','agent.background','agent.shutdown','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
                  OR (method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer')
                  OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
                  OR NOT EXISTS (SELECT 1 FROM operations AS pending
@@ -1343,7 +1341,7 @@ fn next_internal(
                      AND pending.state IN ('sending','native_accepted','outcome_unknown')
                       AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')))
              ORDER BY CASE WHEN method IN ('native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read') THEN 0
-                           WHEN method IN ('agent.reply','agent.background','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session') THEN 1
+                           WHEN method IN ('agent.reply','agent.background','agent.shutdown','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session') THEN 1
                            WHEN method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer' THEN 1
                            WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
                             WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover','native.command.release_evidence') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",
@@ -2226,7 +2224,11 @@ fn expected_command_dispatch_identity(
     operation: &Value,
     request: &Value,
     route: &Value,
-) -> Result<(Value, String, crate::runtime::batch::CommandReceiptFacts)> {
+) -> Result<(
+    Value,
+    Option<String>,
+    crate::runtime::batch::CommandReceiptFacts,
+)> {
     let attempt_id = model::text(request, "attempt_id")?;
     if operation["attempt_id"] != attempt_id {
         return Err(Error::new(
@@ -2254,7 +2256,10 @@ fn expected_command_dispatch_identity(
     }
     let instruction = crate::runtime::batch::instruction(&frozen_input)?;
     let expected = crate::runtime::batch::command_receipt_facts(operation_id, &instruction);
-    let requested_model = model::text(&route["native_options"], "modelId")?.to_owned();
+    let requested_model = match route["native_options"].get("modelId") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(model::text(&route["native_options"], "modelId")?.to_owned()),
+    };
     Ok((attempt, requested_model, expected))
 }
 
@@ -2308,7 +2313,7 @@ fn validate_command_dispatch_receipt(
     if receipt.details["batch_run_id"] != expected.batch_run_id
         || receipt.details["prompt_sha256"] != expected.prompt_sha256
         || receipt.details["prompt_bytes"].as_u64() != u64::try_from(expected.prompt_bytes).ok()
-        || receipt.details["requested_model"].as_str() != Some(expected_model.as_str())
+        || receipt.details.get("requested_model") != Some(&json!(expected_model))
     {
         return Err(Error::new(
             "NATIVE_IDENTITY_MISMATCH",
@@ -2329,9 +2334,9 @@ pub(super) fn validate_module_receipt_for_operation(
     binding: &Value,
     outcome: &RuntimeOutcome,
 ) -> Result<swarm_contracts::runtime::ModuleReceiptIdentity> {
-    let builtin_zed = zed::is_current_route(&binding["route"])
-        && binding["module_artifact_id"] == zed::ARTIFACT_ID;
-    let builtin_opencode = crate::config::is_task_prompt_builtin_route(
+    let builtin_zed = zed::is_task_prompt_route(&binding["route"])
+        && binding["module_artifact_id"] == binding["route"]["module_artifact_id"];
+    let builtin_opencode = crate::config::is_opencode_task_prompt_builtin_route(
         binding["route"]["runtime"].as_str().unwrap_or_default(),
         binding["module_artifact_id"].as_str().unwrap_or_default(),
     );
@@ -2366,9 +2371,16 @@ pub(super) fn validate_module_receipt_for_operation(
     }
 
     if builtin_zed {
+        let artifact_id = model::text(&binding["route"], "module_artifact_id")?;
+        let contract_revision = zed::contract_revision(&binding["route"]).ok_or_else(|| {
+            Error::new(
+                "MODULE_RECEIPT_INVALID",
+                "built-in Zed contract revision is unknown",
+            )
+        })?;
         if receipt.module_id.as_str() != "builtin.zed"
-            || receipt.artifact.artifact_id.as_str() != zed::ARTIFACT_ID
-            || receipt.artifact.version.as_str() != zed::CONTRACT_REVISION
+            || receipt.artifact.artifact_id.as_str() != artifact_id
+            || receipt.artifact.version.as_str() != contract_revision
             || receipt.artifact.build_id.is_some()
             || receipt.protocol
                 != (swarm_contracts::module_catalog::ProtocolVersion { major: 1, minor: 0 })
@@ -2784,7 +2796,7 @@ pub(super) fn outcome_with_artifacts(
     }
     // Versioned bindings require a typed receipt for every outcome. Legacy
     // unversioned bindings retain their existing validators and wire contract.
-    let builtin_opencode_dispatch = crate::config::is_task_prompt_builtin_route(
+    let builtin_opencode_dispatch = crate::config::is_opencode_task_prompt_builtin_route(
         b["route"]["runtime"].as_str().unwrap_or_default(),
         b["module_artifact_id"].as_str().unwrap_or_default(),
     ) && o["method"] == "task.dispatch"
@@ -2792,7 +2804,7 @@ pub(super) fn outcome_with_artifacts(
     let module_receipt = if b["observation"].get("module_contract_selector").is_some()
         || builtin_opencode_dispatch
         || o["method"] == swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD
-        || (zed::is_current_route(&b["route"])
+        || (zed::is_task_prompt_route(&b["route"])
             && o["method"] == "task.dispatch"
             && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted))
     {
@@ -3869,11 +3881,7 @@ fn zed_open_outcome(command: &RuntimeCommand, described: Result<Value>) -> Runti
                 "native_session_state":"not_started",
                 "runtime":zed::RUNTIME,
                 "module_artifact_id":command.route["module_artifact_id"],
-                "contract_revision":if zed::is_legacy_route(&command.route) {
-                    zed::LEGACY_CONTRACT_REVISION
-                } else {
-                    zed::CONTRACT_REVISION
-                },
+                "contract_revision":zed::contract_revision(&command.route).unwrap_or("unknown"),
                 "scope":description["scope"],
                 "requested_model":description["model"],
                 "effective_model":Value::Null,
@@ -4008,7 +4016,7 @@ fn zed_batch_outcome(
     if batch_outcome.native_result.is_some() {
         details["completion_condition"] = json!("native_result_observed");
     }
-    if zed::is_current_route(&command.route) {
+    if zed::is_task_prompt_route(&command.route) {
         let admission = (|| -> Result<Value> {
             let dispatch = zed::validate_task_prompt_dispatch(command)?;
             if dispatch.intent != *intent {
@@ -4045,7 +4053,12 @@ fn zed_batch_outcome(
                             )
                         })?,
                     version: swarm_contracts::module_catalog::ArtifactVersion::new(
-                        zed::CONTRACT_REVISION,
+                        zed::contract_revision(&command.route).ok_or_else(|| {
+                            Error::new(
+                                "MODULE_RECEIPT_INVALID",
+                                "built-in Zed contract revision is unknown",
+                            )
+                        })?,
                     )
                     .map_err(|_| {
                         Error::new(
@@ -4306,7 +4319,7 @@ impl Store {
     ) -> Result<Option<zed::BatchReceipt>> {
         let command = command.clone();
         let output_root = output_root.to_path_buf();
-        if zed::is_current_route(&command.route) {
+        if zed::is_task_prompt_route(&command.route) {
             let dispatch = zed::validate_task_prompt_dispatch(&command)?;
             let source_text = model::text(&command.input, "text")?.to_owned();
             return self
@@ -4414,7 +4427,7 @@ impl Store {
         }
         match command.method.as_str() {
             "agent.open" => {
-                let outcome = match zed::Options::parse(&command.route["native_options"]) {
+                let outcome = match zed::Options::parse_for_route(&command.route) {
                     Ok(options) => zed_open_outcome(&command, zed::describe(&options)),
                     Err(error) => zed_open_outcome(
                         &command,
@@ -4491,7 +4504,7 @@ impl Store {
     ) -> Result<()> {
         match command.method.as_str() {
             "agent.open" => {
-                let outcome = match zed::Options::parse(&command.route["native_options"]) {
+                let outcome = match zed::Options::parse_for_route(&command.route) {
                     Ok(options) => zed_open_outcome(&command, zed::describe(&options)),
                     Err(error) => zed_open_outcome(
                         &command,
@@ -4514,7 +4527,7 @@ impl Store {
                             .await;
                     }
                 };
-                let options = match zed::Options::parse(&command.route["native_options"]) {
+                let options = match zed::Options::parse_for_route(&command.route) {
                     Ok(options) => options,
                     Err(error) => {
                         let rejected = batch_diagnostic(&command, &error.code, false);
@@ -4702,7 +4715,7 @@ impl Store {
             };
             match command.method.as_str() {
                 "agent.open" => {
-                    let outcome = match zed::Options::parse(&command.route["native_options"]) {
+                    let outcome = match zed::Options::parse_for_route(&command.route) {
                         Ok(options) => zed_open_outcome(&command, zed::describe(&options)),
                         Err(error) => zed_open_outcome(
                             &command,
@@ -6083,6 +6096,48 @@ mod command_receipt_binding_tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "FORBIDDEN");
+    }
+
+    #[test]
+    fn command_native_default_receipt_preserves_absence_without_inventing_model() {
+        let (db, operation, mut route, mut receipt) = fixture();
+        route["native_options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelId");
+        receipt.details["requested_model"] = Value::Null;
+        validate_command_dispatch_receipt(&db, &operation, &route, &receipt).unwrap();
+        let raw: String = db
+            .query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                [OPERATION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let request: Value = serde_json::from_str(&raw).unwrap();
+        let fields = command_target_receipt_fields(
+            &db,
+            OPERATION_ID,
+            &operation,
+            &request,
+            &route,
+            "binding-command",
+            4,
+        )
+        .unwrap();
+        assert!(fields["target_command_requested_model"].is_null());
+        assert_eq!(
+            fields["target_command_core_binding"]["prompt_sha256"],
+            receipt.details["prompt_sha256"]
+        );
+        receipt.details["requested_model"] = json!("invented-from-native-observation");
+        assert!(validate_command_dispatch_receipt(&db, &operation, &route, &receipt).is_err());
+        receipt
+            .details
+            .as_object_mut()
+            .unwrap()
+            .remove("requested_model");
+        assert!(validate_command_dispatch_receipt(&db, &operation, &route, &receipt).is_err());
     }
 }
 

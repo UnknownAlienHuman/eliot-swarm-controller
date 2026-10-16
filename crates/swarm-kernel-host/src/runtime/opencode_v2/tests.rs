@@ -87,13 +87,13 @@ impl Fixture {
         let options = Options {
             service_id: "fixture_service".into(),
             connection_file,
-            expected_version: "2.0.fixture".into(),
+            expected_version: Some("2.0.fixture".into()),
             directory: dir.join("workspace"),
-            model: ModelRef {
+            model: Some(ModelRef {
                 id: "fixture-model".into(),
                 provider_id: "fixture-provider".into(),
                 variant: "explicit-variant".into(),
-            },
+            }),
         };
         let world = Arc::new(Mutex::new(World::default()));
         let shared = world.clone();
@@ -200,9 +200,16 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
     }
     match (r.method.as_str(), r.path.as_str()) {
         ("GET", "/api/info") => {
+            // The fixture reports the explicitly pinned version when the route
+            // selects one, otherwise a fixed observed native build: attach
+            // must adopt it as diagnostic data rather than demand a pin.
+            let observed = o
+                .expected_version
+                .clone()
+                .unwrap_or_else(|| "2.0.fixture-observed".into());
             return Reply::Json(
                 200,
-                json!({"version":o.expected_version,"pid":424242,"urls":[origin],"paths":{"tmp":"fixture"}}),
+                json!({"version":observed,"pid":424242,"urls":[origin],"paths":{"tmp":"fixture"}}),
             );
         }
         ("GET", "/api/location") => {
@@ -212,9 +219,27 @@ fn respond(w: &mut World, o: &Options, origin: &str, r: &Request) -> Reply {
             );
         }
         ("GET", "/api/model") => {
+            // The fixture catalog reflects the route's explicit invocation
+            // override when one is pinned; on native harness defaults it
+            // reports the harness-owned catalog entry instead.
+            let (id, provider, variant) = o
+                .model
+                .as_ref()
+                .map(|model| {
+                    (
+                        model.id.clone(),
+                        model.provider_id.clone(),
+                        model.variant.clone(),
+                    )
+                })
+                .unwrap_or((
+                    "native-default-model".into(),
+                    "native-provider".into(),
+                    "native-variant".into(),
+                ));
             return Reply::Json(
                 200,
-                json!({"location":{"directory":o.directory},"data":[{"id":o.model.id,"modelID":o.model.id,"providerID":o.model.provider_id,"name":"Fixture Model","capabilities":{"tools":true,"input":["text"],"output":["text"]},"variants":[{"id":o.model.variant,"settings":{}}],"time":{"released":1},"cost":[],"status":"active","enabled":true,"limit":{"context":1000,"output":100}}]}),
+                json!({"location":{"directory":o.directory},"data":[{"id":id,"modelID":id,"providerID":provider,"name":"Fixture Model","capabilities":{"tools":true,"input":["text"],"output":["text"]},"variants":[{"id":variant,"settings":{}}],"time":{"released":1},"cost":[],"status":"active","enabled":true,"limit":{"context":1000,"output":100}}]}),
             );
         }
         ("GET", "/api/agent") => {
@@ -594,6 +619,123 @@ async fn explicit_route_and_connection_contract() {
     std::fs::write(&f.options.connection_file, record.to_string()).unwrap();
     let error = Service::connect(&f.options).await.err().unwrap();
     assert_eq!(error.code, "NATIVE_INSTANCE_CHANGED");
+}
+#[tokio::test]
+async fn native_defaults_parse_accepts_omitted_version_and_model() {
+    let f = Fixture::new().await;
+    let mut route = json!(f.options);
+    route.as_object_mut().unwrap().remove("model");
+    route.as_object_mut().unwrap().remove("expected_version");
+    let parsed = Options::parse(&route).unwrap();
+    assert!(parsed.model.is_none());
+    assert!(parsed.expected_version.is_none());
+    // A round trip omits both overrides: the controller defaults nothing.
+    let encoded = serde_json::to_value(&parsed).unwrap();
+    assert!(!encoded.as_object().unwrap().contains_key("model"));
+    assert!(
+        !encoded
+            .as_object()
+            .unwrap()
+            .contains_key("expected_version")
+    );
+    // The invocation override stays all-or-none: a partial trio is rejected.
+    let mut partial = json!(f.options);
+    partial["model"].as_object_mut().unwrap().remove("variant");
+    assert!(Options::parse(&partial).is_err());
+    // An explicit-but-empty version pin is a config error, not a default.
+    let mut empty_pin = json!(f.options);
+    empty_pin["expected_version"] = json!("");
+    assert!(Options::parse(&empty_pin).is_err());
+}
+#[tokio::test]
+async fn native_defaults_attach_adopts_observed_version() {
+    let f = Fixture::new().await;
+    let mut options = f.options.clone();
+    options.expected_version = None;
+    let s = Service::connect(&options).await.unwrap();
+    assert_eq!(s.version, "2.0.fixture");
+    // Steady-state verify fences continuity against the adopted version.
+    s.verify().await.unwrap();
+}
+#[tokio::test]
+async fn explicit_version_pin_mismatch_is_rejected_at_attach() {
+    let f = Fixture::new().await;
+    let mut options = f.options.clone();
+    options.expected_version = Some("9.9.9-fixture".into());
+    // The live service reports another build: the explicit pin fails closed.
+    f.override_get(
+        "/api/info",
+        Reply::Json(
+            200,
+            json!({"version":"2.0.other-fixture","pid":424242,"urls":["http://127.0.0.1:1/"],"paths":{"tmp":"fixture"}}),
+        ),
+    );
+    let error = Service::connect(&options).await.err().unwrap();
+    assert_eq!(error.code, "NATIVE_INSTANCE_CHANGED");
+}
+#[tokio::test]
+async fn native_defaults_open_sends_no_model_and_admits_input() {
+    let f = Fixture::new().await;
+    let mut options = f.options.clone();
+    options.expected_version = None;
+    options.model = None;
+    let s = Service::connect(&options).await.unwrap();
+    assert_eq!(s.version, "2.0.fixture");
+    let route =
+        json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,"native_options":options});
+    // The projected route omits both overrides, so descriptors bind Null.
+    assert!(route["native_options"].get("model").is_none());
+    assert!(route["native_options"].get("expected_version").is_none());
+    let mut open = f.command("agent.open");
+    open.route = route.clone();
+    let r = s.execute(&open, &options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    let create = f
+        .world
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|request| request.method == "POST" && request.path == "/api/session")
+        .unwrap()
+        .clone();
+    assert!(create.body.get("model").is_none());
+    assert!(create.body["location"].is_object());
+    // The harness-owned session model passes readback with no catalog gate.
+    let mut send = f.command("agent.send");
+    send.route = route;
+    let r = s.execute(&send, &options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Applied), "{r:?}");
+    assert_eq!(
+        r.native_input_id.as_deref(),
+        Some(input_id(&send.operation_id).as_str())
+    );
+}
+#[tokio::test]
+async fn model_configure_without_route_pin_fails_before_mutation() {
+    let f = Fixture::new().await;
+    let mut options = f.options.clone();
+    options.model = None;
+    let s = Service::connect(&options).await.unwrap();
+    let route =
+        json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,"native_options":options});
+    let mut open = f.command("agent.open");
+    open.route = route.clone();
+    assert_applied(s.execute(&open, &options).await);
+    let root = root_id(&open.binding_id, open.generation);
+    let mut configure = f.command("agent.configure");
+    configure.route = route;
+    configure.input = json!({
+        "client_request_id": "oc-model-no-pin-1",
+        "binding_id": "fixture-binding",
+        "generation": 1,
+        "settings": {"model": {"id": "fixture-model", "providerID": "fixture-provider", "variant": "explicit-variant"}},
+    });
+    let r = s.execute(&configure, &options).await;
+    assert!(matches!(r.outcome, EffectOutcome::Rejected), "{r:?}");
+    assert_eq!(r.details["code"], "NATIVE_MODEL_ROUTE_MISMATCH");
+    // The rejected control never reached the native model switch route.
+    assert_eq!(f.posts(&format!("/api/session/{root}/model")), 0);
 }
 #[tokio::test]
 async fn exact_model_creation_and_input_admission_are_not_turn_completion() {
@@ -1592,6 +1734,55 @@ fn root_creation_and_input_scans_accept_native_omitted_parent_id_only() {
             "NATIVE_LOG_ORIGIN"
         );
     }
+}
+
+#[test]
+fn root_creation_and_input_scans_accept_native_owned_model() {
+    let root = root_id("fixture-binding", 1);
+    // A null descriptor model means the native harness owns the creation
+    // model: any harness-chosen model passes origin, while a non-object,
+    // non-null descriptor is still rejected at construction.
+    assert_eq!(
+        RootCreationScan::new(&root, "fixture-binding", 1, json!("harness-model"))
+            .err()
+            .expect("a scalar creation descriptor is invalid")
+            .code,
+        "NATIVE_LOG_ORIGIN"
+    );
+    let mut origin = RootCreationScan::new(&root, "fixture-binding", 1, Value::Null).unwrap();
+    let mut created = root_log_created(&root);
+    created["data"]["model"] =
+        json!({"id":"harness-model","providerID":"harness-provider","variant":"harness-variant"});
+    origin.consume(&created).unwrap();
+    assert!(origin.created());
+
+    let operation = "op_native_model_root";
+    let text = "verify harness-owned native root";
+    let marker = json!({"binding":"fixture-binding","generation":1,"operation":operation});
+    let command = RuntimeCommand {
+        operation_id: operation.into(),
+        method: "agent.goal".into(),
+        created_at_ms: 1,
+        binding_id: "fixture-binding".into(),
+        generation: 1,
+        native_root_id: Some(root.clone()),
+        route: json!({"runtime":RUNTIME,"module_artifact_id":ARTIFACT_ID,
+        "native_options":{}}),
+        input: json!({"text":text}),
+        input_sha256: None,
+        target_input_sha256: None,
+    };
+    let descriptor =
+        NativeInputDescriptor::for_goal_activation(&command, text, marker.clone()).unwrap();
+    let mut scan = ExecutionScan::for_goal(&descriptor).unwrap();
+    scan.consume(&created, &descriptor).unwrap();
+    let input = input_id(operation);
+    scan.consume(
+        &root_log_enqueued(&root, 2, &input, text, &marker),
+        &descriptor,
+    )
+    .unwrap();
+    assert!(scan.input_admitted());
 }
 
 #[test]

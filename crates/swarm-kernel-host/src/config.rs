@@ -31,20 +31,27 @@ pub(crate) fn opencode_route_kind(runtime: &str, artifact_id: &str) -> Option<Op
     }
 }
 
-/// The current built-in OpenCode artifact uses the Store-owned TaskPrompt
-/// contract. The retained `.1` decoder intentionally does not select it.
+/// Current built-in OpenCode and Zed TaskPrompt routes use Store-owned prompt
+/// preparation. Retained historical decoders keep their own readers.
 pub(crate) fn is_task_prompt_builtin_route(runtime: &str, artifact_id: &str) -> bool {
+    is_opencode_task_prompt_builtin_route(runtime, artifact_id)
+        || (runtime == crate::runtime::zed::RUNTIME
+            && artifact_id == crate::runtime::zed::ARTIFACT_ID)
+}
+
+pub(crate) fn is_opencode_task_prompt_builtin_route(runtime: &str, artifact_id: &str) -> bool {
     runtime == crate::runtime::opencode_v2::RUNTIME
         && artifact_id == crate::runtime::opencode_v2::TASK_PROMPT_ARTIFACT_ID
 }
 
-/// The built-in OpenCode and Zed decoders retain their bounded selector-less
-/// route contract. Every other runtime/artifact topology is module-backed and
-/// requires an exact trusted descriptor for new work.
+/// The built-in OpenCode and retained Zed decoders use their bounded
+/// selector-less route contract. Every other runtime/artifact topology is
+/// module-backed and requires an exact trusted descriptor for new work.
 pub(crate) fn is_selectorless_builtin_route(runtime: &str, artifact_id: &str) -> bool {
     opencode_route_kind(runtime, artifact_id) == Some(OpenCodeRouteKind::Builtin)
         || (runtime == crate::runtime::zed::RUNTIME
             && (artifact_id == crate::runtime::zed::ARTIFACT_ID
+                || artifact_id == crate::runtime::zed::PREVIOUS_ARTIFACT_ID
                 || artifact_id == crate::runtime::zed::LEGACY_ARTIFACT_ID))
 }
 
@@ -259,11 +266,12 @@ impl Route {
 
         if self.runtime == crate::runtime::zed::RUNTIME
             && self.module_artifact_id != crate::runtime::zed::ARTIFACT_ID
+            && self.module_artifact_id != crate::runtime::zed::PREVIOUS_ARTIFACT_ID
             && self.module_artifact_id != crate::runtime::zed::LEGACY_ARTIFACT_ID
         {
             return Err(Error::new(
                 "CONFIG_ERROR",
-                "Zed routes require the current or explicitly retained legacy artifact",
+                "Zed routes require a current or explicitly retained artifact",
             ));
         }
 
@@ -329,9 +337,12 @@ impl Route {
 }
 
 fn validate_codex_rust_options(value: &Value) -> Result<()> {
-    let options = exact_option_object(value, &["modelProvider", "model", "workspaceRoot"], &[])?;
-    required_option_string(options, "modelProvider", 256)?;
-    required_option_string(options, "model", 256)?;
+    let options = exact_option_object(value, &["workspaceRoot"], &["modelProvider", "model"])?;
+    for field in ["modelProvider", "model"] {
+        if let Some(value) = options.get(field).filter(|value| !value.is_null()) {
+            option_string(value, field, 256)?;
+        }
+    }
     required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
     Ok(())
 }
@@ -371,8 +382,18 @@ fn validate_owned_opencode_rust_options(value: &Value) -> Result<()> {
 }
 
 fn validate_command_rust_options(value: &Value) -> Result<()> {
-    let options = exact_option_object(value, &["modelId", "workspaceRoot"], &[])?;
-    required_option_string(options, "modelId", 256)?;
+    // Route config does not carry the selected descriptor version. Validate a
+    // supplied selector here; the versioned adapter enforces its own absence policy.
+    let options = exact_option_object(value, &["workspaceRoot"], &["modelId"])?;
+    if let Some(value) = options.get("modelId").filter(|value| !value.is_null()) {
+        let model_id = option_string(value, "modelId", 256)?;
+        if model_id.trim() != model_id {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "Command modelId must be an exact string",
+            ));
+        }
+    }
     required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
     Ok(())
 }
@@ -380,10 +401,17 @@ fn validate_command_rust_options(value: &Value) -> Result<()> {
 fn validate_antigravity_rust_options(value: &Value) -> Result<()> {
     let options = exact_option_object(
         value,
-        &["modelId", "workspaceRoot"],
-        &["reasoningEffort", "agent", "dangerouslySkipPermissions"],
+        &["workspaceRoot"],
+        &[
+            "modelId",
+            "reasoningEffort",
+            "agent",
+            "dangerouslySkipPermissions",
+        ],
     )?;
-    required_option_string(options, "modelId", 256)?;
+    if let Some(value) = options.get("modelId") {
+        option_string(value, "modelId", 256)?;
+    }
     required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
     if let Some(value) = options.get("reasoningEffort") {
         let effort = option_string(value, "reasoningEffort", 32)?;
@@ -706,7 +734,10 @@ impl Config {
                 ));
             }
             if let Some(owned) = route.owned_opencode_service()? {
-                let key = (owned.state_root().to_path_buf(), owned.version().to_owned());
+                let key = (
+                    owned.state_root().to_path_buf(),
+                    Some(owned.version().to_owned()),
+                );
                 if services
                     .insert(owned.service_id().to_owned(), key.clone())
                     .is_some_and(|old| old != key)
@@ -948,6 +979,84 @@ mod owned_opencode_route_validation_tests {
                 .validate_activation_contract()
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod zed_artifact_contract_tests {
+    use super::*;
+
+    #[test]
+    fn current_and_retained_zed_artifacts_keep_their_route_roles() {
+        let routes = [
+            crate::runtime::zed::ARTIFACT_ID,
+            crate::runtime::zed::PREVIOUS_ARTIFACT_ID,
+            crate::runtime::zed::LEGACY_ARTIFACT_ID,
+        ];
+        for artifact_id in routes {
+            let route = Route {
+                alias: "zed".to_owned(),
+                runtime: crate::runtime::zed::RUNTIME.to_owned(),
+                module_artifact_id: artifact_id.to_owned(),
+                enabled: true,
+                native_options: Value::Null,
+                workspace_option: None,
+                owned_service: None,
+                admission_policy: None,
+            };
+            assert!(route.validate_activation_contract().is_ok());
+            assert!(is_selectorless_builtin_route(
+                crate::runtime::zed::RUNTIME,
+                artifact_id
+            ));
+        }
+        assert!(is_task_prompt_builtin_route(
+            crate::runtime::zed::RUNTIME,
+            crate::runtime::zed::ARTIFACT_ID
+        ));
+        assert!(!is_task_prompt_builtin_route(
+            crate::runtime::zed::RUNTIME,
+            crate::runtime::zed::PREVIOUS_ARTIFACT_ID
+        ));
+        assert!(!is_task_prompt_builtin_route(
+            crate::runtime::zed::RUNTIME,
+            crate::runtime::zed::LEGACY_ARTIFACT_ID
+        ));
+    }
+}
+
+#[cfg(test)]
+mod native_model_default_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_defaults_are_allowed_but_malformed_explicit_overrides_are_not_defaults() {
+        let workspace = std::env::current_dir().unwrap();
+        let mut options = json!({"workspaceRoot":workspace});
+        assert!(validate_codex_rust_options(&options).is_ok());
+        assert!(validate_antigravity_rust_options(&options).is_ok());
+        options["modelProvider"] = json!("native-provider");
+        assert!(validate_codex_rust_options(&options).is_ok());
+        options["model"] = json!("native-model");
+        assert!(validate_codex_rust_options(&options).is_ok());
+        options["modelProvider"] = Value::Null;
+        assert!(validate_codex_rust_options(&options).is_ok());
+        options["model"] = Value::Null;
+        assert!(validate_codex_rust_options(&options).is_ok());
+        for field in ["modelProvider", "model"] {
+            for invalid in [json!(false), json!(""), json!("bad\nmodel")] {
+                let mut options = json!({"workspaceRoot":workspace});
+                options[field] = invalid;
+                assert!(validate_codex_rust_options(&options).is_err());
+            }
+        }
+        let mut options = json!({"workspaceRoot":workspace,"modelId":"explicit-model"});
+        assert!(validate_antigravity_rust_options(&options).is_ok());
+        for invalid in [Value::Null, json!(false), json!("")] {
+            options["modelId"] = invalid;
+            assert!(validate_antigravity_rust_options(&options).is_err());
+        }
     }
 }
 

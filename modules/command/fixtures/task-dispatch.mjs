@@ -7,7 +7,7 @@ import { MODULE_ARTIFACT_ID } from "../glue.mjs";
 export const FIXTURE_MODULE_CONTRACT = {
   schema_version: 1,
   module_id: "runtime.command",
-  artifact: { artifact_id: MODULE_ARTIFACT_ID, version: "5" },
+  artifact: { artifact_id: MODULE_ARTIFACT_ID, version: "6" },
   protocol: { major: 1, minor: 0 },
   capabilities: ["agent.open", "agent.reconcile", "agent.refresh", "task.dispatch"],
   config_schema: null,

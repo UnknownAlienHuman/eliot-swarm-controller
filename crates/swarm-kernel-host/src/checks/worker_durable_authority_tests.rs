@@ -81,6 +81,37 @@ fn scoped_failure_for(
 
 #[test]
 fn check_go_reader_does_not_return_start_until_its_read_barrier_succeeds() {
+    // The executor enters a real process-owned Job. Keep it out of the
+    // parallel parent harness so unrelated fixture children cannot join it.
+    let module = module_path!()
+        .split_once("::")
+        .expect("fixture module has a crate prefix")
+        .1;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            &format!("{module}::check_go_read_barrier_isolated_child"),
+            "--nocapture",
+        ])
+        .output()
+        .expect("run the isolated CheckGo read-barrier fixture");
+    assert!(
+        output.status.success(),
+        "isolated CheckGo fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "CHECK_GO_READ_BARRIER_ASSERTIONS_COMPLETE"),
+        "successful exit without completed CheckGo assertions is not a pass"
+    );
+}
+
+#[test]
+#[ignore = "spawned by the CheckGo read-barrier regression in an isolated process-owned Job"]
+fn check_go_read_barrier_isolated_child() {
     let (_cleanup, work, dir) = fixture_work();
     let go_path = dir.join("go.json");
     let failing = Rc::new(Cell::new(true));
@@ -126,6 +157,7 @@ fn check_go_reader_does_not_return_start_until_its_read_barrier_succeeds() {
         read_value(&go_path).unwrap(),
         json!({"token":work.token.clone()})
     );
+    println!("CHECK_GO_READ_BARRIER_ASSERTIONS_COMPLETE");
 }
 
 #[test]

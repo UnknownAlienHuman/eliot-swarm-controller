@@ -56,8 +56,13 @@ pub fn build_launch_spec(
         "--output-format".to_owned(),
         "stream-json".to_owned(),
     ];
-    args.push("--model".to_owned());
-    args.push(requested_model.to_owned());
+    // The installed harness owns its model default. Pass --model only for an
+    // exact explicit route override, mirroring the Node bridge's conditional
+    // (bridge.mjs/bridge-v4.mjs omit --model when modelId is absent).
+    if let Some(requested_model) = requested_model {
+        args.push("--model".to_owned());
+        args.push(requested_model.to_owned());
+    }
     if let Some(effort) = options.get("reasoningEffort") {
         let effort = bounded_option_string(effort, 32).ok_or("INVALID_EFFORT")?;
         if !matches!(effort.as_str(), "low" | "medium" | "high") {
@@ -97,20 +102,25 @@ pub fn build_launch_spec(
     })
 }
 
-pub fn selected_model_id(route: &Value) -> Result<&str, &'static str> {
+/// Exact explicit route model override, or `None` when the route names no
+/// model. An absent `modelId` is not an error: the launch omits `--model` and
+/// the installed harness default applies. A present value must be the exact
+/// bounded model string; empty, overlong, control-carrying, or non-string
+/// values are rejected without guessing.
+pub fn selected_model_id(route: &Value) -> Result<Option<&str>, &'static str> {
     let options = route
         .get("native_options")
         .and_then(Value::as_object)
         .ok_or("NATIVE_OPTIONS_REQUIRED")?;
-    let model = options
-        .get("modelId")
-        .and_then(Value::as_str)
-        .ok_or("MODEL_ID_REQUIRED")?;
+    let Some(value) = options.get("modelId") else {
+        return Ok(None);
+    };
+    let model = value.as_str().ok_or("INVALID_MODEL_ID")?;
     if model.trim().is_empty() || model.chars().count() > 256 || model.chars().any(char::is_control)
     {
         return Err("INVALID_MODEL_ID");
     }
-    Ok(model)
+    Ok(Some(model))
 }
 
 fn bounded_option_string(value: &Value, max_chars: usize) -> Option<String> {
@@ -126,4 +136,98 @@ fn bounded_option_string(value: &Value, max_chars: usize) -> Option<String> {
 fn bounded_path_text(path: &std::path::Path) -> bool {
     path.to_str()
         .is_some_and(|value| value.len() <= 32 * 1024 && !value.chars().any(char::is_control))
+}
+
+#[cfg(test)]
+mod model_override_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn workspace_root() -> String {
+        std::env::temp_dir()
+            .to_str()
+            .expect("test workspace root must be representable")
+            .to_owned()
+    }
+
+    fn executable() -> PathBuf {
+        std::env::temp_dir().join("agy-test-executable")
+    }
+
+    fn open_command(route: Value) -> RuntimeCommand {
+        RuntimeCommand {
+            operation_id: "op-open-model".to_owned(),
+            method: "agent.open".to_owned(),
+            created_at_ms: 1,
+            binding_id: "binding-model".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route,
+            input: json!({}),
+            input_sha256: None,
+            target_input_sha256: None,
+        }
+    }
+
+    fn route_with_model(model: Value) -> Value {
+        let mut options = serde_json::Map::new();
+        options.insert("workspaceRoot".to_owned(), Value::String(workspace_root()));
+        options.insert("modelId".to_owned(), model);
+        json!({"native_options": Value::Object(options)})
+    }
+
+    #[test]
+    fn absent_model_id_omits_flag_for_native_default() {
+        let route = json!({"native_options": {"workspaceRoot": workspace_root()}});
+        assert_eq!(selected_model_id(&route).unwrap(), None);
+        let spec = build_launch_spec(&executable(), &open_command(route)).unwrap();
+        assert!(!spec.args.contains(&"--model".to_owned()));
+        assert_eq!(
+            &spec.args[..4],
+            &[
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json"
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_model_id_is_passed_exactly() {
+        let route = route_with_model(json!("gemini-explicit-override"));
+        assert_eq!(
+            selected_model_id(&route).unwrap(),
+            Some("gemini-explicit-override")
+        );
+        let spec = build_launch_spec(&executable(), &open_command(route)).unwrap();
+        let position = spec
+            .args
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("explicit override must pass --model");
+        assert_eq!(spec.args[position + 1], "gemini-explicit-override");
+    }
+
+    #[test]
+    fn malformed_model_override_is_rejected_without_guessing() {
+        for invalid in [
+            json!(""),
+            json!("   "),
+            json!("bad\u{7}model"),
+            json!("x".repeat(257)),
+            json!(42),
+            json!(Value::Null),
+            json!({"id": "nested"}),
+        ] {
+            assert_eq!(
+                selected_model_id(&route_with_model(invalid)).unwrap_err(),
+                "INVALID_MODEL_ID"
+            );
+        }
+        assert_eq!(
+            selected_model_id(&json!({})).unwrap_err(),
+            "NATIVE_OPTIONS_REQUIRED"
+        );
+    }
 }

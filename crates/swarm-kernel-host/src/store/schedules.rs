@@ -491,8 +491,23 @@ fn consider(
         if let Some(retry) = probe_retry_at_ms(Some(state))
             && retry > now_ms
         {
-            tx.rollback()?;
-            return Ok((Some(retry), false, false));
+            // A concurrent same-slot sibling may have installed this retry
+            // gate after this caller resolved successfully. A successful
+            // plan for this same slot proves the probe reservation was free
+            // at resolve time and must still admit exactly once; otherwise
+            // the gate would block the only successful admission and leave
+            // both callers Ok with no receipt. Absent or failed plans keep
+            // the retry without consuming the slot.
+            let gate_slot = state
+                .last_failure
+                .as_ref()
+                .and_then(|failure| failure["slot"].as_i64());
+            let has_successful_plan_for_slot = gate_slot == Some(due.slot)
+                && check_plan.as_ref().is_some_and(|plan| plan.result.is_ok());
+            if !has_successful_plan_for_slot {
+                tx.rollback()?;
+                return Ok((Some(retry), false, false));
+            }
         }
 
         let (facts, preflight_error) = input_facts(&tx, schedule, config)?;
@@ -1479,6 +1494,284 @@ mod tests {
             .await
             .unwrap();
 
+        owner.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_slot_success_bypasses_retry_gate() {
+        // Race: A resolves a successful plan while the probe reservation is
+        // free, then a concurrent sibling B commits a same-slot
+        // CHECK_PROBE_CLEANUP_PENDING retry gate before A enters `consider`.
+        // A must still admit exactly once; absent/failed/other-slot/stale
+        // plans must keep the gate without consuming the slot.
+        let (directory, owner, config, mut schedule, now) = fixture().await;
+        schedule.period_ms = None;
+        owner
+            .store
+            .run(|db| super::super::set_meta(db, "execution_mode", &json!({"new_work":"enabled"})))
+            .await
+            .unwrap();
+        let sched_principal = Principal {
+            client_id: INTERNAL_SCHEDULER_CLIENT_ID.to_owned(),
+            link_id: format!("schedule:{}", schedule.schedule_id),
+            role: Role::Scheduler,
+        };
+        let request = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                move |db| check_plan_request(db, &schedule, &config, now)
+            })
+            .await
+            .unwrap()
+            .expect("fixture has one due valid source candidate");
+        let ok_plan = owner
+            .store
+            .resolve_check_plan(sched_principal.clone(), request)
+            .await
+            .unwrap();
+        assert!(
+            ok_plan.result.is_ok(),
+            "fixture plan must resolve successfully"
+        );
+        let due_slot = crate::scheduler::latest_due_slot(&schedule, now, None)
+            .unwrap()
+            .expect("one-shot fixture is due")
+            .slot;
+        // Commit what a concurrent failed probe would commit at
+        // `schedules.rs:551-567`: same-slot retry, no input suppression, no
+        // slot consumption.
+        let retry_at_ms = now.saturating_add(PROBE_RETRY_MS);
+        owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                move |db| {
+                    let digest = definition_digest(&schedule)?;
+                    let mut reg = registry(db)?;
+                    let state = reg
+                        .schedules
+                        .entry(schedule.schedule_id.clone())
+                        .or_insert_with(|| ScheduleState {
+                            schema_version: REGISTRY_VERSION,
+                            definition_sha256: digest.clone(),
+                            last_observed_due_slot: None,
+                            last_considered_slot: None,
+                            last_admitted_slot: None,
+                            last_operation: None,
+                            last_failure: None,
+                            failure_input_sha256: None,
+                        });
+                    state.definition_sha256 = digest;
+                    state.last_observed_due_slot = Some(due_slot);
+                    state.last_failure = Some(json!({
+                        "slot": due_slot,
+                        "code": "CHECK_PROBE_CLEANUP_PENDING",
+                        "message": "concurrent sibling probe holds the resource",
+                        "input_sha256": "concurrent-sibling",
+                        "retry_at_ms": retry_at_ms,
+                    }));
+                    state.failure_input_sha256 = None;
+                    save_registry(db, &reg)?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        // Negative 1: absent plan keeps the retry without a receipt.
+        let (next_due, wake, stale) = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                move |db| consider(db, &schedule, &config, now, None)
+            })
+            .await
+            .unwrap();
+        assert!(!stale);
+        assert!(!wake);
+        assert_eq!(next_due, Some(retry_at_ms));
+        // Negative 2: failed plan for the same slot keeps the retry.
+        let mut failed_plan = ok_plan.clone();
+        failed_plan.result = Err(Error::new(
+            "CHECK_PROBE_CLEANUP_PENDING",
+            "sibling probe still holds the resource",
+        ));
+        let (next_due, wake, stale) = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                move |db| consider(db, &schedule, &config, now, Some(failed_plan))
+            })
+            .await
+            .unwrap();
+        assert!(!stale);
+        assert!(!wake);
+        assert_eq!(next_due, Some(retry_at_ms));
+        // Negative 3: successful plan for another slot must not bypass.
+        owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                move |db| {
+                    let mut reg = registry(db)?;
+                    let state = reg
+                        .schedules
+                        .get_mut(&schedule.schedule_id)
+                        .expect("retry gate present");
+                    state.last_failure = Some(json!({
+                        "slot": due_slot + 100,
+                        "code": "CHECK_PROBE_CLEANUP_PENDING",
+                        "message": "other-slot gate",
+                        "input_sha256": "concurrent-sibling",
+                        "retry_at_ms": retry_at_ms,
+                    }));
+                    save_registry(db, &reg)?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        let (next_due, wake, stale) = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                let ok_plan = ok_plan.clone();
+                move |db| consider(db, &schedule, &config, now, Some(ok_plan))
+            })
+            .await
+            .unwrap();
+        assert!(!stale);
+        assert!(!wake);
+        assert_eq!(next_due, Some(retry_at_ms));
+        // Negative 4: stale successful plan must not admit even with a
+        // matching gate slot; it returns the stale retry instead.
+        owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                move |db| {
+                    let mut reg = registry(db)?;
+                    let state = reg
+                        .schedules
+                        .get_mut(&schedule.schedule_id)
+                        .expect("retry gate present");
+                    state.last_failure = Some(json!({
+                        "slot": due_slot,
+                        "code": "CHECK_PROBE_CLEANUP_PENDING",
+                        "message": "concurrent sibling probe holds the resource",
+                        "input_sha256": "concurrent-sibling",
+                        "retry_at_ms": retry_at_ms,
+                    }));
+                    save_registry(db, &reg)?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        let mut stale_plan = ok_plan.clone();
+        stale_plan.context_fingerprint = "stale-fingerprint-for-race-test".to_owned();
+        let (next_due, wake, stale) = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                move |db| consider(db, &schedule, &config, now, Some(stale_plan))
+            })
+            .await
+            .unwrap();
+        assert!(stale);
+        assert!(!wake);
+        assert_eq!(next_due, Some(now.saturating_add(250)));
+        let gated_counts = owner
+            .store
+            .run(|db| {
+                Ok((
+                    db.query_row(
+                        "SELECT count(*) FROM operations WHERE caller_id=?1",
+                        [INTERNAL_SCHEDULER_CLIENT_ID],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    db.query_row("SELECT count(*) FROM check_runs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(gated_counts, (0, 0), "negatives must not admit");
+        // Positive: same-slot success bypasses the gate exactly once.
+        let (next_due_after_admit, wake_worker, stale) = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                let ok_plan = ok_plan.clone();
+                move |db| consider(db, &schedule, &config, now, Some(ok_plan))
+            })
+            .await
+            .unwrap();
+        assert!(!stale);
+        assert!(wake_worker);
+        let _ = next_due_after_admit;
+        let (operations, checks, state) = owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                move |db| {
+                    Ok((
+                        db.query_row(
+                            "SELECT count(*) FROM operations WHERE caller_id=?1",
+                            [INTERNAL_SCHEDULER_CLIENT_ID],
+                            |row| row.get::<_, i64>(0),
+                        )?,
+                        db.query_row("SELECT count(*) FROM check_runs", [], |row| {
+                            row.get::<_, i64>(0)
+                        })?,
+                        registry(db)?.schedules[&schedule.schedule_id].clone(),
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            operations, 1,
+            "same-slot success admits exactly one receipt"
+        );
+        assert_eq!(checks, 1);
+        assert_eq!(state.last_admitted_slot, Some(due_slot));
+        assert!(state.last_failure.is_none());
+        // Exactly-once: a repeated admission attempt must not duplicate.
+        owner
+            .store
+            .run({
+                let schedule = schedule.clone();
+                let config = config.clone();
+                let ok_plan = ok_plan.clone();
+                move |db| consider(db, &schedule, &config, now, Some(ok_plan))
+            })
+            .await
+            .unwrap();
+        let operations_after_retry: i64 = owner
+            .store
+            .run(|db| {
+                db.query_row(
+                    "SELECT count(*) FROM operations WHERE caller_id=?1",
+                    [INTERNAL_SCHEDULER_CLIENT_ID],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            operations_after_retry, 1,
+            "admission must remain exactly once"
+        );
         owner.close().await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }

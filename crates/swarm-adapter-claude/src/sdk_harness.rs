@@ -24,6 +24,7 @@ const MAX_FRAME_BYTES: usize = 700_000;
 #[derive(Debug)]
 pub enum HarnessFrame {
     Message(Value),
+    StdoutEof,
     Exited { code: Option<i32> },
     ReadFailure,
 }
@@ -53,8 +54,7 @@ impl NativeHarness {
             .stdout(Stdio::piped())
             // Provider stderr may contain user prompts or local data; it is
             // discarded instead of copied into the adapter or Store logs.
-            .stderr(Stdio::null())
-            .env_clear();
+            .stderr(Stdio::null());
         copy_safe_environment(&mut command, &options);
         let mut child = command.spawn().map_err(|_| {
             Error::new(
@@ -232,56 +232,43 @@ fn ensure_embedded_file(path: &Path, expected: &[u8]) -> Result<()> {
 }
 
 fn copy_safe_environment(command: &mut Command, options: &NativeOptions) {
-    for name in [
-        "SystemRoot",
-        "WINDIR",
-        "ComSpec",
-        "PATH",
-        "PATHEXT",
-        "TEMP",
-        "TMP",
-        "USERPROFILE",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "ProgramData",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "HOME",
-        "TMPDIR",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
+    swarm_process::module_owner::apply_native_launch_environment(command.as_std_mut());
     command.env("CLAUDE_CONFIG_DIR", &options.claude_config_dir);
 }
 
 fn spawn_output_reader(stdout: tokio::process::ChildStdout, tx: mpsc::Sender<HarnessFrame>) {
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            let line = match read_bounded_line(&mut reader, MAX_FRAME_BYTES).await {
-                Ok(Some(line)) => line,
-                Ok(None) => return,
-                Err(()) => {
-                    let _ = tx.send(HarnessFrame::ReadFailure).await;
-                    drain_output(&mut reader).await;
-                    return;
-                }
-            };
-            let value = match serde_json::from_slice(&line) {
-                Ok(value) => value,
-                Err(_) => {
-                    let _ = tx.send(HarnessFrame::ReadFailure).await;
-                    drain_output(&mut reader).await;
-                    return;
-                }
-            };
-            if tx.send(HarnessFrame::Message(value)).await.is_err() {
+        forward_output(stdout, tx).await;
+    });
+}
+
+async fn forward_output<R: AsyncRead + Unpin>(stdout: R, tx: mpsc::Sender<HarnessFrame>) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_FRAME_BYTES).await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                let _ = tx.send(HarnessFrame::StdoutEof).await;
                 return;
             }
+            Err(()) => {
+                let _ = tx.send(HarnessFrame::ReadFailure).await;
+                drain_output(&mut reader).await;
+                return;
+            }
+        };
+        let value = match serde_json::from_slice(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = tx.send(HarnessFrame::ReadFailure).await;
+                drain_output(&mut reader).await;
+                return;
+            }
+        };
+        if tx.send(HarnessFrame::Message(value)).await.is_err() {
+            return;
         }
-    });
+    }
 }
 
 async fn drain_output<R: AsyncRead + Unpin>(reader: &mut R) {
@@ -331,6 +318,38 @@ fn spawn_child_waiter(mut child: Child, tx: mpsc::Sender<HarnessFrame>) {
         let code = child.wait().await.ok().and_then(|status| status.code());
         let _ = tx.send(HarnessFrame::Exited { code }).await;
     });
+}
+
+#[cfg(test)]
+mod output_reader_tests {
+    use super::{HarnessFrame, forward_output};
+    use tokio::{
+        io::{AsyncWriteExt, duplex},
+        sync::mpsc,
+    };
+
+    #[tokio::test]
+    async fn clean_stdout_eof_emits_a_distinct_terminal_frame() {
+        let (mut writer, reader) = duplex(1024);
+        let (tx, mut rx) = mpsc::channel(4);
+        let reader_task = tokio::spawn(forward_output(reader, tx));
+
+        writer
+            .write_all(b"{\"kind\":\"diagnostic\"}\n")
+            .await
+            .expect("write one complete harness frame");
+        writer
+            .shutdown()
+            .await
+            .expect("close the harness stdout stream");
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(HarnessFrame::Message(value)) if value["kind"] == "diagnostic"
+        ));
+        assert!(matches!(rx.recv().await, Some(HarnessFrame::StdoutEof)));
+        reader_task.await.expect("finish the bounded output reader");
+    }
 }
 
 #[cfg(all(test, windows))]

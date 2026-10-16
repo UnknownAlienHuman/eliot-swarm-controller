@@ -382,8 +382,14 @@ function Resolve-PackageScope($Changes, $Classification) {
         if ($workspaceMatches.Count -eq 0) {
             throw "Test path '$relativePath' is outside metadata workspace packages; refusing a guessed scope."
         }
-        $testPackageId = [string]$workspaceMatches[0].Id
-        [void]$testPackageIds.Add($testPackageId)
+        $owner = $workspaceMatches[0]
+        $testPackageId = [string]$owner.Id
+        # Embedded src/**/tests modules belong to the package's Rust targets;
+        # only package-root tests/** paths demand Cargo integration targets.
+        # Keep the owner seeded for all-target compilation and Clippy either way.
+        if (Test-PathWithin $absolutePath (Join-Path $owner.Directory 'tests')) {
+            [void]$testPackageIds.Add($testPackageId)
+        }
         [void]$seeds.Add($testPackageId)
     }
     if ($seeds.Count -eq 0) {

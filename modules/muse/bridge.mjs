@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import museDescriptor from './module-descriptor.template.json' with { type: 'json' };
 import { spawnMspConnection, MspError } from '@muse-code/sdk';
 import { Control } from './control.mjs';
-import { configuration, modelMatches, goalCommand, nativeMcpServers, startNativeMcpSession } from './settings.mjs';
+import { configuration, modelMatches, retainModelOverride, goalCommand, nativeMcpServers, startNativeMcpSession } from './settings.mjs';
 import { readResult } from './results.mjs';
 import { spawnOwned } from './owned.mjs';
 import { recoveryState } from './checkpoint.mjs';
@@ -20,8 +20,8 @@ import {
   restoredNativeUsageSnapshot,
 } from './native-usage.mjs';
 
-const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.12';
-const MUSE_ARTIFACT_VERSION = '12';
+const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.13';
+const MUSE_ARTIFACT_VERSION = '13';
 const MAX_TASK_PROMPT_BYTES = 1_000_000;
 const MAX_OBSERVATION_STATE_BYTES = 700_000;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -204,6 +204,8 @@ function compactSession(s) {
     modelId:s.modelId, providerId:s.providerId, approvalMode:s.approvalMode, attention:s.attention, turnCount:s.turnCount };
 }
 const SESSION_LIST_LIMIT=200;
+const RECOVERY_VIEW_PAGE_LIMIT=100;
+const RECOVERY_VIEW_PAGE_MAX_PAGES=10;
 class NativeCompatibilityError extends Error {
   constructor(diagnosticCode,nativeError) {
     super(diagnosticCode);
@@ -358,8 +360,7 @@ function settle(entry, details, turnId) {
 }
 function acceptModel(entry, session, evidence) {
   if (!entry.ack || entry.setting?.key !== 'model' || !modelMatches(session, entry.setting.desired)) return false;
-  routeDefaults.modelId = session.modelId;
-  routeDefaults.providerId = session.providerId ?? undefined;
+  retainModelOverride(routeDefaults, entry.setting.desired);
   latest.model = {modelId:session.modelId,providerId:session.providerId};
   settle(entry, {native_ack:entry.ack,completion_condition:'native_configuration_applied',settings:entry.setting.desired,evidence});
   return true;
@@ -390,10 +391,19 @@ function workFenceCurrent(fence, entry, eventVersion=fence.eventVersion) {
     && entry.command.native_root_id===fence.rootId
     && entry.params?.sessionId===fence.rootId
     && (sessionVersions.get(fence.rootId)??0)===eventVersion
-    && routeDefaults.modelId===fence.modelId
+    && (routeDefaults.modelId===undefined || routeDefaults.modelId===fence.modelId)
     && (routeDefaults.providerId===undefined || routeDefaults.providerId===fence.providerId);
 }
+function hasPendingModelConfiguration() {
+  return [...nativePending.values()].some(entry=>entry.kind==='configure'
+    && entry.setting?.key==='model' && !entry.resolved);
+}
 async function readWorkFence(modelChangedCode) {
+  // setModel's ACK is admission only. Keep every productive path behind the
+  // unresolved request until its exact requested selector is read back; a
+  // restored checkpoint carries the same fence across bridge restart.
+  if(hasPendingModelConfiguration())
+    throw new NativeCompatibilityError('MODEL_CONFIGURATION_RECONCILIATION_REQUIRED');
   const sessionId=rootId;
   if(!sessionId)throw new NativeCompatibilityError('NATIVE_ROOT_IDENTITY_UNAVAILABLE');
   const eventVersion=sessionVersions.get(sessionId)??0;
@@ -781,6 +791,28 @@ async function refreshRoot() {
     latest.last_refresh = {at_ms:Date.now(),metadata_applied:fresh,pending_inventory_applied:pendingApplied,
       readback_method:read.method,...(read.viewCursor?{viewCursor:read.viewCursor}:{}),
       coverage:'root_metadata_and_pending_requests'};
+    // Resume a previously truncated parent-view scan from its persisted opaque
+    // continuation through this existing refresh read path. No poller: each bounded
+    // pass advances at most RECOVERY_VIEW_PAGE_MAX_PAGES further toward the head.
+    // Pre-disconnect cursors are not durable in stored state and view cursors stay
+    // opaque, so a fresh scan starts at the beginning and each truncation persists
+    // its resume point per exact root until the head is reached.
+    if(isRecord(latest.recovery_discovery_cursor)&&latest.recovery_discovery_cursor.parent_session_id===rootId) {
+      const refreshRootId=rootId;
+      const refreshMsp=msp;
+      try {
+        const continued=await discoveryPassShared(refreshRootId);
+        if(msp===refreshMsp&&rootId===refreshRootId) {
+          for(const id of continued.discovered) {
+            if(!children.has(id))continue;
+            void followChild(id);
+          }
+        }
+      } catch {
+        latest.gaps++;
+        changed();
+      }
+    }
     changed();
     return latest.last_refresh;
   })();
@@ -807,12 +839,18 @@ async function completeNative(entry, ack) {
     if(current) {
       void refreshRoot().catch(()=>{latest.gaps++;changed();});
       for(const id of children.keys())void followChild(id);
+      // session/resume+session/read run with excludeItems:true, so a child born
+      // while disconnected leaves no inline item. Page the durable parent view
+      // for subagent/reminderChild childSessionId provenance before following.
+      void discoverAndFollowMissedRootChildren().catch(()=>{latest.gaps++;changed();});
     }
     return;
   }
   if (ack.status !== 'accepted') throw new Error('UNEXPECTED_ADMISSION_STATUS');
   if (entry.kind === 'input') {
-    settle(entry, {native_ack:ack,completion_condition:'native_input_admitted',requested_reasoning_effort:entry.params.reasoningEffort}, required(ack,'turnId'));
+    settle(entry, {native_ack:ack,completion_condition:'native_input_admitted',
+      requested_reasoning_effort:entry.params.reasoningEffort??null,
+      reasoning_application:entry.params.reasoningEffort!==undefined?'explicit_per_turn':'native_default'}, required(ack,'turnId'));
   } else if (entry.kind === 'configure') {
     const setting = entry.setting;
     if (setting.key === 'reasoningEffort') {
@@ -981,12 +1019,140 @@ async function refreshChild(id) {
 async function followChild(id) {
   try {await refreshChild(id);} catch {latest.gaps++;changed();}
 }
+function extractRecoveredChildProvenance(event, parentSessionId) {
+  if(!isRecord(event)||typeof event.method!=='string')return null;
+  if(event.method!=='item/started'&&event.method!=='item/updated'&&event.method!=='item/completed')return null;
+  const params=event.params;
+  if(!isRecord(params)||params.sessionId!==parentSessionId)return null;
+  const item=params.item;
+  if(!isRecord(item))return null;
+  if(item.kind!=='subagent'&&item.kind!=='reminderChild')return null;
+  if(typeof item.childSessionId!=='string'||!item.childSessionId)return null;
+  if(typeof item.itemId!=='string'||!item.itemId)return null;
+  if(!Number.isSafeInteger(item.revision))return null;
+  if(item.childSessionId===parentSessionId)return null;
+  return {childSessionId:item.childSessionId,itemId:item.itemId,subagentId:item.subagentId,parentTurnId:item.turnId,status:item.status,controlStatus:item.controlStatus,revision:item.revision,kind:item.kind};
+}
+async function discoverMissedChildrenFromParentView(parentSessionId) {
+  if(!msp||!parentSessionId)throw new Error('NATIVE_NOT_OPEN');
+  if(parentSessionId!==rootId)throw new Error('RECOVERY_DISCOVERY_ROOT_ONLY');
+  // A truncated pass persists its opaque resume point per exact root; a fresh scan
+  // starts at the beginning. Pre-disconnect cursors are not durable in stored
+  // state and view cursors stay opaque, so continuation is the only contract
+  // available forward progress. A stale point for another root is reset here.
+  const storedContinuation=latest.recovery_discovery_cursor;
+  if(isRecord(storedContinuation)&&storedContinuation.parent_session_id!==parentSessionId)delete latest.recovery_discovery_cursor;
+  const resumeFrom=(isRecord(storedContinuation)&&storedContinuation.parent_session_id===parentSessionId&&typeof storedContinuation.cursor==='string'&&storedContinuation.cursor)?storedContinuation.cursor:undefined;
+  const mspAtEntry=msp;
+  const connectionAtEntry=msp.connection;
+  const bootAtEntry=bootId;
+  const rootAtEntry=rootId;
+  function fenced() {
+    if(msp!==mspAtEntry||!msp||msp.connection!==connectionAtEntry||rootId!==rootAtEntry||bootId!==bootAtEntry||parentSessionId!==rootAtEntry)throw new NativeCompatibilityError('NATIVE_WORK_SNAPSHOT_CHANGED_DURING_READ');
+  }
+  let cursor=resumeFrom;
+  const seen=new Set();
+  let pages=0;
+  let eventsScanned=0;
+  const discovered=[];
+  let truncated=true;
+  let resumeAt=null;
+  while(pages<RECOVERY_VIEW_PAGE_MAX_PAGES) {
+    let page;
+    try {
+      page=await msp.connection.request('view/page',{sessionId:parentSessionId,limit:RECOVERY_VIEW_PAGE_LIMIT,direction:'forward',...(cursor===undefined?{}:{cursor})});
+    } catch(error) {
+      if(methodNotFound(error))throw new NativeCompatibilityError('NATIVE_VIEW_PAGE_UNSUPPORTED',nativeErrorOf(error));
+      throw error;
+    }
+    fenced();
+    if(!isRecord(page)||!Array.isArray(page.events)||!(page.nextCursor===null||typeof page.nextCursor==='string'))throw new NativeCompatibilityError('NATIVE_VIEW_PAGE_RESPONSE_INVALID');
+    pages++;
+    for(const event of page.events) {
+      eventsScanned++;
+      const provenance=extractRecoveredChildProvenance(event,parentSessionId);
+      if(!provenance)continue;
+      const old=children.get(provenance.childSessionId);
+      if(!old&&children.size>=2000) {
+        latest.gaps++;
+        continue;
+      }
+      if(!old||provenance.itemId!==old.itemId||!Number.isSafeInteger(old.revision)||provenance.revision>old.revision) {
+        const wasFresh=old?.snapshot_freshness==='fresh';
+        children.set(provenance.childSessionId,{...old,sessionId:provenance.childSessionId,parentSessionId,itemId:provenance.itemId,subagentId:provenance.subagentId,parentTurnId:provenance.parentTurnId,status:provenance.status,controlStatus:provenance.controlStatus,revision:provenance.revision,kind:provenance.kind,snapshot_freshness:wasFresh?'stale':old?.snapshot_freshness??'unknown',snapshot_freshness_reason:wasFresh?'recovered_parent_provenance_after_read':old?.snapshot_freshness_reason??'recovered_parent_provenance_before_read',result_available:old?.result_available??false});
+        changed();
+        if(!old)discovered.push(provenance.childSessionId);
+      }
+    }
+    if(page.nextCursor===null) {
+      truncated=false;
+      break;
+    }
+    if(page.nextCursor===cursor||seen.has(page.nextCursor))throw new NativeCompatibilityError('NATIVE_PAGINATION_NOT_ADVANCING');
+    cursor=page.nextCursor;
+    seen.add(cursor);
+    resumeAt=cursor;
+    fenced();
+  }
+  fenced();
+  const atMs=Date.now();
+  if(truncated) {
+    if(typeof resumeAt!=='string'||!resumeAt)throw new NativeCompatibilityError('NATIVE_VIEW_PAGE_RESPONSE_INVALID');
+    latest.recovery_discovery_cursor={parent_session_id:parentSessionId,cursor:resumeAt,at_ms:atMs};
+    latest.gaps++;
+  } else if(latest.recovery_discovery_cursor?.parent_session_id===parentSessionId)delete latest.recovery_discovery_cursor;
+  latest.recovery_discovery={at_ms:atMs,parent_session_id:parentSessionId,pages,events_scanned:eventsScanned,discovered_count:discovered.length,discovered_child_session_ids:discovered.slice(0,100),truncated,continued_from_cursor:resumeFrom!==undefined,coverage:'root_view_page_child_provenance'};
+  changed();
+  return {pages,eventsScanned,discovered,truncated};
+}
+let discoveryInFlight;
+function discoveryPassShared(parentSessionId) {
+  if(discoveryInFlight)return discoveryInFlight;
+  discoveryInFlight=(async()=>{
+    try {
+      return await discoverMissedChildrenFromParentView(parentSessionId);
+    } finally {
+      discoveryInFlight=undefined;
+    }
+  })();
+  return discoveryInFlight;
+ }
+async function discoverAndFollowMissedRootChildren() {
+  if(!msp||!rootId)throw new Error('NATIVE_NOT_OPEN');
+  const rootAtEntry=rootId;
+  const mspAtEntry=msp;
+  const connectionAtEntry=msp.connection;
+  const bootAtEntry=bootId;
+  const outcome=await discoveryPassShared(rootAtEntry);
+  if(msp!==mspAtEntry||!msp||msp.connection!==connectionAtEntry||rootId!==rootAtEntry||bootId!==bootAtEntry)throw new NativeCompatibilityError('NATIVE_WORK_SNAPSHOT_CHANGED_DURING_READ');
+  for(const id of outcome.discovered) {
+    if(msp!==mspAtEntry||msp.connection!==connectionAtEntry||rootId!==rootAtEntry||bootId!==bootAtEntry)break;
+    if(!children.has(id))continue;
+    void followChild(id);
+  }
+  return outcome;
+}
 async function launchConnection(options) {
   if (handshake) throw new Error('NATIVE_ALREADY_OWNED');
-  required(options,'workspaceRoot'); required(options,'modelId'); required(options,'reasoningEffort');
+  required(options,'workspaceRoot');
   if (!path.isAbsolute(options.workspaceRoot)) throw new Error('WORKSPACE_MUST_BE_ABSOLUTE');
   const allowed=['workspaceRoot','modelId','providerId','reasoningEffort','approvalMode','mcpServers'];
   for (const name of Object.keys(options)) if (!allowed.includes(name)) throw new Error(`UNSUPPORTED_NATIVE_OPTION_${name}`);
+  // Omission selects the installed native default (installed msp.d.ts
+  // SessionStartParams: modelId optional 'server default when omitted',
+  // providerId optional-nullable 'server default when omitted or explicit null';
+  // TurnStartParams reasoningEffort optional, absent means unspecified for the
+  // turn, not a reset). Explicit values are validated verbatim; no default is
+  // synthesized here and no provider credential/config is read.
+  if (options.modelId !== undefined
+    && (typeof options.modelId !== 'string' || !options.modelId.trim() || options.modelId !== options.modelId.trim()))
+    throw new Error('INVALID_MODEL_SELECTION');
+  if (options.providerId !== undefined && options.providerId !== null
+    && (typeof options.providerId !== 'string' || !options.providerId.trim() || options.providerId !== options.providerId.trim()))
+    throw new Error('INVALID_PROVIDER');
+  if (options.reasoningEffort !== undefined
+    && !['none','minimal','low','medium','high','xhigh','max','ultra'].includes(options.reasoningEffort))
+    throw new Error('INVALID_REASONING_EFFORT');
   if (options.mcpServers !== undefined) nativeMcpServers(options.mcpServers);
   // Explicit launch only, never from describe/status/reconnect. Current vendor auth is inherited.
   sessionReadUnavailable=false;
@@ -1033,8 +1199,15 @@ async function launchConnection(options) {
 }
 
 async function startNative(command,markNativeAdmissionPossible) {
-  const options=command.route.native_options;
+  const options=command.route.native_options ?? {};
+  if (typeof options.workspaceRoot !== 'string' || !options.workspaceRoot.trim())
+    throw new Error('WORKSPACE_MUST_BE_ABSOLUTE');
+  // A new root replaces the previous route defaults. Omitted model/provider/
+  // effort stay omitted so the native default applies. Observed values belong
+  // to session readback; they must not become controller route overrides.
+  for (const name of ['modelId','providerId','reasoningEffort']) delete routeDefaults[name];
   Object.assign(routeDefaults,options);
+  if(routeDefaults.providerId===null)delete routeDefaults.providerId;
   const mcpServers=options.mcpServers===undefined?undefined:nativeMcpServers(options.mcpServers);
   delete latest.mcp_servers_requested;
   delete latest.mcp_servers_config_forwarded;
@@ -1046,8 +1219,12 @@ async function startNative(command,markNativeAdmissionPossible) {
   }
   await checkpoint(true);
   const init=await launchConnection(options);
-  const params={workspaceRoot:options.workspaceRoot,modelId:options.modelId};
-  if(options.providerId!==undefined)params.providerId=options.providerId;
+  // Omit unset model/provider so the installed server default applies.
+  // Explicit values are forwarded byte-exact. A null providerId is also an
+  // omission spelling per the installed schema; it is omitted on the wire.
+  const params={workspaceRoot:options.workspaceRoot};
+  if(options.modelId!==undefined)params.modelId=options.modelId;
+  if(options.providerId!==undefined && options.providerId!==null)params.providerId=options.providerId;
   if(options.approvalMode!==undefined)params.approvalMode=options.approvalMode;
   if(mcpServers!==undefined){
     // The pinned facade omits config until its grant check lands; this raw
@@ -1058,14 +1235,30 @@ async function startNative(command,markNativeAdmissionPossible) {
   const r=await startNativeMcpSession(msp.connection,params,
     {maxAttempts:1,commandId:commandId(command)},mcpServers,latest,markNativeAdmissionPossible);
   rootId=required(r.session,'sessionId'); latest.session=compactSession(r.session);latest.execution=r.session.status;
+  // A new root resets any persisted discovery continuation for the previous one.
+  if(latest.recovery_discovery_cursor?.parent_session_id!==rootId)delete latest.recovery_discovery_cursor;
   // Persist the root identity before any further native work or readback
   // verdict: a crash after session/start must leave a recorded session that
   // explicit recovery can target, not an unrecorded one known only in memory.
   changed(); await checkpoint(true);
-  if(r.session.modelId!==options.modelId)throw new Error('MODEL_READBACK_MISMATCH');
-  if(options.providerId!==undefined && r.session.providerId!==options.providerId)throw new Error('PROVIDER_READBACK_MISMATCH');
-  latest.requested_reasoning_effort=options.reasoningEffort;
-  latest.reasoning_application='explicit_per_turn_option'; // Sampled at submission, not a claimed inference measurement.
+  // Explicit selections must read back exactly. Omitted selections remain
+  // omitted; the session snapshot records native observations separately.
+  if(options.modelId!==undefined) {
+    if(r.session.modelId!==options.modelId)throw new Error('MODEL_READBACK_MISMATCH');
+  }
+  if(options.providerId!==undefined && options.providerId!==null) {
+    if(r.session.providerId!==options.providerId)throw new Error('PROVIDER_READBACK_MISMATCH');
+  }
+  if(options.reasoningEffort===undefined) delete routeDefaults.reasoningEffort;
+  latest.model={modelId:r.session.modelId,providerId:r.session.providerId};
+  latest.requested_model=options.modelId??null;
+  latest.requested_model_status=options.modelId!==undefined?'explicit':'omitted_native_default';
+  latest.requested_provider=options.providerId??null;
+  latest.requested_provider_status=options.providerId!==undefined&&options.providerId!==null?'explicit':'omitted_native_default';
+  latest.requested_reasoning_effort=options.reasoningEffort??null;
+  latest.reasoning_application=options.reasoningEffort!==undefined
+    ?'explicit_per_turn_option' // Sampled at submission, not a claimed inference measurement.
+    :'native_default_at_submission';
   nativeReady=true;changed();
   await checkpoint();
   return {native_scope_key:nativeScope,native_root_id:rootId,details:{session:latest.session,server:init.serverInfo,mcp:{
@@ -1073,7 +1266,10 @@ async function startNative(command,markNativeAdmissionPossible) {
     requested_server_names:latest.mcp_servers_requested??null,
     config_forwarded_server_names:latest.mcp_servers_config_forwarded??null,
     session_start_admission_ack:latest.mcp_servers_admission_ack??null},
-    reasoning:{requested:options.reasoningEffort,application:'per_turn_at_submission'},fingerprint_warning:Boolean(msp.fingerprintWarning)}};
+    requested:{model:latest.requested_model,model_status:latest.requested_model_status,
+      provider:latest.requested_provider,provider_status:latest.requested_provider_status},
+    observed:{modelId:r.session.modelId,providerId:r.session.providerId},
+    reasoning:{requested:latest.requested_reasoning_effort,application:latest.reasoning_application},fingerprint_warning:Boolean(msp.fingerprintWarning)}};
 }
 async function recoverNative(command,markNativeAdmissionPossible) {
   if(!recovery || !rootId || !nativeScope)throw new Error('RECOVERY_CHECKPOINT_UNAVAILABLE');
@@ -1088,9 +1284,9 @@ async function recoverNative(command,markNativeAdmissionPossible) {
   const read=await readNativeSession(rootId,{allowNotLoaded:true});
   const session=compactSession(read.session);
   if(!modelMatches(session,routeDefaults)) {
-    const expected=[...nativePending.values()].some(entry=>entry.kind==='configure' && entry.setting?.key==='model' && modelMatches(session,entry.setting.desired));
+    const expected=[...nativePending.values()].find(entry=>entry.kind==='configure' && entry.setting?.key==='model' && modelMatches(session,entry.setting.desired));
     if(!expected)throw new Error('RECOVERY_MODEL_MISMATCH');
-    routeDefaults.modelId=session.modelId;routeDefaults.providerId=session.providerId??undefined;
+    retainModelOverride(routeDefaults,expected.setting.desired);
     await checkpoint(true);
   }
   await submitNative(command,'session/resume',{sessionId:rootId,excludeItems:true},'recover',undefined,undefined,
@@ -1112,7 +1308,10 @@ async function execute(command) {
         const workFence=await readWorkFence('MODEL_CHANGED_BEFORE_SEND');
         const steer=p.delivery==='steer';
         const promptText=taskPrompt?taskPrompt.envelope.prompt:required(p,'text');
-        const input={sessionId:rootId,input:[{type:'text',text:promptText}],reasoningEffort:routeDefaults.reasoningEffort};
+        // Omit per-turn reasoningEffort when no standing default is set so
+        // the native default applies; an explicit standing value rides verbatim.
+        const input={sessionId:rootId,input:[{type:'text',text:promptText}]};
+        if(routeDefaults.reasoningEffort!==undefined)input.reasoningEffort=routeDefaults.reasoningEffort;
         if(steer)input.expectedTurnId=required(p,'expected_turn_id');else input.ifBusy='queue';
         await submitNative(command,steer?'turn/steer':'turn/start',input,'input',undefined,taskPrompt,entry=>{
           if(!workFenceCurrent(workFence,entry))
@@ -1138,7 +1337,10 @@ async function execute(command) {
         const goal = goalCommand(p,rootId);
         let workFence,beforeNativeRequest;
         if (goal.startsWork) {
-          if (standingEffort !== routeDefaults.reasoningEffort) throw new Error('CONFIGURE_STANDING_EFFORT_BEFORE_GOAL');
+          // With no route override, goals use the native standing default.
+          // Native observations do not create a requested effort constraint.
+          if (routeDefaults.reasoningEffort !== undefined && standingEffort !== routeDefaults.reasoningEffort)
+            throw new Error('CONFIGURE_STANDING_EFFORT_BEFORE_GOAL');
           workFence=await readWorkFence('MODEL_CHANGED_BEFORE_GOAL');
           beforeNativeRequest=entry=>{
             if(!workFenceCurrent(workFence,entry))

@@ -3596,6 +3596,33 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn forge_owner_receipt_requires_exact_live_image_claims() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "store::forge::tests::forge_owner_receipt_image_claims_child",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Forge owner fixture failed: {:?}; stdout={}; stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("FORGE_OWNER_IMAGE_CLAIMS_ASSERTIONS_COMPLETE"),
+            "isolated fixture must finish every receipt assertion"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "isolated process-wide Job/group fixture invoked by the parent test"]
+    fn forge_owner_receipt_image_claims_child() {
         let token = model::new_id();
         let group = swarm_process::Group::enter_module(&token).unwrap();
         let pid = std::process::id();
@@ -3657,17 +3684,19 @@ mod tests {
         // Receipt serialization must preserve the exact restart image claims.
         let restored: Value = serde_json::from_slice(&serde_json::to_vec(&owner).unwrap()).unwrap();
         validate_worker_owner(&job, pid, &restored).unwrap();
+        println!("FORGE_OWNER_IMAGE_CLAIMS_ASSERTIONS_COMPLETE");
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn forge_native_startup_cancellation_retains_child_and_permit_until_exact_departure() {
-        use std::os::unix::process::CommandExt;
+        use std::{os::unix::process::CommandExt, process::Stdio};
+        use tokio::io::AsyncReadExt;
 
         let directory = std::env::temp_dir().join(format!("swarm-forge-owner-{}", model::new_id()));
         fs::create_dir(&directory).unwrap();
         crate::platform::private_permissions(&directory, true).unwrap();
-        let executable = PathBuf::from("/bin/sleep").canonicalize().unwrap();
+        let executable = PathBuf::from("/bin/sh").canonicalize().unwrap();
         let job = NativeWorkerJob {
             kind: "forge",
             phase_name: "fixture",
@@ -3692,14 +3721,66 @@ mod tests {
         let process = Arc::clone(&lane.process);
         let permit = process.clone().try_acquire_owned().unwrap();
         let mut command = TokioCommand::new(&executable);
-        command.arg("30").kill_on_drop(false);
+        // Both commands are shell builtins: after readiness there is no exec
+        // or timed exit before the parent releases stdin or kills the child.
+        command
+            .args(["-c", "printf ready; IFS= read -r release"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(false);
         command.as_std_mut().process_group(0);
         let run = custody
             .spawn_native(&mut command, job.clone(), permit, Some(Arc::clone(&lane)))
             .unwrap();
-        let pid = run.custody.lock().unwrap().pid;
-        let birth = swarm_process::spawned_identity(pid).unwrap();
-        let image = swarm_process::process_image_identity(pid).unwrap();
+        let (pid, release_stdin, ready_stdout) = {
+            let mut entry = run
+                .custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (
+                entry.pid,
+                entry.child.stdin.take(),
+                entry.child.stdout.take(),
+            )
+        };
+        let startup: Result<_> = async {
+            if release_stdin.is_none() {
+                return Err(Error::invalid("fixture stdin barrier is unavailable"));
+            }
+            let mut stdout = ready_stdout
+                .ok_or_else(|| Error::invalid("fixture readiness pipe is unavailable"))?;
+            let mut ready = [0_u8; 5];
+            tokio::time::timeout(Duration::from_secs(5), stdout.read_exact(&mut ready))
+                .await
+                .map_err(|_| {
+                    Error::invalid("fixture readiness did not arrive within its bound")
+                })??;
+            if ready != *b"ready" {
+                return Err(Error::invalid("fixture readiness marker is invalid"));
+            }
+            let birth = swarm_process::spawned_identity(pid)?;
+            let image = swarm_process::process_image_identity(pid)?;
+            Ok((birth, image))
+        }
+        .await;
+        let (birth, image) = match startup {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(release_stdin);
+                let kill_result = run
+                    .custody
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .child
+                    .start_kill();
+                let reaped = wait_worker_exit(&run, Duration::from_secs(5)).await;
+                assert!(
+                    reaped.is_ok(),
+                    "fixture setup failed: {error:?}; exact child cleanup: kill={kill_result:?}, wait={reaped:?}"
+                );
+                panic!("fixture setup failed after reaping its child: {error:?}");
+            }
+        };
         let entry = Arc::clone(&run.custody);
         // Cancel before the owner-receipt await completes. No receipt yet means
         // no inferred family authority, even though the Child is still retained.
@@ -3735,6 +3816,7 @@ mod tests {
         );
         assert!(pending_without_receipt && occupied_without_receipt && validated_late_receipt);
         assert_eq!(process.available_permits(), 1);
+        drop(release_stdin);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3766,9 +3848,16 @@ mod tests {
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
-            "fixture Git command failed: status={:?}, stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
+            "fixture Git command failed: {}",
+            crate::redaction::value(json!({
+                "program":command.get_program().to_string_lossy(),
+                "argv":command.get_args().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+                "cwd":command.get_current_dir().map(Path::to_path_buf)
+                    .or_else(|| std::env::current_dir().ok()),
+                "status":output.status.code(),
+                "stdout":String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(4096)]),
+                "stderr":String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(4096)]),
+            }))
         );
         output.stdout
     }
@@ -3852,7 +3941,7 @@ mod tests {
 
         for bare in [&fetch_repository, &push_repository] {
             let mut command = Command::new(&git);
-            command.arg("init").arg("--bare").arg("--quiet").arg(bare);
+            command.arg("init").arg("--bare").arg(bare);
             checked_fixture_git(&mut command);
         }
         fixture_fetch_ref(&git, &fetch_repository, &checkout, "refs/heads/fetch-base");

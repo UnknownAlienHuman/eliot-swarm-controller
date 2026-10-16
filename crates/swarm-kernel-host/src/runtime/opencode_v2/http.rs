@@ -76,7 +76,12 @@ pub(crate) struct Service {
     client: Client,
     endpoint: Url,
     pub(crate) pid: u32,
+    /// Effective native version: the explicit route pin when one was selected,
+    /// otherwise the exact version observed at attach. Observed versions are
+    /// diagnostic data, never a controller default for another build.
     pub(crate) version: String,
+    expected_version: Option<String>,
+    registered_version: Option<String>,
     owned_process: Option<OwnedProcessIdentity>,
 }
 #[derive(Clone)]
@@ -272,16 +277,20 @@ fn require_owned_process_image(
     Ok(())
 }
 
-fn authenticated_service(record: ConnectionRecord, expected_version: String) -> Result<Service> {
+fn authenticated_service(
+    record: ConnectionRecord,
+    expected_version: Option<String>,
+) -> Result<Service> {
     let endpoint = endpoint(&record.endpoint)?;
-    if record
-        .registered_version
-        .as_ref()
-        .is_some_and(|version| version != &expected_version)
+    if let Some(pin) = expected_version.as_deref()
+        && record
+            .registered_version
+            .as_deref()
+            .is_some_and(|version| version != pin)
     {
         return Err(Error::new(
             "NATIVE_INSTANCE_CHANGED",
-            "native registration version differs from the selected service",
+            "native registration version differs from the explicitly selected service version",
         ));
     }
     let mut headers = header::HeaderMap::new();
@@ -321,7 +330,9 @@ fn authenticated_service(record: ConnectionRecord, expected_version: String) -> 
             .map_err(|_| Error::new("NATIVE_TRANSPORT", "HTTP client initialization failed"))?,
         endpoint,
         pid: record.pid,
-        version: expected_version,
+        version: String::new(),
+        expected_version,
+        registered_version: record.registered_version,
         owned_process: None,
     })
 }
@@ -334,6 +345,8 @@ impl Service {
             endpoint: Url::parse("http://127.0.0.1:1").unwrap(),
             pid,
             version: version.to_owned(),
+            expected_version: None,
+            registered_version: None,
             owned_process: None,
         }
     }
@@ -343,8 +356,8 @@ impl Service {
         let record = tokio::task::spawn_blocking(move || record(&path))
             .await
             .map_err(|_| Error::new("NATIVE_CONNECTION_FILE", "connection reader stopped"))??;
-        let service = authenticated_service(record, options.expected_version.clone())?;
-        service.verify().await?;
+        let mut service = authenticated_service(record, options.expected_version.clone())?;
+        service.adopt_observed_version().await?;
         Ok(service)
     }
 
@@ -399,8 +412,38 @@ impl Service {
                 })?
                 .to_owned(),
         });
-        service.verify().await?;
+        service.adopt_observed_version().await?;
         Ok(service)
+    }
+    /// First-contact version adoption: prove the live process behind the
+    /// connection record, then retain its exact observed version as this
+    /// handle's identity. Without an explicit route pin the observed version
+    /// is diagnostic data, not an admission gate; later `verify` calls still
+    /// fence continuity against the adopted version and live PID.
+    async fn adopt_observed_version(&mut self) -> Result<()> {
+        let info: ServerInfo = decode(self.get("/api/info", &[]).await?)?;
+        if info.pid != self.pid
+            || info.version.trim().is_empty()
+            || info.version.len() > 256
+            || info.version.bytes().any(|byte| byte.is_ascii_control())
+            || self
+                .expected_version
+                .as_deref()
+                .is_some_and(|pin| pin != info.version)
+            || self
+                .registered_version
+                .as_deref()
+                .is_some_and(|version| version != info.version.as_str())
+            || info.urls.is_empty()
+            || info.paths.tmp.is_empty()
+        {
+            return Err(Error::new(
+                "NATIVE_INSTANCE_CHANGED",
+                "native service identity/version differs from the explicit connection record",
+            ));
+        }
+        self.version = info.version;
+        Ok(())
     }
     pub(crate) async fn verify(&self) -> Result<()> {
         // `request` brackets this exact /api/info round trip with the retained
@@ -809,6 +852,52 @@ fn transport_error(effect: bool) -> Error {
         },
         "native transport failed; no automatic mutation replay",
     )
+}
+
+#[cfg(test)]
+mod connection_record_tests {
+    use super::decode_connection_record;
+    use serde_json::json;
+
+    #[test]
+    fn native_registration_carries_its_optional_declared_version() {
+        let registered = decode_connection_record(
+            serde_json::to_vec(&json!({"url":"http://127.0.0.1:9/","pid":7,"version":"2.0.7"}))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(registered.endpoint, "http://127.0.0.1:9/");
+        assert_eq!(registered.pid, 7);
+        assert_eq!(registered.registered_version.as_deref(), Some("2.0.7"));
+
+        let unversioned = decode_connection_record(
+            serde_json::to_vec(&json!({"url":"http://127.0.0.1:9/","pid":7}))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(unversioned.registered_version.is_none());
+
+        // A registration that names no live process or no version text is not
+        // a usable attach record.
+        assert!(
+            decode_connection_record(
+                serde_json::to_vec(&json!({"url":"http://127.0.0.1:9/","pid":0}))
+                    .unwrap()
+                    .as_slice(),
+            )
+            .is_err()
+        );
+        assert!(
+            decode_connection_record(
+                serde_json::to_vec(&json!({"url":"http://127.0.0.1:9/","pid":7,"version":""}))
+                    .unwrap()
+                    .as_slice(),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

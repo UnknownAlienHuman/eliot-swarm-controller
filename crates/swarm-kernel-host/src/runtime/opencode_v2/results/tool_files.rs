@@ -237,7 +237,12 @@ impl Service {
     ) -> Result<ToolFile> {
         let message = self.message(locator.session, locator.message_id).await?;
         complete_assistant(&message)?;
-        if locator.session == locator.root && message["model"] != json!(options.model) {
+        if locator.session == locator.root
+            && options
+                .model
+                .as_ref()
+                .is_some_and(|model| message["model"] != json!(model))
+        {
             return Err(unavailable("RESULT_MODEL_CHANGED"));
         }
         let descriptor = extract_descriptor(&message, locator.tool_call_id, locator.content_index)?;

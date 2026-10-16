@@ -7,7 +7,7 @@ use swarm_contracts::runtime::{
 use swarm_contracts::task_prompt::TaskPromptEnvelopeV1;
 
 pub const ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
-pub const ARTIFACT_VERSION: &str = "5";
+pub const ARTIFACT_VERSION: &str = "6";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationIdentity {

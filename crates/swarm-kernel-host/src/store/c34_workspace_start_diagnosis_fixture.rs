@@ -844,8 +844,8 @@ mod tests {
         let data_directory = fixture_root.join("store");
         for directory in [&repository, &workspace_root, &empty_hooks, &data_directory] {
             std::fs::create_dir_all(directory).expect("create isolated fixture directory");
-            crate::platform::private_permissions(directory, true)
-                .expect("restrict fixture directory to its workspace owner");
+            crate::platform::private_owned_directory(directory)
+                .expect("set fixture directory owner and restrict it to its workspace owner");
         }
         let repository = std::fs::canonicalize(repository).expect("canonicalize fixture repo");
         let workspace_root =
@@ -1178,6 +1178,8 @@ mod tests {
                 baseline_commit.as_str(),
             ],
         );
+        crate::platform::private_owned_directory(&workspace_path)
+            .expect("set the Git-created worktree owner and restrict it to its workspace owner");
         assert_eq!(
             std::fs::canonicalize(Path::new(&workspace_git_path))
                 .expect("canonicalize normalized Git worktree path"),
@@ -1234,7 +1236,9 @@ mod tests {
             reconciled["progressed"], 1,
             "reconcile={reconciled}, operation={retained_readback}, raw_readback_diagnostic={diagnostic}"
         );
-        assert_eq!(reconciled["outcome_unknown"], 0);
+        // This count describes retained launch outcomes, not live writers.
+        // Filesystem proof must not invent a terminal for the old Operation.
+        assert_eq!(reconciled["outcome_unknown"], 1);
         let proof_before_lifecycle = owner
             .store
             .run(move |db| {

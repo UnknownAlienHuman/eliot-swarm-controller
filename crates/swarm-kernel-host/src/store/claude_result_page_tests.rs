@@ -15,7 +15,7 @@ use std::{
     thread,
 };
 
-const ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.5";
+const ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.6";
 const BINDING_ID: &str = "bridge5-result-binding";
 const MODULE_CLIENT_ID: &str = "bridge5-result-module";
 const MODULE_LINK_ID: &str = "bridge5-result-link-1";
@@ -46,6 +46,69 @@ impl Drop for TempStore {
 }
 
 struct FixtureChild(std::process::Child);
+
+const FIXTURE_STDERR_CAPTURE_LIMIT: usize = 4 * 1024;
+
+struct BoundedFixtureStderr {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn capture_bounded_fixture_stderr(mut stderr: impl Read) -> BoundedFixtureStderr {
+    let mut bytes = Vec::with_capacity(FIXTURE_STDERR_CAPTURE_LIMIT);
+    let mut buffer = [0_u8; 1024];
+    let mut truncated = false;
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let retained = read.min(FIXTURE_STDERR_CAPTURE_LIMIT - bytes.len());
+                bytes.extend_from_slice(&buffer[..retained]);
+                truncated |= retained < read;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    BoundedFixtureStderr { bytes, truncated }
+}
+
+fn fixture_stderr_text(stderr: BoundedFixtureStderr) -> String {
+    let mut text = String::from_utf8_lossy(&stderr.bytes).into_owned();
+    if stderr.truncated {
+        text.push_str("\n[stderr truncated after 4096 bytes]");
+    }
+    if text.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        text
+    }
+}
+
+fn finished_fixture_stderr(stderr_reader: thread::JoinHandle<BoundedFixtureStderr>) -> String {
+    if !stderr_reader.is_finished() {
+        return "<unavailable: stderr reader still active>".to_owned();
+    }
+    stderr_reader
+        .join()
+        .map(fixture_stderr_text)
+        .unwrap_or_else(|_| "<unavailable: stderr reader panicked>".to_owned())
+}
+
+fn node_stdout_eof_details(
+    child: &mut FixtureChild,
+    stderr_reader: thread::JoinHandle<BoundedFixtureStderr>,
+) -> String {
+    let exit_status = match child.0.try_wait() {
+        Ok(Some(status)) => format!("observed ({status})"),
+        Ok(None) => "not observed (child still running)".to_owned(),
+        Err(error) => format!("unavailable ({error})"),
+    };
+    format!(
+        "child_exit_status={exit_status}; bounded_stderr={:?}",
+        finished_fixture_stderr(stderr_reader)
+    )
+}
 
 impl Drop for FixtureChild {
     fn drop(&mut self) {
@@ -115,11 +178,7 @@ async fn publish_page_in_bridge(
             "result-page producer stderr is unavailable",
         )
     })?;
-    let stderr_reader = thread::spawn(move || {
-        let mut text = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut text);
-        text
-    });
+    let stderr_reader = thread::spawn(move || capture_bounded_fixture_stderr(stderr));
     writeln!(child_stdin, "{input_line}")
         .map_err(|error| Error::new("FIXTURE_NODE_STDIN", error.to_string()))?;
 
@@ -131,7 +190,10 @@ async fn publish_page_in_bridge(
     if read == 0 {
         return Err(Error::new(
             "FIXTURE_NODE_RESULT_PAGE",
-            "Bridge.5 fixture exited before publishing module.result",
+            format!(
+                "Bridge.5 fixture exited before publishing module.result; {}",
+                node_stdout_eof_details(&mut child, stderr_reader)
+            ),
         ));
     }
     let request: Value = serde_json::from_str(&request_line)
@@ -165,7 +227,10 @@ async fn publish_page_in_bridge(
         if read == 0 {
             return Err(Error::new(
                 "FIXTURE_NODE_RESULT_PAGE",
-                "Bridge.5 fixture exited instead of reporting its uncertain result outcome",
+                format!(
+                    "Bridge.5 fixture exited instead of reporting its uncertain result outcome; {}",
+                    node_stdout_eof_details(&mut child, stderr_reader)
+                ),
             ));
         }
         let outcome_request: Value = serde_json::from_str(&outcome_line)
@@ -194,7 +259,10 @@ async fn publish_page_in_bridge(
     if read == 0 {
         return Err(Error::new(
             "FIXTURE_NODE_RESULT_PAGE",
-            "Bridge.5 fixture exited before reading the result publication receipt",
+            format!(
+                "Bridge.5 fixture exited before reading the result publication receipt; {}",
+                node_stdout_eof_details(&mut child, stderr_reader)
+            ),
         ));
     }
     let terminal: Value = serde_json::from_str(&terminal_line)
@@ -214,9 +282,7 @@ async fn publish_page_in_bridge(
         .0
         .wait()
         .map_err(|error| Error::new("FIXTURE_NODE_EXIT", error.to_string()))?;
-    let stderr = stderr_reader
-        .join()
-        .unwrap_or_else(|_| "fixture stderr reader panicked".to_owned());
+    let stderr = finished_fixture_stderr(stderr_reader);
     if !status.success() {
         return Err(Error::new("FIXTURE_NODE_RESULT_PAGE", stderr));
     }
@@ -305,7 +371,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
                     "route_alias":fixture_route.alias,
                     "module_id":"claude",
                     "artifact_id":ARTIFACT_ID,
-                    "version":"5",
+                    "version":"6",
                     "expected_catalog_revision":registered["catalog_revision"]
                 }),
                 &fixture_config,
@@ -420,7 +486,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
             Ok(())
         })
         .await
-        .expect("select the shipped bridge.5 descriptor and seed one exact Task dispatch");
+        .expect("select the shipped bridge.6 descriptor and seed one exact Task dispatch");
 
     let module = Principal {
         link_id: MODULE_LINK_ID.to_owned(),
@@ -443,7 +509,7 @@ async fn bridge5_sdk_result_page_is_store_acked_readable_and_retired_boot_fenced
     let module_receipt = json!({
         "schema_version":1,
         "module_id":"claude",
-        "artifact":{"artifact_id":ARTIFACT_ID,"version":"5","build_id":null},
+        "artifact":{"artifact_id":ARTIFACT_ID,"version":"6","build_id":null},
         "protocol":{"major":1,"minor":0},
         "binding_id":BINDING_ID,
         "binding_generation":1,

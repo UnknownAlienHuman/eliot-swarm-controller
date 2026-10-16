@@ -5483,8 +5483,14 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     #[tokio::test]
     async fn real_probe_owner_blocks_only_conflicting_preflight_until_exact_family_departure() {
+        const OWNER_PROFILE_REVISION: &str = "pr61-real-owner";
+        const PROBE_PROFILE_REVISION: &str = "pr61-real-probe-error";
         PR61_PROBE_SUCCESS_CALLS.store(0, Ordering::SeqCst);
-        let fixture = probe_error_fixture().await;
+        let fixture = probe_error_fixture_with_profile_revisions(
+            OWNER_PROFILE_REVISION,
+            PROBE_PROFILE_REVISION,
+        )
+        .await;
         let store = &fixture.owner.store;
         let (task_id, attempt_id) = create_attempt(&fixture, "cache-project", None).await;
         let candidate =
@@ -5493,7 +5499,7 @@ mod tests {
             &fixture,
             &attempt_id,
             &candidate.artifact_id,
-            "pr61-probe-error",
+            PROBE_PROFILE_REVISION,
         )
         .await;
 
@@ -5502,12 +5508,12 @@ mod tests {
         let profile_a = fixture
             .config
             .checks
-            .profile("strict", "pr61-probe-error")
+            .profile("strict", PROBE_PROFILE_REVISION)
             .unwrap();
         let profile_b = fixture
             .config
             .checks
-            .profile("strict", "pr61-owner")
+            .profile("strict", OWNER_PROFILE_REVISION)
             .unwrap();
         let scope_a = inputs::ProbeCleanupScope::for_candidate(&profile_a, &verified)
             .expect("derive actual A resource and workspace identity");
@@ -5516,7 +5522,7 @@ mod tests {
         assert!(!scope_a.overlaps(&scope_b));
 
         let (owner, process_fixture) =
-            inputs::tests::pending_probe_custody_fixture(scope_a.clone());
+            inputs::tests::pending_probe_custody_fixture_with_explicit_release(scope_a.clone());
         let target_identity = process_fixture.process_identity("target.identity.json");
         let descendant_identity = process_fixture.process_identity("descendant.identity.json");
         let helper_identity = process_fixture.helper_launch_identity().clone();
@@ -5529,14 +5535,35 @@ mod tests {
             .resolve_check_plan_snapshot(Ok(snapshot_a))
             .await
             .unwrap();
-        match first_a.result {
-            Err(error) => assert_eq!(error.code, "CHECK_PROBE_CLEANUP_PENDING"),
+        let initial_pending_message = match first_a.result {
+            Err(error) => {
+                assert_eq!(error.code, "CHECK_PROBE_CLEANUP_PENDING");
+                error.message
+            }
             Ok(_) => panic!("pending real probe-family custody must hold A preflight"),
-        }
-        assert_eq!(PR61_PROBE_SUCCESS_CALLS.load(Ordering::SeqCst), 1);
+        };
+        assert_eq!(
+            PR61_PROBE_SUCCESS_CALLS.load(Ordering::SeqCst),
+            1,
+            "initial probe resolution: {initial_pending_message}"
+        );
 
         let custody = &store.check_child_custody;
-        assert_eq!(store.check_child_custody_count().await, 1);
+        let before_count = {
+            let owners = custody.probe_cleanup_owners.lock().await;
+            owners
+                .iter()
+                .map(|owner| process_fixture.readiness_diagnostic(owner, true))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            store.check_child_custody_count().await,
+            1,
+            "initial pending={initial_pending_message}; before_count={before_count:?}; helper_departure_proven={}; target_departure_proven={}; descendant_departure_proven={}",
+            process_fixture.process_departed(&helper_identity),
+            process_fixture.process_departed(&target_identity),
+            process_fixture.process_departed(&descendant_identity),
+        );
         {
             let owners = custody.probe_cleanup_owners.lock().await;
             assert_eq!(owners.len(), 1);
@@ -5570,7 +5597,7 @@ mod tests {
             &fixture,
             &attempt_id,
             &candidate.artifact_id,
-            "pr61-probe-error",
+            PROBE_PROFILE_REVISION,
         )
         .await;
         let _probe_a2 =
@@ -5590,8 +5617,13 @@ mod tests {
         );
         drop(_probe_a2);
 
-        let snapshot_b =
-            probe_plan_snapshot(&fixture, &attempt_id, &candidate.artifact_id, "pr61-owner").await;
+        let snapshot_b = probe_plan_snapshot(
+            &fixture,
+            &attempt_id,
+            &candidate.artifact_id,
+            OWNER_PROFILE_REVISION,
+        )
+        .await;
         let _probe_b =
             inputs::override_probe_for_test(&profile_b, count_pr61_successful_input_probe);
         let independent_b = store
@@ -5698,7 +5730,7 @@ mod tests {
         assert!(!owner_scope.overlaps(&incoming_scope));
 
         let (mut owner, process_fixture) =
-            inputs::tests::pending_probe_custody_fixture(owner_scope.clone());
+            inputs::tests::pending_probe_custody_fixture_with_explicit_release(owner_scope.clone());
         owner.set_scope(None);
         let helper_identity = process_fixture.helper_launch_identity().clone();
         let target_identity = process_fixture.process_identity("target.identity.json");
@@ -5715,11 +5747,15 @@ mod tests {
                 "Store retains the live owner as unknown-scope"
             );
         }
+        let helper_departed = process_fixture.process_departed(&helper_identity);
+        let target_departed = process_fixture.process_departed(&target_identity);
+        let descendant_departed = process_fixture.process_departed(&descendant_identity);
         assert!(
-            !process_fixture.process_departed(&helper_identity)
-                && !process_fixture.process_departed(&target_identity)
-                && !process_fixture.process_departed(&descendant_identity),
-            "the exact native helper family is live before the independent preflight"
+            !helper_departed && !target_departed && !descendant_departed,
+            "the exact native helper family is live before the independent preflight; helper_pid={} helper_departed={helper_departed}; target_pid={} target_departed={target_departed}; descendant_pid={} descendant_departed={descendant_departed}",
+            helper_identity["pid"],
+            target_identity["pid"],
+            descendant_identity["pid"],
         );
 
         let blocked_snapshot = probe_plan_snapshot(

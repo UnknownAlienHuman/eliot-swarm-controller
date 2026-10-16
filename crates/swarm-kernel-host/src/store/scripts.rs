@@ -1288,12 +1288,44 @@ impl Store {
                 cause["script_id"] = json!(intent_for_prepare.script_id);
                 cause["script_revision"] = json!(expected_script_revision);
                 if cause["kind"] == "system_event" {
-                    // The event already retained its exact source scope when
-                    // staged. Validate it instead of rebuilding it from the
-                    // current Task or treating its semantic ID as a submission.
-                    automation_dispatch::validate_retained_script_event_cause(
-                        db, &entry.project_id, &cause,
-                    )?;
+                    // Canonicalize an omitted historical scope only from the
+                    // retained source proof. The current source gate above must
+                    // resolve to the same scope; a taskless source stays
+                    // taskless, and the proof reader rejects partial tuples.
+                    let retained_input =
+                        automation_dispatch::validate_retained_script_event_cause(
+                            db, &entry.project_id, &cause,
+                        )?;
+                    let retained_scope = (
+                        retained_input["task_id"].as_str().map(str::to_owned),
+                        retained_input["task_revision"].as_i64(),
+                        retained_input["attempt_id"].as_str().map(str::to_owned),
+                    );
+                    let current_scope = (
+                        source.task_id.clone(),
+                        source.task_revision,
+                        source.attempt_id.clone(),
+                    );
+                    if retained_scope != current_scope {
+                        return Err(Error::new(
+                            "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                            "retained event proof differs from its current Task/Attempt scope",
+                        ));
+                    }
+                    match retained_scope {
+                        (Some(task_id), Some(task_revision), Some(attempt_id)) => {
+                            cause["task_id"] = json!(task_id);
+                            cause["task_revision"] = json!(task_revision);
+                            cause["attempt_id"] = json!(attempt_id);
+                        }
+                        (None, None, None) => {}
+                        _ => {
+                            return Err(Error::new(
+                                "AUTOMATION_LINK_CORRUPT",
+                                "retained event proof has an incomplete Task/Attempt scope",
+                            ));
+                        }
+                    }
                 } else if let (Some(task), Some(attempt)) = (task.as_ref(), attempt.as_ref()) {
                     cause["task_id"] = task["task_id"].clone();
                     cause["task_revision"] = task["revision"].clone();
@@ -1510,7 +1542,11 @@ impl Store {
                             params![operation_caller, request_id],
                             |row| row.get(0),
                         )?;
-                        let link = authorization::operation_link(&tx, &old_operation_id)?
+                        let link =
+                            authorization::script_run_operation_link_for_replay(
+                                &tx,
+                                &old_operation_id,
+                            )?
                             .ok_or_else(|| Error::new("AUTOMATION_LINK_CORRUPT", "replayed triggered ScriptRun has no on-behalf link"))?;
                         if link.action != "script.run"
                             || link.effective_manager_id != grant.entry.owner_manager_id
@@ -2544,7 +2580,19 @@ fn validate_script_trigger_current(
             "current ScriptRun source no longer matches its exact Task/Attempt",
         ));
     }
-    if let Some(task) = task.as_ref() {
+    if grant.cause["kind"] == "system_event" {
+        // Historical event causes may omit an all-null Task/Attempt tuple.
+        // The retained source reader accepts that exact omission, rejects a
+        // partial tuple as link corruption, and reconstructs any immutable
+        // source scope. `require_current_source` above separately checks the
+        // current Manager, selectors, and source liveness, so null legacy
+        // slots must not be compared as changed Task values here.
+        automation_dispatch::validate_retained_script_event_cause(
+            db,
+            &entry.project_id,
+            &grant.cause,
+        )?;
+    } else if let Some(task) = task.as_ref() {
         let current_attempt = attempt.as_ref().ok_or_else(|| {
             Error::new(
                 "SCRIPT_SCOPE_CHANGED",
@@ -6383,6 +6431,102 @@ mod script_trigger_admission_isolation_tests {
             .expect("read manager-scoped ScriptRun explanation")
     }
 
+    fn seed_legacy_null_task_scope(
+        db: &mut rusqlite::Connection,
+        operation_id: &str,
+    ) -> crate::error::Result<(String, String, String, String, String)> {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let operation_key = crate::automation::config::operation_link_key(operation_id)?;
+        let mut link = crate::automation::config::read_record(
+            &tx,
+            &operation_key,
+            "legacy ScriptRun operation link fixture",
+        )?
+        .ok_or_else(|| crate::error::Error::new("NOT_FOUND", "ScriptRun operation link"))?;
+        assert_eq!(link["cause"]["task_id"], "concilium-source-task");
+        assert_eq!(link["cause"]["task_revision"], 1);
+        assert_eq!(link["cause"]["attempt_id"], "concilium-source-attempt");
+        let mut legacy_cause = link["cause"].clone();
+        for field in ["task_id", "task_revision", "attempt_id"] {
+            legacy_cause[field] = Value::Null;
+        }
+        link["cause"] = legacy_cause.clone();
+        crate::automation::config::write_record(&tx, &operation_key, &link)?;
+
+        let entry_key = crate::automation::config::entry_operation_key(
+            OWNER_ID,
+            PROJECT_ID,
+            HEALTHY_AUTOMATION_ID,
+            operation_id,
+        )?;
+        let mut entry_link = crate::automation::config::read_record(
+            &tx,
+            &entry_key,
+            "legacy ScriptRun entry link fixture",
+        )?
+        .ok_or_else(|| crate::error::Error::new("NOT_FOUND", "ScriptRun entry link"))?;
+        entry_link["cause"] = legacy_cause.clone();
+        crate::automation::config::write_record(&tx, &entry_key, &entry_link)?;
+
+        let effective_json: String = tx.query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let mut effective: Value = serde_json::from_str(&effective_json)?;
+        effective["automation_on_behalf"]["cause"] = legacy_cause.clone();
+        tx.execute(
+            "UPDATE operations SET effective_request_json=?1 WHERE operation_id=?2",
+            params![model::canonical(&effective)?, operation_id],
+        )?;
+
+        let spec_json: String = tx.query_row(
+            "SELECT spec_json FROM script_runs WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let mut spec: Value = serde_json::from_str(&spec_json)?;
+        spec["automation_on_behalf"]["cause"] = legacy_cause;
+        tx.execute(
+            "UPDATE script_runs SET spec_json=?1 WHERE operation_id=?2",
+            params![model::canonical(&spec)?, operation_id],
+        )?;
+
+        let original_request_json: String = tx.query_row(
+            "SELECT original_request_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let effective_request_json: String = tx.query_row(
+            "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let spec_json: String = tx.query_row(
+            "SELECT spec_json FROM script_runs WHERE operation_id=?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let operation_link_json: String = tx.query_row(
+            "SELECT value_json FROM meta WHERE key=?1",
+            [&operation_key],
+            |row| row.get(0),
+        )?;
+        let entry_link_json: String = tx.query_row(
+            "SELECT value_json FROM meta WHERE key=?1",
+            [&entry_key],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok((
+            operation_link_json,
+            entry_link_json,
+            original_request_json,
+            effective_request_json,
+            spec_json,
+        ))
+    }
+
     #[tokio::test]
     async fn retained_concilium_cause_admits_one_script_run_and_rejects_scope_mutations() {
         // Seed the exact historical Concilium receipt, then exercise the real
@@ -6467,8 +6611,31 @@ mod script_trigger_admission_isolation_tests {
         assert_eq!(exact_input["task_id"], "concilium-source-task");
         assert_eq!(exact_input["task_revision"], 1);
         assert_eq!(exact_input["attempt_id"], "concilium-source-attempt");
+        // Operation identity is checked against the exact source observation
+        // before the independent Task/Attempt scope authorization checks.
+        let mut altered_operation = intent.clone();
+        altered_operation.cause["operation_id"] = json!("foreign-operation");
+        let failure = owner
+            .store
+            .admit_script_trigger(altered_operation)
+            .await
+            .expect_err("changed source operation_id");
+        assert_eq!(
+            failure.error.code, "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+            "operation_id must match the exact source receipt"
+        );
+        let count = owner
+            .store
+            .run(|db| {
+                Ok(db.query_row("SELECT COUNT(*) FROM script_runs", [], |row| {
+                    row.get::<_, i64>(0)
+                })?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "altered operation_id cannot create a ScriptRun");
+
         for (field, changed) in [
-            ("operation_id", json!("foreign-operation")),
             ("task_id", json!("foreign-task")),
             ("task_revision", json!(2)),
             ("attempt_id", json!("foreign-attempt")),
@@ -6480,19 +6647,10 @@ mod script_trigger_admission_isolation_tests {
                 .admit_script_trigger(altered)
                 .await
                 .expect_err(field);
-            assert!(
-                matches!(
-                    failure.error.code.as_str(),
-                    "SCRIPT_EVENT_SOURCE_UNAUTHORIZED"
-                        | "AUTOMATION_LINK_CORRUPT"
-                        | "SCRIPT_SCOPE_CHANGED"
-                ),
-                "{field}: {}",
-                failure.error.code
+            assert_eq!(
+                failure.error.code, "SCRIPT_EVENT_SOURCE_UNAUTHORIZED",
+                "{field} must match the current source scope"
             );
-            if field != "operation_id" {
-                assert_eq!(failure.error.code, "AUTOMATION_LINK_CORRUPT", "{field}");
-            }
             let count = owner
                 .store
                 .run(|db| {
@@ -6511,6 +6669,8 @@ mod script_trigger_admission_isolation_tests {
             .admit_script_trigger(partial_scope)
             .await
             .expect_err("partial Concilium scope");
+        // A null member is omitted by source-scope comparison, then rejected
+        // by retained-link validation because the tuple is incomplete.
         assert_eq!(failure.error.code, "AUTOMATION_LINK_CORRUPT");
         let count = owner
             .store
@@ -6523,6 +6683,9 @@ mod script_trigger_admission_isolation_tests {
             .unwrap();
         assert_eq!(count, 0, "partial scope cannot create a ScriptRun");
 
+        // This historical cause omitted its Task tuple, while the retained
+        // Concilium proof remains Task-bound. Admission must reconstruct that
+        // exact current scope; it must not turn the run into a taskless one.
         let mut historical_intent = intent.clone();
         for field in ["task_id", "task_revision", "attempt_id"] {
             historical_intent.cause[field] = Value::Null;
@@ -6549,15 +6712,38 @@ mod script_trigger_admission_isolation_tests {
             .await
             .unwrap_or_else(|failure| panic!("historical all-null source: {}", failure.error.code));
         let original_cause = historical_intent.cause.clone();
+        let revoked_manager_intent = historical_intent.clone();
+        let admitted_id = admitted["operation_id"].as_str().unwrap().to_owned();
+        let seed_operation_id = admitted_id.clone();
+        let (
+            legacy_operation_link_json,
+            legacy_entry_link_json,
+            original_request_before,
+            effective_request_before,
+            spec_before,
+        ) = owner
+            .store
+            .run(move |db| seed_legacy_null_task_scope(db, &seed_operation_id))
+            .await
+            .unwrap();
         let retry = owner
             .store
             .admit_script_trigger(historical_intent)
             .await
             .unwrap_or_else(|failure| panic!("historical all-null retry: {}", failure.error.code));
         assert_eq!(admitted["operation_id"], retry["operation_id"]);
-        let admitted_id = admitted["operation_id"].as_str().unwrap().to_owned();
         let inspect_operation_id = admitted_id.clone();
-        let (request_json, run_scope) = owner
+        let (
+            request_json,
+            run_scope,
+            operation_link_json,
+            entry_link_json,
+            effective_request_json,
+            spec_json,
+            saved_link,
+            validated_link_cause,
+            replay_link_cause,
+        ) = owner
             .store
             .run(move |db| {
                 let request_json: String = db.query_row(
@@ -6576,10 +6762,68 @@ mod script_trigger_admission_isolation_tests {
                         ))
                     },
                 )?;
-                Ok((request_json, run_scope))
+                let operation_key =
+                    crate::automation::config::operation_link_key(&inspect_operation_id)?;
+                let entry_key = crate::automation::config::entry_operation_key(
+                    OWNER_ID,
+                    PROJECT_ID,
+                    HEALTHY_AUTOMATION_ID,
+                    &inspect_operation_id,
+                )?;
+                let operation_link_json: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&operation_key],
+                    |row| row.get(0),
+                )?;
+                let entry_link_json: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&entry_key],
+                    |row| row.get(0),
+                )?;
+                let effective_request_json: String = db.query_row(
+                    "SELECT effective_request_json FROM operations WHERE operation_id=?1",
+                    [&inspect_operation_id],
+                    |row| row.get(0),
+                )?;
+                let spec_json: String = db.query_row(
+                    "SELECT spec_json FROM script_runs WHERE operation_id=?1",
+                    [&inspect_operation_id],
+                    |row| row.get(0),
+                )?;
+                let saved_link = crate::automation::config::read_record(
+                    db,
+                    &operation_key,
+                    "retained legacy Concilium ScriptRun link",
+                )?
+                .ok_or_else(|| crate::error::Error::new("NOT_FOUND", "ScriptRun link"))?;
+                let validated_link =
+                    crate::automation::authorization::operation_link(db, &inspect_operation_id)?
+                        .ok_or_else(|| crate::error::Error::new("NOT_FOUND", "validated link"))?;
+                let replay_link =
+                    crate::automation::authorization::script_run_operation_link_for_replay(
+                        db,
+                        &inspect_operation_id,
+                    )?
+                    .ok_or_else(|| crate::error::Error::new("NOT_FOUND", "replay link"))?;
+                Ok((
+                    request_json,
+                    run_scope,
+                    operation_link_json,
+                    entry_link_json,
+                    effective_request_json,
+                    spec_json,
+                    saved_link,
+                    validated_link.cause,
+                    replay_link.cause,
+                ))
             })
             .await
             .unwrap();
+        assert_eq!(operation_link_json, legacy_operation_link_json);
+        assert_eq!(entry_link_json, legacy_entry_link_json);
+        assert_eq!(request_json, original_request_before);
+        assert_eq!(effective_request_json, effective_request_before);
+        assert_eq!(spec_json, spec_before);
         let request: Value = serde_json::from_str(&request_json).unwrap();
         assert_eq!(request["attempt_id"], "concilium-source-attempt");
         assert_eq!(request["expected_task_revision"], 1);
@@ -6598,44 +6842,82 @@ mod script_trigger_admission_isolation_tests {
                 Some("concilium-source-attempt".to_owned()),
             )
         );
-        let saved_link = owner
-            .store
-            .run(move |db| {
-                crate::automation::config::read_record(
-                    db,
-                    &crate::automation::config::operation_link_key(&admitted_id)?,
-                    "retained Concilium ScriptRun link",
-                )?
-                .ok_or_else(|| crate::error::Error::new("NOT_FOUND", "ScriptRun link"))
-            })
-            .await
-            .unwrap();
-        for field in [
-            "kind",
-            "id",
-            "operation_id",
-            "task_id",
-            "task_revision",
-            "attempt_id",
-            "projection",
-        ] {
+        for field in ["kind", "id", "operation_id", "projection"] {
             assert_eq!(
                 saved_link["cause"][field], original_cause[field],
                 "retained {field}"
             );
         }
-        let (count, started) = owner
+        assert_eq!(original_cause["task_id"], Value::Null);
+        assert_eq!(original_cause["task_revision"], Value::Null);
+        assert_eq!(original_cause["attempt_id"], Value::Null);
+        for field in ["task_id", "task_revision", "attempt_id"] {
+            assert_eq!(saved_link["cause"][field], Value::Null);
+            assert_eq!(validated_link_cause[field], Value::Null);
+        }
+        assert_eq!(
+            replay_link_cause["task_id"], "concilium-source-task",
+            "replay view reconstructs the exact proof-bound Task"
+        );
+        assert_eq!(replay_link_cause["task_revision"], 1);
+        assert_eq!(replay_link_cause["attempt_id"], "concilium-source-attempt");
+
+        owner
             .store
             .run(|db| {
-                Ok(db.query_row(
-                    "SELECT COUNT(*),COUNT(started_at_ms) FROM script_runs",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )?)
+                let key = format!("client:{OWNER_ID}");
+                let raw: String =
+                    db.query_row("SELECT value_json FROM meta WHERE key=?1", [&key], |row| {
+                        row.get(0)
+                    })?;
+                let mut manager: Value = serde_json::from_str(&raw)?;
+                manager["disabled"] = json!(true);
+                db.execute(
+                    "UPDATE meta SET value_json=?1 WHERE key=?2",
+                    params![model::canonical(&manager)?, key],
+                )?;
+                Ok(())
             })
             .await
             .unwrap();
-        assert_eq!((count, started), (1, 0));
+        let revoked = owner
+            .store
+            .admit_script_trigger(revoked_manager_intent)
+            .await
+            .expect_err("a revoked Manager cannot replay a retained ScriptRun");
+        assert_eq!(revoked.error.code, "FORBIDDEN");
+
+        let (operations, runs, started) = owner
+            .store
+            .run(move |db| {
+                let request_id: String = db.query_row(
+                    "SELECT client_request_id FROM operations WHERE operation_id=?1",
+                    [&admitted_id],
+                    |row| row.get(0),
+                )?;
+                let operations: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM operations WHERE caller_id=?1 AND client_request_id=?2 AND method='script.run'",
+                    params![
+                        crate::automation::authorization::AUTOMATION_TECHNICAL_REQUESTER_ID,
+                        request_id,
+                    ],
+                    |row| row.get(0),
+                )?;
+                let runs: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM script_runs WHERE operation_id=?1",
+                    [&admitted_id],
+                    |row| row.get(0),
+                )?;
+                let started: i64 = db.query_row(
+                    "SELECT COUNT(started_at_ms) FROM script_runs WHERE operation_id=?1",
+                    [&admitted_id],
+                    |row| row.get(0),
+                )?;
+                Ok((operations, runs, started))
+            })
+            .await
+            .unwrap();
+        assert_eq!((operations, runs, started), (1, 1, 0));
         owner.close().await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }

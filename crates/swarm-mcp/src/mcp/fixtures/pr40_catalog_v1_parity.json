@@ -141,10 +141,10 @@
         "serialized_tool_bytes": 129111
       },
       "current": {
-        "method_count": 127,
-        "catalog_v1": "1b3aa0e9c57b7c3c343e8076c51ac4f5532035fbcd43a74c198057af634a04fc",
-        "surface_v1": "a591dd4c0cdb62265186440c1d8632932eed3c4b42e595756d87b29a755246ab",
-        "serialized_tool_bytes": 153498
+        "method_count": 128,
+        "catalog_v1": "d521c81206354f7706fed162414d75810f6e337387864a01430952ba8644880e",
+        "surface_v1": "86cde3bf856fe26a0bcfb398157c0ca64f3d58034f9c8b5251156da293493660",
+        "serialized_tool_bytes": 154000
       },
       "unchanged": {
         "row_count": 111,
@@ -160,10 +160,10 @@
         "serialized_tool_bytes": 126851
       },
       "current": {
-        "method_count": 137,
-        "catalog_v1": "7905ae4a333b75ec57734d409f91b5cdabd40293ad186762680045743cd633d2",
-        "surface_v1": "2a8936d0e78c7448f865823f7fe6edcf9435b6af1eb69460dc10ddc2a1ac98d3",
-        "serialized_tool_bytes": 152194
+        "method_count": 138,
+        "catalog_v1": "e15eb103b9c77298c3489d772bc36cd52dc763200e35de2ebb3a2e3addbe67ca",
+        "surface_v1": "1af8dbe0e36590ef878982547732313428b219dcf1095342abe661b9fa9847c1",
+        "serialized_tool_bytes": 152696
       },
       "unchanged": {
         "row_count": 120,
@@ -179,10 +179,10 @@
         "serialized_tool_bytes": 155613
       },
       "current": {
-        "method_count": 159,
-        "catalog_v1": "49615667a1b7242dc57c4a54bd5d678bb70f853e48bd18642f5240401af0d016",
-        "surface_v1": "8479b1c3478623c1de10c907f7ffc7db99da07727a319d8b510c6f822ed12b27",
-        "serialized_tool_bytes": 181707
+        "method_count": 160,
+        "catalog_v1": "482bc0f67356afd0f8117d06436eedc58379621a5d7eed683f144d91466ed150",
+        "surface_v1": "7c455e5be1c9d650327684b7024381fcc6bbbf9837a1c48946fd31b62ac14651",
+        "serialized_tool_bytes": 182209
       },
       "unchanged": {
         "row_count": 138,
@@ -452,6 +452,21 @@
       "wire_fields": [
         "inputSchema"
       ]
+    },
+    {
+      "method": "runtime.catalog",
+      "state": "added",
+      "historical_row_digests": {},
+      "current_row_digests": {
+        "full": "c953ea3e371b7a3f1d497bbe35c076d81ca81e96d39159d9b6e421d02bfb7620",
+        "gm": "55aed567f50ec649cce8c627f0e633fe9904f2fd62732bac3fcf0a619a6af993",
+        "manager": "368f13f23fe05277123b8864ed88e625ecaa0f4adb44c6d8f1a6bf96912cb4bd"
+      },
+      "wire_fields": [
+        "catalog_membership",
+        "tool_definition"
+      ],
+      "source_note": "Explicit read-only Manager/GM/full catalog addition in 7277ad6513765a75c37be31a3f5099c60252aa0f; historical rows and unchanged-row digests remain retained."
     },
     {
       "method": "swarm.tools.search",

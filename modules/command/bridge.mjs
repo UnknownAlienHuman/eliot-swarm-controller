@@ -25,7 +25,14 @@ import {
 } from "./glue.mjs";
 
 const ENTRYPOINT = "command_headless_one_shot";
-const FREE_MODEL_ID = "stealth/space-bunny-alpha";
+// No controller model whitelist: the installed CLI documents `-m, --model
+// <model>` as "Run on a specific model this session" (optional per-session
+// override; omission runs the native default) with `/model` and `/config`
+// native settings for the same selection. The distributable keeps the
+// override separately (getModelOverride/clearModelOverride,
+// hasRuntimeModelSelection gate, getConfiguredModel/resolveEffectiveDefaultModel
+// fallback), so absence uses the native default. An explicit model is a
+// validated non-empty string forwarded verbatim; omission omits `--model`.
 // Canonical LF digest of the tracked mod source; glue normalizes CRLF checkouts.
 const PINNED_MOD_SHA256 = "513eaa7d6034cc22b5abf14d080888cdd3e8782133e39f859b7703db123e1f80";
 const CONTRACT_SCHEMA = (schemaId) => ({ schema_id: schemaId, version: "1" });
@@ -34,7 +41,7 @@ const EXPECTED_MODULE_CONTRACT = {
   module_id: "runtime.command",
   artifact: {
     artifact_id: MODULE_ARTIFACT_ID,
-    version: "5",
+    version: "6",
   },
   protocol: { major: 1, minor: 0 },
   capabilities: ["agent.open", "agent.reconcile", "agent.refresh", "task.dispatch"],
@@ -231,9 +238,15 @@ function runDirectory(operationId) {
   return path.join(controlRoot, `op-${sha256Hex(operationId).slice(0, 32)}`);
 }
 function routeModel(command) {
-  const modelId = required(command.route?.native_options ?? {}, "modelId");
-  if (modelId !== modelId.trim()) throw codedError("INVALID_REQUESTED_MODEL");
-  if (modelId !== FREE_MODEL_ID) throw codedError("UNSUPPORTED_ROUTE_MODEL");
+  const nativeOptions = command.route?.native_options ?? {};
+  const modelId = nativeOptions.modelId ?? null;
+  // Omission (absent or explicit null) selects the installed native default:
+  // glue omits `--model` from argv. An explicit value must be a non-empty
+  // trimmed string; no whitelist is enforced here.
+  if (modelId === null || modelId === undefined) return null;
+  if (typeof modelId !== "string" || modelId.trim() === "" || modelId !== modelId.trim()) {
+    throw codedError("INVALID_REQUESTED_MODEL");
+  }
   return modelId;
 }
 function requestedModelFromRoute() {
@@ -319,12 +332,17 @@ async function preflight(command) {
 function unknownTaskOutcome(admission, diagnosticCode, fallback = {}) {
   const operationId = fallback.operation_id ?? admission?.operation_id;
   const facts = fallback.core_binding ?? admission?.core_binding ?? {};
+  // Preserve an explicit null (omitted native default) instead of falling
+  // through to the admission value.
+  const requestedModel = Object.hasOwn(fallback, "requested_model")
+    ? fallback.requested_model
+    : (admission?.requested_model ?? null);
   return {
     outcome: "unknown",
     details: {
       execution_shape: "sessionless_batch",
       batch_run_id: facts.batch_run_id ?? (operationId ? batchRunId(operationId) : null),
-      requested_model: fallback.requested_model ?? admission?.requested_model ?? null,
+      requested_model: requestedModel,
       native_request_model: null,
       native_request_model_status: "unknown",
       native_request_model_evidence: [],
@@ -474,10 +492,16 @@ function matchesCoreBinding(actual, expected) {
 
 function targetDispatchFallback(command, targetOperationId) {
   const input = command.input ?? {};
-  const requestedModel = input.target_command_requested_model;
+  const requestedModel = input.target_command_requested_model ?? null;
   const coreBinding = input.target_command_core_binding;
-  if (typeof requestedModel !== "string"
-      || requestedModel !== routeModel(command)
+  const expectedModel = routeModel(command);
+  const modelMatches = requestedModel === null
+    ? expectedModel === null
+    : typeof requestedModel === "string"
+      && requestedModel.trim() !== ""
+      && requestedModel === requestedModel.trim()
+      && requestedModel === expectedModel;
+  if (!modelMatches
       || !coreBinding
       || typeof coreBinding !== "object"
       || Array.isArray(coreBinding)

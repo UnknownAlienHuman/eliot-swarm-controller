@@ -13,8 +13,8 @@ use swarm_contracts::{
 };
 
 pub const MODULE_ID: &str = "claude";
-pub const ARTIFACT_ID: &str = "claude-agent-sdk-rust-controller.7";
-pub const ARTIFACT_VERSION: &str = "7";
+pub const ARTIFACT_ID: &str = "claude-agent-sdk-rust-controller.8";
+pub const ARTIFACT_VERSION: &str = "8";
 pub const RUNTIME: &str = "module";
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_LAUNCH_VALUE_BYTES: usize = 64 * 1024;
@@ -31,7 +31,7 @@ pub struct NativeOptions {
     pub node_executable: PathBuf,
     pub native_executable: Option<PathBuf>,
     pub claude_config_dir: PathBuf,
-    pub model_id: String,
+    pub model_id: Option<String>,
     pub permission_mode: Option<String>,
     pub allow_dangerously_skip_permissions: bool,
 }
@@ -51,13 +51,16 @@ impl NativeOptions {
                 .as_ref()
                 .is_some_and(|path| !path.is_absolute() || shell_wrapper(path))
             || self.workspace_root.to_str().is_none()
-            || self.model_id.trim().is_empty()
-            || self.model_id.len() > 256
-            || self.model_id.bytes().any(|byte| byte.is_ascii_control())
+            || self.model_id.as_deref().is_some_and(|model| {
+                model.trim().is_empty()
+                    || model != model.trim()
+                    || model.len() > 256
+                    || model.bytes().any(|byte| byte.is_ascii_control())
+            })
         {
             return Err(Error::new(
                 "CONFIG_ERROR",
-                "Claude SDK adapter requires absolute local paths and an explicit model ID",
+                "Claude SDK adapter requires absolute local paths and a valid optional model override",
             ));
         }
         if let Some(mode) = self.permission_mode.as_deref()

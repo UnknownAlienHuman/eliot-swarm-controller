@@ -2,6 +2,13 @@
 
 This runbook covers the standalone adapter packages, independent frontend binaries, and local observer/check executor settings in the current controller config. It installs adapter executables only. It does not install a provider, native service, model, or vendor CLI, and installation or route selection does not qualify those native systems.
 
+Native harness launches inherit the operator's existing environment and profile
+discovery through the supervisor, module owner and adapter. The controller does
+not require a provider-variable allowlist, copy provider credentials or configure
+provider authentication. Reserved controller environment values are replaced
+with the current binding's scoped values; explicit native invocation overrides
+remain optional.
+
 ## Build and install one adapter
 
 New OpenCode qualification runs use
@@ -34,8 +41,8 @@ Build only the selected package, using a caller-owned shared target directory. T
 |---|---|---|---|
 | Codex | `swarm-adapter-codex` | `swarm-codex-adapter` | `crates/swarm-adapter-codex/module-descriptor.template.json` |
 | OpenCode | `swarm-adapter-opencode` | `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/registration/descriptor.template.json` |
-| Command | `swarm-adapter-command` | `swarm-adapter-command` | `crates/swarm-adapter-command/module-descriptor.template.json` (version 3; version 2 is retained separately) |
-| Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` (version 4) |
+| Command | `swarm-adapter-command` | `swarm-adapter-command` | `crates/swarm-adapter-command/module-descriptor.template.json` (Batch version 5); `module-descriptor-acp.template.json` selects ACP version 2. Existing registered versions retain their original contracts. |
+| Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` (version 6) |
 | Claude | `swarm-adapter-claude` | `swarm-adapter-claude` | `modules/claude-rust/module-descriptor.template.json` |
 
 ```powershell
@@ -51,7 +58,7 @@ The host writes the private scoped launch plan and resolver map below its storag
 
 Copy the selected descriptor template outside the checkout. Set `enabled` to `true` only when ready to make that version selectable, and replace the credential placeholder (`<INSTALLER_CREDENTIAL_FILE_REF>` or the retained version-2 `REPLACE_AT_INSTALL` token) with an opaque protected-reference name. Keep adapter identity, protocol, schema, command/event schemas, capabilities, lifecycle and restart policy aligned with that adapter's template. Do not put credential bytes or provider tokens in the descriptor. The installer fills `launch.executable` and `launch.executable_sha256` from the built file.
 
-For Command version 3, keep the typed `module_host_config_path` argument marker unchanged; the supervisor materializes that schema-v1 IPC config inside the exact binding's private state directory at launch. Replace only the final `--config` argument with the absolute path to the operator-maintained Command native config JSON, and make sure that file exists and is readable by the adapter. The installer rejects unresolved `<INSTALLER_...>` and `REPLACE_AT_INSTALL` placeholders, preserves the typed marker, and copies neither the native config nor the Command CLI/mod. The native config contains the native executable and preserved mod paths; it does not select the model. Version 2 keeps its original descriptor and config contract for existing installations.
+For current Command Batch version 5 and ACP version 2, keep the typed `module_host_config_path` argument marker unchanged; the supervisor materializes that schema-v1 IPC config inside the exact binding's private state directory at launch. Replace only the final `--config` argument with the absolute path to the operator-maintained Command native config JSON, and make sure that file exists and is readable by the adapter. The installer rejects unresolved `<INSTALLER_...>` and `REPLACE_AT_INSTALL` placeholders, preserves the typed marker, and copies neither the native config nor the Command CLI/mod. The native config contains the native executable and preserved mod paths; it does not select the model. Current profiles permit an omitted route model and inherit its native default. Retained Batch versions 2/3/4 and ACP version 1 keep their original descriptor, config and receipt contracts for existing bindings.
 
 The separate Antigravity Node artifact `antigravity-cli-warm-bridge.4` uses
 [`modules/antigravity/module-descriptor.template.json`](../../modules/antigravity/module-descriptor.template.json),
@@ -142,15 +149,15 @@ Each route must use the exact Rust artifact ID and workspace field enforced by `
 
 | Route | `runtime` | `module_artifact_id` | `workspace_option` | `native_options` |
 |---|---|---|---|---|
-| Codex | `codex` | `codex-rust-controller.1` | `workspaceRoot` | exactly `modelProvider`, `model`, `workspaceRoot` |
-| OpenCode | `module` | `eliot-opencode-v2.rust-http.1` | `directory` | exactly `service_id`, `connection_file`, `directory`, and `model = { id, providerID, variant }` |
+| Codex | `codex` | `codex-rust-controller.1` | `workspaceRoot` | `workspaceRoot`; independently optional explicit `modelProvider` and `model` |
+| OpenCode | `module` | `eliot-opencode-v2.rust-http.1` | `directory` | `service_id`, `connection_file`, `directory`; optional explicit `model = { id, providerID, variant }` |
 | Command | `command` | `eliot-command.rust-headless.1` | `workspaceRoot` | exactly `modelId`, `workspaceRoot` |
-| Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` (select version 4) | `workspaceRoot` | `modelId = 'gemini-3.8-flash-high'`, `workspaceRoot`; optional `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
+| Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` (select version 6) | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId`, `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
 
 The current standalone OpenCode coordinate is
-`eliot-opencode-v2.rust-http.1@0.6.0`, pinned to
-`opencode-v2-native-options@3` with schema SHA-256
-`070d37891aed021d6a5023cd885647b1403741927e87a0cb28050f30b7c4d97e` in its
+`eliot-opencode-v2.rust-http.1@0.7.0`, pinned to
+`opencode-v2-native-options@4` with schema SHA-256
+`112d277fe7774bef1c05d127a60f6fb8adfef0c6c3dab0e749eef0eb07267ed8` in its
 descriptor. The OpenCode 2.0.7 compatibility path submits flat `text` plus the
 `metadata.eliot` marker and admits only an exact `SessionInbox.User` item.
 Its acknowledgement carries no admission or promotion sequence; actual
@@ -159,15 +166,16 @@ the bounded readback, and no sequence is synthesized. A legacy
 `promoted_sequence` may represent inbox delivery only; it is not execution
 proof and does not set `execution_complete`. Its external-attach route
 has no `expected_version`; observed server version remains diagnostic. The
-artifact ID and config schema digest remain stable while the artifact version
-is `0.6.0` for this changed input-admission contract. Retained v1/v2
-descriptors continue to decode their historical version field, and fresh-owned
-routes keep the exact owner-contract version check. The separate built-in
+artifact ID is stable, while the version and schema digest above identify the
+current source candidate. Native model defaults apply when no override is supplied.
+Provider credentials and isolated-owner launch options are not exposed. Retained
+v1/v2/v3 descriptors keep historical readback; fresh private SDK starts are retired.
+The separate built-in
 `eliot-opencode-v2.http.2` route is current for new TaskPrompt bindings and keeps
-its own native service version contract. Built-in `.1` remains available only
+an optional caller version pin plus observed-instance continuity checks. Built-in `.1` remains available only
 for retained bindings and Operations; new `.1` bindings are rejected.
 
-The standalone Rust Codex source descriptor template declares version `10` under the stable artifact ID `codex-rust-controller.1`. Keep that ID in the route; choose version `10` as the exact catalog coordinate in `module.route.select`. Version 4 introduced normalized result pages with `swarm.normalized_result_context@1` and `swarm.normalized_result_page@1`; version 8 retains that contract and the goal evidence schemas added in version 6, while deriving the local native-store namespace from canonical `codexHome`. The result selector is exactly `{ "kind": "codex_assistant_result", "input_operation_id": "<exact task.dispatch operation ID>" }`; Store validates and seals that producer identity. Older selected descriptor versions and existing bindings are not upgraded by this selection. The generic installer copies the supplied descriptor version without translating or enabling it.
+The standalone Rust Codex source descriptor template declares version `11.4` under the stable artifact ID `codex-rust-controller.1`. Keep that ID in the route; choose version `11.4` as the exact catalog coordinate in `module.route.select`. Version 4 introduced normalized result pages with `swarm.normalized_result_context@1` and `swarm.normalized_result_page@1`; version 8 retains that contract and the goal evidence schemas added in version 6, while deriving the local native-store namespace from canonical `codexHome`. The result selector is exactly `{ "kind": "codex_assistant_result", "input_operation_id": "<exact task.dispatch operation ID>" }`; Store validates and seals that producer identity. Older selected descriptor versions and existing bindings are not upgraded by this selection. The generic installer copies the supplied descriptor version without translating or enabling it.
 
 For example, the route tables use the normal controller TOML shape:
 

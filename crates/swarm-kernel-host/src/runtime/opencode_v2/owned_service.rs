@@ -7,25 +7,32 @@
 //! starts a replacement.
 
 use super::{ModelRef, Options, Service, mcp_plugin};
+#[cfg(test)]
+use crate::platform::process_group::Group;
 use crate::{
     config::OwnedOpenCodeServiceConfig,
     error::{Error, Result},
     model,
     platform::{
         private_permissions,
-        process_group::{Group, process_birth_identity, process_image_identity},
+        process_group::{process_birth_identity, process_image_identity},
     },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::process::Command;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+#[cfg(test)]
+use std::{
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
@@ -40,12 +47,15 @@ const MAX_OWNER_BYTES: usize = 64 * 1024;
 const MAX_HANDSHAKE_BYTES: usize = 32 * 1024;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 4096;
+#[cfg(test)]
 const MAX_BUN_STDERR_BYTES: usize = 16 * 1024;
+#[cfg(test)]
 const MAX_BUN_STDERR_DIAGNOSTIC_BYTES: usize = 48 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_REQUEST_PREFIX: &str = "stop_deadline_unix_ms=";
+#[cfg(test)]
 const MAX_STOP_REQUEST_BYTES: usize = 64;
 
 /// One cross-process deadline. The timestamp is created before launch
@@ -211,9 +221,9 @@ impl OwnedServiceRoute {
         Options {
             service_id: self.service_id.clone(),
             connection_file: self.connection_file.clone(),
-            expected_version: VERSION.to_owned(),
+            expected_version: Some(VERSION.to_owned()),
             directory: self.workspace_directory.clone(),
-            model: self.model.clone(),
+            model: Some(self.model.clone()),
         }
     }
 
@@ -1317,8 +1327,9 @@ fn materialize_launch(
     })
 }
 
-/// Hidden CLI entrypoint. It creates a non-killing per-service Job in this
-/// helper process before Bun is spawned; the root host is never assigned to it.
+/// Test-only implementation retained for the expired-deadline fixture. The
+/// public CLI entrypoint is permanently fenced in `opencode_v2`.
+#[cfg(test)]
 pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
     let plan = read_plan(plan_path)?;
     validate_plan(&plan, plan_path)?;
@@ -1510,6 +1521,7 @@ pub(crate) fn run_owned_service_helper(plan_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn read_stop_deadline() -> Result<SharedDeadline> {
     let stdin = std::io::stdin();
     let mut request = Vec::with_capacity(MAX_STOP_REQUEST_BYTES);
@@ -1539,6 +1551,7 @@ fn read_stop_deadline() -> Result<SharedDeadline> {
     })
 }
 
+#[cfg(test)]
 fn wait_for_bun_exit(
     bun: &mut std::process::Child,
     deadline: SharedDeadline,
@@ -1551,6 +1564,7 @@ fn wait_for_bun_exit(
     }
 }
 
+#[cfg(test)]
 fn wait_for_family_empty(group: &Group, deadline: SharedDeadline) {
     loop {
         if matches!(group.children_empty(), Ok(true)) {
@@ -1560,6 +1574,7 @@ fn wait_for_family_empty(group: &Group, deadline: SharedDeadline) {
     }
 }
 
+#[cfg(test)]
 fn stop_poll_interval(deadline: SharedDeadline) -> Duration {
     match deadline.expired() {
         Ok(false) => Duration::from_millis(100),
@@ -1567,6 +1582,7 @@ fn stop_poll_interval(deadline: SharedDeadline) -> Duration {
     }
 }
 
+#[cfg(test)]
 fn bun_command(plan: &HelperPlan) -> Command {
     let mut command = Command::new(&plan.bun_executable);
     command
@@ -1593,6 +1609,7 @@ fn bun_command(plan: &HelperPlan) -> Command {
     command
 }
 
+#[cfg(test)]
 fn wait_for_ready(
     plan: &HelperPlan,
     bun: &mut std::process::Child,
@@ -1694,6 +1711,7 @@ fn wait_for_ready(
     }
 }
 
+#[cfg(test)]
 fn readiness_timeout_error(
     plan: &HelperPlan,
     helper_observation: &HelperObservation,
@@ -1747,6 +1765,7 @@ struct ConnectionRecord {
     username: String,
     password: String,
 }
+#[cfg(test)]
 struct ReadyRecord {
     pid: u32,
     endpoint: String,
@@ -2026,6 +2045,7 @@ enum SafeProcessIdentityFailureCode {
 }
 
 impl SafeProcessIdentityFailureCode {
+    #[cfg(test)]
     fn from_error(error: &Error) -> Self {
         match error.code.as_str() {
             "PROCESS_GONE" => Self::ProcessGone,
@@ -2088,6 +2108,7 @@ struct HelperStartStageReceipt {
     immediate_process_status: Option<ImmediateProcessStatus>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BunStderrReaderStatus {
@@ -2097,6 +2118,7 @@ enum BunStderrReaderStatus {
     Unavailable,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct BunStderrCapture {
     retained_prefix: Vec<u8>,
@@ -2105,6 +2127,7 @@ struct BunStderrCapture {
     status: BunStderrReaderStatus,
 }
 
+#[cfg(test)]
 impl BunStderrCapture {
     fn new(status: BunStderrReaderStatus) -> Self {
         Self {
@@ -2116,12 +2139,14 @@ impl BunStderrCapture {
     }
 }
 
+#[cfg(test)]
 fn unavailable_bun_stderr_capture() -> Arc<Mutex<BunStderrCapture>> {
     Arc::new(Mutex::new(BunStderrCapture::new(
         BunStderrReaderStatus::Unavailable,
     )))
 }
 
+#[cfg(test)]
 fn start_bun_stderr_capture<R>(reader: R) -> Arc<Mutex<BunStderrCapture>>
 where
     R: Read + Send + 'static,
@@ -2145,6 +2170,7 @@ where
     capture
 }
 
+#[cfg(test)]
 fn drain_bun_stderr<R: Read>(mut reader: R, capture: Arc<Mutex<BunStderrCapture>>) {
     let mut buffer = [0_u8; 4096];
     loop {
@@ -2190,6 +2216,7 @@ struct HelperFamilyStopReceipt {
 }
 
 impl HelperObservation {
+    #[cfg(test)]
     fn current(plan: &HelperPlan) -> Result<Self> {
         let helper_pid = std::process::id();
         let identity = process_birth_identity(helper_pid)?
@@ -2291,6 +2318,7 @@ impl HelperStartStageReceipt {
     }
 }
 
+#[cfg(test)]
 fn write_helper_start_receipt(
     plan: &HelperPlan,
     helper: &HelperObservation,
@@ -2326,6 +2354,7 @@ fn write_helper_start_receipt(
     write_private_new(&path, body.as_bytes())
 }
 
+#[cfg(test)]
 fn write_process_identity_failed_receipt(
     plan: &HelperPlan,
     helper: &HelperObservation,
@@ -2367,6 +2396,7 @@ fn write_process_identity_failed_receipt(
     )
 }
 
+#[cfg(test)]
 fn write_bun_stderr_diagnostic(
     plan: &HelperPlan,
     helper: &HelperObservation,
@@ -2427,6 +2457,7 @@ fn write_bun_stderr_diagnostic(
     )
 }
 
+#[cfg(test)]
 fn write_helper_observation(plan: &HelperPlan) -> Result<HelperObservation> {
     let observation = HelperObservation::current(plan)?;
     write_private_new(
@@ -2436,6 +2467,7 @@ fn write_helper_observation(plan: &HelperPlan) -> Result<HelperObservation> {
     Ok(observation)
 }
 
+#[cfg(test)]
 fn write_helper_family_stop(plan: &HelperPlan, observation: &HelperObservation) -> Result<()> {
     observation.validate(&plan.owner_nonce, &plan.route_digest)?;
     if observation.helper_pid != std::process::id() {
@@ -2500,6 +2532,7 @@ fn helper_family_departed(route: &OwnedServiceRoute) -> Result<Option<String>> {
 }
 
 impl ProcessObservation {
+    #[cfg(test)]
     fn for_spawned_process(plan: &HelperPlan, pid: u32) -> Result<Self> {
         if pid == 0 {
             return Err(readback_error("spawned owner process has no PID"));
@@ -2597,6 +2630,7 @@ fn load_owner_connection(
     Ok((owner, connection, digest))
 }
 
+#[cfg(test)]
 fn proof_from_ready(plan: &HelperPlan, ready: &ReadyRecord, image: &Value) -> Result<Value> {
     verify_image_identity(image, ready.pid, &plan.bun_sha256)?;
     let birth = process_birth_token(image)?;
@@ -2722,6 +2756,7 @@ fn clean_stop_records(
     }))
 }
 
+#[cfg(test)]
 fn verify_stopped_plan(plan: &HelperPlan) -> Result<()> {
     let Some(receipts) = clean_stop_records(
         &plan.state_root,
@@ -3193,6 +3228,7 @@ fn safe_helper_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
         })
         .collect()
 }
+#[cfg(test)]
 fn safe_bun_environment(state_root: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut values = safe_helper_environment();
     let private_home = state_root.join("home");
@@ -3435,7 +3471,7 @@ fn config_error(message: &str) -> Error {
     Error::new("OWNED_SERVICE_CONFIG", message)
 }
 
-fn native_harness_required() -> Error {
+pub(super) fn native_harness_required() -> Error {
     Error::new(
         "OWNED_SERVICE_NATIVE_HARNESS_REQUIRED",
         "an already-running native OpenCode harness is required; fresh owned-service lifecycle is disabled",

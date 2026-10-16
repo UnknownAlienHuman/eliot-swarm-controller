@@ -951,6 +951,10 @@ pub(super) fn require_selected_native_command(
 /// `None` means the binding has no retained descriptor and must keep legacy
 /// route behavior. `Some(true/false)` is an exact compatibility answer for a
 /// selected module descriptor.
+fn command_control_artifact_supported(artifact_id: &str, version: &str) -> bool {
+    artifact_id == "eliot-command.acp-rust.1" && matches!(version, "1" | "2")
+}
+
 pub(super) fn selected_native_command_supported(
     db: &Connection,
     binding_artifact_id: &str,
@@ -1019,13 +1023,14 @@ pub(super) fn selected_native_command_supported(
             .command_schemas
             .contains(&native_mcp_command_schema());
     let command_control_supported = !command_control
-        || (retained.artifact.artifact_id.as_str() == "eliot-command.acp-rust.1"
-            && retained.artifact.version.as_str() == "1"
-            && retained.command_schemas.iter().any(|schema| {
-                schema.schema_id == "swarm.runtime_command"
-                    && schema.version == "1"
-                    && schema.sha256.is_none()
-            }));
+        || (command_control_artifact_supported(
+            retained.artifact.artifact_id.as_str(),
+            retained.artifact.version.as_str(),
+        ) && retained.command_schemas.iter().any(|schema| {
+            schema.schema_id == "swarm.runtime_command"
+                && schema.version == "1"
+                && schema.sha256.is_none()
+        }));
     let is_opencode_artifact = retained.module_id.as_str() == "eliot.opencode.v2"
         && retained.artifact.artifact_id.as_str() == "eliot-opencode-v2.rust-http.1";
     let opencode_reply_schema_supported = !is_opencode_artifact
@@ -1088,6 +1093,23 @@ mod tests {
         ActivationPolicy, ArtifactId, LaunchSpec, LifecycleOwnership, ModuleId, ProtectedRef,
         RestartPolicy, Sha256Digest,
     };
+
+    #[test]
+    fn command_control_accepts_acp_v1_and_v2_retained_descriptors() {
+        assert!(command_control_artifact_supported(
+            "eliot-command.acp-rust.1",
+            "1"
+        ));
+        assert!(command_control_artifact_supported(
+            "eliot-command.acp-rust.1",
+            "2"
+        ));
+        assert!(!command_control_artifact_supported(
+            "eliot-command.acp-rust.1",
+            "3"
+        ));
+        assert!(!command_control_artifact_supported("other-artifact", "2"));
+    }
 
     fn descriptor() -> ModuleDescriptor {
         ModuleDescriptor {

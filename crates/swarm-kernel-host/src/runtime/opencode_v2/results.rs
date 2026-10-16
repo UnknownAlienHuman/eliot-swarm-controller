@@ -369,7 +369,14 @@ impl Service {
                     valid_id(id, "msg_")?;
                     let message = self.message(session, id).await?;
                     complete_assistant(&message)?;
-                    if session == root && message["model"] != json!(options.model) {
+                    // A pinned route trio fences model drift; on native harness
+                    // defaults the native model is observed, never gated.
+                    if session == root
+                        && options
+                            .model
+                            .as_ref()
+                            .is_some_and(|model| message["model"] != json!(model))
+                    {
                         return Err(unavailable("RESULT_MODEL_CHANGED"));
                     }
                     if self.message(session, id).await? != message {

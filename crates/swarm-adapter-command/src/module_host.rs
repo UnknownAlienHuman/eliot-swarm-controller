@@ -1,12 +1,14 @@
 //! Host contract checks for the versioned Rust Command artifact.
 //!
-//! Copy this file to `crates/swarm-adapter-command/src/module_host.rs` when
-//! applying `adapter-host.patch`. Descriptor capabilities are compatibility
-//! metadata only; Store still authorizes each existing module RPC separately.
+//! Descriptor capabilities are compatibility metadata only; Store still
+//! authorizes each existing module RPC separately.
 
 use std::{env, path::PathBuf};
 
-use crate::{ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION, ARTIFACT_ID, ARTIFACT_VERSION, Profile};
+use crate::{
+    ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION, ACP_V1_ARTIFACT_VERSION, ARTIFACT_ID, ARTIFACT_VERSION,
+    BATCH_V4_ARTIFACT_VERSION, BATCH_V5_ARTIFACT_VERSION, Profile,
+};
 use serde_json::Value;
 use swarm_contracts::{
     error::{Error, Result},
@@ -67,8 +69,10 @@ pub fn load_claim_and_verify_owner(owner_record: &Value) -> Result<ModuleHostIde
 
     let profile = match (artifact_id.as_str(), artifact_version.as_str()) {
         (ARTIFACT_ID, ARTIFACT_VERSION) => Profile::BatchV3,
-        (ARTIFACT_ID, "4") => Profile::BatchV4,
-        (ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION) => Profile::AcpV1,
+        (ARTIFACT_ID, BATCH_V4_ARTIFACT_VERSION) => Profile::BatchV4,
+        (ARTIFACT_ID, BATCH_V5_ARTIFACT_VERSION) => Profile::BatchV5,
+        (ACP_ARTIFACT_ID, ACP_V1_ARTIFACT_VERSION) => Profile::AcpV1,
+        (ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION) => Profile::AcpV2,
         _ => {
             return Err(Error::new(
                 "MODULE_CONTRACT_MISMATCH",
@@ -175,10 +179,12 @@ fn command_capabilities_match(claim: &ModuleContractClaim, profile: Profile) -> 
         "task.dispatch",
     ];
     let expected: &[&str] = match profile {
-        Profile::BatchV3 | Profile::BatchV4 => &V3,
-        Profile::AcpV1 if claim.capabilities.len() == ACP_V1.len() => &ACP_V1,
-        Profile::AcpV1 if claim.capabilities.len() == ACP_V1_CLOSE.len() => &ACP_V1_CLOSE,
-        Profile::AcpV1 => return false,
+        Profile::BatchV3 | Profile::BatchV4 | Profile::BatchV5 => &V3,
+        Profile::AcpV1 | Profile::AcpV2 if claim.capabilities.len() == ACP_V1.len() => &ACP_V1,
+        Profile::AcpV1 | Profile::AcpV2 if claim.capabilities.len() == ACP_V1_CLOSE.len() => {
+            &ACP_V1_CLOSE
+        }
+        Profile::AcpV1 | Profile::AcpV2 => return false,
     };
     claim.capabilities.len() == expected.len()
         && claim
@@ -201,15 +207,15 @@ fn schemas_match(claim: &ModuleContractClaim, profile: Profile) -> bool {
     let normalized_results = normalized_result_schemas_match(claim);
     match profile {
         Profile::BatchV3 => legacy || normalized || normalized_results,
-        Profile::BatchV4 => acp_v1_schemas_match(claim),
-        Profile::AcpV1 => acp_v1_schemas_match(claim),
+        Profile::BatchV4 | Profile::BatchV5 => acp_v1_schemas_match(claim),
+        Profile::AcpV1 | Profile::AcpV2 => acp_v1_schemas_match(claim),
     }
 }
 
 pub fn normalized_dispatch_enabled(claim: &ModuleContractClaim) -> bool {
     matches!(
         profile_for_claim(claim),
-        Some(Profile::BatchV4 | Profile::AcpV1)
+        Some(Profile::BatchV4 | Profile::BatchV5 | Profile::AcpV1 | Profile::AcpV2)
     ) || exact_schema_set(
         &claim.command_schemas,
         &["swarm.runtime_command", "swarm.task_dispatch_context"],
@@ -223,14 +229,14 @@ pub fn normalized_result_enabled(claim: &ModuleContractClaim) -> bool {
     normalized_result_schemas_match(claim)
         || matches!(
             profile_for_claim(claim),
-            Some(Profile::BatchV4 | Profile::AcpV1)
+            Some(Profile::BatchV4 | Profile::BatchV5 | Profile::AcpV1 | Profile::AcpV2)
         ) && acp_v1_schemas_match(claim)
 }
 
 pub fn task_prompt_v1_enabled(claim: &ModuleContractClaim) -> bool {
     matches!(
         profile_for_claim(claim),
-        Some(Profile::BatchV4 | Profile::AcpV1)
+        Some(Profile::BatchV4 | Profile::BatchV5 | Profile::AcpV1 | Profile::AcpV2)
     ) && acp_v1_schemas_match(claim)
 }
 
@@ -240,8 +246,10 @@ fn profile_for_claim(claim: &ModuleContractClaim) -> Option<Profile> {
         claim.artifact.version.as_str(),
     ) {
         (ARTIFACT_ID, ARTIFACT_VERSION) => Some(Profile::BatchV3),
-        (ARTIFACT_ID, "4") => Some(Profile::BatchV4),
-        (ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION) => Some(Profile::AcpV1),
+        (ARTIFACT_ID, BATCH_V4_ARTIFACT_VERSION) => Some(Profile::BatchV4),
+        (ARTIFACT_ID, BATCH_V5_ARTIFACT_VERSION) => Some(Profile::BatchV5),
+        (ACP_ARTIFACT_ID, ACP_V1_ARTIFACT_VERSION) => Some(Profile::AcpV1),
+        (ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION) => Some(Profile::AcpV2),
         _ => None,
     }
 }
@@ -303,7 +311,7 @@ pub fn receipt_identity_for_input(
     operation_id: &str,
     input_sha256: &str,
 ) -> Result<ModuleReceiptIdentity> {
-    if operation_id.trim().is_empty() || !is_sha256(input_sha256) {
+    if operation_id.trim().is_empty() || !crate::is_lower_sha256_hex(input_sha256) {
         return Err(Error::new(
             "MODULE_RECEIPT_IDENTITY_INVALID",
             "module receipt input identity is invalid",
@@ -372,7 +380,7 @@ pub fn attach_receipt_identity(
     } else {
         None
     }
-    .filter(|digest| is_sha256(digest))
+    .filter(|digest| crate::is_lower_sha256_hex(digest))
     .ok_or_else(|| {
         Error::new(
             "MODULE_RECEIPT_IDENTITY_MISSING",
@@ -458,19 +466,15 @@ pub fn validate_saved_receipt(
     Ok(())
 }
 
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
     use swarm_contracts::module_contract::ModuleContractClaim;
 
-    use super::{ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION, Profile, command_capabilities_match};
+    use super::{
+        ACP_ARTIFACT_ID, ACP_ARTIFACT_VERSION, ACP_V1_ARTIFACT_VERSION, Profile,
+        command_capabilities_match, profile_for_claim,
+    };
 
     fn claim(capabilities: Value) -> ModuleContractClaim {
         serde_json::from_value(json!({
@@ -502,7 +506,7 @@ mod tests {
         assert!(!capabilities.contains(&json!("agent.configure")));
         assert!(command_capabilities_match(
             &claim(json!(capabilities)),
-            Profile::AcpV1
+            Profile::AcpV2
         ));
 
         let mut old_capabilities = descriptor["capabilities"]
@@ -513,7 +517,31 @@ mod tests {
         old_capabilities.sort_by_key(|value| value.to_string());
         assert!(!command_capabilities_match(
             &claim(json!(old_capabilities)),
-            Profile::AcpV1
+            Profile::AcpV2
         ));
+    }
+
+    #[test]
+    fn descriptor_versions_keep_legacy_model_policy_and_receipt_profile() {
+        let current_capabilities = json!([
+            "agent.open",
+            "agent.reconcile",
+            "agent.refresh",
+            "agent.reply",
+            "agent.result",
+            "agent.send/next_turn",
+            "native.command.cancel_turn",
+            "task.dispatch"
+        ]);
+        let current = claim(current_capabilities.clone());
+        assert_eq!(profile_for_claim(&current), Some(Profile::AcpV2));
+        assert!(Profile::AcpV2.model_optional());
+
+        let mut legacy = current;
+        legacy.artifact.version =
+            swarm_contracts::module_catalog::ArtifactVersion::new(ACP_V1_ARTIFACT_VERSION).unwrap();
+        assert_eq!(profile_for_claim(&legacy), Some(Profile::AcpV1));
+        assert!(!Profile::AcpV1.model_optional());
+        assert!(command_capabilities_match(&legacy, Profile::AcpV1));
     }
 }
