@@ -3282,6 +3282,8 @@ pub(crate) mod tests {
     const PROBE_CUSTODY_REQUEST_ENV: &str = "ELIOT_PROBE_CUSTODY_REQUEST";
     const PROBE_CUSTODY_TARGET_ENV: &str = "ELIOT_PROBE_CUSTODY_TARGET_ENTRY";
     const PROBE_CUSTODY_DESCENDANT_ENV: &str = "ELIOT_PROBE_CUSTODY_DESCENDANT_ENTRY";
+    const PROBE_CUSTODY_STORE_OWNER_ENV: &str = "ELIOT_PROBE_CUSTODY_STORE_OWNER_ENTRY";
+    const PROBE_CUSTODY_DIRECTORY_ENV: &str = "ELIOT_PROBE_CUSTODY_DIRECTORY";
 
     fn probe_custody_file(control: &Path, name: &str) -> PathBuf {
         control.join(name)
@@ -3313,11 +3315,88 @@ pub(crate) mod tests {
 
     #[test]
     fn probe_nested_helper_entry() {
+        if std::env::var(PROBE_CUSTODY_STORE_OWNER_ENV).as_deref() == Ok("1") {
+            run_probe_custody_store_owner_fixture();
+            // Keep the test harness from appending its own text after the
+            // framed response consumed by ProbeHelperCustody.
+            std::process::exit(0);
+        }
         let Some(request) = std::env::var_os(PROBE_CUSTODY_REQUEST_ENV) else {
             return;
         };
         let result = run_probe(Path::new(&request));
         std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+
+    fn run_probe_custody_store_owner_fixture() {
+        let control = PathBuf::from(
+            std::env::var_os(PROBE_CUSTODY_CONTROL_ENV).expect("probe custody control directory"),
+        );
+        let directory = PathBuf::from(
+            std::env::var_os(PROBE_CUSTODY_DIRECTORY_ENV)
+                .expect("probe custody protocol directory"),
+        );
+        let mut owner = ProbeOwner {
+            group: Group::enter(&model::new_id()).expect("enter the exact probe-family owner"),
+        };
+        persist_probe_owner(&directory.join("probe-owner.json"), &owner.group.identity)
+            .expect("persist the exact probe-family identity");
+
+        let executable = std::env::current_exe().expect("test executable path");
+        let mut target_command = Command::new(executable);
+        target_command
+            .args([
+                "--exact",
+                "checks::inputs::tests::probe_nested_target_entry",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(PROBE_CUSTODY_CONTROL_ENV, &control)
+            .env(PROBE_CUSTODY_TARGET_ENV, "1");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            target_command.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+        }
+        let mut target = target_command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the exact probe-family target");
+
+        let target_exit = probe_custody_file(&control, "target.exit");
+        let descendant_exit = probe_custody_file(&control, "descendant.exit");
+        while !target_exit.exists() || !descendant_exit.exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        target.wait().expect("reap the exact probe-family target");
+        while !owner
+            .group
+            .children_empty()
+            .expect("observe exact probe-family membership")
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        owner
+            .release()
+            .expect("disarm only after exact probe-family departure");
+        // This fixture proves custody release only; it did not execute a
+        // metadata/version command and must never masquerade as probe output.
+        encode_probe_response(
+            &ProbeResponse {
+                success: false,
+                timed_out: false,
+                output_limited: false,
+                exit_code: None,
+                group_empty: true,
+                message: "store probe custody fixture".into(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            std::io::stdout().lock(),
+        )
+        .expect("write a complete framed probe-family response");
     }
 
     #[test]
@@ -3610,6 +3689,135 @@ pub(crate) mod tests {
             // Store may release its owner before this fixture independently
             // checks departure. Keep that exact Job observable throughout both
             // observations instead of treating a vanished name as empty.
+            fixture.helper_family_query = Some(
+                Group::open_check_query(
+                    owner
+                        .custody
+                        .family_identity
+                        .as_ref()
+                        .expect("helper family"),
+                    fixture
+                        .helper_family_token
+                        .as_deref()
+                        .expect("helper token"),
+                )
+                .expect("retain the fixture's exact helper Job observation"),
+            );
+        }
+        (owner, fixture)
+    }
+
+    /// Store handoff tests need a family held until their explicit release,
+    /// independent of execute_probe's production command deadline. This helper
+    /// still uses a real named Job/process group and the production owner poll.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn pending_probe_custody_store_fixture(
+        scope: ProbeCleanupScope,
+    ) -> (ProbeCleanupOwner, ProbeCustodyFixture) {
+        let directory =
+            std::env::temp_dir().join(format!("swarm-probe-custody-store-{}", model::new_id()));
+        let control = std::env::temp_dir().join(format!("swarm-probe-control-{}", model::new_id()));
+        fs::create_dir(&directory).expect("create probe protocol directory");
+        fs::create_dir(&control).expect("create probe control directory");
+        let response_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join(PROBE_HELPER_RESPONSE_FILE))
+            .expect("create helper response capture");
+        let executable = std::env::current_exe().expect("test executable path");
+        let mut helper = Command::new(executable);
+        helper
+            .args([
+                "--exact",
+                "checks::inputs::tests::probe_nested_helper_entry",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(PROBE_CUSTODY_STORE_OWNER_ENV, "1")
+            .env(PROBE_CUSTODY_CONTROL_ENV, &control)
+            .env(PROBE_CUSTODY_DIRECTORY_ENV, &directory);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            helper.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+        }
+        let mut child = helper
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn controlled exact probe-family owner");
+        let helper_pid = child.id();
+        let helper_launch_identity =
+            spawned_identity(helper_pid).expect("capture probe-family owner launch identity");
+        let stdout = child.stdout.take().expect("capture helper stdout pipe");
+        let custody = ProbeHelperCustody {
+            child,
+            child_pid: helper_pid,
+            launch_identity: Some(helper_launch_identity.clone()),
+            stdout: Some(stdout),
+            response_file: Some(response_file),
+            capture: None,
+            directory: directory.clone(),
+            family_identity: None,
+            family_token: None,
+            #[cfg(windows)]
+            family_query: None,
+            #[cfg(windows)]
+            next_family_cancel: None,
+            exit_status: None,
+            status_observation_failed: false,
+            capture_setup_failed: false,
+            response_group_empty: None,
+            family_departed_proven: false,
+            cleanup_complete: false,
+        };
+        let mut owner = ProbeCleanupOwner {
+            custody,
+            scope: Some(scope),
+        };
+        let mut fixture = ProbeCustodyFixture {
+            directory: directory.clone(),
+            control: control.clone(),
+            helper_pid,
+            helper_launch_identity: Some(helper_launch_identity),
+            helper_family_token: None,
+            #[cfg(windows)]
+            helper_family_query: None,
+        };
+        let target_identity_path = probe_custody_file(&control, "target.identity.json");
+        let descendant_identity_path = probe_custody_file(&control, "descendant.identity.json");
+        let target_ready_path = probe_custody_file(&control, "target.ready");
+        let identities_deadline = Instant::now() + Duration::from_secs(10);
+        while (!target_identity_path.exists()
+            || !descendant_identity_path.exists()
+            || !target_ready_path.exists())
+            && Instant::now() < identities_deadline
+        {
+            owner.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            target_identity_path.exists()
+                && descendant_identity_path.exists()
+                && target_ready_path.exists(),
+            "controlled target and nested process publish identities and become ready"
+        );
+        assert!(
+            owner.custody.capture.is_some() && !owner.custody.capture_setup_failed,
+            "the real helper stdout capture is active at Store handoff"
+        );
+        assert!(
+            owner.is_pending(),
+            "live nested helper custody stays pending"
+        );
+        fixture.helper_family_token = owner.custody.family_token.clone();
+        assert!(
+            fixture.helper_family_token.is_some(),
+            "capture the exact helper family token before Store handoff"
+        );
+        #[cfg(windows)]
+        {
             fixture.helper_family_query = Some(
                 Group::open_check_query(
                     owner
