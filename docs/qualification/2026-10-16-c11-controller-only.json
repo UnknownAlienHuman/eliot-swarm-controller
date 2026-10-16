@@ -1,0 +1,148 @@
+{
+  "record": "c11-controller-only",
+  "date": "2026-10-16",
+  "branch": "codex/swarm-c11-proof-20261016v",
+  "source_commit": "54e30898245d54897d532f5f13d1d10dafeda916",
+  "source_tree": "922ed5f0d700cf7c6f8d8b8185c687d363863cd4",
+  "source_files": [
+    "swarm-probe-mcp-delivery-20261014:.local/c11-current-head-next-20261016u.json",
+    "swarm-probe-mcp-delivery-20261014:.local/c11-current-head-build-20261016u.json"
+  ],
+  "raw_result_sha256": "c469a930bdd46f2f8ebad15dee543968603a78afc5ba6e1b54ed1bef5e47b60a",
+  "raw_build_sha256": "16e0f8629ca1aef45bfa6c0c51ada2e803b4d3941b01efe33598ef2a22c641b",
+  "build_profile": "release",
+  "build_complete_utc": "2026-10-16T11:42:24.3177038Z",
+  "cargo_rustc_observed_active": false,
+  "binary_image_sha256": {
+    "swarm_kernel_host": "75277b11904f40d8880b234fe7424559a4afd4bb0f648606e2e8f2686ffc96d4",
+    "swarm_supervisor": "d5e95a6af9b88fb3a6205ec360094e3ac5a5c914b8c6035f855fbef958260ff7"
+  },
+  "local_paths_and_hostname_omitted": true,
+  "target_events_per_second": 1000,
+  "throughput_target_met": false,
+  "native_agents_measured": 0,
+  "whole_project_qualification": false,
+  "method_limits": [
+    "single measurement only (n=1); no statistics beyond the recorded run",
+    "no build observed in this worktree; binaries measured in source checkout (cargo_rustc_observed_active=false)",
+    "benchmark not rerun in this worktree",
+    "other machine activity uncontrolled during the recorded run",
+    "no statistical speedup claim; 187.2 events/s against target 1000 is UNMET on this single run"
+  ],
+  "checks": {
+    "json_parse": "both source JSON files parsed successfully",
+    "binary_hash_match": "run-record image_sha256 values match build-record hashes (case-insensitive) for both binaries",
+    "source_and_tree_match": "build source_head and tree match this worktree HEAD 54e30898245d54897d532f5f13d1d10dafeda916 and tree 922ed5f0d700cf7c6f8d8b8185c687d363863cd4",
+    "exact_drain": "4147 sent, 0 errors; verification drain 4147 matches admissions (matches_admissions=true)",
+    "clean_exit_no_agents": "host exit code 0; native_modules_connected 0"
+  },
+  "result": {
+    "scope": "host-only fixture load; no native runtimes, bridges or model calls",
+    "host_identity": {
+      "executable": "<local installed swarm-kernel-host.exe>",
+      "image_sha256": "75277b11904f40d8880b234fe7424559a4afd4bb0f648606e2e8f2686ffc96d4",
+      "pid": 81084,
+      "role": "swarm-kernel-host"
+    },
+    "supervisor_identity": {
+      "executable": "<local installed swarm-supervisor.exe>",
+      "image_sha256": "d5e95a6af9b88fb3a6205ec360094e3ac5a5c914b8c6035f855fbef958260ff7",
+      "role": "swarm-supervisor",
+      "started_by": "swarm-kernel-host"
+    },
+    "controller_version": "0.1.0",
+    "sqlite_version": "3.53.2",
+    "registration": {
+      "clients": 200,
+      "seconds": 0.45
+    },
+    "connect_all": {
+      "clients": 200,
+      "seconds": 0.058
+    },
+    "status_latency_idle": {
+      "count": 50,
+      "min_ms": 0.192,
+      "p50_ms": 0.35,
+      "p95_ms": 0.503,
+      "p99_ms": 1.03,
+      "max_ms": 1.03,
+      "mean_ms": 0.36
+    },
+    "task_create_latency": {
+      "count": 200,
+      "min_ms": 1.613,
+      "p50_ms": 2.403,
+      "p95_ms": 4.183,
+      "p99_ms": 5.749,
+      "max_ms": 7.851,
+      "mean_ms": 2.577
+    },
+    "event_load": {
+      "seconds": 22.154,
+      "senders": 32,
+      "consumers": 168,
+      "message_send_ok": 4147,
+      "message_send_errors": 0,
+      "error_codes": {},
+      "events_per_second": 187.2,
+      "consumer_message_read_calls": 2527,
+      "consumer_items_read": 3483
+    },
+    "status_latency_under_load": {
+      "count": 361,
+      "min_ms": 0.526,
+      "p50_ms": 0.921,
+      "p95_ms": 1.396,
+      "p99_ms": 2.317,
+      "max_ms": 4.8,
+      "mean_ms": 0.996
+    },
+    "verification_drain": {
+      "events_after_baseline": 4147,
+      "message_send_events": 4147,
+      "matches_admissions": true,
+      "seconds": 0.485,
+      "events_per_second": 8551.9
+    },
+    "status_latency_after_load": {
+      "count": 50,
+      "min_ms": 0.519,
+      "p50_ms": 0.646,
+      "p95_ms": 0.963,
+      "p99_ms": 1.334,
+      "max_ms": 1.334,
+      "mean_ms": 0.696
+    },
+    "final_status": {
+      "tasks": 200,
+      "queued_operations": 0,
+      "native_modules_connected": 0
+    },
+    "database_bytes": 7196672,
+    "host_cpu_seconds": 23.296875,
+    "driver_cpu_seconds": 1.3,
+    "host_rss": {
+      "idle_bytes": 19951616,
+      "peak_bytes": 55250944,
+      "final_bytes": 42807296
+    },
+    "shutdown_disposition": "owned_fixture_host_stdin_eof",
+    "host_exit_code": 0,
+    "environment": {
+      "platform": "Windows-11-10.0.26300-SP0",
+      "machine": "AMD64",
+      "cpu_count": 32,
+      "python": "3.13.15",
+      "loadavg_at_start": null
+    },
+    "parameters": {
+      "clients": 200,
+      "senders": 32,
+      "duration_seconds": 20,
+      "tasks": 200,
+      "ipc_defaults": "max_connections=256, max_inflight_per_connection=8, max_frame_bytes=1048576 (config.rs defaults; no --config passed)"
+    }
+  }
+}
+
