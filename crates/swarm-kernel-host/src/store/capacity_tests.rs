@@ -2958,11 +2958,7 @@ fn direct_agent_open_permits_manager_and_denies_unscoped_roles() {
             crate::model::Role::Observer,
             "observer",
         ),
-        (
-            "direct-open-module",
-            crate::model::Role::Module,
-            "module",
-        ),
+        ("direct-open-module", crate::model::Role::Module, "module"),
     ] {
         db.execute(
             "INSERT INTO meta(key,value_json) VALUES(?1,?2)",
@@ -2972,8 +2968,7 @@ fn direct_agent_open_permits_manager_and_denies_unscoped_roles() {
             ],
         )
         .unwrap();
-        let principal =
-            current_principal(&db, read_scope_principal(client_id, role)).unwrap();
+        let principal = current_principal(&db, read_scope_principal(client_id, role)).unwrap();
         let denied_request = json!({
             "client_request_id": format!("{client_id}-request"),
             "lane_id": format!("{client_id}-lane"),
