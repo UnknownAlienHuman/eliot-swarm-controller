@@ -1747,7 +1747,11 @@ mod tests {
             .expect("read the retained launch and its exact owner quarantine");
         assert_eq!(marker_count, 1, "one exact Launcher quarantine is retained");
         assert_eq!(retained_request, raw_request);
-        let marker: Value = serde_json::from_str(&marker_json).expect("decode quarantine evidence");
+        let marker = crate::automation::config::open_record(
+            serde_json::from_str(&marker_json).expect("decode quarantine envelope"),
+            "launcher quarantine fixture",
+        )
+        .expect("verify and open the producer's retained quarantine record");
         assert_eq!(marker["code"], "NATIVE_MCP_RECORD_CORRUPT");
         assert_eq!(
             marker["evidence"]["subject_identity"],
