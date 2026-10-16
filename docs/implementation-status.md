@@ -1,6 +1,12 @@
 # Implementation status
 
 ## Current state
+### RootOps source gates (2026-10-16; source `adaf3469fa92cc45a8e7fe00012c15acdd83a101`)
+
+RootOps' retained source and log evidence records bounded gates for immutable Codex 11.4 small-item pages and turn-status readback; the admitted-to-completed producer lifecycle and scoped shutdown dispatch; Claude EOF/write retirement; and Command pre-notification cancellation. Codex passed 32 cases with two ignored; the shared contract passed 2/2; Claude passed 42 with two ignored. Both Command cancellation regressions passed, including `process_control_during_turn`; the producer SQLite regression and scoped-shutdown public Store regression passed. Strict all-target Clippy passed for Host, Command, and Claude. CI for source `3552b434` passed on Linux and Windows. CI for this source was still running; no result is recorded here.
+
+A new Controller development-profile public host has started. Root is separately qualifying its typed result; this update does not claim that result. Independent delivery acceptance/publication and cross-harness live, release, and full-product qualification remain open. The development-profile startup does not establish native productive execution or release/full-product readiness. The project remains **PARTIAL_PROGRESS**; whole-product READY is not established.
+
 ### Native authorization correction (2026-10-15)
 
 The controller uses the already authorized native OpenCode service. Provider credential sources, key bootstrap and provider-auth proof gates are removed. Direct connection accepts the native service registration in place; controller IPC/MCP credentials remain independent. Fresh isolated SDK service starts are retired, with historical custody/readback retained. Earlier entries below describing provider authorization or isolated-owner qualification are historical, not the current supported launch contract.
@@ -11,7 +17,7 @@ The standalone schema-4 adapter now permits native model defaults and omits the 
 
 ### Current source and completion map
 
-**Source baseline:** [ec4642910bbe0911337e3985e50a828d6a7d626b](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/ec4642910bbe0911337e3985e50a828d6a7d626b); documentation-only PR #24 was merged at 6cd5b1b. The project remains **PARTIAL_PROGRESS**. The [README capability matrix](../README.md#capability-and-qualification-matrix) is the per-component artifact and evidence view; states stay scoped to the recorded artifact and run.
+**Current source checkpoint:** [adaf3469fa92cc45a8e7fe00012c15acdd83a101](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/adaf3469fa92cc45a8e7fe00012c15acdd83a101). **Broader completion-map baseline:** [ec4642910bbe0911337e3985e50a828d6a7d626b](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/ec4642910bbe0911337e3985e50a828d6a7d626b), with documentation-only PR #24 merged at 6cd5b1b. Existing entries retain their recorded source/run scope. The [README capability matrix](../README.md#capability-and-qualification-matrix) is the per-component artifact and evidence view; states stay scoped to the recorded artifact and run.
 
 #### Issue #153 source reconciliation
 
