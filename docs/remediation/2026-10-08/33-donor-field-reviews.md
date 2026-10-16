@@ -25,11 +25,11 @@
 |---|---|---|---|
 | ACP Rust SDK | Client/Agent/Proxy/Conductor, version guards | restore routing и replay до response; Windows console popup | TAKE + SPIKE |
 | ractor | local supervision и Kill→Stop→Supervision→Work | per-actor memory; cluster not production-ready | TAKE semantics |
-| Kingfisher | Rust rule corpus, fingerprints, validation fixtures | false-negative validation, JSON count drift, `--jobs 1` hang | TAKE corpus only |
+| Kingfisher | Rust rule corpus, fingerprints, validation fixtures | false-negative validation, JSON count drift, `--jobs 1` hang | SPIKE (see correction below) |
 | AgentGateway | data-only CEL policy | unavailable phase fields, claim arrays panic, one backend kills fanout | SPIKE |
 | MCPProxy | progressive disclosure, approval snapshot, quarantine | BM25 14% Top-1/916 tools; stale index after approval | TAKE quarantine; benchmark search |
 | Langfuse | trace UI, prompt/version/evals | ClickHouse/migrations, OTLP drops/drift, unbounded query overload | sink/UI only |
-| OpenTelemetry Rust | vendor-neutral OTLP | shutdown deadlocks, span loss, runtime coupling/leak reports | bounded exporter spike |
+| OpenTelemetry Rust | vendor-neutral OTLP | shutdown deadlocks, span loss, runtime coupling/leak reports | SPIKE |
 | DBOS | step memo, durable ID before effect | empty-ID ghost forks, offset-before-intent, drain/replay races | REFERENCE |
 | Restate | awakeables/durable correlation | restart resumes immediately, memory/failover, active-but-stuck partition | REFERENCE |
 | portable-pty | PTY abstraction | Windows read/EOF/order and ConPTY cursor behavior | SPIKE |
@@ -134,7 +134,7 @@ CEL не заменяет Store object authorization.
 
 ### 6.3 Kingfisher
 
-Брать Rust rules, scanner и fingerprints как второй слой поверх Atlas. Не принимать CLI verdict.
+**Correction, 16 October 2026 (ELIOT `cb3b6c18`).** The earlier “TAKE corpus only” verdict in this review does not establish a shipped consumer, and the “second layer over Atlas” phrasing conflates two different mechanisms. Kingfisher stays `SPIKE` in [the registry](36-donor-registry.md): no `kingfisher` package, import, manifest entry or named production consumer exists in this checkout. Atlas Redact is a separately adopted donor, documented with its exact pin, hash coverage, wrapper and consumers in [the registry](36-donor-registry.md); it redacts retained text before persistence and is not an advisory secret-scanning verdict layer. Kingfisher becomes `TAKE` only when a current product requirement names its exact input owner, trigger, output DTO and consumer, per [the 14 October owner correction on #153](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/153#issuecomment-6170715223). Не принимать CLI verdict.
 
 Reports:
 
@@ -168,7 +168,7 @@ Operational reports:
 
 ### 7.2 OpenTelemetry Rust
 
-Брать `tracing` и explicit bounded OTLP/HTTP exporter. Не тащить global provider или auto-instrumentation в core.
+**Correction, 16 October 2026 (ELIOT `cb3b6c18`).** Статус — `SPIKE`, не `TAKE`. В этом checkout нет OpenTelemetry/OTLP пакета, импорта или зависимости `tracing-appender`/`tracing-subscriber`; операционный producer — локальный `crates/swarm-telemetry`, а не внедрение OpenTelemetry. Без названного future consumer D07 остаётся bounded exporter/trace-context кандидатом. Не тащить global provider или auto-instrumentation в core.
 
 Reports: [#3542](https://github.com/open-telemetry/opentelemetry-rust/issues/3542) lifecycle/shutdown umbrella, [#3176](https://github.com/open-telemetry/opentelemetry-rust/issues/3176) current-thread force_flush deadlock, [#2978](https://github.com/open-telemetry/opentelemetry-rust/issues/2978) gRPC span loss, [#2778](https://github.com/open-telemetry/opentelemetry-rust/issues/2778) memory leak report.
 
