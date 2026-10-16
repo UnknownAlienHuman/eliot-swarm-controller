@@ -502,10 +502,36 @@ async fn run_supervisor_process_loop(
             }
             return Err(error);
         }
-        // The host alone chooses and durably admits the next actor UUID. This
-        // happens only after exact prior-child reconciliation and before the
-        // final child bootstrap frame is constructed.
+        // The host alone chooses the next actor UUID only after exact
+        // prior-child reconciliation. Validate the exact serialized child
+        // frame BEFORE durable admission so an oversized retained set cannot
+        // burn the actor fence; the live supervisor already rejects such hot
+        // updates before catalog publication via
+        // StandaloneSupervisorConfig::ensure_hot_descriptor_restartable.
         let actor_instance_id = Uuid::new_v4().to_string();
+        let child_bootstrap = SupervisorBootstrap {
+            config: bootstrap.config.clone(),
+            actor_instance_id: Some(actor_instance_id.clone()),
+        };
+        let frame = match child_bootstrap.to_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                let error = module_error(error);
+                let error = match record_module_actor_status(
+                    &store,
+                    "isolated",
+                    failures.saturating_add(1).min(32),
+                    Some(&error.code),
+                    Some(MODULE_ACTOR_ISOLATED_RETRY),
+                )
+                .await
+                {
+                    Ok(()) => error,
+                    Err(health_error) => return Err(error.with_secondary_error(health_error)),
+                };
+                return Err(error);
+            }
+        };
         if let Err(error) = store
             .admit_module_supervisor_actor(&actor_instance_id)
             .await
@@ -533,29 +559,6 @@ async fn run_supervisor_process_loop(
             }
             continue;
         }
-        let child_bootstrap = SupervisorBootstrap {
-            config: bootstrap.config.clone(),
-            actor_instance_id: Some(actor_instance_id),
-        };
-        let frame = match child_bootstrap.to_frame() {
-            Ok(frame) => frame,
-            Err(error) => {
-                let error = module_error(error);
-                let error = match record_module_actor_status(
-                    &store,
-                    "isolated",
-                    failures.saturating_add(1).min(32),
-                    Some(&error.code),
-                    Some(MODULE_ACTOR_ISOLATED_RETRY),
-                )
-                .await
-                {
-                    Ok(()) => error,
-                    Err(health_error) => return Err(error.with_secondary_error(health_error)),
-                };
-                return Err(error);
-            }
-        };
 
         // Persist the launch intent, then use the existing bounded Store
         // readback before the first exec. A pending intent
