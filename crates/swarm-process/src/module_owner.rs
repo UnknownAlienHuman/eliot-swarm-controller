@@ -1482,8 +1482,18 @@ mod tests {
         };
 
         let error = run_module_with_resolver(plan.clone(), &EmptyRefResolver).unwrap_err();
+        let launch_path = state_dir.join("launch-result.json");
+        assert!(
+            launch_path.is_file(),
+            "missing launch-result.json after run_module_with_resolver error: code={} message={} owner_exists={} worker_exists={} state_dir={}",
+            error.code,
+            error.message,
+            state_dir.join("owner.json").exists(),
+            state_dir.join("worker.json").exists(),
+            state_dir.display()
+        );
         let receipt: Value =
-            serde_json::from_slice(&fs::read(state_dir.join("launch-result.json")).unwrap())
+            serde_json::from_slice(&fs::read(&launch_path).unwrap())
                 .unwrap();
         let owner: Value =
             serde_json::from_slice(&fs::read(state_dir.join("owner.json")).unwrap()).unwrap();
