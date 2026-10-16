@@ -2395,7 +2395,7 @@ impl GitHelperCustody {
         if !status.success() {
             return Err(Error::new(
                 "HOOK_GIT_HELPER_FAILED",
-                "bounded Git helper exited without a successful response",
+                format!("bounded Git helper exited without a successful response ({status})"),
             ));
         }
         if self.capture_setup_failed {
