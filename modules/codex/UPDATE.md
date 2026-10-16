@@ -12,14 +12,14 @@
 | License | Apache-2.0 (`vendor_bridge/LICENSE`) |
 | Legacy Python bridge artifact | `codex-sdk-18194bf-bridge.3` |
 | Standalone Rust artifact | `codex-rust-controller.1` |
-| Standalone Rust descriptor version | `11.2` (current; prior versions remain historical contracts) |
+| Standalone Rust descriptor version | `11.3` (current; prior versions remain historical contracts) |
 | Standalone Rust package / binary | `swarm-adapter-codex` / `swarm-codex-adapter` |
 | Standalone Rust source | `crates/swarm-adapter-codex` |
 | Runtime dependencies | exact pins in `requirements.txt` |
 
 The donor and bridge.2/bridge.3 sections below describe only the legacy Python
 bridge artifact `.3` under `modules/codex`. The standalone Rust artifact
-`.1`, current descriptor version `11.2`, is a separate package and does not vendor
+`.1`, current descriptor version `11.3`, is a separate package and does not vendor
 or update this Python SDK unit.
 
 ## Legacy Python bridge artifact `.3`: ELIOT-owned changes in bridge.2
@@ -61,11 +61,11 @@ remains `openai-codex-cli-bin==0.153.4`. The
 [security patch record](VENDOR-SECURITY-PATCHES.md) retains the original and
 patched hashes; `verify_vendor.py` checks the complete patched unit.
 
-## Standalone Rust controller artifact `.1`, current descriptor version `11.2`
+## Standalone Rust controller artifact `.1`, current descriptor version `11.3`
 
 The Rust adapter is separate from the legacy Python bridge and is sourced from
 `crates/swarm-adapter-codex`, with artifact `codex-rust-controller.1` and
-descriptor version `11.2`. It retains the v4 normalized dispatch/result schema
+descriptor version `11.3`. It retains the v4 normalized dispatch/result schema
 pair, TaskPrompt v1 and Goal continuation admission/terminal evidence
 schemas, and uses the exact route contract `runtime = "codex"`,
 `workspace_option = "workspaceRoot"`, and native options `modelProvider`,
@@ -93,6 +93,16 @@ app-server accepted all three history reads with `experimentalApi: false`.
 The current source retains that native client default. A missing flag is not
 established as the cause of `-32601`; failed readback remains unknown and does
 not authorize input replay.
+
+Version 11.3 reconnects a terminal native RPC channel only for an admitted
+`agent.reconcile` or `agent.result`. It first retains the old observer fault,
+then initializes a fresh client on the same configured endpoint and credential
+reference. A different native scope is rejected without replacing the retained
+root proof or exposing foreign-scoped observations. Reconnection does not open
+a thread or send model input. The source factory, adapter constant and descriptor
+template share the same current artifact version; older installed images stay
+immutable. Native task completion and controller outcome resolution remain
+separate facts and require exact readback.
 
 The current controller retains the v6 result boundary described below; the
 descriptor version change does not add child-history or tool-item projection.
