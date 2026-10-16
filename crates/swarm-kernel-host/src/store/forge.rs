@@ -3941,7 +3941,7 @@ mod tests {
 
         for bare in [&fetch_repository, &push_repository] {
             let mut command = Command::new(&git);
-            command.arg("init").arg("--bare").arg("--quiet").arg(bare);
+            command.arg("init").arg("--bare").arg(bare);
             checked_fixture_git(&mut command);
         }
         fixture_fetch_ref(&git, &fetch_repository, &checkout, "refs/heads/fetch-base");

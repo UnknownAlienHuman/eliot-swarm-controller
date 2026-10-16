@@ -5747,11 +5747,15 @@ mod tests {
                 "Store retains the live owner as unknown-scope"
             );
         }
+        let helper_departed = process_fixture.process_departed(&helper_identity);
+        let target_departed = process_fixture.process_departed(&target_identity);
+        let descendant_departed = process_fixture.process_departed(&descendant_identity);
         assert!(
-            !process_fixture.process_departed(&helper_identity)
-                && !process_fixture.process_departed(&target_identity)
-                && !process_fixture.process_departed(&descendant_identity),
-            "the exact native helper family is live before the independent preflight"
+            !helper_departed && !target_departed && !descendant_departed,
+            "the exact native helper family is live before the independent preflight; helper_pid={} helper_departed={helper_departed}; target_pid={} target_departed={target_departed}; descendant_pid={} descendant_departed={descendant_departed}",
+            helper_identity["pid"],
+            target_identity["pid"],
+            descendant_identity["pid"],
         );
 
         let blocked_snapshot = probe_plan_snapshot(
