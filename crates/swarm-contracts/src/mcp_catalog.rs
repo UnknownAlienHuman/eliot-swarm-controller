@@ -2262,6 +2262,9 @@ fn build_input_schema(
         schema["required"] = json!(required);
     }
     refine_input_schema(spec.method, &mut schema);
+    // Keep wire and digest bytes stable when workspace feature unification
+    // enables serde_json/preserve_order.
+    schema.sort_all_objects();
     match schema {
         Value::Object(map) => Arc::new(map),
         _ => unreachable!("schema literal is an object"),
@@ -4068,7 +4071,8 @@ fn field_schema(kind: &str) -> Value {
     }
 }
 
-fn raw_schema(value: Value) -> Arc<JsonObject> {
+fn raw_schema(mut value: Value) -> Arc<JsonObject> {
+    value.sort_all_objects();
     match value {
         Value::Object(map) => Arc::new(map),
         _ => unreachable!("schema literal is an object"),
