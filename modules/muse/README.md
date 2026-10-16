@@ -6,6 +6,11 @@ Before activation, register and retain the exact bridge.13 descriptor before
 selecting it for a new binding. Existing bindings keep their original artifact
 identity and code; an artifact ID must never be relabelled or cross-served.
 
+This package remains an existing compatibility bridge around the official Node
+SDK. Its stateful checkpoint, recovery and native-control code is still Node;
+the Rust adapter migration required by the [modular architecture](../../docs/agent-operations/modularity.md#6-implementation-sequence-and-completion-criteria)
+remains incomplete. The bridge's fixture results apply to this implementation.
+
 ## Ownership and setup
 
 The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next/outcome/observe/result`; its credential is scoped to the reserved binding/generation and cannot accept Tasks or become GM. Native subscription/auth, tools and model loop remain in Muse.
@@ -119,6 +124,16 @@ command schemas and `swarm.task_dispatch_admission@1` as an event schema, with
 the existing runtime command/outcome schemas and `task.dispatch` capability.
 
 ## Recorded-session recovery — bridge.5
+
+The current bridge.13 source also discovers children created while disconnected
+by reading the exact root's durable `view/page` events. Each pass reads at most
+ten pages of 100 events; an incomplete pass checkpoints the opaque continuation
+for the next explicit root refresh. Every page is fenced to the same connection,
+boot and root. Parent provenance identifies a child; a separate exact child read
+and subscription establish freshness. Partial scans retain gaps and never claim
+complete family coverage. The offline selftest drives the actual bridge,
+including a child beyond event 1000, without replaying native input. Live resume
+and family qualification remain open in Issues #4 and #5.
 
 The local checkpoint persists known session/namespace, relevant settings, compact family observations, pending native command identities/payloads/ACKs and unacknowledged outcomes/result pages. It does not copy credentials or the full native transcript. Writes are serialized and atomically published; a failed checkpoint blocks subsequent native mutations rather than silently losing the recovery boundary. The OS owner serializes this directory, not a second task database.
 
