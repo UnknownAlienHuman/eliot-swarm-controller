@@ -860,9 +860,15 @@ function Get-InstalledFrontend(
     if ($identityPresent.Count -eq 0) {
         # Preserve the original partial-install detection: known resource files
         # without any identity sidecar are an orphaned install, not an absent one.
-        # Only EXISTING spec-known paths are examined. The retired OpenCode
-        # server files are intentionally not listed: they are never part of a
-        # new install, so stray historical bytes without identity are not ours.
+        # Retirement does not make unowned historical server bytes an empty
+        # install. Inspect their root without deleting, installing or adopting
+        # it. Provenance-complete legacy hosts take the inventory path below.
+        if ($Name -ceq 'swarm-kernel-host') {
+            $retiredRoot = Join-Path $Root 'resources/modules/opencode'
+            if ($null -ne (Get-Item -LiteralPath $retiredRoot -Force -ErrorAction SilentlyContinue)) {
+                throw "Installed frontend '$Name' has orphaned retired OpenCode resources without package identity. Use a new empty install directory or restore the exact package files."
+            }
+        }
         $specResourcePaths = @(
             foreach ($group in @(Get-AdditionalResourceSpecGroups $Spec)) {
                 foreach ($entry in @($group.resource_files)) {

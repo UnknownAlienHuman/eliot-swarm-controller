@@ -291,6 +291,12 @@ try {
     $orphanRoot = Join-Path $work 'orphan'
     Write-Ascii (Join-Path $orphanRoot 'resources/modules/antigravity/bridge.mjs') 'orphan'
     Expect-Throw { Get-InstalledFrontend 'swarm-kernel-host' $orphanRoot $spec 'swarm-mcp' } '*orphaned resource files*' 'orphaned bridge files without identity rejected'
+    $orphanServerRoot = Join-Path $work 'orphan-server'
+    $orphanServerFile = Join-Path $orphanServerRoot 'resources/modules/opencode/node_modules/retained.txt'
+    Write-Ascii $orphanServerFile 'unowned historical bytes'
+    $orphanServerHash = Get-Sha256 $orphanServerFile
+    Expect-Throw { Get-InstalledFrontend 'swarm-kernel-host' $orphanServerRoot $spec 'swarm-mcp' } '*orphaned retired OpenCode resources*' 'retired server bytes without identity are not an absent install'
+    Assert-True ((Get-Sha256 $orphanServerFile) -ceq $orphanServerHash) 'orphan detection preserves historical bytes without adoption or deletion'
 } finally {
     $cleanupPath = [IO.Path]::GetFullPath($work)
     $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
