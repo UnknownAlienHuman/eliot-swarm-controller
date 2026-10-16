@@ -526,6 +526,7 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
     let (active_tx, active_rx) = oneshot::channel();
     let (expected_prompt_tx, expected_prompt_rx) = oneshot::channel();
     let (prompt_seen_tx, prompt_seen_rx) = oneshot::channel();
+    let (callback_complete_tx, mut callback_complete_rx) = oneshot::channel();
     let expected_workspace = workspace.clone();
     let peer_workspace = workspace.clone();
     let store_for_adapter = store.clone();
@@ -730,6 +731,9 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
                 .map_err(to_acp_error)?;
             assert_eq!(adapter_link.binding_id, active_prompt.binding_id);
             assert_eq!(adapter_link.generation, active_prompt.generation);
+            callback_complete_tx
+                .send(())
+                .expect("peer observes acknowledged adapter callback completion");
             Ok::<(), agent_client_protocol::Error>(())
         });
 
@@ -848,10 +852,27 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
                 ),
             )))
             .expect("the original prompt receives its cancellation result");
+        // The callback retains and acknowledges the outcome before SDK shutdown.
+        // Reject extra wire traffic while it finishes under the outer deadline.
+        tokio::select! {
+            biased;
+            frame = peer.rx.next() => {
+                assert!(
+                    frame.is_none(),
+                    "no prompt replay, session/load fallback, or $/cancel_request is sent"
+                );
+                callback_complete_rx
+                    .await
+                    .expect("adapter callback completes after the outcome ACK");
+            }
+            completed = &mut callback_complete_rx => {
+                completed.expect("adapter callback completes after the outcome ACK");
+            }
+        }
         assert!(
             tokio::time::timeout(Duration::from_secs(3), peer.rx.next())
                 .await
-                .expect("ACP client closes after the one prompt")
+                .expect("ACP client closes after the acknowledged outcome callback completes")
                 .is_none(),
             "no prompt replay, session/load fallback, or $/cancel_request is sent"
         );

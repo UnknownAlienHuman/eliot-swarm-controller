@@ -79,7 +79,7 @@ enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\Projects\YourRepository'
 controlRoot = 'C:\SwarmState\command-runs'
-modelId = 'REPLACE_WITH_EXACT_NATIVE_MODEL_ID'
+# Optional native invocation override: modelId = 'EXACT_NATIVE_MODEL_ID'
 
 # Disabled. Routed models through an operator-run OpenCodex service
 # (modules/opencodex/README.md). Execution stays with the native Codex

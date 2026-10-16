@@ -2713,6 +2713,59 @@ mod tests {
 
         #[tokio::test]
         async fn unknown362_verified_departure_after_health_failure_allows_only_exact_successor() {
+            let capture_with_image_diagnostic = |child: &Child, executable: &Path| {
+                capture_supervisor_child_identity_with_readers(
+                    child,
+                    executable,
+                    Child::id,
+                    process_birth_identity,
+                    |pid| {
+                        process_image_identity(pid).inspect_err(|source| {
+                            let code = match source.code.as_str() {
+                                "PROCESS_GONE" => "PROCESS_GONE",
+                                "PROCESS_IDENTITY" => "PROCESS_IDENTITY",
+                                "IO_ERROR" => "IO_ERROR",
+                                _ => "OTHER",
+                            };
+                            // Only fixed producer reasons and numeric OS codes may reach CI.
+                            let reason = source.message.as_str();
+                            let reason = if [
+                                "process executable path is not valid Unicode",
+                                "process executable path is outside the supported boundary",
+                                "process executable is outside the supported file boundary",
+                                "process image size overflow",
+                                "process executable exceeds the supported hash boundary",
+                                "process executable changed during bounded hashing",
+                                "process exited during inventory",
+                                "invalid proc stat",
+                                "incomplete proc stat",
+                                "invalid process group",
+                                "cannot observe process pidfd",
+                                "kernel boot identity is unavailable",
+                                "process is no longer live",
+                                "kernel executable path is not absolute",
+                                "process executable disappeared",
+                                "process birth changed while opening its executable",
+                                "process birth or executable image changed during bounded hashing",
+                            ]
+                            .contains(&reason)
+                            {
+                                reason
+                            } else {
+                                "producer reason redacted"
+                            };
+                            let os_error = source
+                                .message
+                                .rsplit_once("(os error ")
+                                .and_then(|(_, value)| value.strip_suffix(')'))
+                                .and_then(|value| value.parse::<i32>().ok());
+                            eprintln!(
+                                "unknown362_identity_reader stage=image pid={pid} source_code={code} source_reason={reason:?} os_error={os_error:?}"
+                            );
+                        })
+                    },
+                )
+            };
             let root = std::env::temp_dir().join(format!(
                 "eliot-unknown362-successor-{}",
                 crate::model::new_id()
@@ -2727,7 +2780,7 @@ mod tests {
             let (child, stdin, identity) =
                 guarded_fixture_spawn(&runtime, &release, &custody, |child, executable| {
                     observe_acquired_child(child, &mut launches);
-                    capture_supervisor_child_identity(child, executable)
+                    capture_with_image_diagnostic(child, executable)
                 })
                 .await
                 .unwrap()
@@ -2769,7 +2822,7 @@ mod tests {
             assert!(
                 guarded_fixture_spawn(&runtime, &release, &custody, |child, executable| {
                     observe_acquired_child(child, &mut launches);
-                    capture_supervisor_child_identity(child, executable)
+                    capture_with_image_diagnostic(child, executable)
                 })
                 .await
                 .unwrap()
@@ -2834,7 +2887,7 @@ mod tests {
                 &next_custody,
                 |child, executable| {
                     observe_acquired_child(child, &mut launches);
-                    capture_supervisor_child_identity(child, executable)
+                    capture_with_image_diagnostic(child, executable)
                 },
             )
             .await
