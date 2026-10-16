@@ -392,7 +392,16 @@ function workFenceCurrent(fence, entry, eventVersion=fence.eventVersion) {
     && (routeDefaults.modelId===undefined || routeDefaults.modelId===fence.modelId)
     && (routeDefaults.providerId===undefined || routeDefaults.providerId===fence.providerId);
 }
+function hasPendingModelConfiguration() {
+  return [...nativePending.values()].some(entry=>entry.kind==='configure'
+    && entry.setting?.key==='model' && !entry.resolved);
+}
 async function readWorkFence(modelChangedCode) {
+  // setModel's ACK is admission only. Keep every productive path behind the
+  // unresolved request until its exact requested selector is read back; a
+  // restored checkpoint carries the same fence across bridge restart.
+  if(hasPendingModelConfiguration())
+    throw new NativeCompatibilityError('MODEL_CONFIGURATION_RECONCILIATION_REQUIRED');
   const sessionId=rootId;
   if(!sessionId)throw new NativeCompatibilityError('NATIVE_ROOT_IDENTITY_UNAVAILABLE');
   const eventVersion=sessionVersions.get(sessionId)??0;

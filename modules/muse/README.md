@@ -187,6 +187,16 @@ One boundary stays explicit: transport EOF without process exit is not separatel
 | agent.refresh | Optional session_id of an observed child | Metadata, questions and subscription; no writer lease/resume. |
 | agent.reconcile | operation_id of unresolved command | Targeted same-command reconciliation, not blanket retry. |
 
+An unresolved model configure fences `agent.send`, `task.dispatch`, and
+work-starting goal actions, even after `session/setModel` returns an ACK. The
+fence remains across checkpoint restore until a fresh native read matches every
+requested model selector. `agent.reply`, `agent.refresh`, and targeted
+`agent.reconcile` remain available. Reconciliation of an ACK-backed configure
+reads again without resending the setter; an unknown no-ACK command keeps the
+existing explicit same-ID reconciliation path. Requested route constraints
+remain separate from observed session values, and an omitted provider stays
+unconstrained.
+
 Use quoted JSON values through `swarm call METHOD --file FILE`. Configure one setter per Operation because the native setters are separate. Await standing effort before starting/resuming a goal. Pause/clear remain usable while new work is disabled and cancel only locally queued old goal starts. Already admitted effects still need native disposition.
 
 MSP `approval/request` and `userInput/request` receive `{}` as presentation acknowledgement immediately; this is not approval or an answer. Actual decisions retain current choice/requirement IDs. Root goal state excludes child goal events. Ordered compact observations do not turn usage snapshots into summed token charges. Parent idle is not family completion.

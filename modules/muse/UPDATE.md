@@ -92,6 +92,16 @@ The Store receives no fabricated native ID or decision.
 
 Bridge.12 is the historical source that retains the bridge.11 observation and checkpoint behavior and adds session-scoped native MCP admission: initialize requests the documented `sessionMcp` grant, and a configured `mcpServers` map is validated against the closed transport union and forwarded as `session/start` config over the raw Connection (the pinned facade omits `config` until its grant check lands). Retained installed CLI 1.4.0 observations show `sessionMcp` in both durable and ephemeral profiles. `session/start` accepted config even when a required stdio executable was unavailable, so its ACK proves admission only and says nothing about server liveness. The bridge refuses out-of-union transports before sending; a separate direct native decode refused an unknown transport with -32602. The documented reads (`session/read`, `view/subscribe`, `view/page`, `skill/list` and `session/list`) exposed no native MCP inventory, and an eight-second view watch on an MCP-attached session delivered only `session/started`. No model, turn, native inventory, or dispatch claim follows from admission; the Store gate refuses dispatch.
 
+The bridge.13 source candidate also keeps productive sends, Task dispatch, and
+work-starting goals behind any unresolved model configure. A native setter ACK
+does not release that fence; exact reconciliation waits for the requested
+selectors to appear in a fresh session read. Replies, refresh and targeted
+reconciliation remain available, and an ACK-backed reconciliation does not
+resend the setter. The `pending-configure-recovery` selftest exercises the
+actual bridge subprocess before and after restart, including the restored
+checkpoint, the old-model rejection, the later matching readback, and the
+separation of an omitted provider from the observed provider.
+
 A present checkpoint containing JSON null fails with CHECKPOINT_CORRUPT before
 host connection or native launch; an absent checkpoint keeps its existing
 fresh-state behavior. The SDK pin is unchanged. The current bridge rejects a
