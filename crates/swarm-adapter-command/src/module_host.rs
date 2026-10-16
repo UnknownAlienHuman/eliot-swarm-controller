@@ -311,7 +311,7 @@ pub fn receipt_identity_for_input(
     operation_id: &str,
     input_sha256: &str,
 ) -> Result<ModuleReceiptIdentity> {
-    if operation_id.trim().is_empty() || !is_sha256(input_sha256) {
+    if operation_id.trim().is_empty() || !crate::is_lower_sha256_hex(input_sha256) {
         return Err(Error::new(
             "MODULE_RECEIPT_IDENTITY_INVALID",
             "module receipt input identity is invalid",
@@ -380,7 +380,7 @@ pub fn attach_receipt_identity(
     } else {
         None
     }
-    .filter(|digest| is_sha256(digest))
+    .filter(|digest| crate::is_lower_sha256_hex(digest))
     .ok_or_else(|| {
         Error::new(
             "MODULE_RECEIPT_IDENTITY_MISSING",
@@ -464,13 +464,6 @@ pub fn validate_saved_receipt(
         ));
     }
     Ok(())
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]

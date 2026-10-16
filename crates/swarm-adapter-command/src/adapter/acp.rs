@@ -37,7 +37,7 @@ use tokio::{
 };
 use tokio_util::codec::{Decoder, FramedRead, FramedWrite, LinesCodec};
 
-use super::{Config, Link, Owner, is_sha256};
+use super::{Config, Link, Owner};
 use crate::{
     ACP_ARTIFACT_ID, ACP_EXECUTION_SHAPE, Profile,
     acp_prompt::{self, PreparedAcpDispatch},
@@ -675,7 +675,7 @@ impl AcpJournal {
                 .as_deref()
                 .is_some_and(|session_id| session_id.trim().is_empty())
             || receipt.stored_bytes > MAX_CAPTURE_BYTES as u64
-            || !is_sha256(&receipt.stored_sha256)
+            || !crate::is_lower_sha256_hex(&receipt.stored_sha256)
             || (receipt.complete
                 && (receipt.session_id.is_none()
                     || receipt.truncated
@@ -4041,7 +4041,7 @@ async fn reply_to_permission(
     let request_id = reply["request_id"].clone();
     let fingerprint = reply["fingerprint"]
         .as_str()
-        .filter(|value| is_sha256(value))
+        .filter(|value| crate::is_lower_sha256_hex(value))
         .ok_or_else(|| Error::invalid("ACP permission reply fingerprint is invalid"))?;
     let option_id = reply["body"]["option_id"]
         .as_str()

@@ -1067,14 +1067,14 @@ impl RunStore {
         route: &Value,
         evidence: &CommandCaptureReleaseEvidence,
     ) -> Result<RuntimeOutcome> {
-        if !is_sha256(release_input_sha256)
+        if !crate::is_lower_sha256_hex(release_input_sha256)
             || release_operation_id.is_empty()
             || binding_id.is_empty()
             || generation <= 0
             || evidence.schema_version != 1
             || evidence.target_operation_id.is_empty()
-            || !is_sha256(&evidence.target_input_sha256)
-            || !is_sha256(&evidence.target_outcome_sha256)
+            || !crate::is_lower_sha256_hex(&evidence.target_input_sha256)
+            || !crate::is_lower_sha256_hex(&evidence.target_outcome_sha256)
             || evidence.outputs.len() != 2
         {
             return Err(Error::new(
@@ -1312,7 +1312,7 @@ impl RunStore {
                     "release tombstone name has no releasing prefix",
                 )
             })?;
-            if !is_sha256(target_digest) {
+            if !crate::is_lower_sha256_hex(target_digest) {
                 return Err(Error::new(
                     "ADAPTER_EVIDENCE_INVALID",
                     "release tombstone name does not contain a canonical target digest",
@@ -1740,10 +1740,10 @@ fn read_saved_release_result_page(
 
 fn validate_release_result_page_descriptor(artifact: &CommandCaptureArtifactPage) -> Result<()> {
     if artifact.result_operation_id.is_empty()
-        || !is_sha256(&artifact.result_input_sha256)
+        || !crate::is_lower_sha256_hex(&artifact.result_input_sha256)
         || artifact.artifact_ref.is_empty()
-        || !is_sha256(&artifact.artifact_sha256)
-        || !is_sha256(&artifact.page_sha256)
+        || !crate::is_lower_sha256_hex(&artifact.artifact_sha256)
+        || !crate::is_lower_sha256_hex(&artifact.page_sha256)
         || artifact.artifact_sha256 != artifact.page_sha256
         || artifact.artifact_byte_length != artifact.byte_length
     {
@@ -1766,7 +1766,7 @@ fn read_release_result_page_record(
         || saved.module_artifact_id != ARTIFACT_ID
         || saved.operation_id != artifact.result_operation_id
         || saved.params["operation_id"] != artifact.result_operation_id
-        || !is_sha256(&saved.result_page_sha256)
+        || !crate::is_lower_sha256_hex(&saved.result_page_sha256)
         || saved.result_page_sha256 != hash
     {
         return Err(Error::new(
@@ -1804,7 +1804,7 @@ fn validate_release_result_page_body(
     if STANDARD.encode(&bytes) != encoded
         || bytes.len() as u64 != artifact.byte_length
         || digest(&bytes) != artifact.page_sha256
-        || !is_sha256(hash)
+        || !crate::is_lower_sha256_hex(hash)
     {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_INVALID",
@@ -1837,7 +1837,7 @@ fn validate_release_result_page_acknowledgement_at(
         || acknowledgement.result_page_sha256 != hash
         || acknowledgement.acknowledgement["recorded"] != true
         || acknowledgement.acknowledgement["artifact_ref"] != artifact.artifact_ref
-        || !is_sha256(hash)
+        || !crate::is_lower_sha256_hex(hash)
         || artifact.artifact_sha256 != artifact.page_sha256
         || artifact.artifact_byte_length != artifact.byte_length
     {
@@ -1896,7 +1896,7 @@ struct ResultPageCleanupEntries {
 fn result_page_cleanup_ack_hash(name: &str) -> Option<&str> {
     name.strip_prefix(RESULT_PAGE_CLEANUP_ACK_PREFIX)
         .and_then(|name| name.strip_suffix(".json"))
-        .filter(|hash| is_sha256(hash))
+        .filter(|hash| crate::is_lower_sha256_hex(hash))
 }
 
 fn inspect_result_page_cleanup_entries(directory: &Path) -> Result<ResultPageCleanupEntries> {
@@ -2325,7 +2325,7 @@ fn read_release_tombstone_intent_if_present(
             "release tombstone name has no releasing prefix",
         )
     })?;
-    if !is_sha256(expected_digest) {
+    if !crate::is_lower_sha256_hex(expected_digest) {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_INVALID",
             "release tombstone name does not contain a canonical target digest",
@@ -2560,7 +2560,7 @@ fn read_result_page_cleanup_markers(store: &RunStore) -> Result<Vec<ResultPageCl
         let Some(operation_digest) = name.strip_prefix(RESULT_PAGE_CLEANUP_PREFIX) else {
             continue;
         };
-        if !is_sha256(operation_digest) {
+        if !crate::is_lower_sha256_hex(operation_digest) {
             return Err(Error::new(
                 "ADAPTER_EVIDENCE_INVALID",
                 "result-page cleanup marker name is not a canonical Operation digest",
@@ -2795,7 +2795,7 @@ fn read_release_operation_cleanup_marker(
                 "release cleanup marker has an invalid namespace",
             )
         })?;
-    if !is_sha256(suffix) {
+    if !crate::is_lower_sha256_hex(suffix) {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_INVALID",
             "release cleanup marker name is not a canonical Operation digest",
@@ -2917,7 +2917,7 @@ fn finalize_acknowledged_release(
             || output.target_command_output["native_output"] != output.native_output
             || output.target_command_output["operation_id"] != intent.target_operation_id
             || output.target_command_output["input_sha256"] != intent.evidence.target_input_sha256
-            || !is_sha256(
+            || !crate::is_lower_sha256_hex(
                 output.target_command_output["stored_sha256"]
                     .as_str()
                     .unwrap_or_default(),
@@ -2944,10 +2944,10 @@ fn finalize_acknowledged_release(
             if artifact.result_operation_id.is_empty()
                 || artifact.result_operation_id == intent.target_operation_id
                 || artifact.result_operation_id == intent.release_operation_id
-                || !is_sha256(&artifact.result_input_sha256)
+                || !crate::is_lower_sha256_hex(&artifact.result_input_sha256)
                 || artifact.artifact_ref.is_empty()
-                || !is_sha256(&artifact.artifact_sha256)
-                || !is_sha256(&artifact.page_sha256)
+                || !crate::is_lower_sha256_hex(&artifact.artifact_sha256)
+                || !crate::is_lower_sha256_hex(&artifact.page_sha256)
                 || artifact.artifact_sha256 != artifact.page_sha256
                 || artifact.artifact_byte_length != artifact.byte_length
             {
@@ -3078,17 +3078,17 @@ fn validate_capture_release_intent(
     if intent.schema != 1
         || intent.module_artifact_id != ARTIFACT_ID
         || intent.release_operation_id.is_empty()
-        || !is_sha256(&intent.release_input_sha256)
+        || !crate::is_lower_sha256_hex(&intent.release_input_sha256)
         || intent.target_operation_id != target_operation_id
         || intent.evidence.target_operation_id != target_operation_id
         || intent.evidence_sha256
             != digest(canonical_release_evidence(&intent.evidence)?.as_bytes())
         || intent.evidence.target_input_sha256.is_empty()
-        || !is_sha256(&intent.evidence.target_input_sha256)
-        || !is_sha256(&intent.evidence.target_outcome_sha256)
+        || !crate::is_lower_sha256_hex(&intent.evidence.target_input_sha256)
+        || !crate::is_lower_sha256_hex(&intent.evidence.target_outcome_sha256)
         || intent.binding_id.is_empty()
         || intent.generation <= 0
-        || !is_sha256(&intent.route_sha256)
+        || !crate::is_lower_sha256_hex(&intent.route_sha256)
         || intent.checksum != capture_release_intent_checksum(intent)?
     {
         return Err(Error::new(
@@ -3423,7 +3423,7 @@ fn remove_empty_release_operation_cleanup_marker(
                 "release cleanup marker has an invalid namespace",
             )
         })?;
-    if !is_sha256(suffix) {
+    if !crate::is_lower_sha256_hex(suffix) {
         return Err(Error::new(
             "ADAPTER_EVIDENCE_INVALID",
             "release cleanup marker name is not a canonical Operation digest",
@@ -3451,12 +3451,6 @@ fn remove_empty_release_operation_cleanup_marker(
         "empty release cleanup marker coexists with its Operation directory",
     )?;
     remove_empty_directory(&canonical)
-}
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn receipt_capture_fact<'a>(
@@ -3487,12 +3481,12 @@ impl NativeStreamFacts {
             .ok_or_else(invalid)?;
         let sha256 = receipt_capture_fact(receipt, stream, "sha256", "sha256")
             .and_then(Value::as_str)
-            .filter(|value| is_sha256(value))
+            .filter(|value| crate::is_lower_sha256_hex(value))
             .ok_or_else(invalid)?
             .to_owned();
         let stored_sha256 = receipt_capture_fact(receipt, stream, "stored_sha256", "stored_sha256")
             .and_then(Value::as_str)
-            .filter(|value| is_sha256(value))
+            .filter(|value| crate::is_lower_sha256_hex(value))
             .ok_or_else(invalid)?
             .to_owned();
         let truncated = receipt_capture_fact(receipt, stream, "truncated", "truncated")

@@ -98,7 +98,7 @@ pub(crate) fn prepare(
     let input_sha256 = command
         .input_sha256
         .as_deref()
-        .filter(|value| is_sha256(value))
+        .filter(|value| crate::is_lower_sha256_hex(value))
         .ok_or_else(|| {
             Error::new(
                 "NATIVE_IDENTITY_MISMATCH",
@@ -154,11 +154,4 @@ pub(crate) fn prepare(
         envelope,
         context,
     })
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

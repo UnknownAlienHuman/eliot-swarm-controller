@@ -1044,7 +1044,7 @@ fn target_dispatch_identity(
     let input_sha256 = command
         .target_input_sha256
         .as_deref()
-        .filter(|value| is_sha256(value))
+        .filter(|value| crate::is_lower_sha256_hex(value))
         .ok_or_else(|| {
             Error::new(
                 "NATIVE_IDENTITY_MISMATCH",
@@ -1053,7 +1053,7 @@ fn target_dispatch_identity(
         })?;
     let prompt_sha256 = core["prompt_sha256"]
         .as_str()
-        .filter(|value| is_sha256(value))
+        .filter(|value| crate::is_lower_sha256_hex(value))
         .ok_or_else(|| {
             Error::new(
                 "NATIVE_IDENTITY_MISMATCH",
@@ -1426,7 +1426,7 @@ fn validate_command(
             || command
                 .target_input_sha256
                 .as_deref()
-                .is_none_or(|digest| !is_sha256(digest))
+                .is_none_or(|digest| !crate::is_lower_sha256_hex(digest))
             || missing_result_data)
     {
         return Err(Error::new(
@@ -1834,13 +1834,6 @@ fn is_transport_uncertain(error: &Error) -> bool {
 
 fn is_connect_retryable(error: &Error) -> bool {
     matches!(error.code.as_str(), "HOST_UNAVAILABLE" | "IO_ERROR")
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn next_sequence(sequence: u64) -> Result<u64> {
