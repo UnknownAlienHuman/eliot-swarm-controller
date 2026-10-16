@@ -15,7 +15,7 @@ The bridge owns one Claude session through the SDK's streaming-input `startup()`
 6. Start the module independently with the guarded launcher below, in a dedicated initially empty module-state directory separate from host data:
 
 ```powershell
-swarm module-run --state-dir C:\SwarmModules\CC --command 'C:\Program Files\nodejs\node.exe' -- C:\SwarmCode\modules\claude\bridge-v5.mjs --config C:\SwarmConfig\claude.json
+swarm module-run --state-dir C:\SwarmModules\CC --command 'C:\Program Files\nodejs\node.exe' -- C:\SwarmCode\modules\claude\bridge-v6.mjs --config C:\SwarmConfig\claude.json
 ```
 
 ```toml
@@ -72,7 +72,7 @@ The mapper (`stream.mjs`) is pure and shared by the live path and the fixture se
 
 ## Permission behavior
 
-When the route omits `permissionMode`, `bridge-v5.mjs` leaves SDK `Options.permissionMode` unset; this is not an explicit `permissionMode = 'default'`. `system/init.permissionMode` remains the observed native mode. The bridge registers a `PreToolUse` hook that asks for a controller decision and requires its tool ID/input digest to match before `canUseTool` can publish a pending request. The unresolved callback projects a bounded redacted request, then `agent.reply` validates the exact bridge boot, session, request ID, digest, kind and typed answer before resolving the original Promise once. Allow, deny and `AskUserQuestion` answers preserve the SDK result shape. A callback ACK means only that the callback Promise was settled; it does not claim tool or task completion. Abort, stream end and bridge retirement settle the callback as denied/lost, and a late reply is rejected. Universal `PreToolUse` coverage on the installed 0.3.287 runtime remains unknown until an exact-runtime run; older upstream bypass reports do not establish 0.3.287 behavior.
+When the route omits `permissionMode`, `bridge-v6.mjs` leaves SDK `Options.permissionMode` unset; this is not an explicit `permissionMode = 'default'`. `system/init.permissionMode` remains the observed native mode. The bridge registers a `PreToolUse` hook that asks for a controller decision and requires its tool ID/input digest to match before `canUseTool` can publish a pending request. The unresolved callback projects a bounded redacted request, then `agent.reply` validates the exact bridge boot, session, request ID, digest, kind and typed answer before resolving the original Promise once. Allow, deny and `AskUserQuestion` answers preserve the SDK result shape. A callback ACK means only that the callback Promise was settled; it does not claim tool or task completion. Abort, stream end and bridge retirement settle the callback as denied/lost, and a late reply is rejected. Universal `PreToolUse` coverage on the installed 0.3.287 runtime remains unknown until an exact-runtime run; older upstream bypass reports do not establish 0.3.287 behavior.
 
 SDK 0.3.287 declares `PreToolUse` defer, session persistence and resume, but the TypeScript query surface does not document how to resume the deferred tool without supplying a new user prompt. This artifact therefore keeps durable defer and resume unavailable. It never serializes a JavaScript resolver or substitutes a fresh prompt.
 
