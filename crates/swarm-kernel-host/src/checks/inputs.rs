@@ -3464,7 +3464,7 @@ pub(crate) mod tests {
             self.release_descendant();
         }
 
-        fn readiness_diagnostic(
+        pub(crate) fn readiness_diagnostic(
             &self,
             owner: &ProbeCleanupOwner,
             explicit_release: bool,
