@@ -658,10 +658,13 @@ impl HostSession {
                 "manager route is not registered for the Rust headless artifact",
             ));
         }
+        // An absent modelId is not an error: the launch omits --model and the
+        // installed harness default applies. Only a malformed explicit
+        // override is rejected here; readback is verified at agent.open.
         selected_model_id(&route).map_err(|code| {
             Error::new(
                 code,
-                "manager route must select a bounded native Antigravity model ID",
+                "manager route carries an invalid native Antigravity model override",
             )
         })?;
         if self

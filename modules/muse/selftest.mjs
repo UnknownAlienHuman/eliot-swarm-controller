@@ -200,7 +200,7 @@ function canonicalFixtureJson(value) {
   try {
     await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-null-fixture',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.12',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.13',
       command:process.execPath,args:[nativeScript]}));
     await writeFile(nativeScript,
       `import { writeFile } from 'node:fs/promises';\nawait writeFile(${JSON.stringify(nativeMarker)},'started');\n`,'utf8');
@@ -261,6 +261,9 @@ function canonicalFixtureJson(value) {
   await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token}));
   const nativeScope=`muse:${process.platform}:${process.platform==='win32'?canonicalHome.toLowerCase():canonicalHome}`;
   const saved=structuredClone(checkpointFixture.state);
+  // Build a fresh current-artifact fixture; the historical roundtrip sample
+  // itself remains byte-identical and must never be cross-served at runtime.
+  saved.module_artifact_id=museDescriptor.artifact.artifact_id;
   saved.native_scope=nativeScope;
   saved.route_defaults.workspaceRoot=home;
   saved.route_defaults.modelId=childFixture.root_session.modelId;
@@ -529,7 +532,7 @@ process.stdin.on('end',()=>process.exit(0));
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.12',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.13',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',nativeFixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
@@ -808,7 +811,7 @@ process.stdin.on('end',()=>process.exit(0));
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.12',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.13',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',fixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
@@ -1134,7 +1137,7 @@ syncBuiltinESMExports();
     const credentialFile=path.join(dir,'credential.json');
     const configFile=path.join(dir,'module.json');
     await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
-    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.12',
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.13',
       command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',fixturePath]}));
     const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
       TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
@@ -1232,6 +1235,185 @@ await runWorkFenceCase('baseline');
 await runWorkFenceCase('read-race');
 await runWorkFenceCase('checkpoint-race');
 await runWorkFenceCase('goal-checkpoint-race');
+
+// 4b. Omission selects the installed native default; explicit overrides ride
+// verbatim. This checks the actual native payloads, not struct shape: an
+// omitted session/start carries no modelId/providerId keys, an omitted
+// turn/start carries no reasoningEffort key, and the observed model comes
+// only from the session/start readback. Explicit coverage stays in the
+// baseline work-fence case (session_start_params modelId/providerId exact,
+// turn_start_params reasoningEffort exact).
+{
+  const { modelMatches } = await import('./settings.mjs');
+  assert.equal(modelMatches({modelId:'native-default',providerId:null},{}),true,
+    'omitted model selection constrains nothing before readback');
+  assert.equal(modelMatches({modelId:'a',providerId:'p'},{modelId:'a',providerId:'p'}),true,
+    'explicit selection still matches exactly');
+  assert.equal(modelMatches({modelId:'b',providerId:'p'},{modelId:'a'}),false,
+    'explicit model mismatch still fails');
+  assert.equal(modelMatches({modelId:'a',providerId:'q'},{modelId:'a',providerId:'p'}),false,
+    'explicit provider mismatch still fails');
+
+  const dir=await mkdtemp(path.join(os.tmpdir(),'muse-omission-'));
+  const stateDir=path.join(dir,'state');
+  const home=path.join(dir,'native-home');
+  await mkdir(stateDir);await mkdir(home);
+  const ownerFile=path.join(stateDir,'owner.json');
+  await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token:'fixture-omission-boot'}));
+  const nativeScript=path.join(dir,'fake-native.mjs');
+  const fixturePath=path.join(dir,'native-fixture.json');
+  const auditPath=path.join(dir,'native-audit.json');
+  const sessionId='ses_omission_fixture';
+  const openId='70000000-0000-4000-8000-000000000001';
+  const workId='70000000-0000-4000-8000-000000000002';
+  const openAt=AT_MS+200,workAt=AT_MS+201;
+  const sentText='fixture-only-omission-payload';
+  function command(operationId,createdAtMs,method,input,routeExtra={}) {
+    const inputSha256=createHash('sha256').update(canonicalFixtureJson(input),'utf8').digest('hex');
+    return {operation_id:operationId,created_at_ms:createdAtMs,method,binding_id:'fixture-binding',generation:1,
+      native_root_id:sessionId,route:{runtime:'muse',module_artifact_id:museDescriptor.artifact.artifact_id,...routeExtra},
+      input_sha256:inputSha256,input};
+  }
+  // Omitted model/provider/effort: only the workspace selects the route.
+  const openCommand=command(openId,openAt,'agent.open',{},{native_options:{workspaceRoot:home}});
+  const workCommand=command(workId,workAt,'agent.send',{delivery:'next_turn',text:sentText});
+  await writeFile(fixturePath,JSON.stringify({sessionId,home}));
+  await writeFile(nativeScript,String.raw`
+import { readFile, writeFile } from 'node:fs/promises';
+const arg=name=>{const i=process.argv.indexOf(name);return i<0?null:process.argv[i+1]};
+const home=arg('--home'),auditPath=arg('--audit'),fixturePath=arg('--fixtures');
+const fixture=JSON.parse(await readFile(fixturePath,'utf8'));
+const session={sessionId:fixture.sessionId,status:'idle',activeTurnId:null,modelId:'native-default-model',
+  providerId:null,turnCount:0,workspaceRoot:home};
+const audit={methods:[],session_start_params:null,session_start_has_modelId:null,
+  session_start_has_providerId:null,turn_start_params:null,turn_start_has_reasoningEffort:null,
+  session_list_count:0,turn_start_count:0};
+const save=()=>writeFile(auditPath,JSON.stringify(audit));
+const respond=(id,result,error,after)=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id,...(error?{error}:{result})})+'\n',()=>after?.());
+async function handle(frame){
+  if(typeof frame.method!=='string'||!Object.hasOwn(frame,'id'))return;
+  audit.methods.push(frame.method);
+  if(frame.method==='initialize'){
+    await save();respond(frame.id,{museHome:home,serverInfo:{name:'fixture-muse',version:'1.4.0'},
+      schema:{fingerprint:'fixture-schema'},sessionDurability:'ephemeral',grantedCapabilities:[]});return;
+  }
+  if(frame.method==='usage/read'){
+    await save();respond(frame.id,null,{code:-32601,message:'Method not found',data:{kind:'methodNotFound'}});return;
+  }
+  if(frame.method==='session/start'){
+    audit.session_start_params=frame.params;
+    audit.session_start_has_modelId=Object.hasOwn(frame.params??{},'modelId');
+    audit.session_start_has_providerId=Object.hasOwn(frame.params??{},'providerId');
+    await save();respond(frame.id,{session});return;
+  }
+  if(frame.method==='session/list'){
+    audit.session_list_count++;await save();respond(frame.id,{sessions:[session],nextCursor:null});return;
+  }
+  if(frame.method==='approval/listPending'){await save();respond(frame.id,{approvals:[],userInputs:[]});return;}
+  if(frame.method==='turn/start'){
+    audit.turn_start_count++;audit.turn_start_params=frame.params;
+    audit.turn_start_has_reasoningEffort=Object.hasOwn(frame.params??{},'reasoningEffort');
+    await save();respond(frame.id,{commandId:frame.params.commandId,status:'accepted',turnId:'turn_omission_started'});return;
+  }
+  await save();respond(frame.id,{});
+}
+process.stdin.setEncoding('utf8');
+let buffer='';
+process.stdin.on('data',chunk=>{
+  buffer+=chunk;let end;
+  while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;
+    try{void handle(JSON.parse(line)).catch(()=>process.exit(2));}catch{process.exit(2);}}
+});
+process.stdin.on('end',()=>process.exit(0));
+`);
+  const endpoint=process.platform==='win32'?`\\\\.\\pipe\\muse-omission-${randomUUID()}`:path.join(dir,'control.sock');
+  const sockets=new Set(),outcomes=new Map(),commands=[openCommand];
+  let workQueued=false,bridge,stderr='',teardownStarted=false,closed,closeResult;
+  let resolveFinished,rejectFinished;
+  const finished=new Promise((resolve,reject)=>{resolveFinished=resolve;rejectFinished=reject;});
+  const server=net.createServer(socket=>{
+    sockets.add(socket);socket.setEncoding('utf8');let buffer='';
+    socket.on('close',()=>sockets.delete(socket));
+    socket.on('error',error=>{if(teardownStarted&&error?.code==='ECONNRESET')return;
+      rejectFinished(new Error(`omission fixture socket: ${error?.code??error?.message??error}`));});
+    socket.on('data',chunk=>{
+      buffer+=chunk;let end;
+      while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;
+        let packet;try{packet=JSON.parse(line);}catch{rejectFinished(new Error('omission fixture received invalid JSON'));return;}
+        void respondHost(socket,packet).catch(rejectFinished);
+      }
+    });
+  });
+  function reply(socket,packet,result={}) {
+    socket.write(JSON.stringify({jsonrpc:'2.0',id:packet.id,result})+'\n');
+  }
+  async function respondHost(socket,packet) {
+    let result={};
+    if(packet.method==='client.hello')result={client_id:'muse-fixture-client'};
+    else if(packet.method==='module.hello'){
+      assert.deepEqual(packet.params.module_contract,museModuleContractClaim);
+      result={binding_id:'fixture-binding',generation:1,recovery_required:false,native_root_id:null,native_scope_key:null,
+        module_contract_negotiation:museModuleContractNegotiation};
+    } else if(packet.method==='module.next') {
+      if(commands.length)result={command:commands.shift()};
+      else await delay(10);
+    } else if(packet.method==='module.outcome') {
+      const outcome=packet.params;outcomes.set(outcome.operation_id,outcome);
+      if(outcome.operation_id===openId&&outcome.outcome==='applied'&&!workQueued){commands.push(workCommand);workQueued=true;}
+      if(outcome.operation_id===workId){reply(socket,packet);resolveFinished(outcome);return;}
+      reply(socket,packet,result);return;
+    }
+    reply(socket,packet,result);
+  }
+  try {
+    await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
+    const credentialFile=path.join(dir,'credential.json');
+    const configFile=path.join(dir,'module.json');
+    await writeFile(credentialFile,JSON.stringify({client_id:'muse-fixture-client',token:'fixture-only'}));
+    await writeFile(configFile,JSON.stringify({endpoint,credentialFile,moduleArtifactId:'muse-sdk-1.3.0-bridge.13',
+      command:process.execPath,args:[nativeScript,'--home',home,'--audit',auditPath,'--fixtures',fixturePath]}));
+    const env={PATH:process.env.PATH,ELIOT_SWARM_MODULE_STATE:stateDir,ELIOT_SWARM_MODULE_OWNER:ownerFile,
+      TEMP:os.tmpdir(),TMP:os.tmpdir(),SystemRoot:process.env.SystemRoot,WINDIR:process.env.WINDIR};
+    bridge=spawn(process.execPath,[path.join(here,'bridge.mjs'),'--config',configFile],
+      {cwd:here,env,windowsHide:true,stdio:['ignore','ignore','pipe']});
+    bridge.stderr.setEncoding('utf8');bridge.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
+    closed=new Promise(resolve=>bridge.once('close',(code,signal)=>resolve({code,signal})));
+    const outcome=await Promise.race([finished,delay(15000).then(()=>{throw new Error(`omission fixture timed out: ${stderr}`);})]);
+    assert.equal(outcomes.get(openId)?.outcome,'applied','the omitted-native-default root opens');
+    assert.equal(outcome.outcome,'applied','omitted per-turn effort still admits native input');
+    assert.equal(outcome.turn_id,'turn_omission_started');
+  } finally {
+    teardownStarted=true;
+    if(bridge&&bridge.exitCode===null)bridge.kill('SIGTERM');
+    if(bridge&&closed)closeResult=await Promise.race([closed,delay(5000).then(()=>null)]);
+    for(const socket of sockets)socket.destroy();
+    if(server.listening)await new Promise(resolve=>server.close(resolve));
+    try {
+      const audit=JSON.parse(await readFile(auditPath,'utf8'));
+      assert.equal(audit.session_start_has_modelId,false,'omitted modelId stays omitted from the session/start payload');
+      assert.equal(audit.session_start_has_providerId,false,'omitted providerId stays omitted from the session/start payload');
+      assert.equal(audit.session_start_params?.workspaceRoot,home,'workspace still rides the payload');
+      assert.equal(audit.turn_start_has_reasoningEffort,false,'omitted effort stays omitted from the turn/start payload');
+      assert.equal(audit.turn_start_params?.sessionId,sessionId);
+      assert.deepEqual(audit.turn_start_params?.input,[{type:'text',text:sentText}]);
+      assert.equal(audit.turn_start_count,1,'one native turn carries the omitted-effort payload');
+      const retained=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
+      assert.equal(Object.hasOwn(retained.route_defaults,'modelId'),false,
+        'an observed native default never becomes a controller override');
+      assert.equal(Object.hasOwn(retained.route_defaults,'providerId'),false);
+      assert.equal(retained.latest?.requested_model,null,'omitted request is recorded as null, not invented');
+      assert.equal(retained.latest?.requested_model_status,'omitted_native_default');
+      assert.equal(retained.latest?.requested_reasoning_effort,null);
+      assert.equal(retained.latest?.reasoning_application,'native_default_at_submission');
+      assert.deepEqual(retained.latest?.model,{modelId:'native-default-model',providerId:null},
+        'effective model is the readback observation, not a pre-start claim');
+    } finally {
+      await rm(dir,{recursive:true,force:true});
+    }
+    assert.ok(closeResult,'the omission bridge subprocess stops after the account-free native fixture');
+  }
+  console.log('PASS omission: session/turn payloads omit unset fields and read back the native default');
+}
 
 // 5. The bridge's closed transport validator mirrors the installed host's
 // session/start union. Invalid entries fail before any native frame; admitted

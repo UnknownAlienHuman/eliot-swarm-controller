@@ -535,3 +535,132 @@ fn skipped_ordinal_foreign_conversation_and_stale_generation_do_not_settle() {
         },
     );
 }
+
+fn open_route(model_id: Option<&str>) -> serde_json::Value {
+    let mut native_options = serde_json::Map::new();
+    if let Some(model) = model_id {
+        native_options.insert("modelId".into(), json!(model));
+    }
+    json!({"runtime":"antigravity","module_artifact_id":"eliot-antigravity.rust-headless.1",
+        "native_options": native_options})
+}
+fn open_command(id: &str, model_id: Option<&str>) -> RuntimeCommand {
+    RuntimeCommand {
+        operation_id: id.into(),
+        method: "agent.open".into(),
+        created_at_ms: 1,
+        binding_id: BINDING.into(),
+        generation: GENERATION,
+        native_root_id: None,
+        route: open_route(model_id),
+        input: json!({}),
+        input_sha256: Some(hash(b"open request")),
+        target_input_sha256: None,
+    }
+}
+fn refresh_command(id: &str) -> RuntimeCommand {
+    RuntimeCommand {
+        operation_id: id.into(),
+        method: "agent.refresh".into(),
+        created_at_ms: 2,
+        binding_id: BINDING.into(),
+        generation: GENERATION,
+        native_root_id: Some(ROOT.into()),
+        route: open_route(None),
+        input: json!({"session_id": ROOT}),
+        input_sha256: Some(hash(b"refresh request")),
+        target_input_sha256: None,
+    }
+}
+fn init_without_model() -> Vec<u8> {
+    serde_json::to_vec(&json!({"event":"init","conversation_id":ROOT,
+        "init":{"tools":[]}}))
+    .unwrap()
+}
+fn fresh_open_controller() -> Controller {
+    Controller::new(
+        BOOT.into(),
+        "scope-seq".into(),
+        BINDING.into(),
+        GENERATION,
+        None,
+        true,
+    )
+}
+
+#[test]
+fn omitted_model_uses_native_default_with_unknown_effective() {
+    with_contract(
+        "omitted_model_uses_native_default_with_unknown_effective",
+        || {
+            let command = open_command("op-open-default", None);
+            let mut controller = fresh_open_controller();
+            controller.begin_open(&command).unwrap();
+            controller.consume_line(&init_without_model());
+            let outcome = controller.complete_open(&command).unwrap();
+            assert_eq!(outcome.native_root_id.as_deref(), Some(ROOT));
+            let describe = &outcome.details["describe"];
+            assert_eq!(describe["model_requested"], json!(null));
+            assert_eq!(describe["model_observed"], json!(null));
+            assert_eq!(describe["model_verification"], "native_default");
+            // A native-default session carries no dispatch session proof: the
+            // effective model is unknown unless the stream observed it.
+            let read = controller
+                .read_command(&refresh_command("op-refresh-default"))
+                .unwrap();
+            let proof: swarm_contracts::runtime::AntigravityDispatchSessionProof =
+                serde_json::from_value(read.details["antigravity_dispatch_session_proof"].clone())
+                    .expect("native-default session identity proof");
+            assert!(proof.validate().is_ok());
+            assert_eq!(proof.schema_version, 2);
+            assert_eq!(proof.model_readback_state, "native_default");
+            assert_eq!(proof.requested_model_id, None);
+            assert_eq!(proof.observed_model_id, None);
+        },
+    );
+}
+#[test]
+fn explicit_model_override_requires_exact_readback() {
+    with_contract("explicit_model_override_requires_exact_readback", || {
+        let command = open_command("op-open-explicit", Some("gemini-3.8"));
+        let mut controller = fresh_open_controller();
+        controller.begin_open(&command).unwrap();
+        controller.consume_line(&init());
+        let outcome = controller.complete_open(&command).unwrap();
+        let describe = &outcome.details["describe"];
+        assert_eq!(describe["model_requested"], "gemini-3.8");
+        assert_eq!(describe["model_observed"], "gemini-3.8");
+        assert_eq!(describe["model_verification"], "verified");
+        let read = controller
+            .read_command(&refresh_command("op-refresh-explicit"))
+            .unwrap();
+        let proof = &read.details["antigravity_dispatch_session_proof"];
+        assert_eq!(proof["requested_model_id"], "gemini-3.8");
+        assert_eq!(proof["observed_model_id"], "gemini-3.8");
+        assert_eq!(proof["model_readback_state"], "verified");
+    });
+}
+#[test]
+fn explicit_model_mismatch_and_missing_readback_stay_rejected() {
+    with_contract(
+        "explicit_model_mismatch_and_missing_readback_stay_rejected",
+        || {
+            let mismatch = open_command("op-open-mismatch", Some("other-model"));
+            let mut controller = fresh_open_controller();
+            controller.begin_open(&mismatch).unwrap();
+            controller.consume_line(&init());
+            assert_eq!(
+                controller.complete_open(&mismatch).unwrap_err().code,
+                "NATIVE_MODEL_READBACK_MISMATCH"
+            );
+            let missing = open_command("op-open-unobserved", Some("gemini-3.8"));
+            let mut controller = fresh_open_controller();
+            controller.begin_open(&missing).unwrap();
+            controller.consume_line(&init_without_model());
+            assert_eq!(
+                controller.complete_open(&missing).unwrap_err().code,
+                "NATIVE_MODEL_READBACK_MISSING"
+            );
+        },
+    );
+}

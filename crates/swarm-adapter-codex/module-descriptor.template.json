@@ -3,7 +3,7 @@
   "module_id": "codex",
   "artifact": {
     "artifact_id": "codex-rust-controller.1",
-    "version": "10",
+    "version": "11",
     "build_id": null
   },
   "launch": {

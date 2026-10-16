@@ -71,7 +71,7 @@ fn owned_route_uses_verified_identity_when_external_service_fields_are_absent() 
             .as_str()
             .map(PathBuf::from)
             .expect("fixture connection path"),
-        expected_version: SERVICE_VERSION.to_owned(),
+        expected_version: Some(SERVICE_VERSION.to_owned()),
         directory: external["directory"]
             .as_str()
             .map(PathBuf::from)
@@ -95,7 +95,7 @@ fn owned_route_rejects_mismatched_or_invalid_verified_process_identity() {
             .as_str()
             .map(PathBuf::from)
             .expect("fixture connection path"),
-        expected_version: SERVICE_VERSION.to_owned(),
+        expected_version: Some(SERVICE_VERSION.to_owned()),
         directory: native["directory"]
             .as_str()
             .map(PathBuf::from)
@@ -129,7 +129,7 @@ fn external_route_keeps_configured_service_identity_and_positive_pid_contract() 
     let route = route(native.clone());
     let identity = external_readback_route_identity(&route).unwrap();
     assert_eq!(identity.service_id, "external-opencode");
-    assert_eq!(identity.expected_version, SERVICE_VERSION);
+    assert_eq!(identity.expected_version.as_deref(), Some(SERVICE_VERSION));
     assert_eq!(identity.expected_process_id, None);
     let valid_source = source(&identity, EXPECTED_PID);
     validate_readback_source_identity(&route, &valid_source, &identity).unwrap();

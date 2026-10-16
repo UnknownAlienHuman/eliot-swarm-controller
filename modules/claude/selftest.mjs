@@ -11,7 +11,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startup } from '@anthropic-ai/claude-agent-sdk';
-import { explicitQueryModel } from './model-selection.mjs';
+import { explicitQueryModel as legacyExplicitQueryModel } from './model-selection.mjs';
+import { explicitQueryModel } from './model-selection-v6.mjs';
 import { prepareQuery } from './prepared-query.mjs';
 import {
   createStreamState, applySdkMessage, noteStreamEnd, noteStreamFailure, snapshot,
@@ -82,13 +83,22 @@ function messageById(snap, id) {
   return snap.messages.find(m => m.id === id);
 }
 
-// 1a. Initial selection is passed as Options.model, then kept distinct from
-// the resolved identity reported by the SDK's system/init frame.
+// The retained model-selection helper keeps the old required-model contract;
+// bridge.6 omits Options.model when the route leaves it unset. Requested alias
+// stays distinct from the resolved identity reported by system/init.
 {
+  assert.deepEqual(legacyExplicitQueryModel({ modelId: 'sonnet' }), { model: 'sonnet' },
+    'the retained model-selection helper passes an explicit alias verbatim');
+  assert.throws(() => legacyExplicitQueryModel({}), /MODEL_ID_REQUIRED/,
+    'the retained model-selection helper still requires a route model');
+
   const option = explicitQueryModel({ modelId: 'sonnet' });
-  assert.deepEqual(option, { model: 'sonnet' }, 'route alias is passed verbatim as SDK Options.model');
-  assert.throws(() => explicitQueryModel({}), /MODEL_ID_REQUIRED/,
-    'an omitted route model must not fall through to the CLI default');
+  assert.deepEqual(option, { model: 'sonnet' }, 'bridge.6 passes an explicit alias verbatim as SDK Options.model');
+  assert.deepEqual(explicitQueryModel({}), {}, 'omitted route model omits SDK Options.model');
+  assert.deepEqual(explicitQueryModel({ modelId: null }), {}, 'explicit null omits SDK Options.model');
+  assert.deepEqual(explicitQueryModel({ modelId: undefined }), {}, 'explicit undefined omits SDK Options.model');
+  assert.throws(() => explicitQueryModel({ modelId: '' }), /MODEL_ID_REQUIRED/,
+    'an empty explicit model is rejected, not silently defaulted');
   assert.throws(() => explicitQueryModel({ modelId: ' sonnet' }), /INVALID_MODEL_ID/,
     'route model identifiers are not silently trimmed');
 
@@ -108,7 +118,15 @@ function messageById(snap, id) {
   assert.equal(unknown.adapter.model_effective, null);
   assert.equal(unknown.adapter.model_selection_status, 'unknown',
     'a missing init model is not promoted from the requested alias');
-  console.log('PASS model-selection: explicit Options.model, requested alias vs native init ID, unknown stays unknown');
+
+  const omittedState = feed(await load('model-selection.stream.json'));
+  omittedState.requested_model = explicitQueryModel({}).model ?? null;
+  const omitted = snapshot(omittedState);
+  assert.equal(omitted.adapter.model_requested, null);
+  assert.equal(omitted.adapter.model_effective, 'claude-sonnet-5');
+  assert.equal(omitted.adapter.model_selection_status, 'observed');
+  assert.equal(omitted.adapter.model_selection_evidence, 'system/init');
+  console.log('PASS model-selection: legacy required model and bridge.6 native default, requested alias vs native init ID');
 }
 
 // 1. Init identity, multi-frame message assembly, replay, partials, success.
@@ -517,7 +535,7 @@ function messageById(snap, id) {
 // 10. Normal bridge.5 graph contains no test fault controller; the fault
 // composition stays explicitly selectable and distinguishable.
 {
-  const bridgeText = await readFile(path.join(here, 'bridge-v5.mjs'), 'utf8');
+  const bridgeText = await readFile(path.join(here, 'bridge-v6.mjs'), 'utf8');
   assert.equal(bridgeText.includes('first-query-spawn-control.test.mjs'), false, 'production entrypoint imports no test file');
   assert.equal(bridgeText.includes('ELIOT_CLAUDE_V5_FIRST_QUERY_FAULT_DIR'), false, 'normal bootstrap requires no fault directory');
   assert.ok(bridgeText.includes("from './first-query-control.mjs'"), 'normal control seam imported');
@@ -525,14 +543,14 @@ function messageById(snap, id) {
   assert.ok(bridgeText.includes("command.method === 'agent.reply'"), 'normal bridge handles one-shot replies');
   assert.ok(bridgeText.includes("command.method === 'agent.result'"), 'normal bridge publishes exact result pages');
   const descriptor = JSON.parse(await readFile(path.join(here, 'module-descriptor.template.json'), 'utf8'));
-  assert.equal(descriptor.artifact.artifact_id, 'claude-agent-sdk-0.3.287-bridge.5');
-  assert.ok(JSON.stringify(descriptor.launch).includes('bridge-v5.mjs'));
+  assert.equal(descriptor.artifact.artifact_id, 'claude-agent-sdk-0.3.287-bridge.6');
+  assert.ok(JSON.stringify(descriptor.launch).includes('bridge-v6.mjs'));
   assert.ok(descriptor.capabilities.includes('agent.reply'), 'bridge.5 publishes the live one-shot reply capability');
   assert.ok(descriptor.capabilities.includes('agent.result'), 'bridge.5 advertises its implemented result-page path');
   assert.equal(JSON.stringify(descriptor).includes('FIRST_QUERY_FAULT'), false, 'standard descriptor carries no fault requirement');
   const faultEntry = await readFile(path.join(here, 'bridge-v5-fault-test.mjs'), 'utf8');
   assert.ok(faultEntry.includes('first-query-spawn-control.test.mjs'), 'fault scenario remains reproducible via its explicit entrypoint');
-  console.log('PASS bridge-v5-graph: production entry clean, descriptor clean, fault entry explicit');
+  console.log('PASS bridge-v6-graph: production entry clean, descriptor clean, fault entry explicit');
 }
 
 console.log('Claude bridge self-test: all fixture assertions passed');

@@ -32,7 +32,10 @@ const endpoint = process.platform === "win32"
   ? `\\\\.\\pipe\\eliot-command-fixture-${randomUUID()}`
   : join(scratch, "host.sock");
 const nativeOptions = {
-  modelId: "stealth/space-bunny-alpha",
+  // Explicit model override for this fixture run. Any non-empty trimmed
+  // string is accepted (no controller whitelist); omission (null/absent) is
+  // covered in test-glue.mjs where argv omission is directly observable.
+  modelId: "fixture-explicit-model",
   workspaceRoot: process.cwd(),
 };
 const workerBootId = "fixture-command-worker-boot";
@@ -490,8 +493,8 @@ try {
   assert.equal(dispatch.native_input_id, undefined);
   assert.equal(dispatch.details.execution_shape, "sessionless_batch");
   assert.equal(dispatch.details.completion_condition, "native_result_observed");
-  assert.equal(dispatch.details.requested_model, "stealth/space-bunny-alpha");
-  assert.equal(dispatch.details.native_request_model, "stealth/space-bunny-alpha");
+  assert.equal(dispatch.details.requested_model, "fixture-explicit-model");
+  assert.equal(dispatch.details.native_request_model, "fixture-explicit-model");
   assert.equal(dispatch.details.native_request_model_status, "observed");
   assert.equal(dispatch.details.native_request_model_evidence.length, 2);
   assert.equal(dispatch.details.effective_model, null);
@@ -555,7 +558,7 @@ try {
   assert.equal(deliveredCommands.filter(command => command.method === "task.dispatch").length, 3);
   assert.equal(readFileSync(invocationLogFile, "utf8").trim().split(/\r?\n/).length, 1);
   assert.equal(readFileSync(versionProbeLogFile, "utf8").trim().split(/\r?\n/).length, 1);
-  assert.ok(observations.some(state => state.describe?.requested_model === "stealth/space-bunny-alpha"));
+  assert.ok(observations.some(state => state.describe?.requested_model === "fixture-explicit-model"));
   process.stdout.write("Command bridge fixture: preflight, one-shot dispatch, refresh and saved-run reconcile passed\n");
 } finally {
   clearTimeout(timeout);

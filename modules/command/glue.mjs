@@ -35,7 +35,8 @@ import { fileURLToPath } from "node:url";
 export const RUNTIME = "command";
 export const ENTRYPOINT = "native_mod";
 export const TRANSPORT = "headless_ndjson";
-export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.5";
+export const MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.6";
+export const SCHEMA3_PREVIOUS_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.5";
 export const HISTORICAL_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.4";
 export const LEGACY_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.2";
 export const PREVIOUS_MODULE_ARTIFACT_ID = "command-mod-0.1.0-glue.3";
@@ -187,7 +188,7 @@ export function validateTaskPromptDispatch(command, bootId, moduleContract) {
   }
   if (!moduleContract || moduleContract.module_id !== "runtime.command"
       || moduleContract.artifact?.artifact_id !== MODULE_ARTIFACT_ID
-      || moduleContract.artifact?.version !== "5"
+      || moduleContract.artifact?.version !== "6"
       || moduleContract.protocol?.major !== 1 || moduleContract.protocol?.minor !== 0) {
     failTaskPrompt("MODULE_CONTRACT_MISMATCH");
   }
@@ -393,7 +394,7 @@ function createAdmission(options) {
     operation_id: options.operationId,
     execution_shape: "sessionless_batch",
     batch_run_id: coreBinding.batch_run_id,
-    requested_model: options.requestedModel,
+    requested_model: options.requestedModel ?? null,
     prompt_sha256: coreBinding.prompt_sha256,
     prompt_bytes: coreBinding.prompt_bytes,
     core_binding: coreBinding,
@@ -623,7 +624,9 @@ function expectedTerminalFacts(result, exit, timedOut, records) {
   return { anomalies, disposition, dispositionBasis, framesAfterResult };
 }
 
-function validSavedDispatchAdmission(receipt, context, taskPrompt, operationId) {
+function validSavedDispatchAdmission(
+  receipt, context, taskPrompt, operationId, moduleArtifactId, moduleArtifactVersion,
+) {
   if (!exactFields(receipt, [
     "schema_version", "module_receipt", "operation_id", "binding_id",
     "binding_generation", "worker_boot_id", "attempt_id", "task_id",
@@ -653,8 +656,8 @@ function validSavedDispatchAdmission(receipt, context, taskPrompt, operationId) 
     && receipt.native_input_id === null
     && moduleReceipt.schema_version === 1
     && moduleReceipt.module_id === "runtime.command"
-    && moduleReceipt.artifact.artifact_id === MODULE_ARTIFACT_ID
-    && moduleReceipt.artifact.version === "5"
+     && moduleReceipt.artifact.artifact_id === moduleArtifactId
+     && moduleReceipt.artifact.version === moduleArtifactVersion
     && moduleReceipt.protocol.major === 1
     && moduleReceipt.protocol.minor === 0
     && moduleReceipt.binding_id === context.binding_id
@@ -719,7 +722,14 @@ function validateSavedEvidence(controlDir, admission, run, records, contract) {
         || !LOWER_SHA256.test(context.source_text_sha256 ?? "")
         || !Number.isSafeInteger(context.source_text_bytes) || context.source_text_bytes < 0
         || admission.prompt_contract_revision !== TASK_PROMPT_CONTRACT_REVISION
-        || !validSavedDispatchAdmission(admission.dispatch_admission, context, taskPrompt, operationId)) {
+        || !validSavedDispatchAdmission(
+          admission.dispatch_admission,
+          context,
+          taskPrompt,
+          operationId,
+          contract.artifactId,
+          contract.artifactVersion,
+        )) {
       return invalid("saved_task_prompt_identity_mismatch");
     }
   }
@@ -922,11 +932,15 @@ export async function openRun(config, options) {
   const runPath = join(controlDir, "run.json");
   const eventsPath = join(controlDir, "events.ndjson");
   const operationId = options.operationId;
-  const requestedModel = options.requestedModel;
+  const requestedModel = options.requestedModel ?? null;
   if (typeof operationId !== "string" || operationId.trim() === "") {
     throw new Error("OPERATION_ID_REQUIRED");
   }
-  if (typeof requestedModel !== "string" || requestedModel.trim() === "" || requestedModel !== requestedModel.trim()) {
+  // Omission (null/undefined) selects the installed native default: `--model`
+  // is omitted from argv. An explicit value must be a non-empty trimmed
+  // string and rides verbatim; no whitelist is enforced here.
+  if (requestedModel !== null
+    && (typeof requestedModel !== "string" || requestedModel.trim() === "" || requestedModel !== requestedModel.trim())) {
     throw new Error("REQUESTED_MODEL_REQUIRED");
   }
   if (typeof options.prompt !== "string" || options.prompt.length === 0) {
@@ -1022,13 +1036,14 @@ export async function openRun(config, options) {
   }
   persistAdmission(controlDir, expectedAdmission);
   const modPath = config.modPath ?? DEFAULT_MOD_PATH;
+  // Omit `--model` when the request omits the model so the installed native
+  // default applies; explicit models ride verbatim as `--model <id>`.
   const args = [
     ...prefix,
     "-p",
     "--output-format",
     "json",
-    "--model",
-    requestedModel,
+    ...(requestedModel === null ? [] : ["--model", requestedModel]),
     "--mod",
     modPath,
     options.prompt,
@@ -1286,6 +1301,10 @@ export function snapshotRun(controlDir) {
     && admission.module_artifact_id === PREVIOUS_MODULE_ARTIFACT_ID
     && run?.schema === 2
     && run.module_artifact_id === PREVIOUS_MODULE_ARTIFACT_ID;
+  const schema3PreviousArtifact = admission?.schema === 3
+    && admission.module_artifact_id === SCHEMA3_PREVIOUS_MODULE_ARTIFACT_ID
+    && (!run || (run.schema === 3
+      && run.module_artifact_id === SCHEMA3_PREVIOUS_MODULE_ARTIFACT_ID));
   const historicalArtifact = admission?.schema === 2
     && admission.module_artifact_id === HISTORICAL_MODULE_ARTIFACT_ID;
   const journal = readModJournal(resolved, { legacy });
@@ -1294,9 +1313,21 @@ export function snapshotRun(controlDir) {
     ? { valid: false, diagnostic_code: "legacy_artifact_read_only" }
     : previousArtifact
       ? { valid: false, diagnostic_code: "legacy_artifact_read_only" }
-      : validateSavedEvidence(resolved, admission, run, eventRecords, historicalArtifact
-        ? { schema: 2, artifactId: HISTORICAL_MODULE_ARTIFACT_ID, taskPrompt: false }
-        : { schema: 3, artifactId: MODULE_ARTIFACT_ID, taskPrompt: true });
+      : validateSavedEvidence(resolved, admission, run, eventRecords, schema3PreviousArtifact
+        ? {
+          schema: 3,
+          artifactId: SCHEMA3_PREVIOUS_MODULE_ARTIFACT_ID,
+          artifactVersion: "5",
+          taskPrompt: true,
+        }
+        : historicalArtifact
+          ? { schema: 2, artifactId: HISTORICAL_MODULE_ARTIFACT_ID, taskPrompt: false }
+          : {
+            schema: 3,
+            artifactId: MODULE_ARTIFACT_ID,
+            artifactVersion: "6",
+            taskPrompt: true,
+          });
   return {
     scope: "single_headless_run",
     completeness: "partial",

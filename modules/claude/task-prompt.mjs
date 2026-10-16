@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
-export const CLAUDE_TASK_PROMPT_ARTIFACT_ID = 'claude-agent-sdk-0.3.287-bridge.5';
-export const CLAUDE_TASK_PROMPT_ARTIFACT_VERSION = '5';
+export const CLAUDE_TASK_PROMPT_ARTIFACT_ID = 'claude-agent-sdk-0.3.287-bridge.6';
+export const CLAUDE_TASK_PROMPT_ARTIFACT_VERSION = '6';
 
 const MAX_PROMPT_BYTES = 1_000_000;
 const SHA256 = /^[0-9a-f]{64}$/;

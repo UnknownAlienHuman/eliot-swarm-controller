@@ -20,8 +20,8 @@ import {
   restoredNativeUsageSnapshot,
 } from './native-usage.mjs';
 
-const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.12';
-const MUSE_ARTIFACT_VERSION = '12';
+const MUSE_ARTIFACT_ID = 'muse-sdk-1.3.0-bridge.13';
+const MUSE_ARTIFACT_VERSION = '13';
 const MAX_TASK_PROMPT_BYTES = 1_000_000;
 const MAX_OBSERVATION_STATE_BYTES = 700_000;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -390,7 +390,7 @@ function workFenceCurrent(fence, entry, eventVersion=fence.eventVersion) {
     && entry.command.native_root_id===fence.rootId
     && entry.params?.sessionId===fence.rootId
     && (sessionVersions.get(fence.rootId)??0)===eventVersion
-    && routeDefaults.modelId===fence.modelId
+    && (routeDefaults.modelId===undefined || routeDefaults.modelId===fence.modelId)
     && (routeDefaults.providerId===undefined || routeDefaults.providerId===fence.providerId);
 }
 async function readWorkFence(modelChangedCode) {
@@ -812,7 +812,9 @@ async function completeNative(entry, ack) {
   }
   if (ack.status !== 'accepted') throw new Error('UNEXPECTED_ADMISSION_STATUS');
   if (entry.kind === 'input') {
-    settle(entry, {native_ack:ack,completion_condition:'native_input_admitted',requested_reasoning_effort:entry.params.reasoningEffort}, required(ack,'turnId'));
+    settle(entry, {native_ack:ack,completion_condition:'native_input_admitted',
+      requested_reasoning_effort:entry.params.reasoningEffort??null,
+      reasoning_application:entry.params.reasoningEffort!==undefined?'explicit_per_turn':'native_default'}, required(ack,'turnId'));
   } else if (entry.kind === 'configure') {
     const setting = entry.setting;
     if (setting.key === 'reasoningEffort') {
@@ -983,10 +985,25 @@ async function followChild(id) {
 }
 async function launchConnection(options) {
   if (handshake) throw new Error('NATIVE_ALREADY_OWNED');
-  required(options,'workspaceRoot'); required(options,'modelId'); required(options,'reasoningEffort');
+  required(options,'workspaceRoot');
   if (!path.isAbsolute(options.workspaceRoot)) throw new Error('WORKSPACE_MUST_BE_ABSOLUTE');
   const allowed=['workspaceRoot','modelId','providerId','reasoningEffort','approvalMode','mcpServers'];
   for (const name of Object.keys(options)) if (!allowed.includes(name)) throw new Error(`UNSUPPORTED_NATIVE_OPTION_${name}`);
+  // Omission selects the installed native default (installed msp.d.ts
+  // SessionStartParams: modelId optional 'server default when omitted',
+  // providerId optional-nullable 'server default when omitted or explicit null';
+  // TurnStartParams reasoningEffort optional, absent means unspecified for the
+  // turn, not a reset). Explicit values are validated verbatim; no default is
+  // synthesized here and no provider credential/config is read.
+  if (options.modelId !== undefined
+    && (typeof options.modelId !== 'string' || !options.modelId.trim() || options.modelId !== options.modelId.trim()))
+    throw new Error('INVALID_MODEL_SELECTION');
+  if (options.providerId !== undefined && options.providerId !== null
+    && (typeof options.providerId !== 'string' || !options.providerId.trim() || options.providerId !== options.providerId.trim()))
+    throw new Error('INVALID_PROVIDER');
+  if (options.reasoningEffort !== undefined
+    && !['none','minimal','low','medium','high','xhigh','max','ultra'].includes(options.reasoningEffort))
+    throw new Error('INVALID_REASONING_EFFORT');
   if (options.mcpServers !== undefined) nativeMcpServers(options.mcpServers);
   // Explicit launch only, never from describe/status/reconnect. Current vendor auth is inherited.
   sessionReadUnavailable=false;
@@ -1033,8 +1050,15 @@ async function launchConnection(options) {
 }
 
 async function startNative(command,markNativeAdmissionPossible) {
-  const options=command.route.native_options;
+  const options=command.route.native_options ?? {};
+  if (typeof options.workspaceRoot !== 'string' || !options.workspaceRoot.trim())
+    throw new Error('WORKSPACE_MUST_BE_ABSOLUTE');
+  // A new root replaces the previous route defaults. Omitted model/provider/
+  // effort stay omitted so the native default applies. Observed values belong
+  // to session readback; they must not become controller route overrides.
+  for (const name of ['modelId','providerId','reasoningEffort']) delete routeDefaults[name];
   Object.assign(routeDefaults,options);
+  if(routeDefaults.providerId===null)delete routeDefaults.providerId;
   const mcpServers=options.mcpServers===undefined?undefined:nativeMcpServers(options.mcpServers);
   delete latest.mcp_servers_requested;
   delete latest.mcp_servers_config_forwarded;
@@ -1046,8 +1070,12 @@ async function startNative(command,markNativeAdmissionPossible) {
   }
   await checkpoint(true);
   const init=await launchConnection(options);
-  const params={workspaceRoot:options.workspaceRoot,modelId:options.modelId};
-  if(options.providerId!==undefined)params.providerId=options.providerId;
+  // Omit unset model/provider so the installed server default applies.
+  // Explicit values are forwarded byte-exact. A null providerId is also an
+  // omission spelling per the installed schema; it is omitted on the wire.
+  const params={workspaceRoot:options.workspaceRoot};
+  if(options.modelId!==undefined)params.modelId=options.modelId;
+  if(options.providerId!==undefined && options.providerId!==null)params.providerId=options.providerId;
   if(options.approvalMode!==undefined)params.approvalMode=options.approvalMode;
   if(mcpServers!==undefined){
     // The pinned facade omits config until its grant check lands; this raw
@@ -1062,10 +1090,24 @@ async function startNative(command,markNativeAdmissionPossible) {
   // verdict: a crash after session/start must leave a recorded session that
   // explicit recovery can target, not an unrecorded one known only in memory.
   changed(); await checkpoint(true);
-  if(r.session.modelId!==options.modelId)throw new Error('MODEL_READBACK_MISMATCH');
-  if(options.providerId!==undefined && r.session.providerId!==options.providerId)throw new Error('PROVIDER_READBACK_MISMATCH');
-  latest.requested_reasoning_effort=options.reasoningEffort;
-  latest.reasoning_application='explicit_per_turn_option'; // Sampled at submission, not a claimed inference measurement.
+  // Explicit selections must read back exactly. Omitted selections remain
+  // omitted; the session snapshot records native observations separately.
+  if(options.modelId!==undefined) {
+    if(r.session.modelId!==options.modelId)throw new Error('MODEL_READBACK_MISMATCH');
+  }
+  if(options.providerId!==undefined && options.providerId!==null) {
+    if(r.session.providerId!==options.providerId)throw new Error('PROVIDER_READBACK_MISMATCH');
+  }
+  if(options.reasoningEffort===undefined) delete routeDefaults.reasoningEffort;
+  latest.model={modelId:r.session.modelId,providerId:r.session.providerId};
+  latest.requested_model=options.modelId??null;
+  latest.requested_model_status=options.modelId!==undefined?'explicit':'omitted_native_default';
+  latest.requested_provider=options.providerId??null;
+  latest.requested_provider_status=options.providerId!==undefined&&options.providerId!==null?'explicit':'omitted_native_default';
+  latest.requested_reasoning_effort=options.reasoningEffort??null;
+  latest.reasoning_application=options.reasoningEffort!==undefined
+    ?'explicit_per_turn_option' // Sampled at submission, not a claimed inference measurement.
+    :'native_default_at_submission';
   nativeReady=true;changed();
   await checkpoint();
   return {native_scope_key:nativeScope,native_root_id:rootId,details:{session:latest.session,server:init.serverInfo,mcp:{
@@ -1073,7 +1115,10 @@ async function startNative(command,markNativeAdmissionPossible) {
     requested_server_names:latest.mcp_servers_requested??null,
     config_forwarded_server_names:latest.mcp_servers_config_forwarded??null,
     session_start_admission_ack:latest.mcp_servers_admission_ack??null},
-    reasoning:{requested:options.reasoningEffort,application:'per_turn_at_submission'},fingerprint_warning:Boolean(msp.fingerprintWarning)}};
+    requested:{model:latest.requested_model,model_status:latest.requested_model_status,
+      provider:latest.requested_provider,provider_status:latest.requested_provider_status},
+    observed:{modelId:r.session.modelId,providerId:r.session.providerId},
+    reasoning:{requested:latest.requested_reasoning_effort,application:latest.reasoning_application},fingerprint_warning:Boolean(msp.fingerprintWarning)}};
 }
 async function recoverNative(command,markNativeAdmissionPossible) {
   if(!recovery || !rootId || !nativeScope)throw new Error('RECOVERY_CHECKPOINT_UNAVAILABLE');
@@ -1112,7 +1157,10 @@ async function execute(command) {
         const workFence=await readWorkFence('MODEL_CHANGED_BEFORE_SEND');
         const steer=p.delivery==='steer';
         const promptText=taskPrompt?taskPrompt.envelope.prompt:required(p,'text');
-        const input={sessionId:rootId,input:[{type:'text',text:promptText}],reasoningEffort:routeDefaults.reasoningEffort};
+        // Omit per-turn reasoningEffort when no standing default is set so
+        // the native default applies; an explicit standing value rides verbatim.
+        const input={sessionId:rootId,input:[{type:'text',text:promptText}]};
+        if(routeDefaults.reasoningEffort!==undefined)input.reasoningEffort=routeDefaults.reasoningEffort;
         if(steer)input.expectedTurnId=required(p,'expected_turn_id');else input.ifBusy='queue';
         await submitNative(command,steer?'turn/steer':'turn/start',input,'input',undefined,taskPrompt,entry=>{
           if(!workFenceCurrent(workFence,entry))

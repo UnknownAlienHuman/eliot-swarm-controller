@@ -211,9 +211,9 @@ impl OwnedServiceRoute {
         Options {
             service_id: self.service_id.clone(),
             connection_file: self.connection_file.clone(),
-            expected_version: VERSION.to_owned(),
+            expected_version: Some(VERSION.to_owned()),
             directory: self.workspace_directory.clone(),
-            model: self.model.clone(),
+            model: Some(self.model.clone()),
         }
     }
 

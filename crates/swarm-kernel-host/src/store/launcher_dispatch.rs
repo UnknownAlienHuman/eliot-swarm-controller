@@ -795,7 +795,7 @@ fn build_current_packet(
     binding: &Value,
     proof: &Value,
 ) -> Result<Value> {
-    if proof["kind"] == antigravity_capability::ANTIGRAVITY_PROOF_KIND {
+    if antigravity_capability::is_session_proof(proof) {
         return build_packet(parent, attempt, binding, proof, "");
     }
     let owned = super::opencode::owned_service_for_binding(
@@ -815,7 +815,7 @@ fn build_packet(
     proof: &Value,
     owned_service_id: &str,
 ) -> Result<Value> {
-    if proof["kind"] == antigravity_capability::ANTIGRAVITY_PROOF_KIND {
+    if antigravity_capability::is_session_proof(proof) {
         return antigravity_capability::build_packet(parent, attempt, binding, proof);
     }
     let capability_identity_digest =

@@ -13,12 +13,12 @@ import { startup } from '@anthropic-ai/claude-agent-sdk';
 import { Control } from './control.mjs';
 import { createFirstQueryControl } from './first-query-control.mjs';
 import { prepareQuery } from './prepared-query.mjs';
-import { explicitQueryModel, modelSelectionFacts } from './model-selection.mjs';
+import { explicitQueryModel, modelSelectionFacts } from './model-selection-v6.mjs';
 import {
   firstNativeQueryUnknownOutcome, streamEndedSendOutcome,
 } from './pending-outcome.mjs';
 import {
-  CLAUDE_TASK_PROMPT_ARTIFACT_ID, taskDispatchAdmission, taskPromptFor,
+  taskDispatchAdmission, taskPromptFor,
   enqueueTaskPrompt, moduleReceipt,
 } from './task-prompt.mjs';
 import { createInteractionManager } from './interactions.mjs';
@@ -32,7 +32,7 @@ import {
 } from './result-pages.mjs';
 
 const SDK_VERSION = '0.3.287';
-const MODULE_ARTIFACT_ID = CLAUDE_TASK_PROMPT_ARTIFACT_ID;
+const MODULE_ARTIFACT_ID = 'claude-agent-sdk-0.3.287-bridge.6';
 const ENTRYPOINT = 'claude_agent_sdk_streaming_input';
 const PERMISSION_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'];
 const CAPABILITIES = {
@@ -75,7 +75,7 @@ function capabilityError(capability) {
 
 const argv = process.argv.slice(2);
 if (argv.length !== 2 || argv[0] !== '--config') {
-  console.error('Usage: node bridge-v5.mjs --config <module-host-connection.json>'); process.exit(2);
+  console.error('Usage: node bridge-v6.mjs --config <module-host-connection.json>'); process.exit(2);
 }
 const bootstrap = await loadModuleBootstrap(argv[1]);
 const { config, credential, managedOwner, bootId, moduleContract } = bootstrap;
@@ -416,7 +416,7 @@ async function startNative(command) {
   let modelOption;
   try { modelOption = explicitQueryModel(nativeOptions); }
   catch (error) { throw codedError(error.message); }
-  const requestedModel = modelOption.model;
+  const requestedModel = modelOption.model ?? null;
   let permissionMode;
   if (nativeOptions.permissionMode !== undefined) {
     if (!PERMISSION_MODES.includes(nativeOptions.permissionMode)) throw codedError('INVALID_PERMISSION_MODE');

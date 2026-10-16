@@ -137,10 +137,16 @@ fn validate_route_pairing(service: &Service, options: &Options) -> Result<()> {
             .service_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
+    // This readback is qualified only against the pinned native build, so the
+    // *observed* service must be that build. An explicit route version pin is
+    // optional: when present it must name the same observed build.
     if !service_id_valid
         || !options.directory.is_absolute()
-        || options.expected_version != PINNED_OPENCODE_VERSION
-        || options.expected_version != service.version
+        || service.version != PINNED_OPENCODE_VERSION
+        || options
+            .expected_version
+            .as_deref()
+            .is_some_and(|pin| pin != service.version)
         || service.pid == 0
     {
         return Err(Error::new(

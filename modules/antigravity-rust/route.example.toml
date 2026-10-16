@@ -9,5 +9,9 @@ module_artifact_id = 'eliot-antigravity.rust-headless.1'
 enabled = false
 [routes.native_options]
 workspaceRoot = 'C:\\Projects\\YourRepository'
-modelId = 'gemini-3.8-flash-high'
+# Optional exact native model override. When omitted, the adapter passes no
+# --model flag and the installed harness default applies; the effective model
+# is reported as unknown unless the native init stream observes it. When set,
+# the value must equal the native init readback exactly, otherwise open fails.
+# modelId = '<OPTIONAL_EXACT_NATIVE_MODEL_ID>'
 reasoningEffort = 'high'

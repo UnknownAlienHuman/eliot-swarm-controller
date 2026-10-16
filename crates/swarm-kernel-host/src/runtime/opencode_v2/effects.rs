@@ -541,7 +541,13 @@ impl Service {
         let session = self
             .verify_binding_identity(root, options, binding, generation)
             .await?;
-        if session["model"] != json!(options.model) {
+        // Without an explicit route model override the native harness owns its
+        // model; only a pinned trio is enforced against the live session.
+        if options
+            .model
+            .as_ref()
+            .is_some_and(|model| session["model"] != serde_json::json!(model))
+        {
             return Err(Error::new(
                 "NATIVE_MODEL_MISMATCH",
                 "native session model differs from the route's exact provider/model/variant",
@@ -585,7 +591,11 @@ impl Service {
 
     async fn check_root(&self, root: &str, options: &Options) -> Result<Value> {
         let session = self.check_root_identity(root, options).await?;
-        if session["model"] != json!(options.model) {
+        if options
+            .model
+            .as_ref()
+            .is_some_and(|model| session["model"] != serde_json::json!(model))
+        {
             return Err(Error::new(
                 "NATIVE_MODEL_MISMATCH",
                 "native session model differs from the route's exact provider/model/variant",
@@ -636,14 +646,25 @@ impl Service {
             Err(e) => return failed(command, options, &e, false),
         };
         let root = root_id(&command.binding_id, command.generation);
-        let result=self.post("/api/session",json!({"id":root,"location":location,"model":options.model,"metadata":{"eliot":marker(command)}})).await;
+        // Without an explicit route model the native harness supplies its own
+        // defaults: no model key is sent and none is demanded back. An
+        // explicit trio is passed through unchanged as the invocation override.
+        let mut creation =
+            json!({"id":root,"location":location,"metadata":{"eliot":marker(command)}});
+        if let Some(model) = options.model.as_ref() {
+            creation["model"] = json!(model);
+        }
+        let result = self.post("/api/session", creation).await;
         let mut result = match result.and_then(decode::<Data<Value>>) {
             Ok(response) => {
                 let valid = super::snapshot::validate_session(&response.data, Some(&root)).is_ok()
                     && response.data["parentID"].is_null()
                     && response.data["fork"].is_null()
                     && response.data["metadata"]["eliot"] == marker(command)
-                    && response.data["model"] == json!(options.model)
+                    && options
+                        .model
+                        .as_ref()
+                        .is_none_or(|model| response.data["model"] == json!(model))
                     && response.data["location"] == location;
                 if valid {
                     match self

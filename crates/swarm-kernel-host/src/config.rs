@@ -329,9 +329,24 @@ impl Route {
 }
 
 fn validate_codex_rust_options(value: &Value) -> Result<()> {
-    let options = exact_option_object(value, &["modelProvider", "model", "workspaceRoot"], &[])?;
-    required_option_string(options, "modelProvider", 256)?;
-    required_option_string(options, "model", 256)?;
+    let options = exact_option_object(value, &["workspaceRoot"], &["modelProvider", "model"])?;
+    let provider = options
+        .get("modelProvider")
+        .filter(|value| !value.is_null());
+    let model = options.get("model").filter(|value| !value.is_null());
+    match (provider, model) {
+        (None, None) => {}
+        (Some(provider), Some(model)) => {
+            option_string(provider, "modelProvider", 256)?;
+            option_string(model, "model", 256)?;
+        }
+        _ => {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "Codex explicit override requires both provider and model",
+            ));
+        }
+    }
     required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
     Ok(())
 }
@@ -380,10 +395,17 @@ fn validate_command_rust_options(value: &Value) -> Result<()> {
 fn validate_antigravity_rust_options(value: &Value) -> Result<()> {
     let options = exact_option_object(
         value,
-        &["modelId", "workspaceRoot"],
-        &["reasoningEffort", "agent", "dangerouslySkipPermissions"],
+        &["workspaceRoot"],
+        &[
+            "modelId",
+            "reasoningEffort",
+            "agent",
+            "dangerouslySkipPermissions",
+        ],
     )?;
-    required_option_string(options, "modelId", 256)?;
+    if let Some(value) = options.get("modelId") {
+        option_string(value, "modelId", 256)?;
+    }
     required_absolute_path(options, "workspaceRoot", 32 * 1024)?;
     if let Some(value) = options.get("reasoningEffort") {
         let effort = option_string(value, "reasoningEffort", 32)?;
@@ -706,7 +728,10 @@ impl Config {
                 ));
             }
             if let Some(owned) = route.owned_opencode_service()? {
-                let key = (owned.state_root().to_path_buf(), owned.version().to_owned());
+                let key = (
+                    owned.state_root().to_path_buf(),
+                    Some(owned.version().to_owned()),
+                );
                 if services
                     .insert(owned.service_id().to_owned(), key.clone())
                     .is_some_and(|old| old != key)
@@ -948,6 +973,35 @@ mod owned_opencode_route_validation_tests {
                 .validate_activation_contract()
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod native_model_default_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_defaults_are_allowed_but_malformed_explicit_overrides_are_not_defaults() {
+        let workspace = std::env::current_dir().unwrap();
+        let mut options = json!({"workspaceRoot":workspace});
+        assert!(validate_codex_rust_options(&options).is_ok());
+        assert!(validate_antigravity_rust_options(&options).is_ok());
+        options["modelProvider"] = json!("native-provider");
+        assert!(validate_codex_rust_options(&options).is_err());
+        options["model"] = json!("native-model");
+        assert!(validate_codex_rust_options(&options).is_ok());
+        for invalid in [json!(false), json!(""), json!("bad\nmodel")] {
+            options["modelProvider"] = invalid.clone();
+            options["model"] = invalid;
+            assert!(validate_codex_rust_options(&options).is_err());
+        }
+        let mut options = json!({"workspaceRoot":workspace,"modelId":"explicit-model"});
+        assert!(validate_antigravity_rust_options(&options).is_ok());
+        for invalid in [Value::Null, json!(false), json!("")] {
+            options["modelId"] = invalid;
+            assert!(validate_antigravity_rust_options(&options).is_err());
+        }
     }
 }
 

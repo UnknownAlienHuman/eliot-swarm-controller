@@ -246,6 +246,7 @@ pub(crate) struct ExecutionScan {
 
 pub(crate) struct ExecutionRead {
     pub scan: ExecutionScan,
+    pub service_version: String,
     pub synced: bool,
     pub gap: Option<&'static str>,
 }
@@ -277,7 +278,12 @@ impl RootCreationScan {
         model: Value,
     ) -> Result<Self> {
         valid_id(session_id, "ses")?;
-        if binding_id.trim().is_empty() || generation < 1 || !model.is_object() {
+        // An object is an exact route invocation override; null means the
+        // native harness owns the creation model and no equality is demanded.
+        // (Standalone adapter parity: its scan skips the model comparison for
+        // a null descriptor model.)
+        if binding_id.trim().is_empty() || generation < 1 || !(model.is_object() || model.is_null())
+        {
             return Err(gap("NATIVE_LOG_ORIGIN"));
         }
         Ok(Self {
@@ -319,7 +325,7 @@ impl RootCreationScan {
                 || data.get("parentID").is_some_and(|parent| !parent.is_null())
                 || data["metadata"]["eliot"]["binding"] != self.binding_id
                 || data["metadata"]["eliot"]["generation"] != self.generation
-                || data["model"] != self.model
+                || (!self.model.is_null() && data["model"] != self.model)
             {
                 return Err(gap("NATIVE_LOG_ORIGIN"));
             }
@@ -468,7 +474,7 @@ impl ExecutionScan {
                 || data.get("parentID").is_some_and(|parent| !parent.is_null())
                 || data["metadata"]["eliot"]["binding"] != descriptor.binding_id
                 || data["metadata"]["eliot"]["generation"] != descriptor.generation
-                || data["model"] != descriptor.model
+                || (!descriptor.model.is_null() && data["model"] != descriptor.model)
             {
                 return Err(gap("NATIVE_LOG_ORIGIN"));
             }

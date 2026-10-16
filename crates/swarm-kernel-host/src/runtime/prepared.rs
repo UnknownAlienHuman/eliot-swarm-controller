@@ -13,17 +13,23 @@ use swarm_contracts::module_catalog::PreInputOpenContract;
 
 pub const CLAUDE_RUNTIME: &str = "claude";
 pub const CLAUDE_MODULE_RUNTIME: &str = "module";
-pub const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.5";
+pub const CLAUDE_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.6";
 pub const CLAUDE_RETAINED_ARTIFACT_ID: &str = "claude-agent-sdk-0.3.287-bridge.3";
 pub const CLAUDE_RETAINED_ARTIFACT_ID_V4: &str = "claude-agent-sdk-0.3.287-bridge.4";
+pub const CLAUDE_RETAINED_ARTIFACT_ID_V5: &str = "claude-agent-sdk-0.3.287-bridge.5";
 
 pub fn is_prepared_claude_route(route: &Value) -> bool {
     let artifact_id = route["module_artifact_id"].as_str();
-    (route["runtime"] == CLAUDE_MODULE_RUNTIME && artifact_id == Some(CLAUDE_ARTIFACT_ID))
+    (route["runtime"] == CLAUDE_MODULE_RUNTIME
+        && matches!(
+            artifact_id,
+            Some(CLAUDE_ARTIFACT_ID | CLAUDE_RETAINED_ARTIFACT_ID_V5)
+        ))
         || (route["runtime"] == CLAUDE_RUNTIME
             && (artifact_id == Some(CLAUDE_ARTIFACT_ID)
                 || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID)
-                || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID_V4)))
+                || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID_V4)
+                || artifact_id == Some(CLAUDE_RETAINED_ARTIFACT_ID_V5)))
 }
 
 fn nonempty<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str> {

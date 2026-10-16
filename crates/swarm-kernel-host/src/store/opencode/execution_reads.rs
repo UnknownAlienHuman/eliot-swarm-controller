@@ -298,7 +298,7 @@ fn record(
     let proof = if read.synced {
         read.scan.proof(command).map(|mut proof| {
             proof["native_scope_key"] = json!(options.scope());
-            proof["native_service_version"] = json!(options.expected_version);
+            proof["native_service_version"] = json!(read.service_version);
             proof
         })
     } else {

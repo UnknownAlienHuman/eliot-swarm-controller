@@ -2226,7 +2226,11 @@ fn expected_command_dispatch_identity(
     operation: &Value,
     request: &Value,
     route: &Value,
-) -> Result<(Value, String, crate::runtime::batch::CommandReceiptFacts)> {
+) -> Result<(
+    Value,
+    Option<String>,
+    crate::runtime::batch::CommandReceiptFacts,
+)> {
     let attempt_id = model::text(request, "attempt_id")?;
     if operation["attempt_id"] != attempt_id {
         return Err(Error::new(
@@ -2254,7 +2258,10 @@ fn expected_command_dispatch_identity(
     }
     let instruction = crate::runtime::batch::instruction(&frozen_input)?;
     let expected = crate::runtime::batch::command_receipt_facts(operation_id, &instruction);
-    let requested_model = model::text(&route["native_options"], "modelId")?.to_owned();
+    let requested_model = match route["native_options"].get("modelId") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(model::text(&route["native_options"], "modelId")?.to_owned()),
+    };
     Ok((attempt, requested_model, expected))
 }
 
@@ -2308,7 +2315,7 @@ fn validate_command_dispatch_receipt(
     if receipt.details["batch_run_id"] != expected.batch_run_id
         || receipt.details["prompt_sha256"] != expected.prompt_sha256
         || receipt.details["prompt_bytes"].as_u64() != u64::try_from(expected.prompt_bytes).ok()
-        || receipt.details["requested_model"].as_str() != Some(expected_model.as_str())
+        || receipt.details.get("requested_model") != Some(&json!(expected_model))
     {
         return Err(Error::new(
             "NATIVE_IDENTITY_MISMATCH",
@@ -6083,6 +6090,48 @@ mod command_receipt_binding_tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "FORBIDDEN");
+    }
+
+    #[test]
+    fn command_native_default_receipt_preserves_absence_without_inventing_model() {
+        let (db, operation, mut route, mut receipt) = fixture();
+        route["native_options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelId");
+        receipt.details["requested_model"] = Value::Null;
+        validate_command_dispatch_receipt(&db, &operation, &route, &receipt).unwrap();
+        let raw: String = db
+            .query_row(
+                "SELECT original_request_json FROM operations WHERE operation_id=?1",
+                [OPERATION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let request: Value = serde_json::from_str(&raw).unwrap();
+        let fields = command_target_receipt_fields(
+            &db,
+            OPERATION_ID,
+            &operation,
+            &request,
+            &route,
+            "binding-command",
+            4,
+        )
+        .unwrap();
+        assert!(fields["target_command_requested_model"].is_null());
+        assert_eq!(
+            fields["target_command_core_binding"]["prompt_sha256"],
+            receipt.details["prompt_sha256"]
+        );
+        receipt.details["requested_model"] = json!("invented-from-native-observation");
+        assert!(validate_command_dispatch_receipt(&db, &operation, &route, &receipt).is_err());
+        receipt
+            .details
+            .as_object_mut()
+            .unwrap()
+            .remove("requested_model");
+        assert!(validate_command_dispatch_receipt(&db, &operation, &route, &receipt).is_err());
     }
 }
 

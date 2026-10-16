@@ -760,6 +760,10 @@ fn module_assignment_command(
     service_pid: u32,
 ) -> Result<Value> {
     let options = &snapshot.options;
+    let expected_version = options
+        .expected_version
+        .as_deref()
+        .ok_or_else(stale_readback)?;
     let directory = options.directory.to_str().ok_or_else(stale_readback)?;
     let scope = assignment.as_value();
     let location_sha256 = model::digest(directory.as_bytes());
@@ -782,7 +786,7 @@ fn module_assignment_command(
         "scope":{
             "binding_id":snapshot.binding_id, "binding_generation":snapshot.binding_generation,
             "native_scope_key":options.scope(), "service_id":options.service_id,
-            "service_pid":service_pid, "expected_version":options.expected_version,
+            "service_pid":service_pid, "expected_version":expected_version,
             "directory":directory, "assignment":scope,
         },
         "prepared":{
@@ -790,7 +794,7 @@ fn module_assignment_command(
             "assignment":scope, "assignment_sha256":assignment_sha256,
             "native_session_id":assignment.native_session_id(),
             "location_sha256":location_sha256, "service_id":options.service_id,
-            "service_pid":service_pid, "service_version":options.expected_version,
+            "service_pid":service_pid, "service_version":expected_version,
         },
         "request":{"method":"GET", "path":path("/api/mcp")?},
         "readback":{"method":"GET", "path":path(&format!("/api/session/{}", assignment.native_session_id()))?},
@@ -828,7 +832,7 @@ fn validate_module_assignment_child(
         || original["native_session_id"] != assignment.native_session_id()
         || original["assignment_sha256"] != model::digest(model::canonical(&scope)?.as_bytes())
         || original["service_id"] != snapshot.options.service_id
-        || original["service_version"] != snapshot.options.expected_version
+        || original["service_version"].as_str() != snapshot.options.expected_version.as_deref()
         || original["service_pid"] != service_pid
         || original["location_sha256"]
             != model::digest(
@@ -1367,7 +1371,7 @@ fn validate_launch_snapshot_with_damage_context(
             let process_birth_token = binding.process_birth_token().to_owned();
             let executable_sha256 = binding.executable_sha256().to_owned();
             if options.service_id != binding.service_id()
-                || options.expected_version != binding.service_version()
+                || options.expected_version.as_deref() != Some(binding.service_version())
                 || binding.service_version() != "2.0.7"
                 || process_id == 0
             {

@@ -37,7 +37,7 @@ const MAX_EXECUTABLE_BYTES: u64 = 536_870_912;
 pub(crate) struct PreparedMcpInstall {
     assignment: AssignmentContext,
     service_id: String,
-    expected_version: String,
+    expected_version: Option<String>,
     #[expect(
         dead_code,
         reason = "Retained private location path for exact prepared-route equality and omitted from identity JSON"
@@ -580,10 +580,16 @@ fn validate_options(options: &Options) -> Result<()> {
             .service_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
+    // The install surface is qualified only for the pinned native build. An
+    // explicit route pin is optional; a wrong explicit pin fails here while an
+    // absent pin defers to the observed-service check at use.
     if !service_id_valid
         || !options.directory.is_absolute()
         || options.directory.to_str().is_none()
-        || options.expected_version != PINNED_OPENCODE_VERSION
+        || options
+            .expected_version
+            .as_deref()
+            .is_some_and(|pin| pin != PINNED_OPENCODE_VERSION)
     {
         return Err(Error::new(
             "NATIVE_MCP_SCOPE_MISMATCH",
@@ -607,7 +613,10 @@ fn validate_prepared_route(
         || options.expected_version != prepared.expected_version
         || options.directory != prepared.directory
         || service.version != PINNED_OPENCODE_VERSION
-        || service.version != options.expected_version
+        || options
+            .expected_version
+            .as_deref()
+            .is_some_and(|pin| pin != service.version)
         || service.pid == 0
     {
         return Err(Error::new(

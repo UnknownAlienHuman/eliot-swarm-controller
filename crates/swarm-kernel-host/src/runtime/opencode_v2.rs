@@ -77,11 +77,24 @@ pub struct Options {
     pub service_id: String,
     /// Explicit adapter connection record; read only, never generated or repaired.
     pub connection_file: PathBuf,
-    pub expected_version: String,
+    /// Optional exact service-version pin. When absent, the observed native
+    /// version is diagnostic data (live PID + registration checks still apply),
+    /// never a controller default; the installed harness owns its build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
     pub directory: PathBuf,
-    pub model: ModelRef,
+    /// Optional exact provider/model/variant invocation override. When absent,
+    /// the already configured native harness owns its model defaults and
+    /// provider readiness; the controller never defaults or invents a trio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
 }
 impl Options {
+    fn version_pin_valid(value: &str) -> bool {
+        !value.trim().is_empty()
+            && value.len() <= 256
+            && !value.bytes().any(|byte| byte.is_ascii_control())
+    }
     pub fn parse(value: &serde_json::Value) -> Result<Self> {
         let options: Self = serde_json::from_value(value.clone())
             .map_err(|_| Error::new("CONFIG_ERROR", "invalid OpenCode V2 route options"))?;
@@ -94,12 +107,15 @@ impl Options {
             || !options.connection_file.is_absolute()
             || !options.directory.is_absolute()
             || options.directory.to_str().is_none()
-            || options.expected_version.trim().is_empty()
-            || !options.model.valid()
+            || options
+                .expected_version
+                .as_deref()
+                .is_some_and(|version| !Self::version_pin_valid(version))
+            || options.model.as_ref().is_some_and(|model| !model.valid())
         {
             return Err(Error::new(
                 "CONFIG_ERROR",
-                "OpenCode requires absolute paths, a service ID, exact version and explicit provider/model/variant",
+                "OpenCode requires absolute paths, a service ID, an optional exact version pin and an optional exact provider/model/variant override; native harness defaults apply when version/model are omitted",
             ));
         }
         Ok(options)

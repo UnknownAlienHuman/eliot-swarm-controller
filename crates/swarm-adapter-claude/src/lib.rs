@@ -2945,7 +2945,7 @@ mod route_option_semantics {
             node_executable: root.join("node.exe"),
             native_executable: None,
             claude_config_dir: root.join("claude"),
-            model_id: "sonnet".to_owned(),
+            model_id: Some("sonnet".to_owned()),
             permission_mode: None,
             allow_dangerously_skip_permissions: false,
         };
@@ -2986,6 +2986,60 @@ mod route_option_semantics {
         options.remove("permissionMode");
         options.remove("nativeExecutable");
         validate_route(&config, &command).expect("omitted options represent the same values");
+    }
+
+    #[test]
+    fn omitted_model_matches_native_default_route() {
+        let root = std::env::temp_dir().join("claude-route-option-unit");
+        let options = NativeOptions {
+            workspace_root: root.join("workspace"),
+            sdk_runtime_root: root.join("sdk"),
+            node_executable: root.join("node.exe"),
+            native_executable: None,
+            claude_config_dir: root.join("claude"),
+            model_id: None,
+            permission_mode: None,
+            allow_dangerously_skip_permissions: false,
+        };
+        options
+            .validate()
+            .expect("omitted model uses the native configured default");
+        let command: RuntimeCommand = serde_json::from_value(json!({
+            "operation_id":"route-option-unit",
+            "method":"agent.open",
+            "created_at_ms":1,
+            "binding_id":"route-option-binding",
+            "generation":1,
+            "native_root_id":null,
+            "route":{
+                "runtime":RUNTIME,
+                "module_artifact_id":ARTIFACT_ID,
+                "workspace_option":"workspaceRoot",
+                "native_options":serde_json::to_value(&options).unwrap(),
+            },
+            "input":{},
+        }))
+        .unwrap();
+        let config = AdapterConfig {
+            host_data_dir: root.join("host"),
+            credential_file: root.join("credential.json"),
+            state_dir: root.join("state"),
+            sdk_harness_dir: root.join("harness"),
+            binding_id: "route-option-binding".to_owned(),
+            generation: 1,
+            native_options: options,
+            ipc: Default::default(),
+        };
+        validate_route(&config, &command).expect("omitted model matches the native default route");
+        let mut with_null = command.clone();
+        with_null.route["native_options"]["modelId"] = json!(null);
+        validate_route(&config, &with_null).expect("explicit null model matches omission");
+        let mut with_missing = command.clone();
+        with_missing.route["native_options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelId");
+        validate_route(&config, &with_missing).expect("missing model key matches omission");
     }
 
     #[test]
@@ -3698,7 +3752,7 @@ mod failed_prepare_lifecycle_fixture {
             node_executable: root.join("node.exe"),
             native_executable: None,
             claude_config_dir: root.join("claude-config"),
-            model_id: "fixture-model".to_owned(),
+            model_id: Some("fixture-model".to_owned()),
             permission_mode: None,
             allow_dangerously_skip_permissions: false,
         };
@@ -5105,7 +5159,7 @@ mod module_family_replacement_fixture {
             node_executable: node,
             native_executable: None,
             claude_config_dir: root.join("claude-config"),
-            model_id: "fixture-model".to_owned(),
+            model_id: Some("fixture-model".to_owned()),
             permission_mode: None,
             allow_dangerously_skip_permissions: false,
         };
@@ -5539,7 +5593,7 @@ mod agent_shutdown_handler_tests {
             node_executable: root.join("node.exe"),
             native_executable: None,
             claude_config_dir: root.join("claude-config"),
-            model_id: "fixture-model".to_owned(),
+            model_id: Some("fixture-model".to_owned()),
             permission_mode: None,
             allow_dangerously_skip_permissions: false,
         };

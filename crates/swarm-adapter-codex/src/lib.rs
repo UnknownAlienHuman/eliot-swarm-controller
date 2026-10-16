@@ -46,8 +46,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub const ARTIFACT_ID: &str = swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
-pub const ARTIFACT_VERSION: &str =
-    swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION;
+pub const ARTIFACT_VERSION: &str = "11";
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
@@ -508,14 +507,30 @@ impl Checkpoint {
         &self,
         root: &str,
         scope: &str,
-        provider: &str,
-        model: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
         workspace: &str,
     ) -> bool {
         self.native_root_phase == Some(NativeRootPhase::Active)
             && self.root_context_matches(root, scope, provider, model, workspace)
-            && self.effective_model_provider.as_deref() == Some(provider)
-            && self.effective_model.as_deref() == Some(model)
+            && match (provider, model) {
+                (Some(provider), Some(model)) => {
+                    self.effective_model_provider.as_deref() == Some(provider)
+                        && self.effective_model.as_deref() == Some(model)
+                }
+                // Omission uses the installed harness thread defaults; the
+                // effective pair is the native readback, never an inference.
+                (None, None) => {
+                    self.effective_model_provider
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                        && self
+                            .effective_model
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty())
+                }
+                _ => false,
+            }
             && self.verified_open_operation_matches(root, scope, provider, model, workspace)
     }
 
@@ -523,8 +538,8 @@ impl Checkpoint {
         &self,
         root: &str,
         scope: &str,
-        provider: &str,
-        model: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
         workspace: &str,
     ) -> bool {
         let Some(operation_id) = self.root_operation_id.as_deref() else {
@@ -537,26 +552,45 @@ impl Checkpoint {
             && record.kind == "open"
             && record.native_root_id.as_deref() == Some(root)
             && record.native_scope_key.as_deref() == Some(scope)
-            && record.requested_model_provider.as_deref() == Some(provider)
-            && record.requested_model.as_deref() == Some(model)
+            && record.requested_model_provider.as_deref() == provider
+            && record.requested_model.as_deref() == model
             && record.workspace_root.as_deref().and_then(normalize_path)
                 == normalize_path(workspace)
             && record.thread_configuration_readback.as_deref() == Some("verified")
     }
 
     fn active_root_proof_matches(&self) -> bool {
-        let (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) = (
+        let (Some(root), Some(scope), Some(workspace)) = (
             self.native_root_id.as_deref(),
             self.native_scope_key.as_deref(),
-            self.requested_model_provider.as_deref(),
-            self.requested_model.as_deref(),
             self.workspace_root.as_deref(),
         ) else {
             return false;
         };
+        let provider = self.requested_model_provider.as_deref();
+        let model = self.requested_model.as_deref();
+        // A partial requested pair never proves an active root.
+        if provider.is_some() != model.is_some() {
+            return false;
+        }
+        let effective_matches = match (provider, model) {
+            (Some(provider), Some(model)) => {
+                self.effective_model_provider.as_deref() == Some(provider)
+                    && self.effective_model.as_deref() == Some(model)
+            }
+            (None, None) => {
+                self.effective_model_provider
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                    && self
+                        .effective_model
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+            }
+            _ => false,
+        };
         self.root_context_matches(root, scope, provider, model, workspace)
-            && self.effective_model_provider.as_deref() == Some(provider)
-            && self.effective_model.as_deref() == Some(model)
+            && effective_matches
             && self.verified_open_operation_matches(root, scope, provider, model, workspace)
     }
 
@@ -564,14 +598,14 @@ impl Checkpoint {
         &self,
         root: &str,
         scope: &str,
-        provider: &str,
-        model: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
         workspace: &str,
     ) -> bool {
         self.native_root_id.as_deref() == Some(root)
             && self.native_scope_key.as_deref() == Some(scope)
-            && self.requested_model_provider.as_deref() == Some(provider)
-            && self.requested_model.as_deref() == Some(model)
+            && self.requested_model_provider.as_deref() == provider
+            && self.requested_model.as_deref() == model
             && self.workspace_root.as_deref().and_then(normalize_path) == normalize_path(workspace)
     }
 
@@ -586,12 +620,13 @@ impl Checkpoint {
         ) else {
             return Ok(None);
         };
-        let (Some(provider), Some(model)) = (
-            outcome.details["requested_model_provider"].as_str(),
-            outcome.details["requested_model"].as_str(),
-        ) else {
-            return Ok(None);
-        };
+        // `null` details mean no explicit override was requested; the native
+        // thread defaults apply. Requested stays distinct from effective.
+        let provider = outcome.details["requested_model_provider"].as_str();
+        let model = outcome.details["requested_model"].as_str();
+        if provider.is_some() != model.is_some() {
+            return Err(AdapterError::Checkpoint);
+        }
         if record
             .native_root_id
             .as_deref()
@@ -600,14 +635,8 @@ impl Checkpoint {
                 .native_scope_key
                 .as_deref()
                 .is_some_and(|saved| saved != scope)
-            || record
-                .requested_model_provider
-                .as_deref()
-                .is_some_and(|saved| saved != provider)
-            || record
-                .requested_model
-                .as_deref()
-                .is_some_and(|saved| saved != model)
+            || record.requested_model_provider.as_deref() != provider
+            || record.requested_model.as_deref() != model
         {
             return Err(AdapterError::Checkpoint);
         }
@@ -628,8 +657,8 @@ impl Checkpoint {
             ("agent.open", "open") | ("agent.send", "send") | ("task.dispatch", "send")
         ) && record.native_root_id.as_deref() == Some(root)
             && record.native_scope_key.as_deref() == Some(scope)
-            && record.requested_model_provider.as_deref() == Some(provider)
-            && record.requested_model.as_deref() == Some(model)
+            && record.requested_model_provider.as_deref() == provider
+            && record.requested_model.as_deref() == model
             && record.thread_configuration_readback.as_deref() == Some("verified")
             && record
                 .workspace_root
@@ -1846,14 +1875,17 @@ impl Journal {
         if dispatch_admission.is_none() && continuation_admission.is_none() {
             return Ok(());
         }
-        let (Some(scope), Some(provider), Some(model), Some(workspace)) = (
+        let (Some(scope), Some(workspace)) = (
             outcome.native_scope_key.as_deref(),
-            outcome.details["requested_model_provider"].as_str(),
-            outcome.details["requested_model"].as_str(),
             self.state.workspace_root.as_deref(),
         ) else {
             return Err(AdapterError::Checkpoint);
         };
+        let provider = outcome.details["requested_model_provider"].as_str();
+        let model = outcome.details["requested_model"].as_str();
+        if provider.is_some() != model.is_some() {
+            return Err(AdapterError::Checkpoint);
+        }
         if !self
             .state
             .is_current_root(root, scope, provider, model, workspace)
@@ -2151,15 +2183,15 @@ impl Journal {
     }
 
     fn active_root_id(&self) -> Option<&str> {
-        let (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) = (
+        let (Some(root), Some(scope), Some(workspace)) = (
             self.state.native_root_id.as_deref(),
             self.state.native_scope_key.as_deref(),
-            self.state.requested_model_provider.as_deref(),
-            self.state.requested_model.as_deref(),
             self.state.workspace_root.as_deref(),
         ) else {
             return None;
         };
+        let provider = self.state.requested_model_provider.as_deref();
+        let model = self.state.requested_model.as_deref();
         self.state
             .is_current_root(root, scope, provider, model, workspace)
             .then_some(root)
@@ -3695,19 +3727,49 @@ fn normalize_unix_path_identity(value: &str) -> Option<String> {
     })
 }
 
-fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), &'static str> {
+fn validate_route(
+    command: &RuntimeCommand,
+) -> Result<(Option<String>, Option<String>, String), &'static str> {
     if command.route["runtime"] != "codex" || command.route["module_artifact_id"] != ARTIFACT_ID {
         return Err("ROUTE_ARTIFACT_MISMATCH");
     }
     let options = &command.route["native_options"];
+    // Pinned native `ThreadStartParams` permits omission of both fields
+    // (`model: str | None = None`, `modelProvider: str | None = None` in
+    // `modules/codex/vendor_bridge/src/openai_codex/generated/v2_all.py:10213-10214`;
+    // resume/fork overrides at `:5906` and fork overrides nearby are likewise
+    // optional). Omission selects the installed harness thread defaults.
+    // An explicit override must supply the complete pair; a partial pair is
+    // rejected so the adapter never infers a provider from a model string.
+    for (field, invalid) in [
+        ("modelProvider", "EXPLICIT_MODEL_PROVIDER_REQUIRED"),
+        ("model", "EXPLICIT_MODEL_REQUIRED"),
+    ] {
+        if let Some(value) = options.get(field).filter(|value| !value.is_null()) {
+            let selected = value.as_str().ok_or(invalid)?;
+            if selected.is_empty()
+                || selected != selected.trim()
+                || selected.len() > 256
+                || selected.chars().any(char::is_control)
+            {
+                return Err(invalid);
+            }
+        }
+    }
     let provider = options["modelProvider"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
-        .ok_or("EXPLICIT_MODEL_PROVIDER_REQUIRED")?;
+        .map(str::to_owned);
     let model = options["model"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
-        .ok_or("EXPLICIT_MODEL_REQUIRED")?;
+        .map(str::to_owned);
+    match (&provider, &model) {
+        (Some(_), Some(_)) => {}
+        (None, None) => {}
+        (None, Some(_)) => return Err("EXPLICIT_MODEL_PROVIDER_REQUIRED"),
+        (Some(_), None) => return Err("EXPLICIT_MODEL_REQUIRED"),
+    }
     let workspace = options["workspaceRoot"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
@@ -3715,7 +3777,7 @@ fn validate_route(command: &RuntimeCommand) -> Result<(String, String, String), 
     if normalize_path(workspace).is_none() {
         return Err("ABSOLUTE_WORKSPACE_REQUIRED");
     }
-    Ok((provider.to_owned(), model.to_owned(), workspace.to_owned()))
+    Ok((provider, model, workspace.to_owned()))
 }
 
 fn prompt_for(
@@ -3776,7 +3838,7 @@ fn prompt_for(
 fn native_send_payload(
     root: &str,
     prompt: &str,
-    model: &str,
+    model: Option<&str>,
     operation_id: &str,
     steer: bool,
     expected_turn_id: Option<&str>,
@@ -3789,11 +3851,19 @@ fn native_send_payload(
             "input": input,
             "clientUserMessageId": operation_id,
         })
-    } else {
+    } else if let Some(model) = model {
         json!({
             "threadId": root,
             "input": input,
             "model": model,
+            "clientUserMessageId": operation_id,
+        })
+    } else {
+        // No explicit per-call model override: omit `model` so the native
+        // thread default applies (`TurnStartParams.model: str | None = None`).
+        json!({
+            "threadId": root,
+            "input": input,
             "clientUserMessageId": operation_id,
         })
     }
@@ -4379,36 +4449,80 @@ impl ThreadConfigurationReadback {
             _ => false,
         };
 
-        let (Some(provider), Some(model), Some(requested_provider), Some(requested_model)) = (
-            observed_model_provider.as_deref(),
-            observed_model.as_deref(),
-            requested_provider,
-            requested_model,
-        ) else {
-            return Self {
-                observed_model_provider,
-                observed_model,
-                ..Self::unavailable("THREAD_CONFIGURATION_READBACK_UNAVAILABLE")
-            };
-        };
-        if provider != requested_provider || model != requested_model || !workspace_matches {
-            return Self {
+        // Requested pair is route selection; effective pair is native readback.
+        // `None`/`None` means no explicit override: the installed harness
+        // thread defaults apply and the observed native values become
+        // effective without inferring a provider. A partial requested pair
+        // never verifies.
+        match (requested_provider, requested_model) {
+            (None, None) => {
+                let (Some(provider), Some(model)) = (
+                    observed_model_provider.as_deref(),
+                    observed_model.as_deref(),
+                ) else {
+                    return Self {
+                        observed_model_provider,
+                        observed_model,
+                        ..Self::unavailable("THREAD_CONFIGURATION_READBACK_UNAVAILABLE")
+                    };
+                };
+                if !workspace_matches {
+                    return Self {
+                        native_thread_readback: "mismatch",
+                        observed_model_provider,
+                        observed_model,
+                        ..Self::unavailable("THREAD_CONFIGURATION_MISMATCH")
+                    };
+                }
+                Self {
+                    native_thread_readback: "verified",
+                    effective_model_provider: Some(provider.to_owned()),
+                    effective_model: Some(model.to_owned()),
+                    observed_model_provider,
+                    observed_model,
+                    effective_model_status: "thread_configuration_verified",
+                    diagnostic_code: None,
+                    verified: true,
+                }
+            }
+            (Some(requested_provider), Some(requested_model)) => {
+                let (Some(provider), Some(model)) = (
+                    observed_model_provider.as_deref(),
+                    observed_model.as_deref(),
+                ) else {
+                    return Self {
+                        observed_model_provider,
+                        observed_model,
+                        ..Self::unavailable("THREAD_CONFIGURATION_READBACK_UNAVAILABLE")
+                    };
+                };
+                if provider != requested_provider || model != requested_model || !workspace_matches
+                {
+                    return Self {
+                        native_thread_readback: "mismatch",
+                        observed_model_provider,
+                        observed_model,
+                        ..Self::unavailable("THREAD_CONFIGURATION_MISMATCH")
+                    };
+                }
+
+                Self {
+                    native_thread_readback: "verified",
+                    effective_model_provider: Some(provider.to_owned()),
+                    effective_model: Some(model.to_owned()),
+                    observed_model_provider,
+                    observed_model,
+                    effective_model_status: "thread_configuration_verified",
+                    diagnostic_code: None,
+                    verified: true,
+                }
+            }
+            _ => Self {
                 native_thread_readback: "mismatch",
                 observed_model_provider,
                 observed_model,
                 ..Self::unavailable("THREAD_CONFIGURATION_MISMATCH")
-            };
-        }
-
-        Self {
-            native_thread_readback: "verified",
-            effective_model_provider: Some(provider.to_owned()),
-            effective_model: Some(model.to_owned()),
-            observed_model_provider,
-            observed_model,
-            effective_model_status: "thread_configuration_verified",
-            diagnostic_code: None,
-            verified: true,
+            },
         }
     }
 }
@@ -4728,11 +4842,9 @@ async fn reconcile_open(
     record: &OperationRecord,
     operation_id: &str,
 ) -> RuntimeOutcome {
-    let (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) = (
+    let (Some(root), Some(scope), Some(workspace)) = (
         record.native_root_id.as_deref(),
         record.native_scope_key.as_deref(),
-        record.requested_model_provider.as_deref(),
-        record.requested_model.as_deref(),
         record.workspace_root.as_deref(),
     ) else {
         let mut details = json!({
@@ -4754,6 +4866,8 @@ async fn reconcile_open(
             details,
         );
     };
+    let provider = record.requested_model_provider.as_deref();
+    let model = record.requested_model.as_deref();
     if native.scope_key() != Some(scope) || !native.identity_is_known() {
         return outcome(
             operation_id,
@@ -4992,13 +5106,17 @@ fn adopt_verified_root(
         .operations
         .get(operation_id)
         .ok_or("OPEN_OPERATION_MISMATCH")?;
-    let (Some(provider), Some(model), Some(workspace)) = (
-        journal.state.requested_model_provider.as_deref(),
-        journal.state.requested_model.as_deref(),
-        journal.state.workspace_root.as_deref(),
-    ) else {
+    let Some(workspace) = journal.state.workspace_root.as_deref() else {
         return Err("THREAD_CONFIGURATION_MISMATCH");
     };
+    let workspace = workspace.to_owned();
+    let provider = journal.state.requested_model_provider.clone();
+    let model = journal.state.requested_model.clone();
+    // A partial requested pair never verifies; the adapter never infers the
+    // missing half.
+    if provider.is_some() != model.is_some() {
+        return Err("THREAD_CONFIGURATION_MISMATCH");
+    }
     if record.method != "agent.open"
         || record.kind != "open"
         || record.native_root_id.as_deref() != Some(root)
@@ -5010,17 +5128,29 @@ fn adopt_verified_root(
     {
         return Err("NATIVE_SCOPE_CHANGED");
     }
-    if record.requested_model_provider.as_deref() != Some(provider)
-        || record.requested_model.as_deref() != Some(model)
-        || record.workspace_root.as_deref().and_then(normalize_path) != normalize_path(workspace)
+    if record.requested_model_provider != provider
+        || record.requested_model != model
+        || record.workspace_root.as_deref().and_then(normalize_path) != normalize_path(&workspace)
     {
         return Err("THREAD_CONFIGURATION_MISMATCH");
     }
-    if thread["id"].as_str() != Some(root)
-        || thread["modelProvider"].as_str() != Some(provider)
-        || thread["model"].as_str() != Some(model)
-        || thread["cwd"].as_str().and_then(normalize_path) != normalize_path(workspace)
-    {
+    let observed_provider = thread["modelProvider"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let observed_model = thread["model"].as_str().filter(|value| !value.is_empty());
+    let thread_matches = thread["id"].as_str() == Some(root)
+        && thread["cwd"].as_str().and_then(normalize_path) == normalize_path(&workspace)
+        && match (&provider, &model) {
+            (Some(provider), Some(model)) => {
+                observed_provider == Some(provider.as_str())
+                    && observed_model == Some(model.as_str())
+            }
+            // Omission keeps the native thread defaults; the observed native
+            // values become effective without provider inference.
+            (None, None) => observed_provider.is_some() && observed_model.is_some(),
+            _ => false,
+        };
+    if !thread_matches {
         return Err("THREAD_CONFIGURATION_MISMATCH");
     }
     // This is the sole Pending/Candidate -> Active transition. Its inputs are
@@ -5036,13 +5166,19 @@ fn adopt_verified_root(
     if let Some(record) = journal.state.operations.get_mut(operation_id) {
         record.thread_configuration_readback = Some("verified".into());
     }
-    journal.state.effective_model_provider = Some(provider.to_owned());
-    journal.state.effective_model = Some(model.to_owned());
+    // Effective values are always the native readback, never the request.
+    // For an explicit override the two coincide; for omission the observed
+    // harness defaults become effective while requested stays `None`.
+    journal.state.effective_model_provider = observed_provider.map(str::to_owned);
+    journal.state.effective_model = observed_model.map(str::to_owned);
     journal.state.native_root_phase = Some(NativeRootPhase::Active);
-    if !journal
-        .state
-        .is_current_root(root, scope, provider, model, workspace)
-    {
+    if !journal.state.is_current_root(
+        root,
+        scope,
+        provider.as_deref(),
+        model.as_deref(),
+        &workspace,
+    ) {
         journal.state.native_root_phase = prior_phase;
         journal.state.effective_model_provider = prior_effective_provider;
         journal.state.effective_model = prior_effective_model;
@@ -5122,8 +5258,8 @@ async fn open_operation(
             &journal.state,
             &NativeError::IdentityUnverified,
             "server_identity",
-            Some(&provider),
-            Some(&model),
+            provider.as_deref(),
+            model.as_deref(),
         );
     }
     let scope = native
@@ -5138,11 +5274,11 @@ async fn open_operation(
     let mut record = OperationRecord::intent("agent.open", "open");
     record.input_sha256 = command.input_sha256.clone();
     record.native_scope_key = Some(scope.clone());
-    record.requested_model_provider = Some(provider.clone());
-    record.requested_model = Some(model.clone());
+    record.requested_model_provider = provider.clone();
+    record.requested_model = model.clone();
     record.workspace_root = Some(canonical_workspace.clone());
-    journal.state.requested_model_provider = Some(provider.clone());
-    journal.state.requested_model = Some(model.clone());
+    journal.state.requested_model_provider = provider.clone();
+    journal.state.requested_model = model.clone();
     journal.state.workspace_root = Some(canonical_workspace);
     journal.state.native_scope_key = Some(scope.clone());
     journal.state.effective_model_provider = None;
@@ -5167,11 +5303,18 @@ async fn open_operation(
             details,
         );
     }
+    let mut start_params = serde_json::Map::new();
+    start_params.insert("cwd".to_owned(), json!(workspace));
+    // Omit both keys when no explicit override was requested so the native
+    // harness thread defaults apply; never infer a provider.
+    if let Some(provider) = provider.as_deref() {
+        start_params.insert("modelProvider".to_owned(), json!(provider));
+    }
+    if let Some(model) = model.as_deref() {
+        start_params.insert("model".to_owned(), json!(model));
+    }
     let response = native
-        .request(
-            "thread/start",
-            json!({"cwd":workspace,"modelProvider":provider,"model":model}),
-        )
+        .request("thread/start", Value::Object(start_params))
         .await;
     let response = match response {
         Ok(response) => response,
@@ -5189,8 +5332,8 @@ async fn open_operation(
             });
             details["native_replay"] = json!(false);
             with_native_failure_details(&mut details, &error, "thread_start_after_effect_marker");
-            details["requested_model_provider"] = json!(provider);
-            details["requested_model"] = json!(model);
+            details["requested_model_provider"] = json!(provider.as_deref());
+            details["requested_model"] = json!(model.as_deref());
             details["native_server_report"] = native_server_report.clone();
             return outcome(
                 &command.operation_id,
@@ -5316,13 +5459,15 @@ async fn send_operation(
         let previous_is_current = match (
             previous.native_root_id.as_deref(),
             previous.native_scope_key.as_deref(),
-            previous.requested_model_provider.as_deref(),
-            previous.requested_model.as_deref(),
             previous.workspace_root.as_deref(),
         ) {
-            (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
-                .state
-                .is_current_root(root, scope, provider, model, workspace),
+            (Some(root), Some(scope), Some(workspace)) => journal.state.is_current_root(
+                root,
+                scope,
+                previous.requested_model_provider.as_deref(),
+                previous.requested_model.as_deref(),
+                workspace,
+            ),
             _ => false,
         };
         if !previous_is_current {
@@ -5367,10 +5512,13 @@ async fn send_operation(
     let Some(root_scope) = journal.state.native_scope_key.as_deref() else {
         return rejected(command, "NATIVE_SCOPE_CHANGED", &journal.state);
     };
-    if !journal
-        .state
-        .is_current_root(&root, root_scope, &provider, &model, &workspace)
-    {
+    if !journal.state.is_current_root(
+        &root,
+        root_scope,
+        provider.as_deref(),
+        model.as_deref(),
+        &workspace,
+    ) {
         return rejected(command, "ROUTE_CONFIGURATION_MISMATCH", &journal.state);
     }
     let prompt = match prompt_for(command, claim) {
@@ -5401,8 +5549,8 @@ async fn send_operation(
             &journal.state,
             &NativeError::IdentityUnverified,
             "server_identity",
-            Some(&provider),
-            Some(&model),
+            provider.as_deref(),
+            model.as_deref(),
         );
     }
     let scope = native
@@ -5422,16 +5570,31 @@ async fn send_operation(
                 &journal.state,
                 &error,
                 "thread_read_preflight",
-                Some(&provider),
-                Some(&model),
+                provider.as_deref(),
+                model.as_deref(),
             );
         }
     };
-    if thread["id"].as_str() != Some(root.as_str())
-        || thread["modelProvider"].as_str() != Some(provider.as_str())
-        || thread["model"].as_str() != Some(model.as_str())
-        || thread["cwd"].as_str().and_then(normalize_path) != normalize_path(&workspace)
-    {
+    let preflight_matches = thread["id"].as_str() == Some(root.as_str())
+        && thread["cwd"].as_str().and_then(normalize_path) == normalize_path(&workspace)
+        && match (provider.as_deref(), model.as_deref()) {
+            (Some(provider), Some(model)) => {
+                thread["modelProvider"].as_str() == Some(provider)
+                    && thread["model"].as_str() == Some(model)
+            }
+            // Omission keeps the native thread defaults; any non-empty native
+            // configuration verifies. The adapter never infers a provider.
+            (None, None) => {
+                thread["modelProvider"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+                    && thread["model"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+            }
+            _ => false,
+        };
+    if !preflight_matches {
         return rejected(command, "THREAD_CONFIGURATION_MISMATCH", &journal.state);
     }
     if !steer && thread["status"]["type"] != "idle" {
@@ -5440,7 +5603,7 @@ async fn send_operation(
     let native_payload = native_send_payload(
         &root,
         &prompt,
-        &model,
+        model.as_deref(),
         &command.operation_id,
         steer,
         expected_turn.as_deref(),
@@ -5461,8 +5624,8 @@ async fn send_operation(
     record.input_sha256 = command.input_sha256.clone();
     record.native_root_id = Some(root.clone());
     record.native_scope_key = Some(scope.clone());
-    record.requested_model_provider = Some(provider.clone());
-    record.requested_model = Some(model.clone());
+    record.requested_model_provider = provider.clone();
+    record.requested_model = model.clone();
     record.workspace_root = Some(canonical_workspace);
     record.thread_configuration_readback = Some("verified".into());
     record.client_user_message_id = Some(command.operation_id.clone());
@@ -5650,25 +5813,29 @@ async fn reconcile_operation(
     let target_context_matches = match (
         target.native_root_id.as_deref(),
         target.native_scope_key.as_deref(),
-        target.requested_model_provider.as_deref(),
-        target.requested_model.as_deref(),
         target.workspace_root.as_deref(),
     ) {
-        (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
-            .state
-            .root_context_matches(root, scope, provider, model, workspace),
+        (Some(root), Some(scope), Some(workspace)) => journal.state.root_context_matches(
+            root,
+            scope,
+            target.requested_model_provider.as_deref(),
+            target.requested_model.as_deref(),
+            workspace,
+        ),
         _ => false,
     };
     let target_is_current = match (
         target.native_root_id.as_deref(),
         target.native_scope_key.as_deref(),
-        target.requested_model_provider.as_deref(),
-        target.requested_model.as_deref(),
         target.workspace_root.as_deref(),
     ) {
-        (Some(root), Some(scope), Some(provider), Some(model), Some(workspace)) => journal
-            .state
-            .is_current_root(root, scope, provider, model, workspace),
+        (Some(root), Some(scope), Some(workspace)) => journal.state.is_current_root(
+            root,
+            scope,
+            target.requested_model_provider.as_deref(),
+            target.requested_model.as_deref(),
+            workspace,
+        ),
         _ => false,
     };
     if target.kind == "send" && !prior_resolved {
@@ -6219,8 +6386,8 @@ async fn build_normalized_result_page(
         || command.generation != origin.binding_generation
         || target_operation_id != origin.target_operation_id
         || target_input_sha256 != origin.target_input_sha256
-        || journal.state.requested_model_provider.as_deref() != Some(route_provider.as_str())
-        || journal.state.requested_model.as_deref() != Some(route_model.as_str())
+        || journal.state.requested_model_provider.as_deref() != route_provider.as_deref()
+        || journal.state.requested_model.as_deref() != route_model.as_deref()
         || journal
             .state
             .workspace_root
@@ -6416,8 +6583,8 @@ async fn build_normalized_result_page(
     if !journal.state.is_current_root(
         native_root_id,
         native_scope_key,
-        &route_provider,
-        &route_model,
+        route_provider.as_deref(),
+        route_model.as_deref(),
         &route_workspace,
     ) {
         return Err("CODEX_RESULT_NATIVE_SCOPE_CHANGED");
@@ -6430,16 +6597,36 @@ async fn build_normalized_result_page(
         .await
         .map_err(|error| error.diagnostic_code())?;
     let thread = &thread["thread"];
-    if thread["id"].as_str() != Some(native_root_id)
-        || thread["modelProvider"].as_str() != journal.state.requested_model_provider.as_deref()
-        || thread["model"].as_str() != journal.state.requested_model.as_deref()
-        || thread["cwd"].as_str().and_then(normalize_path)
-            != journal
+    let result_thread_matches = thread["id"].as_str() == Some(native_root_id)
+        && thread["cwd"].as_str().and_then(normalize_path)
+            == journal
                 .state
                 .workspace_root
                 .as_deref()
                 .and_then(normalize_path)
-    {
+        && match (
+            journal.state.requested_model_provider.as_deref(),
+            journal.state.requested_model.as_deref(),
+        ) {
+            (Some(provider), Some(model)) => {
+                thread["modelProvider"].as_str() == Some(provider)
+                    && thread["model"].as_str() == Some(model)
+            }
+            // Omission keeps the native thread defaults; the observed native
+            // values must match the effective readback, never an inference.
+            (None, None) => {
+                let observed_provider = thread["modelProvider"]
+                    .as_str()
+                    .filter(|value| !value.is_empty());
+                let observed_model = thread["model"].as_str().filter(|value| !value.is_empty());
+                observed_provider.is_some()
+                    && observed_model.is_some()
+                    && observed_provider == journal.state.effective_model_provider.as_deref()
+                    && observed_model == journal.state.effective_model.as_deref()
+            }
+            _ => false,
+        };
+    if !result_thread_matches {
         return Err("CODEX_RESULT_THREAD_CONFIGURATION_MISMATCH");
     }
     let history = match native
@@ -6943,6 +7130,90 @@ mod reg28_tests {
             reconcile_send_outcome(true, unknown.verified),
             EffectOutcome::Unknown
         ));
+    }
+
+    #[test]
+    fn native_defaults_omission_uses_thread_defaults_without_inference() {
+        let workspace_path = std::env::current_dir().expect("fixture workspace");
+        let workspace = workspace_path.to_str().expect("UTF-8 fixture workspace");
+        let native_defaults = serde_json::json!({
+            "thread": {
+                "id": "thread-1",
+                "modelProvider": "provider-native-default",
+                "model": "model-native-default",
+                "cwd": workspace
+            }
+        });
+        // Omission selects the installed harness thread defaults: requested
+        // stays `None` while the observed native values become effective.
+        let omitted = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            None,
+            None,
+            Some(workspace),
+        );
+        assert!(omitted.verified);
+        assert_eq!(omitted.native_thread_readback, "verified");
+        assert_eq!(
+            omitted.effective_model_provider.as_deref(),
+            Some("provider-native-default")
+        );
+        assert_eq!(
+            omitted.effective_model.as_deref(),
+            Some("model-native-default")
+        );
+        assert_eq!(
+            omitted.effective_model_status,
+            "thread_configuration_verified"
+        );
+        // An explicit matching override still verifies against itself.
+        let explicit = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            Some("provider-native-default"),
+            Some("model-native-default"),
+            Some(workspace),
+        );
+        assert!(explicit.verified);
+        assert_eq!(
+            explicit.effective_model_provider,
+            omitted.effective_model_provider
+        );
+        assert_eq!(explicit.effective_model, omitted.effective_model);
+        // An explicit mismatch never adopts the native values as requested.
+        let mismatch = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            Some("provider-other"),
+            Some("model-other"),
+            Some(workspace),
+        );
+        assert!(!mismatch.verified);
+        assert_eq!(mismatch.effective_model_provider, None);
+        // A partial requested pair never verifies, so no provider is inferred.
+        let partial = ThreadConfigurationReadback::from_response(
+            &native_defaults,
+            "thread-1",
+            Some("provider-native-default"),
+            None,
+            Some(workspace),
+        );
+        assert!(!partial.verified);
+        assert_eq!(partial.effective_model_provider, None);
+        // Per-call payload: omission leaves `model` unset (thread default),
+        // explicit override sends the exact model string.
+        let omitted_payload = native_send_payload("thread-1", "prompt", None, "op-1", false, None);
+        assert!(omitted_payload.get("model").is_none());
+        let explicit_payload = native_send_payload(
+            "thread-1",
+            "prompt",
+            Some("model-native-default"),
+            "op-1",
+            false,
+            None,
+        );
+        assert_eq!(explicit_payload["model"], "model-native-default");
     }
 }
 #[cfg(test)]

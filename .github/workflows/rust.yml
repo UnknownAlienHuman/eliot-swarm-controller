@@ -480,6 +480,15 @@ jobs:
           $exeSuffix = if ($IsWindows) { '.exe' } else { '' }
           $env:ELIOT_OPENCODE_TEST_SUPERVISOR = Join-Path $sharedTargetDir "debug/swarm-supervisor$exeSuffix"
           $env:ELIOT_OPENCODE_TEST_OWNER_HELPER = Join-Path $sharedTargetDir "debug/swarm-module-owner$exeSuffix"
+          $env:ELIOT_ZED_TEST_HOST_EXECUTABLE = Join-Path $sharedTargetDir "debug/swarm-kernel-host$exeSuffix"
+          if (-not (Test-Path -LiteralPath $env:ELIOT_ZED_TEST_HOST_EXECUTABLE -PathType Leaf)) {
+            throw 'The Zed fixtures require the host built from this qualification source.'
+          }
+          # Retained owner/wire fixtures only; new product installers do not
+          # bundle this private SDK server or install its dependency closure.
+          & npm ci --prefix modules/opencode --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:ELIOT_OPENCODE_SOURCE_RESOURCES = '1'
           foreach ($fixtureBinary in @($env:ELIOT_OPENCODE_TEST_SUPERVISOR, $env:ELIOT_OPENCODE_TEST_OWNER_HELPER)) {
             if (-not (Test-Path -LiteralPath $fixtureBinary -PathType Leaf)) {
               throw "The OpenCode connected fixture binary was not built: $fixtureBinary"

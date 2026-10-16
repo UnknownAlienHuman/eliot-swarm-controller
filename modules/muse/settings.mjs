@@ -26,8 +26,12 @@ export function configuration(settings, sessionId) {
 }
 
 export function modelMatches(session, selection) {
+  // An omitted modelId selects the installed native default: it constrains
+  // nothing before readback. After session/start the bridge fills the route
+  // defaults from the readback, so later checks compare concrete values.
+  if (selection?.modelId === undefined) return true;
   return session?.modelId === selection.modelId
-    && (selection.providerId === undefined || session.providerId === selection.providerId);
+    && (selection.providerId === undefined || selection.providerId === null || session.providerId === selection.providerId);
 }
 
 export function goalCommand(input, sessionId) {

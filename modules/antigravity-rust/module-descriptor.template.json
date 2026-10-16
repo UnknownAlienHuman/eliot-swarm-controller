@@ -3,7 +3,7 @@
   "module_id": "antigravity",
   "artifact": {
     "artifact_id": "eliot-antigravity.rust-headless.1",
-    "version": "5",
+    "version": "6",
     "build_id": null
   },
   "launch": {

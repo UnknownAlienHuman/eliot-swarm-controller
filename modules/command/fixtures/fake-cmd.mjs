@@ -144,12 +144,19 @@ async function main() {
   if (process.env.FAKE_CMD_INVOCATION_FILE) {
     appendFileSync(process.env.FAKE_CMD_INVOCATION_FILE, "native-run\n");
   }
-  if (!args.print || args.outputFormat !== "json" || !args.model) {
-    process.stderr.write("fixture supports only: -p --output-format json --model <id>\n");
+  if (!args.print || args.outputFormat !== "json") {
+    process.stderr.write("fixture supports only: -p --output-format json [--model <id>]\n");
     process.exitCode = 2;
     return;
   }
-  process.stderr.write(`fixture observed --model ${args.model}\n`);
+  // Omission selects the fixture native default: no `--model` on argv means
+  // no model_request evidence and unknown native request model. An explicit
+  // `--model <id>` rides verbatim into model_request events and stderr.
+  if (args.model === null) {
+    process.stderr.write("fixture observed native default (no --model)\n");
+  } else {
+    process.stderr.write(`fixture observed --model ${args.model}\n`);
+  }
   const scenario = process.env.FAKE_CMD_SCENARIO ?? "success";
   const host = createModHost();
   await loadMods(args.mods, host);
@@ -241,17 +248,19 @@ async function main() {
     }
     default: {
       // success: one tool call; the pause lets the mod's inbox poll run so
-      // pre-seeded inbox commands are consumed mid-run.
+      // pre-seeded inbox commands are consumed mid-run. With an explicit
+      // --model the run emits model_request evidence carrying that id;
+      // with omission (native default) it emits no model_request evidence.
       lifecycle("session_start", { source: "startup" });
       emit({ type: "run_start", sessionId: "ses_fixture_1" });
-      emit({ type: "model_request_start", model: args.model });
+      if (args.model !== null) emit({ type: "model_request_start", model: args.model });
       emit({ type: "turn_start", turnNumber: 1 });
       emit({ type: "tool_queued", input: { tool: "read", path: "README.md" } });
       emit({ type: "tool_running", description: "Read README.md" });
       await sleep(900);
       emit({ type: "tool_completed", result: "ok" });
       emit({ type: "turn_end", turnNumber: 1, hadToolCalls: true, usage });
-      emit({ type: "model_request_end", model: args.model, usage, stopReason: "end_turn" });
+      if (args.model !== null) emit({ type: "model_request_end", model: args.model, usage, stopReason: "end_turn" });
       emit({ type: "run_end", sessionId: "ses_fixture_1", result: { stopReason: "end_turn" } });
       printResultFrame({
         subtype: "success",

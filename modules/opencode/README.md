@@ -6,13 +6,13 @@ New bindings use `.2`, which submits the exact Store-produced `TaskPromptEnvelop
 
 ## Contract and exact scope
 
-Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, durable instruction entries, exact session-agent and route-model controls, controller-recorded goal, refresh, read-only reconciliation, scoped projected-result export, native per-turn patch export, exact detached tool-file export and durable input/execution disposition. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace, connection file and exact version. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
+Implements the HTTP/inbox/readback part of C04: native session creation, immutable Task delivery, next-turn input, family snapshots, addressed form/permission replies, durable instruction entries, exact session-agent and route-model controls, controller-recorded goal, refresh, read-only reconciliation, scoped projected-result export, native per-turn patch export, exact detached tool-file export and durable input/execution disposition. One connection pool and volatile SSE reader serve bindings with the same configured `service_id`. Aliases must share that namespace and connection file; an explicit service-version pin, when selected, must also match. Do not assign different service IDs/files to the same service: physical endpoint aliases are not automatically discovered.
 
 Canonical requirements: [architecture §8](../../docs/agent_swarm.md), [implementation C04](../../docs/agent_swarm.implementation-v6.md), [module contract §§4–7](../../docs/agent_swarm.module-contract-v2.md). Wire contract reviewed against the [official V2 API](https://opencode.ai/v2/docs/api) and [OpenAPI document](https://opencode.ai/v2/openapi.json), captured 2026-10-01. These documents move; they are not proof that a particular installed server has been qualified.
 
 ## Explicit configuration
 
-Keep the shipped route disabled until these values are filled for the intended installation. Use absolute native paths for `connection_file` and `directory`, an exact `/api/info` version, and the exact provider/model/**variant** from the installed model catalog. The adapter refuses missing/disabled variants and verifies resolved location and native settings; it never silently downgrades reasoning or changes provider. A fallback to another workspace is rejected. Native path normalization is accepted only for the same local directory; a controller-created root may not become a child or fork.
+Keep the shipped route disabled until these values are filled for the intended installation. Use absolute native paths for `connection_file` and `directory`. The installed native harness owns provider/model/variant defaults: omit `expected_version` and `model` to attach with those defaults. An explicit `expected_version` pin and an exact provider/model/**variant** trio remain possible as an invocation override; the adapter refuses missing/disabled variants and verifies resolved location and native settings. When pinned, the trio must be copied exactly from the installed model catalog — it never silently downgrades reasoning or changes provider. A fallback to another workspace is rejected. Native path normalization is accepted only for the same local directory; a controller-created root may not become a child or fork.
 
 ```toml
 [[routes]]
@@ -23,15 +23,16 @@ enabled = false
 [routes.native_options]
 service_id = 'my-local-opencode-store'
 connection_file = 'C:\Users\YourUser\.local\state\opencode\service.json'
-expected_version = 'REPLACE_WITH_EXACT_INSTALLED_VERSION'
 directory = 'C:\Projects\YourRepository'
-[routes.native_options.model]
-id = 'REPLACE_WITH_NATIVE_MODEL_ID'
-providerID = 'REPLACE_WITH_NATIVE_PROVIDER_ID'
-variant = 'REPLACE_WITH_EXACT_VARIANT'
+# Optional exact overrides; omit both for native harness defaults:
+# expected_version = 'REPLACE_WITH_EXACT_INSTALLED_VERSION'
+# [routes.native_options.model]
+# id = 'REPLACE_WITH_NATIVE_MODEL_ID'
+# providerID = 'REPLACE_WITH_NATIVE_PROVIDER_ID'
+# variant = 'REPLACE_WITH_EXACT_VARIANT'
 ```
 
-`connection_file` may point directly at the native OpenCode service registration used by the installed client. Its official `@opencode/client/service` contract is `url`, `pid`, optional `version` and `id`, and optional local HTTP `password`. The controller reads that existing record in place. It checks the loopback origin, live PID and declared version, disables redirects/proxies/retries, and keeps service-access headers in memory. It neither reads provider credential files nor connects, logs in or changes a provider account. Provider authorization and registered accounts remain native.
+`connection_file` may point directly at the native OpenCode service registration used by the installed client. Its official `@opencode/client/service` contract is `url`, `pid`, optional `version` and `id`, and optional local HTTP `password`. The controller reads that existing record in place. It checks the loopback origin, live PID and registration/observed version, disables redirects/proxies/retries, and keeps service-access headers in memory. The observed service version is diagnostic data, not an admission gate, unless the route selects an explicit pin: attach then requires the live service to report exactly that version, and every later read fences continuity against the adopted version and PID. The adapter neither reads provider credential files nor connects, logs in or changes a provider account. Provider authorization and registered accounts remain native.
 
 For an ordinary installation the native SDK uses `$XDG_STATE_HOME/opencode/service.json`, defaulting to `$HOME/.local/state/opencode/service.json`; native channels and explicit configuration can select a different registration. Use the registration for the intended native instance. Do not create a new provider profile or copy account keys. The older explicit ELIOT connection record remains supported for existing configured services.
 
@@ -95,7 +96,7 @@ The same `agent.configure` method supports one separate native configuration uni
 }
 ```
 
-Use `swarm call agent.configure --file modules/opencode/switch-agent.example.json`. The adapter reads the complete native agent catalog for the verified route location, rejects duplicate or absent IDs, and never falls back to another agent. An agent-level model override is accepted only when it exactly equals the route's pinned provider/model/variant; an omitted override keeps the route model. This prevents agent selection from silently becoming a model or billing-route change.
+Use `swarm call agent.configure --file modules/opencode/switch-agent.example.json`. The adapter reads the complete native agent catalog for the verified route location, rejects duplicate or absent IDs, and never falls back to another agent. An agent-level model override is accepted only when it exactly equals the route's pinned provider/model/variant; an omitted override keeps the route model. On routes attached with native harness defaults (no pinned trio) any native model override is rejected rather than adopted, since there is no pinned billing route to preserve. This prevents agent selection from silently becoming a model or billing-route change.
 
 A matching pre-existing session agent is an exact no-op. Otherwise the adapter sends one `POST /api/session/{sessionID}/agent`, then requires repeated equal catalog and `session.get` projections proving the selected ID and unchanged agent definition. The typed result records the agent ID, definition/catalog digests, mode, hidden flag, application boundary `subsequent_provider_turn`, and whether the definition carried the same exact model override. Raw system prompts, request settings and permissions are not copied into controller state.
 
@@ -103,7 +104,7 @@ A lost response becomes `outcome_unknown`; reconciliation performs only catalog/
 
 ### Exact route-model control
 
-A third `agent.configure` unit explicitly selects the session model used by subsequent provider turns. The request must contain all three fields and must exactly equal the binding route's pinned provider/model/variant:
+A third `agent.configure` unit explicitly selects the session model used by subsequent provider turns. The request must contain all three fields and must exactly equal the binding route's pinned provider/model/variant. Routes attached with native harness defaults carry no pin, so this control is rejected there before native admission: it restores a pinned route model, it never picks a model for an unpinned route.
 
 ```json
 {
@@ -189,7 +190,7 @@ Qualification: **implemented, fixture-checked only.** In-process fixture tests c
 
 ## Delivery, observation and recovery
 
-A native session has a deterministic controller-owned ID plus binding/generation/operation metadata. Initial creation verifies the model and location. Task dispatch includes the frozen Task snapshot. Each admitted input has a deterministic native message ID. **A prompt response confirms inbox admission, not an executed turn or finished Task.** The retained producer has `native_input_id`, `admission_kind=native_inbox`, `disposition=admitted`; it does not acquire a fabricated turn/run ID.
+A native session has a deterministic controller-owned ID plus binding/generation/operation metadata. Initial creation verifies the location and, when the route pins an exact invocation override, that model trio; otherwise the harness-owned session model is observed, never gated. Task dispatch includes the frozen Task snapshot. Each admitted input has a deterministic native message ID. **A prompt response confirms inbox admission, not an executed turn or finished Task.** The retained producer has `native_input_id`, `admission_kind=native_inbox`, `disposition=admitted`; it does not acquire a fabricated turn/run ID.
 
 Lost creation and prompt replies become `outcome_unknown`. Readback checks the exact owned session, queued inbox or delivered user-message ID and original content/metadata, rejecting additional native attachments. It never repeats the POST, including after host restart or while new-work admission is disabled. Unproven outcomes remain unknown. A changed service, model, binding owner or foreign child cannot silently receive the command.
 
