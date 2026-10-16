@@ -6850,9 +6850,8 @@ async fn reconnect_native_for_readback(
     token: Option<&str>,
     credential_unavailable: bool,
 ) -> Result<bool, AdapterError> {
-    match native.demux.terminal_error() {
-        Ok(None) => return Ok(false),
-        Ok(Some(_)) | Err(_) => {}
+    if let Ok(None) = native.demux.terminal_error() {
+        return Ok(false);
     }
     journal.capture_native_events()?;
     let expected_scope = journal.state.native_scope_key.clone();
@@ -8516,8 +8515,7 @@ mod readback_reconnect_tests {
         }))
         .expect("reconnect fixture claim")
     }
-    async fn serve_readback(
-        listener: tokio::net::TcpListener,
+    struct ReadbackFixture {
         home: String,
         workspace: String,
         thread_id: String,
@@ -8527,9 +8525,25 @@ mod readback_reconnect_tests {
         prompt_text: String,
         observed_provider: String,
         observed_model: String,
+    }
+
+    async fn serve_readback(
+        listener: tokio::net::TcpListener,
+        fixture: ReadbackFixture,
         methods: Arc<std::sync::Mutex<Vec<String>>>,
         forbidden: Arc<AtomicUsize>,
     ) {
+        let ReadbackFixture {
+            home,
+            workspace,
+            thread_id,
+            client_id,
+            turn_id,
+            input_id,
+            prompt_text,
+            observed_provider,
+            observed_model,
+        } = fixture;
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -8659,15 +8673,17 @@ mod readback_reconnect_tests {
         let forbidden = Arc::new(AtomicUsize::new(0));
         let server = tokio::spawn(serve_readback(
             listener,
-            home.clone(),
-            workspace.clone(),
-            thread_id.clone(),
-            client_id.clone(),
-            turn_id.clone(),
-            input_id.clone(),
-            prompt_text.clone(),
-            observed_provider.clone(),
-            observed_model.clone(),
+            ReadbackFixture {
+                home: home.clone(),
+                workspace: workspace.clone(),
+                thread_id: thread_id.clone(),
+                client_id: client_id.clone(),
+                turn_id: turn_id.clone(),
+                input_id: input_id.clone(),
+                prompt_text: prompt_text.clone(),
+                observed_provider: observed_provider.clone(),
+                observed_model: observed_model.clone(),
+            },
             Arc::clone(&methods),
             Arc::clone(&forbidden),
         ));
@@ -8717,7 +8733,10 @@ mod readback_reconnect_tests {
             .operations
             .insert(client_id.clone(), send_record.clone());
         journal.save().expect("persist frozen journal");
-        let old_sink = NativeEventSink::new();
+        let old_sink = journal.native_event_sink();
+        old_sink
+            .set_scope(expected_scope.clone())
+            .expect("bind the production-shared old sink");
         old_sink
             .queue_event(NativeRpcEvent::NativeNotification {
                 method: "test/old-observer".to_owned(),
@@ -8874,15 +8893,17 @@ mod readback_reconnect_tests {
         let expected_forbidden = Arc::new(AtomicUsize::new(0));
         let expected_server = tokio::spawn(serve_readback(
             expected_listener,
-            home.clone(),
-            workspace.clone(),
-            thread_id.clone(),
-            client_id.clone(),
-            turn_id.clone(),
-            input_id.clone(),
-            prompt_text.clone(),
-            observed_provider.clone(),
-            observed_model.clone(),
+            ReadbackFixture {
+                home: home.clone(),
+                workspace: workspace.clone(),
+                thread_id: thread_id.clone(),
+                client_id: client_id.clone(),
+                turn_id: turn_id.clone(),
+                input_id: input_id.clone(),
+                prompt_text: prompt_text.clone(),
+                observed_provider: observed_provider.clone(),
+                observed_model: observed_model.clone(),
+            },
             Arc::clone(&expected_methods),
             Arc::clone(&expected_forbidden),
         ));
@@ -8901,15 +8922,17 @@ mod readback_reconnect_tests {
         let drift_forbidden = Arc::new(AtomicUsize::new(0));
         let drift_server = tokio::spawn(serve_readback(
             drift_listener,
-            drift_home.clone(),
-            workspace.clone(),
-            thread_id.clone(),
-            client_id.clone(),
-            turn_id.clone(),
-            input_id.clone(),
-            prompt_text.clone(),
-            observed_provider.clone(),
-            observed_model.clone(),
+            ReadbackFixture {
+                home: drift_home.clone(),
+                workspace: workspace.clone(),
+                thread_id: thread_id.clone(),
+                client_id: client_id.clone(),
+                turn_id: turn_id.clone(),
+                input_id: input_id.clone(),
+                prompt_text: prompt_text.clone(),
+                observed_provider: observed_provider.clone(),
+                observed_model: observed_model.clone(),
+            },
             Arc::clone(&drift_methods),
             Arc::clone(&drift_forbidden),
         ));
@@ -8951,7 +8974,10 @@ mod readback_reconnect_tests {
             .operations
             .insert(client_id.clone(), send_record.clone());
         journal.save().expect("persist frozen journal");
-        let old_sink = NativeEventSink::new();
+        let old_sink = journal.native_event_sink();
+        old_sink
+            .set_scope(expected_scope.clone())
+            .expect("bind the production-shared old sink");
         let old_demux = Arc::new(NativeRpcDemultiplexer::new(old_sink.clone()));
         old_demux.fail(NativeError::DemultiplexerCapacity);
         let mut native = NativeClient {
