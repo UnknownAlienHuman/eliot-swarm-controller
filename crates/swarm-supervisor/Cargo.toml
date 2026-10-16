@@ -15,3 +15,6 @@ swarm-contracts = { path = "../swarm-contracts" }
 swarm-process = { path = "../swarm-process" }
 tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+swarm-process = { path = "../swarm-process", features = ["test-support"] }
