@@ -705,6 +705,20 @@ mod tests {
             "WORKSPACE_ACL"
         );
         owner.store.call(operator,"attempt.release".into(),json!({"client_request_id":model::new_id(),"attempt_id":attempt_id,"outcome":"failed","reason":"verified absence","assignment_closed":true})).await.unwrap();
+        let demanded = owner
+            .store
+            .run({
+                let config = config.clone();
+                move |db| {
+                    Ok(super::super::super::legacy_worker_demand::snapshot(db, &config)?.launcher)
+                }
+            })
+            .await
+            .unwrap();
+        assert!(
+            demanded,
+            "released verified-absence lease must wake its existing lifecycle owner"
+        );
         owner
             .store
             .reconcile_workspace_lifecycle_once()
@@ -719,6 +733,17 @@ mod tests {
         assert_eq!(
             native_inputs, 0,
             "absence recovery never opens or replays a native session"
+        );
+        let demanded = owner
+            .store
+            .run(move |db| {
+                Ok(super::super::super::legacy_worker_demand::snapshot(db, &config)?.launcher)
+            })
+            .await
+            .unwrap();
+        assert!(
+            !demanded,
+            "retired absence must not leave a permanent worker wake loop"
         );
         owner.close().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();

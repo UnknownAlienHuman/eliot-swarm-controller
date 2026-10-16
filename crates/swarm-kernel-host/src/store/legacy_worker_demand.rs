@@ -280,6 +280,13 @@ pub(super) fn snapshot(db: &Connection, config: &Config) -> Result<LegacyWorkerD
                  'awaiting_participant_credential','outcome_unknown') \
             ELSE 0 END) \
          OR EXISTS(SELECT 1 FROM workspace_leases WHERE state IN ('preparing','held','outcome_unknown')) \
+         OR EXISTS(SELECT 1 FROM workspace_leases l JOIN attempts a ON a.attempt_id=l.attempt_id \
+           WHERE l.state='stale' AND a.task_id=l.task_id AND a.task_revision=l.task_revision \
+             AND a.owner_id=l.owner_client_id AND a.released_at_ms IS NOT NULL \
+             AND a.state IN ('accepted','failed','cancelled','superseded') \
+             AND CASE WHEN json_valid(l.clean_state_json) \
+               THEN json_extract(l.clean_state_json,'$.status')='workspace_absence_verified' \
+               ELSE 0 END) \
          OR EXISTS(SELECT 1 FROM owned_service_starts \
                    WHERE state IN ('reserved','outcome_unknown','service_observed'))",
     )?;
