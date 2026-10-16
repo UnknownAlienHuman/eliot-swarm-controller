@@ -3812,6 +3812,27 @@ mod tests {
     const PROBE_FIXTURE_MODE_ENV: &str = "HOOK_GIT_PROBE_FIXTURE_MODE";
     const PROBE_FIXTURE_MARKER_ENV: &str = "HOOK_GIT_PROBE_FIXTURE_MARKER";
 
+    /// Publish a fixture identity so destination visibility is the
+    /// complete-publication signal. A direct `fs::write` creates or truncates
+    /// the destination before its bytes land, so an exists-then-read observer
+    /// can read empty or partial bytes and fail JSON decode with EOF (seen at
+    /// `pending_git_owner_keeps_live_descendant_and_pipe_until_exact_departure`).
+    /// A sibling temporary file plus atomic replacement keeps the destination
+    /// absent until every identity byte is durable on the same volume.
+    fn publish_fixture_identity(destination: &Path, identity: &Value) {
+        let parent = destination
+            .parent()
+            .expect("fixture identity destination has a parent directory");
+        let temporary = parent.join(format!(".probe-identity-{}", model::new_id()));
+        let bytes = serde_json::to_vec(identity).expect("encode the fixture identity");
+        let staged = write_new(&temporary, &bytes, None);
+        let published = staged.and_then(|()| atomic_replace(&temporary, destination));
+        if let Err(error) = published {
+            let _ = fs::remove_file(&temporary);
+            panic!("publish the exact fixture identity: {error:?}");
+        }
+    }
+
     /// Test-binary entry point used in place of the production `check-worker`
     /// CLI route. It runs the existing probe and exits before libtest writes a
     /// footer onto the framed response stream.
@@ -3835,11 +3856,7 @@ mod tests {
         let direct_identity = platform::process_group::process_birth_identity(std::process::id())
             .expect("capture the direct command birth identity")
             .expect("the direct command is still live");
-        fs::write(
-            marker.with_extension("direct-id"),
-            serde_json::to_vec(&direct_identity).expect("encode direct command identity"),
-        )
-        .expect("publish the exact direct command identity");
+        publish_fixture_identity(&marker.with_extension("direct-id"), &direct_identity);
         let executable = std::env::current_exe().expect("test executable path");
         let mut descendant = Command::new(executable)
             .args([
@@ -3893,11 +3910,7 @@ mod tests {
         let identity = platform::process_group::process_birth_identity(std::process::id())
             .expect("capture the live pipe-holder birth identity")
             .expect("the pipe holder is still live");
-        std::fs::write(
-            marker,
-            serde_json::to_vec(&identity).expect("encode pipe-holder identity"),
-        )
-        .expect("publish live pipe-holder marker");
+        publish_fixture_identity(&marker, &identity);
         thread::sleep(Duration::from_secs(30));
     }
 
