@@ -6898,6 +6898,118 @@ fn participant_native_operation_projection(
     }
 }
 
+/// Narrow CURRENT ordinary-Participant native/source candidate read.
+///
+/// Only a CURRENT `attempt_owner`/`producer_ref` Participant may use this path,
+/// and only for settled/applied `source.capture`/`agent.result` operations in
+/// its exact current Task/Attempt. All validation is reused from
+/// `participant_native_operation_projection`; anything outside that exact shape
+/// returns `Ok(None)` so the caller falls through to the existing generic
+/// object-scope path and preserves exact-caller, sponsored-reviewer late-access
+/// and other receipt grants. Sponsored reviewers never enter this path.
+pub(super) fn try_participant_native_candidate_read(
+    db: &Connection,
+    principal: &Principal,
+    operation_id: &str,
+) -> Result<Option<Value>> {
+    if principal.role != Role::Participant {
+        return Ok(None);
+    }
+    let registration = match participant_registration(db, &principal.client_id) {
+        Ok(registration) => registration,
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "NOT_FOUND"
+                    | "FORBIDDEN"
+                    | "UNAUTHORIZED"
+                    | "STALE_PARTICIPANT"
+                    | "PARTICIPANT_NOT_ASSIGNED"
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !matches!(
+        registration["participation_basis"]["kind"].as_str(),
+        Some("attempt_owner" | "producer_ref")
+    ) {
+        return Ok(None);
+    }
+    let scope = match load_current_scope(db, principal) {
+        Ok(scope) => scope,
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "NOT_FOUND"
+                    | "STALE_PARTICIPANT"
+                    | "PARTICIPANT_NOT_ASSIGNED"
+                    | "FORBIDDEN"
+                    | "UNAUTHORIZED"
+                    | "STALE_REVIEW_ASSIGNMENT"
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let record: Option<ParticipantOperationRecord> = db
+        .query_row(
+            "SELECT caller_id,method,state,task_id,attempt_id,binding_id,binding_generation,result_json \
+             FROM operations WHERE operation_id=?1",
+            [operation_id],
+            |row| {
+                let result_raw: Option<String> = row.get(7)?;
+                let result = result_raw
+                    .map(|raw| {
+                        serde_json::from_str(&raw).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+                Ok(ParticipantOperationRecord {
+                    caller_id: row.get(0)?,
+                    method: row.get(1)?,
+                    state: row.get(2)?,
+                    task_id: row.get(3)?,
+                    attempt_id: row.get(4)?,
+                    binding_id: row.get(5)?,
+                    binding_generation: row.get(6)?,
+                    result,
+                })
+            },
+        )
+        .optional()?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    if !matches!(record.method.as_str(), "source.capture" | "agent.result") {
+        return Ok(None);
+    }
+    match participant_native_operation_projection(db, &scope, operation_id, &record) {
+        Ok(projected) => Ok(Some(projected)),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "NOT_FOUND"
+                    | "STALE_PARTICIPANT"
+                    | "PARTICIPANT_NOT_ASSIGNED"
+                    | "FORBIDDEN"
+                    | "UNAUTHORIZED"
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn send(
     tx: &Transaction<'_>,
     principal: &Principal,

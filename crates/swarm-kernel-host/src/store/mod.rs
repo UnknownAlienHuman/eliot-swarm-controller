@@ -2192,10 +2192,25 @@ impl Store {
                         }
                         if method == "operation.get" {
                             model::fields(&params, &["operation_id"])?;
+                            let operation_id = model::text(&params, "operation_id")?;
+                            // Narrow CURRENT ordinary-Participant native/source
+                            // candidate read first; every other shape keeps the
+                            // existing generic object-scope path so exact-caller,
+                            // sponsored-reviewer late-access and receipt grants
+                            // are unchanged.
+                            if let Some(projected) =
+                                coordination::try_participant_native_candidate_read(
+                                    db,
+                                    &principal,
+                                    operation_id,
+                                )?
+                            {
+                                return Ok(projected);
+                            }
                             return object_reads::current_operation(
                                 db,
                                 &principal,
-                                model::text(&params, "operation_id")?,
+                                operation_id,
                                 &config,
                             );
                         }
