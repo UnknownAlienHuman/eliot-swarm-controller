@@ -1167,7 +1167,8 @@ async fn current_attempt_owner_reads_manager_source_and_native_candidates_via_st
     let result_operation_id = format!("op-{}", model::new_id());
     let page_id = format!("result-{}", model::digest(result_operation_id.as_bytes()));
     let foreign_operation_id = format!("op-{}", model::new_id());
-    let foreign_candidate_ref = format!("source-{}", model::digest(foreign_operation_id.as_bytes()));
+    let foreign_candidate_ref =
+        format!("source-{}", model::digest(foreign_operation_id.as_bytes()));
     let submission_id = format!("submission-{}", model::new_id());
     let now = model::now_ms().unwrap();
 
