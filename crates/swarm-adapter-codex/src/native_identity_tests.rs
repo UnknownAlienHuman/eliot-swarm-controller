@@ -351,3 +351,49 @@ async fn live_existing_empty_thread_matches_native_identity_and_workspace() {
         super::normalize_path(&expected_workspace)
     );
 }
+
+#[tokio::test]
+#[ignore = "explicitly resumes and reads one supplied completed native turn; never submits model input"]
+async fn live_existing_completed_turn_has_exact_input_readback_without_replay() {
+    let endpoint = std::env::var("SWARM_CODEX_QUALIFICATION_LIVE_ENDPOINT").unwrap();
+    let root = std::env::var("SWARM_CODEX_QUALIFICATION_LIVE_ROOT").unwrap();
+    let client_id = std::env::var("SWARM_CODEX_QUALIFICATION_INPUT_OPERATION").unwrap();
+    let turn_id = std::env::var("SWARM_CODEX_QUALIFICATION_COMPLETED_TURN").unwrap();
+    let prompt_sha256 = std::env::var("SWARM_CODEX_QUALIFICATION_PROMPT_SHA256").unwrap();
+    let mut native = super::NativeClient::attach_inner(
+        &endpoint,
+        None,
+        false,
+        super::NativeEventSink::new(),
+        true,
+    )
+    .await
+    .expect("attach using the production native client");
+    assert!(native.identity_is_known());
+    let thread = native.read_thread(&root).await.expect("read exact thread");
+    assert_eq!(thread["thread"]["id"].as_str(), Some(root.as_str()));
+    native
+        .resume_thread(&root)
+        .await
+        .expect("same native resume used by production dispatch, without turn input");
+    let matches = match native.read_history(&root, &client_id).await {
+        super::HistoryRead::Complete(matches) => matches,
+        super::HistoryRead::Truncated(_) => panic!("native input history is truncated"),
+        super::HistoryRead::Failed(error) => panic!("native input history read failed: {error:?}"),
+    };
+    assert_eq!(matches.len(), 1, "exactly one retained native user input");
+    assert_eq!(matches[0].turn_id, turn_id);
+    assert_eq!(
+        super::digest_hex(matches[0].text.as_bytes()),
+        prompt_sha256,
+        "retained native input bytes match the admitted prompt"
+    );
+    let turn = match native.read_turn(&root, &turn_id).await {
+        super::TurnRead::Found(turn) => turn,
+        super::TurnRead::Missing => panic!("recorded turn is missing"),
+        super::TurnRead::Truncated => panic!("native turn history is truncated"),
+        super::TurnRead::Failed(error) => panic!("native turn read failed: {error:?}"),
+    };
+    assert_eq!(turn["status"], "completed");
+    assert!(turn["error"].is_null());
+}
