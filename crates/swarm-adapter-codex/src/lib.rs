@@ -2,6 +2,8 @@
 //! only on the shared host client/contracts and its native JSON-RPC transport.
 
 mod module_contract;
+#[cfg(test)]
+mod native_history_frame_tests;
 mod native_usage;
 
 use std::{
@@ -52,6 +54,9 @@ pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
 const PAGE_SIZE: u64 = 100;
+// Tool-output items can make a 100-item history page exceed the native frame
+// bound. Keep item pages small without expanding the bounded page walk.
+const ITEM_PAGE_SIZE: u64 = 10;
 const MAX_NORMALIZED_RESULT_PAGE_BYTES: usize = 24 * 1024;
 const MAX_NORMALIZED_RESULT_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
@@ -3319,7 +3324,7 @@ impl NativeClient {
         for _ in 0..MAX_HISTORY_PAGES {
             let mut params = json!({
                 "threadId":thread_id,
-                "limit":PAGE_SIZE,
+                "limit":ITEM_PAGE_SIZE,
                 "sortDirection":"desc",
             });
             if let Some(value) = cursor.as_ref() {
@@ -3386,6 +3391,7 @@ impl NativeClient {
                 "threadId":thread_id,
                 "limit":PAGE_SIZE,
                 "sortDirection":"desc",
+                "itemsView":"notLoaded",
             });
             if let Some(value) = cursor.as_ref() {
                 params["cursor"] = json!(value);
@@ -3446,7 +3452,7 @@ impl NativeClient {
             let mut params = json!({
                 "threadId":thread_id,
                 "turnId":turn_id,
-                "limit":PAGE_SIZE,
+                "limit":ITEM_PAGE_SIZE,
                 "sortDirection":"asc",
             });
             if let Some(value) = cursor.as_ref() {
