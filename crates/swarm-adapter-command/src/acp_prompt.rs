@@ -1,4 +1,4 @@
-//! Exact Store-produced TaskPrompt admission for the separately selected ACP artifact.
+//! Exact Store-produced TaskPrompt admission for versioned Batch and ACP artifacts.
 
 use swarm_contracts::{
     error::{Error, Result},
@@ -14,7 +14,7 @@ const MAX_TASK_PROMPT_BYTES: usize = 1_048_576;
 pub(crate) struct AcpDispatchIdentity {
     pub operation_id: String,
     pub input_sha256: String,
-    pub requested_model: String,
+    pub requested_model: Option<String>,
     pub task_id: String,
     pub task_revision: i64,
     pub attempt_id: String,
@@ -32,7 +32,10 @@ pub(crate) struct PreparedAcpDispatch {
 
 /// Prepare the exact Store projection for ACP. This function deliberately
 /// never reads `text`, `task_snapshot`, or the batch prompt renderer.
-pub(crate) fn prepare(command: &RuntimeCommand) -> Result<PreparedAcpDispatch> {
+pub(crate) fn prepare(
+    command: &RuntimeCommand,
+    model_optional: bool,
+) -> Result<PreparedAcpDispatch> {
     if command.method != "task.dispatch" {
         return Err(Error::invalid("ACP TaskPrompt requires task.dispatch"));
     }
@@ -102,21 +105,45 @@ pub(crate) fn prepare(command: &RuntimeCommand) -> Result<PreparedAcpDispatch> {
                 "Store Operation digest is missing or invalid",
             )
         })?;
-    let requested_model = command.route["native_options"]["modelId"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty() && value.trim() == *value && value.len() <= 256)
-        .ok_or_else(|| {
-            Error::new(
+    let native_options = command.route["native_options"]
+        .as_object()
+        .ok_or_else(|| Error::new("COMMAND_MODEL_REQUIRED", "native route options are missing"))?;
+    let requested_model = match native_options.get("modelId") {
+        None if model_optional => None,
+        Some(serde_json::Value::Null) if model_optional => None,
+        None => {
+            return Err(Error::new(
                 "COMMAND_MODEL_REQUIRED",
-                "explicit ACP route modelId is invalid",
-            )
-        })?;
+                "this Command artifact requires an explicit route modelId",
+            ));
+        }
+        Some(serde_json::Value::Null) => {
+            return Err(Error::new(
+                "COMMAND_MODEL_REQUIRED",
+                "this Command artifact requires an explicit route modelId",
+            ));
+        }
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|value| {
+                    !value.trim().is_empty() && value.trim() == *value && value.len() <= 256
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        "COMMAND_MODEL_REQUIRED",
+                        "explicit route modelId is invalid",
+                    )
+                })?
+                .to_owned(),
+        ),
+    };
 
     Ok(PreparedAcpDispatch {
         identity: AcpDispatchIdentity {
             operation_id: command.operation_id.clone(),
             input_sha256: input_sha256.to_owned(),
-            requested_model: requested_model.to_owned(),
+            requested_model,
             task_id: envelope.task_id.clone(),
             task_revision: envelope.task_revision,
             attempt_id: envelope.attempt_id.clone(),

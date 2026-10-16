@@ -808,12 +808,12 @@ async fn r35_late_predecessor_excluded_from_consumers() {
     // successor, so the predecessor cause cannot become package input.
     let repair = consume_repair(store, &a1, &op1).await;
     assert_eq!(repair["status"], "skipped");
-    assert_eq!(repair["reason"], "selected_finding_is_no_longer_actionable");
+    assert_eq!(repair["reason"], "historical_review_result");
     // Feedback resolves live finding provenance, so the predecessor cause
     // cannot authorize feedback again.
     let stale_assignment = a1.clone();
     let stale_result = op1.clone();
-    let feedback_error = store
+    let feedback = store
         .run(move |db| {
             let tx = db.transaction()?;
             let entry =
@@ -831,11 +831,17 @@ async fn r35_late_predecessor_excluded_from_consumers() {
             Ok(result)
         })
         .await
-        .expect_err("superseded feedback authority must fail");
-    assert_eq!(feedback_error.code.as_str(), "REVIEW_FINDING_NOT_FOUND");
+        .unwrap();
+    assert_eq!(feedback["status"], "skipped");
+    assert_eq!(feedback["reason"], "historical_review_result");
+    assert_eq!(feedback["disposition_applied"], false);
     let predecessor = review_get(store, f2, &a1).await;
     assert_eq!(predecessor["result"]["verdict"], "changes_requested");
     assert_eq!(predecessor["current_slot"], false);
+    assert_eq!(
+        review_get(store, manager(), &a2).await["current_slot"],
+        true
+    );
     let fx = auth(store, &fx_id, &fx_token).await;
     let forbidden = store
         .call(fx, "review.get".into(), json!({"review_assignment_id": a1}))
@@ -851,6 +857,273 @@ async fn r35_late_predecessor_excluded_from_consumers() {
         .await
         .expect_err("unknown assignment must fail");
     assert_eq!(missing.code.as_str(), "REVIEW_ASSIGNMENT_NOT_FOUND");
+    drop(owner);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn r35_superseded_result_requires_coherent_current_review_provenance() {
+    let (owner, directory, _credential) = start_store("superseded-provenance").await;
+    let store = &owner.store;
+    seed_manager(store).await;
+    let subject = seed_subject(store, "r35-superseded-provenance").await;
+    let (f1_id, f1_token) = (reviewer_id(15), reviewer_token(15));
+    let (f2_id, f2_token) = (reviewer_id(16), reviewer_token(16));
+    register(store, &subject, &f1_id, &f1_token).await;
+    register(store, &subject, &f2_id, &f2_token).await;
+
+    let (f1, a1) = assign(
+        store,
+        &subject,
+        &f1_id,
+        &f1_token,
+        "r35-superseded-assign-a",
+        None,
+    )
+    .await;
+    let op1 = submit(
+        store,
+        &f1,
+        &subject,
+        &a1,
+        "r35-superseded-submit-a",
+        ("changes_requested", "complete"),
+        &findings_one(),
+    )
+    .await;
+    let feedback = request_changes(store, &subject, &a1, &op1, "r35-superseded-feedback-a").await;
+    assert_eq!(feedback["applied"], true);
+
+    // B replaces A and has a real settled review.assign Operation, but no
+    // review.submit result yet. A is historical only after B's retained
+    // assignment receipt and current slot pointer both validate.
+    let (f2, a2) = assign(
+        store,
+        &subject,
+        &f2_id,
+        &f2_token,
+        "r35-superseded-assign-b",
+        Some(&a1),
+    )
+    .await;
+    assert_eq!(
+        review_get(store, manager(), &a2).await["current_slot"],
+        true
+    );
+    let (identity, assignment_operation_id, pointer_key) = {
+        let assignment_id = a2.clone();
+        store
+            .run(move |db| {
+                let event_key = format!("assignment:{assignment_id}");
+                let (payload_json, operation_id): (String, String) = db.query_row(
+                    "SELECT payload_json,operation_id FROM observations \
+                     WHERE source_stream_id='controller:review' AND source_event_key=?1 \
+                       AND kind='review.assignment'",
+                    [&event_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let assignment: serde_json::Value = serde_json::from_str(&payload_json)?;
+                let identity: crate::review::ReviewSlotIdentity =
+                    serde_json::from_value(assignment["identity"].clone())?;
+                let pointer_key = format!("review:slot:{}", identity.digest()?);
+                Ok((identity, operation_id, pointer_key))
+            })
+            .await
+            .unwrap()
+    };
+    let old_assignment_id = a1.clone();
+    let old_result_operation_id = op1.clone();
+    let identity_for_match = identity.clone();
+    let matches = store
+        .run(move |db| {
+            super::reviews::current_actionable_review_result_matches(
+                db,
+                &identity_for_match,
+                &old_assignment_id,
+                &old_result_operation_id,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(!matches, "a coherent B assignment retires A");
+
+    // A sponsor mismatch against B's real settled review.assign receipt is
+    // integrity damage, even though B has not submitted a result.
+    let identity_for_bad_assignment = identity.clone();
+    let old_assignment_for_bad_assignment = a1.clone();
+    let old_result_for_bad_assignment = op1.clone();
+    let bad_assignment_operation = assignment_operation_id.clone();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let raw: String = tx.query_row(
+                "SELECT result_json FROM operations WHERE operation_id=?1 AND method='review.assign'",
+                [&bad_assignment_operation],
+                |row| row.get(0),
+            )?;
+            let mut receipt: serde_json::Value = serde_json::from_str(&raw)?;
+            receipt["sponsor_client_id"] = json!("foreign-sponsor");
+            tx.execute(
+                "UPDATE operations SET result_json=?2 WHERE operation_id=?1",
+                params![bad_assignment_operation, model::canonical(&receipt)?],
+            )?;
+            let error = super::reviews::current_actionable_review_result_matches(
+                &tx,
+                &identity_for_bad_assignment,
+                &old_assignment_for_bad_assignment,
+                &old_result_for_bad_assignment,
+            )
+            .expect_err("damaged B assignment receipt must not retire A");
+            assert_eq!(error.code, "REVIEW_ASSIGNMENT_DAMAGED");
+            tx.rollback()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // Missing or dangling current pointers are integrity failures, not a
+    // stale-result signal.
+    let missing_pointer_key = pointer_key.clone();
+    let identity_for_missing_pointer = identity.clone();
+    let old_assignment_for_missing_pointer = a1.clone();
+    let old_result_for_missing_pointer = op1.clone();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let deleted = tx.execute("DELETE FROM meta WHERE key=?1", [&missing_pointer_key])?;
+            assert_eq!(deleted, 1);
+            let error = super::reviews::current_actionable_review_result_matches(
+                &tx,
+                &identity_for_missing_pointer,
+                &old_assignment_for_missing_pointer,
+                &old_result_for_missing_pointer,
+            )
+            .expect_err("a missing current slot pointer must remain damaged");
+            assert_eq!(error.code, "REVIEW_SLOT_DAMAGED");
+            tx.rollback()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let dangling_pointer_key = pointer_key.clone();
+    let identity_for_dangling_pointer = identity.clone();
+    let old_assignment_for_dangling_pointer = a1.clone();
+    let old_result_for_dangling_pointer = op1.clone();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let raw: String = tx.query_row(
+                "SELECT value_json FROM meta WHERE key=?1",
+                [&dangling_pointer_key],
+                |row| row.get(0),
+            )?;
+            let mut pointer: serde_json::Value = serde_json::from_str(&raw)?;
+            pointer["review_assignment_id"] = json!("missing-retained-assignment");
+            tx.execute(
+                "UPDATE meta SET value_json=?2 WHERE key=?1",
+                params![dangling_pointer_key, model::canonical(&pointer)?],
+            )?;
+            let error = super::reviews::current_actionable_review_result_matches(
+                &tx,
+                &identity_for_dangling_pointer,
+                &old_assignment_for_dangling_pointer,
+                &old_result_for_dangling_pointer,
+            )
+            .expect_err("a dangling current slot pointer must remain damaged");
+            assert_eq!(error.code, "REVIEW_SLOT_DAMAGED");
+            tx.rollback()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let mut wrong_anchor = identity.clone();
+    wrong_anchor.task_id = "foreign-task-anchor".to_owned();
+    let old_assignment_for_anchor = a1.clone();
+    let old_result_for_anchor = op1.clone();
+    let anchor_error = store
+        .run(move |db| {
+            super::reviews::current_actionable_review_result_matches(
+                db,
+                &wrong_anchor,
+                &old_assignment_for_anchor,
+                &old_result_for_anchor,
+            )
+        })
+        .await
+        .expect_err("an altered Task anchor must not be treated as historical");
+    assert_eq!(anchor_error.code, "REVIEW_ANCHOR_MISMATCH");
+
+    // A coherent current B result is read before A is classified historical.
+    let op2 = submit(
+        store,
+        &f2,
+        &subject,
+        &a2,
+        "r35-superseded-submit-b",
+        ("changes_requested", "complete"),
+        &findings_one(),
+    )
+    .await;
+    let identity_for_b = identity.clone();
+    let current_assignment_id = a2.clone();
+    let current_result_operation_id = op2.clone();
+    let current_matches = store
+        .run(move |db| {
+            super::reviews::current_actionable_review_result_matches(
+                db,
+                &identity_for_b,
+                &current_assignment_id,
+                &current_result_operation_id,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(current_matches);
+
+    // A B result whose settled review.submit receipt diverges from its
+    // observation is damaged before A can be classified historical.
+    let identity_for_bad_result = identity.clone();
+    let old_assignment_for_bad_result = a1.clone();
+    let old_result_for_bad_result = op1.clone();
+    let b_result_operation = op2.clone();
+    store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let raw: String = tx.query_row(
+                "SELECT result_json FROM operations WHERE operation_id=?1 AND method='review.submit'",
+                [&b_result_operation],
+                |row| row.get(0),
+            )?;
+            let mut result: serde_json::Value = serde_json::from_str(&raw)?;
+            result["verdict"] = json!("pass");
+            tx.execute(
+                "UPDATE operations SET result_json=?2 WHERE operation_id=?1",
+                params![b_result_operation, model::canonical(&result)?],
+            )?;
+            let error = super::reviews::current_actionable_review_result_matches(
+                &tx,
+                &identity_for_bad_result,
+                &old_assignment_for_bad_result,
+                &old_result_for_bad_result,
+            )
+            .expect_err("damaged B result receipt must not retire A");
+            assert_eq!(error.code, "REVIEW_RESULT_DAMAGED");
+            tx.rollback()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        review_get(store, manager(), &a2).await["current_slot"],
+        true
+    );
+    assert_eq!(
+        review_get(store, manager(), &a1).await["current_slot"],
+        false
+    );
     drop(owner);
     let _ = std::fs::remove_dir_all(&directory);
 }

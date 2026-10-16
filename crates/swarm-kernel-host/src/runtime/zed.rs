@@ -7,8 +7,9 @@
 //! not Task acceptance. The contract basis is the pinned upstream source
 //! recorded as ZD-EXEC in `docs/agent_swarm.runtime-sources-v16.json`;
 //! the installed binary has not been live-qualified (`installed_runtime_verified`
-//! stays false), so result readback is cross-checked against the exit code
-//! and the configured model instead of being trusted on its own.
+//! stays false), so result readback is cross-checked against the exit code and
+//! any explicit model override; an omitted override relies on native result
+//! evidence and never becomes a controller-invented effective model.
 
 use crate::{
     artifacts::{ArtifactFiles, ArtifactRecord, MAX_PAGE_BYTES},
@@ -31,12 +32,14 @@ use swarm_contracts::{
     task_prompt::{TASK_PROMPT_SCHEMA_ID, TASK_PROMPT_SCHEMA_VERSION, TaskPromptEnvelopeV1},
 };
 
-/// Current built-in route. The artifact identity is immutable across prompt
-/// contract changes so existing `.1` operations retain their legacy reader.
-pub const ARTIFACT_ID: &str = "eliot-zed.eval-cli.2";
+/// Current built-in route. Each invocation-contract change gets a new artifact
+/// identity so retained operations continue through their original reader.
+pub const ARTIFACT_ID: &str = "eliot-zed.eval-cli.3";
+pub const PREVIOUS_ARTIFACT_ID: &str = "eliot-zed.eval-cli.2";
 pub const LEGACY_ARTIFACT_ID: &str = "eliot-zed.eval-cli.1";
 pub const RUNTIME: &str = "zed";
-pub const CONTRACT_REVISION: &str = "zed-eval-cli-v2";
+pub const CONTRACT_REVISION: &str = "zed-eval-cli-v3";
+pub const PREVIOUS_CONTRACT_REVISION: &str = "zed-eval-cli-v2";
 pub const LEGACY_CONTRACT_REVISION: &str = "zed-eval-cli-v1";
 /// Pinned upstream basis of the eval-cli contract (ZD-EXEC).
 pub const UPSTREAM_BASIS: &str = "7604aa3f19cef0c4d8be2bb3335c24acd788ccb1";
@@ -58,13 +61,13 @@ const WORKER_MAX_TERMINATION_ATTEMPTS: u8 = 3;
 pub const BATCH_WORKER_COMMAND: &str = "zed-batch-worker";
 pub const BATCH_WORKER_FILE_FLAG: &str = "--file";
 
-/// Route identity used by existing reads and recovery. New binding admission
-/// is deliberately narrower and must use [`is_current_route`].
+/// Route identity accepted by runtime dispatch and retained readers. Model
+/// defaults are limited separately by [`is_current_route`].
 pub fn is_route(route: &Value) -> bool {
     route["runtime"] == RUNTIME
         && matches!(
             route["module_artifact_id"].as_str(),
-            Some(ARTIFACT_ID | LEGACY_ARTIFACT_ID)
+            Some(ARTIFACT_ID | PREVIOUS_ARTIFACT_ID | LEGACY_ARTIFACT_ID)
         )
 }
 
@@ -74,6 +77,28 @@ pub fn is_current_route(route: &Value) -> bool {
 
 pub fn is_legacy_route(route: &Value) -> bool {
     route["runtime"] == RUNTIME && route["module_artifact_id"] == LEGACY_ARTIFACT_ID
+}
+
+/// Routes using the Store TaskPrompt envelope. `.2` remains readable and
+/// recoverable with its original explicit-model contract.
+pub fn is_task_prompt_route(route: &Value) -> bool {
+    route["runtime"] == RUNTIME
+        && matches!(
+            route["module_artifact_id"].as_str(),
+            Some(ARTIFACT_ID | PREVIOUS_ARTIFACT_ID)
+        )
+}
+
+pub fn contract_revision(route: &Value) -> Option<&'static str> {
+    if is_current_route(route) {
+        Some(CONTRACT_REVISION)
+    } else if route["runtime"] == RUNTIME && route["module_artifact_id"] == PREVIOUS_ARTIFACT_ID {
+        Some(PREVIOUS_CONTRACT_REVISION)
+    } else if is_legacy_route(route) {
+        Some(LEGACY_CONTRACT_REVISION)
+    } else {
+        None
+    }
 }
 
 #[path = "zed_worker.rs"]
@@ -88,9 +113,10 @@ pub struct Options {
     /// Program name resolved through PATH, or an absolute/relative path.
     pub executable: String,
     pub workdir: PathBuf,
-    /// Exact `provider/model` string passed to `--model`. The binary's own
-    /// built-in default is never accepted implicitly.
-    pub model: String,
+    /// Optional exact `provider/model` override passed to `--model`. When
+    /// absent, the installed native harness selects its own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub timeout_seconds: u64,
     /// Retained compatibility metadata. Native launches inherit the operator's
     /// harness environment without requiring a provider-variable allowlist.
@@ -113,7 +139,10 @@ impl Options {
             || options.executable.bytes().any(|b| b.is_ascii_control())
             || !options.workdir.is_absolute()
             || options.workdir.to_str().is_none()
-            || !valid_model(&options.model)
+            || options
+                .model
+                .as_deref()
+                .is_some_and(|model| !valid_model(model))
             || !(1..=86_400).contains(&options.timeout_seconds)
             || options.env_keys.len() > 32
             || options.env_keys.iter().any(|k| !valid_env_key(k))
@@ -126,7 +155,26 @@ impl Options {
         {
             return Err(Error::new(
                 "CONFIG_ERROR",
-                "Zed requires a scope ID, an executable, an absolute workdir, an explicit provider/model, a bounded timeout and unique environment key names",
+                "Zed requires a scope ID, an executable, an absolute workdir, an optional valid provider/model, a bounded timeout and unique environment key names",
+            ));
+        }
+        Ok(options)
+    }
+
+    /// Historical `.1` and `.2` routes always carried an explicit model.
+    /// Only the current `.3` contract permits the native default.
+    pub fn parse_for_route(route: &Value) -> Result<Self> {
+        if !is_route(route) {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "Zed route has an unknown artifact identity",
+            ));
+        }
+        let options = Self::parse(&route["native_options"])?;
+        if !is_current_route(route) && options.model.is_none() {
+            return Err(Error::new(
+                "CONFIG_ERROR",
+                "historical Zed routes require their retained explicit provider/model",
             ));
         }
         Ok(options)
@@ -146,6 +194,10 @@ fn valid_model(model: &str) -> bool {
             && part.len() <= 128
             && !part.bytes().any(|b| b.is_ascii_control() || b == b' ')
     })
+}
+
+fn valid_observed_model(model: &str) -> bool {
+    !model.is_empty() && model.len() <= 256 && !model.bytes().any(|byte| byte.is_ascii_control())
 }
 
 fn valid_env_key(key: &str) -> bool {
@@ -206,8 +258,8 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// Facts about the configured entrypoint. Launching nothing, this is the
-/// describe half of the batch boundary: what would run, under which exact
-/// model, and which capabilities honestly do not exist for it.
+/// describe half of the batch boundary: what would run, which optional model
+/// override is configured, and which capabilities honestly do not exist.
 pub fn describe(options: &Options) -> Result<Value> {
     let resolved = resolve_program(&options.executable, std::env::var_os("PATH").as_deref())?;
     if !options.workdir.is_dir() {
@@ -315,7 +367,7 @@ pub struct BatchIntent {
 }
 
 /// Durable identity for the exact TaskPrompt envelope and Store dispatch
-/// context used by a v2 Zed run. Prompt text itself remains in the private
+/// context used by a TaskPrompt Zed run. Prompt text itself remains in the private
 /// worker plan and is bound by its owner-record digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -361,7 +413,8 @@ struct BatchWorkerPlan {
     intent: BatchIntent,
     executable: PathBuf,
     workdir: PathBuf,
-    model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     timeout_seconds: u64,
     env_keys: Vec<String>,
     instruction: String,
@@ -519,7 +572,11 @@ impl EvalResult {
             }
         };
         if self.status != expected_status
-            || self.model != options.model
+            || !valid_observed_model(&self.model)
+            || options
+                .model
+                .as_ref()
+                .is_some_and(|model| self.model.as_str() != model.as_str())
             || !self.duration_secs.is_finite()
             || self.duration_secs < 0.0
             || self
@@ -529,7 +586,7 @@ impl EvalResult {
         {
             return Err(Error::new(
                 "NATIVE_RESULT_MISMATCH",
-                "result.json disagrees with the exit code, the configured model or its own error field",
+                "result.json disagrees with the exit code, the configured or native-reported model, or its own error field",
             ));
         }
         Ok(())
@@ -578,6 +635,7 @@ pub fn run_batch(
         output_root,
         artifacts,
         None,
+        CONTRACT_REVISION,
     )
 }
 
@@ -589,6 +647,12 @@ pub fn run_batch_command(
     artifacts: &ArtifactFiles,
 ) -> Result<(BatchOutcome, BatchIntent)> {
     let intent = make_intent(command, instruction)?;
+    let contract_revision = contract_revision(&command.route).ok_or_else(|| {
+        Error::new(
+            "UNSUPPORTED_RUNTIME",
+            "Zed batch command has an unknown artifact identity",
+        )
+    })?;
     let outcome = run_batch_inner(
         options,
         &command.operation_id,
@@ -596,6 +660,7 @@ pub fn run_batch_command(
         output_root,
         artifacts,
         Some(intent.clone()),
+        contract_revision,
     )?;
     Ok((outcome, intent))
 }
@@ -606,7 +671,7 @@ pub fn make_intent(command: &RuntimeCommand, instruction: &str) -> Result<BatchI
             "Zed batch executor only accepts task.dispatch",
         ));
     }
-    if is_current_route(&command.route) {
+    if is_task_prompt_route(&command.route) {
         let dispatch = validate_task_prompt_dispatch(command)?;
         if instruction != dispatch.envelope.prompt {
             return Err(Error::new(
@@ -644,14 +709,14 @@ pub fn make_intent(command: &RuntimeCommand, instruction: &str) -> Result<BatchI
     })
 }
 
-/// Validate and retain the exact v2 TaskPrompt envelope and Store context.
+/// Validate and retain the exact TaskPrompt envelope and Store context.
 /// The returned instruction is the envelope's original UTF-8 string; this
 /// path never reconstructs or appends a Task snapshot.
 pub fn validate_task_prompt_dispatch(command: &RuntimeCommand) -> Result<TaskPromptDispatch> {
-    if command.method != "task.dispatch" || !is_current_route(&command.route) {
+    if command.method != "task.dispatch" || !is_task_prompt_route(&command.route) {
         return Err(Error::new(
             "TASK_PROMPT_INVALID",
-            "TaskPrompt dispatch requires the current Zed artifact and task.dispatch",
+            "TaskPrompt dispatch requires a supported Zed TaskPrompt artifact and task.dispatch",
         ));
     }
     if command.input.get("task_snapshot").is_some()
@@ -717,7 +782,7 @@ fn validate_task_prompt_parts(
     envelope: &TaskPromptEnvelopeV1,
     context: &TaskDispatchContext,
 ) -> Result<()> {
-    if !is_current_route(route)
+    if !is_task_prompt_route(route)
         || envelope.validate_shape().is_err()
         || envelope.schema_id != TASK_PROMPT_SCHEMA_ID
         || envelope.schema_version != TASK_PROMPT_SCHEMA_VERSION
@@ -738,6 +803,7 @@ fn validate_task_prompt_parts(
             "TaskPrompt bytes or Store dispatch context differ from this Zed Operation",
         ));
     }
+    Options::parse_for_route(route)?;
     Ok(())
 }
 
@@ -765,6 +831,7 @@ fn run_batch_inner(
     output_root: &Path,
     artifacts: &ArtifactFiles,
     intent: Option<BatchIntent>,
+    contract_revision: &'static str,
 ) -> Result<BatchOutcome> {
     if instruction.trim().is_empty() || instruction.len() > MAX_INSTRUCTION_BYTES {
         return Err(Error::invalid(
@@ -869,6 +936,7 @@ fn run_batch_inner(
             run_id: &run,
             intent: &intent,
             disposition,
+            contract_revision,
         };
         for name in NATIVE_OUTPUTS {
             let path = output_dir.join(name);
@@ -1618,7 +1686,7 @@ pub fn read_receipt(
     Ok(Some(receipt))
 }
 
-/// Read a v2 terminal receipt using the exact retained TaskPrompt and Store
+/// Read a TaskPrompt terminal receipt using the exact retained envelope and Store
 /// context. The worker plan and owner record bind the original prompt bytes;
 /// this readback binds the saved proof to the current immutable Operation.
 pub fn read_task_prompt_receipt(
@@ -1676,7 +1744,7 @@ pub fn read_task_prompt_receipt(
     {
         return Err(Error::new(
             "BATCH_RECEIPT_MISMATCH",
-            "saved v2 terminal evidence differs from the retained TaskPrompt and context",
+            "saved TaskPrompt terminal evidence differs from the retained envelope and context",
         ));
     }
     validate_receipt_content(&receipt, artifacts, context.route)?;
@@ -1748,7 +1816,7 @@ fn validate_receipt_content(
             "terminal result bytes do not match the validated native projection",
         )
     };
-    let route_proof_matches = if is_current_route(route) {
+    let route_proof_matches = if is_task_prompt_route(route) {
         receipt.intent.version == 2 && receipt.intent.task_prompt_proof.is_some()
     } else if is_legacy_route(route) {
         receipt.intent.version == 1 && receipt.intent.task_prompt_proof.is_none()
@@ -1760,28 +1828,45 @@ fn validate_receipt_content(
     {
         return Err(mismatch());
     }
+    let expected_contract_revision = contract_revision(route).ok_or_else(mismatch)?;
     for record in &receipt.artifacts {
+        if record.metadata["runtime"] != RUNTIME
+            || record.metadata["contract_revision"] != expected_contract_revision
+        {
+            return Err(mismatch());
+        }
         if record.metadata["native_output"] != "result.json" {
             artifacts.verify(record)?;
         }
     }
 
+    let options = Options::parse_for_route(route).map_err(|_| mismatch())?;
+    let requested_model = options
+        .model
+        .as_deref()
+        .map(|model| Value::String(model.to_owned()))
+        .unwrap_or(Value::Null);
+    if receipt.outcome.details["requested_model"] != requested_model {
+        return Err(mismatch());
+    }
     let result_records = receipt
         .artifacts
         .iter()
         .filter(|record| record.metadata["native_output"] == "result.json")
         .collect::<Vec<_>>();
     if receipt.outcome.details["native_result"].is_null() {
-        if !result_records.is_empty() || !receipt.outcome.details["native_result_sha256"].is_null()
+        if !result_records.is_empty()
+            || !receipt.outcome.details["native_result_sha256"].is_null()
+            || !receipt.outcome.details["effective_model"].is_null()
+            || receipt.outcome.details["effective_model_status"] != "unknown"
         {
             return Err(mismatch());
         }
         return Ok(());
     }
 
-    let options = Options::parse(&route["native_options"]).map_err(|_| mismatch())?;
-    if receipt.outcome.details["requested_model"] != options.model
-        || receipt.outcome.details["effective_model"] != options.model
+    if receipt.outcome.details["effective_model"]
+        != receipt.outcome.details["native_result"]["model"]
         || receipt.outcome.details["effective_model_status"] != "observed"
     {
         return Err(mismatch());
@@ -2026,6 +2111,7 @@ struct BatchOutputContext<'a> {
     run_id: &'a str,
     intent: &'a BatchIntent,
     disposition: BatchDisposition,
+    contract_revision: &'a str,
 }
 
 fn publish_output(
@@ -2061,7 +2147,7 @@ fn publish_output_bytes(
                 "binding_id": context.intent.binding_id,
                 "binding_generation": context.intent.generation,
                 "runtime": RUNTIME,
-                "contract_revision": CONTRACT_REVISION,
+                "contract_revision": context.contract_revision,
                 "run_id": context.run_id,
                 "native_output": name,
                 "page": page,

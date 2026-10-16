@@ -19,35 +19,44 @@ pub const ARTIFACT_ID: &str = "eliot-command.rust-headless.1";
 pub const ARTIFACT_VERSION: &str = "3";
 pub const CONTRACT_REVISION: &str = "command-headless-module-v3";
 pub const BATCH_V4_CONTRACT_REVISION: &str = "command-headless-module-v4";
+pub const BATCH_V4_ARTIFACT_VERSION: &str = "4";
+pub const BATCH_V5_ARTIFACT_VERSION: &str = "5";
+pub const BATCH_V5_CONTRACT_REVISION: &str = "command-headless-module-v5";
 pub const EXECUTION_SHAPE: &str = "sessionless_batch";
 
 /// ACP is a distinct artifact and execution profile. The historical batch
 /// artifact and its saved receipts continue to use the constants above.
 pub const ACP_ARTIFACT_ID: &str = "eliot-command.acp-rust.1";
-pub const ACP_ARTIFACT_VERSION: &str = "1";
-pub const ACP_CONTRACT_REVISION: &str = "command-acp-module-v1";
+pub const ACP_V1_ARTIFACT_VERSION: &str = "1";
+pub const ACP_V1_CONTRACT_REVISION: &str = "command-acp-module-v1";
+pub const ACP_ARTIFACT_VERSION: &str = "2";
+pub const ACP_CONTRACT_REVISION: &str = "command-acp-module-v2";
 pub const ACP_EXECUTION_SHAPE: &str = "command_acp_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Profile {
     BatchV3,
     BatchV4,
+    BatchV5,
     AcpV1,
+    AcpV2,
 }
 
 impl Profile {
     pub(crate) fn artifact_id(self) -> &'static str {
         match self {
-            Self::BatchV3 | Self::BatchV4 => ARTIFACT_ID,
-            Self::AcpV1 => ACP_ARTIFACT_ID,
+            Self::BatchV3 | Self::BatchV4 | Self::BatchV5 => ARTIFACT_ID,
+            Self::AcpV1 | Self::AcpV2 => ACP_ARTIFACT_ID,
         }
     }
 
     pub(crate) fn artifact_version(self) -> &'static str {
         match self {
             Self::BatchV3 => ARTIFACT_VERSION,
-            Self::BatchV4 => "4",
-            Self::AcpV1 => ACP_ARTIFACT_VERSION,
+            Self::BatchV4 => BATCH_V4_ARTIFACT_VERSION,
+            Self::BatchV5 => BATCH_V5_ARTIFACT_VERSION,
+            Self::AcpV1 => ACP_V1_ARTIFACT_VERSION,
+            Self::AcpV2 => ACP_ARTIFACT_VERSION,
         }
     }
 
@@ -55,15 +64,21 @@ impl Profile {
         match self {
             Self::BatchV3 => CONTRACT_REVISION,
             Self::BatchV4 => BATCH_V4_CONTRACT_REVISION,
-            Self::AcpV1 => ACP_CONTRACT_REVISION,
+            Self::BatchV5 => BATCH_V5_CONTRACT_REVISION,
+            Self::AcpV1 => ACP_V1_CONTRACT_REVISION,
+            Self::AcpV2 => ACP_CONTRACT_REVISION,
         }
     }
 
     pub(crate) fn execution_shape(self) -> &'static str {
         match self {
-            Self::BatchV3 | Self::BatchV4 => EXECUTION_SHAPE,
-            Self::AcpV1 => ACP_EXECUTION_SHAPE,
+            Self::BatchV3 | Self::BatchV4 | Self::BatchV5 => EXECUTION_SHAPE,
+            Self::AcpV1 | Self::AcpV2 => ACP_EXECUTION_SHAPE,
         }
+    }
+
+    pub(crate) fn model_optional(self) -> bool {
+        matches!(self, Self::BatchV5 | Self::AcpV2)
     }
 }
 

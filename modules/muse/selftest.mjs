@@ -860,27 +860,35 @@ async function runWorkFenceCase(scenario) {
   const stateDir=path.join(dir,'state');
   const home=path.join(dir,'native-home');
   await mkdir(stateDir);await mkdir(home);
+  const canonicalHome=await realpath(home);
+  const nativeScope=`muse:${process.platform}:${process.platform==='win32'?canonicalHome.toLowerCase():canonicalHome}`;
   const ownerFile=path.join(stateDir,'owner.json');
-  await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token:`fixture-work-fence-${scenario}`}));
+  const ownerToken=`fixture-work-fence-${scenario}`;
+  await writeFile(ownerFile,JSON.stringify({version:1,process:{purpose:'module'},token:ownerToken}));
   const nativeScript=path.join(dir,'fake-native.mjs');
   const gateScript=path.join(dir,'checkpoint-gate.mjs');
   const fixturePath=path.join(dir,'native-fixture.json');
   const auditPath=path.join(dir,'native-audit.json');
+  const nativeFramesPath=path.join(dir,'native-frames.ndjson');
   const gateSignal=path.join(dir,'checkpoint-durable.signal');
   const gateRelease=path.join(dir,'checkpoint-gate.release');
   const sessionId=`ses_work_fence_${scenario}`;
   const identities={baseline:['000000000001','000000000002','000000000003'],
     'read-race':['000000000011','000000000013','000000000012'],
     'checkpoint-race':['000000000021','000000000022','000000000023'],
-    'goal-checkpoint-race':['000000000031','000000000033','000000000032']}[scenario];
+    'goal-checkpoint-race':['000000000031','000000000033','000000000032'],
+    'pending-configure-recovery':['000000000041','000000000042','000000000043']}[scenario];
   if(!identities)throw new Error('UNKNOWN_WORK_FENCE_FIXTURE');
   const isGoal=scenario==='read-race'||scenario==='goal-checkpoint-race';
   const isCheckpointRace=scenario==='checkpoint-race'||scenario==='goal-checkpoint-race';
+  const isPendingConfigureRecovery=scenario==='pending-configure-recovery';
   const openId=`60000000-0000-4000-8000-${identities[0]}`;
   const workId=`60000000-0000-4000-8000-${identities[1]}`;
   const configureId=`60000000-0000-4000-8000-${identities[2]}`;
   const reconcileId='60000000-0000-4000-8000-000000000023';
-  const openAt=AT_MS+100,configureAt=AT_MS+101,workAt=AT_MS+102,reconcileAt=AT_MS+103;
+  const openAt=AT_MS+100,effortAt=AT_MS+101,configureAt=AT_MS+102,workAt=AT_MS+103,reconcileAt=AT_MS+104;
+  const operationId=n=>`60000000-0000-4000-8000-${String(n).padStart(12,'0')}`;
+  const effortId=operationId(52);
   const sentText=`fixture-only-${scenario}-payload`;
   function command(operationId,createdAtMs,method,input,routeExtra={}) {
     const inputSha256=createHash('sha256').update(canonicalFixtureJson(input),'utf8').digest('hex');
@@ -890,27 +898,93 @@ async function runWorkFenceCase(scenario) {
   }
   const openCommand=command(openId,openAt,'agent.open',{},
     {native_options:{workspaceRoot:home,modelId:'fixture-model',providerId:'fixture-provider',reasoningEffort:'max'}});
-  const configureCommand=command(configureId,configureAt,'agent.configure',{settings:{reasoningEffort:'max'}});
+  const effortCommand=command(effortId,effortAt,'agent.configure',{settings:{reasoningEffort:'max'}});
+  const configureCommand=command(configureId,configureAt,'agent.configure',{settings:isPendingConfigureRecovery
+    ?{model:{modelId:'fixture-model-B'}}:{reasoningEffort:'max'}});
   const workCommand=isGoal
     ?command(workId,workAt,'agent.goal',{action:'set',objective:'fixture goal must stay fenced'})
     :command(workId,workAt,'agent.send',{delivery:'next_turn',text:sentText});
   const reconcileCommand=command(reconcileId,reconcileAt,'agent.reconcile',{operation_id:workId});
-  const fixture={scenario,sessionId,home,auditPath,gateSignal,gateRelease,workId,
+  const recoveryAt=AT_MS+200;
+  const recoveryId=operationId(44),dispatchId=operationId(45),goalId=operationId(46),replyId=operationId(47);
+  const refreshId=operationId(48),reconcilePendingId=operationId(49),reconcileResolvedId=operationId(50);
+  const postReconcileWorkId=operationId(51);
+  const recoveryCommand=command(recoveryId,recoveryAt,'agent.recover',{expected_boot_id:ownerToken});
+  const dispatchPrompt='fixture dispatch prompt after configure reconciliation';
+  const dispatchSource='fixture task source after configure reconciliation';
+  const dispatchTaskId='task_fixture_configure_fence',dispatchAttemptId='attempt_fixture_configure_fence';
+  const dispatchSnapshotSha256='a'.repeat(64);
+  const dispatchCommand=command(dispatchId,recoveryAt+1,'task.dispatch',{
+    text:dispatchSource,
+    task_prompt:{schema_id:'swarm.task_prompt',schema_version:1,task_id:dispatchTaskId,task_revision:1,
+      attempt_id:dispatchAttemptId,
+      task_snapshot_sha256:dispatchSnapshotSha256,
+      prompt_sha256:createHash('sha256').update(dispatchPrompt,'utf8').digest('hex'),
+      prompt_bytes:Buffer.byteLength(dispatchPrompt,'utf8'),prompt:dispatchPrompt},
+    task_dispatch_context:{schema_version:1,operation_id:dispatchId,binding_id:'fixture-binding',
+      binding_generation:1,worker_boot_id:ownerToken,attempt_id:dispatchAttemptId,task_id:dispatchTaskId,
+      task_revision:1,task_snapshot_sha256:dispatchSnapshotSha256,
+      source_text_sha256:createHash('sha256').update(dispatchSource,'utf8').digest('hex'),
+      source_text_bytes:Buffer.byteLength(dispatchSource,'utf8')},
+  });
+  const goalCommand=command(goalId,recoveryAt+2,'agent.goal',{action:'set',objective:'fixture goal after configure reconciliation'});
+  const replyCommand=command(replyId,recoveryAt+3,'agent.reply',{reply:{method:'approval/decide',params:{
+    sessionId,approvalId:'approval_fixture_configure_fence',decision:'approved',choiceId:'allow-once'}}});
+  const refreshCommand=command(refreshId,recoveryAt+4,'agent.refresh',{});
+  const reconcilePendingCommand=command(reconcilePendingId,recoveryAt+5,'agent.reconcile',{operation_id:configureId});
+  const reconcileResolvedCommand=command(reconcileResolvedId,recoveryAt+6,'agent.reconcile',{operation_id:configureId});
+  const postReconcileWorkCommand=command(postReconcileWorkId,recoveryAt+7,'agent.send',
+    {delivery:'next_turn',text:'fixture work after exact configure reconciliation'});
+  const selectedModelPath=path.join(home,'selected-model.json');
+  const fixture={scenario,sessionId,home,auditPath,nativeFramesPath,gateSignal,gateRelease,workId,
     workMethod:workCommand.method,workText:sentText};
   await writeFile(fixturePath,JSON.stringify(fixture));
   await writeFile(nativeScript,String.raw`
-import { access, readFile, writeFile } from 'node:fs/promises';
+import { access, appendFile, readFile, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 const arg=name=>{const i=process.argv.indexOf(name);return i<0?null:process.argv[i+1]};
 const home=arg('--home'),auditPath=arg('--audit'),fixturePath=arg('--fixtures');
 const fixture=JSON.parse(await readFile(fixturePath,'utf8'));
+const nativeInstanceId=randomUUID();
+let nativeFrameCount=0,nativeFrameTail=Promise.resolve();
+function recordNativeFrame(frame){
+  if(fixture.scenario!=='pending-configure-recovery')return Promise.resolve();
+  if(typeof fixture.nativeFramesPath!=='string')throw new Error('NATIVE_FRAME_AUDIT_PATH_MISSING');
+  if(++nativeFrameCount>32)throw new Error('NATIVE_FRAME_AUDIT_LIMIT');
+  const record={instance_id:nativeInstanceId,pid:process.pid,jsonrpc:frame.jsonrpc,id:frame.id,method:frame.method,
+    ...(frame.params===undefined?{}:{params:frame.params})};
+  const line=JSON.stringify(record)+'\n';
+  if(Buffer.byteLength(line,'utf8')>16384)throw new Error('NATIVE_FRAME_AUDIT_RECORD_TOO_LARGE');
+  const pending=nativeFrameTail.then(()=>appendFile(fixture.nativeFramesPath,line,'utf8'));
+  nativeFrameTail=pending;
+  return pending;
+}
 const session={sessionId:fixture.sessionId,status:'idle',activeTurnId:null,modelId:'fixture-model',
   providerId:'fixture-provider',turnCount:0,workspaceRoot:home};
-const audit={methods:[],session_start_params:null,session_list_count:0,session_list_params:null,
+const auditDefaults={methods:[],session_start_params:null,session_list_count:0,session_list_params:null,
   listed_session:null,session_read_count:0,session_resume_count:0,session_set_effort_count:0,
+  session_set_model_count:0,
   model_changed_notifications:0,checkpoint_gate_released:false,turn_start_count:0,turn_steer_count:0,
   goal_set_count:0,goal_edit_count:0,goal_resume_count:0,turn_start_params:null,goal_set_params:null};
-const save=()=>writeFile(auditPath,JSON.stringify(audit));
+let audit=auditDefaults;
+try{audit=Object.assign(auditDefaults,JSON.parse(await readFile(auditPath,'utf8')));}
+catch(error){if(error?.code!=='ENOENT')throw error;}
+let saveTail=Promise.resolve();
+const save=()=>{
+  const bytes=JSON.stringify(audit);
+  const pending=saveTail.then(()=>writeFile(auditPath,bytes));
+  saveTail=pending;
+  return pending;
+};
+async function refreshFixtureSession(){
+  if(fixture.scenario==='pending-configure-recovery'){
+    try{Object.assign(session,JSON.parse(await readFile(path.join(home,'selected-model.json'),'utf8')));}
+    catch(error){if(error?.code!=='ENOENT')throw error;}
+  }
+  return session;
+}
 const send=frame=>process.stdout.write(JSON.stringify(frame)+'\n');
 const respond=(id,result,error,after)=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id,...(error?{error}:{result})})+'\n',()=>after?.());
 const sourceRange=(id,sequence)=>({first:{id,sequence},last:{id,sequence},stream:{id:fixture.sessionId,kind:'session'}});
@@ -963,19 +1037,22 @@ async function handle(frame){
     if(resolve){responseWaiters.delete(frame.id);resolve(frame);}
     return;
   }
+  if(fixture.scenario==='pending-configure-recovery')await recordNativeFrame(frame);
   if(!Object.hasOwn(frame,'id'))return;
   audit.methods.push(frame.method);
   if(frame.method==='initialize'){
     await save();respond(frame.id,{museHome:home,serverInfo:{name:'fixture-muse',version:'1.4.0'},
-      schema:{fingerprint:'fixture-schema'},sessionDurability:'ephemeral',grantedCapabilities:[]});return;
+      schema:{fingerprint:'fixture-schema'},sessionDurability:fixture.scenario==='pending-configure-recovery'?'durable':'ephemeral',
+      grantedCapabilities:[]});return;
   }
   if(frame.method==='usage/read'){
     await save();respond(frame.id,null,{code:-32601,message:'Method not found',data:{kind:'methodNotFound'}});return;
   }
   if(frame.method==='session/start'){
-    audit.session_start_params=frame.params;await save();respond(frame.id,{session});return;
+    audit.session_start_params=frame.params;await refreshFixtureSession();await save();respond(frame.id,{session});return;
   }
   if(frame.method==='session/list'){
+    await refreshFixtureSession();
     audit.session_list_count++;audit.session_list_params=frame.params;
     audit.listed_session={sessionId:session.sessionId,modelId:session.modelId,providerId:session.providerId,
       status:session.status,activeTurnId:session.activeTurnId};
@@ -984,10 +1061,20 @@ async function handle(frame){
     const after=fixture.scenario.endsWith('checkpoint-race')?()=>{void checkpointRace().catch(()=>process.exit(2));}:undefined;
     respond(frame.id,{sessions:[session],nextCursor:null},undefined,after);return;
   }
-  if(frame.method==='session/read')audit.session_read_count++;
-  if(frame.method==='session/resume')audit.session_resume_count++;
+  if(frame.method==='session/read'){
+    audit.session_read_count++;await refreshFixtureSession();await save();
+    respond(frame.id,{session,viewCursor:'cursor_fixture_session_read'});return;
+  }
+  if(frame.method==='session/resume'){
+    audit.session_resume_count++;await refreshFixtureSession();await save();
+    respond(frame.id,{commandId:frame.params.commandId,status:'accepted',session,viewCursor:'cursor_fixture_resume'});return;
+  }
   if(frame.method==='session/setReasoningEffort'){
     audit.session_set_effort_count++;await save();send(effortChanged());
+    respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
+  }
+  if(frame.method==='session/setModel'){
+    audit.session_set_model_count++;await save();
     respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
   }
   if(frame.method==='turn/start'){
@@ -1007,6 +1094,9 @@ async function handle(frame){
   }
   if(frame.method==='goal/resume'){
     audit.goal_resume_count++;await save();respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
+  }
+  if(['approval/decide','userInput/answer','userInput/cancel','userInput/clarify'].includes(frame.method)){
+    await save();respond(frame.id,{status:'accepted'});return;
   }
   if(frame.method==='approval/listPending'){await save();respond(frame.id,{approvals:[],userInputs:[]});return;}
   await save();respond(frame.id,{});
@@ -1054,13 +1144,30 @@ syncBuiltinESMExports();
   const endpoint=process.platform==='win32'?`\\\\.\\pipe\\muse-work-fence-${scenario}-${randomUUID()}`:path.join(dir,'control.sock');
   const sockets=new Set(),outcomes=new Map(),commands=[openCommand];
   let workOutcomeCount=0,reconcileOutcomeCount=0,deferredWorkAck=null,reconcileCommandDelivered=false;
-  let finishedResolve,finishedReject,bridge,stderr='',teardownStarted=false,closed,closeResult;
+  let finishedResolve,finishedReject,configureAcceptedResolve,bridge,stderr='',teardownStarted=false,closed,closeResult;
+  let moduleHelloCount=0,reconcilePendingQueued=false,pendingReplyOutcome,pendingRefreshOutcome;
+  const hostTrace=[];
+  function recordHost(phase,details={}){
+    if(hostTrace.length<64)hostTrace.push({phase,...details});
+  }
+  const fencedWorkOutcomes=new Map();
+  const fencedWorkIds=new Set([workId,dispatchId,goalId]);
   let checkpointAtWorkOutcome;
   const finished=new Promise((resolve,reject)=>{finishedResolve=resolve;finishedReject=reject;});
+  void finished.catch(()=>{});
+  const configureAccepted=new Promise(resolve=>{configureAcceptedResolve=resolve;});
+  function queuePendingModelReconcile(){
+    if(isPendingConfigureRecovery&&!reconcilePendingQueued&&fencedWorkOutcomes.size===fencedWorkIds.size
+        &&pendingReplyOutcome&&pendingRefreshOutcome){
+      reconcilePendingQueued=true;commands.push(reconcilePendingCommand);
+    }
+  }
+  let primaryError;
   const server=net.createServer(socket=>{
     sockets.add(socket);socket.setEncoding('utf8');let buffer='';
     socket.on('close',()=>sockets.delete(socket));
-    socket.on('error',error=>{if(teardownStarted&&error?.code==='ECONNRESET')return;
+    socket.on('error',error=>{if((teardownStarted||isPendingConfigureRecovery)&&error?.code==='ECONNRESET')return;
+      recordHost('socket_error',{code:error?.code??null,message:error?.message??String(error)});
       finishedReject(new Error(`work-fence fixture socket: ${error?.code??error?.message??error}`));});
     socket.on('data',chunk=>{
       buffer+=chunk;let end;
@@ -1075,15 +1182,25 @@ syncBuiltinESMExports();
   }
   async function respondHost(socket,packet) {
     let result={};
-    if(packet.method==='client.hello')result={client_id:'muse-fixture-client'};
+    if(packet.method==='client.hello'){
+      recordHost('client_hello');result={client_id:'muse-fixture-client'};
+    }
     else if(packet.method==='module.hello'){
       assert.deepEqual(packet.params.module_contract,museModuleContractClaim);
-      result={binding_id:'fixture-binding',generation:1,recovery_required:false,native_root_id:null,native_scope_key:null,
+      moduleHelloCount++;
+      const recovering=isPendingConfigureRecovery&&moduleHelloCount>1;
+      recordHost('module_hello',{count:moduleHelloCount,recovery_required:recovering,
+        native_root_id:packet.params.native_root_id??null,native_scope_key:packet.params.native_scope_key??null});
+      result={binding_id:'fixture-binding',generation:1,recovery_required:recovering,
+        native_root_id:recovering?sessionId:null,
+        native_scope_key:recovering?nativeScope:null,
         module_contract_negotiation:museModuleContractNegotiation};
+      if(recovering)commands.push(recoveryCommand);
     } else if(packet.method==='module.next') {
       if(!commands.length)await delay(10);
       if(commands.length){
         const command=commands.shift();result={command};
+        recordHost('command_delivered',{operation_id:command.operation_id,method:command.method});
         if(command.method==='agent.reconcile'){
           reconcileCommandDelivered=true;
           if(deferredWorkAck)setTimeout(()=>reply(deferredWorkAck.socket,deferredWorkAck.packet),40);
@@ -1091,11 +1208,59 @@ syncBuiltinESMExports();
       }
     } else if(packet.method==='module.outcome') {
       const outcome=packet.params;outcomes.set(outcome.operation_id,outcome);
+      recordHost('outcome',{operation_id:outcome.operation_id,outcome:outcome.outcome,
+        diagnostic_code:outcome.details?.diagnostic_code??null});
       if(outcome.operation_id===openId&&outcome.outcome==='applied'){
-        if(scenario==='read-race'||scenario==='goal-checkpoint-race')commands.push(configureCommand,workCommand);
+        if(isPendingConfigureRecovery)commands.push(effortCommand);
+        else if(scenario==='read-race'||scenario==='goal-checkpoint-race')commands.push(configureCommand,workCommand);
         else commands.push(workCommand);
       }
-      if(outcome.operation_id===workId){
+      if(isPendingConfigureRecovery&&outcome.operation_id===effortId&&outcome.outcome==='applied'){
+        commands.push(configureCommand);
+      } else if(isPendingConfigureRecovery&&outcome.operation_id===configureId&&outcome.outcome==='accepted'
+          &&moduleHelloCount===1){
+        const checkpoint=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
+        const pending=checkpoint.native_pending?.find(([id])=>id===configureId)?.[1];
+        assert.equal(outcome.details.waiting_for,'model_readback','setModel ACK remains an accepted pending outcome');
+        assert.equal(pending?.ack?.status,'accepted','the actual setter ACK is checkpointed before restart');
+        assert.equal(pending?.resolved,false,'readback A leaves the configure operation unresolved');
+        assert.deepEqual(pending?.setting,{key:'model',desired:{modelId:'fixture-model-B'},method:'session/setModel',
+          params:{sessionId,model:{modelId:'fixture-model-B'}}});
+        assert.equal(checkpoint.route_defaults.modelId,'fixture-model','the requested B does not replace route A before readback');
+        assert.equal(checkpoint.route_defaults.providerId,'fixture-provider');
+        assert.equal(checkpoint.standing_effort,'max','the work-starting goal precondition is durably configured');
+        configureAcceptedResolve(outcome);
+      } else if(isPendingConfigureRecovery&&outcome.operation_id===recoveryId){
+        assert.equal(outcome.outcome,'applied','restored native readiness precedes replies, refresh and work attempts');
+        commands.push(workCommand,dispatchCommand,goalCommand,replyCommand,refreshCommand);
+      } else if(isPendingConfigureRecovery&&fencedWorkIds.has(outcome.operation_id)){
+        assert.equal(outcome.outcome,'rejected','productive work stays held behind the restored model configure');
+        assert.equal(outcome.details.diagnostic_code,'MODEL_CONFIGURATION_RECONCILIATION_REQUIRED');
+        fencedWorkOutcomes.set(outcome.operation_id,outcome);
+        queuePendingModelReconcile();
+      } else if(isPendingConfigureRecovery&&outcome.operation_id===replyId){
+        assert.equal(outcome.outcome,'applied','native replies remain usable while model work is fenced');
+        pendingReplyOutcome=outcome;queuePendingModelReconcile();
+      } else if(isPendingConfigureRecovery&&outcome.operation_id===refreshId){
+        assert.equal(outcome.outcome,'applied','native refresh remains usable while model work is fenced');
+        pendingRefreshOutcome=outcome;queuePendingModelReconcile();
+      } else if(isPendingConfigureRecovery&&outcome.operation_id===reconcilePendingId){
+        assert.equal(outcome.outcome,'applied');
+        assert.equal(outcome.details.target_operation_id,configureId);
+        assert.equal(outcome.details.disposition,'pending_application','readback A does not resolve requested model B');
+        assert.equal(outcome.details.resubmitted,false,'ACK-backed reconciliation does not resend setModel');
+        await writeFile(selectedModelPath,JSON.stringify({modelId:'fixture-model-B',providerId:'fixture-native-provider-B'}));
+        commands.push(reconcileResolvedCommand);
+      } else if(isPendingConfigureRecovery&&outcome.operation_id===reconcileResolvedId){
+        assert.equal(outcome.outcome,'applied');
+        assert.equal(outcome.details.target_operation_id,configureId);
+        assert.equal(outcome.details.disposition,'resolved','the requested model readback resolves the original configure');
+        assert.equal(outcome.details.resubmitted,false,'exact readback still does not resend setModel');
+        commands.push(postReconcileWorkCommand);
+      } else if(isPendingConfigureRecovery&&outcome.operation_id===postReconcileWorkId){
+        assert.equal(outcome.outcome,'applied','productive work resumes after the matching readback');
+        finishedResolve(outcome);
+      } else if(outcome.operation_id===workId){
         workOutcomeCount++;
         assert.equal(workOutcomeCount,1,'the original work command produces one host outcome');
         if(isCheckpointRace){
@@ -1148,14 +1313,59 @@ syncBuiltinESMExports();
       env.MUSE_FIXTURE_GATE_SIGNAL=gateSignal;
       env.MUSE_FIXTURE_GATE_RELEASE=gateRelease;
     }
-    bridge=spawn(process.execPath,[path.join(here,'bridge.mjs'),'--config',configFile],
-      {cwd:here,env,windowsHide:true,stdio:['ignore','ignore','pipe']});
-    bridge.stderr.setEncoding('utf8');bridge.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
-    closed=new Promise(resolve=>bridge.once('close',(code,signal)=>resolve({code,signal})));
+    function spawnBridge(){
+      bridge=spawn(process.execPath,[path.join(here,'bridge.mjs'),'--config',configFile],
+        {cwd:here,env,windowsHide:true,stdio:['ignore','ignore','pipe']});
+      bridge.stderr.setEncoding('utf8');bridge.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
+      closed=new Promise(resolve=>bridge.once('close',(code,signal)=>resolve({code,signal})));
+    }
+    spawnBridge();
+    if(isPendingConfigureRecovery){
+      const configureFailure=finished.then(
+        ()=>{throw new Error('WORK_FENCE_FINISHED_BEFORE_CONFIGURE_ACK');},
+        error=>{throw error;});
+      const accepted=await Promise.race([configureAccepted,configureFailure,
+        delay(15000).then(()=>{throw new Error(`pending configure ACK fixture timed out: ${stderr}`);})]);
+      assert.equal(accepted.outcome,'accepted');
+      const firstBridge=bridge,firstClosed=closed;
+      firstBridge.kill('SIGTERM');
+      closeResult=await Promise.race([firstClosed,delay(5000).then(()=>null)]);
+      assert.ok(closeResult,'the first actual bridge process checkpoints and stops before restart');
+      const restored=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
+      const pending=restored.native_pending?.find(([id])=>id===configureId)?.[1];
+      assert.equal(pending?.ack?.status,'accepted');
+      assert.equal(pending?.resolved,false);
+      assert.equal(restored.route_defaults.modelId,'fixture-model');
+      assert.equal(restored.route_defaults.providerId,'fixture-provider');
+      assert.equal(restored.standing_effort,'max');
+      spawnBridge();
+    }
     const outcome=await Promise.race([finished,delay(15000).then(()=>{throw new Error(`work-fence fixture timed out: ${stderr}`);})]);
-    assert.equal(outcomes.get(openId)?.outcome,'applied','the fixture root opens before work preflight');
-    assert.ok(outcomes.has(workId),'the work command outcome is recorded');
-    if(scenario==='baseline'){
+    if(isPendingConfigureRecovery){
+      assert.equal(outcomes.get(effortId)?.outcome,'applied','standing effort is configured before the model fence scenario');
+      assert.equal(outcomes.get(recoveryId)?.outcome,'applied','the restored native session is explicitly resumed');
+      assert.equal(outcomes.get(configureId)?.outcome,'applied','the original configure settles only after its requested readback');
+      assert.equal(fencedWorkOutcomes.size,3);
+      assert.equal(pendingReplyOutcome?.outcome,'applied');
+      assert.equal(pendingRefreshOutcome?.outcome,'applied');
+      assert.equal(outcome.operation_id,postReconcileWorkId);
+      assert.equal(outcome.turn_id,'turn_fixture_started');
+    } else {
+      assert.equal(outcomes.get(openId)?.outcome,'applied','the fixture root opens before work preflight');
+      assert.ok(outcomes.has(workId),'the work command outcome is recorded');
+    }
+    if(isPendingConfigureRecovery){
+      const finalCheckpoint=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
+      assert.equal(finalCheckpoint.route_defaults.modelId,'fixture-model-B');
+      assert.equal(Object.hasOwn(finalCheckpoint.route_defaults,'providerId'),false,
+        'an omitted provider stays unconstrained after model readback');
+      assert.equal(finalCheckpoint.latest.requested_provider,'fixture-provider',
+        'the original requested provider remains recorded separately');
+      assert.deepEqual(finalCheckpoint.latest.model,{modelId:'fixture-model-B',providerId:'fixture-native-provider-B'},
+        'observed provider stays a session fact instead of becoming a requested route provider');
+      assert.equal(finalCheckpoint.native_pending?.some(([id])=>id===configureId),false,
+        'the original configure entry retires only after host acknowledgement of exact readback');
+    } else if(scenario==='baseline'){
       assert.equal(outcomes.get(workId)?.outcome,'applied');
       assert.equal(outcome.outcome,'applied','a stable session/list snapshot admits one clean dispatch');
       assert.equal(outcome.turn_id,'turn_fixture_started');
@@ -1172,6 +1382,8 @@ syncBuiltinESMExports();
       assert.equal(outcome.reconcile?.details?.resubmitted,false);
       assert.equal(reconcileCommandDelivered,true);
     }
+  } catch(error) {
+    primaryError=error;
   } finally {
     teardownStarted=true;
     if(bridge&&bridge.exitCode===null)bridge.kill('SIGTERM');
@@ -1179,18 +1391,62 @@ syncBuiltinESMExports();
     for(const socket of sockets)socket.destroy();
     if(server.listening)await new Promise(resolve=>server.close(resolve));
     try {
-      const audit=JSON.parse(await readFile(auditPath,'utf8'));
-      assert.equal(audit.session_start_params?.workspaceRoot,home);
-      assert.equal(audit.session_start_params?.modelId,'fixture-model');
-      assert.equal(audit.session_start_params?.providerId,'fixture-provider');
-      assert.equal(audit.session_list_count,1,'one exact session/list row is used for work preflight');
-      assert.equal(audit.session_list_params?.workspaceRoot,home);
-      assert.equal(audit.session_list_params?.limit,200);
-      assert.deepEqual(audit.listed_session,{sessionId,modelId:'fixture-model',providerId:'fixture-provider',
-        status:'idle',activeTurnId:null});
-      assert.equal(audit.session_read_count,0,'ephemeral fixtures stay on the supported session/list API');
-      assert.equal(audit.session_resume_count,0,'work fencing never resumes a native session');
-      const nativeWorkMethods=audit.methods.filter(method=>['turn/start','turn/steer','goal/set','goal/edit','goal/resume'].includes(method));
+      if(primaryError){
+        if(isPendingConfigureRecovery){
+          let frames=[];
+          try{frames=(await readFile(nativeFramesPath,'utf8')).trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));}
+          catch(error){frames=[{audit_read_error:error?.message??String(error)}];}
+          primaryError.stack=`${primaryError.stack??String(primaryError)}\nHOST_TRACE=${JSON.stringify(hostTrace)}\nNATIVE_FRAME_TRACE=${JSON.stringify(frames)}`;
+        }
+      } else {
+      let nativeWorkMethods,audit;
+      if(isPendingConfigureRecovery){
+        const frames=(await readFile(nativeFramesPath,'utf8')).trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
+        const initializations=frames.filter(frame=>frame.method==='initialize');
+        const starts=frames.filter(frame=>frame.method==='session/start');
+        const resumes=frames.filter(frame=>frame.method==='session/resume');
+        const frameEvidence=JSON.stringify(frames);
+        assert.equal(initializations.length,2,frameEvidence);
+        assert.notEqual(initializations[0].instance_id,initializations[1].instance_id,frameEvidence);
+        assert.equal(starts.length,1,`one original session/start across both native processes: ${frameEvidence}`);
+        assert.equal(starts[0].instance_id,initializations[0].instance_id,frameEvidence);
+        assert.equal(starts[0].params.workspaceRoot,home,frameEvidence);
+        assert.equal(starts[0].params.modelId,'fixture-model',frameEvidence);
+        assert.equal(starts[0].params.providerId,'fixture-provider',frameEvidence);
+        assert.equal(resumes.length,1,`the second native process resumes the recorded session: ${frameEvidence}`);
+        assert.equal(resumes[0].instance_id,initializations[1].instance_id,frameEvidence);
+        assert.equal(resumes[0].params.sessionId,sessionId,frameEvidence);
+        assert.equal(resumes[0].params.excludeItems,true,frameEvidence);
+        assert.equal(frames.some(frame=>frame.method==='session/start'
+          &&frame.instance_id===resumes[0].instance_id),false,
+        `recovery did not fall back to a fresh session/start: ${frameEvidence}`);
+        assert.equal(frames.filter(frame=>frame.method==='session/setModel').length,1,
+          `ACK-backed reconciliation does not resend the original setter: ${frameEvidence}`);
+        assert.equal(frames.filter(frame=>frame.method==='session/setReasoningEffort').length,1,frameEvidence);
+        assert.ok(frames.filter(frame=>frame.method==='session/read').length>=4,frameEvidence);
+        assert.ok(frames.some(frame=>frame.method==='approval/decide'),
+          `replies remain available while productive work is fenced: ${frameEvidence}`);
+        nativeWorkMethods=frames.filter(frame=>['turn/start','turn/steer','goal/set','goal/edit','goal/resume'].includes(frame.method))
+          .map(frame=>frame.method);
+        assert.deepEqual(nativeWorkMethods,['turn/start'],'only the post-reconciliation send reaches native work');
+        const admittedStart=frames.find(frame=>frame.method==='turn/start');
+        assert.equal(admittedStart.params.input?.[0]?.text,'fixture work after exact configure reconciliation',frameEvidence);
+        assert.equal(frames.filter(frame=>frame.method==='goal/set').length,0,
+          `work-starting goals remain fenced: ${frameEvidence}`);
+      } else {
+        audit=JSON.parse(await readFile(auditPath,'utf8'));
+        assert.equal(audit.session_start_params?.workspaceRoot,home);
+        assert.equal(audit.session_start_params?.modelId,'fixture-model');
+        assert.equal(audit.session_start_params?.providerId,'fixture-provider');
+        nativeWorkMethods=audit.methods.filter(method=>['turn/start','turn/steer','goal/set','goal/edit','goal/resume'].includes(method));
+        assert.equal(audit.session_list_count,1,'one exact session/list row is used for work preflight');
+        assert.equal(audit.session_list_params?.workspaceRoot,home);
+        assert.equal(audit.session_list_params?.limit,200);
+        assert.deepEqual(audit.listed_session,{sessionId,modelId:'fixture-model',providerId:'fixture-provider',
+          status:'idle',activeTurnId:null});
+        assert.equal(audit.session_read_count,0,'ephemeral fixtures stay on the supported session/list API');
+        assert.equal(audit.session_resume_count,0,'work fencing never resumes a native session');
+      }
       if(scenario==='baseline'){
         assert.deepEqual(nativeWorkMethods,['turn/start'],'the baseline sends exactly one clean native work command');
         assert.equal(audit.turn_start_count,1);
@@ -1201,7 +1457,7 @@ syncBuiltinESMExports();
         assert.equal(audit.turn_start_params?.reasoningEffort,'max');
         assert.equal(audit.turn_start_params?.ifBusy,'queue');
         assert.deepEqual(audit.turn_start_params?.input,[{type:'text',text:sentText}]);
-      } else {
+      } else if(!isPendingConfigureRecovery) {
         assert.deepEqual(nativeWorkMethods,[],'a stale session snapshot causes no native work call');
         assert.equal(audit.turn_start_count,0);
         assert.equal(audit.turn_steer_count,0);
@@ -1223,11 +1479,16 @@ syncBuiltinESMExports();
       const retained=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
       if(scenario==='read-race')
         assert.equal(retained.native_pending?.some(([id])=>id===workId),false,'a changed preflight read creates no native intent');
+      assert.ok(closeResult,'the actual bridge subprocess stops after the account-free native fixture');
+      }
+    } catch(error) {
+      if(primaryError)primaryError.stack=`${primaryError.stack??String(primaryError)}\nFINAL_AUDIT_ERROR=${error?.stack??String(error)}`;
+      else primaryError=error;
     } finally {
       await rm(dir,{recursive:true,force:true});
     }
-    assert.ok(closeResult,'the actual bridge subprocess stops after the account-free native fixture');
   }
+  if(primaryError)throw primaryError;
   console.log(`PASS work fence ${scenario}: actual bridge preserves exact read/checkpoint and no-replay boundaries`);
 }
 
@@ -1235,6 +1496,7 @@ await runWorkFenceCase('baseline');
 await runWorkFenceCase('read-race');
 await runWorkFenceCase('checkpoint-race');
 await runWorkFenceCase('goal-checkpoint-race');
+await runWorkFenceCase('pending-configure-recovery');
 
 // 4b. Omission selects the installed native default; explicit overrides ride
 // verbatim. This checks the actual native payloads, not struct shape: an

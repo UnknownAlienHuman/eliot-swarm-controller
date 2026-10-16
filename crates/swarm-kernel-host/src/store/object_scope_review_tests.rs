@@ -87,13 +87,21 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
     db.execute_batch(SCRIPT_SCHEMA).unwrap();
     db.execute_batch(WORKSPACE_SCHEMA).unwrap();
 
+    let task_spec = json!({
+        "objective":"Exercise exact assigned-review receipt scope",
+        "phase":"implementation",
+        "requirements":[{"id":"R1","statement":"Keep the receipt bounded"}],
+    });
+    let parsed_task_spec: crate::model::TaskSpec =
+        serde_json::from_value(task_spec.clone()).unwrap();
     let identity = ReviewSlotIdentity {
         task_id: TASK_ID.to_owned(),
         attempt_id: ATTEMPT_ID.to_owned(),
         task_revision: 1,
         submission_ref: SUBMISSION_REF.to_owned(),
         candidate_ref: CANDIDATE_REF.to_owned(),
-        review_policy_generation: "fixture-generation".to_owned(),
+        review_policy_generation: crate::review::review_policy_generation(&parsed_task_spec)
+            .unwrap(),
         review_slot: "primary".to_owned(),
     };
     let identity_value = serde_json::to_value(&identity).unwrap();
@@ -105,11 +113,7 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
         "submission_ref":SUBMISSION_REF,
         "candidate_ref":CANDIDATE_REF,
     });
-    let task_spec = json!({
-        "objective":"Exercise exact assigned-review receipt scope",
-        "phase":"implementation",
-        "requirements":[{"id":"R1","statement":"Keep the receipt bounded"}],
-    });
+    let slot_key = identity.digest().unwrap();
     db.execute(
         "INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES(?1,'fixture',1,'open',?2,1,1)",
         params![TASK_ID, model::canonical(&task_spec).unwrap()],
@@ -117,13 +121,14 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
     .unwrap();
 
     let candidate_bytes = b"review candidate fixture";
+    let candidate_sha256 = model::digest(candidate_bytes);
     let candidate_metadata = json!({"attempt_id":ATTEMPT_ID,"task_revision":1});
     db.execute(
         "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) VALUES(?1,'artifacts/review-candidate.bin','source_snapshot',?2,?3,1,?4)",
         params![
             CANDIDATE_REF,
             candidate_bytes.len() as i64,
-            model::digest(candidate_bytes),
+            candidate_sha256,
             model::canonical(&candidate_metadata).unwrap(),
         ],
     )
@@ -135,6 +140,9 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
         "attempt_id":ATTEMPT_ID,
         "task_revision":1,
         "candidate_ref":CANDIDATE_REF,
+        "candidate_sha256":candidate_sha256,
+        "candidate_kind":"source_snapshot",
+        "candidate_byte_length":candidate_bytes.len(),
         "summary":"applied fixture submission",
     });
     let submission_document_raw = model::canonical(&submission_document).unwrap();
@@ -181,14 +189,47 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
         &submission_result,
     );
 
+    let required_coverage = json!({
+        "requirement_ids":parsed_task_spec.requirements.iter().map(|requirement| requirement.id.clone()).collect::<Vec<_>>(),
+        "source_refs":parsed_task_spec.source_refs,
+        "source_index":parsed_task_spec.source_index,
+        "phase":parsed_task_spec.phase,
+    });
+    let assignment_receipt = json!({
+        "operation_id":ASSIGNMENT_OPERATION_ID,
+        "review_assignment_id":ASSIGNMENT_ID,
+        "identity":identity_value,
+        "sponsor_client_id":"review-manager",
+        "technical_requester_id":"review-manager",
+        "reviewer_client_id":"assigned-reviewer",
+        "review_profile":null,
+        "state":"assigned",
+        "coalesced":false,
+        "supersedes_review_assignment_id":null,
+        "replacement_context":null,
+        "task_transition":"none",
+        "on_behalf":null,
+    });
     let assignment = json!({
+        "schema_version":1,
         "review_assignment_id":ASSIGNMENT_ID,
         "operation_id":ASSIGNMENT_OPERATION_ID,
         "identity":identity_value,
+        "slot_key":slot_key,
         "sponsor_client_id":"review-manager",
+        "technical_requester_id":"review-manager",
         "reviewer_client_id":"assigned-reviewer",
+        "review_profile":null,
+        "required_coverage":required_coverage,
+        "candidate_sha256":candidate_sha256,
+        "submission_sha256":candidate_sha256,
+        "candidate_kind":"source_snapshot",
+        "candidate_byte_length":candidate_bytes.len(),
+        "supersedes_review_assignment_id":null,
+        "replacement_context":null,
         "assignment_state":"assigned",
-        "private_assignment_data":"must not escape the receipt projector",
+        "on_behalf":null,
+        "result":assignment_receipt,
     });
     insert_operation(
         &db,
@@ -196,8 +237,8 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
         "review-manager",
         "review.assign",
         (TASK_ID, ATTEMPT_ID),
-        &json!({"review_assignment":assignment,"private_contract":"private"}),
-        &assignment,
+        &json!({"review_assignment":assignment["result"],"on_behalf":null,"private_contract":"private"}),
+        &assignment["result"],
     );
     db.execute(
         "INSERT INTO observations(source_stream_id,source_event_key,operation_id,kind,payload_json,recorded_at_ms) VALUES('controller:review',?1,?2,'review.assignment',?3,1)",
@@ -209,7 +250,6 @@ fn review_fixture() -> (Connection, Principal, ReviewSlotIdentity, Value) {
     )
     .unwrap();
 
-    let slot_key = identity.digest().unwrap();
     set_meta(
         &db,
         &format!("review:slot:{slot_key}"),

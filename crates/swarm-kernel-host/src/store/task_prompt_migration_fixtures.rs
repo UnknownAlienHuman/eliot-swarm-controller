@@ -408,7 +408,7 @@ fn retained_builtin_and_batch_v3_keep_their_old_prompt_and_decoder_identity() {
 }
 
 #[test]
-fn command_batch_v4_and_current_acp_selectors_remain_admissible() {
+fn command_batch_v4_v5_and_current_acp_v2_selectors_remain_admissible() {
     let batch_v4 = route("module", COMMAND_ARTIFACT_ID);
     let batch_v4_selector = json!({
         "artifact":{"artifact_id":COMMAND_ARTIFACT_ID,"version":"4"}
@@ -417,9 +417,15 @@ fn command_batch_v4_and_current_acp_selectors_remain_admissible() {
 
     let current_acp = route("module", COMMAND_ACP_ARTIFACT_ID);
     let acp_selector = json!({
-        "artifact":{"artifact_id":COMMAND_ACP_ARTIFACT_ID,"version":"1"}
+        "artifact":{"artifact_id":COMMAND_ACP_ARTIFACT_ID,"version":"2"}
     });
     super::require_new_binding(&current_acp, Some(&acp_selector)).unwrap();
+
+    // Existing ACP v1 descriptors retain their versioned compatibility path.
+    let acp_v1_selector = json!({
+        "artifact":{"artifact_id":COMMAND_ACP_ARTIFACT_ID,"version":"1"}
+    });
+    super::require_new_binding(&current_acp, Some(&acp_v1_selector)).unwrap();
 
     let later_batch = json!({
         "artifact":{"artifact_id":COMMAND_ARTIFACT_ID,"version":"5"}

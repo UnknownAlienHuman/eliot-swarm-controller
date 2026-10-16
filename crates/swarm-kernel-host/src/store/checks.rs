@@ -5516,7 +5516,7 @@ mod tests {
         assert!(!scope_a.overlaps(&scope_b));
 
         let (owner, process_fixture) =
-            inputs::tests::pending_probe_custody_fixture(scope_a.clone());
+            inputs::tests::pending_probe_custody_store_fixture(scope_a.clone());
         let target_identity = process_fixture.process_identity("target.identity.json");
         let descendant_identity = process_fixture.process_identity("descendant.identity.json");
         let helper_identity = process_fixture.helper_launch_identity().clone();

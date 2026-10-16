@@ -293,6 +293,19 @@ pub(crate) fn consume_review_result_for_entry(
             ));
         }
     }
+    let current_result_matches = reviews::current_actionable_review_result_matches(
+        tx,
+        &review.identity,
+        assignment_id,
+        result_operation_id,
+    )?;
+    if !current_result_matches {
+        return Ok(repair_skipped(
+            assignment_id,
+            result_operation_id,
+            "historical_review_result",
+        ));
+    }
 
     let disposition_key = format!("disposition:{assignment_id}");
     let disposition_row: Option<(Option<String>, String)> = tx

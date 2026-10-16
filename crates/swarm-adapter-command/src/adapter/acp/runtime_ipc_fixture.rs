@@ -438,7 +438,7 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
     )?;
     let module_host = module_host::ModuleHostIdentity {
         claim,
-        profile: crate::Profile::AcpV1,
+        profile: crate::Profile::AcpV2,
         boot_id: Uuid::new_v4().to_string(),
         binding_id: binding_id.clone(),
         generation,
@@ -514,13 +514,13 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
         false,
     )
     .await?;
-    validate_acp_route(&link.route)?;
+    validate_acp_route_with_model_policy(&link.route, owner.host.profile.model_optional())?;
     let open_command: RuntimeCommand =
         serde_json::from_value(link.client.next().await?["command"].clone())?;
     assert_eq!(open_command.operation_id, open["operation_id"]);
     crate::adapter::validate_command(&open_command, &link, None)?;
 
-    let journal = AcpJournal::new(&owner.state_dir)?;
+    let journal = AcpJournal::new_for_profile(&owner.state_dir, owner.host.profile)?;
     let capture = Arc::new(Mutex::new(Capture::default()));
     let (transport, peer) = Channel::duplex();
     let (active_tx, active_rx) = oneshot::channel();
@@ -557,9 +557,7 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
             let features = initialize(&connection).await?;
             let open_workspace = expected_workspace.as_path();
             let route = SessionRouteConfiguration {
-                model_id: command_model(&adapter_link.route)
-                    .expect("Store route carries a scripted model")
-                    .to_owned(),
+                model_id: command_model(&adapter_link.route).map(str::to_owned),
                 effort: command_effort(&adapter_link.route).map(str::to_owned),
                 mode: command_mode(&adapter_link.route).map(str::to_owned),
             };
@@ -671,7 +669,9 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
             adapter_journal
                 .record_command(&dispatch_command)
                 .map_err(to_acp_error)?;
-            let prepared = acp_prompt::prepare(&dispatch_command).map_err(to_acp_error)?;
+            let prepared =
+                acp_prompt::prepare(&dispatch_command, adapter_link.profile.model_optional())
+                    .map_err(to_acp_error)?;
             assert!(prepared.envelope.prompt.starts_with(DISPATCH_TEXT));
             assert!(prepared.envelope.prompt.contains("ELIOT Task identity v1:"));
             let active_prompt = ActivePrompt {
@@ -705,7 +705,7 @@ async fn pr44_acp_runtime_ipc_loss_keeps_the_admitted_prompt_and_client()
                 features: &features,
                 session: &mut session,
                 workspace: Some(open_workspace),
-                model: &route.model_id,
+                model: route.model_id.as_deref(),
                 capture: &adapter_capture,
                 permissions: &permissions,
                 permission_wakeup: &permission_wakeup,

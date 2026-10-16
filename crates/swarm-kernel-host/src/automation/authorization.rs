@@ -1711,26 +1711,39 @@ pub(crate) fn operation_link(
     db: &Connection,
     operation_id: &str,
 ) -> Result<Option<OnBehalfOperationLink>> {
-    operation_link_inner(db, operation_id, None)
+    operation_link_inner(db, operation_id, None, false)
+}
+
+/// Read a validated ScriptRun link for idempotent replay. Historical event
+/// causes may omit a Task scope that the retained proof reconstructs; this
+/// returns that exact in-memory projection while leaving the stored link bytes
+/// untouched. Callers must validate current manager, entry and source authority
+/// separately; this readback is not an authorization grant.
+pub(crate) fn script_run_operation_link_for_replay(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<OnBehalfOperationLink>> {
+    operation_link_inner(db, operation_id, None, true)
 }
 
 fn operation_link_for_existing(
     db: &Connection,
     retained: &ExistingAutomaticOperation,
 ) -> Result<Option<OnBehalfOperationLink>> {
-    operation_link_inner(db, &retained.operation_id, Some(retained))
+    operation_link_inner(db, &retained.operation_id, Some(retained), false)
 }
 
 fn operation_link_inner(
     db: &Connection,
     operation_id: &str,
     retained_operation: Option<&ExistingAutomaticOperation>,
+    project_script_run_event_scope: bool,
 ) -> Result<Option<OnBehalfOperationLink>> {
     let key = config::operation_link_key(operation_id)?;
     let Some(value) = config::read_record(db, &key, "on-behalf operation link")? else {
         return Ok(None);
     };
-    let link: OnBehalfOperationLink = serde_json::from_value(value).map_err(|_| {
+    let mut link: OnBehalfOperationLink = serde_json::from_value(value).map_err(|_| {
         Error::new(
             "AUTOMATION_LINK_CORRUPT",
             "on-behalf operation link fields are invalid",
@@ -1835,6 +1848,11 @@ fn operation_link_inner(
         && link.cause["kind"] == "goal_progression"
     {
         crate::store::automation_goal_progression::validate_operation_link(db, &link)?;
+    } else if link.action == "script.run" && link.cause["kind"] == "system_event" {
+        let reconstructed_cause = validate_script_event_run_operation_link(db, &link)?;
+        if project_script_run_event_scope {
+            link.cause = reconstructed_cause;
+        }
     } else if link.action == "script.run" {
         validate_script_run_operation_link(db, &link)?;
     } else if link.action == "message.send" {
@@ -2761,7 +2779,7 @@ fn validate_script_run_operation_link(db: &Connection, link: &OnBehalfOperationL
     };
     let cause = &link.cause;
     if cause["kind"] == "system_event" {
-        return validate_script_event_run_operation_link(db, link);
+        return validate_script_event_run_operation_link(db, link).map(|_| ());
     }
     let observation_id = cause["observation_id"]
         .as_i64()
@@ -2920,7 +2938,7 @@ fn validate_script_run_operation_link(db: &Connection, link: &OnBehalfOperationL
 fn validate_script_event_run_operation_link(
     db: &Connection,
     link: &OnBehalfOperationLink,
-) -> Result<()> {
+) -> Result<Value> {
     let corrupt = || {
         Error::new(
             "AUTOMATION_LINK_CORRUPT",
@@ -3022,15 +3040,49 @@ fn validate_script_event_run_operation_link(
         "semantic_cause_id":semantic_event_id,
         "cause":cause
     });
-    let task_id = cause["task_id"].as_str();
-    let task_revision = cause["task_revision"].as_i64();
-    let attempt_id = cause["attempt_id"].as_str();
-    let task_scope_valid = match (task_id, task_revision, attempt_id) {
-        (None, None, None) => true,
-        (Some(task_id), Some(task_revision), Some(attempt_id)) => {
-            !task_id.is_empty() && task_revision > 0 && !attempt_id.is_empty()
+    // The source reader above validated this cause against the immutable event
+    // proof. An all-null legacy tuple is omitted only when that proof itself
+    // reconstructs a complete Task scope or confirms a genuinely taskless event.
+    let cause_scope = (
+        cause["task_id"].as_str().map(str::to_owned),
+        cause["task_revision"].as_i64(),
+        cause["attempt_id"].as_str().map(str::to_owned),
+    );
+    let proof_scope = (
+        input["task_id"].as_str().map(str::to_owned),
+        input["task_revision"].as_i64(),
+        input["attempt_id"].as_str().map(str::to_owned),
+    );
+    let cause_scope_omitted =
+        cause_scope.0.is_none() && cause_scope.1.is_none() && cause_scope.2.is_none();
+    let (task_id, task_revision, attempt_id) = match (&cause_scope, &proof_scope) {
+        ((None, None, None), (None, None, None)) => (None, None, None),
+        ((None, None, None), (Some(task_id), Some(task_revision), Some(attempt_id)))
+            if !task_id.is_empty() && *task_revision > 0 && !attempt_id.is_empty() =>
+        {
+            (
+                Some(task_id.as_str()),
+                Some(*task_revision),
+                Some(attempt_id.as_str()),
+            )
         }
-        _ => false,
+        (
+            (Some(task_id), Some(task_revision), Some(attempt_id)),
+            (Some(proof_task_id), Some(proof_task_revision), Some(proof_attempt_id)),
+        ) if !task_id.is_empty()
+            && *task_revision > 0
+            && !attempt_id.is_empty()
+            && task_id == proof_task_id
+            && task_revision == proof_task_revision
+            && attempt_id == proof_attempt_id =>
+        {
+            (
+                Some(task_id.as_str()),
+                Some(*task_revision),
+                Some(attempt_id.as_str()),
+            )
+        }
+        _ => return Err(corrupt()),
     };
     let expected_capabilities = if task_id.is_some() {
         spec["capabilities"].clone()
@@ -3064,12 +3116,17 @@ fn validate_script_event_run_operation_link(
         || spec["invocation"]["effective_manager_id"] != link.effective_manager_id
         || spec["automation_on_behalf"] != expected_linkage
         || spec["capabilities"] != expected_capabilities
-        || !task_scope_valid
         || task_id.is_none() && spec["capabilities"] != json!([])
     {
         return Err(corrupt());
     }
-    Ok(())
+    let mut replay_cause = cause.clone();
+    if cause_scope_omitted && task_id.is_some() {
+        replay_cause["task_id"] = json!(task_id);
+        replay_cause["task_revision"] = json!(task_revision);
+        replay_cause["attempt_id"] = json!(attempt_id);
+    }
+    Ok(replay_cause)
 }
 
 fn validate_cron_check_run_link(db: &Connection, link: &OnBehalfOperationLink) -> Result<()> {

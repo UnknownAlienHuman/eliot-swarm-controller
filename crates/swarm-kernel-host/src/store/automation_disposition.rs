@@ -104,6 +104,20 @@ pub(super) fn consume_review_result_for_entry(
             "the exact Task is outside this automation entry project",
         ));
     }
+    if result["verdict"] == "changes_requested"
+        && !reviews::current_actionable_review_result_matches(
+            tx,
+            &review.identity,
+            review_assignment_id,
+            review_result_operation_id,
+        )?
+    {
+        return Ok(skipped(
+            &review,
+            "historical_review_result",
+            "a replacement assignment now owns the current actionable review slot",
+        ));
+    }
     let acceptance_selected = entry.steps.contains(&AutomationStep::Acceptance);
     let disposition_selected = entry.steps.contains(&AutomationStep::ReviewDisposition);
     let repair_selected = entry.steps.contains(&AutomationStep::RepairDispatch);
