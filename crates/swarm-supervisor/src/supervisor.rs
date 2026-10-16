@@ -3,7 +3,10 @@ use crate::{
     LaunchValue, LifecycleOwnership, ModuleDescriptor, ModuleEffectCertainty, ModuleFailureStage,
     ModuleOwnerExecutable, ProtectedResolver, ProtectedResolverContext, ProtocolRange,
     ProtocolVersion, ServiceScope, SupervisorControlClient,
-    descriptor::{validate_environment_name, validate_identifier, validate_launch_value},
+    descriptor::{
+        extend_descriptor_catalog, validate_environment_name, validate_identifier,
+        validate_launch_value,
+    },
     module_link::module_contract_claim,
 };
 use serde::{Deserialize, Serialize};
@@ -400,6 +403,7 @@ impl Hash for RegistryKey {
 /// constructs a new fingerprinted slot; existing slots keep their old artifact.
 pub struct SupervisorRegistry {
     catalog: RwLock<Arc<DescriptorCatalog>>,
+    catalog_update: AsyncMutex<()>,
     state_root: PathBuf,
     ipc_root: PathBuf,
     supervisor_credential: Credential,
@@ -490,6 +494,7 @@ impl SupervisorRegistry {
         };
         Ok(Self {
             catalog: RwLock::new(Arc::new(catalog)),
+            catalog_update: AsyncMutex::new(()),
             state_root,
             ipc_root,
             supervisor_credential,
@@ -513,12 +518,35 @@ impl SupervisorRegistry {
         *write_lock(&self.catalog) = Arc::new(catalog);
     }
 
-    /// Register one already-installed descriptor through the dedicated
-    /// ModuleSupervisor credential. Descriptor registration is a Store
-    /// metadata mutation and starts no process. The local descriptor must be
-    /// present in this trusted catalog and its executable bytes must match
-    /// the installer-provided digest before the request is sent.
+    /// Register one descriptor already present in the published catalog.
     pub async fn register_descriptor(&self, descriptor: &ModuleDescriptor) -> Result<Value> {
+        let _update = self.catalog_update.lock().await;
+        let catalog = read_lock(&self.catalog).clone();
+        self.register_descriptor_against(descriptor, &catalog).await
+    }
+
+    /// Serialize a live install, stage the current catalog plus the immutable
+    /// new artifact, durably register it, then expose it to future admissions.
+    pub async fn register_installed_descriptor(
+        &self,
+        descriptor: &ModuleDescriptor,
+    ) -> Result<Value> {
+        let _update = self.catalog_update.lock().await;
+        let current = read_lock(&self.catalog).clone();
+        let candidate = extend_descriptor_catalog(&current, descriptor.clone())?;
+        let response = self
+            .register_descriptor_against(descriptor, &candidate)
+            .await?;
+        // The Store receipt is validated before the candidate becomes visible.
+        self.replace_catalog(candidate);
+        Ok(response)
+    }
+
+    async fn register_descriptor_against(
+        &self,
+        descriptor: &ModuleDescriptor,
+        catalog: &DescriptorCatalog,
+    ) -> Result<Value> {
         descriptor
             .validate()
             .map_err(|error| Error::new("MODULE_DESCRIPTOR_INVALID", error.to_string()))?;
@@ -532,8 +560,18 @@ impl SupervisorRegistry {
                     "descriptor registration requires the installed executable SHA-256",
                 )
             })?;
-        let path = fs::canonicalize(&descriptor.launch.executable)?;
-        let actual_hash = hash_file_sha256(&path)?;
+        let path = fs::canonicalize(&descriptor.launch.executable).map_err(|_| {
+            Error::new(
+                "MODULE_ARTIFACT_UNAVAILABLE",
+                "installed executable is unavailable at its validated path",
+            )
+        })?;
+        let actual_hash = hash_file_sha256(&path).map_err(|_| {
+            Error::new(
+                "MODULE_ARTIFACT_UNAVAILABLE",
+                "installed executable could not be hashed",
+            )
+        })?;
         if !actual_hash.eq_ignore_ascii_case(expected_hash.as_str()) {
             return Err(Error::new(
                 "MODULE_ARTIFACT_MISMATCH",
@@ -546,14 +584,13 @@ impl SupervisorRegistry {
             descriptor.artifact.version.clone(),
             Some(expected_hash.clone()),
         );
-        let catalog = read_lock(&self.catalog).clone();
         let selected = catalog
             .select_exact(&selector, descriptor.protocol, &descriptor.capabilities)
             .map_err(|error| Error::new("MODULE_SELECTION", error.to_string()))?;
         if selected != descriptor {
             return Err(Error::new(
                 "MODULE_DESCRIPTOR_UNTRUSTED",
-                "descriptor does not exactly match the host's validated catalog entry",
+                "descriptor does not exactly match the staged catalog entry",
             ));
         }
 

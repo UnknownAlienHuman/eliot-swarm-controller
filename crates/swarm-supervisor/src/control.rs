@@ -18,6 +18,8 @@ use swarm_contracts::{
 };
 
 const MODULE_DESCRIPTOR_REGISTER: &str = "module.descriptor.register";
+const SUPERVISOR_INSTALL_REQUESTS: &str = "module.supervisor.install.requests";
+const SUPERVISOR_INSTALL_COMPLETE: &str = "module.supervisor.install.complete";
 const SUPERVISOR_ADMISSION: &str = "module.supervisor.admission";
 const SUPERVISOR_DEMAND_PAGE: &str = "module.supervisor.demand.page";
 const SUPERVISOR_SCOPE_READBACK: &str = "module.supervisor.scope.readback";
@@ -79,6 +81,90 @@ pub struct ModuleDemandBlock {
     pub descriptor: Option<ModuleDescriptor>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstalledDescriptorRequestState {
+    Queued,
+    Installed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledDescriptorRequestRecord {
+    pub operation_id: String,
+    pub descriptor_file: PathBuf,
+    pub state: InstalledDescriptorRequestState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledDescriptorRequestPage {
+    pub requests: Vec<InstalledDescriptorRequestRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstalledDescriptorCompletionOutcome {
+    Installed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DescriptorRegistrationReceipt {
+    pub registered: bool,
+    pub unchanged: bool,
+    pub catalog_revision: u64,
+    pub module_id: ModuleId,
+    pub artifact: swarm_contracts::module_catalog::ArtifactIdentity,
+    pub registered_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteInstalledDescriptorRequest {
+    pub operation_id: String,
+    pub outcome: InstalledDescriptorCompletionOutcome,
+    #[serde(default)]
+    pub registration: Option<DescriptorRegistrationReceipt>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstalledDescriptorOperationOutcome {
+    Installed,
+    Unchanged,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstalledDescriptorOperationState {
+    Settled,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledDescriptorCompletionReceipt {
+    pub operation_id: String,
+    pub state: InstalledDescriptorOperationState,
+    pub outcome: InstalledDescriptorOperationOutcome,
+    #[serde(default)]
+    pub module_id: Option<ModuleId>,
+    #[serde(default)]
+    pub artifact: Option<swarm_contracts::module_catalog::ArtifactIdentity>,
+    #[serde(default)]
+    pub catalog_revision: Option<u64>,
+    #[serde(default)]
+    pub registered: Option<bool>,
+    #[serde(default)]
+    pub unchanged: Option<bool>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleDemandPage {
@@ -414,6 +500,25 @@ impl SupervisorControlClient {
             credential,
             ipc,
         })
+    }
+
+    pub async fn install_requests(
+        &self,
+        include_installed: bool,
+    ) -> Result<InstalledDescriptorRequestPage> {
+        self.request(
+            SUPERVISOR_INSTALL_REQUESTS,
+            json!({"include_installed": include_installed}),
+        )
+        .await
+    }
+
+    pub async fn complete_install_request(
+        &self,
+        request: &CompleteInstalledDescriptorRequest,
+    ) -> Result<InstalledDescriptorCompletionReceipt> {
+        self.request(SUPERVISOR_INSTALL_COMPLETE, serde_json::to_value(request)?)
+            .await
     }
 
     pub async fn register_descriptor(&self, descriptor: &ModuleDescriptor) -> Result<Value> {

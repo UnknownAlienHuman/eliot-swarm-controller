@@ -24,8 +24,8 @@ use swarm_process::{
     process_birth_identity, process_image_identity,
 };
 use swarm_supervisor::control::{
-    SupervisorChildExit, SupervisorChildExitCategory, SupervisorChildHealth,
-    SupervisorChildProcessIdentity, SupervisorChildStopState,
+    InstalledDescriptorRequestState, SupervisorChildExit, SupervisorChildExitCategory,
+    SupervisorChildHealth, SupervisorChildProcessIdentity, SupervisorChildStopState,
 };
 use swarm_supervisor::{
     ModuleOwnerExecutable, StandaloneRouteConfigMapper, StandaloneSupervisorConfig,
@@ -332,7 +332,7 @@ const SUPERVISOR_SPAWN_PENDING: &str = "MODULE_SUPERVISOR_SPAWN_PENDING";
 async fn run_supervisor_process_loop(
     store: Store,
     control: SupervisorControlClient,
-    bootstrap: SupervisorBootstrap,
+    mut bootstrap: SupervisorBootstrap,
     stopping: watch::Receiver<bool>,
     shutdown_custody: ShutdownCustody,
 ) -> Result<()> {
@@ -452,6 +452,56 @@ async fn run_supervisor_process_loop(
             }
         };
 
+        let retained = match control.install_requests(true).await {
+            Ok(page) => page,
+            Err(error) => {
+                failures = failures.saturating_add(1).min(32);
+                if let Err(health_error) = record_module_actor_status(
+                    &store,
+                    "isolated",
+                    failures,
+                    Some(&error.code),
+                    Some(MODULE_ACTOR_ISOLATED_RETRY),
+                )
+                .await
+                {
+                    return Err(error.with_secondary_error(health_error));
+                }
+                if !wait_for_supervisor_retry(
+                    MODULE_ACTOR_ISOLATED_RETRY,
+                    &mut demand_changes,
+                    &mut stopping,
+                )
+                .await
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let retained_paths = retained
+            .requests
+            .into_iter()
+            .filter(|request| request.state == InstalledDescriptorRequestState::Installed)
+            .map(|request| request.descriptor_file);
+        if let Err(error) = bootstrap
+            .config
+            .append_retained_descriptor_files(retained_paths)
+        {
+            let error = module_error(error);
+            if let Err(health_error) = record_module_actor_status(
+                &store,
+                "isolated",
+                failures.saturating_add(1).min(32),
+                Some(&error.code),
+                Some(MODULE_ACTOR_ISOLATED_RETRY),
+            )
+            .await
+            {
+                return Err(error.with_secondary_error(health_error));
+            }
+            return Err(error);
+        }
         // The host alone chooses and durably admits the next actor UUID. This
         // happens only after exact prior-child reconciliation and before the
         // final child bootstrap frame is constructed.
@@ -761,6 +811,9 @@ async fn wait_for_supervisor_retry(
 }
 
 async fn module_supervisor_has_demand(store: &Store) -> Result<bool> {
+    if store.has_pending_descriptor_install().await? {
+        return Ok(true);
+    }
     let mut cursor = None;
     for _ in 0..SUPERVISOR_DEMAND_PAGE_LIMIT {
         let page = store.module_demand_snapshot(cursor).await?;

@@ -707,6 +707,27 @@ pub fn validate_mutation(method: &str, params: &Value) -> Result<()> {
             crate::goals::validate_mutation(method, params)?;
             return Ok(());
         }
+        "module.descriptor.install" => {
+            let request: swarm_contracts::module_catalog::ModuleDescriptorInstallRequest =
+                serde_json::from_value(params.clone())
+                    .map_err(|_| Error::invalid("descriptor install request is malformed"))?;
+            let descriptor_path = request.descriptor_file.as_os_str().to_string_lossy();
+            if request.client_request_id.is_empty()
+                || request.client_request_id.len() > 128
+                || request
+                    .client_request_id
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+                || !request.descriptor_file.is_absolute()
+                || descriptor_path.len() > 1024
+                || descriptor_path.chars().any(char::is_control)
+            {
+                return Err(Error::invalid(
+                    "descriptor install request needs a bounded ID and absolute local path",
+                ));
+            }
+            return Ok(());
+        }
         "forge.publish_ref" => {
             crate::forge::PublishRefRequest::parse(params)?;
             return Ok(());

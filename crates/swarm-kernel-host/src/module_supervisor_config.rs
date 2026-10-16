@@ -25,6 +25,8 @@ pub enum ModuleRouteConfigMapper {
 pub struct ModuleSupervisorConfig {
     pub enabled: bool,
     pub install_root: Option<PathBuf>,
+    /// Explicit configured seeds. The host extends each child bootstrap from
+    /// successful descriptor install Operations before a supervisor restart.
     pub descriptor_files: Vec<PathBuf>,
     pub owner_helper: Option<PathBuf>,
     pub owner_helper_sha256: Option<String>,

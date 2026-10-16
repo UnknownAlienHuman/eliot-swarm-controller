@@ -641,6 +641,31 @@ pub(crate) fn validate_launch_value(value: &LaunchValue) -> Result<()> {
     }
 }
 
+/// Add one exact installed version without replacing any retained artifact.
+/// Repeating the identical identity is idempotent; a changed descriptor for an
+/// existing identity is rejected before it can become a candidate catalog.
+pub fn extend_descriptor_catalog(
+    current: &DescriptorCatalog,
+    descriptor: ModuleDescriptor,
+) -> Result<DescriptorCatalog> {
+    if let Some(existing) = current.descriptors().iter().find(|existing| {
+        existing.module_id == descriptor.module_id
+            && existing.artifact.artifact_id == descriptor.artifact.artifact_id
+            && existing.artifact.version == descriptor.artifact.version
+    }) {
+        if existing != &descriptor {
+            return Err(Error::new(
+                "MODULE_DESCRIPTOR_IMMUTABLE",
+                "an installed artifact identity cannot be replaced",
+            ));
+        }
+        return Ok(current.clone());
+    }
+    let mut descriptors = current.descriptors().to_vec();
+    descriptors.push(descriptor);
+    DescriptorCatalog::from_descriptors(descriptors)
+        .map_err(|error| Error::new("MODULE_CATALOG_INVALID", error.to_string()))
+}
 #[cfg(test)]
 mod installed_descriptor_tests {
     use super::*;
@@ -704,6 +729,26 @@ mod installed_descriptor_tests {
         }
     }
 
+    #[test]
+    fn candidate_catalog_keeps_old_version_and_adds_immutable_new_version() {
+        let fixture = Fixture::new();
+        let v1 = load_installed_descriptor(&fixture.descriptor, &fixture.root).unwrap();
+        let mut v2 = v1.clone();
+        v2.artifact.version =
+            swarm_contracts::module_catalog::ArtifactVersion::new("9.9.9").unwrap();
+        let initial = DescriptorCatalog::from_descriptors([v1.clone()]).unwrap();
+
+        let candidate = extend_descriptor_catalog(&initial, v2.clone()).unwrap();
+        assert_eq!(candidate.descriptors().len(), 2);
+        assert!(candidate.descriptors().contains(&v1));
+        assert!(candidate.descriptors().contains(&v2));
+        assert_eq!(
+            extend_descriptor_catalog(&candidate, v2)
+                .unwrap()
+                .descriptors(),
+            candidate.descriptors(),
+        );
+    }
     #[test]
     fn installed_descriptor_accepts_path_spellings_and_rejects_changed_bytes() {
         let fixture = Fixture::new();

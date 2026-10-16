@@ -129,7 +129,7 @@ const fn mutation(
 /// classification plus the CLI's
 /// request-ID treatment (`agent.result` and `host.mode` are mutations).
 pub static TOOLS: &[(bool, ToolSpec)] = &TOOL_ITEMS;
-static TOOL_ITEMS: [(bool, ToolSpec); 160] = [
+static TOOL_ITEMS: [(bool, ToolSpec); 161] = [
     // Read-only methods.
     read(
         "swarm.tools.search",
@@ -1368,6 +1368,12 @@ static TOOL_ITEMS: [(bool, ToolSpec); 160] = [
             "version",
             "expected_catalog_revision",
         ],
+    ),
+    mutation(
+        "module.descriptor.install",
+        "Operator only: submit one already-installed descriptor file for supervisor validation and Store registration. The returned durable Operation does not select a route or start a worker; the supervisor settles it.",
+        &[f("client_request_id", S), f("descriptor_file", S)],
+        &["client_request_id", "descriptor_file"],
     ),
     mutation(
         "client.register",

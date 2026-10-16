@@ -6,7 +6,13 @@
 //! Store handle, database connection, controller object, or host IPC listener
 //! never crosses into this crate.
 
-use crate::control::ObservationDeliveryDisposition;
+use crate::control::{
+    CompleteInstalledDescriptorRequest, DescriptorRegistrationReceipt,
+    InstalledDescriptorCompletionOutcome, InstalledDescriptorOperationOutcome,
+    InstalledDescriptorOperationState, InstalledDescriptorRequestState,
+    ObservationDeliveryDisposition,
+};
+use crate::descriptor::extend_descriptor_catalog;
 use crate::{
     AdmissionState, BindingLaunchConfig, BindingMapPublication, CapabilityId, DemandCause,
     DemandLease, DescriptorCatalog, KernelFault, LaunchValue, ModuleBindingCredential,
@@ -41,7 +47,7 @@ const STARTUP_ATTEMPTS: usize = 60;
 const STARTUP_RETRY: Duration = Duration::from_millis(100);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_BOOTSTRAP_BYTES: usize = 65_536;
-const MAX_DESCRIPTOR_FILES: usize = 256;
+const MAX_DESCRIPTOR_FILES: usize = 512;
 const MAX_PROTECTED_FILES: usize = 128;
 const MAX_LAUNCH_CONFIGS: usize = 256;
 const MAX_STATUS_QUEUE: usize = 1_024;
@@ -170,6 +176,32 @@ pub enum StandaloneRouteConfigMapper {
 }
 
 impl StandaloneSupervisorConfig {
+    /// Add retained Operator-installed descriptor files to this child bootstrap.
+    /// The host obtains these explicit paths from completed durable Operations.
+    pub fn append_retained_descriptor_files(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<()> {
+        let mut staged = self.descriptor_files.clone();
+        let mut seen = staged.iter().cloned().collect::<BTreeSet<_>>();
+        for path in paths {
+            if !path.is_absolute() {
+                return Err(Error::invalid("retained descriptor path must be absolute"));
+            }
+            if seen.insert(path.clone()) {
+                staged.push(path);
+            }
+        }
+        if staged.len() > MAX_DESCRIPTOR_FILES {
+            return Err(Error::new(
+                "MODULE_DESCRIPTOR_LIMIT",
+                "retained descriptor bootstrap exceeds its bounded file count",
+            ));
+        }
+        self.descriptor_files = staged;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(Error::invalid(
@@ -965,19 +997,18 @@ impl StandaloneSupervisor {
         }
         create_private_directory(&config.state_root)?;
         create_private_directory(&config.resolver_root)?;
-        let mut descriptors = Vec::with_capacity(config.descriptor_files.len());
+        let mut catalog = DescriptorCatalog::default();
         for path in &config.descriptor_files {
-            descriptors.push(
+            let descriptor =
                 load_installed_descriptor(path, &config.install_root).map_err(|error| {
                     Error::new(
                         "MODULE_DESCRIPTOR_UNAVAILABLE",
                         format!("descriptor load failed: {}", error.code),
                     )
-                })?,
-            );
+                })?;
+            catalog = extend_descriptor_catalog(&catalog, descriptor)
+                .map_err(|error| Error::new("MODULE_CATALOG_INVALID", error.to_string()))?;
         }
-        let catalog = DescriptorCatalog::from_descriptors(descriptors)
-            .map_err(|error| Error::new("MODULE_CATALOG_INVALID", error.to_string()))?;
         let control = SupervisorControlClient::new(
             config.root.clone(),
             config.supervisor_credential.clone(),
@@ -1064,6 +1095,18 @@ impl StandaloneSupervisor {
                                 recovered = false;
                                 cycle_error = Some(error.code.clone());
                                 eprintln!("module supervisor demand readback: {}", error.code);
+                            }
+                        }
+                    }
+                    if recovered {
+                        match self.reconcile_install_requests().await {
+                            Ok(found) => saw_demand |= found,
+                            Err(error) => {
+                                self.registry
+                                    .close_durable_admission(KernelFault::StoreUnavailable);
+                                recovered = false;
+                                cycle_error = Some(error.code.clone());
+                                eprintln!("module supervisor install handoff: {}", error.code);
                             }
                         }
                     }
@@ -1219,6 +1262,95 @@ impl StandaloneSupervisor {
             .map_err(module_error)
     }
 
+    async fn reconcile_install_requests(&self) -> Result<bool> {
+        let page = self.control.install_requests(false).await?;
+        if page.requests.len() > 1 {
+            return Err(Error::new(
+                "MODULE_INSTALL_REQUEST_LIMIT",
+                "Store returned more than one pending descriptor installation",
+            ));
+        }
+        let Some(request) = page.requests.into_iter().next() else {
+            return Ok(false);
+        };
+        if request.state != InstalledDescriptorRequestState::Queued {
+            return Err(Error::new(
+                "MODULE_INSTALL_REQUEST_INVALID",
+                "pending descriptor request has a non-queued state",
+            ));
+        }
+
+        let descriptor =
+            match load_installed_descriptor(&request.descriptor_file, &self.config.install_root) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    self.reject_install_request(&request.operation_id, &error.code)
+                        .await?;
+                    return Ok(true);
+                }
+            };
+        let registration = match self
+            .registry
+            .register_installed_descriptor(&descriptor)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) if permanent_install_error(&error.code) => {
+                self.reject_install_request(&request.operation_id, &error.code)
+                    .await?;
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
+        let registration: DescriptorRegistrationReceipt = serde_json::from_value(registration)
+            .map_err(|_| {
+                Error::new(
+                    "MODULE_SUPERVISOR_RESPONSE_INVALID",
+                    "Store registration receipt did not match its typed shape",
+                )
+            })?;
+        let completion = CompleteInstalledDescriptorRequest {
+            operation_id: request.operation_id.clone(),
+            outcome: InstalledDescriptorCompletionOutcome::Installed,
+            registration: Some(registration),
+            error_code: None,
+        };
+        let receipt = self.control.complete_install_request(&completion).await?;
+        if receipt.operation_id != request.operation_id
+            || receipt.state != InstalledDescriptorOperationState::Settled
+            || !matches!(
+                receipt.outcome,
+                InstalledDescriptorOperationOutcome::Installed
+                    | InstalledDescriptorOperationOutcome::Unchanged
+            )
+        {
+            return Err(Error::new(
+                "MODULE_SUPERVISOR_RESPONSE_INVALID",
+                "Store did not settle the exact installed descriptor Operation",
+            ));
+        }
+        Ok(true)
+    }
+
+    async fn reject_install_request(&self, operation_id: &str, error_code: &str) -> Result<()> {
+        let completion = CompleteInstalledDescriptorRequest {
+            operation_id: operation_id.to_owned(),
+            outcome: InstalledDescriptorCompletionOutcome::Rejected,
+            registration: None,
+            error_code: Some(safe_install_error_code(error_code)),
+        };
+        let receipt = self.control.complete_install_request(&completion).await?;
+        if receipt.operation_id != operation_id
+            || receipt.state != InstalledDescriptorOperationState::Rejected
+            || receipt.outcome != InstalledDescriptorOperationOutcome::Rejected
+        {
+            return Err(Error::new(
+                "MODULE_SUPERVISOR_RESPONSE_INVALID",
+                "Store did not reject the exact descriptor Operation",
+            ));
+        }
+        Ok(())
+    }
     async fn reconcile_demands(
         &self,
         held: &mut HashMap<DemandKey, DemandLease>,
@@ -1744,6 +1876,34 @@ async fn await_host_admission(
     }))
 }
 
+fn safe_install_error_code(code: &str) -> String {
+    if !code.is_empty()
+        && code.len() <= 128
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        code.to_owned()
+    } else {
+        "MODULE_INSTALL_REJECTED".to_owned()
+    }
+}
+
+fn permanent_install_error(code: &str) -> bool {
+    matches!(
+        code,
+        "MODULE_DESCRIPTOR_INVALID"
+            | "MODULE_DESCRIPTOR_IMMUTABLE"
+            | "MODULE_DESCRIPTOR_UNTRUSTED"
+            | "MODULE_ARTIFACT_DIGEST_REQUIRED"
+            | "MODULE_ARTIFACT_MISMATCH"
+            | "MODULE_ARTIFACT_UNAVAILABLE"
+            | "MODULE_SELECTION"
+            | "MODULE_CATALOG_INVALID"
+            | "MODULE_CATALOG_FULL"
+            | "MODULE_DESCRIPTOR_REGISTER_RESPONSE"
+    )
+}
 fn demand_key(demand: &ModuleDemandRecord) -> DemandKey {
     DemandKey {
         module_id: demand.module_id.clone(),

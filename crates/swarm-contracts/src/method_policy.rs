@@ -649,6 +649,12 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
         participant: ParticipantAccess::None,
     },
     MethodPolicy {
+        method: "module.descriptor.install",
+        class: MethodClass::Mutation,
+        mcp: true,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "client.register",
         class: MethodClass::Mutation,
         mcp: true,
@@ -1118,6 +1124,18 @@ pub const METHOD_REGISTRY: &[MethodPolicy] = &[
     },
     MethodPolicy {
         method: "module.descriptor.register",
+        class: MethodClass::Internal,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "module.supervisor.install.requests",
+        class: MethodClass::Internal,
+        mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
+        method: "module.supervisor.install.complete",
         class: MethodClass::Internal,
         mcp: false,
         participant: ParticipantAccess::None,
