@@ -1728,7 +1728,9 @@ mod tests {
                 "fixture":"Issue153 damaged CheckRun"
             }),
         };
-        crate::artifacts::ArtifactFiles::new(&fixture.directory.0)
+        let artifact_state_root = fs::canonicalize(&fixture.directory.0)
+            .expect("resolve the same canonical state root used by the Store");
+        crate::artifacts::ArtifactFiles::new(&artifact_state_root)
             .expect("open the real artifact store for the CheckRun fixture")
             .publish(&candidate_artifact, candidate_bytes)
             .expect("publish the candidate artifact used by the CheckRun fixture");
