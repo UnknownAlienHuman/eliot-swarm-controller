@@ -3870,13 +3870,13 @@ impl Service {
                 "departure owner envelope is invalid",
             ));
         }
-        if let Some(expected_helper) = helper {
-            if !same_process_identity(&receipt.owner_helper, expected_helper) {
-                return Err(Error::new(
-                    "MODULE_OWNER_DEPARTURE_MISMATCH",
-                    "departure helper image does not match the prior helper",
-                ));
-            }
+        if let Some(expected_helper) = helper
+            && !same_process_identity(&receipt.owner_helper, expected_helper)
+        {
+            return Err(Error::new(
+                "MODULE_OWNER_DEPARTURE_MISMATCH",
+                "departure helper image does not match the prior helper",
+            ));
         }
         Ok(Some(receipt))
     }
@@ -5160,7 +5160,18 @@ mod tests {
                     "MODULE_WORKER_EXITED",
                 )
                 .await;
+            self.service().remember_owner_family_query(
+                &self.owner_receipt["process"],
+                self.owner_receipt["token"].as_str().unwrap(),
+            );
             self.release();
+            {
+                let mut custody = self.service().helper_child_custody.lock().await;
+                let retained = custody
+                    .as_mut()
+                    .expect("exact owner Child remains retained");
+                assert_eq!(retained.child.wait().await.unwrap().code(), Some(23));
+            }
             self.service()
                 .reconcile_retained_helper_child()
                 .await
