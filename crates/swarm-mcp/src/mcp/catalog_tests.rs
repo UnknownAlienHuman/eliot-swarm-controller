@@ -479,6 +479,7 @@ fn catalog_v1_historical_unchanged_rows_and_current_schema_parity() {
         "coordination.thread.list",
         "coordination.watch.list",
         "coordination.work_card.list",
+        "module.descriptor.install",
         "report.delta",
         "review.submit",
         "runtime.catalog",
@@ -554,7 +555,7 @@ fn catalog_v1_historical_unchanged_rows_and_current_schema_parity() {
     );
     assert_eq!(
         deltas.iter().filter(|row| row["state"] == "added").count(),
-        5,
+        6,
         "only the retained additions are excluded from historical parity"
     );
 
