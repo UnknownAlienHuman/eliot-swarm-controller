@@ -3596,6 +3596,33 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn forge_owner_receipt_requires_exact_live_image_claims() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "store::forge::tests::forge_owner_receipt_image_claims_child",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Forge owner fixture failed: {:?}; stdout={}; stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("FORGE_OWNER_IMAGE_CLAIMS_ASSERTIONS_COMPLETE"),
+            "isolated fixture must finish every receipt assertion"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "isolated process-wide Job/group fixture invoked by the parent test"]
+    fn forge_owner_receipt_image_claims_child() {
         let token = model::new_id();
         let group = swarm_process::Group::enter_module(&token).unwrap();
         let pid = std::process::id();
@@ -3657,6 +3684,7 @@ mod tests {
         // Receipt serialization must preserve the exact restart image claims.
         let restored: Value = serde_json::from_slice(&serde_json::to_vec(&owner).unwrap()).unwrap();
         validate_worker_owner(&job, pid, &restored).unwrap();
+        println!("FORGE_OWNER_IMAGE_CLAIMS_ASSERTIONS_COMPLETE");
     }
 
     #[cfg(target_os = "linux")]
