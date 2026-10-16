@@ -689,7 +689,8 @@ mod normalized_dispatch_lifecycle_tests {
         );
         tx.commit().unwrap();
 
-        let mut terminal = admitted.clone();
+        let mut terminal: RuntimeOutcome =
+            serde_json::from_value(serde_json::to_value(&admitted).unwrap()).unwrap();
         terminal.outcome = EffectOutcome::Applied;
         terminal.details = json!({"completion_condition":"native_turn_completed",
             "execution_complete":true, "task_completion":"unknown"});
@@ -723,7 +724,8 @@ mod normalized_dispatch_lifecycle_tests {
                 .code,
             "CONFLICT"
         );
-        let mut foreign_root = terminal.clone();
+        let mut foreign_root: RuntimeOutcome =
+            serde_json::from_value(serde_json::to_value(&terminal).unwrap()).unwrap();
         foreign_root.native_root_id = Some("foreign-root".to_owned());
         assert_eq!(
             record_task_dispatch(&tx, &operation, &foreign_root, &admission, None, 7)
