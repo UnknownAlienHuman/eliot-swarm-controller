@@ -2548,7 +2548,7 @@ impl Service {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        swarm_process::module_owner::apply_launch_environment(command.as_std_mut());
+        swarm_process::module_owner::apply_native_launch_environment(command.as_std_mut());
         let child = command.spawn().map_err(|error| {
             Error::new(
                 "MODULE_OWNER_SPAWN_FAILED",

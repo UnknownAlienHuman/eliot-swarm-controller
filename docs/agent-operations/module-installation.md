@@ -2,6 +2,13 @@
 
 This runbook covers the standalone adapter packages, independent frontend binaries, and local observer/check executor settings in the current controller config. It installs adapter executables only. It does not install a provider, native service, model, or vendor CLI, and installation or route selection does not qualify those native systems.
 
+Native harness launches inherit the operator's existing environment and profile
+discovery through the supervisor, module owner and adapter. The controller does
+not require a provider-variable allowlist, copy provider credentials or configure
+provider authentication. Reserved controller environment values are replaced
+with the current binding's scoped values; explicit native invocation overrides
+remain optional.
+
 ## Build and install one adapter
 
 New OpenCode qualification runs use
@@ -35,7 +42,7 @@ Build only the selected package, using a caller-owned shared target directory. T
 | Codex | `swarm-adapter-codex` | `swarm-codex-adapter` | `crates/swarm-adapter-codex/module-descriptor.template.json` |
 | OpenCode | `swarm-adapter-opencode` | `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/registration/descriptor.template.json` |
 | Command | `swarm-adapter-command` | `swarm-adapter-command` | `crates/swarm-adapter-command/module-descriptor.template.json` (version 3; version 2 is retained separately) |
-| Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` (version 4) |
+| Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` (version 6) |
 | Claude | `swarm-adapter-claude` | `swarm-adapter-claude` | `modules/claude-rust/module-descriptor.template.json` |
 
 ```powershell

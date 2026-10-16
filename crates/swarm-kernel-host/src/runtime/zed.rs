@@ -92,8 +92,8 @@ pub struct Options {
     /// built-in default is never accepted implicitly.
     pub model: String,
     pub timeout_seconds: u64,
-    /// Names of host environment variables handed to the child (provider API
-    /// keys). Values are never read into controller state, persisted or logged.
+    /// Retained compatibility metadata. Native launches inherit the operator's
+    /// harness environment without requiring a provider-variable allowlist.
     #[serde(default)]
     pub env_keys: Vec<String>,
 }

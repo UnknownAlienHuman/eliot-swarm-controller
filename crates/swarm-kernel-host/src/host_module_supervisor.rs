@@ -1563,7 +1563,7 @@ async fn spawn_supervisor_child(
     shutdown_custody: &ShutdownCustody,
 ) -> Result<(Child, ChildStdin, SupervisorChildIdentity)> {
     let mut command = Command::new(executable);
-    swarm_process::module_owner::apply_launch_environment(command.as_std_mut());
+    swarm_process::module_owner::apply_native_launch_environment(command.as_std_mut());
     spawn_supervisor_child_with_identity_reader(
         store,
         executable,

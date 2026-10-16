@@ -187,18 +187,8 @@ pub fn run_worker(plan_path: &Path) -> Result<()> {
         .arg(&plan.output_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_writer))
-        .stderr(Stdio::from(stderr_writer))
-        .env_clear();
-    for key in ["PATH", "HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
-    for key in &plan.env_keys {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
+        .stderr(Stdio::from(stderr_writer));
+    swarm_process::module_owner::apply_native_launch_environment(&mut command);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

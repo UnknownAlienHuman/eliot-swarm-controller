@@ -53,8 +53,7 @@ impl NativeHarness {
             .stdout(Stdio::piped())
             // Provider stderr may contain user prompts or local data; it is
             // discarded instead of copied into the adapter or Store logs.
-            .stderr(Stdio::null())
-            .env_clear();
+            .stderr(Stdio::null());
         copy_safe_environment(&mut command, &options);
         let mut child = command.spawn().map_err(|_| {
             Error::new(
@@ -232,27 +231,7 @@ fn ensure_embedded_file(path: &Path, expected: &[u8]) -> Result<()> {
 }
 
 fn copy_safe_environment(command: &mut Command, options: &NativeOptions) {
-    for name in [
-        "SystemRoot",
-        "WINDIR",
-        "ComSpec",
-        "PATH",
-        "PATHEXT",
-        "TEMP",
-        "TMP",
-        "USERPROFILE",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "ProgramData",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "HOME",
-        "TMPDIR",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
+    swarm_process::module_owner::apply_native_launch_environment(command.as_std_mut());
     command.env("CLAUDE_CONFIG_DIR", &options.claude_config_dir);
 }
 

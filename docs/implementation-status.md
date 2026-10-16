@@ -1034,6 +1034,13 @@ performed for this integration.
 
 ### PR #25 scoped child environment — 2026-10-05
 
+Superseded for native harness launches by the owner's 15 October correction:
+native environment and profile discovery now pass through supervisor, owner and
+adapter without a provider-variable allowlist. Inherited controller coordination
+variables are replaced by the current binding's values. The separately scoped
+Forge worker environment remains unchanged. The paragraph below records the
+historical implementation, not current native-launch guidance.
+
 The module-owner wrapper clears the adapter child's inherited environment.
 Windows carries an explicit OS/home/config baseline, then the validated plan's
 literals and protected file references. Arbitrary ambient provider credentials
