@@ -14,10 +14,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use swarm_contracts::{
+    module_catalog::Sha256Digest,
     module_contract::ModuleContractClaim,
     native_mcp::{
-        CODEX_NATIVE_MCP_READBACK_KIND, CODEX_NATIVE_MCP_SERVER_INFO_NAME,
-        CodexNativeMcpCommand, CodexNativeMcpReadback, codex_participant_toolset,
+        CODEX_NATIVE_MCP_READBACK_KIND, CODEX_NATIVE_MCP_SERVER_INFO_NAME, CodexNativeMcpCommand,
+        CodexNativeMcpReadback, codex_participant_toolset,
     },
     runtime::EffectOutcome,
 };
@@ -41,7 +42,7 @@ enum ReadFailure {
 pub(super) async fn observe_operation(
     command: &RuntimeCommand,
     journal: &mut Journal,
-    native: &NativeClient,
+    native: &mut NativeClient,
     claim: &ModuleContractClaim,
     boot_id: &str,
 ) -> Result<super::RuntimeOutcome, AdapterError> {
@@ -77,7 +78,7 @@ pub(super) async fn observe_operation(
         if previous.method != command.method
             || previous.kind != "native_mcp_observe"
             || previous.input_sha256.as_deref()
-                != command.input_sha256.as_ref().map(|digest| digest.as_str())
+                != command.input_sha256.as_deref()
         {
             return Err(AdapterError::HostProtocol);
         }
@@ -100,9 +101,8 @@ pub(super) async fn observe_operation(
         if previous.outcome.is_none()
             && let Some(record) = journal.state.operations.get_mut(&command.operation_id)
         {
-            record.outcome = Some(
-                serde_json::to_value(&result).map_err(|_| AdapterError::Checkpoint)?,
-            );
+            record.outcome =
+                Some(serde_json::to_value(&result).map_err(|_| AdapterError::Checkpoint)?);
             record.state = "outcome_unknown".into();
             journal.save()?;
         }
@@ -193,7 +193,7 @@ fn current_thread_matches(
     request: &CodexNativeMcpCommand,
 ) -> bool {
     let (Some(root), Some(scope), Some(workspace)) = (
-        state.active_root_id(),
+        state.native_root_id.as_deref(),
         state.native_scope_key.as_deref(),
         state.workspace_root.as_deref(),
     ) else {
@@ -215,21 +215,32 @@ fn current_thread_matches(
 }
 
 async fn read_current_thread(
-    native: &NativeClient,
+    native: &mut NativeClient,
     state: &Checkpoint,
     request: &CodexNativeMcpCommand,
 ) -> Result<CodexNativeMcpReadback, ReadFailure> {
-    let identity = native
+    let (reported_product, reported_version) = native
         .server_identity
         .as_ref()
+        .map(|identity| {
+            (
+                identity.reported_product.clone(),
+                identity.reported_version.clone(),
+            )
+        })
         .ok_or(ReadFailure::Rejected("CODEX_NATIVE_IDENTITY_UNAVAILABLE"))?;
     let thread = native
         .read_thread(&request.native_root_id)
         .await
         .map_err(|_| ReadFailure::Unknown("CODEX_THREAD_READ_UNKNOWN"))?;
     if thread["thread"]["id"].as_str() != Some(request.native_root_id.as_str())
-        || thread["thread"]["cwd"].as_str().and_then(super::normalize_path)
-            != state.workspace_root.as_deref().and_then(super::normalize_path)
+        || thread["thread"]["cwd"]
+            .as_str()
+            .and_then(super::normalize_path)
+            != state
+                .workspace_root
+                .as_deref()
+                .and_then(super::normalize_path)
         || !matches_native_model(&thread["thread"], state)
     {
         return Err(ReadFailure::Rejected("CODEX_THREAD_READBACK_MISMATCH"));
@@ -239,18 +250,21 @@ async fn read_current_thread(
         list_thread_mcp_status(native, &request.native_root_id, &request.server_name).await?;
     let mut matching = statuses.iter().filter(|status| {
         status["name"].as_str() == Some(request.server_name.as_str())
-            && status["serverInfo"]["name"].as_str()
-                == Some(CODEX_NATIVE_MCP_SERVER_INFO_NAME)
+            && status["serverInfo"]["name"].as_str() == Some(CODEX_NATIVE_MCP_SERVER_INFO_NAME)
     });
-    let status = matching
-        .next()
-        .ok_or(ReadFailure::Rejected("CODEX_PARTICIPANT_MCP_SERVER_MISSING"))?;
+    let status = matching.next().ok_or(ReadFailure::Rejected(
+        "CODEX_PARTICIPANT_MCP_SERVER_MISSING",
+    ))?;
     if matching.next().is_some()
         || status["runtimeStatus"] != "connected"
         || !status["toolsError"].is_null()
-        || status["serverInfo"]["version"].as_str().is_none_or(str::is_empty)
+        || status["serverInfo"]["version"]
+            .as_str()
+            .is_none_or(str::is_empty)
     {
-        return Err(ReadFailure::Rejected("CODEX_PARTICIPANT_MCP_SERVER_NOT_READY"));
+        return Err(ReadFailure::Rejected(
+            "CODEX_PARTICIPANT_MCP_SERVER_NOT_READY",
+        ));
     }
     let (expected_tools, expected_digest) = codex_participant_toolset()
         .map_err(|_| ReadFailure::Rejected("CODEX_PARTICIPANT_CATALOG_INVALID"))?;
@@ -264,8 +278,10 @@ async fn read_current_thread(
     let server_id = status["name"]
         .as_str()
         .filter(|value| !value.is_empty() && value.len() <= 256)
-        .ok_or(ReadFailure::Rejected("CODEX_PARTICIPANT_MCP_SERVER_ID_INVALID"))?;
-    let tool_search = crate::swarm_contracts::mcp_catalog::tool_name("swarm.tools.search");
+        .ok_or(ReadFailure::Rejected(
+            "CODEX_PARTICIPANT_MCP_SERVER_ID_INVALID",
+        ))?;
+    let tool_search = swarm_contracts::mcp_catalog::tool_name("swarm.tools.search");
     let catalog = call_public_tool(
         native,
         &request.native_root_id,
@@ -282,28 +298,27 @@ async fn read_current_thread(
         != Some(request.expected_authorization_revision.as_str())
         || catalog["authorization_basis"] != "authenticated_store_scope"
         || !catalog["matches"].as_array().is_some_and(|matches| {
-            matches.iter().any(|entry| entry["method"] == "swarm.context.get")
+            matches
+                .iter()
+                .any(|entry| entry["method"] == "swarm.context.get")
         })
     {
-        return Err(ReadFailure::Rejected("CODEX_PARTICIPANT_AUTHORIZATION_MISMATCH"));
+        return Err(ReadFailure::Rejected(
+            "CODEX_PARTICIPANT_AUTHORIZATION_MISMATCH",
+        ));
     }
 
-    let context_tool = crate::swarm_contracts::mcp_catalog::tool_name("swarm.context.get");
+    let context_tool = swarm_contracts::mcp_catalog::tool_name("swarm.context.get");
     let context = call_public_tool(
         native,
         &request.native_root_id,
         server_id,
         &context_tool,
-        json!({
-            "task_id":request.task_id,
-            "task_revision":request.task_revision,
-            "attempt_id":request.attempt_id,
-        }),
+        json!({}),
     )
     .await?;
     let assignment = &context["runtime_capability"]["authenticated_assignment"];
     if context["scope"]["participant"]["role"] != "participant"
-        || context["scope"]["participant"]["client_id"] != request.participant_id
         || context["scope"]["participant"]["grant_revision"] != request.grant_revision
         || context["scope"]["task"]["task_id"] != request.task_id
         || context["scope"]["task"]["revision"] != request.task_revision
@@ -341,10 +356,16 @@ async fn read_current_thread(
         native_root_id: request.native_root_id.clone(),
         native_scope_key: request.native_scope_key.clone(),
         adapter_boot_id: request.expected_adapter_boot_id.clone(),
-        reported_product: identity.reported_product.clone(),
-        reported_version: identity.reported_version.clone(),
-        effective_model_provider: thread["thread"]["modelProvider"].as_str().ok_or(ReadFailure::Rejected("CODEX_THREAD_MODEL_PROVIDER_MISSING"))?.to_owned(),
-        effective_model: thread["thread"]["model"].as_str().ok_or(ReadFailure::Rejected("CODEX_THREAD_MODEL_MISSING"))?.to_owned(),
+        reported_product,
+        reported_version,
+        effective_model_provider: thread["thread"]["modelProvider"]
+            .as_str()
+            .ok_or(ReadFailure::Rejected("CODEX_THREAD_MODEL_PROVIDER_MISSING"))?
+            .to_owned(),
+        effective_model: thread["thread"]["model"]
+            .as_str()
+            .ok_or(ReadFailure::Rejected("CODEX_THREAD_MODEL_MISSING"))?
+            .to_owned(),
         server_info_name: CODEX_NATIVE_MCP_SERVER_INFO_NAME.to_owned(),
         server_info_version: status["serverInfo"]["version"]
             .as_str()
@@ -380,29 +401,15 @@ async fn read_current_thread(
 fn matches_native_model(thread: &Value, state: &Checkpoint) -> bool {
     let observed_provider = thread["modelProvider"].as_str();
     let observed_model = thread["model"].as_str();
-    let requested_pair = state.requested_model_provider.is_some()
-        && state.requested_model.is_some();
-    if state.requested_model_provider.is_some() != state.requested_model.is_some() {
-        return false;
-    }
-    if requested_pair
-        && (observed_provider != state.requested_model_provider.as_deref()
-            || observed_model != state.requested_model.as_deref())
-    {
-        return false;
-    }
-    if !requested_pair
-        && (observed_provider.is_none_or(str::is_empty)
-            || observed_model.is_none_or(str::is_empty))
-    {
-        return false;
-    }
-    if observed_provider != state.effective_model_provider.as_deref()
-        || observed_model != state.effective_model.as_deref()
-    {
-        return false;
-    }
-    true
+    super::requested_model_selection_matches_frozen(
+        state.requested_model_provider.as_deref(),
+        state.requested_model.as_deref(),
+        observed_provider,
+        observed_model,
+        state.effective_model_provider.as_deref(),
+        state.effective_model.as_deref(),
+    ) && observed_provider == state.effective_model_provider.as_deref()
+        && observed_model == state.effective_model.as_deref()
 }
 
 async fn list_thread_mcp_status(
@@ -522,4 +529,34 @@ async fn call_public_tool(
         .filter(|value| value.is_object())
         .cloned()
         .ok_or(ReadFailure::Rejected("CODEX_MCP_TOOL_RESULT_INVALID"))
+}
+
+#[cfg(test)]
+mod model_readback_tests {
+    use super::*;
+
+    #[test]
+    fn native_c8_accepts_independent_selectors_without_accepting_effective_drift() {
+        for (provider, model) in [
+            (None, Some("native-model")),
+            (Some("native-provider"), None),
+        ] {
+            let mut state = Checkpoint::new("fixture-c8-boot".to_owned());
+            state.requested_model_provider = provider.map(str::to_owned);
+            state.requested_model = model.map(str::to_owned);
+            state.effective_model_provider = Some("native-provider".to_owned());
+            state.effective_model = Some("native-model".to_owned());
+            let mut observed = json!({"modelProvider":"native-provider","model":"native-model"});
+            assert!(matches_native_model(&observed, &state));
+            let omitted = if provider.is_none() {
+                "modelProvider"
+            } else {
+                "model"
+            };
+            observed[omitted] = json!("changed-native-value");
+            assert!(!matches_native_model(&observed, &state));
+            observed[omitted] = json!("");
+            assert!(!matches_native_model(&observed, &state));
+        }
+    }
 }

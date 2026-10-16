@@ -128,43 +128,22 @@ fn optional_env(name: &str) -> Result<Option<String>, AdapterError> {
 }
 
 fn has_generic_schemas(claim: &ModuleContractClaim) -> bool {
-    fn schema(id: &str) -> SchemaDescriptor {
-        SchemaDescriptor {
-            schema_id: id.to_owned(),
-            version: "1".to_owned(),
-            sha256: None,
-        }
-    }
     task_prompt_selected(claim).is_ok_and(|enabled| enabled)
-        && exact_schemas(
-            &claim.command_schemas,
-            &[
-                schema("swarm.runtime_command"),
-                schema("swarm.task_dispatch_context"),
-                schema("swarm.normalized_result_context"),
-                swarm_contracts::module_contract::task_prompt_schema(),
-            ],
-        )
-        && exact_schemas(
-            &claim.event_schemas,
-            &[
-                schema("swarm.runtime_outcome"),
-                schema("swarm.task_dispatch_admission"),
-                schema("swarm.normalized_result_page"),
-                swarm_contracts::module_contract::goal_continuation_admission_schema(),
-                swarm_contracts::module_contract::goal_terminal_evidence_schema(),
-            ],
-        )
+        && codex_native_mcp_enabled(claim)
+        && normalized_result_enabled(claim)
 }
 
 pub(crate) fn codex_native_mcp_enabled(claim: &ModuleContractClaim) -> bool {
-    claim.capabilities.iter().any(|value| value.as_str() == "native.mcp.observe")
+    claim
+        .capabilities
+        .iter()
+        .any(|value| value.as_str() == "native.mcp.observe")
         && claim
             .command_schemas
             .contains(&swarm_contracts::module_contract::codex_native_mcp_command_schema())
-        && claim.command_schemas.contains(
-            &swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
-        )
+        && claim
+            .command_schemas
+            .contains(&swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema())
 }
 
 /// A v8 executable never accepts an unselected or unknown prompt schema.
@@ -290,4 +269,39 @@ pub(crate) fn validate_negotiated_hello(
         return Err(AdapterError::HostProtocol);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod descriptor_schema_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn current_descriptor_is_accepted_by_startup_and_result_consumers() {
+        let descriptor: Value =
+            serde_json::from_str(include_str!("../module-descriptor.template.json")).unwrap();
+        let claim: ModuleContractClaim = serde_json::from_value(json!({
+            "schema_version":1,
+            "module_id":descriptor["module_id"],
+            "artifact":descriptor["artifact"],
+            "protocol":{"major":1,"minor":0},
+            "capabilities":descriptor["capabilities"],
+            "config_schema":descriptor["config_schema"],
+            "command_schemas":descriptor["command_schemas"],
+            "event_schemas":descriptor["event_schemas"]
+        }))
+        .unwrap();
+        assert!(has_generic_schemas(&claim));
+        assert!(normalized_result_enabled(&claim));
+        for schema_id in [
+            "swarm.codex_native_mcp_command",
+            "swarm.codex_native_mcp_launch_profile",
+        ] {
+            let mut incomplete = claim.clone();
+            incomplete
+                .command_schemas
+                .retain(|schema| schema.schema_id != schema_id);
+            assert!(!has_generic_schemas(&incomplete));
+        }
+    }
 }

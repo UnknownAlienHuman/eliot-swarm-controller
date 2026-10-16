@@ -5,8 +5,9 @@
 //! replayed; an observed proof is rechecked against current Store assignment,
 //! lease, binding, and authorization facts before dispatch.
 use super::{
-    Store, launcher_dispatch::{self, LaunchParent}, launcher_mcp_tools,
-    launcher_participant, meta, operations, tasks, workspace,
+    Store,
+    launcher_dispatch::{self, LaunchParent},
+    launcher_mcp_tools, launcher_participant, meta, operations, tasks, workspace,
 };
 use crate::{
     config::Config,
@@ -51,50 +52,70 @@ struct OperationRow {
 pub(super) async fn reconcile_once(store: &Store) -> Result<Option<Value>> {
     let now = model::now_ms()?;
     let config = store.config.clone();
-    let progress = store.run(move |db| {
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(launch_id) = next_candidate(&tx)? else {
-            tx.commit()?;
-            return Ok(None);
-        };
-        let parent = launcher_dispatch::load_parent(&tx, &launch_id)?;
-        let marker = parent.manifest.get(MARKER_FIELD).cloned();
-        let (value, changed) = match marker {
-            None => {
-                let child_id = queue_observation(&tx, &config, &parent, now)?;
-                (step_value(&launch_id, &child_id, "reading"), true)
-            }
-            Some(marker) if marker["state"] == "reading" => {
-                let child_id = marker["module_operation_id"].as_str()
-                    .filter(|value| !value.is_empty()).ok_or_else(invalid_marker)?;
-                match read_operation(&tx, child_id)? {
-                    None => {
-                        let next = terminal_marker(marker, "invalid", "CODEX_C8_CHILD_OPERATION_MISSING");
-                        persist_marker(&tx, &parent, next, now)?;
-                        (step_value(&launch_id, child_id, "invalid"), true)
-                    }
-                    Some(child) if matches!(child.state.as_str(), "queued" | "sending" | "native_accepted") => {
-                        (step_value(&launch_id, child_id, "reading"), false)
-                    }
-                    Some(child) => {
-                        let next = consume_operation(&tx, &config, &parent, marker, child_id, child, now)?;
-                        let state = next["state"].as_str().unwrap_or("invalid").to_owned();
-                        persist_marker(&tx, &parent, next, now)?;
-                        (step_value(&launch_id, child_id, &state), true)
-                    }
-                }
-            }
-            Some(_) => {
+    let progress = store
+        .run(move |db| {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let Some(launch_id) = next_candidate(&tx)? else {
                 tx.commit()?;
                 return Ok(None);
-            }
-        };
-        tx.commit()?;
-        Ok(Some((value, changed)))
-    }).await?;
-    let Some((value, changed)) = progress else { return Ok(None) };
+            };
+            let parent = launcher_dispatch::load_parent(&tx, &launch_id)?;
+            let marker = parent.manifest.get(MARKER_FIELD).cloned();
+            let (value, changed) = match marker {
+                None => {
+                    let child_id = queue_observation(&tx, &config, &parent, now)?;
+                    (step_value(&launch_id, &child_id, "reading"), true)
+                }
+                Some(marker) if marker["state"] == "reading" => {
+                    let child_id = marker["module_operation_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(invalid_marker)?
+                        .to_owned();
+                    match read_operation(&tx, &child_id)? {
+                        None => {
+                            let next = terminal_marker(
+                                marker,
+                                "invalid",
+                                "CODEX_C8_CHILD_OPERATION_MISSING",
+                            );
+                            persist_marker(&tx, &parent, next, now)?;
+                            (step_value(&launch_id, &child_id, "invalid"), true)
+                        }
+                        Some(child)
+                            if matches!(
+                                child.state.as_str(),
+                                "queued" | "sending" | "native_accepted"
+                            ) =>
+                        {
+                            (step_value(&launch_id, &child_id, "reading"), false)
+                        }
+                        Some(child) => {
+                            let next = consume_operation(
+                                &tx, &config, &parent, marker, &child_id, child, now,
+                            )?;
+                            let state = next["state"].as_str().unwrap_or("invalid").to_owned();
+                            persist_marker(&tx, &parent, next, now)?;
+                            (step_value(&launch_id, &child_id, &state), true)
+                        }
+                    }
+                }
+                Some(_) => {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+            };
+            tx.commit()?;
+            Ok(Some((value, changed)))
+        })
+        .await?;
+    let Some((value, changed)) = progress else {
+        return Ok(None);
+    };
     if changed {
-        store.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+        store
+            .changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
     Ok(Some(value))
 }
@@ -157,7 +178,9 @@ fn queue_observation(
 ) -> Result<String> {
     let operation_id = model::new_id();
     launcher_participant::require_launch_activation_facts(
-        tx, &parent.operation_id, &parent.manifest,
+        tx,
+        &parent.operation_id,
+        &parent.manifest,
         model::positive(&parent.manifest["task"], "observed_revision")?,
         &tasks::get_attempt(tx, model::text(&parent.manifest["task"], "attempt_id")?)?,
     )?;
@@ -167,13 +190,20 @@ fn queue_observation(
     let original = serde_json::to_value(&request)?;
     let original_bytes = model::canonical(&original)?;
     if original_bytes.len() > MAX_COMMAND_BYTES {
-        return Err(Error::new("NATIVE_MCP_COMMAND_LIMIT", "Codex C8 command exceeds its bounded Operation input"));
+        return Err(Error::new(
+            "NATIVE_MCP_COMMAND_LIMIT",
+            "Codex C8 command exceeds its bounded Operation input",
+        ));
     }
     let input_sha256 = model::digest(original_bytes.as_bytes());
     let mut enriched = request.clone();
-    enriched.input_sha256 = Some(Sha256Digest::new(input_sha256.clone())
-        .map_err(|_| Error::invalid("Codex C8 Operation digest is invalid"))?);
-    enriched.validate().map_err(|_| Error::invalid("Codex C8 command identity is invalid"))?;
+    enriched.input_sha256 = Some(
+        Sha256Digest::new(input_sha256.clone())
+            .map_err(|_| Error::invalid("Codex C8 Operation digest is invalid"))?,
+    );
+    enriched
+        .validate()
+        .map_err(|_| Error::invalid("Codex C8 command identity is invalid"))?;
     let effect = enriched.effect_identity();
     let effective = json!({"native_mcp":{
         "schema_version":2,
@@ -231,13 +261,16 @@ fn consume_operation(
     tx: &Transaction<'_>,
     config: &Config,
     parent: &LaunchParent,
-    marker: Value,
+    mut marker: Value,
     child_id: &str,
     child: OperationRow,
     now: i64,
 ) -> Result<Value> {
     if child.state == "outcome_unknown"
-        || child.result.as_ref().is_some_and(|result| result["outcome"] == "unknown")
+        || child
+            .result
+            .as_ref()
+            .is_some_and(|result| result["outcome"] == "unknown")
     {
         return Ok(terminal_marker(
             marker,
@@ -252,12 +285,21 @@ fn consume_operation(
         || child.binding_id.as_deref() != parent.binding_id.as_deref()
         || child.binding_generation != parent.binding_generation
     {
-        return Ok(terminal_marker(marker, "invalid", "CODEX_C8_CHILD_SCOPE_MISMATCH"));
+        return Ok(terminal_marker(
+            marker,
+            "invalid",
+            "CODEX_C8_CHILD_SCOPE_MISMATCH",
+        ));
     }
     if child.state != "settled"
-        || child.result.as_ref().is_none_or(|result| result["outcome"] != "applied")
+        || child
+            .result
+            .as_ref()
+            .is_none_or(|result| result["outcome"] != "applied")
     {
-        let code = child.result.as_ref()
+        let code = child
+            .result
+            .as_ref()
             .and_then(|result| result["details"]["diagnostic_code"].as_str())
             .filter(|value| !value.is_empty() && value.len() <= 128)
             .unwrap_or("CODEX_NATIVE_MCP_READBACK_NOT_APPLIED");
@@ -265,8 +307,13 @@ fn consume_operation(
     }
 
     let expected = current_command(tx, config, parent, child_id, None)?;
-    let stored: CodexNativeMcpCommand = serde_json::from_value(child.original.clone())
-        .map_err(|_| Error::new("CODEX_C8_COMMAND_INVALID", "retained Codex C8 command is invalid"))?;
+    let stored: CodexNativeMcpCommand =
+        serde_json::from_value(child.original.clone()).map_err(|_| {
+            Error::new(
+                "CODEX_C8_COMMAND_INVALID",
+                "retained Codex C8 command is invalid",
+            )
+        })?;
     if stored != expected
         || stored.input_sha256.is_some()
         || marker["assignment_sha256"] != stored.assignment_sha256.as_str()
@@ -294,10 +341,17 @@ fn consume_operation(
         || native_effect["effect"] != effect
         || native_effect["command_sha256"] != model::digest(model::canonical(&effect)?.as_bytes())
     {
-        return Ok(terminal_marker(marker, "invalid", "CODEX_C8_EFFECT_IDENTITY_MISMATCH"));
+        return Ok(terminal_marker(
+            marker,
+            "invalid",
+            "CODEX_C8_EFFECT_IDENTITY_MISMATCH",
+        ));
     }
     let result = child.result.as_ref().ok_or_else(|| {
-        Error::new("CODEX_C8_RESULT_MISSING", "applied Codex C8 result is missing")
+        Error::new(
+            "CODEX_C8_RESULT_MISSING",
+            "applied Codex C8 result is missing",
+        )
     })?;
     let details = &result["details"];
     if details["native_mcp_action"] != "native.mcp.observe"
@@ -305,18 +359,36 @@ fn consume_operation(
         || details["dispatch_permitted"] != false
         || details["model_consumed"] != "unknown"
     {
-        return Ok(terminal_marker(marker, "invalid", "CODEX_C8_RESULT_ENVELOPE_INVALID"));
+        return Ok(terminal_marker(
+            marker,
+            "invalid",
+            "CODEX_C8_RESULT_ENVELOPE_INVALID",
+        ));
     }
     if !module_receipt_is_exact(details, &stored, child_id, &input_sha256) {
-        return Ok(terminal_marker(marker, "invalid", "CODEX_C8_MODULE_RECEIPT_MISMATCH"));
+        return Ok(terminal_marker(
+            marker,
+            "invalid",
+            "CODEX_C8_MODULE_RECEIPT_MISMATCH",
+        ));
     }
     let readback: CodexNativeMcpReadback =
         match serde_json::from_value(details["codex_native_mcp_readback"].clone()) {
             Ok(value) => value,
-            Err(_) => return Ok(terminal_marker(marker, "invalid", "CODEX_C8_READBACK_SCHEMA_INVALID")),
+            Err(_) => {
+                return Ok(terminal_marker(
+                    marker,
+                    "invalid",
+                    "CODEX_C8_READBACK_SCHEMA_INVALID",
+                ));
+            }
         };
     if !readback_matches_command(&readback, &stored) {
-        return Ok(terminal_marker(marker, "invalid", "CODEX_C8_READBACK_SCOPE_MISMATCH"));
+        return Ok(terminal_marker(
+            marker,
+            "invalid",
+            "CODEX_C8_READBACK_SCOPE_MISMATCH",
+        ));
     }
     marker["state"] = json!("observed");
     marker["readback"] = serde_json::to_value(readback)?;
@@ -351,7 +423,9 @@ fn readback_matches_command(
     readback: &CodexNativeMcpReadback,
     command: &CodexNativeMcpCommand,
 ) -> bool {
-    let expected_tool_count = codex_participant_toolset().ok().map(|(tools, _)| tools.len());
+    let expected_tool_count = codex_participant_toolset()
+        .ok()
+        .map(|(tools, _)| tools.len());
     readback.validate().is_ok()
         && expected_tool_count == Some(readback.tool_count as usize)
         && readback.operation_id == command.operation_id
@@ -370,8 +444,7 @@ fn readback_matches_command(
         && readback.grant_revision == command.grant_revision
         && readback.participant_native_session_id == command.participant_native_session_id
         && readback.surface == command.surface
-        && readback.server_id_sha256.as_str()
-            == model::digest(command.server_name.as_bytes())
+        && readback.server_id_sha256.as_str() == model::digest(command.server_name.as_bytes())
         && readback.authorization_revision == command.expected_authorization_revision
         && readback.toolset_sha256 == command.expected_toolset_sha256
 }
@@ -403,10 +476,19 @@ fn persist_marker(
 }
 
 fn read_operation(db: &Connection, operation_id: &str) -> Result<Option<OperationRow>> {
-    let raw: Option<(
-        String, String, String, Option<String>, Option<String>, Option<String>,
-        Option<i64>, String, String, Option<String>,
-    )> = db.query_row(
+    type RawOperationRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+        Option<String>,
+    );
+    let raw: Option<RawOperationRow> = db.query_row(
         "SELECT method,state,caller_id,task_id,attempt_id,binding_id,binding_generation,original_request_json,effective_request_json,result_json \
          FROM operations WHERE operation_id=?1",
         [operation_id],
@@ -415,7 +497,19 @@ fn read_operation(db: &Connection, operation_id: &str) -> Result<Option<Operatio
             row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
         )),
     ).optional()?;
-    let Some((method,state,caller_id,task_id,attempt_id,binding_id,binding_generation,original,effective,result))=raw else {
+    let Some((
+        method,
+        state,
+        caller_id,
+        task_id,
+        attempt_id,
+        binding_id,
+        binding_generation,
+        original,
+        effective,
+        result,
+    )) = raw
+    else {
         return Ok(None);
     };
     Ok(Some(OperationRow {
@@ -438,14 +532,35 @@ fn current_command(
     operation_id: &str,
     dispatch_operation_id: Option<&str>,
 ) -> Result<CodexNativeMcpCommand> {
-    let task_id = parent.task_id.as_deref().filter(|value| !value.is_empty()).ok_or_else(stale_scope)?;
-    let attempt_id = parent.attempt_id.as_deref().filter(|value| !value.is_empty()).ok_or_else(stale_scope)?;
-    let binding_id = parent.binding_id.as_deref().filter(|value| !value.is_empty()).ok_or_else(stale_scope)?;
-    let generation = parent.binding_generation.filter(|value| *value > 0).ok_or_else(stale_scope)?;
+    let task_id = parent
+        .task_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(stale_scope)?;
+    let attempt_id = parent
+        .attempt_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(stale_scope)?;
+    let binding_id = parent
+        .binding_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(stale_scope)?;
+    let generation = parent
+        .binding_generation
+        .filter(|value| *value > 0)
+        .ok_or_else(stale_scope)?;
     let attempt = tasks::get_attempt(db, attempt_id)?;
     let task = tasks::get_task(db, task_id)?;
     let binding = operations::get_binding(db, binding_id, generation)?;
-    launcher_dispatch::validate_parent_tuple(parent, &attempt, &task, &binding, dispatch_operation_id)?;
+    launcher_dispatch::validate_parent_tuple(
+        parent,
+        &attempt,
+        &task,
+        &binding,
+        dispatch_operation_id,
+    )?;
     require_current_lease(db, parent, &attempt)?;
 
     let manifest = &parent.manifest;
@@ -483,7 +598,8 @@ fn current_command(
         || registration["binding_generation"] != generation
         || registration["grant_revision"] != grant_revision
         || registration["participation_basis"] != expected_basis
-        || registration["created_operation_id"] != manifest["participant"]["registration_operation_id"]
+        || registration["created_operation_id"]
+            != manifest["participant"]["registration_operation_id"]
         || registration["native_session_id"] != manifest["participant"]["native_session_id"]
         || manifest["mcp"]["credential_ref"] != credential_ref
         || manifest["mcp"]["profile_config_ref"] != profile_config_ref
@@ -527,8 +643,12 @@ fn current_command(
         return Err(stale_scope());
     }
 
-    let (_tools, expected_toolset_sha256) = codex_participant_toolset()
-        .map_err(|_| Error::new("NATIVE_MCP_CAPABILITY_UNAVAILABLE", "Participant tool catalog is invalid"))?;
+    let (_tools, expected_toolset_sha256) = codex_participant_toolset().map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "Participant tool catalog is invalid",
+        )
+    })?;
     let authorization = super::mcp_authorization(
         db,
         &Principal {
@@ -538,43 +658,57 @@ fn current_command(
         },
         &json!({"task_id":task_id}),
     )?;
-    let expected_authorization_revision = Sha256Digest::new(
-        model::text(&authorization, "authorization_revision")?.to_owned(),
-    ).map_err(|_| Error::new("NATIVE_MCP_CAPABILITY_UNAVAILABLE", "Participant authorization revision is invalid"))?;
-    let server_name = codex_native_mcp_server_name(&parent.operation_id)
-        .map_err(|_| Error::new("NATIVE_MCP_CAPABILITY_UNAVAILABLE", "Codex MCP server identity is invalid"))?;
+    let expected_authorization_revision =
+        Sha256Digest::new(model::text(&authorization, "authorization_revision")?.to_owned())
+            .map_err(|_| {
+                Error::new(
+                    "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+                    "Participant authorization revision is invalid",
+                )
+            })?;
+    let server_name = codex_native_mcp_server_name(&parent.operation_id).map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+            "Codex MCP server identity is invalid",
+        )
+    })?;
 
     let mut command = CodexNativeMcpCommand {
-        schema_version:3,
-        codex_schema_version:3,
-        kind:"codex_native_mcp_command".to_owned(),
-        operation_id:operation_id.to_owned(),
-        launch_operation_id:parent.operation_id.clone(),
-        phase:"observe".to_owned(),
-        observation_kind:"assigned_session".to_owned(),
-        input_sha256:None,
-        assignment_sha256:Sha256Digest::new("0".repeat(64))
+        schema_version: 3,
+        codex_schema_version: 3,
+        kind: "codex_native_mcp_command".to_owned(),
+        operation_id: operation_id.to_owned(),
+        launch_operation_id: parent.operation_id.clone(),
+        phase: "observe".to_owned(),
+        observation_kind: "assigned_session".to_owned(),
+        input_sha256: None,
+        assignment_sha256: Sha256Digest::new("0".repeat(64))
             .map_err(|_| Error::invalid("Codex C8 assignment digest is invalid"))?,
-        binding_id:binding_id.to_owned(),
-        binding_generation:generation,
-        open_operation_id:open_operation_id.to_owned(),
-        native_root_id:native_root_id.to_owned(),
-        native_scope_key:native_scope_key.to_owned(),
-        expected_adapter_boot_id:expected_adapter_boot_id.to_owned(),
-        task_id:task_id.to_owned(),
-        task_revision:model::positive(&manifest["task"],"observed_revision")?,
-        attempt_id:attempt_id.to_owned(),
-        participant_id:participant_id.to_owned(),
+        binding_id: binding_id.to_owned(),
+        binding_generation: generation,
+        open_operation_id: open_operation_id.to_owned(),
+        native_root_id: native_root_id.to_owned(),
+        native_scope_key: native_scope_key.to_owned(),
+        expected_adapter_boot_id: expected_adapter_boot_id.to_owned(),
+        task_id: task_id.to_owned(),
+        task_revision: model::positive(&manifest["task"], "observed_revision")?,
+        attempt_id: attempt_id.to_owned(),
+        participant_id: participant_id.to_owned(),
         grant_revision,
-        participant_native_session_id:registration["native_session_id"].as_str().map(str::to_owned),
-        surface:surface.to_owned(),
+        participant_native_session_id: registration["native_session_id"]
+            .as_str()
+            .map(str::to_owned),
+        surface: surface.to_owned(),
         server_name,
         expected_authorization_revision,
         expected_toolset_sha256,
     };
-    command.assignment_sha256 = command.computed_assignment_sha256()
+    command.assignment_sha256 = command
+        .computed_assignment_sha256()
         .map_err(|_| Error::invalid("Codex C8 assignment digest is invalid"))?;
-    command.validate().map_err(|_| Error::invalid("Codex C8 command identity is invalid"))?;
+    command
+        .validate()
+        .map_err(|_| Error::invalid("Codex C8 command identity is invalid"))?;
     Ok(command)
 }
 
@@ -583,13 +717,22 @@ pub(super) fn require_codex_descriptor(db: &Connection, binding: &Value) -> Resu
         db,
         CODEX_RUST_CONTROLLER_ARTIFACT_ID,
         binding["observation"].get("module_contract_selector"),
-    )?.ok_or_else(stale_scope)?;
-    let has_capability = identity.capabilities.iter().any(|value| value.as_str() == "native.mcp.observe");
-    let has_dispatch_capability = identity.capabilities.iter().any(|value| value.as_str() == "task.dispatch");
-    let has_codex_schema = identity.command_schemas.contains(&codex_native_mcp_command_schema());
-    let has_launch_profile_schema = identity.command_schemas.contains(
-        &swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema(),
-    );
+    )?
+    .ok_or_else(stale_scope)?;
+    let has_capability = identity
+        .capabilities
+        .iter()
+        .any(|value| value.as_str() == "native.mcp.observe");
+    let has_dispatch_capability = identity
+        .capabilities
+        .iter()
+        .any(|value| value.as_str() == "task.dispatch");
+    let has_codex_schema = identity
+        .command_schemas
+        .contains(&codex_native_mcp_command_schema());
+    let has_launch_profile_schema = identity
+        .command_schemas
+        .contains(&swarm_contracts::module_contract::codex_native_mcp_launch_profile_schema());
     if identity.module_id.as_str() != "codex"
         || identity.artifact.artifact_id.as_str() != CODEX_RUST_CONTROLLER_ARTIFACT_ID
         || identity.artifact.version.as_str() != CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
@@ -610,11 +753,7 @@ pub(super) fn require_codex_descriptor(db: &Connection, binding: &Value) -> Resu
     Ok(())
 }
 
-fn require_current_lease(
-    db: &Connection,
-    parent: &LaunchParent,
-    attempt: &Value,
-) -> Result<()> {
+fn require_current_lease(db: &Connection, parent: &LaunchParent, attempt: &Value) -> Result<()> {
     let manifest = &parent.manifest;
     let authority: LeaseAuthorityRef =
         serde_json::from_value(manifest["workspace"]["lease_authority"].clone())
@@ -641,28 +780,29 @@ fn require_current_lease(
     Ok(())
 }
 fn launch_identity_digest(parent: &LaunchParent) -> Result<String> {
-    Ok(model::digest(model::canonical(&json!({
-        "launch_operation_id":parent.operation_id,
-        "plan_digest":parent.manifest["plan_digest"],
-        "task":parent.manifest["task"],
-        "binding":parent.manifest["binding"],
-        "participant":parent.manifest["participant"],
-        "mcp":{
-            "profile_name":parent.manifest["mcp"]["profile_name"],
-            "surface":parent.manifest["mcp"]["surface"],
-            "credential_ref":parent.manifest["mcp"]["credential_ref"],
-            "profile_config_ref":parent.manifest["mcp"]["profile_config_ref"],
-        },
-    }))?.as_bytes()))
-}
-
-fn digest_value(value: &Value) -> Result<Sha256Digest> {
-    Sha256Digest::new(model::digest(model::canonical(value)?.as_bytes()))
-        .map_err(|_| Error::invalid("Codex C8 digest is invalid"))
+    Ok(model::digest(
+        model::canonical(&json!({
+            "launch_operation_id":parent.operation_id,
+            "plan_digest":parent.manifest["plan_digest"],
+            "task":parent.manifest["task"],
+            "binding":parent.manifest["binding"],
+            "participant":parent.manifest["participant"],
+            "mcp":{
+                "profile_name":parent.manifest["mcp"]["profile_name"],
+                "surface":parent.manifest["mcp"]["surface"],
+                "credential_ref":parent.manifest["mcp"]["credential_ref"],
+                "profile_config_ref":parent.manifest["mcp"]["profile_config_ref"],
+            },
+        }))?
+        .as_bytes(),
+    ))
 }
 
 fn invalid_marker() -> Error {
-    Error::new("CODEX_C8_MARKER_INVALID", "Codex C8 readback marker is malformed")
+    Error::new(
+        "CODEX_C8_MARKER_INVALID",
+        "Codex C8 readback marker is malformed",
+    )
 }
 
 fn stale_scope() -> Error {
@@ -689,23 +829,41 @@ pub(super) fn require_current_dispatch_capability(
             "Codex C8 per-thread Participant MCP proof is not current",
         ));
     }
-    let readback: CodexNativeMcpReadback =
-        serde_json::from_value(marker["readback"].clone())
-            .map_err(|_| Error::new("NATIVE_MCP_READBACK_INVALID", "Codex C8 readback is invalid"))?;
-    readback.validate()
-        .map_err(|_| Error::new("NATIVE_MCP_READBACK_INVALID", "Codex C8 readback is invalid"))?;
+    let readback: CodexNativeMcpReadback = serde_json::from_value(marker["readback"].clone())
+        .map_err(|_| {
+            Error::new(
+                "NATIVE_MCP_READBACK_INVALID",
+                "Codex C8 readback is invalid",
+            )
+        })?;
+    readback.validate().map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_READBACK_INVALID",
+            "Codex C8 readback is invalid",
+        )
+    })?;
     let now = model::now_ms()?;
     if readback.observed_at_ms > now.saturating_add(MAX_FUTURE_SKEW_MS) {
-        return Err(Error::new("NATIVE_MCP_READBACK_INVALID", "Codex C8 readback timestamp is in the future"));
+        return Err(Error::new(
+            "NATIVE_MCP_READBACK_INVALID",
+            "Codex C8 readback timestamp is in the future",
+        ));
     }
-    let child_id = marker["module_operation_id"].as_str()
-        .filter(|value| !value.is_empty()).ok_or_else(invalid_marker)?;
+    let child_id = marker["module_operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(invalid_marker)?;
     let expected = current_command(db, config, &parent, child_id, dispatch_operation_id)?;
-    let child = read_operation(db, child_id)?
-        .ok_or_else(|| Error::new("NATIVE_MCP_READBACK_INVALID", "Codex C8 Operation is missing"))?;
+    let child = read_operation(db, child_id)?.ok_or_else(|| {
+        Error::new(
+            "NATIVE_MCP_READBACK_INVALID",
+            "Codex C8 Operation is missing",
+        )
+    })?;
     let stored: CodexNativeMcpCommand = serde_json::from_value(child.original.clone())
         .map_err(|_| Error::new("NATIVE_MCP_READBACK_INVALID", "Codex C8 command is invalid"))?;
-    if stored != expected || stored.input_sha256.is_some()
+    if stored != expected
+        || stored.input_sha256.is_some()
         || !readback_matches_command(&readback, &stored)
     {
         return Err(Error::new(
@@ -713,7 +871,9 @@ pub(super) fn require_current_dispatch_capability(
             "Codex C8 readback does not match its current Store assignment",
         ));
     }
-    let result = child.result.as_ref()
+    let result = child
+        .result
+        .as_ref()
         .ok_or_else(|| Error::new("NATIVE_MCP_READBACK_INVALID", "Codex C8 result is missing"))?;
     if child.method != "native.mcp.observe"
         || child.state != "settled"

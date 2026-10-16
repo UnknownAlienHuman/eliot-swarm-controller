@@ -45,11 +45,11 @@ pub const GOAL_TERMINAL_EVIDENCE_SCHEMA_VERSION: &str = "1";
 pub const MODULE_EVENT_METADATA_SCHEMA_ID: &str = "swarm.module_event_metadata";
 pub const RUNTIME_SCHEMA_VERSION: &str = "1";
 
-pub use crate::native_mcp::{NATIVE_MCP_COMMAND_SCHEMA_ID, NATIVE_MCP_COMMAND_SCHEMA_VERSION};
 pub use crate::native_mcp::{
     CODEX_NATIVE_MCP_COMMAND_SCHEMA_ID, CODEX_NATIVE_MCP_COMMAND_SCHEMA_VERSION,
     CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_ID, CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_VERSION,
 };
+pub use crate::native_mcp::{NATIVE_MCP_COMMAND_SCHEMA_ID, NATIVE_MCP_COMMAND_SCHEMA_VERSION};
 
 /// Descriptor declaration for the bounded native MCP command carried inside
 /// the existing authenticated RuntimeCommand transport. Native outcomes keep
@@ -567,10 +567,22 @@ mod tests {
         assert!(v6.event_schemas.contains(&terminal));
         assert!(v8.event_schemas.contains(&continuation));
         assert!(v8.event_schemas.contains(&terminal));
-        assert!(v8.capabilities.contains(&CapabilityId::new("native.mcp.observe").unwrap()));
-        assert!(!v8.capabilities.contains(&CapabilityId::new("native.mcp.configure").unwrap()));
+        assert!(
+            v8.capabilities
+                .contains(&CapabilityId::new("native.mcp.observe").unwrap())
+        );
+        assert!(
+            !v8.capabilities
+                .contains(&CapabilityId::new("native.mcp.configure").unwrap())
+        );
         assert!(!v8.command_schemas.contains(&native_mcp_command_schema()));
-        assert!(v8.command_schemas.contains(&codex_native_mcp_command_schema()));
-        assert!(v8.command_schemas.contains(&codex_native_mcp_launch_profile_schema()));
+        assert!(
+            v8.command_schemas
+                .contains(&codex_native_mcp_command_schema())
+        );
+        assert!(
+            v8.command_schemas
+                .contains(&codex_native_mcp_launch_profile_schema())
+        );
     }
 }

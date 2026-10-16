@@ -726,11 +726,15 @@ pub(super) fn current_dispatch_capability_readback(
     }
 
     if route.runtime == "codex"
-        && route.module_artifact_id == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
+        && route.module_artifact_id
+            == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
     {
         return dispatch_capability_readback(
             super::codex_c8::require_current_dispatch_capability(
-                db, config, launch_operation_id, None,
+                db,
+                config,
+                launch_operation_id,
+                None,
             )
             .is_ok(),
         );
@@ -771,10 +775,14 @@ pub(super) fn require_current_dispatch_capability(
     }
 
     if route.runtime == "codex"
-        && route.module_artifact_id == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
+        && route.module_artifact_id
+            == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
     {
         return super::codex_c8::require_current_dispatch_capability(
-            db, config, launch_operation_id, dispatch_operation_id,
+            db,
+            config,
+            launch_operation_id,
+            dispatch_operation_id,
         );
     }
     if route.runtime != "antigravity"
@@ -838,7 +846,9 @@ fn build_codex_dispatch_packet(
     let readback: swarm_contracts::native_mcp::CodexNativeMcpReadback =
         serde_json::from_value(proof.clone())
             .map_err(|_| stale_capability("Codex C8 readback schema is invalid"))?;
-    readback.validate().map_err(|_| stale_capability("Codex C8 readback is invalid"))?;
+    readback
+        .validate()
+        .map_err(|_| stale_capability("Codex C8 readback is invalid"))?;
     let task_id = model::text(&parent.manifest["task"], "task_id")?;
     let task_revision = model::positive(&parent.manifest["task"], "observed_revision")?;
     let attempt_id = model::text(&parent.manifest["task"], "attempt_id")?;
@@ -869,9 +879,12 @@ fn build_codex_dispatch_packet(
         || attempt["task_id"] != task_id
         || attempt["task_revision"] != task_revision
     {
-        return Err(stale_capability("Codex C8 proof is stale for this exact assignment"));
+        return Err(stale_capability(
+            "Codex C8 proof is stale for this exact assignment",
+        ));
     }
-    let required_core_schemas = tools.iter()
+    let required_core_schemas = tools
+        .iter()
         .map(|tool| model::text(tool, "name").map(str::to_owned))
         .collect::<Result<Vec<_>>>()?;
     Ok(json!({

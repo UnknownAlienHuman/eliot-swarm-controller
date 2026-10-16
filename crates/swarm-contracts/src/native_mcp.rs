@@ -13,7 +13,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, BTreeSet}, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 pub const NATIVE_MCP_COMMAND_SCHEMA_ID: &str = "swarm.native_mcp_command";
 pub const NATIVE_MCP_COMMAND_SCHEMA_VERSION: &str = "2";
@@ -48,8 +51,7 @@ pub const NATIVE_MCP_ASSIGNMENT_READBACK_KIND: &str = "native_mcp_assignment_rea
 
 pub const CODEX_NATIVE_MCP_COMMAND_SCHEMA_ID: &str = "swarm.codex_native_mcp_command";
 pub const CODEX_NATIVE_MCP_COMMAND_SCHEMA_VERSION: &str = "3";
-pub const CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_ID: &str =
-    "swarm.codex_native_mcp_launch_profile";
+pub const CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_ID: &str = "swarm.codex_native_mcp_launch_profile";
 pub const CODEX_NATIVE_MCP_LAUNCH_PROFILE_SCHEMA_VERSION: &str = "1";
 pub const CODEX_NATIVE_MCP_READBACK_KIND: &str = "codex_native_mcp_assignment_readback";
 pub const CODEX_NATIVE_MCP_SERVER_INFO_NAME: &str = "eliot-swarm-controller";
@@ -523,8 +525,8 @@ impl CodexNativeMcpReadback {
 
 fn codex_value_sha256(value: &Value) -> Result<Sha256Digest, &'static str> {
     let ordered = ordered_json(value);
-    let bytes = serde_json::to_vec(&ordered)
-        .map_err(|_| "Codex native MCP digest serialization failed")?;
+    let bytes =
+        serde_json::to_vec(&ordered).map_err(|_| "Codex native MCP digest serialization failed")?;
     Sha256Digest::new(format!("{:x}", Sha256::digest(bytes)))
         .map_err(|_| "Codex native MCP digest is invalid")
 }
@@ -1019,10 +1021,22 @@ mod tests {
         let args_key = format!("{prefix}args");
         let startup_readiness_key = format!("{prefix}startup_readiness");
 
-        assert_eq!(config.get(command_key.as_str()).and_then(Value::as_str), Some(profile.executable.as_str()));
-        assert_eq!(config.get(enabled_key.as_str()).and_then(Value::as_bool), Some(true));
-        assert_eq!(config.get(required_key.as_str()).and_then(Value::as_bool), Some(true));
-        let args = config.get(args_key.as_str()).and_then(Value::as_array).unwrap();
+        assert_eq!(
+            config.get(command_key.as_str()).and_then(Value::as_str),
+            Some(profile.executable.as_str())
+        );
+        assert_eq!(
+            config.get(enabled_key.as_str()).and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            config.get(required_key.as_str()).and_then(Value::as_bool),
+            Some(true)
+        );
+        let args = config
+            .get(args_key.as_str())
+            .and_then(Value::as_array)
+            .unwrap();
         assert_eq!(args.first().and_then(Value::as_str), Some("--config"));
         assert_eq!(args.get(2).and_then(Value::as_str), Some("--credential"));
         assert_eq!(args.get(4).and_then(Value::as_str), Some("--profile"));

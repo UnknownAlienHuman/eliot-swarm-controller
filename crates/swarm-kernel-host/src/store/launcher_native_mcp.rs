@@ -263,7 +263,8 @@ impl Store {
                     Ok(())
                 })
                 .await?;
-                self.changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+                self.changed
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
             }
             return Ok(codex);
         }

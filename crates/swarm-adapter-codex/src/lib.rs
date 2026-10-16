@@ -5277,12 +5277,14 @@ async fn open_operation(
         Err(code) => return rejected(command, code, &journal.state),
     };
     let native_mcp_config = match native_mcp_profile {
-        Some(profile) => match swarm_contracts::native_mcp::codex_native_mcp_thread_config(&profile) {
-            Ok(config) => Some(config),
-            Err(_) => {
-                return rejected(command, "CODEX_NATIVE_MCP_PROFILE_INVALID", &journal.state);
+        Some(profile) => {
+            match swarm_contracts::native_mcp::codex_native_mcp_thread_config(&profile) {
+                Ok(config) => Some(config),
+                Err(_) => {
+                    return rejected(command, "CODEX_NATIVE_MCP_PROFILE_INVALID", &journal.state);
+                }
             }
-        },
+        }
         None => None,
     };
     let canonical_workspace = normalize_path(&workspace).expect("validated absolute workspace");
@@ -6125,7 +6127,8 @@ async fn handle_command(
             }
             "native.mcp.observe" if module_contract::codex_native_mcp_enabled(claim) => {
                 let mut result =
-                    native_mcp::observe_operation(&command, journal, native, claim, boot_id).await?;
+                    native_mcp::observe_operation(&command, journal, native, claim, boot_id)
+                        .await?;
                 attach_command_receipt(&mut result, &command, claim)?;
                 vec![result]
             }
@@ -7445,6 +7448,17 @@ mod reg28_tests {
             "native_options":native_options
         });
         let open_id = format!("open-partial-{case}");
+        let claim: ModuleContractClaim = serde_json::from_value(serde_json::json!({
+            "schema_version":1,
+            "module_id":"codex",
+            "artifact":{"artifact_id":ARTIFACT_ID,"version":ARTIFACT_VERSION,"build_id":null},
+            "protocol":{"major":1,"minor":0},
+            "capabilities":["agent.send"],
+            "config_schema":null,
+            "command_schemas":[],
+            "event_schemas":[]
+        }))
+        .expect("fixture module claim");
         let open_command = RuntimeCommand {
             operation_id: open_id.clone(),
             method: "agent.open".to_owned(),
@@ -7457,7 +7471,7 @@ mod reg28_tests {
             input_sha256: Some("a".repeat(64)),
             target_input_sha256: None,
         };
-        let open_outcome = open_operation(&open_command, &mut journal, &mut native).await;
+        let open_outcome = open_operation(&open_command, &mut journal, &mut native, &claim).await;
         assert_eq!(
             open_outcome.outcome,
             EffectOutcome::Applied,
@@ -7510,17 +7524,6 @@ mod reg28_tests {
         assert_eq!(recovered.outcome, EffectOutcome::Applied, "{recovered:?}");
         assert!(journal.state.active_root_proof_matches());
 
-        let claim: ModuleContractClaim = serde_json::from_value(serde_json::json!({
-            "schema_version":1,
-            "module_id":"codex",
-            "artifact":{"artifact_id":ARTIFACT_ID,"version":ARTIFACT_VERSION,"build_id":null},
-            "protocol":{"major":1,"minor":0},
-            "capabilities":["agent.send"],
-            "config_schema":null,
-            "command_schemas":[],
-            "event_schemas":[]
-        }))
-        .expect("fixture module claim");
         let send_id = format!("send-partial-{case}");
         let send_command = RuntimeCommand {
             operation_id: send_id.clone(),
@@ -8486,8 +8489,10 @@ mod codex_launch_profile_tests {
             target_input_sha256: None,
         };
 
-        assert!(codex_native_mcp_launch_profile(&command, &claim)
-            .expect("ordinary open does not activate launch C8")
-            .is_none());
+        assert!(
+            codex_native_mcp_launch_profile(&command, &claim)
+                .expect("ordinary open does not activate launch C8")
+                .is_none()
+        );
     }
 }

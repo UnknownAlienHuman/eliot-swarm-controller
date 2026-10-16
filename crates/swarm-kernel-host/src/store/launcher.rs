@@ -2,7 +2,10 @@
 //! capacity and attention authorities, plus digest-bound launch admission.
 //! Workspace and runtime effects remain outside Store transactions.
 
-use super::{acceptance, capacity, meta, projection, provider_conditions, tasks::task_sources};
+use super::{
+    acceptance, capacity, launcher_participant, meta, projection, provider_conditions,
+    tasks::task_sources,
+};
 use crate::{
     config::{Config, McpToolProfile},
     error::{Error, Result},
@@ -59,9 +62,15 @@ fn codex_module_connected_for_preopen_issuance(
         && open_operation["state"] == "queued"
         && binding["state"] == "opening"
         && binding["observation"]["connection"] == "connected"
-        && binding["observation"]["module_client_id"].as_str().is_some_and(|value| !value.is_empty())
-        && binding["observation"]["module_link_id"].as_str().is_some_and(|value| !value.is_empty())
-        && binding["observation"]["bridge_boot_id"].as_str().is_some_and(|value| !value.is_empty())
+        && binding["observation"]["module_client_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        && binding["observation"]["module_link_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        && binding["observation"]["bridge_boot_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
         && binding["native_root_id"].is_null()
 }
 
@@ -76,7 +85,7 @@ fn codex_c8_readback_pending(manifest: &Value) -> bool {
 #[cfg(test)]
 mod codex_preopen_profile_tests {
     use super::{
-        codex_module_connected_for_preopen_issuance, codex_c8_readback_pending,
+        codex_c8_readback_pending, codex_module_connected_for_preopen_issuance,
         codex_preopen_participant_pending, is_codex_c8_launch,
     };
     use serde_json::json;
@@ -5367,7 +5376,6 @@ pub(super) fn reconcile_launch(
     if binding["released_at_ms"].is_number() || lease_view["state"] != "held" {
         return fail_launch(tx, operation_id, "workspace_stale_before_effect", now);
     }
-    let codex_preopen_participant = is_codex_c8_launch(&manifest);
     if codex_module_connected_for_preopen_issuance(&manifest, &open_operation, &binding) {
         // The module handshake is ready while the native root is still absent;
         // keep the open queued and project only that connected Module state.
@@ -5532,7 +5540,12 @@ pub(super) fn reconcile_launch(
     // revalidates the stored proof and the current Task/Attempt/lease tuple.
     let codex_c8_observed = is_codex_c8_launch(&manifest)
         && manifest["codex_native_mcp_readback"]["state"] == "observed";
-    manifest["state"] = json!("awaiting_capability");
+    let launch_state = if codex_c8_observed {
+        launcher_participant::AWAITING_NATIVE_MCP
+    } else {
+        "awaiting_capability"
+    };
+    manifest["state"] = json!(launch_state);
     manifest["progress"]["capability_readback"] = json!(if codex_c8_observed {
         "observed"
     } else {
@@ -5541,7 +5554,7 @@ pub(super) fn reconcile_launch(
     manifest["runtime"]["dispatch_permitted"] = json!(false);
     let result = json!({
         "operation_id":operation_id,
-        "launch_state":"awaiting_capability",
+        "launch_state":launch_state,
         "state":"queued",
         "plan_digest":manifest["plan_digest"],
         "workspace_manifest_digest":manifest["workspace"]["manifest_digest"],

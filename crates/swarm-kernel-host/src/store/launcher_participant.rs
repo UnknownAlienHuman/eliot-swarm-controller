@@ -18,8 +18,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::path::Path;
 use swarm_contracts::{
-    module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID,
-    native_mcp::CodexNativeMcpLaunchProfile,
+    module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID, native_mcp::CodexNativeMcpLaunchProfile,
 };
 
 pub(super) const AWAITING_ISSUANCE: &str = "awaiting_participant_credential";
@@ -171,8 +170,7 @@ fn validated_scope(
     let open_operation_id = model::text(&manifest["binding"], "operation_id")?;
     let open_operation = super::operations::get_operation(db, open_operation_id)?;
     let is_codex_c8 = manifest["runtime"]["route"]["runtime"] == "codex"
-        && manifest["runtime"]["route"]["module_artifact_id"]
-            == CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+        && manifest["runtime"]["route"]["module_artifact_id"] == CODEX_RUST_CONTROLLER_ARTIFACT_ID;
     if is_codex_c8 {
         super::codex_c8::require_codex_descriptor(db, &binding)?;
     }
@@ -189,9 +187,15 @@ fn validated_scope(
     // the readiness fence for issuing its launch Participant.
     let module_connection_ready = binding["state"] == "opening"
         && binding["observation"]["connection"] == "connected"
-        && binding["observation"]["module_client_id"].as_str().is_some_and(|value| !value.is_empty())
-        && binding["observation"]["module_link_id"].as_str().is_some_and(|value| !value.is_empty())
-        && binding["observation"]["bridge_boot_id"].as_str().is_some_and(|value| !value.is_empty());
+        && binding["observation"]["module_client_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        && binding["observation"]["module_link_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        && binding["observation"]["bridge_boot_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty());
     let binding_ready = if codex_preopen_issuance {
         module_connection_ready
     } else {
@@ -214,9 +218,11 @@ fn validated_scope(
     )?;
     if open_operation["method"] != "agent.open"
         || (!codex_preopen_issuance && open_operation["state"] != "settled")
-        || (is_codex_c8 && !codex_preopen_issuance
+        || (is_codex_c8
+            && !codex_preopen_issuance
             && open_operation["result"]["outcome"] != "applied")
-        || (is_codex_c8 && !codex_preopen_issuance
+        || (is_codex_c8
+            && !codex_preopen_issuance
             && (open_operation["result"]["native_root_id"] != binding["native_root_id"]
                 || open_operation["result"]["native_scope_key"] != binding["native_scope_key"]
                 || manifest["binding"]["native_root_id"] != binding["native_root_id"]))
@@ -490,8 +496,7 @@ pub(super) fn codex_launch_profile_for_open(
     let operation = super::operations::get_operation(tx, launch_operation_id)?;
     let manifest = retained_manifest(tx, launch_operation_id)?;
     if manifest["runtime"]["route"]["runtime"] != "codex"
-        || manifest["runtime"]["route"]["module_artifact_id"]
-            != CODEX_RUST_CONTROLLER_ARTIFACT_ID
+        || manifest["runtime"]["route"]["module_artifact_id"] != CODEX_RUST_CONTROLLER_ARTIFACT_ID
     {
         return Ok(None);
     }
@@ -536,14 +541,8 @@ pub(super) fn codex_launch_profile_for_open(
         registration,
     };
     let request = build_issue_request(&scope, launch_operation_id)?;
-    let (registered_client_id, stored_registration, _) = check_registered_participant(
-        tx,
-        actor,
-        &scope,
-        launch_operation_id,
-        &request,
-        &issued,
-    )?;
+    let (registered_client_id, stored_registration, _) =
+        check_registered_participant(tx, actor, &scope, launch_operation_id, &request, &issued)?;
     let grant_revision = model::positive(&stored_registration, "grant_revision")?;
     if registered_client_id != client_id
         || participant["role"] != "participant"
@@ -563,11 +562,8 @@ pub(super) fn codex_launch_profile_for_open(
             "Codex launch profile differs from the exact pre-open Participant registration",
         ));
     }
-    let artifacts = crate::participant_credentials::resolve_refs(
-        config,
-        &credential_ref,
-        &profile_config_ref,
-    )?;
+    let artifacts =
+        crate::participant_credentials::resolve_refs(config, &credential_ref, &profile_config_ref)?;
     let path_text = |path: &Path, label: &str| {
         path.to_str().map(str::to_owned).ok_or_else(|| {
             Error::new(
@@ -595,7 +591,12 @@ pub(super) fn codex_launch_profile_for_open(
         path_text(artifacts.credential_path(), "Participant credential")?,
         path_text(artifacts.profile_config_path(), "Participant profile")?,
     )
-    .map_err(|_| Error::new("NATIVE_MCP_PROFILE_INVALID", "Codex launch profile is invalid"))?;
+    .map_err(|_| {
+        Error::new(
+            "NATIVE_MCP_PROFILE_INVALID",
+            "Codex launch profile is invalid",
+        )
+    })?;
     Ok(Some(profile))
 }
 
@@ -992,12 +993,9 @@ pub(super) fn require_launch_activation_for_mutation(
     else {
         return Ok(());
     };
-    let Some(manifest) = pending_manifest_for_client(
-        tx,
-        &launch_operation_id,
-        &p.client_id,
-        &registration,
-    )? else {
+    let Some(manifest) =
+        pending_manifest_for_client(tx, &launch_operation_id, &p.client_id, &registration)?
+    else {
         return Ok(());
     };
     let task_id = manifest["task"]["task_id"]
@@ -1034,12 +1032,13 @@ pub(super) fn require_launch_activation_for_mutation(
     {
         return Ok(());
     }
-    require_launch_activation_facts(
-        tx,
-        &launch_operation_id,
-        &manifest,
-        task_revision,
-        &attempt,
+    require_launch_activation_facts(tx, &launch_operation_id, &manifest, task_revision, &attempt)
+}
+
+fn pending_launch_activation() -> Error {
+    Error::new(
+        "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
+        "launch-issued Participant credential is pending exact native open activation",
     )
 }
 
@@ -1091,7 +1090,10 @@ fn pending_manifest_for_client(
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    let Some(manifest) = effective.get("launch_manifest").filter(|value| value.is_object()) else {
+    let Some(manifest) = effective
+        .get("launch_manifest")
+        .filter(|value| value.is_object())
+    else {
         return Ok(None);
     };
     if !matches!(
@@ -1110,8 +1112,12 @@ fn pending_manifest_for_client(
             != registration.get("attempt_id").and_then(Value::as_str)
         || participant.get("binding_id").and_then(Value::as_str)
             != registration.get("binding_id").and_then(Value::as_str)
-        || participant.get("binding_generation").and_then(Value::as_i64)
-            != registration.get("binding_generation").and_then(Value::as_i64)
+        || participant
+            .get("binding_generation")
+            .and_then(Value::as_i64)
+            != registration
+                .get("binding_generation")
+                .and_then(Value::as_i64)
     {
         return Ok(None);
     }
@@ -1125,12 +1131,7 @@ pub(super) fn require_launch_activation_facts(
     task_revision: i64,
     attempt: &Value,
 ) -> Result<()> {
-    let pending = || {
-        Error::new(
-            "NATIVE_MCP_CAPABILITY_UNAVAILABLE",
-            "launch-issued Participant credential is pending exact native open activation",
-        )
-    };
+    let pending = pending_launch_activation;
     let task_id = manifest["task"]["task_id"]
         .as_str()
         .filter(|value| !value.is_empty())
@@ -1163,8 +1164,7 @@ pub(super) fn require_launch_activation_facts(
         .ok_or_else(pending)?;
     let open = super::operations::get_operation(tx, open_operation_id).map_err(|_| pending())?;
     let is_codex_c8 = manifest["runtime"]["route"]["runtime"] == "codex"
-        && manifest["runtime"]["route"]["module_artifact_id"]
-            == CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+        && manifest["runtime"]["route"]["module_artifact_id"] == CODEX_RUST_CONTROLLER_ARTIFACT_ID;
     if open["method"] != "agent.open"
         || open["state"] != "settled"
         || (is_codex_c8 && open["result"]["outcome"] != "applied")
