@@ -343,7 +343,7 @@ fn publication_error(error: std::io::Error) -> Error {
 /// replacement. Windows uses `MOVEFILE_WRITE_THROUGH` without claiming an
 /// equivalent directory fsync.
 pub fn replace_private_durable(path: &Path, data: &[u8]) -> Result<()> {
-    replace_private_durable_with_barrier(path, data, sync_parent_directory)
+    replace_private_durable_with_barrier(path, data, durability_barrier)
 }
 
 fn replace_private_durable_with_barrier(
