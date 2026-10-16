@@ -2054,8 +2054,16 @@ impl Journal {
             // result. Publish the durable dedupe marker before removing the
             // record from the current full snapshot.
             self.write_operation_tombstone(operation_id, &record)?;
-            self.state.operations.remove(operation_id);
-            self.state.acknowledged_outcomes.remove(operation_id);
+            if self.state.root_operation_id.as_deref() == Some(operation_id) {
+                // Current-root validation still needs the verified opening
+                // record. It becomes compactable when another root replaces it.
+                self.state
+                    .acknowledged_outcomes
+                    .insert(operation_id.to_owned());
+            } else {
+                self.state.operations.remove(operation_id);
+                self.state.acknowledged_outcomes.remove(operation_id);
+            }
         } else {
             if self.state.acknowledged_outcomes.contains(operation_id) {
                 return Ok(());
@@ -7465,6 +7473,31 @@ mod reg28_tests {
             "event_schemas":[]
         }))
         .expect("fixture module claim");
+        journal
+            .bind(&open_command.binding_id, open_command.generation)
+            .expect("bind opening receipt");
+        let mut acknowledged_open = open_outcome;
+        attach_command_receipt(&mut acknowledged_open, &open_command, &claim)
+            .expect("attach opening receipt");
+        journal
+            .store_outcome(&acknowledged_open, "agent.open", "open")
+            .expect("persist opening outcome before host ACK");
+        journal
+            .acknowledge_outcome(&open_id)
+            .expect("host accepted opening outcome");
+        assert!(
+            journal.state.active_root_proof_matches(),
+            "acknowledging the open must retain its current-root proof"
+        );
+        journal = Journal::open(journal_dir.clone(), boot_id.clone())
+            .expect("reopen acknowledged current root before dispatch");
+        assert!(journal.state.active_root_proof_matches());
+        assert!(
+            journal
+                .pending_outcomes()
+                .expect("pending outcomes")
+                .is_empty()
+        );
         let send_id = format!("send-partial-{case}");
         let send_command = RuntimeCommand {
             operation_id: send_id.clone(),
