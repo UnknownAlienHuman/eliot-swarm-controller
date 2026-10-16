@@ -703,6 +703,9 @@ mod normalized_dispatch_lifecycle_tests {
             completed["native_payload_sha256"],
             admission.native_payload_sha256
         );
+        tx.commit().unwrap();
+        // Reconnect/replay happens after the terminal receipt is committed.
+        let tx = db.transaction().unwrap();
         // A late admission receipt cannot erase the verified completion.
         assert_eq!(
             record_task_dispatch(&tx, &operation, &admitted, &admission, None, 4).unwrap(),

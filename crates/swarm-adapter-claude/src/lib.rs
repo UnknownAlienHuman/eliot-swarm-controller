@@ -4704,9 +4704,9 @@ mod failed_prepare_lifecycle_fixture {
                     HarnessFrame::Exited { .. } => {
                         break;
                     }
-                    HarnessFrame::StdoutEof => {
-                        panic!("fake SDK bridge closed stdout unexpectedly")
-                    }
+                    // The explicit stop closes stdout before or beside the
+                    // child-exit notification. EOF alone is not exit proof.
+                    HarnessFrame::StdoutEof => {}
                     HarnessFrame::ReadFailure => panic!("fake SDK bridge output pipe failed"),
                     HarnessFrame::Message(_) => {}
                 }
