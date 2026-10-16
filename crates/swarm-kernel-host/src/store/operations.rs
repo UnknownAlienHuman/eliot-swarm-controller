@@ -2617,6 +2617,23 @@ pub(super) fn get_binding_public(db: &Connection, id: &str, generation: i64) -> 
     Ok(binding)
 }
 
+/// Direct agent.open is an ordinary planning and execution right shared by the
+/// registered Manager and the pinned local Operator (modularity sections 1,
+/// 3 and 4; agent.open is an ordinary MCP Mutation and route selection is
+/// Manager-scoped). Explicit allowlist only: never the broader require_writer
+/// predicate and no new grant database. Every route, descriptor, admission,
+/// and binding guard below is unchanged.
+fn require_open_planner(p: &Principal) -> Result<()> {
+    match &p.role {
+        Role::Operator => p.require_operator(),
+        Role::Manager => Ok(()),
+        _ => Err(Error::new(
+            "FORBIDDEN",
+            "agent.open requires Manager or local Operator authority",
+        )),
+    }
+}
+
 pub(super) fn open(
     tx: &Transaction<'_>,
     p: &Principal,
@@ -2625,7 +2642,7 @@ pub(super) fn open(
     id: &str,
     now: i64,
 ) -> Result<Value> {
-    p.require_operator()?;
+    require_open_planner(p)?;
     reserve_open(tx, &p.client_id, v, config, id, now)
 }
 
