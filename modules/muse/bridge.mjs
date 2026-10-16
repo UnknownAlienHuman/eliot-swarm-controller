@@ -1194,7 +1194,10 @@ async function execute(command) {
         const goal = goalCommand(p,rootId);
         let workFence,beforeNativeRequest;
         if (goal.startsWork) {
-          if (standingEffort !== routeDefaults.reasoningEffort) throw new Error('CONFIGURE_STANDING_EFFORT_BEFORE_GOAL');
+          // With no route override, goals use the native standing default.
+          // Native observations do not create a requested effort constraint.
+          if (routeDefaults.reasoningEffort !== undefined && standingEffort !== routeDefaults.reasoningEffort)
+            throw new Error('CONFIGURE_STANDING_EFFORT_BEFORE_GOAL');
           workFence=await readWorkFence('MODEL_CHANGED_BEFORE_GOAL');
           beforeNativeRequest=entry=>{
             if(!workFenceCurrent(workFence,entry))
