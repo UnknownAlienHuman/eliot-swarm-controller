@@ -5483,8 +5483,14 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     #[tokio::test]
     async fn real_probe_owner_blocks_only_conflicting_preflight_until_exact_family_departure() {
+        const OWNER_PROFILE_REVISION: &str = "pr61-real-owner";
+        const PROBE_PROFILE_REVISION: &str = "pr61-real-probe-error";
         PR61_PROBE_SUCCESS_CALLS.store(0, Ordering::SeqCst);
-        let fixture = probe_error_fixture().await;
+        let fixture = probe_error_fixture_with_profile_revisions(
+            OWNER_PROFILE_REVISION,
+            PROBE_PROFILE_REVISION,
+        )
+        .await;
         let store = &fixture.owner.store;
         let (task_id, attempt_id) = create_attempt(&fixture, "cache-project", None).await;
         let candidate =
@@ -5493,7 +5499,7 @@ mod tests {
             &fixture,
             &attempt_id,
             &candidate.artifact_id,
-            "pr61-probe-error",
+            PROBE_PROFILE_REVISION,
         )
         .await;
 
@@ -5502,12 +5508,12 @@ mod tests {
         let profile_a = fixture
             .config
             .checks
-            .profile("strict", "pr61-probe-error")
+            .profile("strict", PROBE_PROFILE_REVISION)
             .unwrap();
         let profile_b = fixture
             .config
             .checks
-            .profile("strict", "pr61-owner")
+            .profile("strict", OWNER_PROFILE_REVISION)
             .unwrap();
         let scope_a = inputs::ProbeCleanupScope::for_candidate(&profile_a, &verified)
             .expect("derive actual A resource and workspace identity");
@@ -5570,7 +5576,7 @@ mod tests {
             &fixture,
             &attempt_id,
             &candidate.artifact_id,
-            "pr61-probe-error",
+            PROBE_PROFILE_REVISION,
         )
         .await;
         let _probe_a2 =
@@ -5590,8 +5596,13 @@ mod tests {
         );
         drop(_probe_a2);
 
-        let snapshot_b =
-            probe_plan_snapshot(&fixture, &attempt_id, &candidate.artifact_id, "pr61-owner").await;
+        let snapshot_b = probe_plan_snapshot(
+            &fixture,
+            &attempt_id,
+            &candidate.artifact_id,
+            OWNER_PROFILE_REVISION,
+        )
+        .await;
         let _probe_b =
             inputs::override_probe_for_test(&profile_b, count_pr61_successful_input_probe);
         let independent_b = store
@@ -5698,7 +5709,7 @@ mod tests {
         assert!(!owner_scope.overlaps(&incoming_scope));
 
         let (mut owner, process_fixture) =
-            inputs::tests::pending_probe_custody_fixture(owner_scope.clone());
+            inputs::tests::pending_probe_custody_fixture_with_explicit_release(owner_scope.clone());
         owner.set_scope(None);
         let helper_identity = process_fixture.helper_launch_identity().clone();
         let target_identity = process_fixture.process_identity("target.identity.json");

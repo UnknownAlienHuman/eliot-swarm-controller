@@ -3464,6 +3464,94 @@ pub(crate) mod tests {
             self.release_descendant();
         }
 
+        fn readiness_diagnostic(
+            &self,
+            owner: &ProbeCleanupOwner,
+            explicit_release: bool,
+        ) -> String {
+            let target_identity =
+                probe_custody_file(&self.control, "target.identity.json").is_file();
+            let descendant_identity =
+                probe_custody_file(&self.control, "descendant.identity.json").is_file();
+            let identity_pid = |name: &str| {
+                File::open(probe_custody_file(&self.control, name))
+                    .ok()
+                    .and_then(|file| read_bounded(file, 16 * 1024).ok())
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|identity| identity["pid"].as_u64())
+            };
+            let target_pid = identity_pid("target.identity.json");
+            let descendant_pid = identity_pid("descendant.identity.json");
+            let target_ready = probe_custody_file(&self.control, "target.ready").is_file();
+            let descendant_ready = probe_custody_file(&self.control, "descendant.ready").is_file();
+            let target_exit = probe_custody_file(&self.control, "target.exit").is_file();
+            let descendant_exit = probe_custody_file(&self.control, "descendant.exit").is_file();
+            let owner_record = self.directory.join("probe-owner.json").is_file();
+            let response_path = self.directory.join(PROBE_HELPER_RESPONSE_FILE);
+            let response_bytes = fs::metadata(&response_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let response = File::open(&response_path)
+                .ok()
+                .and_then(|file| read_bounded(file, PROBE_RESPONSE_LIMIT).ok())
+                .and_then(|bytes| decode_probe_response(&bytes).ok())
+                .map(|response| {
+                    let message_kind = if response
+                        .message
+                        .starts_with("unable to start input probe:")
+                    {
+                        "launch_failed"
+                    } else if response.message == "invalid internal CheckRunner probe request" {
+                        "invalid_request"
+                    } else if response
+                        .message
+                        .starts_with("input probe process group membership check failed")
+                    {
+                        "membership_failed"
+                    } else if response.message == "input probe left descendants after its command exited" {
+                        "descendants_remained"
+                    } else if response.message.is_empty() {
+                        "empty"
+                    } else {
+                        "other"
+                    };
+                    format!(
+                        "decoded(success={},timed_out={},exit_code={:?},group_empty={},message_kind={},stdout_bytes={},stderr_bytes={})",
+                        response.success,
+                        response.timed_out,
+                        response.exit_code,
+                        response.group_empty,
+                        message_kind,
+                        response.stdout.len(),
+                        response.stderr.len(),
+                    )
+                })
+                .unwrap_or_else(|| "unavailable".to_string());
+            let capture = owner.custody.capture.as_ref();
+            let helper_pid = self.helper_pid;
+            let helper_running = owner.custody.exit_status.is_none();
+            let helper_exit_code = owner
+                .custody
+                .exit_status
+                .as_ref()
+                .and_then(|status| status.code());
+            let helper_exit_success = owner
+                .custody
+                .exit_status
+                .as_ref()
+                .map(|status| status.success());
+            let owner_pending = owner.is_pending();
+            let status_observation_failed = owner.custody.status_observation_failed;
+            let capture_setup_failed = owner.custody.capture_setup_failed;
+            let capture_started = capture.is_some();
+            let capture_finished = capture.is_some_and(CaptureStream::is_finished);
+            let capture_reader_failed = capture.is_some_and(CaptureStream::reader_failed);
+            let capture_truncated = capture.is_some_and(CaptureStream::truncated);
+            format!(
+                "fixture_producer={{helper_pid={helper_pid},target_pid={target_pid:?},descendant_pid={descendant_pid:?},target_identity={target_identity},descendant_identity={descendant_identity},target_ready={target_ready},descendant_ready={descendant_ready},target_exit={target_exit},descendant_exit={descendant_exit},owner_record={owner_record},explicit_release={explicit_release},helper_running={helper_running},helper_exit_code={helper_exit_code:?},helper_exit_success={helper_exit_success:?},owner_pending={owner_pending},status_observation_failed={status_observation_failed},capture_setup_failed={capture_setup_failed},capture_started={capture_started},capture_finished={capture_finished},capture_reader_failed={capture_reader_failed},capture_truncated={capture_truncated},response_bytes={response_bytes},response={response}}}"
+            )
+        }
+
         fn cleanup(&self) {
             self.release_all();
             let owner_path = self.directory.join("probe-owner.json");
@@ -3626,12 +3714,15 @@ pub(crate) mod tests {
             owner.poll();
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(
-            target_identity_path.exists()
-                && descendant_identity_path.exists()
-                && target_ready_path.exists(),
-            "real target and nested process publish identities and become ready"
-        );
+        if !target_identity_path.exists()
+            || !descendant_identity_path.exists()
+            || !target_ready_path.exists()
+        {
+            panic!(
+                "real target and nested process publish identities and become ready; {}",
+                fixture.readiness_diagnostic(&owner, explicit_release)
+            );
+        }
         assert!(
             owner.custody.capture.is_some() && !owner.custody.capture_setup_failed,
             "the real helper stdout capture is active at Store handoff"
