@@ -90,35 +90,31 @@ async fn run_check(
         .await
         .expect("read retained CheckRun");
     let result_ref_present = check["result_ref"].as_str().is_some();
-    let (result_error_code, artifact_read_error_code) =
-        if check["state"] == "passed" {
-            (None, None)
-        } else if let Some(artifact_id) = check["result_ref"].as_str() {
-            match store
-                .call(
-                    caller.clone(),
-                    "artifact.read".into(),
-                    json!({"artifact_id":artifact_id,"offset_bytes":0,"length_bytes":65536}),
-                )
-                .await
-            {
-                Ok(page) => (
-                    page["content"]
-                        .as_str()
-                        .and_then(|content| serde_json::from_str::<Value>(content).ok())
-                        .and_then(|report| {
-                            report["error"]["code"].as_str().map(str::to_owned)
-                        }),
-                    None,
-                ),
-                Err(error) => (None, Some(error.code)),
-            }
-        } else {
-            (None, None)
-        };
+    let (result_error_code, artifact_read_error_code) = if check["state"] == "passed" {
+        (None, None)
+    } else if let Some(artifact_id) = check["result_ref"].as_str() {
+        match store
+            .call(
+                caller.clone(),
+                "artifact.read".into(),
+                json!({"artifact_id":artifact_id,"offset_bytes":0,"length_bytes":65536}),
+            )
+            .await
+        {
+            Ok(page) => (
+                page["content"]
+                    .as_str()
+                    .and_then(|content| serde_json::from_str::<Value>(content).ok())
+                    .and_then(|report| report["error"]["code"].as_str().map(str::to_owned)),
+                None,
+            ),
+            Err(error) => (None, Some(error.code)),
+        }
+    } else {
+        (None, None)
+    };
     assert_eq!(
-        check["state"],
-        "passed",
+        check["state"], "passed",
         "retained CheckRun: {check}; result_ref_present={result_ref_present}; result_artifact_error_code={result_error_code:?}; artifact_read_error_code={artifact_read_error_code:?}"
     );
     check_id
