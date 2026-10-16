@@ -23,7 +23,7 @@
 
 | Донор | Что реально ценно | Что ломалось у пользователей | Вердикт |
 |---|---|---|---|
-| ACP Rust SDK | Client/Agent/Proxy/Conductor, version guards | restore routing и replay до response; Windows console popup | TAKE + SPIKE |
+| ACP Rust SDK | Client/Agent/Proxy/Conductor, version guards | restore routing и replay до response; Windows console popup | TAKE (landed as Command ACP crate) + SPIKE for the remaining slices |
 | ractor | local supervision и Kill→Stop→Supervision→Work | per-actor memory; cluster not production-ready | TAKE semantics |
 | Kingfisher | Rust rule corpus, fingerprints, validation fixtures | false-negative validation, JSON count drift, `--jobs 1` hang | SPIKE (see correction below) |
 | AgentGateway | data-only CEL policy | unavailable phase fields, claim arrays panic, one backend kills fanout | SPIKE |
