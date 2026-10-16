@@ -24,8 +24,8 @@ use swarm_process::{
     process_birth_identity, process_image_identity,
 };
 use swarm_supervisor::control::{
-    SupervisorChildExit, SupervisorChildExitCategory, SupervisorChildHealth,
-    SupervisorChildProcessIdentity, SupervisorChildStopState,
+    InstalledDescriptorRequestState, SupervisorChildExit, SupervisorChildExitCategory,
+    SupervisorChildHealth, SupervisorChildProcessIdentity, SupervisorChildStopState,
 };
 use swarm_supervisor::{
     ModuleOwnerExecutable, StandaloneRouteConfigMapper, StandaloneSupervisorConfig,
@@ -332,7 +332,7 @@ const SUPERVISOR_SPAWN_PENDING: &str = "MODULE_SUPERVISOR_SPAWN_PENDING";
 async fn run_supervisor_process_loop(
     store: Store,
     control: SupervisorControlClient,
-    bootstrap: SupervisorBootstrap,
+    mut bootstrap: SupervisorBootstrap,
     stopping: watch::Receiver<bool>,
     shutdown_custody: ShutdownCustody,
 ) -> Result<()> {
@@ -452,10 +452,87 @@ async fn run_supervisor_process_loop(
             }
         };
 
-        // The host alone chooses and durably admits the next actor UUID. This
-        // happens only after exact prior-child reconciliation and before the
-        // final child bootstrap frame is constructed.
+        let retained = match control.install_requests(true).await {
+            Ok(page) => page,
+            Err(error) => {
+                let error = Error::from(error);
+                failures = failures.saturating_add(1).min(32);
+                if let Err(health_error) = record_module_actor_status(
+                    &store,
+                    "isolated",
+                    failures,
+                    Some(&error.code),
+                    Some(MODULE_ACTOR_ISOLATED_RETRY),
+                )
+                .await
+                {
+                    return Err(error.with_secondary_error(health_error));
+                }
+                if !wait_for_supervisor_retry(
+                    MODULE_ACTOR_ISOLATED_RETRY,
+                    &mut demand_changes,
+                    &mut stopping,
+                )
+                .await
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let retained_paths = retained
+            .requests
+            .into_iter()
+            .filter(|request| request.state == InstalledDescriptorRequestState::Installed)
+            .map(|request| request.descriptor_file);
+        if let Err(error) = bootstrap
+            .config
+            .append_retained_descriptor_files(retained_paths)
+        {
+            let error = module_error(error);
+            if let Err(health_error) = record_module_actor_status(
+                &store,
+                "isolated",
+                failures.saturating_add(1).min(32),
+                Some(&error.code),
+                Some(MODULE_ACTOR_ISOLATED_RETRY),
+            )
+            .await
+            {
+                return Err(error.with_secondary_error(health_error));
+            }
+            return Err(error);
+        }
+        // The host alone chooses the next actor UUID only after exact
+        // prior-child reconciliation. Validate the exact serialized child
+        // frame BEFORE durable admission so an oversized retained set cannot
+        // burn the actor fence; the live supervisor already rejects such hot
+        // updates before catalog publication via
+        // StandaloneSupervisorConfig::ensure_hot_descriptor_restartable.
         let actor_instance_id = Uuid::new_v4().to_string();
+        let child_bootstrap = SupervisorBootstrap {
+            config: bootstrap.config.clone(),
+            actor_instance_id: Some(actor_instance_id.clone()),
+        };
+        let frame = match child_bootstrap.to_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                let error = module_error(error);
+                let error = match record_module_actor_status(
+                    &store,
+                    "isolated",
+                    failures.saturating_add(1).min(32),
+                    Some(&error.code),
+                    Some(MODULE_ACTOR_ISOLATED_RETRY),
+                )
+                .await
+                {
+                    Ok(()) => error,
+                    Err(health_error) => return Err(error.with_secondary_error(health_error)),
+                };
+                return Err(error);
+            }
+        };
         if let Err(error) = store
             .admit_module_supervisor_actor(&actor_instance_id)
             .await
@@ -483,29 +560,6 @@ async fn run_supervisor_process_loop(
             }
             continue;
         }
-        let child_bootstrap = SupervisorBootstrap {
-            config: bootstrap.config.clone(),
-            actor_instance_id: Some(actor_instance_id),
-        };
-        let frame = match child_bootstrap.to_frame() {
-            Ok(frame) => frame,
-            Err(error) => {
-                let error = module_error(error);
-                let error = match record_module_actor_status(
-                    &store,
-                    "isolated",
-                    failures.saturating_add(1).min(32),
-                    Some(&error.code),
-                    Some(MODULE_ACTOR_ISOLATED_RETRY),
-                )
-                .await
-                {
-                    Ok(()) => error,
-                    Err(health_error) => return Err(error.with_secondary_error(health_error)),
-                };
-                return Err(error);
-            }
-        };
 
         // Persist the launch intent, then use the existing bounded Store
         // readback before the first exec. A pending intent
@@ -761,6 +815,9 @@ async fn wait_for_supervisor_retry(
 }
 
 async fn module_supervisor_has_demand(store: &Store) -> Result<bool> {
+    if store.has_pending_descriptor_install().await? {
+        return Ok(true);
+    }
     let mut cursor = None;
     for _ in 0..SUPERVISOR_DEMAND_PAGE_LIMIT {
         let page = store.module_demand_snapshot(cursor).await?;

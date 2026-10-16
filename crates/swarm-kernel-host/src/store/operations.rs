@@ -320,6 +320,21 @@ fn project_result_receipt(method: &str, result: &Value) -> Result<Option<Value>>
             "repair_started",
             "publication_started",
         ],
+        "module.descriptor.install" => &[
+            "operation_id",
+            "state",
+            "status",
+            "outcome",
+            "module_id",
+            "artifact_id",
+            "version",
+            "artifact",
+            "registered",
+            "unchanged",
+            "catalog_revision",
+            "registered_revision",
+            "error_code",
+        ],
         "swarm.launch"
         | "agent.open"
         | "agent.send"
@@ -3909,6 +3924,12 @@ pub(super) fn cancel(
             ));
         }
     }
+    if o["method"] == "module.descriptor.install" {
+        return Err(Error::new(
+            "MODULE_INSTALL_NOT_CANCELLABLE",
+            "an accepted descriptor install must settle through the supervisor handoff",
+        ));
+    }
     if o["method"] == "check.run" {
         return Err(Error::new(
             "CHECK_CANCEL_METHOD",
@@ -4355,5 +4376,30 @@ mod native_catalog_failure_public_projection_tests {
                     .contains(PRIVATE_MARKER)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod descriptor_install_projection_tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_install_result_never_projects_local_paths() {
+        let projected = project_result_receipt(
+            "module.descriptor.install",
+            &json!({
+                "operation_id":"op-install",
+                "state":"settled",
+                "outcome":"installed",
+                "descriptor_file":"C:/private/modules/example/module-descriptor.json",
+                "registered":true,
+                "catalog_revision":7,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(projected["operation_id"], "op-install");
+        assert_eq!(projected["catalog_revision"], 7);
+        assert!(projected.get("descriptor_file").is_none());
     }
 }

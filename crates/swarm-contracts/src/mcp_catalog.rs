@@ -129,7 +129,7 @@ const fn mutation(
 /// classification plus the CLI's
 /// request-ID treatment (`agent.result` and `host.mode` are mutations).
 pub static TOOLS: &[(bool, ToolSpec)] = &TOOL_ITEMS;
-static TOOL_ITEMS: [(bool, ToolSpec); 160] = [
+static TOOL_ITEMS: [(bool, ToolSpec); 161] = [
     // Read-only methods.
     read(
         "swarm.tools.search",
@@ -1368,6 +1368,12 @@ static TOOL_ITEMS: [(bool, ToolSpec); 160] = [
             "version",
             "expected_catalog_revision",
         ],
+    ),
+    mutation(
+        "module.descriptor.install",
+        "Operator only: submit one already-installed descriptor file for supervisor validation and Store registration. The returned durable Operation does not select a route or start a worker; the supervisor settles it.",
+        &[f("client_request_id", S), f("descriptor_file", S)],
+        &["client_request_id", "descriptor_file"],
     ),
     mutation(
         "client.register",
@@ -5113,6 +5119,21 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
             "expected_catalog_revision"
         ],
         "One revision-checked selection for this Manager's new bindings only; other Managers and existing bindings keep their own retained descriptors."
+    ),
+    entry_with_inputs!(
+        "module.descriptor.install",
+        Administration,
+        FULL_AUDIENCE,
+        ManualOnly,
+        "Admit an already-installed module descriptor through the local supervisor.",
+        "Use only with local Operator authority to validate and register a descriptor already present on disk; this does not select a route or start a worker.",
+        &["module", "descriptor", "install", "supervisor", "operator"],
+        &["client_request_id", "descriptor_file"],
+        &[
+            "local Operator authorization",
+            "already-installed descriptor file"
+        ],
+        "Returns a durable Operation receipt; its settled result reports the catalog revision without local paths."
     ),
     entry!(
         "client.register",

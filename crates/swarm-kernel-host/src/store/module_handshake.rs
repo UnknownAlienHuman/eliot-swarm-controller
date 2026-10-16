@@ -11,19 +11,27 @@ use crate::{
     error::{Error, Result},
     model::{self, Principal, Role},
 };
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use swarm_contracts::module_catalog::{
-    ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleCatalog, ModuleDescriptor, ModuleId,
-    PreInputOpenContract, ProtocolVersion, SchemaDescriptor, WorkspaceOptionContract,
+    ArtifactIdentity, ArtifactVersion, CapabilityId, ModuleCatalog, ModuleDescriptor,
+    ModuleDescriptorInstallRequest, ModuleId, PreInputOpenContract, ProtocolVersion,
+    SchemaDescriptor, WorkspaceOptionContract,
 };
 use swarm_contracts::module_command::{capability_satisfies, classify_runtime_command};
 use swarm_contracts::module_contract::{
     MODULE_PROTOCOL_V1, ModuleContractClaim, native_mcp_command_schema,
 };
 use swarm_contracts::runtime_catalog::ModuleDescriptorEvidence;
+use swarm_supervisor::control::{
+    CompleteInstalledDescriptorRequest, DescriptorRegistrationReceipt,
+    InstalledDescriptorCompletionOutcome, InstalledDescriptorCompletionReceipt,
+    InstalledDescriptorOperationOutcome, InstalledDescriptorOperationState,
+    InstalledDescriptorRequestPage, InstalledDescriptorRequestRecord,
+    InstalledDescriptorRequestState,
+};
 
 const REGISTRY_KEY: &str = "module_catalog:trusted_descriptors:v1";
 const REGISTRY_SCHEMA_VERSION: u16 = 1;
@@ -47,6 +55,18 @@ const PREVIOUS_SUPERVISOR_CAPABILITIES: &[&str] = &[
     "module.supervisor.observation.record",
     "module.supervisor.health.record",
 ];
+const CURRENT_PRE_INSTALL_SUPERVISOR_CAPABILITIES: &[&str] = &[
+    "module.descriptor.register",
+    "module.supervisor.admission",
+    "module.supervisor.demand.page",
+    "module.supervisor.scope.readback",
+    "module.supervisor.credential.ensure",
+    "module.supervisor.credential.ready",
+    "module.supervisor.recovery.reconcile",
+    "module.supervisor.observation.record",
+    "module.supervisor.health.record",
+    "module.supervisor.health.read",
+];
 const SUPERVISOR_CAPABILITIES: &[&str] = &[
     "module.descriptor.register",
     "module.supervisor.admission",
@@ -58,6 +78,8 @@ const SUPERVISOR_CAPABILITIES: &[&str] = &[
     "module.supervisor.observation.record",
     "module.supervisor.health.record",
     "module.supervisor.health.read",
+    "module.supervisor.install.requests",
+    "module.supervisor.install.complete",
 ];
 
 /// The currently implemented generic module contract. A descriptor may
@@ -145,6 +167,7 @@ pub(super) fn supervisor_scope_matches(client_id: &str, registration: &Value) ->
         && registration["module_scope"] == "descriptor_catalog"
         && (registration["capabilities"] == json!(LEGACY_SUPERVISOR_CAPABILITIES)
             || registration["capabilities"] == json!(PREVIOUS_SUPERVISOR_CAPABILITIES)
+            || registration["capabilities"] == json!(CURRENT_PRE_INSTALL_SUPERVISOR_CAPABILITIES)
             || registration["capabilities"] == json!(SUPERVISOR_CAPABILITIES))
         && registration["token_hash"].as_str().is_some_and(|hash| {
             hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -249,6 +272,349 @@ fn save_registry(tx: &Transaction<'_>, registry: &Registry) -> Result<()> {
     super::set_meta(tx, REGISTRY_KEY, &serde_json::to_value(registry)?)
 }
 
+const MAX_PENDING_DESCRIPTOR_INSTALLS: i64 = 1;
+
+/// Reserve one authenticated Operator handoff as the existing durable Operation.
+/// This transaction never reads the descriptor or touches the filesystem.
+pub(super) fn reserve_descriptor_install(
+    tx: &Transaction<'_>,
+    principal: &Principal,
+    params: &Value,
+    operation_id: &str,
+) -> Result<(Value, bool)> {
+    if principal.role != Role::Operator {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "only the local Operator may request descriptor installation",
+        ));
+    }
+    super::require_local_operator(tx, &principal.client_id)?;
+    let request: ModuleDescriptorInstallRequest = serde_json::from_value(params.clone())
+        .map_err(|_| Error::invalid("installed descriptor request is malformed"))?;
+    let descriptor_path = request.descriptor_file.as_os_str().to_string_lossy();
+    if request.client_request_id.is_empty()
+        || request.client_request_id.len() > 128
+        || request
+            .client_request_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || !request.descriptor_file.is_absolute()
+        || descriptor_path.len() > 1024
+        || descriptor_path.chars().any(char::is_control)
+    {
+        return Err(Error::invalid(
+            "descriptor install request needs an absolute path and request ID",
+        ));
+    }
+    let pending: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM operations WHERE method=?1 AND state='queued' AND operation_id != ?2",
+        params!["module.descriptor.install", operation_id],
+        |row| row.get(0),
+    )?;
+    if pending >= MAX_PENDING_DESCRIPTOR_INSTALLS {
+        return Err(Error::new(
+            "MODULE_INSTALL_IN_PROGRESS",
+            "the previous explicit descriptor install Operation is still pending",
+        ));
+    }
+    Ok((
+        json!({"operation_id":operation_id,"state":"queued","status":"queued"}),
+        true,
+    ))
+}
+
+pub(super) fn has_pending_descriptor_install(db: &Connection) -> Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE method=?1 AND state='queued')",
+        ["module.descriptor.install"],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Return only queued requests for the live child, or the latest successful
+/// explicit path for each currently registered artifact when the host rebuilds
+/// a child bootstrap. Store reads durable Operations only; it performs no I/O.
+pub(super) fn descriptor_install_requests(
+    db: &Connection,
+    include_installed: bool,
+) -> Result<InstalledDescriptorRequestPage> {
+    let mut requests = Vec::new();
+    if include_installed {
+        let registry = load_registry(db)?;
+        for entry in registry.descriptors {
+            let identity = &entry.descriptor;
+            let registered_revision = i64::try_from(entry.registered_revision).map_err(|_| {
+                Error::invalid("registered descriptor revision exceeds SQLite integer range")
+            })?;
+            let retained: Option<(String, String)> = db
+                .query_row(
+                    "SELECT operation_id,original_request_json FROM operations \
+                     WHERE method=?1 AND state='settled' \
+                       AND CASE WHEN json_valid(result_json) THEN json_extract(result_json,'$.outcome') ELSE '' END='installed' \
+                       AND CASE WHEN json_valid(result_json) THEN json_extract(result_json,'$.module_id') ELSE '' END=?2 \
+                       AND CASE WHEN json_valid(result_json) THEN json_extract(result_json,'$.artifact_id') ELSE '' END=?3 \
+                       AND CASE WHEN json_valid(result_json) THEN json_extract(result_json,'$.version') ELSE '' END=?4 \
+                       AND CASE WHEN json_valid(result_json) THEN json_extract(result_json,'$.registered_revision') ELSE 0 END=?5 \
+                     ORDER BY created_at_ms DESC,operation_id DESC LIMIT 1",
+                    params![
+                        "module.descriptor.install",
+                        identity.module_id.to_string(),
+                        identity.artifact.artifact_id.to_string(),
+                        identity.artifact.version.to_string(),
+                        registered_revision,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((operation_id, original)) = retained {
+                let request = parse_descriptor_install_request(&original)?;
+                requests.push(InstalledDescriptorRequestRecord {
+                    operation_id,
+                    descriptor_file: request.descriptor_file,
+                    state: InstalledDescriptorRequestState::Installed,
+                });
+            }
+        }
+    }
+    let mut statement = db.prepare(
+        "SELECT operation_id,original_request_json FROM operations \
+         WHERE method=?1 AND state='queued' ORDER BY created_at_ms,operation_id LIMIT 2",
+    )?;
+    let pending = statement
+        .query_map(["module.descriptor.install"], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if pending.len() > MAX_PENDING_DESCRIPTOR_INSTALLS as usize {
+        return Err(Error::new(
+            "MODULE_INSTALL_REQUEST_LIMIT",
+            "more than one pending descriptor install Operation was retained",
+        ));
+    }
+    for (operation_id, original) in pending {
+        let request = parse_descriptor_install_request(&original)?;
+        requests.push(InstalledDescriptorRequestRecord {
+            operation_id,
+            descriptor_file: request.descriptor_file,
+            state: InstalledDescriptorRequestState::Queued,
+        });
+    }
+    let page = InstalledDescriptorRequestPage { requests };
+    let encoded = serde_json::to_vec(&page)?;
+    if encoded.len() > MAX_PAGE_BYTES {
+        return Err(Error::new(
+            "MODULE_INSTALL_REQUEST_LIMIT",
+            "descriptor install request page exceeds its bounded size",
+        ));
+    }
+    Ok(page)
+}
+
+fn parse_descriptor_install_request(raw: &str) -> Result<ModuleDescriptorInstallRequest> {
+    let request: ModuleDescriptorInstallRequest = serde_json::from_str(raw).map_err(|_| {
+        Error::new(
+            "MODULE_INSTALL_OPERATION_DAMAGED",
+            "install request is invalid",
+        )
+    })?;
+    let descriptor_path = request.descriptor_file.as_os_str().to_string_lossy();
+    if request.client_request_id.is_empty()
+        || request.client_request_id.len() > 128
+        || request
+            .client_request_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || !request.descriptor_file.is_absolute()
+        || descriptor_path.len() > 1024
+        || descriptor_path.chars().any(char::is_control)
+    {
+        return Err(Error::new(
+            "MODULE_INSTALL_OPERATION_DAMAGED",
+            "install request does not retain an absolute descriptor path",
+        ));
+    }
+    Ok(request)
+}
+
+pub(super) fn complete_descriptor_install(
+    tx: &Transaction<'_>,
+    request: CompleteInstalledDescriptorRequest,
+    now: i64,
+) -> Result<InstalledDescriptorCompletionReceipt> {
+    if request.operation_id.is_empty()
+        || request.operation_id.len() > 128
+        || request
+            .operation_id
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+    {
+        return Err(Error::invalid("descriptor install Operation ID is invalid"));
+    }
+    let (method, state, original, previous_result): (String, String, String, Option<String>) = tx
+        .query_row(
+            "SELECT method,state,original_request_json,result_json FROM operations WHERE operation_id=?1",
+            [&request.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::new("NOT_FOUND", "descriptor install Operation was not found"))?;
+    if method != "module.descriptor.install" {
+        return Err(Error::new(
+            "FORBIDDEN",
+            "supervisor completion is scoped to descriptor install Operations",
+        ));
+    }
+    let _installed_request = parse_descriptor_install_request(&original)?;
+    let (next_state, result, receipt) = match request.outcome {
+        InstalledDescriptorCompletionOutcome::Rejected => {
+            if request.registration.is_some() {
+                return Err(Error::invalid(
+                    "rejected install cannot include a registration receipt",
+                ));
+            }
+            let error_code = request
+                .error_code
+                .as_deref()
+                .ok_or_else(|| Error::invalid("rejected install needs a bounded error code"))?;
+            let error_code = safe_descriptor_install_error_code(error_code)?;
+            let result = json!({
+                "operation_id":request.operation_id,
+                "state":"rejected",
+                "outcome":"rejected",
+                "error_code":error_code,
+            });
+            let receipt = InstalledDescriptorCompletionReceipt {
+                operation_id: request.operation_id.clone(),
+                state: InstalledDescriptorOperationState::Rejected,
+                outcome: InstalledDescriptorOperationOutcome::Rejected,
+                module_id: None,
+                artifact: None,
+                catalog_revision: None,
+                registered: None,
+                unchanged: None,
+                error_code: Some(error_code),
+            };
+            ("rejected", result, receipt)
+        }
+        InstalledDescriptorCompletionOutcome::Installed => {
+            if request.error_code.is_some() {
+                return Err(Error::invalid(
+                    "installed descriptor cannot include an error code",
+                ));
+            }
+            let registration = request.registration.ok_or_else(|| {
+                Error::invalid(
+                    "installed descriptor needs the committed Store registration receipt",
+                )
+            })?;
+            validate_install_registration(tx, &registration)?;
+            let result = json!({
+                "operation_id":request.operation_id,
+                "state":"settled",
+                "outcome":"installed",
+                "module_id":registration.module_id,
+                "artifact_id":registration.artifact.artifact_id,
+                "version":registration.artifact.version,
+                "artifact":registration.artifact,
+                "registered":registration.registered,
+                "unchanged":registration.unchanged,
+                "catalog_revision":registration.catalog_revision,
+                "registered_revision":registration.registered_revision,
+            });
+            let receipt = InstalledDescriptorCompletionReceipt {
+                operation_id: request.operation_id.clone(),
+                state: InstalledDescriptorOperationState::Settled,
+                outcome: InstalledDescriptorOperationOutcome::Installed,
+                module_id: Some(registration.module_id),
+                artifact: Some(registration.artifact),
+                catalog_revision: Some(registration.catalog_revision),
+                registered: Some(registration.registered),
+                unchanged: Some(registration.unchanged),
+                error_code: None,
+            };
+            ("settled", result, receipt)
+        }
+    };
+    if state != "queued" {
+        let existing: Value = previous_result
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .ok_or_else(|| {
+                Error::new(
+                    "MODULE_INSTALL_COMPLETION_CONFLICT",
+                    "Operation is already terminal",
+                )
+            })?;
+        if model::canonical(&existing)? == model::canonical(&result)? {
+            return Ok(receipt);
+        }
+        return Err(Error::new(
+            "MODULE_INSTALL_COMPLETION_CONFLICT",
+            "descriptor install Operation already has a different terminal receipt",
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE operations SET state=?2,result_json=?3,settled_at_ms=?4,updated_at_ms=?4 \
+         WHERE operation_id=?1 AND method='module.descriptor.install' AND state='queued'",
+        params![
+            request.operation_id,
+            next_state,
+            model::canonical(&result)?,
+            now
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::new(
+            "MODULE_INSTALL_COMPLETION_CONFLICT",
+            "descriptor install Operation changed before completion",
+        ));
+    }
+    Ok(receipt)
+}
+
+fn validate_install_registration(
+    tx: &Transaction<'_>,
+    receipt: &DescriptorRegistrationReceipt,
+) -> Result<()> {
+    if receipt.registered == receipt.unchanged
+        || receipt.catalog_revision == 0
+        || receipt.registered_revision == 0
+        || receipt.registered_revision > receipt.catalog_revision
+        || (receipt.registered && receipt.registered_revision != receipt.catalog_revision)
+    {
+        return Err(Error::new(
+            "MODULE_INSTALL_REGISTRATION_INVALID",
+            "Store registration receipt has inconsistent durable revisions",
+        ));
+    }
+    let registry = load_registry(tx)?;
+    if receipt.catalog_revision > registry.revision
+        || !registry.descriptors.iter().any(|entry| {
+            entry.descriptor.module_id == receipt.module_id
+                && entry.descriptor.artifact == receipt.artifact
+                && entry.registered_revision == receipt.registered_revision
+        })
+    {
+        return Err(Error::new(
+            "MODULE_INSTALL_REGISTRATION_INVALID",
+            "Store registration receipt does not match its current trusted catalog",
+        ));
+    }
+    Ok(())
+}
+
+fn safe_descriptor_install_error_code(code: &str) -> Result<String> {
+    if code.is_empty()
+        || code.len() > 128
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(Error::invalid("descriptor install error code is invalid"));
+    }
+    Ok(code.to_owned())
+}
 /// Internal host-only registration. This does not inspect or launch an
 /// executable; the trusted local installer/supervisor caller owns that proof.
 /// Existing artifact identities are immutable, so live bindings can retain
@@ -1147,6 +1513,144 @@ mod tests {
         }
     }
 
+    #[test]
+    fn descriptor_install_request_is_local_operator_owned_and_single_flight() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);\
+             CREATE TABLE operations(operation_id TEXT NOT NULL,method TEXT NOT NULL,state TEXT NOT NULL);",
+        )
+        .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        super::super::set_meta(
+            &tx,
+            super::super::LOCAL_OPERATOR_CLIENT_ID_KEY,
+            &json!("local-operator"),
+        )
+        .unwrap();
+        let path = if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\modules\example\module-descriptor.json")
+        } else {
+            std::path::PathBuf::from("/modules/example/module-descriptor.json")
+        };
+        let params = json!({
+            "client_request_id":"descriptor-install-1",
+            "descriptor_file":path,
+        });
+        let manager = Principal {
+            link_id: "manager-link".to_owned(),
+            client_id: "manager".to_owned(),
+            role: Role::Manager,
+        };
+        assert_eq!(
+            reserve_descriptor_install(&tx, &manager, &params, "op-manager")
+                .unwrap_err()
+                .code,
+            "FORBIDDEN"
+        );
+        let operator = Principal {
+            link_id: "operator-link".to_owned(),
+            client_id: "local-operator".to_owned(),
+            role: Role::Operator,
+        };
+        // Production Store::call pre-inserts the current Operation as queued
+        // before reserve runs; the single-flight gate must exclude that self row.
+        tx.execute(
+            "INSERT INTO operations(operation_id,method,state) VALUES('op-install-1','module.descriptor.install','queued')",
+            [],
+        )
+        .unwrap();
+        let (receipt, queued) =
+            reserve_descriptor_install(&tx, &operator, &params, "op-install-1").unwrap();
+        assert!(queued);
+        assert_eq!(receipt["state"], "queued");
+        // Self replay with the same Operation ID stays accepted.
+        let (replay, replay_queued) =
+            reserve_descriptor_install(&tx, &operator, &params, "op-install-1").unwrap();
+        assert!(replay_queued);
+        assert_eq!(replay["operation_id"], "op-install-1");
+        tx.execute(
+            "INSERT INTO operations(operation_id,method,state) VALUES('op-other-pending','module.descriptor.install','queued')",
+            [],
+        )
+        .unwrap();
+        let other_params = json!({
+            "client_request_id":"descriptor-install-2",
+            "descriptor_file":params["descriptor_file"].clone(),
+        });
+        assert_eq!(
+            reserve_descriptor_install(&tx, &operator, &other_params, "op-install-2")
+                .unwrap_err()
+                .code,
+            "MODULE_INSTALL_IN_PROGRESS"
+        );
+    }
+
+    #[test]
+    fn completed_descriptor_install_is_idempotent_and_restores_its_explicit_path() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);\
+             CREATE TABLE operations(\
+                 operation_id TEXT PRIMARY KEY,method TEXT NOT NULL,state TEXT NOT NULL,\
+                 original_request_json TEXT NOT NULL,result_json TEXT,created_at_ms INTEGER NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL,settled_at_ms INTEGER\
+             );",
+        )
+        .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        let descriptor = descriptor();
+        let registration: DescriptorRegistrationReceipt =
+            serde_json::from_value(register_trusted_descriptor(&tx, descriptor.clone()).unwrap())
+                .unwrap();
+        let descriptor_file = if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\modules\example\module-descriptor.json")
+        } else {
+            std::path::PathBuf::from("/modules/example/module-descriptor.json")
+        };
+        let original = json!({
+            "client_request_id":"descriptor-install-2",
+            "descriptor_file":descriptor_file.clone(),
+        });
+        tx.execute(
+            "INSERT INTO operations(\
+                operation_id,method,state,original_request_json,result_json,created_at_ms,updated_at_ms\
+             ) VALUES(?1,'module.descriptor.install','queued',?2,?3,1,1)",
+            params![
+                "op-install-2",
+                model::canonical(&original).unwrap(),
+                model::canonical(&json!({"operation_id":"op-install-2","state":"queued","status":"queued"})).unwrap(),
+            ],
+        )
+        .unwrap();
+        let completion = CompleteInstalledDescriptorRequest {
+            operation_id: "op-install-2".to_owned(),
+            outcome: InstalledDescriptorCompletionOutcome::Installed,
+            registration: Some(registration),
+            error_code: None,
+        };
+        let first = complete_descriptor_install(&tx, completion.clone(), 10).unwrap();
+        let retry = complete_descriptor_install(&tx, completion, 11).unwrap();
+        assert_eq!(first.state, InstalledDescriptorOperationState::Settled);
+        assert_eq!(
+            first.outcome,
+            InstalledDescriptorOperationOutcome::Installed
+        );
+        assert_eq!(first.operation_id, retry.operation_id);
+        let page = descriptor_install_requests(&tx, true).unwrap();
+        assert_eq!(page.requests.len(), 1);
+        assert_eq!(
+            page.requests[0].state,
+            InstalledDescriptorRequestState::Installed
+        );
+        assert_eq!(page.requests[0].descriptor_file, descriptor_file);
+        assert!(
+            descriptor_install_requests(&tx, false)
+                .unwrap()
+                .requests
+                .is_empty()
+        );
+    }
     fn native_mcp_schema_admission(schema_version: &str) -> Option<bool> {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
@@ -1744,11 +2248,36 @@ mod tests {
         ));
         assert!(!supervisor_scope_matches("ordinary-manager", &registration));
 
-        let mut expanded = registration.clone();
-        expanded["capabilities"] = json!(["module.descriptor.register", "module.route.select"]);
+        let mut previous_current = registration.clone();
+        previous_current["capabilities"] = json!(CURRENT_PRE_INSTALL_SUPERVISOR_CAPABILITIES);
+        assert!(supervisor_scope_matches(
+            model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID,
+            &previous_current
+        ));
+        let mut current = registration.clone();
+        current["capabilities"] = json!(SUPERVISOR_CAPABILITIES);
+        assert!(supervisor_scope_matches(
+            model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID,
+            &current
+        ));
+        current["capabilities"] = json!([
+            "module.descriptor.register",
+            "module.supervisor.admission",
+            "module.supervisor.demand.page",
+            "module.supervisor.scope.readback",
+            "module.supervisor.credential.ensure",
+            "module.supervisor.credential.ready",
+            "module.supervisor.recovery.reconcile",
+            "module.supervisor.observation.record",
+            "module.supervisor.health.record",
+            "module.supervisor.health.read",
+            "module.supervisor.install.requests",
+            "module.supervisor.install.complete",
+            "module.route.select",
+        ]);
         assert!(!supervisor_scope_matches(
             model::INTERNAL_MODULE_SUPERVISOR_CLIENT_ID,
-            &expanded
+            &current
         ));
         let mut internal = registration.clone();
         internal["internal_only"] = json!(true);

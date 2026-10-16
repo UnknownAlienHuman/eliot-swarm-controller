@@ -6,7 +6,13 @@
 //! Store handle, database connection, controller object, or host IPC listener
 //! never crosses into this crate.
 
-use crate::control::ObservationDeliveryDisposition;
+use crate::control::{
+    CompleteInstalledDescriptorRequest, DescriptorRegistrationReceipt,
+    InstalledDescriptorCompletionOutcome, InstalledDescriptorOperationOutcome,
+    InstalledDescriptorOperationState, InstalledDescriptorRequestPage,
+    InstalledDescriptorRequestState, ObservationDeliveryDisposition,
+};
+use crate::descriptor::extend_descriptor_catalog;
 use crate::{
     AdmissionState, BindingLaunchConfig, BindingMapPublication, CapabilityId, DemandCause,
     DemandLease, DescriptorCatalog, KernelFault, LaunchValue, ModuleBindingCredential,
@@ -23,7 +29,7 @@ use std::{
     fs,
     io::{BufRead, Cursor, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use swarm_client::IpcConfig;
@@ -41,7 +47,7 @@ const STARTUP_ATTEMPTS: usize = 60;
 const STARTUP_RETRY: Duration = Duration::from_millis(100);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_BOOTSTRAP_BYTES: usize = 65_536;
-const MAX_DESCRIPTOR_FILES: usize = 256;
+const MAX_DESCRIPTOR_FILES: usize = 512;
 const MAX_PROTECTED_FILES: usize = 128;
 const MAX_LAUNCH_CONFIGS: usize = 256;
 const MAX_STATUS_QUEUE: usize = 1_024;
@@ -170,6 +176,65 @@ pub enum StandaloneRouteConfigMapper {
 }
 
 impl StandaloneSupervisorConfig {
+    /// Add retained Operator-installed descriptor files to this child bootstrap.
+    /// The host obtains these explicit paths from completed durable Operations.
+    pub fn append_retained_descriptor_files(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<()> {
+        let mut staged = self.descriptor_files.clone();
+        let mut seen = staged.iter().cloned().collect::<BTreeSet<_>>();
+        for path in paths {
+            if !path.is_absolute() {
+                return Err(Error::invalid("retained descriptor path must be absolute"));
+            }
+            if seen.insert(path.clone()) {
+                staged.push(path);
+            }
+        }
+        if staged.len() > MAX_DESCRIPTOR_FILES {
+            return Err(Error::new(
+                "MODULE_DESCRIPTOR_LIMIT",
+                "retained descriptor bootstrap exceeds its bounded file count",
+            ));
+        }
+        self.descriptor_files = staged;
+        Ok(())
+    }
+
+    /// Hot-update restart admission: prove the combined bootstrap that the
+    /// next host restart would rebuild still fits the 65_536-byte child
+    /// frame. `prior_hot` carries hot paths already admitted in this process
+    /// lifetime; `candidate` is the queued install under review. Uses exact
+    /// serialized bytes via `SupervisorBootstrap::to_frame` (UTF-8/JSON
+    /// accounting), not char counts or the 512-entry bound.
+    pub fn ensure_hot_descriptor_restartable(
+        &self,
+        actor_instance_id: &str,
+        prior_hot: &BTreeSet<PathBuf>,
+        candidate: &Path,
+    ) -> Result<()> {
+        let mut staged = self.clone();
+        if !prior_hot.is_empty() {
+            staged.append_retained_descriptor_files(prior_hot.iter().cloned())?;
+        }
+        staged.append_retained_descriptor_files([candidate.to_path_buf()])?;
+        let probe = SupervisorBootstrap {
+            config: staged,
+            actor_instance_id: Some(actor_instance_id.to_owned()),
+        };
+        probe.to_frame().map(|_| ()).map_err(|error| {
+            if error.message.contains("exceeds its size bound") {
+                Error::new(
+                    "MODULE_BOOTSTRAP_LIMIT",
+                    "retained descriptor bootstrap exceeds its serialized size bound",
+                )
+            } else {
+                error
+            }
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(Error::invalid(
@@ -915,6 +980,7 @@ pub struct StandaloneSupervisor {
     config: StandaloneSupervisorConfig,
     launch_config: Arc<dyn LaunchConfigProvider>,
     actor_instance_id: String,
+    hot_retained_paths: Mutex<BTreeSet<PathBuf>>,
 }
 
 impl StandaloneSupervisor {
@@ -965,19 +1031,18 @@ impl StandaloneSupervisor {
         }
         create_private_directory(&config.state_root)?;
         create_private_directory(&config.resolver_root)?;
-        let mut descriptors = Vec::with_capacity(config.descriptor_files.len());
+        let mut catalog = DescriptorCatalog::default();
         for path in &config.descriptor_files {
-            descriptors.push(
+            let descriptor =
                 load_installed_descriptor(path, &config.install_root).map_err(|error| {
                     Error::new(
                         "MODULE_DESCRIPTOR_UNAVAILABLE",
                         format!("descriptor load failed: {}", error.code),
                     )
-                })?,
-            );
+                })?;
+            catalog = extend_descriptor_catalog(&catalog, descriptor)
+                .map_err(|error| Error::new("MODULE_CATALOG_INVALID", error.to_string()))?;
         }
-        let catalog = DescriptorCatalog::from_descriptors(descriptors)
-            .map_err(|error| Error::new("MODULE_CATALOG_INVALID", error.to_string()))?;
         let control = SupervisorControlClient::new(
             config.root.clone(),
             config.supervisor_credential.clone(),
@@ -1014,6 +1079,7 @@ impl StandaloneSupervisor {
             config,
             launch_config,
             actor_instance_id,
+            hot_retained_paths: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -1064,6 +1130,18 @@ impl StandaloneSupervisor {
                                 recovered = false;
                                 cycle_error = Some(error.code.clone());
                                 eprintln!("module supervisor demand readback: {}", error.code);
+                            }
+                        }
+                    }
+                    if recovered {
+                        match self.reconcile_install_requests().await {
+                            Ok(found) => saw_demand |= found,
+                            Err(error) => {
+                                self.registry
+                                    .close_durable_admission(KernelFault::StoreUnavailable);
+                                recovered = false;
+                                cycle_error = Some(error.code.clone());
+                                eprintln!("module supervisor install handoff: {}", error.code);
                             }
                         }
                     }
@@ -1219,6 +1297,147 @@ impl StandaloneSupervisor {
             .map_err(module_error)
     }
 
+    fn check_hot_bootstrap_capacity(&self, candidate: &Path) -> Result<()> {
+        let prior = self
+            .hot_retained_paths
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| {
+                Error::new(
+                    "MODULE_SUPERVISOR_STATE_INVALID",
+                    "retained bootstrap state is unavailable",
+                )
+            })?;
+        self.config
+            .ensure_hot_descriptor_restartable(&self.actor_instance_id, &prior, candidate)
+    }
+
+    fn note_hot_bootstrap_admitted(&self, candidate: &Path) {
+        if let Ok(mut guard) = self.hot_retained_paths.lock() {
+            guard.insert(candidate.to_path_buf());
+        }
+    }
+
+    fn refresh_hot_bootstrap_installed_paths(
+        &self,
+        page: &InstalledDescriptorRequestPage,
+    ) -> Result<()> {
+        let mut retained = self.hot_retained_paths.lock().map_err(|_| {
+            Error::new(
+                "MODULE_SUPERVISOR_STATE_INVALID",
+                "retained bootstrap state is unavailable",
+            )
+        })?;
+        retain_installed_descriptor_paths(&mut retained, page);
+        Ok(())
+    }
+
+    async fn reconcile_install_requests(&self) -> Result<bool> {
+        // Refresh from durable Store state every pass. A completion may have
+        // committed while its reply was lost, leaving the path absent from
+        // this process's local ledger. If readback fails, `?` keeps the
+        // queued candidate unresolved; it is never rejected from stale data.
+        let page = self.control.install_requests(true).await?;
+        let queued = page
+            .requests
+            .iter()
+            .filter(|request| request.state == InstalledDescriptorRequestState::Queued)
+            .cloned()
+            .collect::<Vec<_>>();
+        if queued.len() > 1 {
+            return Err(Error::new(
+                "MODULE_INSTALL_REQUEST_LIMIT",
+                "Store returned more than one pending descriptor installation",
+            ));
+        }
+        self.refresh_hot_bootstrap_installed_paths(&page)?;
+        let Some(request) = queued.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let descriptor =
+            match load_installed_descriptor(&request.descriptor_file, &self.config.install_root) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    self.reject_install_request(&request.operation_id, &error.code)
+                        .await?;
+                    return Ok(true);
+                }
+            };
+        // P2 hot-descriptor restart byte boundary: enforce the exact
+        // serialized combined-bootstrap capacity BEFORE any Store
+        // registration or catalog publication. A rejected too-large update
+        // settles only its own Operation; catalog and live workers stay.
+        if let Err(error) = self.check_hot_bootstrap_capacity(&request.descriptor_file) {
+            self.reject_install_request(&request.operation_id, &error.code)
+                .await?;
+            return Ok(true);
+        }
+        let registration = match self
+            .registry
+            .register_installed_descriptor(&descriptor)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) if permanent_install_error(&error.code) => {
+                self.reject_install_request(&request.operation_id, &error.code)
+                    .await?;
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
+        let registration: DescriptorRegistrationReceipt = serde_json::from_value(registration)
+            .map_err(|_| {
+                Error::new(
+                    "MODULE_SUPERVISOR_RESPONSE_INVALID",
+                    "Store registration receipt did not match its typed shape",
+                )
+            })?;
+        let completion = CompleteInstalledDescriptorRequest {
+            operation_id: request.operation_id.clone(),
+            outcome: InstalledDescriptorCompletionOutcome::Installed,
+            registration: Some(registration),
+            error_code: None,
+        };
+        let receipt = self.control.complete_install_request(&completion).await?;
+        if receipt.operation_id != request.operation_id
+            || receipt.state != InstalledDescriptorOperationState::Settled
+            || !matches!(
+                receipt.outcome,
+                InstalledDescriptorOperationOutcome::Installed
+                    | InstalledDescriptorOperationOutcome::Unchanged
+            )
+        {
+            return Err(Error::new(
+                "MODULE_SUPERVISOR_RESPONSE_INVALID",
+                "Store did not settle the exact installed descriptor Operation",
+            ));
+        }
+        // Track the admitted path so later hot updates in this process
+        // lifetime see cumulative restart bytes, not just spawn-time bytes.
+        self.note_hot_bootstrap_admitted(&request.descriptor_file);
+        Ok(true)
+    }
+
+    async fn reject_install_request(&self, operation_id: &str, error_code: &str) -> Result<()> {
+        let completion = CompleteInstalledDescriptorRequest {
+            operation_id: operation_id.to_owned(),
+            outcome: InstalledDescriptorCompletionOutcome::Rejected,
+            registration: None,
+            error_code: Some(safe_install_error_code(error_code)),
+        };
+        let receipt = self.control.complete_install_request(&completion).await?;
+        if receipt.operation_id != operation_id
+            || receipt.state != InstalledDescriptorOperationState::Rejected
+            || receipt.outcome != InstalledDescriptorOperationOutcome::Rejected
+        {
+            return Err(Error::new(
+                "MODULE_SUPERVISOR_RESPONSE_INVALID",
+                "Store did not reject the exact descriptor Operation",
+            ));
+        }
+        Ok(())
+    }
     async fn reconcile_demands(
         &self,
         held: &mut HashMap<DemandKey, DemandLease>,
@@ -1715,6 +1934,18 @@ impl StandaloneSupervisor {
     }
 }
 
+fn retain_installed_descriptor_paths(
+    retained: &mut BTreeSet<PathBuf>,
+    page: &InstalledDescriptorRequestPage,
+) {
+    retained.extend(
+        page.requests
+            .iter()
+            .filter(|request| request.state == InstalledDescriptorRequestState::Installed)
+            .map(|request| request.descriptor_file.clone()),
+    );
+}
+
 async fn await_host_admission(
     control: &SupervisorControlClient,
     admission: &watch::Sender<AdmissionState>,
@@ -1744,6 +1975,36 @@ async fn await_host_admission(
     }))
 }
 
+fn safe_install_error_code(code: &str) -> String {
+    if !code.is_empty()
+        && code.len() <= 128
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        code.to_owned()
+    } else {
+        "MODULE_INSTALL_REJECTED".to_owned()
+    }
+}
+
+fn permanent_install_error(code: &str) -> bool {
+    matches!(
+        code,
+        "MODULE_DESCRIPTOR_INVALID"
+            | "MODULE_DESCRIPTOR_IMMUTABLE"
+            | "MODULE_DESCRIPTOR_UNTRUSTED"
+            | "MODULE_ARTIFACT_DIGEST_REQUIRED"
+            | "MODULE_ARTIFACT_MISMATCH"
+            | "MODULE_ARTIFACT_UNAVAILABLE"
+            | "MODULE_SELECTION"
+            | "MODULE_CATALOG_INVALID"
+            | "MODULE_CATALOG_FULL"
+            | "MODULE_DESCRIPTOR_REGISTER_RESPONSE"
+            | "MODULE_DESCRIPTOR_LIMIT"
+            | "MODULE_BOOTSTRAP_LIMIT"
+    )
+}
 fn demand_key(demand: &ModuleDemandRecord) -> DemandKey {
     DemandKey {
         module_id: demand.module_id.clone(),
@@ -2280,5 +2541,202 @@ mod opencode_schema_projection_tests {
             project(&descriptor, &options).unwrap_err().code,
             "MODULE_CONFIG_SCOPE_MISMATCH"
         );
+    }
+}
+
+#[cfg(test)]
+mod hot_bootstrap_byte_boundary_tests {
+    use super::{StandaloneRouteConfigMapper, StandaloneSupervisorConfig, SupervisorBootstrap};
+    use crate::Sha256Digest;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use swarm_client::IpcConfig;
+    use swarm_contracts::Credential;
+
+    const HOT_ACTOR_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn absolute_root(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:\\tmp\\eliot-hot-bootstrap-test\\{name}"))
+        } else {
+            PathBuf::from(format!("/tmp/eliot-hot-bootstrap-test/{name}"))
+        }
+    }
+
+    fn test_config(descriptor_files: Vec<PathBuf>) -> StandaloneSupervisorConfig {
+        StandaloneSupervisorConfig {
+            schema_version: 1,
+            root: absolute_root("root"),
+            ipc: IpcConfig {
+                max_frame_bytes: 1_048_576,
+                max_connections: 256,
+                max_inflight_per_connection: 8,
+                write_timeout_seconds: 15,
+            },
+            supervisor_credential: Credential {
+                client_id: "eliot-module-supervisor-v1".to_owned(),
+                token: "test-token".to_owned(),
+            },
+            install_root: absolute_root("install"),
+            descriptor_files,
+            state_root: absolute_root("state"),
+            resolver_root: absolute_root("resolver"),
+            owner_helper: absolute_root("owner-helper"),
+            owner_helper_sha256: Sha256Digest::new("a".repeat(64)).unwrap(),
+            protected_files: BTreeMap::new(),
+            launch_configs: BTreeMap::new(),
+            route_config_mapper: StandaloneRouteConfigMapper::DescriptorSchema,
+        }
+    }
+
+    /// Build an absolute ASCII descriptor path with an exact UTF-8 byte length.
+    /// Byte length (not char count) is what `to_frame` serializes.
+    fn long_descriptor_path(index: usize, total_bytes: usize) -> PathBuf {
+        let dir = if cfg!(windows) {
+            "C:\\install"
+        } else {
+            "/install"
+        };
+        let sep = std::path::MAIN_SEPARATOR.to_string();
+        let stem = format!("hot-{index:04}-");
+        let ext = ".json";
+        let base_len = dir.len() + sep.len() + stem.len() + ext.len();
+        assert!(total_bytes > base_len, "total_bytes too small");
+        let fill = "a".repeat(total_bytes - base_len);
+        let path = PathBuf::from(format!("{dir}{sep}{stem}{fill}{ext}"));
+        assert_eq!(
+            path.as_os_str().as_encoded_bytes().len(),
+            total_bytes,
+            "long path must measure bytes, not chars"
+        );
+        assert!(path.is_absolute());
+        path
+    }
+
+    #[test]
+    fn lost_completion_reply_restores_installed_paths_before_next_capacity_check() {
+        use super::retain_installed_descriptor_paths;
+        use crate::control::{
+            InstalledDescriptorRequestPage, InstalledDescriptorRequestRecord,
+            InstalledDescriptorRequestState,
+        };
+
+        let config = test_config(vec![absolute_root("short.json")]);
+        let mut committed = BTreeSet::new();
+        let mut next = None;
+        for index in 0..256 {
+            let candidate = long_descriptor_path(index, 1024);
+            if config
+                .ensure_hot_descriptor_restartable(HOT_ACTOR_ID, &committed, &candidate)
+                .is_err()
+            {
+                next = Some(candidate);
+                break;
+            }
+            committed.insert(candidate);
+        }
+        let next = next.expect("a later candidate exceeds the fixed restart frame");
+        let lost = committed.iter().next().unwrap().clone();
+        let mut local = committed.clone();
+        local.remove(&lost);
+        config
+            .ensure_hot_descriptor_restartable(HOT_ACTOR_ID, &local, &next)
+            .expect("the incomplete local ledger would wrongly admit the candidate");
+
+        // The Store committed the first install, but its completion reply was lost.
+        // Its next complete page includes that install and the later queued request.
+        let page = InstalledDescriptorRequestPage {
+            requests: vec![
+                InstalledDescriptorRequestRecord {
+                    operation_id: "committed-with-lost-reply".to_owned(),
+                    descriptor_file: lost,
+                    state: InstalledDescriptorRequestState::Installed,
+                },
+                InstalledDescriptorRequestRecord {
+                    operation_id: "later-queued-install".to_owned(),
+                    descriptor_file: next.clone(),
+                    state: InstalledDescriptorRequestState::Queued,
+                },
+            ],
+        };
+        retain_installed_descriptor_paths(&mut local, &page);
+        assert_eq!(local, committed);
+        assert!(!local.contains(&next));
+        let error = config
+            .ensure_hot_descriptor_restartable(HOT_ACTOR_ID, &local, &next)
+            .unwrap_err();
+        assert_eq!(error.code, "MODULE_BOOTSTRAP_LIMIT");
+        retain_installed_descriptor_paths(&mut local, &page);
+        assert_eq!(local, committed, "durable readback is idempotent");
+    }
+
+    #[test]
+    fn hot_update_byte_boundary_rejects_before_catalog_publish() {
+        let short = absolute_root("short.json");
+        let config = test_config(vec![short]);
+        let mut prior = BTreeSet::new();
+        let mut admitted = 0_usize;
+        let mut rejected: Option<PathBuf> = None;
+        let mut rejected_code = String::new();
+        for index in 0..256 {
+            let candidate = long_descriptor_path(index, 1024);
+            match config.ensure_hot_descriptor_restartable(HOT_ACTOR_ID, &prior, &candidate) {
+                Ok(()) => {
+                    prior.insert(candidate);
+                    admitted += 1;
+                }
+                Err(error) => {
+                    rejected = Some(candidate);
+                    rejected_code = error.code.clone();
+                    break;
+                }
+            }
+        }
+        let rejected = rejected.expect("65 x 1024-byte paths must exceed the 65_536-byte frame");
+        assert_eq!(rejected_code, "MODULE_BOOTSTRAP_LIMIT");
+        // The 512-entry count bound alone would still allow this update.
+        assert!(
+            admitted < 65,
+            "byte bound must trigger before 65 x 1024-byte paths"
+        );
+        assert!(
+            prior.len() + 1 < 512,
+            "count bound alone would allow the rejected update"
+        );
+        // Rejection leaves the admitted set unchanged: the caller returns
+        // before Store registration and catalog publication, so live workers stay.
+        assert!(!prior.contains(&rejected));
+        assert_eq!(prior.len(), admitted);
+        // Exact serialized accounting: admitted fits, admitted plus rejected does not.
+        let mut fits = config.clone();
+        fits.append_retained_descriptor_files(prior.iter().cloned())
+            .unwrap();
+        SupervisorBootstrap {
+            config: fits,
+            actor_instance_id: Some(HOT_ACTOR_ID.to_owned()),
+        }
+        .to_frame()
+        .expect("admitted set must still fit the restart frame");
+        let mut overflows = config.clone();
+        overflows
+            .append_retained_descriptor_files(prior.iter().cloned())
+            .unwrap();
+        overflows
+            .append_retained_descriptor_files([rejected.clone()])
+            .unwrap();
+        assert!(overflows.descriptor_files.len() < 512);
+        let frame_error = SupervisorBootstrap {
+            config: overflows,
+            actor_instance_id: Some(HOT_ACTOR_ID.to_owned()),
+        }
+        .to_frame()
+        .unwrap_err();
+        assert!(frame_error.message.contains("exceeds its size bound"));
+        // A duplicate of an already-admitted path adds no bytes and stays admissible.
+        let duplicate = prior.iter().next().unwrap().clone();
+        config
+            .ensure_hot_descriptor_restartable(HOT_ACTOR_ID, &prior, &duplicate)
+            .expect("duplicate retained path must not grow the restart frame");
+        let _ = Path::new("placeholder");
     }
 }

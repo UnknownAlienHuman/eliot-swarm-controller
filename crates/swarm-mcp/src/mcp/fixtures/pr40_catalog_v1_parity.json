@@ -179,10 +179,10 @@
         "serialized_tool_bytes": 155613
       },
       "current": {
-        "method_count": 160,
-        "catalog_v1": "482bc0f67356afd0f8117d06436eedc58379621a5d7eed683f144d91466ed150",
-        "surface_v1": "7c455e5be1c9d650327684b7024381fcc6bbbf9837a1c48946fd31b62ac14651",
-        "serialized_tool_bytes": 182209
+        "method_count": 161,
+        "catalog_v1": "aebc5960e151529cdca1aec1994e548aee53cb093764d498fd8559e86c408edf",
+        "surface_v1": "4a76b9151c63813fac3878005195159f570f4e46c694d308b3f56ad5cbf07131",
+        "serialized_tool_bytes": 182857
       },
       "unchanged": {
         "row_count": 138,
@@ -580,6 +580,20 @@
       "wire_fields": [
         "inputSchema"
       ]
+    },
+    {
+      "method": "module.descriptor.install",
+      "current_row_digests": {
+        "full": "326e0a94ae3586dd59d1e2e1523a42bba4e1ca229b13c53884cb5da4820af42e"
+      },
+      "wire_fields": [
+        "metadata",
+        "description",
+        "inputSchema"
+      ],
+      "source_note": "Operator-only hot descriptor installation adds one FullCompatibility row. Historical and restricted-profile vectors are retained unchanged.",
+      "state": "added",
+      "historical_row_digests": {}
     }
   ]
 }

@@ -673,6 +673,16 @@ impl RestartPolicy {
     }
 }
 
+/// One explicit local Operator request to admit an already-installed descriptor.
+/// The Store retains this path only in the private durable Operation request;
+/// the supervisor validates the receipt, root containment, and executable hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleDescriptorInstallRequest {
+    pub client_request_id: String,
+    pub descriptor_file: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleDescriptor {

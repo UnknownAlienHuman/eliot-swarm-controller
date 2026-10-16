@@ -770,6 +770,11 @@ fn kernel_lifecycle_name(lifecycle: swarm_kernel::KernelHostLifecycle) -> &'stat
 
 impl Store {
     /// A periodic durable snapshot covers missed change notifications and restarts.
+    pub(crate) async fn has_pending_descriptor_install(&self) -> Result<bool> {
+        self.run(|db| module_handshake::has_pending_descriptor_install(db))
+            .await
+    }
+    /// A periodic durable snapshot covers missed change notifications and restarts.
     pub(crate) fn subscribe_module_demand_changes(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
     }
@@ -2118,6 +2123,7 @@ impl Store {
                 | "module.outcome"
                 | "module.observe"
                 | "module.event"
+                | "module.descriptor.install"
                 | "bus.consumer.admit"
                 | "swarm.launch"
                 | "coordination.watch.create"
@@ -2359,6 +2365,42 @@ impl Store {
         match method.as_str() {
             "module.descriptor.register" => {
                 self.register_module_descriptor(principal, params).await
+            }
+            "module.supervisor.install.requests" => {
+                model::fields(&params, &["include_installed"])?;
+                let include_installed = params["include_installed"]
+                    .as_bool()
+                    .ok_or_else(|| Error::invalid("include_installed must be a boolean"))?;
+                let requests = self
+                    .run(move |db| {
+                        module_handshake::descriptor_install_requests(db, include_installed)
+                    })
+                    .await?;
+                serde_json::to_value(requests).map_err(Into::into)
+            }
+            "module.supervisor.install.complete" => {
+                let request: swarm_supervisor::control::CompleteInstalledDescriptorRequest =
+                    serde_json::from_value(params).map_err(|_| {
+                        Error::invalid("descriptor install completion is malformed")
+                    })?;
+                let authorization = principal.clone();
+                let receipt = self
+                    .run(move |db| {
+                        let current = current_principal(db, authorization)?;
+                        module_handshake::require_supervisor_scope(db, &current)?;
+                        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                        let receipt = module_handshake::complete_descriptor_install(
+                            &tx,
+                            request,
+                            model::now_ms()?,
+                        )?;
+                        tx.commit()?;
+                        Ok(receipt)
+                    })
+                    .await?;
+                self.changed
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
+                serde_json::to_value(receipt).map_err(Into::into)
             }
             "module.supervisor.admission" => {
                 model::fields(&params, &[])?;
@@ -3898,7 +3940,9 @@ fn initialize_database(
             "module.supervisor.recovery.reconcile",
             "module.supervisor.observation.record",
             "module.supervisor.health.record",
-            "module.supervisor.health.read"
+            "module.supervisor.health.read",
+            "module.supervisor.install.requests",
+            "module.supervisor.install.complete"
         ],
     });
     match meta(tx, &supervisor_key)? {
@@ -7296,6 +7340,16 @@ fn apply(
             ))
         }
         "gm.handover" => gm::handover(tx, p, v, id).map(|v| (v, false)),
+        "module.descriptor.install" => {
+            let queued = module_handshake::reserve_descriptor_install(tx, p, v, id)?;
+            if !config.module_supervisor.enabled {
+                return Err(Error::new(
+                    "MODULE_SUPERVISOR_UNAVAILABLE",
+                    "module supervisor is not enabled for installed descriptor requests",
+                ));
+            }
+            Ok(queued)
+        }
         "module.route.select" => {
             module_handshake::select_route(tx, p, v, config, id).map(|value| (value, false))
         }
