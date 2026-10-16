@@ -9,8 +9,8 @@
 use crate::control::{
     CompleteInstalledDescriptorRequest, DescriptorRegistrationReceipt,
     InstalledDescriptorCompletionOutcome, InstalledDescriptorOperationOutcome,
-    InstalledDescriptorOperationState, InstalledDescriptorRequestState,
-    ObservationDeliveryDisposition,
+    InstalledDescriptorOperationState, InstalledDescriptorRequestPage,
+    InstalledDescriptorRequestState, ObservationDeliveryDisposition,
 };
 use crate::descriptor::extend_descriptor_catalog;
 use crate::{
@@ -1318,23 +1318,42 @@ impl StandaloneSupervisor {
         }
     }
 
+    fn refresh_hot_bootstrap_installed_paths(
+        &self,
+        page: &InstalledDescriptorRequestPage,
+    ) -> Result<()> {
+        let mut retained = self.hot_retained_paths.lock().map_err(|_| {
+            Error::new(
+                "MODULE_SUPERVISOR_STATE_INVALID",
+                "retained bootstrap state is unavailable",
+            )
+        })?;
+        retain_installed_descriptor_paths(&mut retained, page);
+        Ok(())
+    }
+
     async fn reconcile_install_requests(&self) -> Result<bool> {
-        let page = self.control.install_requests(false).await?;
-        if page.requests.len() > 1 {
+        // Refresh from durable Store state every pass. A completion may have
+        // committed while its reply was lost, leaving the path absent from
+        // this process's local ledger. If readback fails, `?` keeps the
+        // queued candidate unresolved; it is never rejected from stale data.
+        let page = self.control.install_requests(true).await?;
+        let queued = page
+            .requests
+            .iter()
+            .filter(|request| request.state == InstalledDescriptorRequestState::Queued)
+            .cloned()
+            .collect::<Vec<_>>();
+        if queued.len() > 1 {
             return Err(Error::new(
                 "MODULE_INSTALL_REQUEST_LIMIT",
                 "Store returned more than one pending descriptor installation",
             ));
         }
-        let Some(request) = page.requests.into_iter().next() else {
+        self.refresh_hot_bootstrap_installed_paths(&page)?;
+        let Some(request) = queued.into_iter().next() else {
             return Ok(false);
         };
-        if request.state != InstalledDescriptorRequestState::Queued {
-            return Err(Error::new(
-                "MODULE_INSTALL_REQUEST_INVALID",
-                "pending descriptor request has a non-queued state",
-            ));
-        }
 
         let descriptor =
             match load_installed_descriptor(&request.descriptor_file, &self.config.install_root) {
@@ -1913,6 +1932,18 @@ impl StandaloneSupervisor {
         }
         Ok(health_code)
     }
+}
+
+fn retain_installed_descriptor_paths(
+    retained: &mut BTreeSet<PathBuf>,
+    page: &InstalledDescriptorRequestPage,
+) {
+    retained.extend(
+        page.requests
+            .iter()
+            .filter(|request| request.state == InstalledDescriptorRequestState::Installed)
+            .map(|request| request.descriptor_file.clone()),
+    );
 }
 
 async fn await_host_admission(
@@ -2580,6 +2611,59 @@ mod hot_bootstrap_byte_boundary_tests {
         );
         assert!(path.is_absolute());
         path
+    }
+
+    #[test]
+    fn lost_completion_reply_restores_installed_paths_before_next_capacity_check() {
+        use crate::control::InstalledDescriptorRequestRecord;
+
+        let config = test_config(vec![absolute_root("short.json")]);
+        let mut committed = BTreeSet::new();
+        let mut next = None;
+        for index in 0..256 {
+            let candidate = long_descriptor_path(index, 1024);
+            if config
+                .ensure_hot_descriptor_restartable(HOT_ACTOR_ID, &committed, &candidate)
+                .is_err()
+            {
+                next = Some(candidate);
+                break;
+            }
+            committed.insert(candidate);
+        }
+        let next = next.expect("a later candidate exceeds the fixed restart frame");
+        let lost = committed.iter().next().unwrap().clone();
+        let mut local = committed.clone();
+        local.remove(&lost);
+        config
+            .ensure_hot_descriptor_restartable(HOT_ACTOR_ID, &local, &next)
+            .expect("the incomplete local ledger would wrongly admit the candidate");
+
+        // The Store committed the first install, but its completion reply was lost.
+        // Its next complete page includes that install and the later queued request.
+        let page = InstalledDescriptorRequestPage {
+            requests: vec![
+                InstalledDescriptorRequestRecord {
+                    operation_id: "committed-with-lost-reply".to_owned(),
+                    descriptor_file: lost,
+                    state: InstalledDescriptorRequestState::Installed,
+                },
+                InstalledDescriptorRequestRecord {
+                    operation_id: "later-queued-install".to_owned(),
+                    descriptor_file: next.clone(),
+                    state: InstalledDescriptorRequestState::Queued,
+                },
+            ],
+        };
+        retain_installed_descriptor_paths(&mut local, &page);
+        assert_eq!(local, committed);
+        assert!(!local.contains(&next));
+        let error = config
+            .ensure_hot_descriptor_restartable(HOT_ACTOR_ID, &local, &next)
+            .unwrap_err();
+        assert_eq!(error.code, "MODULE_BOOTSTRAP_LIMIT");
+        retain_installed_descriptor_paths(&mut local, &page);
+        assert_eq!(local, committed, "durable readback is idempotent");
     }
 
     #[test]
