@@ -96,7 +96,7 @@ controlRoot = 'C:\SwarmState\command-runs'
 # Current writable route: standalone Rust swarm-adapter-codex over an
 # explicitly operator-owned installed Codex app-server. New Store bindings
 # require the exact registered current descriptor (codex-rust-controller.1,
-# v10), including TaskPrompt v1 and dispatch-admission schemas; the Store builds
+# v11.4), including TaskPrompt v1 and dispatch-admission schemas; the Store builds
 # the immutable prompt from the frozen Task. The Python bridge is historical
 # fixture provenance and is not a new writable route.
 # Provider is its registered native provider ID; model is the Codex-visible ID.

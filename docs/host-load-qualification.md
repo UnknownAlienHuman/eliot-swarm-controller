@@ -1,13 +1,16 @@
 # Host-only load contour
 
-C11 measurement, recorded 2026-10-02. This document describes a reproducible
-host-only measurement scenario and one recorded run of it. It is contour
-qualification on fixtures: no native runtimes, bridges or model calls were
-involved, and nothing here is platform qualification, a benchmark claim, or
-evidence about real incidents. The plan's figures (200 observed agents /
-1 000 small events per second / p95 host < 100 ms; implementation plan v6
-§12, architecture §14) are *measurement targets*; this contour records what
-one run measured, under the conditions stated below, and no more.
+C11 measurement contour, scenario documented 2026-10-02. This document
+describes a reproducible host-only measurement scenario and local runs
+recorded on 2026-10-15 and 2026-10-16. It is contour qualification on
+fixtures: no native runtimes, bridges or model calls were involved, and
+nothing here is platform qualification, a benchmark claim, or evidence about
+real incidents.
+
+The plan's figures (200 observed agents / 1 000 small events per second /
+p95 host < 100 ms; implementation plan v6 §12, architecture §14) are
+*measurement targets*. Each recorded run reports what it measured, under its
+stated conditions, and no more.
 
 ## Local Windows execution, 15 October 2026
 
@@ -39,6 +42,39 @@ percentage gate. The 1,000-events/s target was **not met**. The harness integrit
 checks passed, but Issue #11 remains open for the throughput target and its
 separate requirement to qualify 200 real native agents. This run establishes
 neither a native population result nor a whole-project pass.
+
+## Local Windows execution, 16 October 2026
+
+The [result record](qualification/2026-10-16-c11-controller-only.json) identifies
+the measured release package source as commit
+54e30898245d54897d532f5f13d1d10dafeda916, tree
+922ed5f0d700cf7c6f8d8b8185c687d363863cd4. Its recorded kernel host image
+SHA-256 is
+75277b11904f40d8880b234fe7424559a4afd4bb0f648606e2e8f2686ffc96d4; the
+supervisor image SHA-256 is
+d5e95a6af9b88fb3a6205ec360094e3ac5a5c914b8c6035f855fbef958260ff7. The
+record retains raw result and build SHA-256 digests. No build was observed in
+this worktree and the benchmark was not rerun here. These are identities and
+measurements for this recorded run, not final-head or whole-project qualification.
+
+| Measurement | Result |
+| --- | --- |
+| Registered / connected controller clients | 200 / 200 |
+| Senders / consumers | 32 / 168 |
+| Accepted sends / errors | 4,147 / 0 |
+| Event load window | 22.154 s |
+| Durable event admissions | 187.2 events/s |
+| Verification drain | Exactly 4,147 matching events |
+| Loaded host.status p95 | 1.396 ms |
+| Host / driver CPU | 23.296875 s / 1.3 s |
+| Host peak working set | 55,250,944 bytes |
+| Host exit | 0, owned fixture host stdin EOF |
+| Native agents measured | 0 |
+| 1,000 events/s target | **Not met** |
+
+This was one measurement (n=1); other machine activity was uncontrolled.
+The recorded environment was Windows 11 build 10.0.26300, AMD64, 32 CPUs,
+Python 3.13.15. The result makes no statistical speedup claim.
 
 ## Scenario
 
