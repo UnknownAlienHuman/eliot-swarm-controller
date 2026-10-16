@@ -6449,7 +6449,8 @@ mod tests {
     async fn pr44_command_acp_production_control_keeps_prompt_on_permission_cancel_unknown()
     -> super::Result<()> {
         let state = TestState::new()?;
-        let (dispatch_command, _) = task_prompt_fixture()?;
+        let (mut dispatch_command, _) = task_prompt_fixture()?;
+        dispatch_command.route["module_artifact_id"] = json!(crate::ACP_ARTIFACT_ID);
         let session_id = SessionId::new("session-production-cancel-unknown-fixture");
         let session = super::ActiveSession {
             id: session_id.clone(),
@@ -6472,6 +6473,9 @@ mod tests {
             command.route = dispatch_command.route.clone();
             command.native_root_id = Some(session_id.to_string());
             command.input = json!({
+                "client_request_id": command.operation_id,
+                "binding_id": command.binding_id,
+                "generation": command.generation,
                 "session_id": session_id,
                 "target_operation_id": dispatch_command.operation_id,
                 "turn_id": dispatch_command.operation_id
