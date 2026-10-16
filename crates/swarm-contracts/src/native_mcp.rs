@@ -36,6 +36,7 @@ const MAX_SERVICE_ID_BYTES: usize = 128;
 const MAX_SERVICE_VERSION_BYTES: usize = 128;
 const MAX_NATIVE_TEXT_BYTES: usize = 256;
 const MAX_NATIVE_MCP_SERVERS: usize = 256;
+#[cfg(test)]
 const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 
 pub const NATIVE_MCP_ASSIGNMENT_READBACK_KIND: &str = "native_mcp_assignment_readback";
@@ -201,7 +202,7 @@ impl NativeMcpAssignmentReadback {
             || !is_lower_sha256(&self.assignment_sha256)
             || !service_id(&self.service_id)
             || self.service_pid == 0
-            || self.service_version != PINNED_OPENCODE_VERSION
+            || !service_version(&self.service_version)
             || !is_lower_sha256(&self.location_sha256)
             || self.observed_at_ms <= 0
             || self.mcp_servers.len() > MAX_NATIVE_MCP_SERVERS
@@ -435,9 +436,15 @@ mod tests {
         let readback = valid_readback();
         assert!(readback.validate().is_ok());
 
-        let mut wrong_version = readback.clone();
-        wrong_version.service_version = "2.0.8".into();
-        assert!(wrong_version.validate().is_err());
+        // This DTO validates sanitized facts. The adapter/Store bind the
+        // observed version to the exact live native instance, not one release.
+        let mut other_version = readback.clone();
+        other_version.service_version = "2.0.8".into();
+        assert!(other_version.validate().is_ok());
+        for invalid_version in ["", "2.0.8\n", "version with spaces"] {
+            other_version.service_version = invalid_version.into();
+            assert!(other_version.validate().is_err());
+        }
 
         let mut wrong_session = readback.clone();
         wrong_session.native_session.id = "ses_../other".into();

@@ -31,6 +31,9 @@ const MAX_ID_BYTES: usize = 256;
 const MAX_COMMAND_ARGS: usize = 64;
 const MAX_ARG_BYTES: usize = 32 * 1024;
 const MAX_SERVER_ENTRIES: usize = 256;
+/// Baseline fixture version used by tests. Production gates compare the
+/// observation against the live native identity instead of this value.
+#[cfg(test)]
 const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 const RPC_ID: &str = "eliot.native-mcp-proof.v1";
 
@@ -141,7 +144,6 @@ pub async fn execute(
         .is_some_and(|observation| {
             observation.service_id != options.service_id
                 || observation.service_pid != native.process_id()
-                || observation.service_version != PINNED_OPENCODE_VERSION
                 || observation.service_version != native.process_version()
         })
     {
@@ -834,7 +836,6 @@ fn validate_assignment_observe_request(
         || observation.service_id != options.service_id
         || scope.get("service_id").and_then(Value::as_str) != Some(observation.service_id.as_str())
         || service_pid != Some(u64::from(observation.service_pid))
-        || observation.service_version != PINNED_OPENCODE_VERSION
         || scope.get("expected_version").and_then(Value::as_str)
             != Some(observation.service_version.as_str())
         || observation.native_session_id
@@ -1100,13 +1101,13 @@ fn project_assignment_readback(
         serde_json::from_value(mcp_value.clone()).map_err(|_| {
             reject(
                 "NATIVE_MCP_SCHEMA",
-                "OpenCode MCP response does not match the pinned 2.0.7 contract",
+                "OpenCode MCP response does not match the admitted native contract",
             )
         })?;
     let directory = options.directory.to_str().unwrap_or_default();
     if response.location.directory != directory
         || response.data.len() > MAX_SERVER_ENTRIES
-        || native.process_version() != PINNED_OPENCODE_VERSION
+        || observation.service_version != native.process_version()
         || native.process_id() != observation.service_pid
     {
         return Err(reject(
@@ -1476,6 +1477,17 @@ mod tests {
         })
     }
 
+    fn assigned_effect_with_version(
+        options: &NativeOptions,
+        service_pid: u32,
+        version: &str,
+    ) -> Value {
+        let mut effect = assigned_effect(options, service_pid);
+        effect["scope"]["expected_version"] = json!(version);
+        effect["prepared"]["service_version"] = json!(version);
+        effect
+    }
+
     fn installed_server_effect(options: &NativeOptions, service_pid: u32) -> Value {
         let directory = options.directory.to_str().unwrap();
         let assignment = assigned_value("ses_123");
@@ -1755,6 +1767,110 @@ mod tests {
         assert!(!serialized.contains("private server error"));
         assert!(!serialized.contains("integration-alpha"));
         assert!(!serialized.contains("private session payload"));
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn assigned_session_observe_accepts_same_shape_different_native_version() {
+        const OTHER_VERSION: &str = "2.0.8";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let directory = std::env::current_dir().unwrap();
+        let directory_text = directory.to_str().unwrap().to_owned();
+        let service_pid = std::process::id();
+        let options = test_options(
+            directory,
+            std::env::temp_dir().join(format!("native-mcp-{}.json", uuid::Uuid::new_v4())),
+            "service",
+        );
+        let connection_file = TempConnectionFile(options.connection_file.clone());
+        tokio::fs::write(
+            &connection_file.0,
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "endpoint":endpoint,
+                "pid":service_pid,
+                "username":"fixture",
+                "password":"fixture-secret",
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let expected_mcp_path = scoped_path("/api/mcp", &directory_text);
+        let expected_session_path = scoped_path("/api/session/ses_123", &directory_text);
+        let server = tokio::spawn(async move {
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (method, path) = read_request(&mut stream).await;
+                assert_eq!(method, "GET");
+                let response = if path == expected_mcp_path {
+                    json!({
+                        "location":{"directory":directory_text},
+                        "data":[
+                            {"name":"zeta","status":{"status":"connected"}},
+                        ]
+                    })
+                } else if path == expected_session_path {
+                    json!({"data":{
+                        "id":"ses_123",
+                        "projectID":"native-project-without-prefix",
+                        "time":{"created":10,"updated":11},
+                    }})
+                } else {
+                    assert_eq!(path, "/api/info");
+                    json!({
+                        "version":"2.0.8",
+                        "pid":service_pid,
+                        "urls":["http://127.0.0.1/"],
+                        "paths":{"tmp":"fixture"}
+                    })
+                };
+                respond(&mut stream, response).await;
+            }
+        });
+
+        let (native, _) = NativeClient::connect(&options).await.unwrap();
+        let receipt = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute(
+                &native,
+                &runtime_command(assigned_effect_with_version(
+                    &options,
+                    service_pid,
+                    OTHER_VERSION,
+                )),
+                &options,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|error| panic!("unexpected execution failure: {}", error.error.code));
+        assert_eq!(receipt["action"], "observe");
+        assert_eq!(receipt["observation_kind"], "assigned_session");
+        assert_eq!(receipt["native_replay"], false);
+        assert_eq!(receipt["readback"]["service_version"], OTHER_VERSION);
+        assert_eq!(receipt["readback"]["native_session"]["id"], "ses_123");
+        assert_eq!(receipt["readback"]["mcp_servers"][0]["name"], "zeta");
+        assert_eq!(receipt["readback"]["mcp_servers"][0]["status"], "connected");
+
+        let mismatch = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute(
+                &native,
+                &runtime_command(assigned_effect(&options, service_pid)),
+                &options,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect_err("stale pinned version must not satisfy a live native identity");
+        assert_eq!(mismatch.error.code, "NATIVE_INSTANCE_CHANGED");
+
         tokio::time::timeout(Duration::from_secs(3), server)
             .await
             .unwrap()
