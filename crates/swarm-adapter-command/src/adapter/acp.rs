@@ -6667,6 +6667,12 @@ mod tests {
             }
             Ok::<(), agent_client_protocol::Error>(())
         });
+        let (connection_done_tx, connection_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let client = async move {
+            let result = client.await;
+            let _ = connection_done_tx.send(());
+            result
+        };
         let peer = async move {
             let Some(TransportFrame::Single(RawJsonRpcMessage::Request(prompt))) =
                 peer.rx.next().await
@@ -6680,6 +6686,10 @@ mod tests {
                 panic!("later exact cancel reaches native once")
             };
             assert_eq!(cancel.method.as_ref(), "session/cancel");
+            // The physical receiver must outlive the client's final control
+            // ACK and connection drain; EOF here would be a transport fault.
+            let _ = connection_done_rx.await;
+            drop(peer);
             Ok::<(), agent_client_protocol::Error>(())
         };
         tokio::time::timeout(Duration::from_secs(5), async {
