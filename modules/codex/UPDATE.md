@@ -12,14 +12,14 @@
 | License | Apache-2.0 (`vendor_bridge/LICENSE`) |
 | Legacy Python bridge artifact | `codex-sdk-18194bf-bridge.3` |
 | Standalone Rust artifact | `codex-rust-controller.1` |
-| Standalone Rust descriptor version | `11` (current; prior versions remain historical contracts) |
+| Standalone Rust descriptor version | `11.1` (current; prior versions remain historical contracts) |
 | Standalone Rust package / binary | `swarm-adapter-codex` / `swarm-codex-adapter` |
 | Standalone Rust source | `crates/swarm-adapter-codex` |
 | Runtime dependencies | exact pins in `requirements.txt` |
 
 The donor and bridge.2/bridge.3 sections below describe only the legacy Python
 bridge artifact `.3` under `modules/codex`. The standalone Rust artifact
-`.1`, current descriptor version `11`, is a separate package and does not vendor
+`.1`, current descriptor version `11.1`, is a separate package and does not vendor
 or update this Python SDK unit.
 
 ## Legacy Python bridge artifact `.3`: ELIOT-owned changes in bridge.2
@@ -61,12 +61,12 @@ remains `openai-codex-cli-bin==0.153.4`. The
 [security patch record](VENDOR-SECURITY-PATCHES.md) retains the original and
 patched hashes; `verify_vendor.py` checks the complete patched unit.
 
-## Standalone Rust controller artifact `.1`, current descriptor version `11`
+## Standalone Rust controller artifact `.1`, current descriptor version `11.1`
 
 The Rust adapter is separate from the legacy Python bridge and is sourced from
 `crates/swarm-adapter-codex`, with artifact `codex-rust-controller.1` and
-descriptor version `11`. It retains the v4 normalized dispatch/result schema
-pair, adds TaskPrompt v1 and Goal continuation admission/terminal evidence
+descriptor version `11.1`. It retains the v4 normalized dispatch/result schema
+pair, TaskPrompt v1 and Goal continuation admission/terminal evidence
 schemas, and uses the exact route contract `runtime = "codex"`,
 `workspace_option = "workspaceRoot"`, and native options `modelProvider`,
 `model`, and `workspaceRoot`. Model and provider overrides are independently
@@ -78,6 +78,14 @@ remains:
 ```json
 {"kind":"codex_assistant_result","input_operation_id":"<exact task.dispatch operation ID>"}
 ```
+
+Version 11.1 retains the verified current `agent.open` record after its outcome
+is acknowledged. Subsequent dispatch and journal reopen can still validate the
+same native root. The acknowledged record does not become pending work again;
+ordinary compaction can remove it after another root replaces it. Its control
+schemas are unchanged from v11. The separate install coordinate preserves old
+installed bytes and bindings; it does not reconstruct proof already lost by an
+older journal or authorize input replay.
 
 The current controller retains the v6 result boundary described below; the
 descriptor version change does not add child-history or tool-item projection.

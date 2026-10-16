@@ -46,7 +46,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub const ARTIFACT_ID: &str = swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID;
-pub const ARTIFACT_VERSION: &str = "11";
+pub const ARTIFACT_VERSION: &str = "11.1";
 pub const MODULE_ID: &str = "codex";
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_HISTORY_PAGES: usize = 100;
