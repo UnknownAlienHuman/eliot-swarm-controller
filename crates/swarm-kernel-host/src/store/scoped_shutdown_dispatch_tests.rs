@@ -64,6 +64,10 @@ fn codex_descriptor() -> swarm_contracts::module_catalog::ModuleDescriptor {
         .unwrap()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep both exact binding identities explicit at the SQLite fixture boundary."
+)]
 fn insert_binding(
     tx: &Transaction<'_>,
     binding_id: &str,
