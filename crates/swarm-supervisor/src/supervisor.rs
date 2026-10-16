@@ -3709,10 +3709,8 @@ impl Service {
         token: &str,
         helper: &ProcessIdentity,
     ) -> Result<()> {
-        Uuid::parse_str(boot_id)
-            .map_err(|_| Error::invalid("departure boot is not a UUID"))?;
-        Uuid::parse_str(token)
-            .map_err(|_| Error::invalid("departure token is invalid"))?;
+        Uuid::parse_str(boot_id).map_err(|_| Error::invalid("departure boot is not a UUID"))?;
+        Uuid::parse_str(token).map_err(|_| Error::invalid("departure token is invalid"))?;
         if owner.get("version").and_then(Value::as_u64) != Some(1)
             || owner.get("token").and_then(Value::as_str) != Some(token)
             || owner
@@ -6662,7 +6660,10 @@ mod tests {
             service.descriptor.artifact.version.as_str()
         );
         assert_eq!(proved.build_id, service.descriptor.artifact.build_id);
-        assert_eq!(proved.descriptor_fingerprint, service.descriptor_fingerprint);
+        assert_eq!(
+            proved.descriptor_fingerprint,
+            service.descriptor_fingerprint
+        );
         assert_eq!(proved.scope, service.scope);
         assert_eq!(proved.boot_id, boot);
         assert_eq!(proved.owner, owner);
@@ -6684,33 +6685,27 @@ mod tests {
         assert_eq!(restarted.token, token);
         // Missing guard: no file is never a proof.
         fs::remove_file(&path).unwrap();
-        assert!(service
-            .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
-            .unwrap()
-            .is_none());
+        assert!(
+            service
+                .read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper))
+                .unwrap()
+                .is_none()
+        );
         // Restore valid for corrupt/mismatch guards.
         service
             .write_owner_departure_receipt(&boot, &owner, &token, &helper)
             .unwrap();
         // Corrupt guard: invalid shape must block.
         fs::write(&path, b"{not-json").unwrap();
-        let corrupt = service.read_owner_departure_receipt_for(
-            Some(&boot),
-            &owner,
-            &token,
-            Some(&helper),
-        );
+        let corrupt =
+            service.read_owner_departure_receipt_for(Some(&boot), &owner, &token, Some(&helper));
         assert!(corrupt.is_err(), "corrupt receipt must not be consumable");
-        assert_eq!(
-            corrupt.unwrap_err().code,
-            "MODULE_OWNER_DEPARTURE_INVALID"
-        );
+        assert_eq!(corrupt.unwrap_err().code, "MODULE_OWNER_DEPARTURE_INVALID");
         // Wrong-boot guard: no reuse across boots.
         service
             .write_owner_departure_receipt(&boot, &owner, &token, &helper)
             .unwrap();
-        let mut wrong_boot: Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut wrong_boot: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         wrong_boot["boot_id"] = serde_json::json!(Uuid::new_v4().to_string());
         fs::write(&path, serde_json::to_vec(&wrong_boot).unwrap()).unwrap();
         assert!(
@@ -6723,10 +6718,8 @@ mod tests {
         service
             .write_owner_departure_receipt(&boot, &owner, &token, &helper)
             .unwrap();
-        let mut wrong_owner: Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        wrong_owner["owner"]["token"] =
-            serde_json::json!(Uuid::new_v4().to_string());
+        let mut wrong_owner: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        wrong_owner["owner"]["token"] = serde_json::json!(Uuid::new_v4().to_string());
         fs::write(&path, serde_json::to_vec(&wrong_owner).unwrap()).unwrap();
         assert!(
             service
@@ -6738,8 +6731,7 @@ mod tests {
         service
             .write_owner_departure_receipt(&boot, &owner, &token, &helper)
             .unwrap();
-        let mut stale_scope: Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut stale_scope: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         stale_scope["scope"]["generation"] = serde_json::json!(999999u64);
         fs::write(&path, serde_json::to_vec(&stale_scope).unwrap()).unwrap();
         assert!(
