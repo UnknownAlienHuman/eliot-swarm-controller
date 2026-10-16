@@ -786,28 +786,69 @@ mod mailbox_identity_index_tests {
             plan.contains("SEARCH") && plan.contains("mailbox_settled_delivery_identity"),
             "delivery lookup must seek delivery index, got: {plan}"
         );
-        assert!(!plan.contains("SCAN"), "delivery lookup must not scan, got: {plan}");
+        assert!(
+            !plan.contains("SCAN"),
+            "delivery lookup must not scan, got: {plan}"
+        );
     }
     #[test]
     fn find_delivery_preserves_ambiguity_typedtext_failclosed() {
         let db = fixture_db();
-        seed_op(&db, "op-f1", "message.send", "settled", &serde_json::json!({"delivery_id": "d-find-1", "message_id": "m-find-1"}));
-        let found = find_delivery(&db, "d-find-1").unwrap().expect("unique delivery must resolve");
+        seed_op(
+            &db,
+            "op-f1",
+            "message.send",
+            "settled",
+            &serde_json::json!({"delivery_id": "d-find-1", "message_id": "m-find-1"}),
+        );
+        let found = find_delivery(&db, "d-find-1")
+            .unwrap()
+            .expect("unique delivery must resolve");
         assert_eq!(found["operation_id"], "op-f1");
         assert_eq!(found["result"]["delivery_id"], "d-find-1");
         assert!(find_delivery(&db, "no-such-delivery").unwrap().is_none());
-        seed_op(&db, "op-dup-a", "message.send", "settled", &serde_json::json!({"delivery_id": "d-dup-1"}));
-        seed_op(&db, "op-dup-b", "message.send", "settled", &serde_json::json!({"delivery_id": "d-dup-1"}));
+        seed_op(
+            &db,
+            "op-dup-a",
+            "message.send",
+            "settled",
+            &serde_json::json!({"delivery_id": "d-dup-1"}),
+        );
+        seed_op(
+            &db,
+            "op-dup-b",
+            "message.send",
+            "settled",
+            &serde_json::json!({"delivery_id": "d-dup-1"}),
+        );
         let err = find_delivery(&db, "d-dup-1").unwrap_err();
         assert_eq!(err.code, "MAILBOX_DELIVERY_AMBIGUOUS");
-        seed_op(&db, "op-num", "message.send", "settled", &serde_json::json!({"delivery_id": 123}));
+        seed_op(
+            &db,
+            "op-num",
+            "message.send",
+            "settled",
+            &serde_json::json!({"delivery_id": 123}),
+        );
         assert!(find_delivery(&db, "123").unwrap().is_none());
-        seed_op(&db, "op-empty", "message.send", "settled", &serde_json::json!({"delivery_id": ""}));
+        seed_op(
+            &db,
+            "op-empty",
+            "message.send",
+            "settled",
+            &serde_json::json!({"delivery_id": ""}),
+        );
         assert!(find_delivery(&db, "").unwrap().is_none());
         seed_malformed_op(&db, "op-bad-in", "message.send", "settled");
         assert!(find_delivery(&db, "d-find-1").is_err());
         let clean = fixture_db();
-        seed_op(&clean, "op-f1", "message.send", "settled", &serde_json::json!({"delivery_id": "d-find-1"}));
+        seed_op(
+            &clean,
+            "op-f1",
+            "message.send",
+            "settled",
+            &serde_json::json!({"delivery_id": "d-find-1"}),
+        );
         seed_malformed_op(&clean, "op-bad-method", "task.create", "settled");
         seed_malformed_op(&clean, "op-bad-state", "message.send", "queued");
         assert!(find_delivery(&clean, "d-find-1").unwrap().is_some());
