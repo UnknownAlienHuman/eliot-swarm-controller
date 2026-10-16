@@ -105,13 +105,13 @@ mod is_lower_sha256_hex_tests {
     #[test]
     fn boundary_vectors() {
         assert!(is_lower_sha256_hex(
-            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a"
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
         ));
         assert!(!is_lower_sha256_hex(
-            "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A"
+            "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08"
         ));
         assert!(!is_lower_sha256_hex(
-            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a"
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
         ));
         assert!(!is_lower_sha256_hex("9f86d081884c7d659a2feaa0c55ad015"));
     }
