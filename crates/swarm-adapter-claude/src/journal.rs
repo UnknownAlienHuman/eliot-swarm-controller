@@ -1,6 +1,7 @@
 //! Small durable adapter receipt journal. It is scoped below the existing
 //! module owner directory and never stores prompts, credentials, or SDK text.
 
+use crate::receipt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,7 +19,6 @@ use swarm_process::{
     JsonlScanVerdict, private_permissions, remove_private_acknowledged, replace_private_durable,
     scan_jsonl, write_private_new,
 };
-use crate::receipt;
 
 const MAX_RECORD_BYTES: usize = 1_048_576;
 const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
@@ -1502,7 +1502,7 @@ impl OperationJournal {
                 .as_deref()
                 .is_some_and(|digest| !receipt::is_sha256(digest))
             || item.acknowledged_sha256.as_deref().is_some_and(|digest| {
-                    !receipt::is_sha256(digest) || item.outcome_sha256.as_deref() != Some(digest)
+                !receipt::is_sha256(digest) || item.outcome_sha256.as_deref() != Some(digest)
             })
         {
             return Err(Error::new(
