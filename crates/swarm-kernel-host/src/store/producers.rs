@@ -653,7 +653,14 @@ mod normalized_dispatch_lifecycle_tests {
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch(super::super::SCHEMA).unwrap();
         db.execute("INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES('task','project',1,'open','{}',1,1)", []).unwrap();
+        db.execute("INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,created_at_ms) VALUES('binding',1,'lane','module','codex-rust-controller.1','ready','scope','root','{}',1)", []).unwrap();
+        db.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,binding_id,binding_generation,state,due_at_ms,sent_at_ms,created_at_ms,updated_at_ms) VALUES('dispatch','manager','dispatch-request','task.dispatch','{}','{}','task','binding',1,'native_accepted',0,1,1,1)", []).unwrap();
         db.execute("INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,start_operation_id,binding_id,binding_generation,state,created_at_ms,updated_at_ms) VALUES('attempt','task',1,'{}','manager','controller','dispatch','binding',1,'reserved',1,1)", []).unwrap();
+        db.execute(
+            "UPDATE operations SET attempt_id='attempt' WHERE operation_id='dispatch'",
+            [],
+        )
+        .unwrap();
         let admission: swarm_contracts::runtime::TaskDispatchAdmissionReceipt =
             serde_json::from_value(json!({
                 "schema_version":1, "module_receipt":{
