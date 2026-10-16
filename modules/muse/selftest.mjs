@@ -1244,7 +1244,16 @@ await runWorkFenceCase('goal-checkpoint-race');
 // baseline work-fence case (session_start_params modelId/providerId exact,
 // turn_start_params reasoningEffort exact).
 {
-  const { modelMatches } = await import('./settings.mjs');
+  const { modelMatches, retainModelOverride } = await import('./settings.mjs');
+  assert.equal(modelMatches({modelId:'native-a',providerId:'chosen'},{providerId:'chosen'}),true);
+  assert.equal(modelMatches({modelId:'native-b',providerId:'other'},{providerId:'chosen'}),false);
+  const retained = {modelId:'old',providerId:'old-explicit'};
+  retainModelOverride(retained,{modelId:'selected'});
+  assert.deepEqual(retained,{modelId:'selected'});
+  assert.equal(modelMatches({modelId:'selected',providerId:'native-a'},retained),true);
+  assert.equal(modelMatches({modelId:'selected',providerId:'native-b'},retained),true);
+  retainModelOverride(retained,{modelId:'selected',providerId:'explicit'});
+  assert.equal(modelMatches({modelId:'selected',providerId:'native-b'},retained),false);
   assert.equal(modelMatches({modelId:'native-default',providerId:null},{}),true,
     'omitted model selection constrains nothing before readback');
   assert.equal(modelMatches({modelId:'a',providerId:'p'},{modelId:'a',providerId:'p'}),true,

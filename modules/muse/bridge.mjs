@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import museDescriptor from './module-descriptor.template.json' with { type: 'json' };
 import { spawnMspConnection, MspError } from '@muse-code/sdk';
 import { Control } from './control.mjs';
-import { configuration, modelMatches, goalCommand, nativeMcpServers, startNativeMcpSession } from './settings.mjs';
+import { configuration, modelMatches, retainModelOverride, goalCommand, nativeMcpServers, startNativeMcpSession } from './settings.mjs';
 import { readResult } from './results.mjs';
 import { spawnOwned } from './owned.mjs';
 import { recoveryState } from './checkpoint.mjs';
@@ -358,8 +358,7 @@ function settle(entry, details, turnId) {
 }
 function acceptModel(entry, session, evidence) {
   if (!entry.ack || entry.setting?.key !== 'model' || !modelMatches(session, entry.setting.desired)) return false;
-  routeDefaults.modelId = session.modelId;
-  routeDefaults.providerId = session.providerId ?? undefined;
+  retainModelOverride(routeDefaults, entry.setting.desired);
   latest.model = {modelId:session.modelId,providerId:session.providerId};
   settle(entry, {native_ack:entry.ack,completion_condition:'native_configuration_applied',settings:entry.setting.desired,evidence});
   return true;
@@ -1133,9 +1132,9 @@ async function recoverNative(command,markNativeAdmissionPossible) {
   const read=await readNativeSession(rootId,{allowNotLoaded:true});
   const session=compactSession(read.session);
   if(!modelMatches(session,routeDefaults)) {
-    const expected=[...nativePending.values()].some(entry=>entry.kind==='configure' && entry.setting?.key==='model' && modelMatches(session,entry.setting.desired));
+    const expected=[...nativePending.values()].find(entry=>entry.kind==='configure' && entry.setting?.key==='model' && modelMatches(session,entry.setting.desired));
     if(!expected)throw new Error('RECOVERY_MODEL_MISMATCH');
-    routeDefaults.modelId=session.modelId;routeDefaults.providerId=session.providerId??undefined;
+    retainModelOverride(routeDefaults,expected.setting.desired);
     await checkpoint(true);
   }
   await submitNative(command,'session/resume',{sessionId:rootId,excludeItems:true},'recover',undefined,undefined,
