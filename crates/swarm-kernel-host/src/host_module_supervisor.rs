@@ -365,7 +365,7 @@ async fn run_supervisor_process_loop(
                 )
                 .await
                 {
-                    return Err(Error::from(error).with_secondary_error(health_error));
+                    return Err(error.with_secondary_error(health_error));
                 }
                 if !wait_for_supervisor_backoff(delay, &mut stopping).await {
                     return Ok(());
@@ -455,6 +455,7 @@ async fn run_supervisor_process_loop(
         let retained = match control.install_requests(true).await {
             Ok(page) => page,
             Err(error) => {
+                let error = Error::from(error);
                 failures = failures.saturating_add(1).min(32);
                 if let Err(health_error) = record_module_actor_status(
                     &store,
