@@ -155,9 +155,9 @@ fn forge_query_fixture_worker_process() {
     let owner_birth = swarm_process::process_birth_identity(owner_pid)
         .expect("query Forge worker birth identity")
         .expect("Forge worker remains live");
-    assert_eq!(
-        owner_process["creation_filetime"],
-        owner_birth["creation_filetime"]
+    assert!(
+        same_birth(&owner_process, &owner_birth),
+        "Forge Job owner and process readback must name the same birth identity"
     );
     let owner_image = swarm_process::process_image_identity(owner_pid)
         .expect("query Forge worker image identity");
@@ -171,7 +171,7 @@ fn forge_query_fixture_worker_process() {
         .env(FORGE_QUERY_MODE, "grandchild")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn Forge worker grandchild in its Job");
     let grandchild_pid = grandchild.id();
@@ -239,7 +239,7 @@ fn forge_worker_retained_query_sees_live_grandchild_after_worker_exit() {
         .env(FORGE_QUERY_GRANDCHILD_RELEASE, &grandchild_release)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn Forge worker fixture");
 
