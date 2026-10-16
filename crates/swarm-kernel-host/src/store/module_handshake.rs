@@ -344,6 +344,9 @@ pub(super) fn descriptor_install_requests(
         let registry = load_registry(db)?;
         for entry in registry.descriptors {
             let identity = &entry.descriptor;
+            let registered_revision = i64::try_from(entry.registered_revision).map_err(|_| {
+                Error::invalid("registered descriptor revision exceeds SQLite integer range")
+            })?;
             let retained: Option<(String, String)> = db
                 .query_row(
                     "SELECT operation_id,original_request_json FROM operations \
@@ -359,7 +362,7 @@ pub(super) fn descriptor_install_requests(
                         identity.module_id.to_string(),
                         identity.artifact.artifact_id.to_string(),
                         identity.artifact.version.to_string(),
-                        entry.registered_revision,
+                        registered_revision,
                     ],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )

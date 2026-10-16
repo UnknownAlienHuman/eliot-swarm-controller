@@ -365,7 +365,7 @@ async fn run_supervisor_process_loop(
                 )
                 .await
                 {
-                    return Err(error.with_secondary_error(health_error));
+                    return Err(Error::from(error).with_secondary_error(health_error));
                 }
                 if !wait_for_supervisor_backoff(delay, &mut stopping).await {
                     return Ok(());
