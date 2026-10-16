@@ -6849,7 +6849,7 @@ async fn reconnect_native_for_readback(
     endpoint: &str,
     token: Option<&str>,
     credential_unavailable: bool,
- ) -> Result<bool, AdapterError> {
+) -> Result<bool, AdapterError> {
     match native.demux.terminal_error() {
         Ok(None) => return Ok(false),
         Ok(Some(_)) | Err(_) => {}
@@ -8493,10 +8493,15 @@ mod agent_shutdown_loopback_tests {
 #[cfg(test)]
 mod readback_reconnect_tests {
     use super::*;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     fn frozen_fixture() -> serde_json::Value {
-        serde_json::from_str(include_str!("../fixtures/codex-readback-reconnect-frozen-20261016.json"))
-            .expect("frozen reconnect fixture is valid JSON")
+        serde_json::from_str(include_str!(
+            "../fixtures/codex-readback-reconnect-frozen-20261016.json"
+        ))
+        .expect("frozen reconnect fixture is valid JSON")
     }
     fn fixture_claim() -> ModuleContractClaim {
         serde_json::from_value(serde_json::json!({
@@ -8555,13 +8560,18 @@ mod readback_reconnect_tests {
                     Ok(packet) => packet,
                     Err(_) => break,
                 };
-                let Some(id) = packet.get("id").cloned() else { continue; };
+                let Some(id) = packet.get("id").cloned() else {
+                    continue;
+                };
                 let method = packet["method"].as_str().unwrap_or("").to_owned();
                 methods.lock().expect("method log").push(method.clone());
                 if method == "thread/start" || method == "turn/start" || method == "turn/steer" {
                     forbidden.fetch_add(1, Ordering::SeqCst);
                 }
-                let params = packet.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                let params = packet
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let result = if method == "initialize" {
                     serde_json::json!({
                         "userAgent": "Codex CLI/1.2.3",
@@ -8571,7 +8581,9 @@ mod readback_reconnect_tests {
                     })
                 } else if method == "thread/read" || method == "thread/resume" {
                     serde_json::json!({"thread": thread.clone()})
-                } else if method == "thread/items/list" && params.get("turnId").and_then(|v| v.as_str()).is_some() {
+                } else if method == "thread/items/list"
+                    && params.get("turnId").and_then(|v| v.as_str()).is_some()
+                {
                     serde_json::json!({"data": [], "nextCursor": null})
                 } else if method == "thread/items/list" {
                     serde_json::json!({"data": [{"item": {"type": "userMessage", "id": input_id.clone(), "clientId": client_id.clone(), "content": [{"type": "text", "text": prompt_text.clone()}]}, "turnId": turn_id.clone()}], "nextCursor": null})
@@ -8585,8 +8597,14 @@ mod readback_reconnect_tests {
                 } else {
                     serde_json::json!({"id": id, "result": result})
                 };
-                let send = futures_util::SinkExt::send(&mut ws, tokio_tungstenite::tungstenite::Message::Text(response.to_string().into())).await;
-                if send.is_err() { break; }
+                let send = futures_util::SinkExt::send(
+                    &mut ws,
+                    tokio_tungstenite::tungstenite::Message::Text(response.to_string().into()),
+                )
+                .await;
+                if send.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -8594,14 +8612,29 @@ mod readback_reconnect_tests {
     async fn frozen_reconcile_after_terminal_fault_reconnects_without_replay() {
         let fixture = frozen_fixture();
         let thread_id = fixture["thread_id"].as_str().expect("thread").to_owned();
-        let open_id = fixture["open_operation_id"].as_str().expect("open").to_owned();
+        let open_id = fixture["open_operation_id"]
+            .as_str()
+            .expect("open")
+            .to_owned();
         let client_id = fixture["client_id"].as_str().expect("client").to_owned();
-        let reconcile_id = fixture["reconcile_operation_id"].as_str().expect("reconcile").to_owned();
+        let reconcile_id = fixture["reconcile_operation_id"]
+            .as_str()
+            .expect("reconcile")
+            .to_owned();
         let turn_id = fixture["turn_id"].as_str().expect("turn").to_owned();
-        let input_id = fixture["native_input_id"].as_str().expect("input").to_owned();
+        let input_id = fixture["native_input_id"]
+            .as_str()
+            .expect("input")
+            .to_owned();
         let prompt_text = fixture["prompt_text"].as_str().expect("prompt").to_owned();
-        let observed_provider = fixture["observed_model_provider"].as_str().expect("provider").to_owned();
-        let observed_model = fixture["observed_model"].as_str().expect("model").to_owned();
+        let observed_provider = fixture["observed_model_provider"]
+            .as_str()
+            .expect("provider")
+            .to_owned();
+        let observed_model = fixture["observed_model"]
+            .as_str()
+            .expect("model")
+            .to_owned();
         let prompt_sha = digest_hex(prompt_text.as_bytes());
         let prompt_bytes = prompt_text.len() as u64;
         let base = std::env::temp_dir().join(format!("codex-reconnect-{}", uuid::Uuid::new_v4()));
@@ -8609,20 +8642,44 @@ mod readback_reconnect_tests {
         let home_path = base.join("codex-home");
         std::fs::create_dir_all(&workspace_path).expect("workspace");
         std::fs::create_dir_all(&home_path).expect("home");
-        let workspace = std::fs::canonicalize(&workspace_path).expect("canonical workspace").to_string_lossy().into_owned();
-        let home = std::fs::canonicalize(&home_path).expect("canonical home").to_string_lossy().into_owned();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let workspace = std::fs::canonicalize(&workspace_path)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+        let home = std::fs::canonicalize(&home_path)
+            .expect("canonical home")
+            .to_string_lossy()
+            .into_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let address = listener.local_addr().expect("addr");
         let endpoint = format!("ws://{address}/");
         let methods = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let forbidden = Arc::new(AtomicUsize::new(0));
-        let server = tokio::spawn(serve_readback(listener, home.clone(), workspace.clone(), thread_id.clone(), client_id.clone(), turn_id.clone(), input_id.clone(), prompt_text.clone(), observed_provider.clone(), observed_model.clone(), Arc::clone(&methods), Arc::clone(&forbidden)));
-        let probe = NativeClient::attach(&endpoint, None, false, NativeEventSink::new()).await.expect("probe attach");
+        let server = tokio::spawn(serve_readback(
+            listener,
+            home.clone(),
+            workspace.clone(),
+            thread_id.clone(),
+            client_id.clone(),
+            turn_id.clone(),
+            input_id.clone(),
+            prompt_text.clone(),
+            observed_provider.clone(),
+            observed_model.clone(),
+            Arc::clone(&methods),
+            Arc::clone(&forbidden),
+        ));
+        let probe = NativeClient::attach(&endpoint, None, false, NativeEventSink::new())
+            .await
+            .expect("probe attach");
         let expected_scope = probe.scope_key().expect("probe scope").to_owned();
         assert!(probe.identity_is_known());
         drop(probe);
         let journal_dir = base.join("journal");
-        let mut journal = Journal::open(journal_dir.clone(), "boot-reconnect-test".to_owned()).expect("open journal");
+        let mut journal = Journal::open(journal_dir.clone(), "boot-reconnect-test".to_owned())
+            .expect("open journal");
         journal.state.binding_id = Some("fixture-binding".to_owned());
         journal.state.generation = Some(1);
         journal.state.native_root_id = Some(thread_id.clone());
@@ -8640,7 +8697,10 @@ mod readback_reconnect_tests {
         open_record.native_scope_key = Some(expected_scope.clone());
         open_record.workspace_root = Some(workspace.clone());
         open_record.thread_configuration_readback = Some("verified".to_owned());
-        journal.state.operations.insert(open_id.clone(), open_record);
+        journal
+            .state
+            .operations
+            .insert(open_id.clone(), open_record);
         let mut send_record = OperationRecord::intent("agent.send", "send");
         send_record.input_sha256 = Some("b".repeat(64));
         send_record.native_root_id = Some(thread_id.clone());
@@ -8652,42 +8712,106 @@ mod readback_reconnect_tests {
         send_record.prompt_bytes = Some(prompt_bytes);
         send_record.delivery = Some("next_turn".to_owned());
         send_record.returned_turn_id = Some(turn_id.clone());
-        journal.state.operations.insert(client_id.clone(), send_record.clone());
+        journal
+            .state
+            .operations
+            .insert(client_id.clone(), send_record.clone());
         journal.save().expect("persist frozen journal");
         let old_sink = NativeEventSink::new();
-        old_sink.queue_event(NativeRpcEvent::NativeNotification { method: "test/old-observer".to_owned(), params: serde_json::json!({}) }).expect("queue old");
+        old_sink
+            .queue_event(NativeRpcEvent::NativeNotification {
+                method: "test/old-observer".to_owned(),
+                params: serde_json::json!({}),
+            })
+            .expect("queue old");
         let old_demux = Arc::new(NativeRpcDemultiplexer::new(old_sink.clone()));
         old_demux.fail(NativeError::DemultiplexerCapacity);
-        let mut native = NativeClient { writer: None, demux: old_demux, events: old_sink, reader_task: None, native_scope_key: Some(expected_scope.clone()), server_identity: None };
-        assert!(native.demux.terminal_error().expect("old terminal").is_some());
-        let reconnected = reconnect_native_for_readback(&mut journal, &mut native, &endpoint, None, false).await.expect("reconnect");
+        let mut native = NativeClient {
+            writer: None,
+            demux: old_demux,
+            events: old_sink,
+            reader_task: None,
+            native_scope_key: Some(expected_scope.clone()),
+            server_identity: None,
+        };
+        assert!(
+            native
+                .demux
+                .terminal_error()
+                .expect("old terminal")
+                .is_some()
+        );
+        let reconnected =
+            reconnect_native_for_readback(&mut journal, &mut native, &endpoint, None, false)
+                .await
+                .expect("reconnect");
         assert!(reconnected);
         assert!(native.demux.terminal_error().expect("fresh live").is_none());
         assert_eq!(native.scope_key(), Some(expected_scope.as_str()));
-        assert_eq!(journal.state.native_scope_key.as_deref(), Some(expected_scope.as_str()));
+        assert_eq!(
+            journal.state.native_scope_key.as_deref(),
+            Some(expected_scope.as_str())
+        );
         assert!(!journal.state.pending_native_events.is_empty());
-        let retained = journal.state.operations.get(&client_id).expect("retained send");
+        let retained = journal
+            .state
+            .operations
+            .get(&client_id)
+            .expect("retained send");
         assert_eq!(retained.input_sha256, send_record.input_sha256);
         assert_eq!(retained.prompt_sha256, send_record.prompt_sha256);
         assert_eq!(retained.prompt_bytes, send_record.prompt_bytes);
-        assert_eq!(journal.state.native_root_id.as_deref(), Some(thread_id.as_str()));
+        assert_eq!(
+            journal.state.native_root_id.as_deref(),
+            Some(thread_id.as_str())
+        );
         let claim = fixture_claim();
-        let command = RuntimeCommand { operation_id: reconcile_id.clone(), method: "agent.reconcile".to_owned(), created_at_ms: 3, binding_id: "fixture-binding".to_owned(), generation: 1, native_root_id: None, route: serde_json::json!({}), input: serde_json::json!({"operation_id": client_id}), input_sha256: Some("c".repeat(64)), target_input_sha256: Some("b".repeat(64)) };
-        let target = journal.operation_record(&client_id).expect("target lookup").expect("target present");
-        let results = reconcile_operation(&command, &mut journal, &mut native, Some(target), &claim).await.expect("reconcile");
+        let command = RuntimeCommand {
+            operation_id: reconcile_id.clone(),
+            method: "agent.reconcile".to_owned(),
+            created_at_ms: 3,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: serde_json::json!({}),
+            input: serde_json::json!({"operation_id": client_id}),
+            input_sha256: Some("c".repeat(64)),
+            target_input_sha256: Some("b".repeat(64)),
+        };
+        let target = journal
+            .operation_record(&client_id)
+            .expect("target lookup")
+            .expect("target present");
+        let results =
+            reconcile_operation(&command, &mut journal, &mut native, Some(target), &claim)
+                .await
+                .expect("reconcile");
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].outcome, EffectOutcome::Applied);
-        assert_eq!(results[0].details["native_input_readback"], serde_json::json!("verified"));
-        assert_eq!(results[0].details["completion_condition"], serde_json::json!("native_turn_completed"));
+        assert_eq!(
+            results[0].details["native_input_readback"],
+            serde_json::json!("verified")
+        );
+        assert_eq!(
+            results[0].details["completion_condition"],
+            serde_json::json!("native_turn_completed")
+        );
         assert_eq!(results[0].turn_id.as_deref(), Some(turn_id.as_str()));
-        assert_eq!(results[0].native_input_id.as_deref(), Some(input_id.as_str()));
+        assert_eq!(
+            results[0].native_input_id.as_deref(),
+            Some(input_id.as_str())
+        );
         assert_eq!(results[1].outcome, EffectOutcome::Applied);
         assert_eq!(results[1].details["resolved"], serde_json::json!(true));
         assert_eq!(forbidden.load(Ordering::SeqCst), 0);
         let seen = methods.lock().expect("methods").clone();
         assert!(seen.iter().any(|m| m == "thread/items/list"));
         assert!(seen.iter().any(|m| m == "thread/turns/list"));
-        assert!(!seen.iter().any(|m| m == "thread/start" || m == "turn/start" || m == "turn/steer"));
+        assert!(
+            !seen
+                .iter()
+                .any(|m| m == "thread/start" || m == "turn/start" || m == "turn/steer")
+        );
         server.abort();
         std::fs::remove_dir_all(&base).ok();
     }
@@ -8695,45 +8819,103 @@ mod readback_reconnect_tests {
     async fn drifted_scope_after_reconnect_stays_unknown() {
         let fixture = frozen_fixture();
         let thread_id = fixture["thread_id"].as_str().expect("thread").to_owned();
-        let open_id = fixture["open_operation_id"].as_str().expect("open").to_owned();
+        let open_id = fixture["open_operation_id"]
+            .as_str()
+            .expect("open")
+            .to_owned();
         let client_id = fixture["client_id"].as_str().expect("client").to_owned();
-        let reconcile_id = fixture["reconcile_operation_id"].as_str().expect("reconcile").to_owned();
+        let reconcile_id = fixture["reconcile_operation_id"]
+            .as_str()
+            .expect("reconcile")
+            .to_owned();
         let turn_id = fixture["turn_id"].as_str().expect("turn").to_owned();
-        let input_id = fixture["native_input_id"].as_str().expect("input").to_owned();
+        let input_id = fixture["native_input_id"]
+            .as_str()
+            .expect("input")
+            .to_owned();
         let prompt_text = fixture["prompt_text"].as_str().expect("prompt").to_owned();
-        let observed_provider = fixture["observed_model_provider"].as_str().expect("provider").to_owned();
-        let observed_model = fixture["observed_model"].as_str().expect("model").to_owned();
+        let observed_provider = fixture["observed_model_provider"]
+            .as_str()
+            .expect("provider")
+            .to_owned();
+        let observed_model = fixture["observed_model"]
+            .as_str()
+            .expect("model")
+            .to_owned();
         let prompt_sha = digest_hex(prompt_text.as_bytes());
         let prompt_bytes = prompt_text.len() as u64;
-        let base = std::env::temp_dir().join(format!("codex-reconnect-drift-{}", uuid::Uuid::new_v4()));
+        let base =
+            std::env::temp_dir().join(format!("codex-reconnect-drift-{}", uuid::Uuid::new_v4()));
         let workspace_path = base.join("workspace");
         let home_path = base.join("codex-home");
         let drift_path = base.join("codex-home-drift");
         std::fs::create_dir_all(&workspace_path).expect("workspace");
         std::fs::create_dir_all(&home_path).expect("home");
         std::fs::create_dir_all(&drift_path).expect("drift home");
-        let workspace = std::fs::canonicalize(&workspace_path).expect("canonical workspace").to_string_lossy().into_owned();
-        let home = std::fs::canonicalize(&home_path).expect("canonical home").to_string_lossy().into_owned();
-        let drift_home = std::fs::canonicalize(&drift_path).expect("canonical drift").to_string_lossy().into_owned();
+        let workspace = std::fs::canonicalize(&workspace_path)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+        let home = std::fs::canonicalize(&home_path)
+            .expect("canonical home")
+            .to_string_lossy()
+            .into_owned();
+        let drift_home = std::fs::canonicalize(&drift_path)
+            .expect("canonical drift")
+            .to_string_lossy()
+            .into_owned();
         assert_ne!(home, drift_home);
-        let expected_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind expected");
+        let expected_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind expected");
         let expected_addr = expected_listener.local_addr().expect("addr");
         let expected_endpoint = format!("ws://{expected_addr}/");
         let expected_methods = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let expected_forbidden = Arc::new(AtomicUsize::new(0));
-        let expected_server = tokio::spawn(serve_readback(expected_listener, home.clone(), workspace.clone(), thread_id.clone(), client_id.clone(), turn_id.clone(), input_id.clone(), prompt_text.clone(), observed_provider.clone(), observed_model.clone(), Arc::clone(&expected_methods), Arc::clone(&expected_forbidden)));
-        let probe = NativeClient::attach(&expected_endpoint, None, false, NativeEventSink::new()).await.expect("probe attach");
+        let expected_server = tokio::spawn(serve_readback(
+            expected_listener,
+            home.clone(),
+            workspace.clone(),
+            thread_id.clone(),
+            client_id.clone(),
+            turn_id.clone(),
+            input_id.clone(),
+            prompt_text.clone(),
+            observed_provider.clone(),
+            observed_model.clone(),
+            Arc::clone(&expected_methods),
+            Arc::clone(&expected_forbidden),
+        ));
+        let probe = NativeClient::attach(&expected_endpoint, None, false, NativeEventSink::new())
+            .await
+            .expect("probe attach");
         let expected_scope = probe.scope_key().expect("probe scope").to_owned();
         drop(probe);
         expected_server.abort();
-        let drift_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind drift");
+        let drift_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind drift");
         let drift_addr = drift_listener.local_addr().expect("addr");
         let drift_endpoint = format!("ws://{drift_addr}/");
         let drift_methods = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let drift_forbidden = Arc::new(AtomicUsize::new(0));
-        let drift_server = tokio::spawn(serve_readback(drift_listener, drift_home.clone(), workspace.clone(), thread_id.clone(), client_id.clone(), turn_id.clone(), input_id.clone(), prompt_text.clone(), observed_provider.clone(), observed_model.clone(), Arc::clone(&drift_methods), Arc::clone(&drift_forbidden)));
+        let drift_server = tokio::spawn(serve_readback(
+            drift_listener,
+            drift_home.clone(),
+            workspace.clone(),
+            thread_id.clone(),
+            client_id.clone(),
+            turn_id.clone(),
+            input_id.clone(),
+            prompt_text.clone(),
+            observed_provider.clone(),
+            observed_model.clone(),
+            Arc::clone(&drift_methods),
+            Arc::clone(&drift_forbidden),
+        ));
         let journal_dir = base.join("journal");
-        let mut journal = Journal::open(journal_dir.clone(), "boot-reconnect-drift".to_owned()).expect("open journal");
+        let mut journal = Journal::open(journal_dir.clone(), "boot-reconnect-drift".to_owned())
+            .expect("open journal");
         journal.state.binding_id = Some("fixture-binding".to_owned());
         journal.state.generation = Some(1);
         journal.state.native_root_id = Some(thread_id.clone());
@@ -8749,7 +8931,10 @@ mod readback_reconnect_tests {
         open_record.native_scope_key = Some(expected_scope.clone());
         open_record.workspace_root = Some(workspace.clone());
         open_record.thread_configuration_readback = Some("verified".to_owned());
-        journal.state.operations.insert(open_id.clone(), open_record);
+        journal
+            .state
+            .operations
+            .insert(open_id.clone(), open_record);
         let mut send_record = OperationRecord::intent("agent.send", "send");
         send_record.input_sha256 = Some("b".repeat(64));
         send_record.native_root_id = Some(thread_id.clone());
@@ -8761,44 +8946,127 @@ mod readback_reconnect_tests {
         send_record.prompt_bytes = Some(prompt_bytes);
         send_record.delivery = Some("next_turn".to_owned());
         send_record.returned_turn_id = Some(turn_id.clone());
-        journal.state.operations.insert(client_id.clone(), send_record.clone());
+        journal
+            .state
+            .operations
+            .insert(client_id.clone(), send_record.clone());
         journal.save().expect("persist frozen journal");
         let old_sink = NativeEventSink::new();
         let old_demux = Arc::new(NativeRpcDemultiplexer::new(old_sink.clone()));
         old_demux.fail(NativeError::DemultiplexerCapacity);
-        let mut native = NativeClient { writer: None, demux: old_demux, events: old_sink, reader_task: None, native_scope_key: Some(expected_scope.clone()), server_identity: None };
-        let reconnected = reconnect_native_for_readback(&mut journal, &mut native, &drift_endpoint, None, false).await.expect("drift reconnect");
+        let mut native = NativeClient {
+            writer: None,
+            demux: old_demux,
+            events: old_sink,
+            reader_task: None,
+            native_scope_key: Some(expected_scope.clone()),
+            server_identity: None,
+        };
+        let reconnected =
+            reconnect_native_for_readback(&mut journal, &mut native, &drift_endpoint, None, false)
+                .await
+                .expect("drift reconnect");
         assert!(reconnected);
-        assert!(matches!(native.demux.terminal_error(), Ok(Some(NativeError::IdentityUnverified))));
-        assert!(!native.identity_is_known(), "drifted client must not present a known identity");
-        assert_eq!(native.scope_key(), None, "drifted scope must not be adopted");
-        assert_eq!(journal.state.native_scope_key.as_deref(), Some(expected_scope.as_str()));
-        assert_eq!(journal.state.native_root_id.as_deref(), Some(thread_id.as_str()));
-        assert_eq!(journal.active_root_id(), Some(thread_id.as_str()), "retained root stays current in journal");
+        assert!(matches!(
+            native.demux.terminal_error(),
+            Ok(Some(NativeError::IdentityUnverified))
+        ));
+        assert!(
+            !native.identity_is_known(),
+            "drifted client must not present a known identity"
+        );
+        assert_eq!(
+            native.scope_key(),
+            None,
+            "drifted scope must not be adopted"
+        );
+        assert_eq!(
+            journal.state.native_scope_key.as_deref(),
+            Some(expected_scope.as_str())
+        );
+        assert_eq!(
+            journal.state.native_root_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            journal.active_root_id(),
+            Some(thread_id.as_str()),
+            "retained root stays current in journal"
+        );
         for record in &journal.state.pending_native_events {
-            assert!(record.appserver_scope.as_deref().is_none_or(|scope| scope == expected_scope.as_str()), "no foreign-scoped metadata may enter the journal");
+            assert!(
+                record
+                    .appserver_scope
+                    .as_deref()
+                    .is_none_or(|scope| scope == expected_scope.as_str()),
+                "no foreign-scoped metadata may enter the journal"
+            );
         }
         let claim = fixture_claim();
-        let command = RuntimeCommand { operation_id: reconcile_id.clone(), method: "agent.reconcile".to_owned(), created_at_ms: 3, binding_id: "fixture-binding".to_owned(), generation: 1, native_root_id: None, route: serde_json::json!({}), input: serde_json::json!({"operation_id": client_id}), input_sha256: Some("c".repeat(64)), target_input_sha256: Some("b".repeat(64)) };
-        let target = journal.operation_record(&client_id).expect("target lookup").expect("target present");
-        let results = reconcile_operation(&command, &mut journal, &mut native, Some(target), &claim).await.expect("drift reconcile");
+        let command = RuntimeCommand {
+            operation_id: reconcile_id.clone(),
+            method: "agent.reconcile".to_owned(),
+            created_at_ms: 3,
+            binding_id: "fixture-binding".to_owned(),
+            generation: 1,
+            native_root_id: None,
+            route: serde_json::json!({}),
+            input: serde_json::json!({"operation_id": client_id}),
+            input_sha256: Some("c".repeat(64)),
+            target_input_sha256: Some("b".repeat(64)),
+        };
+        let target = journal
+            .operation_record(&client_id)
+            .expect("target lookup")
+            .expect("target present");
+        let results =
+            reconcile_operation(&command, &mut journal, &mut native, Some(target), &claim)
+                .await
+                .expect("drift reconcile");
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].outcome, EffectOutcome::Unknown);
-        assert_eq!(results[0].details["diagnostic_code"], serde_json::json!("NATIVE_SCOPE_CHANGED"));
+        assert_eq!(
+            results[0].details["diagnostic_code"],
+            serde_json::json!("NATIVE_SCOPE_CHANGED")
+        );
         assert_eq!(results[1].details["resolved"], serde_json::json!(false));
-        assert_eq!(journal.state.native_scope_key.as_deref(), Some(expected_scope.as_str()));
-        assert!(!native.identity_is_known(), "drifted client still cannot advertise the old root as ready");
+        assert_eq!(
+            journal.state.native_scope_key.as_deref(),
+            Some(expected_scope.as_str())
+        );
+        assert!(
+            !native.identity_is_known(),
+            "drifted client still cannot advertise the old root as ready"
+        );
         assert_eq!(journal.active_root_id(), Some(thread_id.as_str()));
         assert_eq!(native.scope_key(), None);
-        let observation = journal.next_observation(false, false).expect("observation renders");
-        assert_eq!(observation["state"]["native"]["root_id"], serde_json::json!(thread_id.as_str()));
-        assert_eq!(observation["state"]["native"]["scope_key"], serde_json::json!(expected_scope.as_str()));
-        assert_eq!(observation["state"]["native"]["ready"], serde_json::json!(false));
+        let observation = journal
+            .next_observation(false, false)
+            .expect("observation renders");
+        assert_eq!(
+            observation["state"]["native"]["root_id"],
+            serde_json::json!(thread_id.as_str())
+        );
+        assert_eq!(
+            observation["state"]["native"]["scope_key"],
+            serde_json::json!(expected_scope.as_str())
+        );
+        assert_eq!(
+            observation["state"]["native"]["ready"],
+            serde_json::json!(false)
+        );
         assert!(journal.state.pending_observation.is_some());
         assert_eq!(drift_forbidden.load(Ordering::SeqCst), 0);
         let seen = drift_methods.lock().expect("methods").clone();
-        assert!(!seen.iter().any(|m| m == "thread/start" || m == "turn/start" || m == "turn/steer"));
-        assert!(!seen.iter().any(|m| m.starts_with("thread/")), "drifted home must see no readback at all");
+        assert!(
+            !seen
+                .iter()
+                .any(|m| m == "thread/start" || m == "turn/start" || m == "turn/steer")
+        );
+        assert!(
+            !seen.iter().any(|m| m.starts_with("thread/")),
+            "drifted home must see no readback at all"
+        );
         drift_server.abort();
         std::fs::remove_dir_all(&base).ok();
     }
