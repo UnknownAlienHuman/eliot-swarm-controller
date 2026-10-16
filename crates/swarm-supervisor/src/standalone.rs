@@ -2615,7 +2615,11 @@ mod hot_bootstrap_byte_boundary_tests {
 
     #[test]
     fn lost_completion_reply_restores_installed_paths_before_next_capacity_check() {
-        use crate::control::InstalledDescriptorRequestRecord;
+        use super::retain_installed_descriptor_paths;
+        use crate::control::{
+            InstalledDescriptorRequestPage, InstalledDescriptorRequestRecord,
+            InstalledDescriptorRequestState,
+        };
 
         let config = test_config(vec![absolute_root("short.json")]);
         let mut committed = BTreeSet::new();
