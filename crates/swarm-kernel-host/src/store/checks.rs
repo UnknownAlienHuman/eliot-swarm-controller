@@ -5535,11 +5535,18 @@ mod tests {
             .resolve_check_plan_snapshot(Ok(snapshot_a))
             .await
             .unwrap();
-        match first_a.result {
-            Err(error) => assert_eq!(error.code, "CHECK_PROBE_CLEANUP_PENDING"),
+        let initial_pending_message = match first_a.result {
+            Err(error) => {
+                assert_eq!(error.code, "CHECK_PROBE_CLEANUP_PENDING");
+                error.message
+            }
             Ok(_) => panic!("pending real probe-family custody must hold A preflight"),
-        }
-        assert_eq!(PR61_PROBE_SUCCESS_CALLS.load(Ordering::SeqCst), 1);
+        };
+        assert_eq!(
+            PR61_PROBE_SUCCESS_CALLS.load(Ordering::SeqCst),
+            1,
+            "initial probe resolution: {initial_pending_message}"
+        );
 
         let custody = &store.check_child_custody;
         assert_eq!(store.check_child_custody_count().await, 1);
