@@ -5549,7 +5549,14 @@ mod tests {
         );
 
         let custody = &store.check_child_custody;
-        assert_eq!(store.check_child_custody_count().await, 1);
+        assert_eq!(
+            store.check_child_custody_count().await,
+            1,
+            "initial pending={initial_pending_message}; helper_departure_proven={}; target_departure_proven={}; descendant_departure_proven={}",
+            process_fixture.process_departed(&helper_identity),
+            process_fixture.process_departed(&target_identity),
+            process_fixture.process_departed(&descendant_identity),
+        );
         {
             let owners = custody.probe_cleanup_owners.lock().await;
             assert_eq!(owners.len(), 1);
