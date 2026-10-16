@@ -1,7 +1,14 @@
 //! Focused tests for deriving native MCP route identity from owned-service
 //! readback while keeping externally configured routes exact.
 use super::*;
-use crate::runtime::opencode_v2::{Options, RUNTIME};
+use crate::{
+    config::McpToolProfile,
+    native_mcp::{
+        AssignmentContext, AssignmentSeed, NativeMcpReadback, NativeSessionFact,
+        OpenCodeV2ReadbackInput,
+    },
+    runtime::opencode_v2::{Options, RUNTIME},
+};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -43,20 +50,122 @@ fn route(native_options: Value) -> Value {
 }
 
 fn source(identity: &ReadbackRouteIdentity, pid: u32) -> Value {
+    let service_version = identity
+        .expected_version
+        .as_deref()
+        .unwrap_or(SERVICE_VERSION);
     json!({
         "runtime":RUNTIME,
-        "api_contract":MCP_API_CONTRACT,
+        "api_contract":crate::native_mcp::opencode_mcp_api_contract_for_version(service_version),
         "api_method":"GET /api/mcp",
         "api_scope":"configured_server_connection_status_only",
         "service_id":identity.service_id,
         "service_identity_basis":SERVICE_IDENTITY_BASIS,
-        "service_version":identity.expected_version,
+        "service_version":service_version,
         "service_pid":pid,
         "directory_sha256":format!(
             "sha256:{}",
             model::digest(identity.directory.as_bytes())
         ),
     })
+}
+
+fn produced_source(service_version: &str) -> Value {
+    let directory = paths().0;
+    let directory_text = directory.to_str().expect("fixture directory");
+    let readback = NativeMcpReadback::from_opencode_v2(
+        AssignmentContext::new(AssignmentSeed {
+            task_id: "fixture-task".into(),
+            task_revision: 1,
+            attempt_id: "fixture-attempt".into(),
+            binding_id: "fixture-binding".into(),
+            binding_generation: 1,
+            native_session_id: "ses_fixture".into(),
+            participant_id: "fixture-participant".into(),
+            profile: McpToolProfile::Participant,
+            grant_revision: 1,
+            basis_kind: "attempt_owner".into(),
+            assignment_id: None,
+            review_assignment_id: None,
+        })
+        .unwrap(),
+        OpenCodeV2ReadbackInput {
+            service_id: "external-opencode".into(),
+            service_pid: EXPECTED_PID,
+            service_version: service_version.into(),
+            directory_sha256: format!("sha256:{}", model::digest(directory_text.as_bytes())),
+            session: NativeSessionFact::new(
+                "ses_fixture".into(),
+                "prj_fixture".into(),
+                None,
+                None,
+                1,
+                2,
+            )
+            .unwrap(),
+            servers: Vec::new(),
+            observed_at_ms: 3,
+        },
+    )
+    .unwrap();
+    readback.payload()["source"].clone()
+}
+
+fn external_route(expected_version: Option<&str>) -> (Value, ReadbackRouteIdentity) {
+    let route = route(native_options(Some("external-opencode"), expected_version));
+    let identity = external_readback_route_identity(&route).unwrap();
+    (route, identity)
+}
+
+#[test]
+fn producer_non_legacy_contract_round_trips_through_store_with_optional_pin() {
+    let observed = produced_source("2.1.0");
+    assert_eq!(observed["api_contract"], "opencode-http-mcp-list-v1");
+
+    for expected_version in [None, Some("2.1.0")] {
+        let (route, identity) = external_route(expected_version);
+        validate_readback_source_identity(&route, &observed, &identity).unwrap();
+    }
+}
+
+#[test]
+fn store_rejects_wrong_contract_pin_and_route_identity_for_non_legacy_producer() {
+    let observed = produced_source("2.1.0");
+    let (route, identity) = external_route(Some("2.1.0"));
+
+    let mut wrong_contract = observed.clone();
+    wrong_contract["api_contract"] = json!("opencode-http-mcp-list-v2");
+    assert!(validate_readback_source_identity(&route, &wrong_contract, &identity).is_err());
+
+    let (wrong_pin_route, wrong_pin_identity) = external_route(Some("2.1.1"));
+    assert!(
+        validate_readback_source_identity(&wrong_pin_route, &observed, &wrong_pin_identity)
+            .is_err()
+    );
+
+    let mut wrong_service = observed.clone();
+    wrong_service["service_id"] = json!(SERVICE_ID);
+    assert!(validate_readback_source_identity(&route, &wrong_service, &identity).is_err());
+
+    let mut wrong_location = observed;
+    wrong_location["directory_sha256"] = json!(format!("sha256:{}", "0".repeat(64)));
+    assert!(validate_readback_source_identity(&route, &wrong_location, &identity).is_err());
+}
+
+#[test]
+fn producer_preserves_legacy_2_0_7_contract_bytes() {
+    let observed = produced_source(SERVICE_VERSION);
+    assert_eq!(
+        observed["api_contract"],
+        "@opencode/protocol 2.0.7 mcp.list"
+    );
+
+    let (route, identity) = external_route(Some(SERVICE_VERSION));
+    validate_readback_source_identity(&route, &observed, &identity).unwrap();
+
+    let mut wrong_contract = observed;
+    wrong_contract["api_contract"] = json!("opencode-http-mcp-list-v1");
+    assert!(validate_readback_source_identity(&route, &wrong_contract, &identity).is_err());
 }
 
 #[test]

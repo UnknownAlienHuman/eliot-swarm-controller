@@ -14,7 +14,6 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
-const MCP_API_CONTRACT: &str = "@opencode/protocol 2.0.7 mcp.list";
 const SERVICE_IDENTITY_BASIS: &str = "explicit_route_id_and_verified_connection_pid_version";
 type BindingRouteFacts = (String, String, Option<String>, Option<i64>, String);
 
@@ -493,12 +492,14 @@ fn validate_readback_source_identity(
                 "native service version fact is invalid",
             )
         })?;
+    let expected_api_contract =
+        crate::native_mcp::opencode_mcp_api_contract_for_version(source_version);
     if !source_matches
         || identity
             .expected_version
             .as_deref()
             .is_some_and(|expected| expected != source_version)
-        || source["api_contract"] != MCP_API_CONTRACT
+        || source["api_contract"].as_str() != Some(expected_api_contract)
         || source["api_method"] != "GET /api/mcp"
         || source["api_scope"] != "configured_server_connection_status_only"
         || source["service_id"] != identity.service_id
