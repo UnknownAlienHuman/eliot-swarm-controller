@@ -170,88 +170,24 @@ function Get-PolicySiblingBinaries([object] $Coordinate) {
 }
 
 function Assert-PolicyResourceCoordinate([object] $Coordinate) {
-    if ($null -eq $Coordinate['resource_coordinate']) {
-        foreach ($field in @('resource_installed_relative_root', 'resource_repository_relative_root', 'resource_files', 'resource_dependency_install')) {
-            if ($null -ne $Coordinate[$field]) {
-                throw "Package '$($Coordinate.package_name)' has resource metadata without a resource coordinate."
-            }
-        }
-        if ([string]$Coordinate['package_name'] -ceq 'swarm-kernel-host') {
-            throw "Package 'swarm-kernel-host' is missing its required resource coordinate."
-        }
-        return
-    }
-    if ([string]$Coordinate['resource_coordinate'] -cne 'swarm-kernel-host-opencode-resources' -or
-        [string]$Coordinate['resource_installed_relative_root'] -cne 'resources/modules/opencode' -or
-        [string]$Coordinate['resource_repository_relative_root'] -cne 'modules/opencode' -or
-        $Coordinate['resource_files'] -isnot [array] -or
-        $Coordinate['resource_dependency_install'] -isnot [System.Collections.IDictionary]) {
-        throw "Package '$($Coordinate.package_name)' has an unsupported resource coordinate."
-    }
-    $expected = @(
-        @{ path = 'serve.mjs'; role = 'server_program' },
-        @{ path = 'native-mcp-proof.mjs'; role = 'plugin_module' },
-        @{ path = 'index.mjs'; role = 'plugin_entry' },
-        @{ path = 'package.json'; role = 'dependency_manifest' },
-        @{ path = 'package-lock.json'; role = 'dependency_lock' }
-    )
-    $actual = @($Coordinate['resource_files'])
-    if ($actual.Count -ne $expected.Count) { throw "Package '$($Coordinate.package_name)' has an incomplete resource file coordinate." }
-    for ($index = 0; $index -lt $expected.Count; $index++) {
-        $fileCoordinate = $actual[$index]
-        if ($fileCoordinate -isnot [System.Collections.IDictionary] -or
-            [string]$fileCoordinate['path'] -cne $expected[$index].path -or
-            [string]$fileCoordinate['role'] -cne $expected[$index].role) {
-            throw "Package '$($Coordinate.package_name)' resource file coordinate drifted from the pinned OpenCode set."
+    # The retired OpenCode private SDK/server npm dependency installation is
+    # gone from new packages: no swarm-kernel-host-opencode-resources
+    # coordinate, no modules/opencode files, no npm locked-install contract.
+    # New kernel-host packages carry only the Antigravity Node bridge group
+    # (validated by Get-KernelHostAdditionalResourceGroups). Historical
+    # build manifests remain read-only inventory elsewhere; they are never
+    # rebuilt here.
+    foreach ($field in @('resource_coordinate', 'resource_installed_relative_root', 'resource_repository_relative_root', 'resource_files', 'resource_dependency_install')) {
+        if ($null -ne $Coordinate[$field]) {
+            throw "Package '$($Coordinate.package_name)' declares retired OpenCode private server resource field '$field'. New packages carry only the Antigravity Node bridge group."
         }
     }
-    $install = $Coordinate['resource_dependency_install']
-    $expectedArguments = @('ci', '--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--loglevel=error')
-    $actualArguments = @($install['arguments'] | ForEach-Object { [string]$_ })
-    if ([string]$install['manager'] -cne 'npm' -or
-        [string]$install['output_directory'] -cne 'node_modules' -or
-        [string]$install['closure_manifest_file'] -cne 'dependency-closure.json' -or
-        [long]$install['max_files'] -ne 100000 -or
-        [long]$install['max_entries'] -ne 200000 -or
-        [long]$install['max_total_bytes'] -ne 1073741824 -or
-        [long]$install['max_manifest_bytes'] -ne 33554432 -or
-        [long]$install['timeout_seconds'] -ne 1800 -or
-        $actualArguments.Count -ne $expectedArguments.Count) {
-        throw "Package '$($Coordinate.package_name)' has an unsupported locked dependency-install contract."
-    }
-    for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
-        if ($actualArguments[$index] -cne $expectedArguments[$index]) {
-            throw "Package '$($Coordinate.package_name)' dependency install arguments drifted from the pinned contract."
+    if ([string]$Coordinate['package_name'] -cne 'swarm-kernel-host') {
+        $rawGroups = $Coordinate['additional_resource_groups']
+        if ($null -ne $rawGroups -and @($rawGroups).Count -gt 0) {
+            throw "Package '$($Coordinate.package_name)' cannot declare host additional resources."
         }
     }
-}
-
-function Get-KernelHostResourcePins([string] $PackageName, [object] $Coordinate) {
-    if ($PackageName -cne 'swarm-kernel-host') { return @() }
-    Assert-PolicyResourceCoordinate $Coordinate
-    $resourceRoot = Join-Path $repoRoot 'modules/opencode'
-    $pins = @(
-        foreach ($entry in @($Coordinate['resource_files'])) {
-            $sourcePath = [IO.Path]::GetFullPath((Join-Path $resourceRoot ([string]$entry['path'])))
-            Assert-NoReparseTraversal $sourcePath
-            if (-not (Test-PathWithin $sourcePath $resourceRoot) -or
-                -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-                throw "Pinned kernel resource is missing from the repository: $sourcePath"
-            }
-            $item = Get-Item -LiteralPath $sourcePath -Force
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -le 0) {
-                throw "Pinned kernel resource is not a regular non-empty file: $sourcePath"
-            }
-            [ordered]@{
-                path = [string]$entry['path']
-                role = [string]$entry['role']
-                file = 'resources/modules/opencode/' + [string]$entry['path']
-                bytes = [long]$item.Length
-                source_sha256 = Get-Sha256 $sourcePath
-            }
-        }
-    )
-    return $pins
 }
 
 function Get-KernelHostAdditionalResourceGroups([string] $PackageName, [object] $Coordinate) {
@@ -485,7 +421,6 @@ if ($actualBinTargets.Count -ne 1 -or $binTargets.Count -ne 1) {
     throw "Package '$Package' target drift: policy names only '$($selectedCoordinate.binary_target)' but Cargo metadata reports [$($actualNames -join ', ')]. Update the explicit coordinate policy before packaging."
 }
 $dependencyPins = Get-ResolvedDependencyPins $metadata $selected $repoRoot $lockFile
-$resourcePins = @(Get-KernelHostResourcePins $Package $selectedCoordinate)
 $additionalResourceGroups = @(Get-KernelHostAdditionalResourceGroups $Package $selectedCoordinate)
 $compatibility = $null
 if ($Package -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervisor')) {
@@ -501,8 +436,6 @@ if ($Package -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervi
         manifest = 'crates/swarm-kernel-host/Cargo.toml'
         binary_target = 'swarm-kernel-host'
         role = 'host_runtime'
-        resource_coordinate = 'swarm-kernel-host-opencode-resources'
-        resource_installed_relative_root = 'resources/modules/opencode'
     }
     $hostSupervisor = [ordered]@{
         package_name = 'swarm-supervisor'
@@ -574,28 +507,6 @@ if (Test-Path -LiteralPath $outputPath) {
 [void][IO.Directory]::CreateDirectory($outputPath)
 $binaryOutputDir = Join-Path $outputPath 'bin'
 [void][IO.Directory]::CreateDirectory($binaryOutputDir)
-$resourceRows = @(
-    foreach ($resource in $resourcePins) {
-        $sourcePath = Join-Path (Join-Path $repoRoot 'modules/opencode') ([string]$resource.path)
-        Assert-NoReparseTraversal $sourcePath
-        $stagedPath = Join-Path $outputPath ([string]$resource.file -replace '/', [IO.Path]::DirectorySeparatorChar)
-        $stagedParent = Split-Path -Parent $stagedPath
-        [void][IO.Directory]::CreateDirectory($stagedParent)
-        Copy-Item -LiteralPath $sourcePath -Destination $stagedPath
-        $artifactHash = Get-Sha256 $stagedPath
-        if ($artifactHash -cne [string]$resource.source_sha256) {
-            throw "Staged hash mismatch for pinned kernel resource '$($resource.path)'."
-        }
-        [ordered]@{
-            path = [string]$resource.path
-            role = [string]$resource.role
-            file = [string]$resource.file
-            bytes = (Get-Item -LiteralPath $stagedPath).Length
-            source_sha256 = [string]$resource.source_sha256
-            artifact_sha256 = $artifactHash
-        }
-    }
-)
 $additionalResourceRows = @(
     foreach ($group in $additionalResourceGroups) {
         $groupFiles = @(
@@ -655,7 +566,6 @@ $selectedManifestPin = Get-PackageManifestPin $selected $repoRoot
 if ([string]$selectedManifestPin.path -cne $manifestRelative) {
     throw 'Selected package manifest provenance differs from its exact Cargo metadata path.'
 }
-$resourceDependencyInstall = $selectedCoordinate['resource_dependency_install']
 $buildManifest = [ordered]@{
     schema_version = 1
     format = 'eliot.module_build_manifest.v1'
@@ -693,27 +603,10 @@ $buildManifest = [ordered]@{
         feature_sets = 'workspace_unified_not_package_specific_build_features'
     }
     artifacts = @($binaryRows)
-    resources = if ($resourceRows.Count -gt 0) {
+    resources = if ($additionalResourceRows.Count -gt 0) {
         [ordered]@{
             schema_version = 1
-            coordinate = [string]$selectedCoordinate['resource_coordinate']
-            repository_relative_root = [string]$selectedCoordinate['resource_repository_relative_root']
-            installed_relative_root = [string]$selectedCoordinate['resource_installed_relative_root']
-            files = @($resourceRows)
             additional_groups = @($additionalResourceRows)
-            dependency_policy = [ordered]@{
-                node_modules = 'installer_generated_locked_closure'
-                manager = [string]$resourceDependencyInstall['manager']
-                install_command = 'npm ci --ignore-scripts'
-                arguments = @($resourceDependencyInstall['arguments'])
-                output_directory = [string]$resourceDependencyInstall['output_directory']
-                closure_manifest_file = [string]$resourceDependencyInstall['closure_manifest_file']
-                max_files = [long]$resourceDependencyInstall['max_files']
-                max_entries = [long]$resourceDependencyInstall['max_entries']
-                max_total_bytes = [long]$resourceDependencyInstall['max_total_bytes']
-                max_manifest_bytes = [long]$resourceDependencyInstall['max_manifest_bytes']
-                timeout_seconds = [long]$resourceDependencyInstall['timeout_seconds']
-            }
         }
     } else { $null }
     installation = [ordered]@{

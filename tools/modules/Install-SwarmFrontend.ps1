@@ -2,6 +2,10 @@
 param(
     [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string] $PackageDirectory,
     [Parameter(Mandatory = $true)] [ValidateNotNullOrEmpty()] [string] $InstallDirectory,
+    # Retained for caller compatibility only. New Antigravity-only packages
+    # run no npm install, so these are accepted and ignored; historical
+    # receipt readback never launches a toolchain either. Root owns the CI
+    # workflow argument updates separately.
     [string] $NodeExecutable,
     [string] $NpmCliScript,
     [string] $ExpectedNodeVersion,
@@ -30,26 +34,15 @@ $packageMap = @{
         binary = 'swarm-kernel-host'
         role = 'host_runtime'
         required_siblings = @('swarm-supervisor')
-        resource_coordinate = 'swarm-kernel-host-opencode-resources'
-        resource_installed_relative_root = 'resources/modules/opencode'
-        resource_dependency_install = [ordered]@{
-            manager = 'npm'
-            arguments = @('ci', '--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--loglevel=error')
-            output_directory = 'node_modules'
-            closure_manifest_file = 'dependency-closure.json'
-            max_files = 100000
-            max_entries = 200000
-            max_total_bytes = 1073741824
-            max_manifest_bytes = 33554432
-            timeout_seconds = 1800
-        }
-        resource_files = @(
-            [ordered]@{ path = 'serve.mjs'; role = 'server_program' },
-            [ordered]@{ path = 'native-mcp-proof.mjs'; role = 'plugin_module' },
-            [ordered]@{ path = 'index.mjs'; role = 'plugin_entry' },
-            [ordered]@{ path = 'package.json'; role = 'dependency_manifest' },
-            [ordered]@{ path = 'package-lock.json'; role = 'dependency_lock' }
-        )
+        # Retired: new kernel-host packages carry no OpenCode private
+        # SDK/server resources and run no npm install. They carry only the
+        # Antigravity Node bridge group below. The retired
+        # swarm-kernel-host-opencode-resources coordinate (serve.mjs,
+        # native-mcp-proof.mjs, index.mjs, package.json, package-lock.json
+        # plus the locked npm/node_modules dependency closure) is accepted
+        # only as fenced read-only inventory of historical manifests and
+        # receipts (see Assert-ResourceManifest -AllowLegacyMissingAdditionalGroups
+        # and Assert-DependencyClosure); it is never staged or installed anew.
         additional_resource_groups = @(
             [ordered]@{
                 coordinate = 'swarm-kernel-host-antigravity-node-bridge'
@@ -154,78 +147,112 @@ function Assert-ResourceManifest(
     [string] $Label,
     [switch] $AllowLegacyMissingAdditionalGroups
 ) {
-    $expected = @(Get-ResourceSpecFiles $Spec)
-    if ($expected.Count -eq 0) {
-        if ($null -ne $Manifest['resources']) { throw "$Label advertises undeclared package resources." }
-        return $null
+    $expectedGroups = @(Get-AdditionalResourceSpecGroups $Spec)
+    $hasResources = $Manifest.Contains('resources') -and $null -ne $Manifest['resources']
+    if (-not $hasResources) {
+        if ($expectedGroups.Count -eq 0 -and @(Get-ResourceSpecFiles $Spec).Count -eq 0) { return $null }
+        throw "$Label is missing its pinned Antigravity bridge resource group."
     }
     $resources = $Manifest.resources
-    if ($resources -isnot [System.Collections.IDictionary] -or
-        $resources.schema_version -ne 1 -or
-        $resources.coordinate -cne [string]$Spec.resource_coordinate -or
-        $resources.repository_relative_root -cne 'modules/opencode' -or
-        $resources.installed_relative_root -cne [string]$Spec.resource_installed_relative_root -or
-        $resources.files -isnot [array] -or
-        $resources.dependency_policy -isnot [System.Collections.IDictionary]) {
-        throw "$Label does not carry the pinned kernel resource coordinate."
+    if ($resources -isnot [System.Collections.IDictionary] -or $resources.schema_version -ne 1) {
+        throw "$Label does not carry a supported resource record."
     }
-    $dependencyPolicy = $resources.dependency_policy
-    $expectedDependencyPolicy = $Spec.resource_dependency_install
-    if ($null -eq $expectedDependencyPolicy -or
-        $dependencyPolicy.node_modules -cne 'installer_generated_locked_closure' -or
-        $dependencyPolicy.manager -cne [string]$expectedDependencyPolicy.manager -or
-        $dependencyPolicy.install_command -cne 'npm ci --ignore-scripts' -or
-        $dependencyPolicy.output_directory -cne [string]$expectedDependencyPolicy.output_directory -or
-        $dependencyPolicy.closure_manifest_file -cne [string]$expectedDependencyPolicy.closure_manifest_file -or
-        [long]$dependencyPolicy.max_files -ne [long]$expectedDependencyPolicy.max_files -or
-        [long]$dependencyPolicy.max_entries -ne [long]$expectedDependencyPolicy.max_entries -or
-        [long]$dependencyPolicy.max_total_bytes -ne [long]$expectedDependencyPolicy.max_total_bytes -or
-        [long]$dependencyPolicy.max_manifest_bytes -ne [long]$expectedDependencyPolicy.max_manifest_bytes -or
-        [long]$dependencyPolicy.timeout_seconds -ne [long]$expectedDependencyPolicy.timeout_seconds) {
-        throw "$Label has an unsupported locked OpenCode dependency-install contract."
+    if ($expectedGroups.Count -eq 0) {
+        throw "$Label advertises undeclared package resources."
     }
-    $actualArguments = @($dependencyPolicy.arguments | ForEach-Object { [string]$_ })
-    $expectedArguments = @($expectedDependencyPolicy.arguments | ForEach-Object { [string]$_ })
-    if ($actualArguments.Count -ne $expectedArguments.Count) {
-        throw "$Label has a different locked OpenCode dependency-install command."
-    }
-    for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
-        if ($actualArguments[$index] -cne $expectedArguments[$index]) {
-            throw "$Label has a different locked OpenCode dependency-install command."
+    # A manifest that still carries the retired OpenCode private server
+    # coordinate is historical evidence only. It is accepted solely as
+    # fenced read-only inventory (legacy switch below); the new-package gate
+    # refuses to stage or install it anew.
+    $isLegacyServerManifest = $resources.Contains('coordinate') -or $resources.Contains('dependency_policy')
+    if ($isLegacyServerManifest) {
+        if (-not $AllowLegacyMissingAdditionalGroups) {
+            throw "$Label carries the retired OpenCode private server resource coordinate. New packages must not bundle the retired server; historical manifests remain read-only inventory."
+        }
+        $retiredCoordinate = 'swarm-kernel-host-opencode-resources'
+        $retiredRepositoryRoot = 'modules/opencode'
+        $retiredInstalledRoot = 'resources/modules/opencode'
+        $retiredFiles = @(
+            [ordered]@{ path = 'serve.mjs'; role = 'server_program' },
+            [ordered]@{ path = 'native-mcp-proof.mjs'; role = 'plugin_module' },
+            [ordered]@{ path = 'index.mjs'; role = 'plugin_entry' },
+            [ordered]@{ path = 'package.json'; role = 'dependency_manifest' },
+            [ordered]@{ path = 'package-lock.json'; role = 'dependency_lock' }
+        )
+        if ($resources.coordinate -cne $retiredCoordinate -or
+            $resources.repository_relative_root -cne $retiredRepositoryRoot -or
+            $resources.installed_relative_root -cne $retiredInstalledRoot -or
+            $resources.files -isnot [array] -or
+            $resources.dependency_policy -isnot [System.Collections.IDictionary]) {
+            throw "$Label does not carry the pinned retired kernel resource coordinate."
+        }
+        $retiredPolicy = $resources.dependency_policy
+        $retiredArguments = @('ci', '--ignore-scripts', '--no-audit', '--no-fund', '--no-progress', '--loglevel=error')
+        $actualRetiredArguments = @($retiredPolicy.arguments | ForEach-Object { [string]$_ })
+        if ($retiredPolicy.node_modules -cne 'installer_generated_locked_closure' -or
+            $retiredPolicy.manager -cne 'npm' -or
+            $retiredPolicy.install_command -cne 'npm ci --ignore-scripts' -or
+            $retiredPolicy.output_directory -cne 'node_modules' -or
+            $retiredPolicy.closure_manifest_file -cne 'dependency-closure.json' -or
+            [long]$retiredPolicy.max_files -ne 100000 -or
+            [long]$retiredPolicy.max_entries -ne 200000 -or
+            [long]$retiredPolicy.max_total_bytes -ne 1073741824 -or
+            [long]$retiredPolicy.max_manifest_bytes -ne 33554432 -or
+            [long]$retiredPolicy.timeout_seconds -ne 1800 -or
+            $actualRetiredArguments.Count -ne $retiredArguments.Count) {
+            throw "$Label has an unsupported retired locked OpenCode dependency-install contract."
+        }
+        for ($index = 0; $index -lt $retiredArguments.Count; $index++) {
+            if ($actualRetiredArguments[$index] -cne $retiredArguments[$index]) {
+                throw "$Label has a different retired locked OpenCode dependency-install command."
+            }
+        }
+        $actual = @($resources.files)
+        if ($actual.Count -ne $retiredFiles.Count) { throw "$Label has an incomplete retired pinned kernel resource set." }
+        for ($index = 0; $index -lt $retiredFiles.Count; $index++) {
+            $row = $actual[$index]
+            $entry = $retiredFiles[$index]
+            $expectedFile = $retiredInstalledRoot + '/' + [string]$entry.path
+            if ($row -isnot [System.Collections.IDictionary] -or
+                [string]$row.path -cne [string]$entry.path -or
+                [string]$row.role -cne [string]$entry.role -or
+                [string]$row.file -cne $expectedFile -or
+                [long]$row.bytes -le 0) {
+                throw "$Label retired kernel resource row $index does not match the pinned coordinate."
+            }
+            Assert-Hash $row.source_sha256 "$Label.resources.files[$index].source_sha256"
+            Assert-Hash $row.artifact_sha256 "$Label.resources.files[$index].artifact_sha256"
+            if ([string]$row.source_sha256 -cne [string]$row.artifact_sha256) {
+                throw "$Label retired kernel resource row $index has different source and artifact digests."
+            }
+        }
+        # Strict-mode safe: a legacy build manifest has no 'additional_groups' key at all.
+        $legacyGroups = @()
+        if ($resources.Contains('additional_groups')) {
+            $legacyGroups = @($resources['additional_groups'] | Where-Object { $null -ne $_ })
+        }
+        if ($legacyGroups.Count -eq 0) {
+            # Inventory of an already installed package trusts its own build-manifest
+            # identity: a legacy host staged before the Antigravity group existed
+            # declares no additional groups and must not demand current group files.
+            # New packages never take this branch (rejected above), so the exact
+            # group requirement below stays mandatory for them.
+            return $resources
+        }
+    } else {
+        # New Antigravity-only shape: no retired server field may be present.
+        foreach ($retiredField in @('coordinate', 'repository_relative_root', 'installed_relative_root', 'files', 'dependency_policy')) {
+            if ($resources.Contains($retiredField) -and $null -ne $resources[$retiredField]) {
+                throw "$Label mixes the retired OpenCode server resource field '$retiredField' with the Antigravity-only package shape."
+            }
         }
     }
-    $actual = @($resources.files)
-    if ($actual.Count -ne $expected.Count) { throw "$Label has an incomplete pinned kernel resource set." }
-    for ($index = 0; $index -lt $expected.Count; $index++) {
-        $row = $actual[$index]
-        $entry = $expected[$index]
-        $expectedFile = [string]$Spec.resource_installed_relative_root + '/' + [string]$entry.path
-        if ($row -isnot [System.Collections.IDictionary] -or
-            [string]$row.path -cne [string]$entry.path -or
-            [string]$row.role -cne [string]$entry.role -or
-            [string]$row.file -cne $expectedFile -or
-            [long]$row.bytes -le 0) {
-            throw "$Label kernel resource row $index does not match the package coordinate."
-        }
-        Assert-Hash $row.source_sha256 "$Label.resources.files[$index].source_sha256"
-        Assert-Hash $row.artifact_sha256 "$Label.resources.files[$index].artifact_sha256"
-        if ([string]$row.source_sha256 -cne [string]$row.artifact_sha256) {
-            throw "$Label kernel resource row $index has different source and artifact digests."
-        }
-    }
-    $expectedGroups = @(Get-AdditionalResourceSpecGroups $Spec)
-    # Strict-mode safe: a legacy build manifest has no 'additional_groups' key at all.
+    # Shared exact Antigravity bridge group requirement: mandatory for new
+    # packages; legacy inventory with groups validates them identically.
+    # Strict-mode safe: a new or group-less legacy record may lack the key.
     $actualGroups = @()
     if ($resources.Contains('additional_groups')) {
         $actualGroups = @($resources['additional_groups'] | Where-Object { $null -ne $_ })
-    }
-    if ($AllowLegacyMissingAdditionalGroups -and $actualGroups.Count -eq 0) {
-        # Inventory of an already installed package trusts its own build-manifest
-        # identity: a legacy host staged before the Antigravity group existed
-        # declares no additional groups and must not demand current group files.
-        # New packages never pass this switch, so their exact group requirement
-        # below stays mandatory.
-        return $resources
     }
     if ($actualGroups.Count -ne $expectedGroups.Count) {
         throw "$Label has an incomplete additional resource group set."
@@ -299,8 +326,13 @@ function Assert-InstalledResourceFiles(
     [string] $Label
 ) {
     if ($null -eq $Resources) { return }
-    $resourceRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot ([string]$Spec.resource_installed_relative_root)))
-    Assert-InstalledResourceRows -ResourceRoot $resourceRoot -InstallRoot $InstallRoot -Rows @($Resources.files) -Label $Label
+    # Primary server rows exist only on retired historical manifests; their
+    # install root comes from the manifest's own validated identity, never
+    # from live policy. New Antigravity-only records carry groups alone.
+    if ($Resources.Contains('files') -and $null -ne $Resources['files']) {
+        $resourceRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot ([string]$Resources.installed_relative_root)))
+        Assert-InstalledResourceRows -ResourceRoot $resourceRoot -InstallRoot $InstallRoot -Rows @($Resources.files) -Label $Label
+    }
     $installedGroups = @()
     if ($Resources.Contains('additional_groups')) {
         $installedGroups = @($Resources['additional_groups'] | Where-Object { $null -ne $_ })
@@ -311,151 +343,13 @@ function Assert-InstalledResourceFiles(
     }
 }
 
-function Invoke-BoundedInstallerProcess(
-    [string] $Executable,
-    [string[]] $Arguments,
-    [string] $WorkingDirectory,
-    [int] $TimeoutSeconds,
-    [bool] $CaptureOutput
-) {
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $Executable
-    $startInfo.WorkingDirectory = $WorkingDirectory
-    $startInfo.UseShellExecute = $false
-    if ($CaptureOutput) {
-        $startInfo.RedirectStandardOutput = $true
-        $startInfo.RedirectStandardError = $true
-    }
-    foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add([string]$argument) }
-    foreach ($key in @($startInfo.Environment.Keys)) {
-        if ([string]$key -match '(?i)^(npm_config_|node_options$|node_path$)') {
-            [void]$startInfo.Environment.Remove([string]$key)
-        }
-    }
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    try {
-        if (-not $process.Start()) { throw 'The pinned installer process did not start.' }
-        $stdoutTask = $null
-        $stderrTask = $null
-        if ($CaptureOutput) {
-            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-            $stderrTask = $process.StandardError.ReadToEndAsync()
-        }
-        $timeoutMilliseconds = [int][Math]::Min([long]::MaxValue, [long]$TimeoutSeconds * 1000)
-        if (-not $process.WaitForExit($timeoutMilliseconds)) {
-            try { $process.Kill($true) } catch { }
-            try { $process.WaitForExit() } catch { }
-            throw "The pinned installer process exceeded its $TimeoutSeconds second deadline and was stopped."
-        }
-        $process.WaitForExit()
-        if ($process.ExitCode -ne 0) {
-            if ($CaptureOutput) {
-                $stdout = $stdoutTask.GetAwaiter().GetResult()
-                $stderr = $stderrTask.GetAwaiter().GetResult()
-                $details = (($stdout + [Environment]::NewLine + $stderr).Trim())
-                if ($details.Length -gt 4096) { $details = $details.Substring($details.Length - 4096) }
-                throw "The pinned installer process exited with code $($process.ExitCode): $details"
-            }
-            throw "The pinned installer process exited with code $($process.ExitCode)."
-        }
-        if ($CaptureOutput) { return $stdoutTask.GetAwaiter().GetResult().Trim() }
-        return ''
-    } finally {
-        $process.Dispose()
-    }
-}
-
-function Get-PinnedNpmTools(
-    [string] $NodeExecutable,
-    [string] $NpmCliScript,
-    [string] $ExpectedNodeVersion,
-    [string] $ExpectedNpmVersion
-) {
-    if ([string]::IsNullOrWhiteSpace($NodeExecutable) -or
-        [string]::IsNullOrWhiteSpace($NpmCliScript) -or
-        $ExpectedNodeVersion -cnotmatch '\Av[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\z' -or
-        $ExpectedNpmVersion -cnotmatch '\A[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\z') {
-        throw 'Kernel OpenCode installation requires absolute Node/npm paths and exact expected version pins.'
-    }
-    $nodePath = Get-CanonicalPath $NodeExecutable 'NodeExecutable'
-    $npmPath = Get-CanonicalPath $NpmCliScript 'NpmCliScript'
-    foreach ($path in @($nodePath, $npmPath)) {
-        Assert-NoReparseTraversal $path
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            throw 'The explicitly pinned Node executable or npm CLI script is missing.'
-        }
-        $item = Get-Item -LiteralPath $path -Force
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -le 0) {
-            throw 'The explicitly pinned Node executable or npm CLI script is not a regular non-empty file.'
-        }
-    }
-    $nodeHash = Get-Sha256 $nodePath
-    $npmHash = Get-Sha256 $npmPath
-    $nodeVersion = Invoke-BoundedInstallerProcess $nodePath @('--version') (Split-Path -Parent $nodePath) 30 $true
-    $npmVersion = Invoke-BoundedInstallerProcess $nodePath @($npmPath, '--version') (Split-Path -Parent $npmPath) 30 $true
-    if ($nodeVersion -cne $ExpectedNodeVersion -or $npmVersion -cne $ExpectedNpmVersion) {
-        throw "Pinned Node/npm versions do not match the supplied expectation (Node '$nodeVersion', npm '$npmVersion')."
-    }
-    return [ordered]@{
-        node = [ordered]@{
-            file = [IO.Path]::GetFileName($nodePath)
-            version = $nodeVersion
-            executable_sha256 = $nodeHash
-        }
-        npm = [ordered]@{
-            file = [IO.Path]::GetFileName($npmPath)
-            version = $npmVersion
-            cli_sha256 = $npmHash
-        }
-        node_path = $nodePath
-        npm_path = $npmPath
-    }
-}
-
-function Invoke-LockedNpmInstall(
-    [string] $ResourceRoot,
-    [System.Collections.IDictionary] $Tools,
-    [System.Collections.IDictionary] $Policy
-) {
-    $nodeModules = Join-Path $ResourceRoot ([string]$Policy.output_directory)
-    if (Test-Path -LiteralPath $nodeModules) {
-        throw 'The staged OpenCode resource directory already contains node_modules.'
-    }
-    $nonce = [guid]::NewGuid().ToString('N')
-    $configPath = Join-Path $ResourceRoot ('.npm-empty-config-' + $nonce)
-    $globalConfigPath = Join-Path $ResourceRoot ('.npm-empty-global-config-' + $nonce)
-    $cachePath = Join-Path $ResourceRoot ('.npm-cache-' + $nonce)
-    $configBytes = [Text.UTF8Encoding]::new($false).GetBytes([string]::Empty)
-    foreach ($emptyConfigPath in @($configPath, $globalConfigPath)) {
-        $configStream = [IO.File]::Open($emptyConfigPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try {
-            $configStream.Write($configBytes, 0, $configBytes.Length)
-            $configStream.Flush($true)
-        } finally { $configStream.Dispose() }
-    }
-    [void][IO.Directory]::CreateDirectory($cachePath)
-    try {
-        $arguments = @($Tools.npm_path) + @($Policy.arguments | ForEach-Object { [string]$_ }) + @(
-            '--userconfig', $configPath,
-            '--globalconfig', $globalConfigPath,
-            '--cache', $cachePath
-        )
-        [void](Invoke-BoundedInstallerProcess ([string]$Tools.node_path) $arguments $ResourceRoot ([int]$Policy.timeout_seconds) $false)
-    } finally {
-        foreach ($emptyConfigPath in @($configPath, $globalConfigPath)) {
-            if (Test-Path -LiteralPath $emptyConfigPath -PathType Leaf) {
-                Remove-Item -LiteralPath $emptyConfigPath -Force -Confirm:$false
-            }
-        }
-        if (Test-Path -LiteralPath $cachePath) {
-            Remove-Item -LiteralPath $cachePath -Recurse -Force -Confirm:$false
-        }
-    }
-    if (-not (Test-Path -LiteralPath $nodeModules -PathType Container)) {
-        throw 'Locked npm ci returned success without producing node_modules.'
-    }
-}
+# Retired: the OpenCode private SDK/server locked npm installation
+# (Invoke-BoundedInstallerProcess, Get-PinnedNpmTools, Invoke-LockedNpmInstall,
+# New-DependencyClosureManifest) is removed. New Antigravity-only packages
+# stage no node_modules and need no Node/npm toolchain. Historical installs
+# are verified read-only by Assert-DependencyClosure with the retained
+# Get-DependencyTreeRows / Get-DependencyTreeSha256 helpers below; nothing
+# here launches npm, Node, or a native server.
 
 function Get-DependencyTreeRows([string] $NodeModulesPath, [System.Collections.IDictionary] $Policy) {
     if (-not (Test-Path -LiteralPath $NodeModulesPath -PathType Container)) {
@@ -532,69 +426,6 @@ function Get-DependencyTreeSha256([object[]] $Files) {
     } finally { $hasher.Dispose() }
 }
 
-function New-DependencyClosureManifest(
-    [string] $ResourceRoot,
-    [System.Collections.IDictionary] $Tools,
-    [System.Collections.IDictionary] $Spec
-) {
-    $policy = $Spec.resource_dependency_install
-    $tree = Get-DependencyTreeRows (Join-Path $ResourceRoot ([string]$policy.output_directory)) $policy
-    $treeHash = Get-DependencyTreeSha256 @($tree.files)
-    $packageJsonHash = Get-Sha256 (Join-Path $ResourceRoot 'package.json')
-    $packageLockHash = Get-Sha256 (Join-Path $ResourceRoot 'package-lock.json')
-    $manifest = [ordered]@{
-        schema_version = 1
-        format = 'eliot.opencode_dependency_closure.v1'
-        coordinate = [string]$Spec.resource_coordinate
-        package_json_sha256 = $packageJsonHash
-        package_lock_sha256 = $packageLockHash
-        node = [ordered]@{
-            file = [string]$Tools.node.file
-            version = [string]$Tools.node.version
-            executable_sha256 = [string]$Tools.node.executable_sha256
-        }
-        npm = [ordered]@{
-            file = [string]$Tools.npm.file
-            version = [string]$Tools.npm.version
-            cli_sha256 = [string]$Tools.npm.cli_sha256
-        }
-        tree_sha256 = $treeHash
-        entry_count = [long]$tree.entry_count
-        file_count = [long]$tree.files.Count
-        total_bytes = [long]$tree.total_bytes
-        files = @($tree.files)
-    }
-    $json = ConvertTo-Json -InputObject $manifest -Depth 8 -Compress
-    $manifestBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + "`n")
-    if ($manifestBytes.Length -gt [long]$policy.max_manifest_bytes) {
-        throw 'Generated dependency closure manifest exceeds its pinned size bound.'
-    }
-    $manifestPath = Join-Path $ResourceRoot ([string]$policy.closure_manifest_file)
-    $stream = [IO.File]::Open($manifestPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try {
-        $stream.Write($manifestBytes, 0, $manifestBytes.Length)
-        $stream.Flush($true)
-    } finally { $stream.Dispose() }
-    return [ordered]@{
-        schema_version = 1
-        manifest_file = [string]$policy.closure_manifest_file
-        manifest_sha256 = Get-Sha256 $manifestPath
-        coordinate = [string]$Spec.resource_coordinate
-        package_json_sha256 = $packageJsonHash
-        package_lock_sha256 = $packageLockHash
-        tree_sha256 = $treeHash
-        node_version = [string]$Tools.node.version
-        node_executable_sha256 = [string]$Tools.node.executable_sha256
-        node_file = [string]$Tools.node.file
-        npm_version = [string]$Tools.npm.version
-        npm_cli_sha256 = [string]$Tools.npm.cli_sha256
-        npm_cli_file = [string]$Tools.npm.file
-        entry_count = [long]$tree.entry_count
-        file_count = [long]$tree.files.Count
-        total_bytes = [long]$tree.total_bytes
-    }
-}
-
 function Assert-DependencyClosure(
     [string] $ResourceRoot,
     [System.Collections.IDictionary] $ReceiptResources,
@@ -602,12 +433,24 @@ function Assert-DependencyClosure(
     [System.Collections.IDictionary] $Spec,
     [string] $Label
 ) {
-    $policy = $Spec.resource_dependency_install
+    # Fenced read-only verification of historical installs only. The retired
+    # locked-install bounds below are pinned literals (ex-policy), never live
+    # configuration; no npm or Node process is launched. $Spec is accepted
+    # for caller compatibility and otherwise unused.
+    $policy = [ordered]@{
+        output_directory = 'node_modules'
+        closure_manifest_file = 'dependency-closure.json'
+        max_files = 100000
+        max_entries = 200000
+        max_total_bytes = 1073741824
+        max_manifest_bytes = 33554432
+    }
+    $retiredCoordinate = 'swarm-kernel-host-opencode-resources'
     $pin = $ReceiptResources.dependency_closure
     if ($pin -isnot [System.Collections.IDictionary] -or
         $pin.schema_version -ne 1 -or
         $pin.manifest_file -cne [string]$policy.closure_manifest_file -or
-        $pin.coordinate -cne [string]$Spec.resource_coordinate) {
+        $pin.coordinate -cne $retiredCoordinate) {
         throw "$Label has no pinned installed dependency closure receipt."
     }
     Assert-Hash $pin.manifest_sha256 "$Label.resources.dependency_closure.manifest_sha256"
@@ -621,7 +464,7 @@ function Assert-DependencyClosure(
     $manifest = Read-JsonMap $manifestPath "$Label dependency closure manifest"
     if ($manifest.schema_version -ne 1 -or
         $manifest.format -cne 'eliot.opencode_dependency_closure.v1' -or
-        $manifest.coordinate -cne [string]$Spec.resource_coordinate -or
+        $manifest.coordinate -cne $retiredCoordinate -or
         $manifest.node -isnot [System.Collections.IDictionary] -or
         $manifest.npm -isnot [System.Collections.IDictionary] -or
         $manifest.files -isnot [array]) {
@@ -689,34 +532,81 @@ function Assert-ReceiptResourceContract([object] $Receipt, [object] $Resources, 
         return
     }
     $receiptResources = $Receipt.resources
-    if ($receiptResources -isnot [System.Collections.IDictionary] -or
-        $receiptResources.coordinate -cne [string]$Resources.coordinate -or
-        $receiptResources.installed_relative_root -cne [string]$Resources.installed_relative_root -or
-        $receiptResources.files -isnot [array]) {
-        throw "$Label receipt does not carry the pinned kernel resource coordinate."
+    if ($receiptResources -isnot [System.Collections.IDictionary]) {
+        throw "$Label receipt does not carry a supported resource record."
     }
-    $manifestRows = @($Resources.files)
-    $receiptRows = @($receiptResources.files)
-    if ($manifestRows.Count -ne $receiptRows.Count) { throw "$Label receipt has an incomplete kernel resource set." }
-    for ($index = 0; $index -lt $manifestRows.Count; $index++) {
-        if ([string]$receiptRows[$index].path -cne [string]$manifestRows[$index].path -or
-            [string]$receiptRows[$index].file -cne [string]$manifestRows[$index].file -or
-            [string]$receiptRows[$index].artifact_sha256 -cne [string]$manifestRows[$index].artifact_sha256) {
-            throw "$Label receipt kernel resource row $index does not match its build manifest."
+    $isLegacyManifest = ($Resources.Contains('coordinate') -and $null -ne $Resources['coordinate']) -or
+        ($Resources.Contains('dependency_policy') -and $null -ne $Resources['dependency_policy'])
+    $isLegacyReceipt = ($receiptResources.Contains('coordinate') -and $null -ne $receiptResources['coordinate']) -or
+        ($receiptResources.Contains('dependency_closure') -and $null -ne $receiptResources['dependency_closure'])
+    if ($isLegacyManifest -ne $isLegacyReceipt) {
+        throw "$Label receipt resource shape does not match its build manifest."
+    }
+    if ($isLegacyManifest) {
+        # Fenced historical receipt: retired coordinate literals, never live policy.
+        if ($receiptResources.coordinate -cne 'swarm-kernel-host-opencode-resources' -or
+            $receiptResources.installed_relative_root -cne 'resources/modules/opencode' -or
+            $receiptResources.files -isnot [array]) {
+            throw "$Label receipt does not carry the retired kernel resource coordinate."
+        }
+        $manifestRows = @($Resources.files)
+        $receiptRows = @($receiptResources.files)
+        if ($manifestRows.Count -ne $receiptRows.Count) { throw "$Label receipt has an incomplete retired kernel resource set." }
+        for ($index = 0; $index -lt $manifestRows.Count; $index++) {
+            if ([string]$receiptRows[$index].path -cne [string]$manifestRows[$index].path -or
+                [string]$receiptRows[$index].file -cne [string]$manifestRows[$index].file -or
+                [string]$receiptRows[$index].artifact_sha256 -cne [string]$manifestRows[$index].artifact_sha256) {
+                throw "$Label receipt retired kernel resource row $index does not match its build manifest."
+            }
+        }
+        $closure = $receiptResources.dependency_closure
+        if ($closure -isnot [System.Collections.IDictionary] -or
+            $closure.schema_version -ne 1 -or
+            $closure.manifest_file -cne 'dependency-closure.json' -or
+            $closure.coordinate -cne 'swarm-kernel-host-opencode-resources') {
+            throw "$Label receipt does not pin its installed dependency closure."
+        }
+        foreach ($field in @('manifest_sha256', 'package_json_sha256', 'package_lock_sha256', 'tree_sha256', 'node_executable_sha256', 'npm_cli_sha256')) {
+            Assert-Hash $closure[$field] "$Label receipt dependency_closure.$field"
+        }
+        if ([long]$closure.entry_count -le 0 -or [long]$closure.entry_count -gt 200000) {
+            throw "$Label receipt dependency closure has an invalid directory-entry count."
         }
     }
-    $closure = $receiptResources.dependency_closure
-    if ($closure -isnot [System.Collections.IDictionary] -or
-        $closure.schema_version -ne 1 -or
-        $closure.manifest_file -cne 'dependency-closure.json' -or
-        $closure.coordinate -cne [string]$Resources.coordinate) {
-        throw "$Label receipt does not pin its installed dependency closure."
+    # Antigravity bridge groups are pinned on both new and grouped legacy
+    # receipts; legacy receipts predating the group carry none and skip this.
+    $manifestGroups = @()
+    if ($Resources.Contains('additional_groups')) {
+        $manifestGroups = @($Resources['additional_groups'] | Where-Object { $null -ne $_ })
     }
-    foreach ($field in @('manifest_sha256', 'package_json_sha256', 'package_lock_sha256', 'tree_sha256', 'node_executable_sha256', 'npm_cli_sha256')) {
-        Assert-Hash $closure[$field] "$Label receipt dependency_closure.$field"
+    $receiptGroups = @()
+    if ($receiptResources.Contains('additional_groups')) {
+        $receiptGroups = @($receiptResources['additional_groups'] | Where-Object { $null -ne $_ })
     }
-    if ([long]$closure.entry_count -le 0 -or [long]$closure.entry_count -gt [long]$Spec.resource_dependency_install.max_entries) {
-        throw "$Label receipt dependency closure has an invalid directory-entry count."
+    if ($receiptGroups.Count -ne $manifestGroups.Count) {
+        if ($isLegacyManifest -and $receiptGroups.Count -eq 0) { return }
+        throw "$Label receipt has an incomplete additional resource group set."
+    }
+    for ($groupIndex = 0; $groupIndex -lt $manifestGroups.Count; $groupIndex++) {
+        $manifestGroup = $manifestGroups[$groupIndex]
+        $receiptGroup = $receiptGroups[$groupIndex]
+        if ($receiptGroup -isnot [System.Collections.IDictionary] -or
+            [string]$receiptGroup.coordinate -cne [string]$manifestGroup.coordinate -or
+            [string]$receiptGroup.installed_relative_root -cne [string]$manifestGroup.installed_relative_root) {
+            throw "$Label receipt additional resource group $groupIndex does not match its build manifest."
+        }
+        $manifestFiles = @($manifestGroup.files)
+        $receiptFiles = @($receiptGroup.files)
+        if ($manifestFiles.Count -ne $receiptFiles.Count) {
+            throw "$Label receipt additional resource group $groupIndex is incomplete."
+        }
+        for ($fileIndex = 0; $fileIndex -lt $manifestFiles.Count; $fileIndex++) {
+            if ([string]$receiptFiles[$fileIndex].path -cne [string]$manifestFiles[$fileIndex].path -or
+                [string]$receiptFiles[$fileIndex].file -cne [string]$manifestFiles[$fileIndex].file -or
+                [string]$receiptFiles[$fileIndex].artifact_sha256 -cne [string]$manifestFiles[$fileIndex].artifact_sha256) {
+                throw "$Label receipt additional resource group $groupIndex file row $fileIndex does not match its build manifest."
+            }
+        }
     }
 }
 
@@ -762,16 +652,28 @@ function Get-HostIpcVersion([object] $Manifest, [string] $Label) {
     return $version
 }
 
-function Get-HostRuntimeCoordinate([object] $Manifest, [string] $Label) {
+function Get-HostRuntimeCoordinate([object] $Manifest, [string] $Label, [switch] $AllowLegacyServerResources) {
     $runtime = $Manifest.compatibility.host_runtime
     if ($runtime -isnot [System.Collections.IDictionary] -or
         $runtime.package_name -cne 'swarm-kernel-host' -or
         $runtime.manifest -cne 'crates/swarm-kernel-host/Cargo.toml' -or
         $runtime.binary_target -cne 'swarm-kernel-host' -or
-        $runtime.role -cne 'host_runtime' -or
-        $runtime.resource_coordinate -cne 'swarm-kernel-host-opencode-resources' -or
-        $runtime.resource_installed_relative_root -cne 'resources/modules/opencode') {
+        $runtime.role -cne 'host_runtime') {
         throw "$Label does not pin the independent swarm-kernel-host runtime coordinate. Rebuild it with the current provenance builder."
+    }
+    # New packages carry no server resource requirement here. Historical
+    # manifests pin the retired coordinate; accepted only as fenced
+    # read-only inventory, never for new packages.
+    $hasLegacyServerFields = ($runtime.Contains('resource_coordinate') -and $null -ne $runtime['resource_coordinate']) -or
+        ($runtime.Contains('resource_installed_relative_root') -and $null -ne $runtime['resource_installed_relative_root'])
+    if ($hasLegacyServerFields) {
+        if (-not $AllowLegacyServerResources) {
+            throw "$Label carries the retired OpenCode server resource requirement in its host runtime coordinate. Rebuild it with the current provenance builder."
+        }
+        if ($runtime.resource_coordinate -cne 'swarm-kernel-host-opencode-resources' -or
+            $runtime.resource_installed_relative_root -cne 'resources/modules/opencode') {
+            throw "$Label pins an unsupported retired server resource coordinate."
+        }
     }
     return $runtime
 }
@@ -792,7 +694,8 @@ function Assert-CompatibilityManifest(
     [object] $Manifest,
     [string] $PackageName,
     [System.Collections.IDictionary] $Spec,
-    [string] $Label
+    [string] $Label,
+    [switch] $AllowLegacyServerResources
 ) {
     if ($Manifest.compatibility -isnot [System.Collections.IDictionary]) {
         throw "$Label is missing its explicit host IPC/launcher compatibility record. Repackage it with the updated provenance builder."
@@ -801,7 +704,7 @@ function Assert-CompatibilityManifest(
     $runtime = $null
     $supervisor = $null
     if ($PackageName -in @('eliot-swarm-controller', 'swarm-kernel-host', 'swarm-supervisor', 'swarm-cli')) {
-        $runtime = Get-HostRuntimeCoordinate $Manifest $Label
+        $runtime = Get-HostRuntimeCoordinate $Manifest $Label -AllowLegacyServerResources:$AllowLegacyServerResources
         $supervisor = Get-HostSupervisorCoordinate $Manifest $Label
     }
     $targetTriple = [string]$Manifest.compatibility.target.rustc_host_triple
@@ -842,7 +745,7 @@ function Assert-CompatibilityManifest(
         }
     } elseif ($PackageName -ceq 'swarm-cli') {
         $launcher = $Manifest.compatibility.host_launcher
-        $runtime = Get-HostRuntimeCoordinate $Manifest $Label
+        $runtime = Get-HostRuntimeCoordinate $Manifest $Label -AllowLegacyServerResources:$AllowLegacyServerResources
         if ($launcher.package_name -cne 'eliot-swarm-controller' -or
             $launcher.binary_target -cne 'swarm-host' -or
             $runtime.package_name -cne 'swarm-kernel-host' -or
@@ -865,15 +768,25 @@ function Assert-HostIpcCompatible([object] $Left, [string] $LeftLabel, [object] 
     $rightVersion = Get-HostIpcVersion $Right $RightLabel
     $leftTarget = [string]$Left.compatibility.target.rustc_host_triple
     $rightTarget = [string]$Right.compatibility.target.rustc_host_triple
-    $leftRuntime = if ($null -ne $Left.compatibility['host_runtime']) { Get-HostRuntimeCoordinate $Left $LeftLabel } else { $null }
-    $rightRuntime = if ($null -ne $Right.compatibility['host_runtime']) { Get-HostRuntimeCoordinate $Right $RightLabel } else { $null }
+    # Inventory context: either side may be a historical manifest that still
+    # pins the retired server resource requirement.
+    $leftRuntime = if ($null -ne $Left.compatibility['host_runtime']) { Get-HostRuntimeCoordinate $Left $LeftLabel -AllowLegacyServerResources } else { $null }
+    $rightRuntime = if ($null -ne $Right.compatibility['host_runtime']) { Get-HostRuntimeCoordinate $Right $RightLabel -AllowLegacyServerResources } else { $null }
     $leftSupervisor = if ($null -ne $Left.compatibility['host_supervisor']) { Get-HostSupervisorCoordinate $Left $LeftLabel } else { $null }
     $rightSupervisor = if ($null -ne $Right.compatibility['host_supervisor']) { Get-HostSupervisorCoordinate $Right $RightLabel } else { $null }
+    # Retired server resource fields are compared only when both sides pin
+    # them: a mixed historical/new pair differs by design, not by contract.
+    $leftLegacyServer = $null -ne $leftRuntime -and
+        ($leftRuntime.Contains('resource_coordinate') -and $null -ne $leftRuntime['resource_coordinate'])
+    $rightLegacyServer = $null -ne $rightRuntime -and
+        ($rightRuntime.Contains('resource_coordinate') -and $null -ne $rightRuntime['resource_coordinate'])
+    $serverMismatch = $leftLegacyServer -and $rightLegacyServer -and
+        ([string]$leftRuntime['resource_coordinate'] -cne [string]$rightRuntime['resource_coordinate'] -or
+         [string]$leftRuntime['resource_installed_relative_root'] -cne [string]$rightRuntime['resource_installed_relative_root'])
     $runtimeMismatch = $null -ne $leftRuntime -and $null -ne $rightRuntime -and
         ($leftRuntime.package_name -cne $rightRuntime.package_name -or
          $leftRuntime.binary_target -cne $rightRuntime.binary_target -or
-         $leftRuntime.resource_coordinate -cne $rightRuntime.resource_coordinate -or
-         $leftRuntime.resource_installed_relative_root -cne $rightRuntime.resource_installed_relative_root)
+         $serverMismatch)
     $supervisorMismatch = $null -ne $leftSupervisor -and $null -ne $rightSupervisor -and
         ($leftSupervisor.package_name -cne $rightSupervisor.package_name -or
          $leftSupervisor.binary_target -cne $rightSupervisor.binary_target -or
@@ -947,12 +860,10 @@ function Get-InstalledFrontend(
     if ($identityPresent.Count -eq 0) {
         # Preserve the original partial-install detection: known resource files
         # without any identity sidecar are an orphaned install, not an absent one.
-        # Only EXISTING spec-known paths are examined, so a legitimate legacy host
-        # (complete identity, no additional groups) is unaffected here.
+        # Only EXISTING spec-known paths are examined. The retired OpenCode
+        # server files are intentionally not listed: they are never part of a
+        # new install, so stray historical bytes without identity are not ours.
         $specResourcePaths = @(
-            foreach ($entry in @(Get-ResourceSpecFiles $Spec)) {
-                Join-Path (Join-Path $Root ([string]$Spec.resource_installed_relative_root)) ([string]$entry.path)
-            }
             foreach ($group in @(Get-AdditionalResourceSpecGroups $Spec)) {
                 foreach ($entry in @($group.resource_files)) {
                     Join-Path (Join-Path $Root ([string]$group.installed_relative_root)) ([string]$entry.path)
@@ -1020,15 +931,20 @@ function Get-InstalledFrontend(
     }
     Assert-SourceIdentity $manifest.source 'Installed build source' $isHostPackage
     Assert-DependencyPins $manifest "Installed frontend '$Name' build manifest"
-    Assert-CompatibilityManifest $manifest $Name $Spec "Installed frontend '$Name' build manifest"
+    # Inventory context: already installed historical manifests may still pin
+    # the retired server resource requirement; read-only verification only.
+    Assert-CompatibilityManifest $manifest $Name $Spec "Installed frontend '$Name' build manifest" -AllowLegacyServerResources
     $resources = Assert-ResourceManifest $manifest $Spec "Installed frontend '$Name' build manifest" -AllowLegacyMissingAdditionalGroups
     if ($null -ne $resources) {
         # Required resource files come from the installed build manifest's own
-        # identity: legacy hosts declare no additional groups, current hosts
-        # declare the exact Antigravity group validated above.
+        # identity. Retired server rows exist only on historical manifests
+        # (rooted at their own validated relative root); new Antigravity-only
+        # records list groups alone.
         $installedResourcePaths = @(
-            foreach ($row in @($resources.files)) {
-                Join-Path (Join-Path $Root ([string]$Spec.resource_installed_relative_root)) ([string]$row.path)
+            if ($resources.Contains('files') -and $null -ne $resources['files']) {
+                foreach ($row in @($resources.files)) {
+                    Join-Path (Join-Path $Root ([string]$resources.installed_relative_root)) ([string]$row.path)
+                }
             }
             $legacyGroups = @()
             if ($resources.Contains('additional_groups')) {
@@ -1051,9 +967,16 @@ function Get-InstalledFrontend(
     }
     Assert-ReceiptResourceContract $receipt $resources "Installed frontend '$Name'"
     Assert-InstalledResourceFiles $Root $Spec $resources "Installed frontend '$Name'"
-    if ($null -ne $resources) {
-        $installedResourceRoot = Join-Path $Root ([string]$Spec.resource_installed_relative_root)
+    # The retired locked dependency closure is re-verified read-only on
+    # historical installs only; new Antigravity-only records carry none.
+    $hasLegacyServerRows = $null -ne $resources -and $resources.Contains('files') -and $null -ne $resources['files']
+    $hasLegacyClosure = $null -ne $receipt.resources -and
+        $receipt.resources.Contains('dependency_closure') -and $null -ne $receipt.resources['dependency_closure']
+    if ($hasLegacyServerRows -and $hasLegacyClosure) {
+        $installedResourceRoot = Join-Path $Root ([string]$resources.installed_relative_root)
         Assert-DependencyClosure $installedResourceRoot $receipt.resources $resources $Spec "Installed frontend '$Name'"
+    } elseif ($hasLegacyClosure -xor $hasLegacyServerRows) {
+        throw "Installed frontend '$Name' mixes retired server resources with an Antigravity-only install record. Use a new empty install directory."
     }
     Assert-Hash $receipt.package_manifest_sha256 'receipt.package_manifest_sha256'
     if ($null -ne $manifest.source['package_manifest_path'] -and
@@ -1226,12 +1149,15 @@ foreach ($name in $packageMap.Keys) {
 $binaryDestination = Join-Path $installRoot $binaryLeaf
 $buildDestination = Join-Path $installRoot ([string]$selectedSpec.binary + '.build-manifest.json')
 $receiptDestination = Join-Path $installRoot ([string]$selectedSpec.binary + '.install-receipt.json')
-$resourceDestinationRoot = if ($null -ne $provenanceResources) {
-    [IO.Path]::GetFullPath((Join-Path $installRoot ([string]$selectedSpec.resource_installed_relative_root)))
-} else { $null }
-$additionalResourceGroups = if ($null -ne $provenanceResources) {
-    @($provenanceResources.additional_groups)
-} else { @() }
+# Retired: no server staging directory is ever created and no npm install
+# ever runs. A legacy server manifest never reaches this point: the
+# new-package gate above (Assert-ResourceManifest without the legacy switch)
+# rejects it. Only the Antigravity bridge groups below are planned.
+$resourceDestinationRoot = $null
+$additionalResourceGroups = @()
+if ($null -ne $provenanceResources -and $provenanceResources.Contains('additional_groups')) {
+    $additionalResourceGroups = @($provenanceResources['additional_groups'] | Where-Object { $null -ne $_ })
+}
 $additionalResourcePlans = @(
     foreach ($group in $additionalResourceGroups) {
         [ordered]@{
@@ -1298,40 +1224,15 @@ if ($null -ne $existing[$packageName]) {
         $stageBinary = Join-Path $installRoot ('.' + $binaryLeaf + '.' + $nonce + '.stage')
         $stageBuild = Join-Path $installRoot ('.' + [string]$selectedSpec.binary + '.build-manifest.' + $nonce + '.stage')
         $stageReceipt = Join-Path $installRoot ('.' + [string]$selectedSpec.binary + '.install-receipt.' + $nonce + '.stage')
-        $stageResourceRoot = if ($null -ne $provenanceResources) {
-            Join-Path $installRoot ('.resources.' + $nonce + '.stage')
-        } else { $null }
         foreach ($plan in $additionalResourcePlans) {
             $safeCoordinate = [string]$plan.coordinate -replace '[^A-Za-z0-9._-]', '_'
             $plan.stage_root = Join-Path $installRoot ('.resources.' + $safeCoordinate + '.' + $nonce + '.stage')
         }
-        $resourceParent = if ($null -ne $resourceDestinationRoot) { Split-Path -Parent $resourceDestinationRoot } else { $null }
-        $resourceParentCreated = $false
-        $resourceMoved = $false
         $createdDestinations = [Collections.Generic.List[string]]::new()
         $receiptHash = $null
         try {
             Copy-ToStage $packageBinary $stageBinary
             Copy-ToStage $manifestPath $stageBuild
-            $npmTools = $null
-            $dependencyClosure = $null
-            if ($null -ne $provenanceResources) {
-                $npmTools = Get-PinnedNpmTools $NodeExecutable $NpmCliScript $ExpectedNodeVersion $ExpectedNpmVersion
-                [void][IO.Directory]::CreateDirectory($stageResourceRoot)
-                foreach ($row in @($provenanceResources.files)) {
-                    $stageResourcePath = Join-Path $stageResourceRoot ([string]$row.path)
-                    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $stageResourcePath))
-                    $packageResourcePath = Join-Path $packagePath ([string]$row.file -replace '/', [IO.Path]::DirectorySeparatorChar)
-                    Copy-ToStage $packageResourcePath $stageResourcePath
-                    $stageResourceItem = Get-Item -LiteralPath $stageResourcePath -Force
-                    if ([long]$stageResourceItem.Length -ne [long]$row.bytes -or
-                        (Get-Sha256 $stageResourcePath) -cne [string]$row.artifact_sha256) {
-                        throw "Staged kernel resource '$($row.path)' failed its pinned size or SHA-256 check."
-                    }
-                }
-                Invoke-LockedNpmInstall $stageResourceRoot $npmTools $selectedSpec.resource_dependency_install
-                $dependencyClosure = New-DependencyClosureManifest $stageResourceRoot $npmTools $selectedSpec
-            }
             foreach ($plan in $additionalResourcePlans) {
                 [void][IO.Directory]::CreateDirectory([string]$plan.stage_root)
                 foreach ($row in @($plan.group.files)) {
@@ -1374,15 +1275,29 @@ if ($null -ne $existing[$packageName]) {
                 rust_toolchain_toml_sha256 = [string]$provenance.source.rust_toolchain_toml_sha256
                 resources = if ($null -ne $provenanceResources) {
                     [ordered]@{
-                        coordinate = [string]$provenanceResources.coordinate
-                        installed_relative_root = [string]$provenanceResources.installed_relative_root
-                        files = @($provenanceResources.files)
-                        dependency_closure = $dependencyClosure
+                        additional_groups = @(
+                            foreach ($group in $additionalResourceGroups) {
+                                [ordered]@{
+                                    coordinate = [string]$group.coordinate
+                                    module_id = [string]$group.module_id
+                                    artifact_id = [string]$group.artifact_id
+                                    version = [string]$group.version
+                                    repository_relative_root = [string]$group.repository_relative_root
+                                    installed_relative_root = [string]$group.installed_relative_root
+                                    files = @(
+                                        foreach ($row in @($group.files)) {
+                                            [ordered]@{
+                                                path = [string]$row.path
+                                                file = [string]$row.file
+                                                artifact_sha256 = [string]$row.artifact_sha256
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                        )
                     }
                 } else { $null }
-            }
-            if ($null -ne $provenanceResources) {
-                Assert-DependencyClosure $stageResourceRoot $receipt.resources $provenanceResources $selectedSpec 'Staged frontend'
             }
             $receiptJson = ConvertTo-Json -InputObject $receipt -Depth 6
             $receiptBytes = [Text.UTF8Encoding]::new($false).GetBytes($receiptJson + [Environment]::NewLine)
@@ -1397,7 +1312,6 @@ if ($null -ne $existing[$packageName]) {
                 throw 'Staged frontend executable or build manifest failed its pinned SHA-256 check.'
             }
             $installDestinations = @($binaryDestination, $buildDestination, $receiptDestination)
-            if ($null -ne $resourceDestinationRoot) { $installDestinations += $resourceDestinationRoot }
             foreach ($plan in $additionalResourcePlans) { $installDestinations += [string]$plan.destination }
             foreach ($destination in $installDestinations) {
                 Assert-NoReparseTraversal $destination
@@ -1411,16 +1325,6 @@ if ($null -ne $existing[$packageName]) {
             $createdDestinations.Add($buildDestination)
             [IO.File]::Move($stageReceipt, $receiptDestination)
             $createdDestinations.Add($receiptDestination)
-            if ($null -ne $resourceDestinationRoot) {
-                Assert-NoReparseTraversal $resourceParent
-                if (-not (Test-Path -LiteralPath $resourceParent -PathType Container)) {
-                    [void][IO.Directory]::CreateDirectory($resourceParent)
-                    $resourceParentCreated = $true
-                }
-                Assert-NoReparseTraversal $resourceParent
-                [IO.Directory]::Move($stageResourceRoot, $resourceDestinationRoot)
-                $resourceMoved = $true
-            }
             foreach ($plan in $additionalResourcePlans) {
                 $additionalParent = Split-Path -Parent ([string]$plan.destination)
                 Assert-NoReparseTraversal $additionalParent
@@ -1440,9 +1344,6 @@ if ($null -ne $existing[$packageName]) {
                 throw 'Installed frontend bytes differ from the staged package pins.'
             }
             Assert-InstalledResourceFiles $installRoot $selectedSpec $provenanceResources 'Installed frontend'
-            if ($null -ne $provenanceResources) {
-                Assert-DependencyClosure (Join-Path $installRoot ([string]$selectedSpec.resource_installed_relative_root)) $receipt.resources $provenanceResources $selectedSpec 'Installed frontend'
-            }
             $status = 'installed'
         } catch {
             $installFailure = $_
@@ -1452,20 +1353,11 @@ if ($null -ne $existing[$packageName]) {
             $cleanupHashes[$buildDestination] = $buildManifestHash
             $cleanupHashes[$receiptDestination] = $receiptHash
             $movedAdditionalResources = @($additionalResourcePlans | Where-Object { $_.moved -eq $true })
-            if (($resourceMoved -and $null -ne $resourceDestinationRoot) -or $movedAdditionalResources.Count -gt 0) {
+            if ($movedAdditionalResources.Count -gt 0) {
                 try {
-                    if ($resourceMoved -and $null -ne $resourceDestinationRoot) {
-                        Assert-NoReparseTraversal $resourceDestinationRoot
-                        Assert-InstalledResourceRows -ResourceRoot $resourceDestinationRoot -InstallRoot $installRoot -Rows @($provenanceResources.files) -Label 'Rollback kernel resource check'
-                        Assert-DependencyClosure $resourceDestinationRoot $receipt.resources $provenanceResources $selectedSpec 'Rollback kernel resource check'
-                    }
                     foreach ($plan in $movedAdditionalResources) {
                         Assert-NoReparseTraversal ([string]$plan.destination)
                         Assert-InstalledResourceRows -ResourceRoot ([string]$plan.destination) -InstallRoot $installRoot -Rows @($plan.group.files) -Label "Rollback $($plan.coordinate) resource check"
-                    }
-                    if ($resourceMoved -and $null -ne $resourceDestinationRoot) {
-                        Remove-Item -LiteralPath $resourceDestinationRoot -Recurse -Force -Confirm:$false
-                        $resourceMoved = $false
                     }
                     foreach ($plan in $movedAdditionalResources) {
                         Remove-Item -LiteralPath ([string]$plan.destination) -Recurse -Force -Confirm:$false
@@ -1489,16 +1381,6 @@ if ($null -ne $existing[$packageName]) {
                     $cleanupFailures.Add("could not roll back ${createdPath}: $($_.Exception.Message)")
                 }
             }
-            if ($resourceParentCreated -and $null -ne $resourceParent) {
-                try {
-                    if ((Test-Path -LiteralPath $resourceParent -PathType Container) -and
-                        @((Get-ChildItem -LiteralPath $resourceParent -Force)).Count -eq 0) {
-                        Remove-Item -LiteralPath $resourceParent -Force -Confirm:$false
-                    }
-                } catch {
-                    $cleanupFailures.Add("could not roll back resource parent ${resourceParent}: $($_.Exception.Message)")
-                }
-            }
             foreach ($plan in $additionalResourcePlans | Where-Object { $_.parent_created -eq $true }) {
                 $additionalParent = Split-Path -Parent ([string]$plan.destination)
                 try {
@@ -1517,9 +1399,6 @@ if ($null -ne $existing[$packageName]) {
         } finally {
             foreach ($stage in @($stageBinary, $stageBuild, $stageReceipt)) {
                 if (Test-Path -LiteralPath $stage -PathType Leaf) { Remove-Item -LiteralPath $stage -Force -Confirm:$false }
-            }
-            if ($null -ne $stageResourceRoot -and (Test-Path -LiteralPath $stageResourceRoot)) {
-                Remove-Item -LiteralPath $stageResourceRoot -Recurse -Force -Confirm:$false
             }
             foreach ($plan in $additionalResourcePlans) {
                 if ($null -ne $plan.stage_root -and (Test-Path -LiteralPath ([string]$plan.stage_root))) {

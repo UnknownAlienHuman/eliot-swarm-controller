@@ -245,8 +245,6 @@ if ($Package -ceq 'swarm-cli') {
         manifest = 'crates/swarm-kernel-host/Cargo.toml'
         binary_target = 'swarm-kernel-host'
         role = 'host_runtime'
-        resource_coordinate = 'swarm-kernel-host-opencode-resources'
-        resource_installed_relative_root = 'resources/modules/opencode'
     }
     $hostSupervisor = [ordered]@{
         package_name = 'swarm-supervisor'
