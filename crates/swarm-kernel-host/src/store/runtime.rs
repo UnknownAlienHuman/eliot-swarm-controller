@@ -1323,8 +1323,9 @@ fn next_internal(
     {
         return Ok(json!({"command":null}));
     }
-    // Readback, replies and continuation-stop controls stay available while an
-    // ordinary mutation awaits application. They do not spawn another executor.
+    // Readback, replies, continuation-stop controls, and exact-scope resource
+    // shutdowns stay available while an ordinary mutation awaits application.
+    // These controls do not admit a competing model input.
     let (op, method, raw, created, opening_actor) = {
         let row:Option<(String,String,String,i64)>=tx.query_row(
             "SELECT operation_id,method,original_request_json,created_at_ms FROM operations AS candidate
@@ -1332,7 +1333,7 @@ fn next_internal(
                AND (?5=0 OR (method='agent.result' AND json_type(candidate.effective_request_json,'$.normalized_result_origin')='object'))
                AND (COALESCE(json_extract(?4,'$.recovery_required'),0)=0 OR method IN ('agent.recover','agent.reconcile'))
                AND method IN ('agent.open','task.dispatch','agent.send','agent.reply','agent.configure','agent.goal','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','agent.shutdown','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
-               AND (method IN ('agent.reply','agent.background','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
+               AND (method IN ('agent.reply','agent.background','agent.shutdown','agent.refresh','agent.reconcile','agent.result','agent.recover','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session','native.command.release_evidence','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')
                  OR (method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer')
                  OR (method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear'))
                  OR NOT EXISTS (SELECT 1 FROM operations AS pending
@@ -1340,7 +1341,7 @@ fn next_internal(
                      AND pending.state IN ('sending','native_accepted','outcome_unknown')
                       AND pending.method IN ('agent.open','task.dispatch','agent.send','agent.configure','agent.goal','agent.recover','native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read')))
              ORDER BY CASE WHEN method IN ('native.mcp.install','native.mcp.observe','native.mcp.arm','native.mcp.read') THEN 0
-                           WHEN method IN ('agent.reply','agent.background','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session') THEN 1
+                           WHEN method IN ('agent.reply','agent.background','agent.shutdown','native.opencode.loop_step','native.command.cancel_turn','native.command.close_session') THEN 1
                            WHEN method='agent.send' AND json_extract(original_request_json,'$.delivery')='steer' THEN 1
                            WHEN method='agent.goal' AND json_extract(original_request_json,'$.action') IN ('pause','clear') THEN 1
                             WHEN method IN ('agent.refresh','agent.reconcile','agent.result','agent.recover','native.command.release_evidence') THEN 2 ELSE 3 END, due_at_ms, rowid LIMIT 1",

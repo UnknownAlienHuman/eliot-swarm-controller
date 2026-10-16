@@ -7406,6 +7406,8 @@ mod review_replacement_matrix_fixture;
 #[cfg(test)]
 mod runtime_admission_tests;
 #[cfg(test)]
+mod scoped_shutdown_dispatch_tests;
+#[cfg(test)]
 mod security_tests;
 #[cfg(test)]
 mod system_event_producer_tests;
