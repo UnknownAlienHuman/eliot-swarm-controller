@@ -3608,7 +3608,46 @@ fn validate_acceptance_review_pass(
     let required_ids: Vec<String> =
         serde_json::from_value(assignment["required_coverage"]["requirement_ids"].clone())
             .map_err(|_| corrupt())?;
-    let required_ids = required_ids.into_iter().collect::<BTreeSet<_>>();
+    let coverage_count = required_ids.len();
+    let coverage_ids = required_ids.into_iter().collect::<BTreeSet<_>>();
+    if coverage_ids.len() != coverage_count {
+        return Err(corrupt());
+    }
+    let snapshot_raw: String = db.query_row(
+        "SELECT task_snapshot_json FROM attempts WHERE attempt_id=?1",
+        [&identity.attempt_id],
+        |row| row.get(0),
+    )?;
+    let snapshot: Value = serde_json::from_str(&snapshot_raw).map_err(|_| corrupt())?;
+    let required_ids = if snapshot["spec"]["acceptance"]["schema_version"] == 2 {
+        // Assignment coverage describes every Task criterion. V2 structured
+        // reviews address only the frozen plan's review-required subset;
+        // check-only criteria remain covered by their exact CheckRuns.
+        let plan = swarm_kernel::acceptance::validate_frozen_requirement_evidence_plan(
+            &snapshot["spec"],
+            &snapshot["requirement_evidence_plan"],
+        )
+        .map_err(|_| corrupt())?;
+        let all_ids: BTreeSet<String> = snapshot["spec"]["requirements"]
+            .as_array()
+            .ok_or_else(corrupt)?
+            .iter()
+            .map(|requirement| {
+                requirement["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(corrupt)
+            })
+            .collect::<Result<_>>()?;
+        if coverage_ids != all_ids || coverage_ids.len() != coverage_count {
+            return Err(corrupt());
+        }
+        plan.review_requirement_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    } else {
+        coverage_ids
+    };
     let submitted_ids = submit
         .requirement_reviews
         .iter()
@@ -3645,10 +3684,6 @@ fn validate_acceptance_review_pass(
         || !submit.findings.is_empty()
         || submit.requirement_reviews.is_empty()
         || required_ids.is_empty()
-        || required_ids.len()
-            != assignment["required_coverage"]["requirement_ids"]
-                .as_array()
-                .map_or(0, Vec::len)
         || submitted_ids != required_ids
         || submitted_reviews != result["requirement_reviews"]
         || accepted_reviews != submitted_reviews
