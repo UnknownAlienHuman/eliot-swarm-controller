@@ -3820,9 +3820,16 @@ mod tests {
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
-            "fixture Git command failed: status={:?}, stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
+            "fixture Git command failed: {}",
+            crate::redaction::value(json!({
+                "program":command.get_program().to_string_lossy(),
+                "argv":command.get_args().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+                "cwd":command.get_current_dir().map(Path::to_path_buf)
+                    .or_else(|| std::env::current_dir().ok()),
+                "status":output.status.code(),
+                "stdout":String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(4096)]),
+                "stderr":String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(4096)]),
+            }))
         );
         output.stdout
     }
