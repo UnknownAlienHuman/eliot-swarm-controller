@@ -90,7 +90,7 @@ async fn run_check(
         .await
         .expect("read retained CheckRun");
     let result_ref_present = check["result_ref"].as_str().is_some();
-    let (result_error_code, artifact_read_error_code) = if check["state"] == "passed" {
+    let (result_error, artifact_read_error_code) = if check["state"] == "passed" {
         (None, None)
     } else if let Some(artifact_id) = check["result_ref"].as_str() {
         match store
@@ -105,7 +105,7 @@ async fn run_check(
                 page["content"]
                     .as_str()
                     .and_then(|content| serde_json::from_str::<Value>(content).ok())
-                    .and_then(|report| report["error"]["code"].as_str().map(str::to_owned)),
+                    .and_then(|report| report.get("error").cloned()),
                 None,
             ),
             Err(error) => (None, Some(error.code)),
@@ -115,7 +115,7 @@ async fn run_check(
     };
     assert_eq!(
         check["state"], "passed",
-        "retained CheckRun: {check}; result_ref_present={result_ref_present}; result_artifact_error_code={result_error_code:?}; artifact_read_error_code={artifact_read_error_code:?}"
+        "retained CheckRun: {check}; result_ref_present={result_ref_present}; result_artifact_error={result_error:?}; artifact_read_error_code={artifact_read_error_code:?}"
     );
     check_id
 }

@@ -202,25 +202,31 @@ pub(crate) fn prepare_and_spawn(
                 format!("checks executor started without a recordable launch identity: {error}"),
             )
         })?;
-        let image = process_image_identity(pid).map_err(|_| {
+        let image = process_image_identity(pid).map_err(|error| {
             Error::new(
                 "CHECK_EXECUTOR_MISMATCH",
                 "checks executor image could not be verified before Store Go",
             )
+            .with_secondary_error(error)
         })?;
-        let image_path = canonical_path_text(&image["image_path"]).map_err(|_| {
+        let image_path = canonical_path_text(&image["image_path"]).map_err(|error| {
             Error::new(
                 "CHECK_EXECUTOR_MISMATCH",
                 "the running checks executor image could not be verified",
             )
+            .with_secondary_error(error)
         })?;
         let expected_image_sha256 = format!("sha256:{}", executor.sha256);
-        if image["image_sha256"].as_str() != Some(expected_image_sha256.as_str())
-            || image_path != path_text(&executor.executable)?
-        {
+        if image["image_sha256"].as_str() != Some(expected_image_sha256.as_str()) {
             return Err(Error::new(
                 "CHECK_EXECUTOR_MISMATCH",
-                "the running checks executor differs from the configured artifact pin",
+                "the running checks executor digest differs from the configured artifact pin",
+            ));
+        }
+        if image_path != path_text(&executor.executable)? {
+            return Err(Error::new(
+                "CHECK_EXECUTOR_MISMATCH",
+                "the running checks executor path differs from the configured artifact pin",
             ));
         }
         Ok(json!({
