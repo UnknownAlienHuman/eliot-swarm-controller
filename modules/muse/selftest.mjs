@@ -877,9 +877,13 @@ async function runWorkFenceCase(scenario) {
     'read-race':['000000000011','000000000013','000000000012'],
     'checkpoint-race':['000000000021','000000000022','000000000023'],
     'goal-checkpoint-race':['000000000031','000000000033','000000000032'],
-    'pending-configure-recovery':['000000000041','000000000042','000000000043']}[scenario];
+    'pending-configure-recovery':['000000000041','000000000042','000000000043'],
+    'native-effort-default':['000000000061','000000000062','000000000063'],
+    'explicit-effort-mismatch':['000000000071','000000000072','000000000073']}[scenario];
   if(!identities)throw new Error('UNKNOWN_WORK_FENCE_FIXTURE');
-  const isGoal=scenario==='read-race'||scenario==='goal-checkpoint-race';
+  const isEffortMismatch=scenario==='explicit-effort-mismatch';
+  const isEffortCase=scenario==='native-effort-default'||isEffortMismatch;
+  const isGoal=scenario==='read-race'||scenario==='goal-checkpoint-race'||isEffortCase;
   const isCheckpointRace=scenario==='checkpoint-race'||scenario==='goal-checkpoint-race';
   const isPendingConfigureRecovery=scenario==='pending-configure-recovery';
   const openId=`60000000-0000-4000-8000-${identities[0]}`;
@@ -897,13 +901,18 @@ async function runWorkFenceCase(scenario) {
       input_sha256:inputSha256,input};
   }
   const openCommand=command(openId,openAt,'agent.open',{},
-    {native_options:{workspaceRoot:home,modelId:'fixture-model',providerId:'fixture-provider',reasoningEffort:'max'}});
+    {native_options:{workspaceRoot:home,modelId:'fixture-model',providerId:'fixture-provider',
+      ...(scenario==='native-effort-default'?{}:{reasoningEffort:'max'})}});
   const effortCommand=command(effortId,effortAt,'agent.configure',{settings:{reasoningEffort:'max'}});
   const configureCommand=command(configureId,configureAt,'agent.configure',{settings:isPendingConfigureRecovery
     ?{model:{modelId:'fixture-model-B'}}:{reasoningEffort:'max'}});
   const workCommand=isGoal
-    ?command(workId,workAt,'agent.goal',{action:'set',objective:'fixture goal must stay fenced'})
+    ?command(workId,workAt,'agent.goal',{action:'set',objective:isEffortCase
+      ?'fixture goal using native standing effort':'fixture goal must stay fenced'})
     :command(workId,workAt,'agent.send',{delivery:'next_turn',text:sentText});
+  const effortGoalCommands=isEffortCase?[workCommand,
+    command(operationId(81),workAt+1,'agent.goal',{action:'edit',objective:'fixture edited goal using native standing effort'}),
+    command(operationId(82),workAt+2,'agent.goal',{action:'resume'})]:[];
   const reconcileCommand=command(reconcileId,reconcileAt,'agent.reconcile',{operation_id:workId});
   const recoveryAt=AT_MS+200;
   const recoveryId=operationId(44),dispatchId=operationId(45),goalId=operationId(46),replyId=operationId(47);
@@ -937,6 +946,7 @@ async function runWorkFenceCase(scenario) {
     {delivery:'next_turn',text:'fixture work after exact configure reconciliation'});
   const selectedModelPath=path.join(home,'selected-model.json');
   const fixture={scenario,sessionId,home,auditPath,nativeFramesPath,gateSignal,gateRelease,workId,
+    nativeEffortNotification:isEffortCase?'high':null,
     workMethod:workCommand.method,workText:sentText};
   await writeFile(fixturePath,JSON.stringify(fixture));
   await writeFile(nativeScript,String.raw`
@@ -967,7 +977,9 @@ const auditDefaults={methods:[],session_start_params:null,session_list_count:0,s
   listed_session:null,session_read_count:0,session_resume_count:0,session_set_effort_count:0,
   session_set_model_count:0,
   model_changed_notifications:0,checkpoint_gate_released:false,turn_start_count:0,turn_steer_count:0,
-  goal_set_count:0,goal_edit_count:0,goal_resume_count:0,turn_start_params:null,goal_set_params:null};
+  effort_changed_notifications:0,effort_refresh_notifications:0,
+  goal_set_count:0,goal_edit_count:0,goal_resume_count:0,turn_start_params:null,goal_set_params:null,
+  goal_edit_params:null,goal_resume_params:null};
 let audit=auditDefaults;
 try{audit=Object.assign(auditDefaults,JSON.parse(await readFile(auditPath,'utf8')));}
 catch(error){if(error?.code!=='ENOENT')throw error;}
@@ -994,10 +1006,11 @@ function modelChanged(){
     modelId:'changed-model',providerId:'changed-provider',source:'user',sourceRange:sourceRange('fixture_model_change',2),
     viewCursor:'cursor_fixture_model_change'}};
 }
-function effortChanged(){
+function effortChanged(reasoningEffort='max'){
+  const sequence=++audit.effort_changed_notifications;
+  const eventId='fixture_effort_change'+(sequence===1?'':'_'+sequence);
   return {jsonrpc:'2.0',method:'session/reasoningEffortChanged',params:{sessionId:fixture.sessionId,
-    reasoningEffort:'max',source:'user',sourceRange:sourceRange('fixture_effort_change',1),
-    viewCursor:'cursor_fixture_effort_change'}};
+    reasoningEffort,source:'user',sourceRange:sourceRange(eventId,sequence),viewCursor:'cursor_'+eventId}};
 }
 const responseWaiters=new Map();
 function waitForResponse(id){return new Promise((resolve,reject)=>{
@@ -1056,6 +1069,12 @@ async function handle(frame){
     audit.session_list_count++;audit.session_list_params=frame.params;
     audit.listed_session={sessionId:session.sessionId,modelId:session.modelId,providerId:session.providerId,
       status:session.status,activeTurnId:session.activeTurnId};
+    // The host requests this refresh only after session/start is applied.
+    // Emit once here, never during a later productive goal's preflight.
+    if(fixture.nativeEffortNotification&&audit.effort_refresh_notifications===0){
+      audit.effort_refresh_notifications++;
+      send(effortChanged(fixture.nativeEffortNotification));
+    }
     await save();
     if(fixture.scenario==='read-race'){send(modelChanged());await save();}
     const after=fixture.scenario.endsWith('checkpoint-race')?()=>{void checkpointRace().catch(()=>process.exit(2));}:undefined;
@@ -1090,10 +1109,12 @@ async function handle(frame){
     respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
   }
   if(frame.method==='goal/edit'){
-    audit.goal_edit_count++;await save();respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
+    audit.goal_edit_count++;audit.goal_edit_params=frame.params;await save();
+    respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
   }
   if(frame.method==='goal/resume'){
-    audit.goal_resume_count++;await save();respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
+    audit.goal_resume_count++;audit.goal_resume_params=frame.params;await save();
+    respond(frame.id,{commandId:frame.params.commandId,status:'accepted'});return;
   }
   if(['approval/decide','userInput/answer','userInput/cancel','userInput/clarify'].includes(frame.method)){
     await save();respond(frame.id,{status:'accepted'});return;
@@ -1146,6 +1167,7 @@ syncBuiltinESMExports();
   let workOutcomeCount=0,reconcileOutcomeCount=0,deferredWorkAck=null,reconcileCommandDelivered=false;
   let finishedResolve,finishedReject,configureAcceptedResolve,bridge,stderr='',teardownStarted=false,closed,closeResult;
   let moduleHelloCount=0,reconcilePendingQueued=false,pendingReplyOutcome,pendingRefreshOutcome;
+  let effortGoalIndex=0,effortObservedBeforeGoals=false;
   const hostTrace=[];
   function recordHost(phase,details={}){
     if(hostTrace.length<64)hostTrace.push({phase,...details});
@@ -1161,6 +1183,17 @@ syncBuiltinESMExports();
         &&pendingReplyOutcome&&pendingRefreshOutcome){
       reconcilePendingQueued=true;commands.push(reconcilePendingCommand);
     }
+  }
+  function assertEffortCheckpoint(checkpoint){
+    assert.equal(checkpoint.standing_effort,'high','the actual native notification updates standing effort');
+    assert.equal(checkpoint.latest.reasoning_effort,'high');
+    assert.equal(Object.hasOwn(checkpoint.route_defaults,'reasoningEffort'),isEffortMismatch,
+      'an observed effort does not become a requested route override');
+    assert.equal(checkpoint.route_defaults.reasoningEffort,isEffortMismatch?'max':undefined);
+    assert.equal(checkpoint.latest.requested_reasoning_effort,isEffortMismatch?'max':null,
+      'requested effort stays separate from native observed effort');
+    assert.equal(checkpoint.latest.reasoning_application,isEffortMismatch
+      ?'native_durable_default_ack_and_explicit_per_turn':'native_default_at_submission');
   }
   let primaryError;
   const server=net.createServer(socket=>{
@@ -1212,10 +1245,40 @@ syncBuiltinESMExports();
         diagnostic_code:outcome.details?.diagnostic_code??null});
       if(outcome.operation_id===openId&&outcome.outcome==='applied'){
         if(isPendingConfigureRecovery)commands.push(effortCommand);
+        else if(isEffortCase){
+          assert.deepEqual(outcome.details.reasoning,{requested:isEffortMismatch?'max':null,
+            application:isEffortMismatch?'explicit_per_turn_option':'native_default_at_submission'});
+          commands.push(isEffortMismatch?configureCommand:refreshCommand);
+        }
         else if(scenario==='read-race'||scenario==='goal-checkpoint-race')commands.push(configureCommand,workCommand);
         else commands.push(workCommand);
       }
-      if(isPendingConfigureRecovery&&outcome.operation_id===effortId&&outcome.outcome==='applied'){
+      if(isEffortCase&&outcome.operation_id===configureId){
+        assert.equal(outcome.outcome,'applied','the explicit max setter is acknowledged before the native change');
+        commands.push(refreshCommand);
+      } else if(isEffortCase&&outcome.operation_id===refreshId){
+        assert.equal(outcome.outcome,'applied');
+        assertEffortCheckpoint(JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8')));
+        effortObservedBeforeGoals=true;
+        commands.push(effortGoalCommands[0]);
+      } else if(isEffortCase&&effortGoalCommands.some(goal=>goal.operation_id===outcome.operation_id)){
+        assert.equal(effortObservedBeforeGoals,true,'native effort is processed before any productive goal');
+        const goal=effortGoalCommands[effortGoalIndex];
+        assert.equal(outcome.operation_id,goal?.operation_id,'set/edit/resume run in order, once each');
+        assert.equal(outcome.outcome,isEffortMismatch?'rejected':'applied');
+        if(isEffortMismatch)assert.equal(outcome.details.diagnostic_code,'CONFIGURE_STANDING_EFFORT_BEFORE_GOAL');
+        else {
+          assert.equal(outcome.details.completion_condition,'native_goal_admitted');
+          assert.equal(outcome.details.native_ack.commandId,commandIdFor(goal.operation_id,goal.created_at_ms));
+        }
+        const checkpoint=JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8'));
+        assertEffortCheckpoint(checkpoint);
+        if(isEffortMismatch)assert.equal(checkpoint.native_pending?.some(([id])=>id===goal.operation_id),false,
+          'an explicit effort mismatch creates no native goal intent');
+        effortGoalIndex++;
+        if(effortGoalIndex<effortGoalCommands.length)commands.push(effortGoalCommands[effortGoalIndex]);
+        else finishedResolve(outcome);
+      } else if(isPendingConfigureRecovery&&outcome.operation_id===effortId&&outcome.outcome==='applied'){
         commands.push(configureCommand);
       } else if(isPendingConfigureRecovery&&outcome.operation_id===configureId&&outcome.outcome==='accepted'
           &&moduleHelloCount===1){
@@ -1365,6 +1428,11 @@ syncBuiltinESMExports();
         'observed provider stays a session fact instead of becoming a requested route provider');
       assert.equal(finalCheckpoint.native_pending?.some(([id])=>id===configureId),false,
         'the original configure entry retires only after host acknowledgement of exact readback');
+    } else if(isEffortCase){
+      assert.equal(effortObservedBeforeGoals,true);
+      assert.equal(effortGoalIndex,3,'all productive goal actions are exercised after the native notification');
+      assert.equal(outcomes.get(refreshId)?.outcome,'applied');
+      assertEffortCheckpoint(JSON.parse(await readFile(path.join(stateDir,'checkpoint.json'),'utf8')));
     } else if(scenario==='baseline'){
       assert.equal(outcomes.get(workId)?.outcome,'applied');
       assert.equal(outcome.outcome,'applied','a stable session/list snapshot admits one clean dispatch');
@@ -1439,7 +1507,8 @@ syncBuiltinESMExports();
         assert.equal(audit.session_start_params?.modelId,'fixture-model');
         assert.equal(audit.session_start_params?.providerId,'fixture-provider');
         nativeWorkMethods=audit.methods.filter(method=>['turn/start','turn/steer','goal/set','goal/edit','goal/resume'].includes(method));
-        assert.equal(audit.session_list_count,1,'one exact session/list row is used for work preflight');
+        assert.equal(audit.session_list_count,isEffortCase?(isEffortMismatch?1:4):1,
+          'each admitted work action reads once; effort cases first refresh to observe the native change');
         assert.equal(audit.session_list_params?.workspaceRoot,home);
         assert.equal(audit.session_list_params?.limit,200);
         assert.deepEqual(audit.listed_session,{sessionId,modelId:'fixture-model',providerId:'fixture-provider',
@@ -1447,7 +1516,24 @@ syncBuiltinESMExports();
         assert.equal(audit.session_read_count,0,'ephemeral fixtures stay on the supported session/list API');
         assert.equal(audit.session_resume_count,0,'work fencing never resumes a native session');
       }
-      if(scenario==='baseline'){
+      if(isEffortCase){
+        assert.deepEqual(nativeWorkMethods,isEffortMismatch?[]:['goal/set','goal/edit','goal/resume'],
+          'native defaults permit all productive goals; explicit effort mismatch admits none');
+        assert.equal(audit.effort_refresh_notifications,1,'one native effort change precedes the goal phase');
+        assert.equal(audit.effort_changed_notifications,isEffortMismatch?2:1);
+        assert.equal(audit.session_set_effort_count,isEffortMismatch?1:0,
+          'omitted effort does not require or fabricate a controller setter');
+        assert.equal(audit.turn_start_count,0);
+        assert.equal(audit.turn_steer_count,0);
+        for(const goal of effortGoalCommands){
+          const action=goal.input.action;
+          assert.equal(audit[`goal_${action}_count`],isEffortMismatch?0:1);
+          if(!isEffortMismatch)assert.deepEqual(audit[`goal_${action}_params`],{
+            sessionId,...(goal.input.objective===undefined?{}:{objective:goal.input.objective}),
+            commandId:commandIdFor(goal.operation_id,goal.created_at_ms)},
+          'the original goal payload reaches native once without an invented effort override');
+        }
+      } else if(scenario==='baseline'){
         assert.deepEqual(nativeWorkMethods,['turn/start'],'the baseline sends exactly one clean native work command');
         assert.equal(audit.turn_start_count,1);
         assert.equal(audit.turn_steer_count,0);
@@ -1497,6 +1583,8 @@ await runWorkFenceCase('read-race');
 await runWorkFenceCase('checkpoint-race');
 await runWorkFenceCase('goal-checkpoint-race');
 await runWorkFenceCase('pending-configure-recovery');
+await runWorkFenceCase('native-effort-default');
+await runWorkFenceCase('explicit-effort-mismatch');
 
 // 4b. Omission selects the installed native default; explicit overrides ride
 // verbatim. This checks the actual native payloads, not struct shape: an

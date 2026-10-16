@@ -18,6 +18,14 @@ const LEGACY_OPENCODE_MCP_API_CONTRACT: &str = "@opencode/protocol 2.0.7 mcp.lis
 const OPENCODE_MCP_API_CONTRACT: &str = "opencode-http-mcp-list-v1";
 const MAX_SERVER_FACTS: usize = 256;
 
+pub(crate) fn opencode_mcp_api_contract_for_version(service_version: &str) -> &'static str {
+    if service_version == LEGACY_OPENCODE_VERSION {
+        LEGACY_OPENCODE_MCP_API_CONTRACT
+    } else {
+        OPENCODE_MCP_API_CONTRACT
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParticipationBasis {
     AttemptOwner,
@@ -471,11 +479,7 @@ impl NativeMcpReadback {
 
         // Preserve the existing payload bytes for retained 2.0.7 observations.
         // Other builds name the verified wire contract rather than a release.
-        let api_contract = if service_version == LEGACY_OPENCODE_VERSION {
-            LEGACY_OPENCODE_MCP_API_CONTRACT
-        } else {
-            OPENCODE_MCP_API_CONTRACT
-        };
+        let api_contract = opencode_mcp_api_contract_for_version(&service_version);
         let payload = json!({
             "schema_version":READBACK_SCHEMA_VERSION,
             "source":{

@@ -1178,6 +1178,8 @@ mod tests {
                 baseline_commit.as_str(),
             ],
         );
+        crate::platform::private_owned_directory(&workspace_path)
+            .expect("set the Git-created worktree owner and restrict it to its workspace owner");
         assert_eq!(
             std::fs::canonicalize(Path::new(&workspace_git_path))
                 .expect("canonicalize normalized Git worktree path"),

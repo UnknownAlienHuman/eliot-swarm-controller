@@ -108,8 +108,9 @@ module_artifact_id = 'codex-rust-controller.1'
 enabled = false
 workspace_option = 'workspaceRoot'
 [routes.native_options]
-modelProvider = 'REPLACE_WITH_REGISTERED_CODEX_PROVIDER_ID'
-model = 'REPLACE_WITH_CODEX_VISIBLE_MODEL_ID'
+# Omitted selectors use the native app-server settings. Either override is optional.
+# modelProvider = 'REPLACE_WITH_REGISTERED_CODEX_PROVIDER_ID'
+# model = 'REPLACE_WITH_CODEX_VISIBLE_MODEL_ID'
 workspaceRoot = 'C:\Projects\YourRepository'
 
 # MCP surfaces are fixed when the stdio session starts. The default is a

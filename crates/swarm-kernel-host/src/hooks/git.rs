@@ -1712,15 +1712,15 @@ fn git_output_from_probe(outcome: GitProbeOutcome) -> Result<GitOutput> {
         ));
     }
     if !outcome.probe_success && outcome.exit_code == Some(0) {
-        return Err(Error::new(
-            "HOOK_GIT_OUTPUT",
+        return Err(git_probe_output_error(
             "Git helper reported a failed capture despite a successful direct exit",
+            &outcome.message,
         ));
     }
     if !outcome.message.is_empty() && !outcome.message.starts_with("input probe exited with ") {
-        return Err(Error::new(
-            "HOOK_GIT_OUTPUT",
+        return Err(git_probe_output_error(
             "the bounded Git helper could not complete a clean readback",
+            &outcome.message,
         ));
     }
     let Some(code) = outcome.exit_code else {
@@ -1733,6 +1733,38 @@ fn git_output_from_probe(outcome: GitProbeOutcome) -> Result<GitOutput> {
         status: GitStatus { code: Some(code) },
         stdout: outcome.stdout,
     })
+}
+
+fn git_probe_output_error(summary: &str, message: &str) -> Error {
+    // Match the input-probe cleanup diagnostic policy; never include pipe bytes.
+    let message = if message.contains('/')
+        || message.contains('\\')
+        || message
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_alphabetic() && pair[1] == b':')
+    {
+        if message.starts_with("input probe process group membership check failed; ") {
+            "input probe process group membership check failed; OS diagnostic redacted"
+        } else {
+            "OS diagnostic redacted"
+        }
+    } else {
+        message
+    };
+    let diagnostic = message
+        .chars()
+        .filter(|character| character.is_ascii() && !character.is_ascii_control())
+        .take(CHECK_PROBE_MESSAGE_BYTES)
+        .collect::<String>();
+    Error::new(
+        "HOOK_GIT_OUTPUT",
+        if diagnostic.is_empty() {
+            summary.to_owned()
+        } else {
+            format!("{summary}; helper diagnostic: {diagnostic}")
+        },
+    )
 }
 
 #[derive(Debug)]
@@ -4216,6 +4248,60 @@ mod tests {
         haystack
             .windows(needle.len())
             .any(|window| window == needle)
+    }
+
+    #[test]
+    fn failed_git_probe_with_zero_exit_retains_bounded_producer_diagnostic() {
+        let reason = "input probe output capture ended without natural EOF or complete bytes";
+        let membership_reason = concat!(
+            "input probe process group membership check failed; ",
+            "cleanup_error[PROCESS_IDENTITY]: invalid proc stat"
+        );
+        for (message, expected) in [
+            (reason.to_owned(), reason),
+            (membership_reason.to_owned(), membership_reason),
+            (
+                concat!(
+                    "input probe process group membership check failed; ",
+                    "cleanup_error[PROCESS_IDENTITY]: /private-path/credential.json"
+                )
+                .to_owned(),
+                "input probe process group membership check failed; OS diagnostic redacted",
+            ),
+            (
+                format!("{reason}\n\t{}", "x".repeat(CHECK_PROBE_MESSAGE_BYTES)),
+                reason,
+            ),
+            (
+                "input probe failed at /private-path/credential.json".to_owned(),
+                "OS diagnostic redacted",
+            ),
+            (
+                r"input probe failed at C:\private-path\credential.json".to_owned(),
+                "OS diagnostic redacted",
+            ),
+        ] {
+            let error = git_output_from_probe(GitProbeOutcome {
+                exit_code: Some(0),
+                timed_out: false,
+                output_limited: false,
+                group_empty: true,
+                family_departed: true,
+                had_descendants: false,
+                probe_success: false,
+                stdout: b"sensitive-git-stdout".to_vec(),
+                stderr: b"sensitive-git-stderr".to_vec(),
+                message,
+            })
+            .expect_err("a failed probe remains an error despite a zero direct exit");
+            assert_eq!(error.code, "HOOK_GIT_OUTPUT");
+            assert!(error.message.contains(expected));
+            assert!(!error.message.chars().any(char::is_control));
+            assert!(error.message.len() <= CHECK_PROBE_MESSAGE_BYTES + 128);
+            assert!(!error.message.contains("sensitive-git-stdout"));
+            assert!(!error.message.contains("sensitive-git-stderr"));
+            assert!(!error.message.contains("private-path"));
+        }
     }
 
     #[test]

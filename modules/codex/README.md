@@ -10,7 +10,7 @@ are documented separately below.
 
 ## Setup
 
-The Python setup below is historical donor tooling, not required by the current Rust controller. The Rust route attaches to an already configured native app-server; omitting the explicit model/provider pair uses that harness's defaults. Descriptor v13 is current; older v11/v10 bindings and receipts retain their original identities.
+The Python setup below is historical donor tooling, not required by the current Rust controller. The Rust route attaches to an already configured native app-server; each omitted model/provider selector uses that harness's default. Descriptor v13 is current; older v11/v10 bindings and receipts retain their original identities.
 
 Create a module-local Python environment and install only the pinned
 requirements:
@@ -102,15 +102,15 @@ continuation admission/terminal evidence schemas. Launch-owned C8 requires the
 exact current v13 descriptor; existing v10/v11 bindings retain their original
 contract and are not upgraded by route selection. The route contract requires
 `workspace_option = "workspaceRoot"` and absolute `workspaceRoot`.
-`modelProvider` and `model` are an optional explicit override pair for
-`thread/start`: omit both to use the installed harness thread defaults, or
-supply both as the exact values registered by the native Codex app-server.
-A partial pair is rejected. The pinned native `ThreadStartParams` permits
-omission (`model: str | None = None`, `modelProvider: str | None = None`);
+For current v13 bindings, `modelProvider` and `model` are independently optional
+`thread/start` overrides. Omit either field to use its installed harness default;
+each supplied field must match native readback. The pinned native
+`ThreadStartParams` permits independent omission
+(`model: str | None = None`, `modelProvider: str | None = None`);
 per-turn `model` is likewise omitted when no override was requested. The
 adapter never infers a provider from a model string, never reconfigures the
 provider, and never substitutes a proxy/delegation model ID. `agent.open`
-records the requested pair (null when omitted) separately from the
+records each requested selector (null when omitted) separately from the
 effective pair from native `thread/read` readback; served model and billing
 remain `unknown` unless native evidence says otherwise. The result selector remains:
 
