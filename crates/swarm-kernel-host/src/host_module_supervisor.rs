@@ -2444,6 +2444,9 @@ mod tests {
                 return Ok(None);
             }
             #[cfg(target_os = "linux")]
+            let ready =
+                release.with_file_name(format!("identity-ready-{}", crate::model::new_id()));
+            #[cfg(target_os = "linux")]
             let (executable, command) = {
                 // A debug libtest image can exceed the production executable
                 // hash boundary. Use a real small OS executable for this
@@ -2453,10 +2456,11 @@ mod tests {
                 command
                     .args([
                         "-c",
-                        "while [ ! -e \"$1\" ]; do sleep 0.02; done",
+                        "printf ready > \"$2\"; while [ ! -e \"$1\" ]; do sleep 0.02; done",
                         "eliot-identity-fixture",
                     ])
                     .arg(release)
+                    .arg(&ready)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
@@ -2473,7 +2477,31 @@ mod tests {
                 b"",
                 custody,
                 command,
-                read_identity,
+                move |child, executable| {
+                    #[cfg(target_os = "linux")]
+                    {
+                        // spawn can return before the child's exec completes.
+                        // Wait for this exact shell to publish its unique marker
+                        // before injecting faults into the production readers.
+                        let deadline = std::time::Instant::now() + StdDuration::from_secs(3);
+                        loop {
+                            match fs::read(&ready) {
+                                Ok(bytes) if bytes == b"ready" => break,
+                                Ok(_) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                return Err(Error::new(
+                                    "FIXTURE_CHILD_NOT_READY",
+                                    "identity fixture did not publish readiness",
+                                ));
+                            }
+                            std::thread::sleep(StdDuration::from_millis(1));
+                        }
+                    }
+                    read_identity(child, executable)
+                },
             )
             .await
             .map(Some)
