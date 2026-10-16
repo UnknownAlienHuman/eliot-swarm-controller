@@ -3564,7 +3564,8 @@ pub(crate) mod tests {
             .env(PROBE_CUSTODY_REQUEST_ENV, &request_path)
             .env(PROBE_CUSTODY_CONTROL_ENV, &control)
             .env(PROBE_CUSTODY_TARGET_ENV, "1")
-            .env("ELIOT_PROBE_CUSTODY_FIXTURE_GRACE", "nested");
+            .env("ELIOT_PROBE_CUSTODY_FIXTURE_GRACE", "nested")
+            .env_remove(PROBE_CUSTODY_EXPLICIT_RELEASE_ENV);
         if explicit_release {
             helper.env(PROBE_CUSTODY_EXPLICIT_RELEASE_ENV, "1");
         }
