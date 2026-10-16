@@ -4,7 +4,7 @@ use super::{
 };
 use crate::config::McpToolProfile;
 use sha2::Digest;
-use swarm_contracts::mcp_catalog::{ToolAudience, metadata_for};
+use swarm_contracts::mcp_catalog::{ToolAudience, exposes_method, metadata_for};
 
 #[test]
 fn catalog_direct_schema_bytes_and_profile_membership_match() {
@@ -105,6 +105,28 @@ fn catalog_direct_schema_bytes_and_profile_membership_match() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn descriptor_install_is_limited_to_the_local_operator_profile() {
+    const METHOD: &str = "module.descriptor.install";
+
+    let metadata = metadata_for(METHOD).expect("descriptor install has catalog metadata");
+    assert_eq!(metadata.audiences, &[ToolAudience::FullCompatibility]);
+    assert!(exposes_method(McpToolProfile::Full, METHOD));
+    for profile in [
+        McpToolProfile::Observer,
+        McpToolProfile::Reviewer,
+        McpToolProfile::Participant,
+        McpToolProfile::AssignedReviewer,
+        McpToolProfile::Manager,
+        McpToolProfile::Gm,
+    ] {
+        assert!(
+            !exposes_method(profile, METHOD),
+            "unexpected exposure: {profile:?}"
+        );
     }
 }
 

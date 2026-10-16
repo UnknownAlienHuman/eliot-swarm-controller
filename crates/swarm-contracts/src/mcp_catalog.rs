@@ -5120,6 +5120,21 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         ],
         "One revision-checked selection for this Manager's new bindings only; other Managers and existing bindings keep their own retained descriptors."
     ),
+    entry_with_inputs!(
+        "module.descriptor.install",
+        Administration,
+        FULL_AUDIENCE,
+        ManualOnly,
+        "Admit an already-installed module descriptor through the local supervisor.",
+        "Use only with local Operator authority to validate and register a descriptor already present on disk; this does not select a route or start a worker.",
+        &["module", "descriptor", "install", "supervisor", "operator"],
+        &["client_request_id", "descriptor_file"],
+        &[
+            "local Operator authorization",
+            "already-installed descriptor file"
+        ],
+        "Returns a durable Operation receipt; its settled result reports the catalog revision without local paths."
+    ),
     entry!(
         "client.register",
         Administration,
