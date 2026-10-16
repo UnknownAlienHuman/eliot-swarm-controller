@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn options_require_explicit_model_bounded_timeout_and_absolute_workdir() {
+fn options_allow_the_native_model_default_and_validate_explicit_overrides() {
     // An absolute path on every platform: "/tmp" is not absolute on Windows.
     let abs = std::env::temp_dir().to_string_lossy().into_owned();
     let base = json!({
@@ -12,13 +12,60 @@ fn options_require_explicit_model_bounded_timeout_and_absolute_workdir() {
         "model": "anthropic/claude-sonnet-4-6",
         "timeout_seconds": 60
     });
-    assert!(Options::parse(&base).is_ok());
+    assert_eq!(
+        Options::parse(&base).unwrap().model.as_deref(),
+        Some("anthropic/claude-sonnet-4-6")
+    );
+    let no_model = json!({
+        "scope_id":"fixture",
+        "executable":"eval-cli",
+        "workdir":abs,
+        "timeout_seconds":60
+    });
+    assert_eq!(Options::parse(&no_model).unwrap().model, None);
+    let current_route = json!({
+        "runtime":RUNTIME,
+        "module_artifact_id":ARTIFACT_ID,
+        "native_options":no_model
+    });
+    assert_eq!(
+        Options::parse_for_route(&current_route).unwrap().model,
+        None
+    );
+    for artifact_id in [PREVIOUS_ARTIFACT_ID, LEGACY_ARTIFACT_ID] {
+        let historical_route = json!({
+            "runtime":RUNTIME,
+            "module_artifact_id":artifact_id,
+            "native_options":current_route["native_options"]
+        });
+        assert_eq!(
+            Options::parse_for_route(&historical_route)
+                .unwrap_err()
+                .code,
+            "CONFIG_ERROR"
+        );
+        let mut retained_options = current_route["native_options"].clone();
+        retained_options["model"] = json!("anthropic/claude-sonnet-4-6");
+        let retained_route = json!({
+            "runtime":RUNTIME,
+            "module_artifact_id":artifact_id,
+            "native_options":retained_options
+        });
+        assert_eq!(
+            Options::parse_for_route(&retained_route)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+    }
     for broken in [
         json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"claude-sonnet-4-6","timeout_seconds":60}),
         json!({"scope_id":"fixture","executable":"eval-cli","workdir":"relative/dir","model":"anthropic/claude-sonnet-4-6","timeout_seconds":60}),
         json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"anthropic/claude-sonnet-4-6","timeout_seconds":0}),
         json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"anthropic/","timeout_seconds":60}),
         json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"anthropic/claude-sonnet-4-6","timeout_seconds":60,"env_keys":["1BAD"]}),
+        json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"","timeout_seconds":60}),
         json!({"scope_id":"fixture","executable":"eval-cli","workdir":abs,"model":"anthropic/claude-sonnet-4-6","timeout_seconds":60,"surprise":true}),
     ] {
         assert_eq!(
@@ -39,11 +86,11 @@ mod unix {
     const SCRIPT: &str = r##"#!/bin/sh
 dir=$(dirname "$0")
 mode=$(cat "$dir/fake-mode" 2>/dev/null || echo completed)
-model=""; out=""; timeout=""
+    model="provider/native-default-fixture"; out=""; timeout=""; model_arg_seen=0
 prev=""
 for a in "$@"; do
   case "$prev" in
-    --model) model="$a" ;;
+    --model) model="$a"; model_arg_seen=1 ;;
     --output-dir) out="$a" ;;
     --timeout) timeout="$a" ;;
   esac
@@ -51,6 +98,10 @@ for a in "$@"; do
 done
 echo "fake eval-cli progress" >&2
 case "$mode" in
+  default_model)
+    [ "$model_arg_seen" -eq 0 ] || exit 9
+    printf '{"status":"completed","duration_secs":0.75,"timeout_secs":%s,"model":"%s"}' "$timeout" "$model" > "$out/result.json"
+    exit 0 ;;
   completed)
     printf '{"status":"completed","duration_secs":1.25,"timeout_secs":%s,"model":"%s","input_tokens":11,"output_tokens":7,"step_count":3,"tool_call_count":2,"tool_calls":{"edit":2}}' "$timeout" "$model" > "$out/result.json"
     printf '# Thread\n\nhello from fixture\n' > "$out/thread.md"
@@ -123,6 +174,16 @@ exit 9
                 "executable": self.bin.to_string_lossy(),
                 "workdir": self.workdir,
                 "model": "anthropic/claude-sonnet-4-6",
+                "timeout_seconds": timeout_seconds,
+                "env_keys": ["ANTHROPIC_API_KEY"]
+            }))
+            .unwrap()
+        }
+        fn options_without_model(&self, timeout_seconds: u64) -> Options {
+            Options::parse(&json!({
+                "scope_id": "fixture",
+                "executable": self.bin.to_string_lossy(),
+                "workdir": self.workdir,
                 "timeout_seconds": timeout_seconds,
                 "env_keys": ["ANTHROPIC_API_KEY"]
             }))
@@ -213,6 +274,25 @@ exit 9
         assert_eq!(
             outcome.native_result_sha256.as_deref(),
             Some(result_page.content_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn omitted_model_leaves_selection_to_the_native_harness() {
+        let fixture = Fixture::new("default_model");
+        let artifacts = ArtifactFiles::new(&fixture.data_dir).unwrap();
+        let outcome = run_batch(
+            &fixture.options_without_model(5),
+            "op-zed-native-default",
+            "Fix the fixture bug",
+            &fixture.out_root,
+            &artifacts,
+        )
+        .unwrap();
+        assert_eq!(outcome.disposition, BatchDisposition::Completed);
+        assert_eq!(
+            outcome.native_result.unwrap()["model"],
+            "provider/native-default-fixture"
         );
     }
 
@@ -323,7 +403,7 @@ exit 9
     #[test]
     fn terminal_receipt_binds_artifacts_to_exact_operation_and_frozen_prompt() {
         let fixture = Fixture::new("big_thread");
-        let options = fixture.options(5);
+        let options = fixture.options_without_model(5);
         let route = json!({
             "runtime":RUNTIME,
             "module_artifact_id":ARTIFACT_ID,
@@ -331,7 +411,6 @@ exit 9
                 "scope_id":"fixture",
                 "executable":fixture.bin,
                 "workdir":fixture.workdir,
-                "model":"anthropic/claude-sonnet-4-6",
                 "timeout_seconds":5,
                 "env_keys":["ANTHROPIC_API_KEY"]
             }
@@ -444,8 +523,8 @@ exit 9
                     "execution_shape":crate::runtime::batch::EXECUTION_SHAPE,
                     "completion_condition":"native_result_observed",
                     "batch_run_id":intent.run_id,
-                    "requested_model":"anthropic/claude-sonnet-4-6",
-                    "effective_model":"anthropic/claude-sonnet-4-6",
+                    "requested_model":null,
+                    "effective_model":batch.native_result.as_ref().unwrap()["model"],
                     "effective_model_status":"observed",
                     "exit_code":batch.exit_code,
                     "native_result":batch.native_result,

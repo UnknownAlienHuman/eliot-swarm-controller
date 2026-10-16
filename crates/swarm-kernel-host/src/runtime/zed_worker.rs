@@ -174,11 +174,11 @@ pub fn run_worker(plan_path: &Path) -> Result<()> {
     let (stdout_writer, stdout_sync) = open_capture(&plan.output_dir.join("stdout.log"))?;
     let (stderr_writer, stderr_sync) = open_capture(&plan.output_dir.join("stderr.log"))?;
     let mut command = Command::new(&plan.executable);
+    command.arg("--workdir").arg(&plan.workdir);
+    if let Some(model) = &plan.model {
+        command.arg("--model").arg(model);
+    }
     command
-        .arg("--workdir")
-        .arg(&plan.workdir)
-        .arg("--model")
-        .arg(&plan.model)
         .arg("--instruction")
         .arg(&plan.instruction)
         .arg("--timeout")
@@ -262,6 +262,10 @@ pub(super) fn validate_plan(plan_path: &Path, plan: &BatchWorkerPlan, value: &Va
         || plan.intent.run_id != plan.run_id
         || !plan.executable.is_absolute()
         || !plan.workdir.is_absolute()
+        || plan
+            .model
+            .as_deref()
+            .is_some_and(|model| !super::valid_model(model))
         || !(1..=86_400).contains(&plan.timeout_seconds)
         || plan.instruction.trim().is_empty()
         || plan.instruction.len() > super::MAX_INSTRUCTION_BYTES
@@ -1033,7 +1037,7 @@ mod tests {
             },
             executable: std::env::current_exe().unwrap(),
             workdir: std::env::current_dir().unwrap(),
-            model: "fixture/real-child".to_owned(),
+            model: Some("fixture/real-child".to_owned()),
             timeout_seconds: 3_600,
             env_keys: Vec::new(),
             instruction: "controlled direct-child wait observation fixture".to_owned(),

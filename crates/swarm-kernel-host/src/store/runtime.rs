@@ -172,14 +172,11 @@ fn selected_task_dispatch_admission(db: &Connection, binding: &Value) -> Result<
     if selected_codex_controller_contract(db, binding)?.is_some() {
         return Ok(true);
     }
-    let builtin_opencode = crate::config::is_task_prompt_builtin_route(
+    let builtin_opencode = crate::config::is_opencode_task_prompt_builtin_route(
         binding["route"]["runtime"].as_str().unwrap_or_default(),
         binding["module_artifact_id"].as_str().unwrap_or_default(),
     );
-    if (zed::is_current_route(&binding["route"])
-        && binding["module_artifact_id"] == zed::ARTIFACT_ID)
-        || builtin_opencode
-    {
+    if zed::is_task_prompt_route(&binding["route"]) || builtin_opencode {
         return Ok(true);
     }
     let Some(selector) = binding["observation"].get("module_contract_selector") else {
@@ -2336,9 +2333,9 @@ pub(super) fn validate_module_receipt_for_operation(
     binding: &Value,
     outcome: &RuntimeOutcome,
 ) -> Result<swarm_contracts::runtime::ModuleReceiptIdentity> {
-    let builtin_zed = zed::is_current_route(&binding["route"])
-        && binding["module_artifact_id"] == zed::ARTIFACT_ID;
-    let builtin_opencode = crate::config::is_task_prompt_builtin_route(
+    let builtin_zed = zed::is_task_prompt_route(&binding["route"])
+        && binding["module_artifact_id"] == binding["route"]["module_artifact_id"];
+    let builtin_opencode = crate::config::is_opencode_task_prompt_builtin_route(
         binding["route"]["runtime"].as_str().unwrap_or_default(),
         binding["module_artifact_id"].as_str().unwrap_or_default(),
     );
@@ -2373,9 +2370,16 @@ pub(super) fn validate_module_receipt_for_operation(
     }
 
     if builtin_zed {
+        let artifact_id = model::text(&binding["route"], "module_artifact_id")?;
+        let contract_revision = zed::contract_revision(&binding["route"]).ok_or_else(|| {
+            Error::new(
+                "MODULE_RECEIPT_INVALID",
+                "built-in Zed contract revision is unknown",
+            )
+        })?;
         if receipt.module_id.as_str() != "builtin.zed"
-            || receipt.artifact.artifact_id.as_str() != zed::ARTIFACT_ID
-            || receipt.artifact.version.as_str() != zed::CONTRACT_REVISION
+            || receipt.artifact.artifact_id.as_str() != artifact_id
+            || receipt.artifact.version.as_str() != contract_revision
             || receipt.artifact.build_id.is_some()
             || receipt.protocol
                 != (swarm_contracts::module_catalog::ProtocolVersion { major: 1, minor: 0 })
@@ -2791,7 +2795,7 @@ pub(super) fn outcome_with_artifacts(
     }
     // Versioned bindings require a typed receipt for every outcome. Legacy
     // unversioned bindings retain their existing validators and wire contract.
-    let builtin_opencode_dispatch = crate::config::is_task_prompt_builtin_route(
+    let builtin_opencode_dispatch = crate::config::is_opencode_task_prompt_builtin_route(
         b["route"]["runtime"].as_str().unwrap_or_default(),
         b["module_artifact_id"].as_str().unwrap_or_default(),
     ) && o["method"] == "task.dispatch"
@@ -2799,7 +2803,7 @@ pub(super) fn outcome_with_artifacts(
     let module_receipt = if b["observation"].get("module_contract_selector").is_some()
         || builtin_opencode_dispatch
         || o["method"] == swarm_contracts::module_command::COMMAND_RELEASE_EVIDENCE_METHOD
-        || (zed::is_current_route(&b["route"])
+        || (zed::is_task_prompt_route(&b["route"])
             && o["method"] == "task.dispatch"
             && matches!(r.outcome, EffectOutcome::Applied | EffectOutcome::Accepted))
     {
@@ -3876,11 +3880,7 @@ fn zed_open_outcome(command: &RuntimeCommand, described: Result<Value>) -> Runti
                 "native_session_state":"not_started",
                 "runtime":zed::RUNTIME,
                 "module_artifact_id":command.route["module_artifact_id"],
-                "contract_revision":if zed::is_legacy_route(&command.route) {
-                    zed::LEGACY_CONTRACT_REVISION
-                } else {
-                    zed::CONTRACT_REVISION
-                },
+                "contract_revision":zed::contract_revision(&command.route).unwrap_or("unknown"),
                 "scope":description["scope"],
                 "requested_model":description["model"],
                 "effective_model":Value::Null,
@@ -4015,7 +4015,7 @@ fn zed_batch_outcome(
     if batch_outcome.native_result.is_some() {
         details["completion_condition"] = json!("native_result_observed");
     }
-    if zed::is_current_route(&command.route) {
+    if zed::is_task_prompt_route(&command.route) {
         let admission = (|| -> Result<Value> {
             let dispatch = zed::validate_task_prompt_dispatch(command)?;
             if dispatch.intent != *intent {
@@ -4052,7 +4052,12 @@ fn zed_batch_outcome(
                             )
                         })?,
                     version: swarm_contracts::module_catalog::ArtifactVersion::new(
-                        zed::CONTRACT_REVISION,
+                        zed::contract_revision(&command.route).ok_or_else(|| {
+                            Error::new(
+                                "MODULE_RECEIPT_INVALID",
+                                "built-in Zed contract revision is unknown",
+                            )
+                        })?,
                     )
                     .map_err(|_| {
                         Error::new(
@@ -4313,7 +4318,7 @@ impl Store {
     ) -> Result<Option<zed::BatchReceipt>> {
         let command = command.clone();
         let output_root = output_root.to_path_buf();
-        if zed::is_current_route(&command.route) {
+        if zed::is_task_prompt_route(&command.route) {
             let dispatch = zed::validate_task_prompt_dispatch(&command)?;
             let source_text = model::text(&command.input, "text")?.to_owned();
             return self
@@ -4421,7 +4426,7 @@ impl Store {
         }
         match command.method.as_str() {
             "agent.open" => {
-                let outcome = match zed::Options::parse(&command.route["native_options"]) {
+                let outcome = match zed::Options::parse_for_route(&command.route) {
                     Ok(options) => zed_open_outcome(&command, zed::describe(&options)),
                     Err(error) => zed_open_outcome(
                         &command,
@@ -4498,7 +4503,7 @@ impl Store {
     ) -> Result<()> {
         match command.method.as_str() {
             "agent.open" => {
-                let outcome = match zed::Options::parse(&command.route["native_options"]) {
+                let outcome = match zed::Options::parse_for_route(&command.route) {
                     Ok(options) => zed_open_outcome(&command, zed::describe(&options)),
                     Err(error) => zed_open_outcome(
                         &command,
@@ -4521,7 +4526,7 @@ impl Store {
                             .await;
                     }
                 };
-                let options = match zed::Options::parse(&command.route["native_options"]) {
+                let options = match zed::Options::parse_for_route(&command.route) {
                     Ok(options) => options,
                     Err(error) => {
                         let rejected = batch_diagnostic(&command, &error.code, false);
@@ -4709,7 +4714,7 @@ impl Store {
             };
             match command.method.as_str() {
                 "agent.open" => {
-                    let outcome = match zed::Options::parse(&command.route["native_options"]) {
+                    let outcome = match zed::Options::parse_for_route(&command.route) {
                         Ok(options) => zed_open_outcome(&command, zed::describe(&options)),
                         Err(error) => zed_open_outcome(
                             &command,

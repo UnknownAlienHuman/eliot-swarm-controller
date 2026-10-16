@@ -515,6 +515,20 @@ mod tests {
         assert!(is_sessionless_route(&zed_route()));
         assert!(supports(&zed_route(), "agent.result"));
         assert!(!supports(&zed_route(), "agent.send"));
+        let previous_zed = json!({
+            "runtime":crate::runtime::zed::RUNTIME,
+            "module_artifact_id":crate::runtime::zed::PREVIOUS_ARTIFACT_ID
+        });
+        assert!(is_sessionless_route(&previous_zed));
+        assert!(supports(&previous_zed, "task.dispatch"));
+        assert!(crate::runtime::zed::is_task_prompt_route(&previous_zed));
+        let legacy_zed = json!({
+            "runtime":crate::runtime::zed::RUNTIME,
+            "module_artifact_id":crate::runtime::zed::LEGACY_ARTIFACT_ID
+        });
+        assert!(is_sessionless_route(&legacy_zed));
+        assert!(supports(&legacy_zed, "agent.reconcile"));
+        assert!(!supports(&legacy_zed, "task.dispatch"));
         assert!(!is_sessionless_route(&json!({
             "runtime":"zed",
             "module_artifact_id":"unrecognized"
