@@ -13,8 +13,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 const READBACK_SCHEMA_VERSION: u32 = 1;
-const OPENCODE_VERSION: &str = "2.0.7";
-const OPENCODE_MCP_API_CONTRACT: &str = "@opencode/protocol 2.0.7 mcp.list";
+const LEGACY_OPENCODE_VERSION: &str = "2.0.7";
+const LEGACY_OPENCODE_MCP_API_CONTRACT: &str = "@opencode/protocol 2.0.7 mcp.list";
+const OPENCODE_MCP_API_CONTRACT: &str = "opencode-http-mcp-list-v1";
 const MAX_SERVER_FACTS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,12 +432,6 @@ impl NativeMcpReadback {
         } = input;
         validate_identifier(&service_id, "OpenCode service ID", 128)?;
         validate_text(&service_version, "OpenCode service version", 256)?;
-        if service_version != OPENCODE_VERSION {
-            return Err(Error::new(
-                "NATIVE_MCP_VERSION_UNSUPPORTED",
-                "native MCP readback is pinned to OpenCode 2.0.7",
-            ));
-        }
         if service_pid == 0 || observed_at_ms <= 0 {
             return Err(Error::invalid(
                 "OpenCode service identity and observation time are required",
@@ -474,11 +469,18 @@ impl NativeMcpReadback {
             ));
         }
 
+        // Preserve the existing payload bytes for retained 2.0.7 observations.
+        // Other builds name the verified wire contract rather than a release.
+        let api_contract = if service_version == LEGACY_OPENCODE_VERSION {
+            LEGACY_OPENCODE_MCP_API_CONTRACT
+        } else {
+            OPENCODE_MCP_API_CONTRACT
+        };
         let payload = json!({
             "schema_version":READBACK_SCHEMA_VERSION,
             "source":{
                 "runtime":"opencode_v2",
-                "api_contract":OPENCODE_MCP_API_CONTRACT,
+                "api_contract":api_contract,
                 "api_method":"GET /api/mcp",
                 "api_scope":"configured_server_connection_status_only",
                 "service_id":service_id,

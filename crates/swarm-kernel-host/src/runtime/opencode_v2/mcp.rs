@@ -17,7 +17,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const MAX_MCP_SERVERS: usize = 256;
-const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,7 +79,7 @@ pub(crate) async fn observe(
         serde_json::from_value(raw).map_err(|_| {
             Error::new(
                 "NATIVE_MCP_SCHEMA",
-                "OpenCode MCP response does not match the pinned 2.0.7 contract",
+                "OpenCode MCP response does not match the supported typed contract",
             )
         })?;
     if response.location.directory != directory || response.data.len() > MAX_MCP_SERVERS {
@@ -137,12 +136,11 @@ fn validate_route_pairing(service: &Service, options: &Options) -> Result<()> {
             .service_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
-    // This readback is qualified only against the pinned native build, so the
-    // *observed* service must be that build. An explicit route version pin is
-    // optional: when present it must name the same observed build.
+    // An explicit pin must match the observed service. Without one, response
+    // schemas and the live PID/version continuity checks define this readback.
     if !service_id_valid
         || !options.directory.is_absolute()
-        || service.version != PINNED_OPENCODE_VERSION
+        || !Options::version_pin_valid(&service.version)
         || options
             .expected_version
             .as_deref()
@@ -199,5 +197,129 @@ fn optional_string(value: &Value, field: &str) -> Result<Option<String>> {
             .as_str()
             .map(|value| Some(value.to_owned()))
             .ok_or_else(|| Error::new("NATIVE_MCP_SCHEMA", "OpenCode session fact is invalid")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::McpToolProfile, native_mcp::AssignmentSeed};
+    use serde_json::json;
+
+    fn assignment() -> AssignmentContext {
+        AssignmentContext::new(AssignmentSeed {
+            task_id: "fixture-task".into(),
+            task_revision: 1,
+            attempt_id: "fixture-attempt".into(),
+            binding_id: "fixture-binding".into(),
+            binding_generation: 1,
+            native_session_id: "ses_fixture".into(),
+            participant_id: "fixture-participant".into(),
+            profile: McpToolProfile::Participant,
+            grant_revision: 1,
+            basis_kind: "attempt_owner".into(),
+            assignment_id: None,
+            review_assignment_id: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_mcp_defaults_accept_typed_readback_from_observed_build() {
+        use super::super::tests::{Fixture, Reply};
+        let f = Fixture::new().await;
+        let mut options = f.options.clone();
+        options.expected_version = None;
+        f.override_get(
+            "/api/mcp",
+            Reply::Json(
+                200,
+                json!({
+                    "location":{"directory":options.directory}, "data":[]
+                }),
+            ),
+        );
+        f.world.lock().unwrap().sessions.insert(
+            "ses_fixture".into(),
+            json!({
+                "id":"ses_fixture", "projectID":"prj_fixture",
+                "time":{"created":1,"updated":2}
+            }),
+        );
+        let service = Service::connect(&options).await.unwrap();
+        let observed = observe(&service, &options, assignment()).await.unwrap();
+        observed.verify_digest().unwrap();
+        assert_eq!(
+            observed.payload()["source"]["service_version"],
+            "2.0.fixture"
+        );
+        assert_eq!(
+            observed.payload()["source"]["api_contract"],
+            "opencode-http-mcp-list-v1"
+        );
+        assert!(
+            f.world
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| r.method == "GET")
+        );
+
+        // Omitting the release pin does not admit malformed native responses.
+        f.override_get(
+            "/api/mcp",
+            Reply::Json(
+                200,
+                json!({
+                    "location":{"directory":options.directory}, "data":[{"name":"bad"}]
+                }),
+            ),
+        );
+        assert_eq!(
+            observe(&service, &options, assignment())
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "NATIVE_MCP_SCHEMA"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_mcp_defaults_keep_explicit_pin_and_live_continuity_guards() {
+        use super::super::tests::{Fixture, Reply};
+        let f = Fixture::new().await;
+        let mut options = f.options.clone();
+        options.expected_version = None;
+        let service = Service::connect(&options).await.unwrap();
+        let mut pinned = options.clone();
+        pinned.expected_version = Some("another-build".into());
+        assert_eq!(
+            observe(&service, &pinned, assignment())
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "NATIVE_MCP_SCOPE_MISMATCH"
+        );
+        f.override_get(
+            "/api/info",
+            Reply::Json(
+                200,
+                json!({
+                    "version":"replacement-build", "pid":424242,
+                    "urls":["http://127.0.0.1:1/"], "paths":{"tmp":"fixture"}
+                }),
+            ),
+        );
+        assert_eq!(
+            observe(&service, &options, assignment())
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "NATIVE_INSTANCE_CHANGED"
+        );
     }
 }

@@ -21,7 +21,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const PINNED_OPENCODE_VERSION: &str = "2.0.7";
 const MAX_PROFILE_CONFIG_BYTES: u64 = 131_072;
 #[expect(
     dead_code,
@@ -580,20 +579,19 @@ fn validate_options(options: &Options) -> Result<()> {
             .service_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
-    // The install surface is qualified only for the pinned native build. An
-    // explicit route pin is optional; a wrong explicit pin fails here while an
-    // absent pin defers to the observed-service check at use.
+    // Validate an optional operator pin without imposing a controller release.
+    // The exact observed service and typed response are checked at use.
     if !service_id_valid
         || !options.directory.is_absolute()
         || options.directory.to_str().is_none()
         || options
             .expected_version
             .as_deref()
-            .is_some_and(|pin| pin != PINNED_OPENCODE_VERSION)
+            .is_some_and(|pin| !Options::version_pin_valid(pin))
     {
         return Err(Error::new(
             "NATIVE_MCP_SCOPE_MISMATCH",
-            "OpenCode route must use an explicit absolute location and pinned 2.0.7 service",
+            "OpenCode route must use an explicit absolute location and a valid optional version pin",
         ));
     }
     Ok(())
@@ -612,7 +610,7 @@ fn validate_prepared_route(
     if options.service_id != prepared.service_id
         || options.expected_version != prepared.expected_version
         || options.directory != prepared.directory
-        || service.version != PINNED_OPENCODE_VERSION
+        || !Options::version_pin_valid(&service.version)
         || options
             .expected_version
             .as_deref()
