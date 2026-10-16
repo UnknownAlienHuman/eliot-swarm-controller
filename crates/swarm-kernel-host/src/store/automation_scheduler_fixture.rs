@@ -610,12 +610,27 @@ async fn cron_quarantine_reaches_store_outcome_while_goal_reminder_progresses() 
     );
 
     scheduler_owner.0.kill().unwrap();
-    scheduler_owner.0.wait().unwrap();
-    owner
+    let direct_child_exit = scheduler_owner.0.wait().unwrap();
+    let owner_pid = group_identity["pid"].clone();
+    #[cfg(windows)]
+    let retained_job_empty = scheduler_owner
+        .1
+        .as_ref()
+        .map(swarm_process::Group::family_empty);
+    let finish = owner
         .store
         .finish_automation_scheduler_worker(worker_scope, worker_launch_id, group_identity)
-        .await
-        .unwrap();
+        .await;
+    if let Err(error) = finish {
+        #[cfg(windows)]
+        panic!(
+            "scheduler fixture owner finish failed after direct child wait: {error:?}; direct_child_exit={direct_child_exit:?}; owner_pid={owner_pid}; retained_job_empty={retained_job_empty:?}"
+        );
+        #[cfg(not(windows))]
+        panic!(
+            "scheduler fixture owner finish failed after direct child wait: {error:?}; direct_child_exit={direct_child_exit:?}; owner_pid={owner_pid}"
+        );
+    }
     owner.close().await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
