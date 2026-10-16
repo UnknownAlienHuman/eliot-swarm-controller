@@ -1249,6 +1249,16 @@ fn admit_candidate(
         return Ok((next, false));
     }
 
+    // Source/probe custody contention is not a rejected calendar occurrence.
+    // Keep this exact due index untouched so a concurrent successful resolver
+    // can still admit it once; the existing scheduler supplies the retry wake.
+    if resolution
+        .result
+        .as_ref()
+        .is_err_and(|error| error.code == "CHECK_PROBE_CLEANUP_PENDING")
+    {
+        return Ok((Some(retry_wake(now_ms)), false));
+    }
     let admission = super::mutate_cron_check_in_transaction(
         tx,
         &candidate.context,
@@ -1676,6 +1686,45 @@ mod tests {
         .await;
         assert_eq!(foreign_applied["applied"], true);
 
+        // A held source-probe reservation defers this occurrence without a
+        // rejected Operation or cursor movement. It does not simulate a native
+        // CheckRun and retains custody in the existing probe owner.
+        let probe = owner
+            .store
+            .check_child_custody
+            .reserve_probe_resolution_for_fixture("cron-checks")
+            .await
+            .expect("fresh fixture has no probe reservation");
+        let before: String = owner.store.run(|db| {
+            db.query_row(
+                "SELECT value_json FROM meta WHERE key LIKE ?1 AND json_extract(value_json,'$.automation_id')=?2 AND json_extract(value_json,'$.origin_manager_id')='cron-origin'",
+                params![format!("{STATE_PREFIX}%"), AUTOMATION_ID], |row| row.get(0),
+            ).map_err(Into::into)
+        }).await.unwrap();
+        assert!(
+            owner
+                .store
+                .reconcile_automation_cron_once(16, model::now_ms().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let (after, operations, occurrences): (String,i64,i64) = owner.store.run(|db| {
+            let state = db.query_row(
+                "SELECT value_json FROM meta WHERE key LIKE ?1 AND json_extract(value_json,'$.automation_id')=?2 AND json_extract(value_json,'$.origin_manager_id')='cron-origin'",
+                params![format!("{STATE_PREFIX}%"), AUTOMATION_ID], |row| row.get(0),
+            )?;
+            let operations = db.query_row("SELECT COUNT(*) FROM operations WHERE method='check.run'", [], |row| row.get(0))?;
+            let occurrences = db.query_row("SELECT COUNT(*) FROM meta WHERE key LIKE ?1", [format!("{OCCURRENCE_PREFIX}%")], |row| row.get(0))?;
+            Ok((state, operations, occurrences))
+        }).await.unwrap();
+        assert_eq!(
+            after, before,
+            "probe contention must not consume or rewrite the due cursor"
+        );
+        assert_eq!((operations, occurrences), (0, 0));
+        drop(probe);
+
         let reconcile_ms = model::now_ms().unwrap();
         let (first, concurrent) = tokio::join!(
             owner.store.reconcile_automation_cron_once(16, reconcile_ms),
@@ -1703,7 +1752,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(coalesced_receipt["coalesced"], true);
+        assert_eq!(
+            coalesced_receipt["coalesced"], true,
+            "direct check receipt: {coalesced_receipt}"
+        );
         let (
             coalesced_operation_id,
             coalesced_state,
