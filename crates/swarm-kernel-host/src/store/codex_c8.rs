@@ -139,8 +139,10 @@ fn next_candidate(db: &Connection) -> Result<Option<String>> {
               json_extract(launch.effective_request_json,'$.launch_manifest.state') IN ('awaiting_native_mcp','awaiting_capability') \
              AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.dispatch_permitted')=0 \
              AND json_extract(launch.effective_request_json,'$.launch_manifest.progress.task_dispatch')='not_started' \
-             AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.route.runtime')='codex' \
-             AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.route.module_artifact_id')=?1 \
+             AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.route.runtime_kind')='codex' \
+             AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.route.module_contract_selector.module_id')='codex' \
+             AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.route.module_contract_selector.artifact.artifact_id')=?1 \
+             AND json_extract(launch.effective_request_json,'$.launch_manifest.runtime.route.module_contract_selector.artifact.version')=?2 \
               AND json_extract(launch.effective_request_json,'$.launch_manifest.binding.state')='ready' \
               AND json_type(launch.effective_request_json,'$.launch_manifest.binding.native_root_id')='text' \
               AND json_type(launch.effective_request_json,'$.launch_manifest.binding.native_scope_key')='text' \

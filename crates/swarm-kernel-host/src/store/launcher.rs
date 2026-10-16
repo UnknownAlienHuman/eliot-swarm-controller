@@ -41,10 +41,15 @@ const MAX_DECISION_CARD_LIST_ITEMS: usize = 16;
 const MAX_DECISION_CARD_OVERLAP_ITEMS: usize = 8;
 const MAX_LAUNCH_MANIFEST_BYTES: usize = 1_048_576;
 
-fn is_codex_c8_launch(manifest: &Value) -> bool {
-    manifest["runtime"]["route"]["runtime"] == "codex"
-        && manifest["runtime"]["route"]["module_artifact_id"]
+pub(super) fn is_codex_c8_launch(manifest: &Value) -> bool {
+    let route = &manifest["runtime"]["route"];
+    let selector = &route["module_contract_selector"];
+    route["runtime_kind"] == "codex"
+        && selector["module_id"] == "codex"
+        && selector["artifact"]["artifact_id"]
             == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID
+        && selector["artifact"]["version"]
+            == swarm_contracts::module_contract::CODEX_RUST_CONTROLLER_CURRENT_DESCRIPTOR_VERSION
 }
 
 fn codex_preopen_participant_pending(manifest: &Value) -> bool {
@@ -93,7 +98,10 @@ mod codex_preopen_profile_tests {
     fn manifest(runtime: &str, artifact_id: &str, state: &str) -> serde_json::Value {
         json!({
             "state":state,
-            "runtime":{"route":{"runtime":runtime,"module_artifact_id":artifact_id}}
+            "runtime":{"route":{"runtime_kind":runtime,"module_contract_selector":{
+                "schema_version":1,"module_id":runtime,"selected_revision":3,"registered_revision":1,
+                "artifact":{"artifact_id":artifact_id,"version":"13"}
+            }}}
         })
     }
 
@@ -155,6 +163,10 @@ mod codex_preopen_profile_tests {
 
         let other_runtime = manifest("command", "codex-rust-controller.1", "awaiting_binding");
         assert!(!codex_preopen_participant_pending(&other_runtime));
+        let mut prior_contract = awaiting.clone();
+        prior_contract["runtime"]["route"]["module_contract_selector"]["artifact"]["version"] =
+            json!("12");
+        assert!(!is_codex_c8_launch(&prior_contract));
     }
 }
 

@@ -17,9 +17,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::path::Path;
-use swarm_contracts::{
-    module_contract::CODEX_RUST_CONTROLLER_ARTIFACT_ID, native_mcp::CodexNativeMcpLaunchProfile,
-};
+use swarm_contracts::native_mcp::CodexNativeMcpLaunchProfile;
 
 pub(super) const AWAITING_ISSUANCE: &str = "awaiting_participant_credential";
 pub(super) const AWAITING_NATIVE_MCP: &str = "awaiting_native_mcp";
@@ -169,8 +167,7 @@ fn validated_scope(
     let binding = super::operations::get_binding(db, &binding_id, binding_generation)?;
     let open_operation_id = model::text(&manifest["binding"], "operation_id")?;
     let open_operation = super::operations::get_operation(db, open_operation_id)?;
-    let is_codex_c8 = manifest["runtime"]["route"]["runtime"] == "codex"
-        && manifest["runtime"]["route"]["module_artifact_id"] == CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+    let is_codex_c8 = super::launcher::is_codex_c8_launch(&manifest);
     if is_codex_c8 {
         super::codex_c8::require_codex_descriptor(db, &binding)?;
     }
@@ -495,9 +492,7 @@ pub(super) fn codex_launch_profile_for_open(
 ) -> Result<Option<CodexNativeMcpLaunchProfile>> {
     let operation = super::operations::get_operation(tx, launch_operation_id)?;
     let manifest = retained_manifest(tx, launch_operation_id)?;
-    if manifest["runtime"]["route"]["runtime"] != "codex"
-        || manifest["runtime"]["route"]["module_artifact_id"] != CODEX_RUST_CONTROLLER_ARTIFACT_ID
-    {
+    if !super::launcher::is_codex_c8_launch(&manifest) {
         return Ok(None);
     }
     if manifest["binding"]["operation_id"] != open_operation_id {
@@ -1163,8 +1158,7 @@ pub(super) fn require_launch_activation_facts(
         .filter(|value| !value.is_empty())
         .ok_or_else(pending)?;
     let open = super::operations::get_operation(tx, open_operation_id).map_err(|_| pending())?;
-    let is_codex_c8 = manifest["runtime"]["route"]["runtime"] == "codex"
-        && manifest["runtime"]["route"]["module_artifact_id"] == CODEX_RUST_CONTROLLER_ARTIFACT_ID;
+    let is_codex_c8 = super::launcher::is_codex_c8_launch(manifest);
     if open["method"] != "agent.open"
         || open["state"] != "settled"
         || (is_codex_c8 && open["result"]["outcome"] != "applied")

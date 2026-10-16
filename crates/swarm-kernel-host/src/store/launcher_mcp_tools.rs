@@ -2969,7 +2969,7 @@ fn claim_next_tools(tx: &Transaction<'_>, now: i64, config: &Config) -> Result<T
                  AND json_extract(effective_request_json,'$.launch_manifest.runtime.dispatch_permitted')=0 \
                  AND json_extract(effective_request_json,'$.launch_manifest.progress.task_dispatch')='not_started' \
                  AND json_extract(effective_request_json,'$.launch_manifest.native_mcp_readback.state')='observed_partial' \
-                 AND COALESCE(json_extract(effective_request_json,'$.launch_manifest.runtime.route.runtime'),'')!='codex' \
+                 AND COALESCE(json_extract(effective_request_json,'$.launch_manifest.runtime.route.runtime_kind'),'')!='codex' \
                  ELSE 0 END \
                AND operation_id>?1 \
              ORDER BY operation_id LIMIT ?2",
