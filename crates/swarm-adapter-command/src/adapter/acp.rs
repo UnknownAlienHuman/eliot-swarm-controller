@@ -6588,7 +6588,7 @@ mod tests {
             run_timeout_ms: None,
             host_connection: None,
         };
-        let mut link = super::super::Link {
+        let link = super::super::Link {
             client: fake_module_link,
             binding_id: dispatch_command.binding_id.clone(),
             generation: dispatch_command.generation,
