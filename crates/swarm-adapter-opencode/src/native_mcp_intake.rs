@@ -267,34 +267,18 @@ fn bounded_json(value: &Value) -> Result<()> {
 }
 
 pub(crate) fn digest_json(value: &Value) -> Result<String> {
-    let canonical = canonical_value(value);
-    let bytes = serde_json::to_vec(&canonical).map_err(|_| {
-        Error::new(
-            "NATIVE_MCP_ARTIFACT",
-            "native MCP private artifact cannot be canonicalized",
-        )
-    })?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Sha256Digest::of_canonical_json(value)
+        .map(|digest| digest.as_str().to_owned())
+        .map_err(|_| {
+            Error::new(
+                "NATIVE_MCP_ARTIFACT",
+                "native MCP private artifact cannot be canonicalized",
+            )
+        })
 }
 
 fn digest_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
-}
-
-fn canonical_value(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let mut ordered = Map::new();
-            let mut keys = object.keys().collect::<Vec<_>>();
-            keys.sort_unstable();
-            for key in keys {
-                ordered.insert(key.clone(), canonical_value(&object[key]));
-            }
-            Value::Object(ordered)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonical_value).collect()),
-        value => value.clone(),
-    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use swarm_contracts::module_catalog::Sha256Digest;
 
 const READBACK_SCHEMA_VERSION: u32 = 1;
 const LEGACY_OPENCODE_VERSION: &str = "2.0.7";
@@ -581,5 +582,5 @@ fn is_lowercase_sha256(value: &str) -> bool {
 }
 
 fn digest_value(value: &Value) -> Result<String> {
-    Ok(model::digest(model::canonical(value)?.as_bytes()))
+    Ok(Sha256Digest::of_canonical_json(value)?.as_str().to_owned())
 }

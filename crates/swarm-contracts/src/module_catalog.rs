@@ -5,9 +5,15 @@
 //! build a ModuleCatalog from retained descriptors and select an exact
 //! artifact without probing or starting any module.
 
-use std::{collections::BTreeSet, fmt, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const MAX_ID_BYTES: usize = 128;
 const MAX_VERSION_BYTES: usize = 128;
@@ -131,6 +137,29 @@ impl fmt::Display for ArtifactVersion {
 pub struct Sha256Digest(String);
 
 impl Sha256Digest {
+    /// Hash compact JSON bytes after recursively sorting object keys.
+    ///
+    /// Arrays retain their order, and the returned digest is the bare
+    /// lowercase hexadecimal SHA-256 representation used by protected refs.
+    pub fn of_canonical_json(value: &Value) -> Result<Self, serde_json::Error> {
+        fn ordered(value: &Value) -> Value {
+            match value {
+                Value::Object(object) => {
+                    let sorted: BTreeMap<_, _> = object
+                        .iter()
+                        .map(|(key, value)| (key.clone(), ordered(value)))
+                        .collect();
+                    Value::Object(sorted.into_iter().collect())
+                }
+                Value::Array(items) => Value::Array(items.iter().map(ordered).collect()),
+                value => value.clone(),
+            }
+        }
+
+        let bytes = serde_json::to_vec(&ordered(value))?;
+        Ok(Self(format!("{:x}", Sha256::digest(bytes))))
+    }
+
     pub fn new(value: impl Into<String>) -> Result<Self, CatalogError> {
         let value = value.into();
         if !is_sha256_hex(&value) {
@@ -947,4 +976,36 @@ pub enum CatalogError {
         module_id: String,
         missing: Vec<CapabilityId>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sha256Digest;
+    use serde_json::Value;
+
+    #[test]
+    fn canonical_json_digest_matches_protected_artifact_contract_vector() {
+        let reordered: Value = serde_json::from_str(
+            r#"{"z":0,"items":[{"z":-3.5,"a":2},"é",{"nested":{"β":4,"α":3}}],"a":{"y":"雪","x":1}}"#,
+        )
+        .unwrap();
+        let canonical_order: Value = serde_json::from_str(
+            r#"{"a":{"x":1,"y":"雪"},"items":[{"a":2,"z":-3.5},"é",{"nested":{"α":3,"β":4}}],"z":0}"#,
+        )
+        .unwrap();
+        let expected = "f3c729029c469e1bab71621422e105732835bdd84c306d448e8d4826d1361c9e";
+
+        assert_eq!(
+            Sha256Digest::of_canonical_json(&reordered)
+                .unwrap()
+                .as_str(),
+            expected
+        );
+        assert_eq!(
+            Sha256Digest::of_canonical_json(&canonical_order)
+                .unwrap()
+                .as_str(),
+            expected
+        );
+    }
 }
