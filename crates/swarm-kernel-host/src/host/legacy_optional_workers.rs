@@ -1664,8 +1664,158 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn damaged_optional_launch_json_is_quarantined_while_host_serves_valid_ipc_work() {
+    async fn damaged_optional_check_and_automation_json_are_quarantined_while_host_serves_valid_ipc_work()
+     {
         let fixture = Fixture::new().await;
+        let task = fixture
+            .owner
+            .store
+            .call(
+                fixture.operator.clone(),
+                "task.create".to_owned(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "project_id":"issue153-host-boundary",
+                    "spec":{
+                        "objective":"Retain a damaged CheckRun for exact isolation",
+                        "phase":"implementation",
+                        "owner_policy_id":crate::policy::OWNER_POLICY_V2_ID,
+                        "requirements":[{
+                            "id":"isolate",
+                            "statement":"Retained damage creates no CheckRun effect"
+                        }]
+                    }
+                }),
+            )
+            .await
+            .expect("create a real Task for the damaged CheckRun fixture");
+        let task_id = task["task_id"]
+            .as_str()
+            .expect("Task creation returns its durable ID")
+            .to_owned();
+        let attempt = fixture
+            .owner
+            .store
+            .call(
+                fixture.operator.clone(),
+                "task.claim".to_owned(),
+                json!({
+                    "client_request_id":model::new_id(),
+                    "task_id":task_id.clone(),
+                    "expected_revision":1,
+                    "start_owner":"native_manager"
+                }),
+            )
+            .await
+            .expect("claim the fixture Task through the real Store");
+        let attempt_id = attempt["attempt_id"]
+            .as_str()
+            .expect("Task claim returns its durable Attempt ID")
+            .to_owned();
+        let check_id = model::new_id();
+        let check_operation_id = model::new_id();
+        let candidate_bytes = b"issue153 damaged CheckRun fixture";
+        let candidate_ref = format!("source-{}", model::digest(candidate_bytes));
+        let candidate_artifact = crate::artifacts::ArtifactRecord {
+            artifact_id: candidate_ref.clone(),
+            relative_path: format!("artifacts/{candidate_ref}.bin"),
+            kind: "source_snapshot".to_owned(),
+            byte_length: candidate_bytes.len() as u64,
+            content_digest: model::digest(candidate_bytes),
+            metadata: json!({
+                "attempt_id":attempt_id.clone(),
+                "task_revision":1,
+                "fixture":"Issue153 damaged CheckRun"
+            }),
+        };
+        let artifact_state_root = fs::canonicalize(&fixture.directory.0)
+            .expect("resolve the same canonical state root used by the Store");
+        crate::artifacts::ArtifactFiles::new(&artifact_state_root)
+            .expect("open the real artifact store for the CheckRun fixture")
+            .publish(&candidate_artifact, candidate_bytes)
+            .expect("publish the candidate artifact used by the CheckRun fixture");
+        let raw_check_spec = "{broken-check-run-json".to_owned();
+        let check_quarantine_key = format!(
+            "checks:pending:v1:quarantine:{}",
+            model::digest(check_id.as_bytes())
+        );
+        let automation_id = format!("issue153-damaged-enabled-{}", model::new_id());
+        let automation_key =
+            crate::automation::config::entry_key("review-owner-v2", "fixture", &automation_id)
+                .expect("build the retained automation entry key");
+        let task_id_for_seed = task_id.clone();
+        let attempt_id_for_seed = attempt_id.clone();
+        let check_id_for_seed = check_id.clone();
+        let check_operation_id_for_seed = check_operation_id.clone();
+        let candidate_ref_for_seed = candidate_ref.clone();
+        let candidate_artifact_for_seed = candidate_artifact;
+        let raw_check_spec_for_seed = raw_check_spec.clone();
+        let caller_id = fixture.operator.client_id.clone();
+        let automation_id_for_seed = automation_id.clone();
+        let automation_key_for_seed = automation_key.clone();
+        let automation_source_digest = fixture
+            .owner
+            .store
+            .run_fixture(move |db| {
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id,relative_path,kind,byte_length,content_digest,created_at_ms,metadata_json) \
+                     VALUES(?1,?2,?3,?4,?5,1,?6)",
+                    rusqlite::params![
+                        candidate_artifact_for_seed.artifact_id,
+                        candidate_artifact_for_seed.relative_path,
+                        candidate_artifact_for_seed.kind,
+                        i64::try_from(candidate_artifact_for_seed.byte_length)
+                            .expect("candidate byte length fits SQLite"),
+                        candidate_artifact_for_seed.content_digest,
+                        model::canonical(&candidate_artifact_for_seed.metadata)?
+                    ],
+                )?;
+                db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,state,due_at_ms,created_at_ms,updated_at_ms) \
+                     VALUES(?1,?2,?1,'check.run','{}','{}',?3,?4,'queued',1,1,1)",
+                    rusqlite::params![
+                        check_operation_id_for_seed,
+                        caller_id,
+                        task_id_for_seed,
+                        attempt_id_for_seed
+                    ],
+                )?;
+                db.pragma_update(None, "ignore_check_constraints", true)?;
+                let inserted = db.execute(
+                    "INSERT INTO check_runs(check_id,operation_id,attempt_id,candidate_ref,cache_key,resource_key,spec_json,state,created_at_ms) \
+                     VALUES(?1,?2,?3,?4,'issue153-poison-cache','issue153-poison-resource',?5,'queued',1)",
+                    rusqlite::params![
+                        check_id_for_seed,
+                        check_operation_id_for_seed,
+                        attempt_id_for_seed,
+                        candidate_ref_for_seed,
+                        raw_check_spec_for_seed
+                    ],
+                );
+                db.pragma_update(None, "ignore_check_constraints", false)?;
+                inserted?;
+
+                let mut entry = crate::automation::config::AutomationEntry::new(
+                    "review-owner-v2",
+                    "fixture",
+                    &automation_id_for_seed,
+                    1,
+                )
+                .value()?;
+                entry["enabled"] = json!(true);
+                entry["steps"] = json!([]);
+                entry["scope"] = Value::Null;
+                crate::automation::config::write_record(db, &automation_key_for_seed, &entry)?;
+                let raw_entry: String = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [&automation_key_for_seed],
+                    |row| row.get(0),
+                )?;
+                Ok(model::digest(raw_entry.as_bytes()))
+            })
+            .await
+            .expect("retain malformed queued CheckRun and enabled automation sources");
+
         let operation_id = format!("issue153-poison-launch-{}", model::new_id());
         let raw_request = "{broken-launch-json".to_owned();
         let insert_operation_id = operation_id.clone();
@@ -1710,18 +1860,127 @@ mod tests {
             "running",
             "the retained launch damage activates its existing Launcher owner"
         );
-        let dormant = fixture
-            .wait_for_states(&[(Worker::Launcher, "dormant")])
-            .await;
+        let dormant = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let check_key = check_quarantine_key.clone();
+                let automation_digest = automation_source_digest.clone();
+                let quarantined = store
+                    .run_fixture(move |db| {
+                        let check_quarantined: bool = db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+                            [check_key],
+                            |row| row.get(0),
+                        )?;
+                        let automation_quarantined: bool = db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM meta \
+                             WHERE key LIKE 'automation:v1:publication:quarantine:%' \
+                               AND json_extract(value_json,'$.record.evidence.source_digest')=?1)",
+                            [automation_digest],
+                            |row| row.get(0),
+                        )?;
+                        Ok(check_quarantined && automation_quarantined)
+                    })
+                    .await
+                    .expect("poll the production Store for exact owner quarantines");
+                let status = fixture.status().await;
+                let workers = Fixture::optional_workers(&status);
+                let owners_dormant = workers[Worker::Launcher.name()]["state"].as_str()
+                    == Some("dormant")
+                    && workers[Worker::Checks.name()]["state"].as_str() == Some("dormant")
+                    && workers[Worker::Automation.name()]["state"].as_str() == Some("dormant");
+                if quarantined && owners_dormant {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all damaged optional owners quarantine and go dormant within the existing bound");
         assert_eq!(
             Fixture::optional_workers(&dormant)[Worker::Launcher.name()]["state"],
             "dormant",
             "Launcher returns to dormant after isolating the damaged source"
         );
+        assert_eq!(
+            Fixture::optional_workers(&dormant)[Worker::Checks.name()]["state"],
+            "dormant",
+            "Checks returns to dormant after quarantining the malformed queued CheckRun"
+        );
+        assert_eq!(
+            Fixture::optional_workers(&dormant)[Worker::Automation.name()]["state"],
+            "dormant",
+            "Automation returns to dormant after quarantining the enabled damaged entry"
+        );
         assert!(
             !coordinator.is_finished(),
-            "subject-local launch damage must not terminate the host coordinator"
+            "subject-local optional JSON damage must not terminate the host coordinator"
         );
+
+        let check_marker_key_for_read = check_quarantine_key.clone();
+        let check_id_for_read = check_id.clone();
+        let automation_key_for_read = automation_key.clone();
+        let automation_digest_for_read = automation_source_digest.clone();
+        let (
+            check_marker_json,
+            retained_check_spec,
+            automation_marker_json,
+            retained_automation_entry,
+        ) = store
+            .run_fixture(move |db| {
+                let check_marker_json = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [check_marker_key_for_read],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let retained_check_spec = db.query_row(
+                    "SELECT spec_json FROM check_runs WHERE check_id=?1",
+                    [check_id_for_read],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let automation_marker_json = db.query_row(
+                    "SELECT value_json FROM meta \
+                     WHERE key LIKE 'automation:v1:publication:quarantine:%' \
+                       AND json_extract(value_json,'$.record.evidence.source_digest')=?1 \
+                     ORDER BY key LIMIT 1",
+                    [automation_digest_for_read],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let retained_automation_entry = db.query_row(
+                    "SELECT value_json FROM meta WHERE key=?1",
+                    [automation_key_for_read],
+                    |row| row.get::<_, String>(0),
+                )?;
+                Ok((
+                    check_marker_json,
+                    retained_check_spec,
+                    automation_marker_json,
+                    retained_automation_entry,
+                ))
+            })
+            .await
+            .expect("read both retained sources and their exact owner quarantines");
+        assert_eq!(retained_check_spec, raw_check_spec);
+        let check_marker: Value = serde_json::from_str(&check_marker_json)
+            .expect("decode the exact CheckRun quarantine marker");
+        assert_eq!(check_marker["identity"]["check_id"], check_id);
+        assert_eq!(
+            check_marker["identity"]["check_spec_sha256"],
+            model::digest(raw_check_spec.as_bytes())
+        );
+        let automation_marker: Value = serde_json::from_str(&automation_marker_json)
+            .expect("decode the exact Automation quarantine marker");
+        assert_eq!(
+            automation_marker["record"]["code"],
+            "AUTOMATION_RECORD_INVALID"
+        );
+        assert_eq!(
+            automation_marker["record"]["evidence"]["source_digest"],
+            automation_source_digest
+        );
+        let retained_automation_entry: Value = serde_json::from_str(&retained_automation_entry)
+            .expect("enabled damaged automation source remains retained as JSON");
+        assert_eq!(retained_automation_entry["record"]["enabled"], true);
+        assert!(retained_automation_entry["record"]["scope"].is_null());
 
         let operation_for_read = operation_id.clone();
         let (marker_count, marker_json, retained_request) = store
@@ -1769,6 +2028,7 @@ mod tests {
             .legacy_worker_demand_snapshot()
             .await
             .expect("read demand after exact source quarantine");
+        assert!(!demand.checks && !demand.automation);
         assert!(!demand.launcher && !demand.native_mcp && !demand.native_mcp_tools);
 
         let mut client = crate::ipc::Client::connect(
@@ -1784,6 +2044,14 @@ mod tests {
             .expect("host remains available after optional JSON damage");
         assert_eq!(
             status["host_lifecycle"]["optional_workers"][Worker::Launcher.name()]["state"],
+            "dormant"
+        );
+        assert_eq!(
+            status["host_lifecycle"]["optional_workers"][Worker::Checks.name()]["state"],
+            "dormant"
+        );
+        assert_eq!(
+            status["host_lifecycle"]["optional_workers"][Worker::Automation.name()]["state"],
             "dormant"
         );
         let created = client
