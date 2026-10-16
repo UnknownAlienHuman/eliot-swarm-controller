@@ -539,7 +539,10 @@ impl NativeWorkerCustody {
                     "Forge worker owner receipt is unavailable",
                 )
             })?;
-            Ok(swarm_process::departed_empty(&owner["process"], &self.job.owner_token)?)
+            Ok(swarm_process::departed_empty(
+                &owner["process"],
+                &self.job.owner_token,
+            )?)
         }
     }
 
