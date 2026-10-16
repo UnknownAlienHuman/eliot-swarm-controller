@@ -491,18 +491,21 @@ pub(super) fn record_task_dispatch(
         item["assignment_id"] == outcome.operation_id
             || item["dispatch_operation_id"] == outcome.operation_id
     }) {
-        let mut existing_identity = producers[index].clone();
-        let mut producer_identity = producer.clone();
-        if let Some(fields) = existing_identity.as_object_mut() {
-            fields.remove("native_session_id");
-        }
-        if let Some(fields) = producer_identity.as_object_mut() {
-            fields.remove("native_session_id");
-        }
-        if model::canonical(&existing_identity)? != model::canonical(&producer_identity)? {
-            return Err(Error::conflict(
-                "normalized dispatch Operation already has different producer evidence",
-            ));
+        // Admission identity is immutable; completion is a later observation
+        // of that same input. Do not compare its lifecycle fields as identity
+        // or discard evidence already attached to the retained producer.
+        for (field, value) in producer.as_object().expect("producer is an object") {
+            if matches!(
+                field.as_str(),
+                "native_session_id" | "completion_condition" | "execution_complete" | "disposition"
+            ) {
+                continue;
+            }
+            if model::canonical(&producers[index][field])? != model::canonical(value)? {
+                return Err(Error::conflict(
+                    "normalized dispatch Operation already has different producer evidence",
+                ));
+            }
         }
         if !producers[index]["native_session_id"].is_null()
             && !producer["native_session_id"].is_null()
@@ -512,10 +515,30 @@ pub(super) fn record_task_dispatch(
                 "normalized dispatch Operation changed its native session identity",
             ));
         }
+        let mut changed = false;
         if producers[index]["native_session_id"].is_null()
             && !producer["native_session_id"].is_null()
         {
             producers[index]["native_session_id"] = producer["native_session_id"].clone();
+            changed = true;
+        }
+        if execution_complete {
+            if matches!(
+                producers[index]["disposition"].as_str(),
+                Some("failed" | "cancelled")
+            ) {
+                return Err(Error::conflict(
+                    "completed dispatch conflicts with retained terminal producer evidence",
+                ));
+            }
+            for field in ["completion_condition", "execution_complete", "disposition"] {
+                if producers[index][field] != producer[field] {
+                    producers[index][field] = producer[field].clone();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
             tx.execute(
                 "UPDATE attempts SET producers_json=?2,updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",
                 params![&attempt_id, model::canonical(&json!(producers))?, now],
@@ -618,6 +641,100 @@ pub(super) fn bind(
     Ok(
         json!({"operation_id":operation,"attempt_id":attempt_id,"producer":producers[index],"native_start_sent":false}),
     )
+}
+
+#[cfg(test)]
+mod normalized_dispatch_lifecycle_tests {
+    use super::*;
+    use crate::runtime::EffectOutcome;
+
+    #[test]
+    fn exact_admission_can_complete_without_changing_identity_or_accepting_task() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(super::super::SCHEMA).unwrap();
+        db.execute("INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES('task','project',1,'open','{}',1,1)", []).unwrap();
+        db.execute("INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,start_operation_id,binding_id,binding_generation,state,created_at_ms,updated_at_ms) VALUES('attempt','task',1,'{}','manager','controller','dispatch','binding',1,'reserved',1,1)", []).unwrap();
+        let admission: swarm_contracts::runtime::TaskDispatchAdmissionReceipt =
+            serde_json::from_value(json!({
+                "schema_version":1, "module_receipt":{
+                    "schema_version":1, "module_id":"codex",
+                    "artifact":{"artifact_id":"codex-rust-controller.1","version":"11.4"},
+                    "protocol":{"major":1,"minor":0}, "binding_id":"binding",
+                    "binding_generation":1, "operation_id":"dispatch", "input_sha256":"0".repeat(64)
+                },
+                "operation_id":"dispatch", "binding_id":"binding", "binding_generation":1,
+                "worker_boot_id":"boot", "attempt_id":"attempt", "task_id":"task", "task_revision":1,
+                "task_snapshot_sha256":model::digest(b"{}"),
+                "source_text_sha256":model::digest(b"text"), "source_text_bytes":4,
+                "native_payload_sha256":model::digest(b"prompt"), "native_payload_bytes":6,
+                "native_input_id":"input"
+            })).unwrap();
+        admission.validate().unwrap();
+        let operation = json!({"method":"task.dispatch", "operation_id":"dispatch",
+            "attempt_id":"attempt", "binding_id":"binding", "binding_generation":1});
+        let admitted = RuntimeOutcome {
+            operation_id: "dispatch".to_owned(),
+            outcome: EffectOutcome::Accepted,
+            native_root_id: Some("root".to_owned()),
+            native_scope_key: Some("scope".to_owned()),
+            turn_id: Some("turn".to_owned()),
+            native_input_id: Some("input".to_owned()),
+            details: json!({"completion_condition":"native_input_admitted",
+                "execution_complete":false, "task_completion":"unknown"}),
+        };
+        let tx = db.transaction().unwrap();
+        assert_eq!(
+            record_task_dispatch(&tx, &operation, &admitted, &admission, None, 2).unwrap()["disposition"],
+            "admitted"
+        );
+        tx.commit().unwrap();
+
+        let mut terminal = admitted.clone();
+        terminal.outcome = EffectOutcome::Applied;
+        terminal.details = json!({"completion_condition":"native_turn_completed",
+            "execution_complete":true, "task_completion":"unknown"});
+        let tx = db.transaction().unwrap();
+        let completed =
+            record_task_dispatch(&tx, &operation, &terminal, &admission, None, 3).unwrap();
+        assert_eq!(completed["disposition"], "completed");
+        assert_eq!(completed["execution_complete"], true);
+        assert_eq!(completed["task_completion"], "unknown");
+        assert_eq!(
+            completed["native_payload_sha256"],
+            admission.native_payload_sha256
+        );
+        // A late admission receipt cannot erase the verified completion.
+        assert_eq!(
+            record_task_dispatch(&tx, &operation, &admitted, &admission, None, 4).unwrap(),
+            completed
+        );
+        assert_eq!(
+            record_task_dispatch(&tx, &operation, &terminal, &admission, None, 5).unwrap(),
+            completed
+        );
+        let mut changed = admission.clone();
+        changed.native_payload_sha256 = "f".repeat(64);
+        assert_eq!(
+            record_task_dispatch(&tx, &operation, &terminal, &changed, None, 6)
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        let mut foreign_root = terminal.clone();
+        foreign_root.native_root_id = Some("foreign-root".to_owned());
+        assert_eq!(
+            record_task_dispatch(&tx, &operation, &foreign_root, &admission, None, 7)
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        tx.commit().unwrap();
+        let attempt = tasks::get_attempt(&db, "attempt").unwrap();
+        assert_eq!(attempt["producers"].as_array().unwrap().len(), 1);
+        assert_eq!(attempt["producers"][0], completed);
+        assert_ne!(attempt["state"], "accepted");
+        assert_eq!(tasks::get_task(&db, "task").unwrap()["state"], "open");
+    }
 }
 
 #[cfg(test)]
