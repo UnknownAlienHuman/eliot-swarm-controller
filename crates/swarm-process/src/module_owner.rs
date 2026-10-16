@@ -1445,6 +1445,37 @@ mod tests {
 
     #[test]
     fn spawn_failure_publishes_exact_not_started_receipt_with_artifact_version() {
+        // The real owner joins a process-wide Job/group. Running it in this
+        // parallel harness would also capture unrelated fixture children.
+        let module = module_path!()
+            .split_once("::")
+            .expect("fixture module has a crate prefix")
+            .1;
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                &format!("{module}::spawn_failure_receipt_isolated_child"),
+                "--nocapture",
+            ])
+            .output()
+            .expect("run the isolated module-owner spawn-failure fixture");
+        assert!(
+            output.status.success(),
+            "isolated module-owner fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "MODULE_SPAWN_FAILURE_RECEIPT_ASSERTIONS_COMPLETE"),
+            "successful exit without completed launch-receipt assertions is not a pass"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned by the launch-receipt regression in an isolated process-owned Job/group"]
+    fn spawn_failure_receipt_isolated_child() {
         let root = env::temp_dir().join(format!(
             "swarm-module-owner-spawn-failure-{}",
             uuid::Uuid::new_v4()
@@ -1492,9 +1523,7 @@ mod tests {
             state_dir.join("worker.json").exists(),
             state_dir.display()
         );
-        let receipt: Value =
-            serde_json::from_slice(&fs::read(&launch_path).unwrap())
-                .unwrap();
+        let receipt: Value = serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
         let owner: Value =
             serde_json::from_slice(&fs::read(state_dir.join("owner.json")).unwrap()).unwrap();
         let actual_fields = receipt
@@ -1555,6 +1584,7 @@ mod tests {
         assert!(!state_dir.join("worker.json").exists());
 
         fs::remove_dir_all(root).unwrap();
+        println!("MODULE_SPAWN_FAILURE_RECEIPT_ASSERTIONS_COMPLETE");
     }
 
     #[test]
