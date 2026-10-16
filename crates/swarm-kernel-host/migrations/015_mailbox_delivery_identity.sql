@@ -25,4 +25,3 @@ CREATE INDEX IF NOT EXISTS mailbox_settled_invalid_result ON operations(
   method,
   state
 ) WHERE method IN ('message.send','coordination.message.send','coordination.send','coordination.consult') AND state = 'settled' AND result_json IS NOT NULL AND NOT json_valid(result_json);
-
