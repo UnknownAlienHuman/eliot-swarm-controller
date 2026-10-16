@@ -2226,9 +2226,39 @@ mod tests {
     // the Cargo test harness is not a stable image-size assumption. Identity is
     // still captured through the production OS readers.
     fn spawn_identity_mismatch_fixture_child(release: &Path) -> Child {
-        identity_mismatch_fixture_command(release)
-            .spawn()
-            .expect("start compact real child for image-mismatch fixture")
+        #[cfg(windows)]
+        {
+            identity_mismatch_fixture_command(release)
+                .spawn()
+                .expect("start compact real child for image-mismatch fixture")
+        }
+        #[cfg(not(windows))]
+        {
+            let ready =
+                release.with_file_name(format!("mismatch-ready-{}", crate::model::new_id()));
+            let child = identity_mismatch_fixture_command(release, &ready)
+                .spawn()
+                .expect("start compact real child for image-mismatch fixture");
+            // spawn can return before the child's exec completes. Wait for this
+            // exact shell to publish its unique marker before the production
+            // identity readers inspect /proc/<pid>/exe; a pre-exec read can
+            // observe the parent image or fail as UNKNOWN and mask the
+            // deliberate IMAGE_MISMATCH assertion.
+            let deadline = std::time::Instant::now() + StdDuration::from_secs(3);
+            loop {
+                match fs::read(&ready) {
+                    Ok(bytes) if bytes == b"ready" => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("read mismatch fixture readiness marker: {error}"),
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("mismatch fixture shell did not publish readiness");
+                }
+                thread::sleep(StdDuration::from_millis(1));
+            }
+            child
+        }
     }
 
     #[cfg(windows)]
@@ -2252,12 +2282,15 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    fn identity_mismatch_fixture_command(release: &Path) -> Command {
-        const WAIT_FOR_RELEASE: &str =
-            "while [ ! -e \"$ELIOT_SWARM_UNKNOWN362_CHILD_RELEASE\" ]; do sleep 0.02; done";
+    fn identity_mismatch_fixture_command(release: &Path, ready: &Path) -> Command {
+        // Publish readiness from inside the exec'd shell so identity capture
+        // cannot race fork-before-exec. The release wait stays env-based to
+        // preserve the existing custody drain contract.
+        const WAIT_FOR_RELEASE: &str = "printf ready > \"$1\"; while [ ! -e \"$ELIOT_SWARM_UNKNOWN362_CHILD_RELEASE\" ]; do sleep 0.02; done";
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", WAIT_FOR_RELEASE])
+            .args(["-c", WAIT_FOR_RELEASE, "eliot-mismatch-fixture"])
+            .arg(ready)
             .env(CHILD_RELEASE_ENV, release)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
