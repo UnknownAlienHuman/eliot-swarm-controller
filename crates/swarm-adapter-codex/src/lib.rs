@@ -6839,18 +6839,10 @@ async fn report_pending(
     Ok(())
 }
 
-/// Demand-driven reconnect for exact native readback after a terminal observer fault.
-///
-/// Call only immediately before an admitted agent.reconcile or agent.result when the
-/// live demux is terminal (for example NATIVE_EVENT_BUFFER_LIMIT after observer overflow).
-/// The old queued fault and events are persisted through the existing capture_native_events
-/// before the swap, so the terminal diagnosis stays durable. The fresh NativeClient reuses
-/// the same configured endpoint and token reference on a fresh NativeEventSink; it performs
-/// only initialize plus the existing optional account reads, never a thread, turn, or input
-/// write or replay. Journal root proof, dispatch boot and admission digests, pending results
-/// and bounds are left untouched, and a drifted fresh scope is never adopted: readback
-/// callers still require the exact expected scope and stay Unknown on mismatch without
-/// advertising the old root as ready for a new home.
+/// Reconnect a terminal demux before admitted reconcile/result: persist the old fault
+/// via capture_native_events, then swap in a fresh client on the same endpoint/token
+/// without replay. A fresh scope differing from the retained scope is contained, never
+/// adopted: readback stays Unknown through the existing identity checks.
 async fn reconnect_native_for_readback(
     journal: &mut Journal,
     native: &mut NativeClient,
@@ -6863,6 +6855,7 @@ async fn reconnect_native_for_readback(
         Ok(Some(_)) | Err(_) => {}
     }
     journal.capture_native_events()?;
+    let expected_scope = journal.state.native_scope_key.clone();
     let fresh_events = NativeEventSink::new();
     let fresh = match NativeClient::attach(
         endpoint,
@@ -6875,6 +6868,13 @@ async fn reconnect_native_for_readback(
         Ok(client) => client,
         Err(error) => NativeClient::unavailable(error, fresh_events.clone()),
     };
+    if fresh.identity_is_known() && fresh.scope_key() != expected_scope.as_deref() {
+        drop(fresh);
+        let clean = NativeEventSink::new();
+        *native = NativeClient::unavailable(NativeError::IdentityUnverified, clean.clone());
+        journal.native_events = clean;
+        return Ok(true);
+    }
     journal.native_events = fresh.events.clone();
     *native = fresh;
     Ok(true)
@@ -8769,10 +8769,15 @@ mod readback_reconnect_tests {
         let mut native = NativeClient { writer: None, demux: old_demux, events: old_sink, reader_task: None, native_scope_key: Some(expected_scope.clone()), server_identity: None };
         let reconnected = reconnect_native_for_readback(&mut journal, &mut native, &drift_endpoint, None, false).await.expect("drift reconnect");
         assert!(reconnected);
-        assert!(native.demux.terminal_error().expect("drift live").is_none());
-        assert_ne!(native.scope_key(), Some(expected_scope.as_str()));
+        assert!(matches!(native.demux.terminal_error(), Ok(Some(NativeError::IdentityUnverified))));
+        assert!(!native.identity_is_known(), "drifted client must not present a known identity");
+        assert_eq!(native.scope_key(), None, "drifted scope must not be adopted");
         assert_eq!(journal.state.native_scope_key.as_deref(), Some(expected_scope.as_str()));
         assert_eq!(journal.state.native_root_id.as_deref(), Some(thread_id.as_str()));
+        assert_eq!(journal.active_root_id(), Some(thread_id.as_str()), "retained root stays current in journal");
+        for record in &journal.state.pending_native_events {
+            assert!(record.appserver_scope.as_deref().is_none_or(|scope| scope == expected_scope.as_str()), "no foreign-scoped metadata may enter the journal");
+        }
         let claim = fixture_claim();
         let command = RuntimeCommand { operation_id: reconcile_id.clone(), method: "agent.reconcile".to_owned(), created_at_ms: 3, binding_id: "fixture-binding".to_owned(), generation: 1, native_root_id: None, route: serde_json::json!({}), input: serde_json::json!({"operation_id": client_id}), input_sha256: Some("c".repeat(64)), target_input_sha256: Some("b".repeat(64)) };
         let target = journal.operation_record(&client_id).expect("target lookup").expect("target present");
@@ -8782,9 +8787,18 @@ mod readback_reconnect_tests {
         assert_eq!(results[0].details["diagnostic_code"], serde_json::json!("NATIVE_SCOPE_CHANGED"));
         assert_eq!(results[1].details["resolved"], serde_json::json!(false));
         assert_eq!(journal.state.native_scope_key.as_deref(), Some(expected_scope.as_str()));
+        assert!(!native.identity_is_known(), "drifted client still cannot advertise the old root as ready");
+        assert_eq!(journal.active_root_id(), Some(thread_id.as_str()));
+        assert_eq!(native.scope_key(), None);
+        let observation = journal.next_observation(false, false).expect("observation renders");
+        assert_eq!(observation["state"]["native"]["root_id"], serde_json::json!(thread_id.as_str()));
+        assert_eq!(observation["state"]["native"]["scope_key"], serde_json::json!(expected_scope.as_str()));
+        assert_eq!(observation["state"]["native"]["ready"], serde_json::json!(false));
+        assert!(journal.state.pending_observation.is_some());
         assert_eq!(drift_forbidden.load(Ordering::SeqCst), 0);
         let seen = drift_methods.lock().expect("methods").clone();
         assert!(!seen.iter().any(|m| m == "thread/start" || m == "turn/start" || m == "turn/steer"));
+        assert!(!seen.iter().any(|m| m.starts_with("thread/")), "drifted home must see no readback at all");
         drift_server.abort();
         std::fs::remove_dir_all(&base).ok();
     }
