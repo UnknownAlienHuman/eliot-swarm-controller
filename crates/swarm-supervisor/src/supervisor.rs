@@ -2126,19 +2126,7 @@ impl Service {
                 }
             }
 
-            let boot_id = Uuid::new_v4().to_string();
-            self.update_status(|status| {
-                status.lifecycle = LifecycleState::Starting {
-                    boot_id: boot_id.clone(),
-                };
-                status.owner = None;
-                status.worker = None;
-                status.worker_boot_id = Some(boot_id.clone());
-                status.worker_diagnostic_code = None;
-                status.effect_certainty = ModuleEffectCertainty::Unknown;
-                status.failure_stage = None;
-                status.last_failure = None;
-            });
+            let boot_id = self.allocate_worker_boot();
             starts.push_back(now);
             if let Err(error) = self.write_restart_history(&starts) {
                 self.record_failure(
@@ -4058,6 +4046,26 @@ impl Service {
         swarm_process::private_permissions(&self.state_dir, true)
     }
 
+    fn allocate_worker_boot(&self) -> String {
+        let boot_id = Uuid::new_v4().to_string();
+        self.update_status(|status| {
+            status.lifecycle = LifecycleState::Starting {
+                boot_id: boot_id.clone(),
+            };
+            status.owner = None;
+            status.worker = None;
+            status.worker_boot_id = Some(boot_id.clone());
+            // This diagnostic belongs to the prior attempt, whose retained
+            // Store observations and owner receipts remain unchanged.
+            status.hello_failure = None;
+            status.worker_diagnostic_code = None;
+            status.effect_certainty = ModuleEffectCertainty::Unknown;
+            status.failure_stage = None;
+            status.last_failure = None;
+        });
+        boot_id
+    }
+
     fn record_failure(&self, code: &str, detail: &str) {
         self.update_status(|status| {
             status.last_failure = Some(FailureSummary {
@@ -5943,6 +5951,72 @@ mod tests {
                 .collect(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn historical_hello_new_boot_failure_projects_new_attempt_before_confirmation() {
+        let fixture = StartupFixture::new();
+        retain_hello_fixture_operations(&fixture.service);
+        let boot_a = fixture.service.allocate_worker_boot();
+        assert!(
+            fixture
+                .service
+                .record_module_hello_failure(&boot_a, "MODULE_WORKER_IDENTITY_UNKNOWN")
+                .unwrap()
+        );
+        let event_a = crate::ModuleSupervisorObservation::from_status(
+            &fixture.service.current_status(),
+            "fixture-actor",
+            1,
+        )
+        .unwrap();
+        assert_eq!(event_a.boot_id.as_deref(), Some(boot_a.as_str()));
+        assert_eq!(
+            event_a.error_code.as_deref(),
+            Some("MODULE_WORKER_IDENTITY_UNKNOWN")
+        );
+
+        let boot_b = fixture.service.allocate_worker_boot();
+        assert_ne!(boot_a, boot_b);
+        let starting = fixture.service.current_status();
+        assert!(starting.hello_failure.is_none());
+        assert!(starting.last_failure.is_none());
+        assert!(starting.failure_stage.is_none());
+        fixture.service.record_failure(
+            "MODULE_OWNER_HELPER_MISMATCH",
+            "current helper failed before worker confirmation",
+        );
+        fixture.service.update_status(|status| {
+            status.lifecycle = LifecycleState::OwnerIdentityUnknown;
+        });
+        fixture
+            .service
+            .reconcile_retained_module_hello(&boot_a)
+            .unwrap();
+
+        let failed = fixture.service.current_status();
+        assert_eq!(failed.worker_boot_id.as_deref(), Some(boot_b.as_str()));
+        assert!(failed.hello_failure.is_none());
+        assert!(failed.owner.is_none());
+        assert!(failed.worker.is_none());
+        assert!(failed.readback_required);
+        assert!(fixture.service.readback_required.load(Ordering::Acquire));
+        assert!(lock(&fixture.service.confirmed_ready).is_none());
+        let event_b =
+            crate::ModuleSupervisorObservation::from_status(&failed, "fixture-actor", 2).unwrap();
+        assert_eq!(event_b.boot_id.as_deref(), Some(boot_b.as_str()));
+        assert_eq!(event_b.event_id, format!("{boot_b}:fixture-actor:2"));
+        assert_eq!(
+            event_b.error_code.as_deref(),
+            Some("MODULE_OWNER_HELPER_MISMATCH")
+        );
+        assert_eq!(event_b.stage, Some(ModuleFailureStage::Owner));
+        assert_eq!(event_b.effect_certainty, ModuleEffectCertainty::Unknown);
+        assert_eq!(event_b.unknown_operation_count, 2);
+        assert_eq!(
+            event_b.unknown_operation_ids,
+            ["pending-refresh", "pending-result"]
+        );
     }
 
     #[test]
