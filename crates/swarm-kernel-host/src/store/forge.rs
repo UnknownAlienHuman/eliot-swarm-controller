@@ -595,7 +595,12 @@ impl WorkerResultStatus {
     }
 
     fn proves_inner_tree_empty(self) -> bool {
-        matches!(self, Self::Present { inner_tree_empty: true })
+        matches!(
+            self,
+            Self::Present {
+                inner_tree_empty: true
+            }
+        )
     }
 }
 
@@ -1843,7 +1848,9 @@ fn readback_worker_completed(db: &mut Connection, receipt: &Value, result: &Valu
         params![operation_id, model::canonical(&recovered)?, now],
     )?;
     if changed != 1 {
-        return Err(Error::conflict("publication left its readback completion phase"));
+        return Err(Error::conflict(
+            "publication left its readback completion phase",
+        ));
     }
     tx.commit()?;
     Ok(())
@@ -2781,7 +2788,12 @@ fn worker_recovery_ready_result(
         ));
     }
     if (worker_recovery_has_tree_hold(operation)
-        || matches!(result_status, WorkerResultStatus::Present { inner_tree_empty: false }))
+        || matches!(
+            result_status,
+            WorkerResultStatus::Present {
+                inner_tree_empty: false
+            }
+        ))
         && !result_status.proves_inner_tree_empty()
     {
         // Outer worker departure is a separate fact. A missing/malformed
@@ -2827,11 +2839,7 @@ fn worker_recovery_ready_result(
     Ok(result)
 }
 
-fn worker_recovery_block_result(
-    operation: &Value,
-    error_code: &str,
-    now: i64,
-) -> Result<Value> {
+fn worker_recovery_block_result(operation: &Value, error_code: &str, now: i64) -> Result<Value> {
     let process_family_departed = matches!(
         error_code,
         "FORGE_WORKER_PLAN_SCOPE_MISMATCH"
@@ -2839,8 +2847,7 @@ fn worker_recovery_block_result(
             | "FORGE_WORKER_EVIDENCE_UNAVAILABLE"
             | "FORGE_WORKER_EVIDENCE_INVALID"
     );
-    let tree_unconfirmed = worker_recovery_has_tree_hold(operation)
-        || !process_family_departed;
+    let tree_unconfirmed = worker_recovery_has_tree_hold(operation) || !process_family_departed;
     let reason_code = match error_code {
         "FORGE_WORKER_PLAN_SCOPE_MISMATCH" => "worker_plan_scope_mismatch",
         "FORGE_WORKER_RESULT_SCOPE_MISMATCH" => "worker_result_scope_mismatch",
