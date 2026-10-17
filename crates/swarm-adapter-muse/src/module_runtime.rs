@@ -527,9 +527,9 @@ impl<D: ConsumerDriver> RunOwner<D> {
             *active = None;
         }
         self.driver.request_stop();
-        // Join/abort-and-join the consumer FIRST. Then close the retained MSP
-        // and its notification drain; no accepted native input is replayed.
-        self.driver.stop_native().await;
+        // Fence every command before the FINAL transport snapshot/close. A
+        // command already inside native.start may still publish its transport
+        // after request_stop; closing first could miss it and strand custody.
         let retained_commands = self.commands.clone();
         let mut commands = retained_commands.lock().await;
         commands.abort_all();
@@ -545,6 +545,9 @@ impl<D: ConsumerDriver> RunOwner<D> {
             }
         }
         drop(commands);
+        // No command can now publish a late attachment. MSP close still drains
+        // accepted frames; aborted commands remain uncertain, never replayed.
+        self.driver.stop_native().await;
         let drains = self.native.drain_stdio().await;
         self.retain(drains);
         let joined = self.native.join_custodians().await;
@@ -1270,4 +1273,6 @@ mod runtime_tests {
         assert_eq!(driver.native_writes.load(Ordering::SeqCst), 1);
         assert_eq!(facts.lock().unwrap().auth, 1);
     }
+
+    include!("module_runtime_startup_shutdown_tests.rs");
 }
