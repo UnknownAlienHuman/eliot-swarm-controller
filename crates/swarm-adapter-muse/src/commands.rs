@@ -3,8 +3,8 @@
 //! Sources at the parent revision 8283a61f:
 //! - modules/muse/bridge.mjs:125-172 (receipt/TaskPrompt), 1200-1362 (dispatch);
 //! - modules/muse/settings.mjs (one setter, goal verbs, grant-gated MCP config);
-//! - modules/muse/results.mjs:21-104 (pinned, non-consuming result reads);
-//! - modules/muse/observe.mjs:19-25 (Operation-derived native command identity).
+//! - modules/muse/results.mjs: result work is delegated to the results owner;
+//! - modules/muse/observe.mjs:38-50 (pinned absent durability classification).
 //! Public MSP 1.3 schema:
 //! <https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts>
 //! Approval/user-input identities: lines 36-48, 120-123, 2064-2182;
@@ -15,15 +15,23 @@
 //! freshness again immediately before I/O and durably retain exact intent first.
 //! These functions cannot prove those caller obligations or native admission.
 //! Requested selectors are retained caller intent, never observed defaults.
+//! Native command UUIDv7 and a NEW root's reserved sessionId are caller-supplied
+//! intent identities, separate from the host Operation and transport RPC ID.
+//! Before first send, the journal must atomically retain the chosen root ID and
+//! exact commandId/method/params, including session/start, as pending intent.
+//! A lost start ACK stays pending: only explicit same-ID, byte-equivalent
+//! reconciliation may resolve it. Conflict is not permission to adopt another
+//! root, mint another start, fork or resend a prompt. initialize must complete
+//! and initialized must be flushed before a native method is sent.
 //!
-//! Refresh/result return only their FIRST read. Cursor/subscription/inventory
-//! fencing, historical result selection and output verification remain caller
-//! work. Reconciliation returns a validated target, NEVER a replay: the journal
+//! Refresh returns only its FIRST read. Result requests are opaque inputs
+//! validated by the results owner, which alone constructs native result reads,
+//! verifies family scope and owns selection, cursors, paging and output checks.
+//! Reconciliation returns a validated target, NEVER a replay: the journal
 //! owner must match the target's binding/generation, original receipt, exact
 //! method/params/native command ID, ACK/disposition and current work fences.
-//! Result continuation needs the exact terminal item/session/revision and
-//! observed outputRef/digest; refresh needs a real read cursor, subscription,
-//! pending inventory and a stable event fence. Neither first read is completion.
+//! Refresh needs a real read cursor, subscription, pending inventory and a
+//! stable event fence. Its first read is not completion.
 //! No Session/PendingCommandSet/GapFiller, checkpoint, scheduling, automatic
 //! approval, native execution or Task authority is implemented here.
 
@@ -35,9 +43,7 @@ use swarm_contracts::{
 };
 
 pub const MAX_TASK_PROMPT_BYTES: usize = 1_000_000;
-pub const MAX_RESULT_PAGE_BYTES: u64 = 65_536;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-const MAX_COMMAND_TIMESTAMP: i64 = (1_i64 << 48) - 1;
 
 /// Closed diagnostics: no input, prompt, configuration or native error text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +68,7 @@ pub enum EncodeError {
     SessionMcpNotGranted,
     InvalidMcpServers,
     RecoveryNotPermitted,
-    InvalidResultSelector,
+    ResultRequestUnvalidated,
     InvalidReconciliationTarget,
 }
 
@@ -91,6 +97,8 @@ pub enum ModelConfiguration {
 /// here is converted into a requested selector. Unknown status is rejected.
 #[derive(Clone, Copy)]
 pub struct WorkFacts<'a> {
+    /// Exact known-root session/read, not session/list or an inferred snapshot.
+    pub read_method: &'a str,
     pub session_id: &'a str,
     pub model_id: Option<&'a str>,
     pub provider_id: Option<&'a str>,
@@ -115,20 +123,53 @@ pub struct PendingRequestFacts<'a> {
 
 #[derive(Clone, Copy)]
 pub struct RecoveryFacts {
-    /// A classified native durability fact, not an inferred filesystem state.
-    pub durable: bool,
+    pub durability: SessionDurability,
     pub native_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionDurability {
+    Durable,
+    Ephemeral,
+    Unrecognized,
+}
+
+/// Pinned MSP 1.3 / SDK host-death semantics: only an ABSENT member or the
+/// exact durable spelling is durable. Null and unknown spellings stay unknown.
+pub fn session_durability(initialize_result: &Value) -> SessionDurability {
+    let Some(result) = initialize_result.as_object() else {
+        return SessionDurability::Unrecognized;
+    };
+    match result.get("sessionDurability") {
+        None => SessionDurability::Durable,
+        Some(Value::String(value)) if value == "durable" => SessionDurability::Durable,
+        Some(Value::String(value)) if value == "ephemeral" => SessionDurability::Ephemeral,
+        _ => SessionDurability::Unrecognized,
+    }
 }
 
 pub struct EncodeContext<'a> {
     pub expected_receipt: &'a ModuleReceiptIdentity,
     pub worker_boot_id: &'a str,
+    /// Existing retained root, never a proposed replacement on a start conflict.
     pub native_root_id: Option<&'a str>,
+    /// Caller-chosen fresh session identity, pre-recorded for this agent.open.
+    pub fresh_root_session_id: Option<&'a str>,
+    /// Exact UUIDv7 reserved for this Operation in the caller's pending ledger.
+    /// No derivation from an Operation UUID or JSON-RPC ID occurs here.
+    pub native_command_id: Option<&'a str>,
+    /// initialize response accepted AND initialized notification flushed.
+    pub initialized: bool,
     pub observed_children: &'a [String],
     pub requested: &'a RequestedSelectors,
     pub work: Option<WorkFacts<'a>>,
     pub pending_request: Option<PendingRequestFacts<'a>>,
     pub recovery: Option<RecoveryFacts>,
+    /// Temporary opaque handoff until results::ResultRequest is wired here.
+    /// Caller precondition: ResultRequest::parse has accepted this exact input.
+    /// The results owner must additionally check observed family scope before
+    /// I/O. This Value itself supplies neither validation nor native authority.
+    pub validated_result_input: Option<&'a Value>,
     /// Exact initialize grant; a requested capability is not a grant.
     pub session_mcp_granted: bool,
 }
@@ -155,19 +196,6 @@ pub struct ValidatedTaskPrompt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResultSelector {
-    pub kind: String,
-    pub session_id: String,
-    pub item_id: String,
-    pub item_revision: u64,
-    pub output_ref: Option<String>,
-    pub expected_digest: Option<String>,
-    pub before_cursor: Option<String>,
-    pub offset_bytes: u64,
-    pub length_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconciliationTarget {
     pub operation_id: String,
     pub input_sha256: String,
@@ -184,9 +212,9 @@ pub enum CommandEncoding {
         request: NativeRequest,
         session_id: String,
     },
-    ResultFirstRead {
-        request: NativeRequest,
-        selector: ResultSelector,
+    /// No result codec or native request is owned by this module.
+    ResultReadRequired {
+        validated_input: Value,
     },
     /// No native request is safe from this target alone.
     ReconciliationRequired(ReconciliationTarget),
@@ -195,10 +223,8 @@ pub enum CommandEncoding {
 impl CommandEncoding {
     pub fn first_request(&self) -> Option<&NativeRequest> {
         match self {
-            Self::Native { request, .. }
-            | Self::RefreshFirstRead { request, .. }
-            | Self::ResultFirstRead { request, .. } => Some(request),
-            Self::ReconciliationRequired(_) => None,
+            Self::Native { request, .. } | Self::RefreshFirstRead { request, .. } => Some(request),
+            Self::ResultReadRequired { .. } | Self::ReconciliationRequired(_) => None,
         }
     }
 }
@@ -285,24 +311,20 @@ pub fn validate_requested_readback(
     Ok(())
 }
 
-/// Pure bridge.13 commandIdFor mapping. The journal, not this function, retains
-/// it before I/O; reconciliation must not mint a replacement identity.
-pub fn native_command_id(command: &RuntimeCommand) -> Result<String, EncodeError> {
-    if !atom(&command.operation_id)
-        || !(0..=MAX_COMMAND_TIMESTAMP).contains(&command.created_at_ms)
+/// MSP SS3.1.1 requires UUIDv7. This validates spelling only; freshness and
+/// immutable association with an Operation belong to the pending ledger.
+pub fn validate_native_command_id(id: &str) -> Result<(), EncodeError> {
+    let bytes = id.as_bytes();
+    if bytes.len() != 36
+        || bytes.iter().enumerate().any(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) { *byte != b'-' } else { !byte.is_ascii_hexdigit() }
+        })
+        || bytes[14] != b'7'
+        || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
     {
         return Err(EncodeError::InvalidNativeCommandIdentity);
     }
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&Sha256::digest(command.operation_id.as_bytes())[..16]);
-    bytes[..6].copy_from_slice(&command.created_at_ms.to_be_bytes()[2..]);
-    bytes[6] = (bytes[6] & 15) | 0x70;
-    bytes[8] = (bytes[8] & 63) | 0x80;
-    let hex = b"0123456789abcdef";
-    let h = bytes.into_iter().flat_map(|byte| {
-        [char::from(hex[usize::from(byte >> 4)]), char::from(hex[usize::from(byte & 15)])]
-    }).collect::<String>();
-    Ok(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
+    Ok(())
 }
 
 fn validate_receipt(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<(), EncodeError> {
@@ -342,6 +364,9 @@ fn member(cx: &EncodeContext<'_>, session_id: &str) -> bool {
 
 fn work<'a>(cx: &EncodeContext<'a>, root: &str, allow_not_loaded: bool) -> Result<WorkFacts<'a>, EncodeError> {
     let facts = cx.work.ok_or(EncodeError::NativeFactsRequired)?;
+    if facts.read_method != "session/read" {
+        return Err(EncodeError::NativeFactsRequired);
+    }
     if facts.session_id != root {
         return Err(EncodeError::NativeIdentityMismatch);
     }
@@ -405,13 +430,21 @@ pub fn validate_task_prompt(
 }
 
 fn native(
-    command: &RuntimeCommand,
+    cx: &EncodeContext<'_>,
     method: &'static str,
     mut params: Map<String, Value>,
     task_prompt: Option<ValidatedTaskPrompt>,
     requested: Option<RequestedSelectors>,
 ) -> Result<CommandEncoding, EncodeError> {
-    params.insert("commandId".into(), json!(native_command_id(command)?));
+    if !cx.initialized {
+        return Err(EncodeError::NativeFactsRequired);
+    }
+    let id = cx.native_command_id.ok_or(EncodeError::NativeFactsRequired)?;
+    validate_native_command_id(id)?;
+    if params.get("commandId").is_some_and(|value| value.as_str() != Some(id)) {
+        return Err(EncodeError::InvalidNativeCommandIdentity);
+    }
+    params.insert("commandId".into(), json!(id));
     Ok(CommandEncoding::Native {
         request: NativeRequest { method, params },
         task_prompt,
@@ -420,8 +453,8 @@ fn native(
 }
 
 /// Validate all ten advertised host methods. Native variants are exact request
-/// encodings, not permissions to execute; read variants intentionally cannot
-/// claim refresh/result completion. No native server request is auto-approved.
+/// encodings, not permissions to execute; refresh cannot claim completion and
+/// result work is delegated. No native server request is auto-approved.
 pub fn encode(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<CommandEncoding, EncodeError> {
     validate_receipt(command, cx)?;
     if command.method != "task.dispatch"
@@ -432,6 +465,26 @@ pub fn encode(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<Comman
     }
     if command.method == "agent.open" {
         return open(command, cx);
+    }
+    if command.method == "agent.reconcile" {
+        // A lost session/start ACK has no confirmed root yet. This is only a
+        // journal target: the journal must resolve that exact pending start,
+        // not adopt the proposed root or generate another start here.
+        if command.native_root_id.as_deref() != cx.native_root_id {
+            return Err(EncodeError::NativeIdentityMismatch);
+        }
+        if cx.native_root_id.is_some_and(|id| !atom(id)) {
+            return Err(EncodeError::NativeFactsRequired);
+        }
+        let target = text(&command.input, "operation_id")?;
+        let hash = command.target_input_sha256.as_deref().filter(|s| digest(s))
+            .ok_or(EncodeError::InvalidReconciliationTarget)?;
+        if !atom(target) || target == command.operation_id {
+            return Err(EncodeError::InvalidReconciliationTarget);
+        }
+        return Ok(CommandEncoding::ReconciliationRequired(ReconciliationTarget {
+            operation_id: target.to_owned(), input_sha256: hash.to_owned(),
+        }));
     }
     let root = root(command, cx)?;
     let p = &command.input;
@@ -477,20 +530,24 @@ pub fn encode(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<Comman
                 }
                 _ => return Err(EncodeError::InvalidInput),
             };
-            native(command, method, params, task_prompt, None)
+            native(cx, method, params, task_prompt, None)
         }
         "agent.reply" => reply(command, cx),
-        "agent.configure" => configure(command, root),
+        "agent.configure" => configure(command, cx, root),
         "agent.goal" => goal(command, cx, root),
         "agent.recover" => {
             let recovery = cx.recovery.ok_or(EncodeError::NativeFactsRequired)?;
-            if !recovery.durable || recovery.native_ready || text(p, "expected_boot_id")? != cx.worker_boot_id {
+            if recovery.durability == SessionDurability::Unrecognized {
+                return Err(EncodeError::NativeFactsRequired);
+            }
+            if recovery.durability != SessionDurability::Durable || recovery.native_ready || text(p, "expected_boot_id")? != cx.worker_boot_id {
                 return Err(EncodeError::RecoveryNotPermitted);
             }
             work(cx, root, true)?;
-            native(command, "session/resume", json!({"sessionId":root,"excludeItems":true}).as_object().expect("object literal").clone(), None, None)
+            native(cx, "session/resume", json!({"sessionId":root,"excludeItems":true}).as_object().expect("object literal").clone(), None, None)
         }
         "agent.refresh" => {
+            if !cx.initialized { return Err(EncodeError::NativeFactsRequired); }
             let target = match p.get("session_id") {
                 None => root,
                 Some(_) => text(p, "session_id")?,
@@ -504,26 +561,13 @@ pub fn encode(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<Comman
             })
         }
         "agent.result" => {
-            let selector = validate_result_selector(p, cx)?;
-            let mut params = json!({"sessionId":selector.session_id,"direction":"backward","limit":100}).as_object().expect("object literal").clone();
-            if let Some(cursor) = &selector.before_cursor {
-                params.insert("cursor".into(), json!(cursor));
+            let validated = cx.validated_result_input.ok_or(EncodeError::ResultRequestUnvalidated)?;
+            if validated != p {
+                return Err(EncodeError::ResultRequestUnvalidated);
             }
-            Ok(CommandEncoding::ResultFirstRead {
-                request: NativeRequest { method: "view/page", params },
-                selector,
+            Ok(CommandEncoding::ResultReadRequired {
+                validated_input: validated.clone(),
             })
-        }
-        "agent.reconcile" => {
-            let target = text(p, "operation_id")?;
-            let hash = command.target_input_sha256.as_deref().filter(|s| digest(s))
-                .ok_or(EncodeError::InvalidReconciliationTarget)?;
-            if !atom(target) || target == command.operation_id {
-                return Err(EncodeError::InvalidReconciliationTarget);
-            }
-            Ok(CommandEncoding::ReconciliationRequired(ReconciliationTarget {
-                operation_id: target.to_owned(), input_sha256: hash.to_owned(),
-            }))
         }
         _ => Err(EncodeError::UnsupportedMethod),
     }
@@ -542,6 +586,14 @@ fn absolute(path: &str) -> bool {
 fn open(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<CommandEncoding, EncodeError> {
     // Opening does not select or replace a retained root. Recovery owns that path.
     if cx.native_root_id.is_some() || command.native_root_id.is_some() {
+        return Err(EncodeError::NativeIdentityMismatch);
+    }
+    let new_root = cx.fresh_root_session_id.ok_or(EncodeError::NativeFactsRequired)?;
+    // The pin types sessionId as an exact string identity; only commandId is
+    // explicitly constrained to UUIDv7. Freshness is the caller's reservation.
+    if !atom(new_root)
+        || cx.observed_children.iter().any(|id| id == new_root)
+    {
         return Err(EncodeError::NativeIdentityMismatch);
     }
     let options = &command.route["native_options"];
@@ -564,7 +616,7 @@ fn open(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<CommandEncod
         reasoning_effort: optional("reasoningEffort", false)?,
     };
     validate_selectors(&requested)?;
-    let mut params = json!({"workspaceRoot":workspace}).as_object().expect("object literal").clone();
+    let mut params = json!({"workspaceRoot":workspace,"sessionId":new_root}).as_object().expect("object literal").clone();
     for (key, value) in [("modelId", &requested.model_id), ("providerId", &requested.provider_id)] {
         if let Some(value) = value {
             params.insert(key.into(), json!(value));
@@ -583,10 +635,10 @@ fn open(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<CommandEncod
         validate_mcp_servers(servers)?;
         params.insert("config".into(), json!({"mcpServers":servers}));
     }
-    native(command, "session/start", params, None, Some(requested))
+    native(cx, "session/start", params, None, Some(requested))
 }
 
-fn configure(command: &RuntimeCommand, root: &str) -> Result<CommandEncoding, EncodeError> {
+fn configure(command: &RuntimeCommand, cx: &EncodeContext<'_>, root: &str) -> Result<CommandEncoding, EncodeError> {
     let settings = &command.input["settings"];
     let values = object(settings).map_err(|_| EncodeError::InvalidSettings)?;
     if values.len() != 1 {
@@ -615,7 +667,7 @@ fn configure(command: &RuntimeCommand, root: &str) -> Result<CommandEncoding, En
         }
         _ => return Err(EncodeError::InvalidSettings),
     };
-    native(command, method, params, None, None)
+    native(cx, method, params, None, None)
 }
 
 fn goal(command: &RuntimeCommand, cx: &EncodeContext<'_>, root: &str) -> Result<CommandEncoding, EncodeError> {
@@ -633,12 +685,13 @@ fn goal(command: &RuntimeCommand, cx: &EncodeContext<'_>, root: &str) -> Result<
     }
     let mut params = json!({"sessionId":root}).as_object().expect("object literal").clone();
     if matches!(action, "set" | "edit") {
-        // Preserve caller bytes; the native schema owns admission-time trimming.
-        params.insert("objective".into(), json!(text(&command.input, "objective").map_err(|_| EncodeError::InvalidGoal)?));
+        // MSP SS3.18 requires the trimmed objective as payload. The pending
+        // ledger must retain these final params before the first write.
+        params.insert("objective".into(), json!(text(&command.input, "objective").map_err(|_| EncodeError::InvalidGoal)?.trim()));
     } else if command.input.get("objective").is_some() {
         return Err(EncodeError::InvalidGoal);
     }
-    native(command, method, params, None, None)
+    native(cx, method, params, None, None)
 }
 
 fn validate_mcp_servers(value: &Value) -> Result<(), EncodeError> {
@@ -716,11 +769,7 @@ fn reply(command: &RuntimeCommand, cx: &EncodeContext<'_>) -> Result<CommandEnco
         }
         _ => return Err(EncodeError::InvalidReply),
     };
-    let id = native_command_id(command)?;
-    if params.get("commandId").is_some_and(|value| value.as_str() != Some(id.as_str())) {
-        return Err(EncodeError::InvalidNativeCommandIdentity);
-    }
-    native(command, method, object(params)?.clone(), None, None)
+    native(cx, method, object(params)?.clone(), None, None)
 }
 
 fn validate_approval(params: &Value, pending: &Value) -> Result<(), EncodeError> {
@@ -800,32 +849,6 @@ fn validate_answers(params: &Value, pending: &Value) -> Result<(), EncodeError> 
     validate().map_err(|e| if e == EncodeError::ReplyIdentityMismatch { e } else { EncodeError::InvalidReply })
 }
 
-pub fn validate_result_selector(input: &Value, cx: &EncodeContext<'_>) -> Result<ResultSelector, EncodeError> {
-    let validate = || -> Result<ResultSelector, EncodeError> {
-        let selector = &input["selector"];
-        only(selector, &["kind", "session_id", "item_id", "item_revision", "output_ref", "expected_digest", "before_cursor"])?;
-        let kind = text(selector, "kind")?;
-        let session = text(selector, "session_id")?;
-        if !["result", "message", "output", "patch"].contains(&kind) || !member(cx, session) { return Err(EncodeError::InvalidResultSelector); }
-        let optional = |key| -> Result<Option<String>, EncodeError> {
-            selector.get(key).map(|_| text(selector, key).map(str::to_owned)).transpose()
-        };
-        let output_ref = optional("output_ref")?;
-        if matches!(kind, "output" | "patch") != output_ref.is_some() { return Err(EncodeError::InvalidResultSelector); }
-        let expected_digest = optional("expected_digest")?;
-        if expected_digest.as_deref().is_some_and(|s| !s.strip_prefix("sha256:").is_some_and(digest)) { return Err(EncodeError::InvalidResultSelector); }
-        let offset = input.get("offset_bytes").map(|v| integer(v, 0)).transpose()?.unwrap_or(0);
-        let length = input.get("length_bytes").map(|v| integer(v, 1)).transpose()?.unwrap_or(MAX_RESULT_PAGE_BYTES);
-        if length > MAX_RESULT_PAGE_BYTES || offset.checked_add(length).is_none_or(|n| n > MAX_SAFE_INTEGER) { return Err(EncodeError::InvalidResultSelector); }
-        Ok(ResultSelector {
-            kind: kind.to_owned(), session_id: session.to_owned(), item_id: text(selector, "item_id")?.to_owned(),
-            item_revision: integer(&selector["item_revision"], 1)?, output_ref, expected_digest,
-            before_cursor: optional("before_cursor")?, offset_bytes: offset, length_bytes: length,
-        })
-    };
-    validate().map_err(|_| EncodeError::InvalidResultSelector)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,6 +856,8 @@ mod tests {
     const ROOT: &str = "ses_root_fixture";
     const OPERATION: &str = "3f6b8f2e-9c41-4d7a-a5e2-1b0c9d8e7f60";
     const BOOT: &str = "fixture-boot-token";
+    const NATIVE_COMMAND: &str = "019e7044-8800-73ed-9497-0f0c6eaca68d";
+    const FRESH_ROOT: &str = "019e7044-8801-7000-8000-000000000001";
     const SHA_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     struct Fixture {
@@ -865,14 +890,19 @@ mod tests {
         fn context(&self) -> EncodeContext<'_> {
             EncodeContext {
                 expected_receipt: &self.receipt, worker_boot_id: BOOT,
-                native_root_id: Some(ROOT), observed_children: &self.children,
+                native_root_id: Some(ROOT),
+                fresh_root_session_id: (self.command.method == "agent.open").then_some(FRESH_ROOT),
+                native_command_id: Some(NATIVE_COMMAND), initialized: true,
+                observed_children: &self.children,
                 requested: &self.requested,
                 work: Some(WorkFacts {
-                    session_id: ROOT, model_id: Some("observed-native-model"), provider_id: Some("observed-provider"),
+                    read_method: "session/read", session_id: ROOT,
+                    model_id: Some("observed-native-model"), provider_id: Some("observed-provider"),
                     status: "idle", active_turn_id: None, sampled_event_version: 7, current_event_version: 7,
                     model_configuration: ModelConfiguration::Settled, standing_effort: None,
                 }),
-                pending_request: None, recovery: None, session_mcp_granted: false,
+                pending_request: None, recovery: None, validated_result_input: None,
+                session_mcp_granted: false,
             }
         }
 
@@ -922,14 +952,49 @@ mod tests {
     }
 
     #[test]
-    fn muse_commands_native_id_matches_retained_bridge_vector() {
-        // modules/muse/fixtures/checkpoint-roundtrip.json: retained native ID,
-        // not an expectation calculated through this encoder.
-        let mut fixture = Fixture::new("agent.send", json!({}));
-        assert_eq!(native_command_id(&fixture.command).unwrap(), "019e7044-8800-73ed-9497-0f0c6eaca68d");
-        for timestamp in [-1, MAX_COMMAND_TIMESTAMP + 1] {
-            fixture.command.created_at_ms = timestamp;
-            assert_eq!(native_command_id(&fixture.command).unwrap_err(), EncodeError::InvalidNativeCommandIdentity);
+    fn muse_commands_native_id_is_explicit_uuid_v7_not_operation_or_rpc_id() {
+        // Retained UUIDv7 vector from checkpoint-roundtrip.json. The encoder
+        // accepts the ledger's ID; it does not mint it from the UUIDv4 Operation.
+        assert_eq!(validate_native_command_id(NATIVE_COMMAND), Ok(()));
+        let fixture = Fixture::new("agent.send", json!({"text":"input"}));
+        assert_eq!(request(encode(&fixture.command, &fixture.context()).unwrap()).params["commandId"], NATIVE_COMMAND);
+        for id in [OPERATION, "0", "", "019e7044-8800-73ed-1497-0f0c6eaca68d"] {
+            let mut cx = fixture.context();
+            cx.native_command_id = Some(id);
+            assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::InvalidNativeCommandIdentity);
+        }
+    }
+
+    #[test]
+    fn muse_commands_open_requires_reserved_root_and_completed_handshake() {
+        let fixture = Fixture::open(json!({"workspaceRoot":"/work"}));
+        let mut cx = fixture.context(); cx.native_root_id = None;
+        cx.fresh_root_session_id = None;
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::NativeFactsRequired);
+        cx.fresh_root_session_id = Some(FRESH_ROOT);
+        cx.initialized = false;
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::NativeFactsRequired);
+        cx.initialized = true;
+        cx.native_command_id = None;
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::NativeFactsRequired);
+        cx.native_command_id = Some(NATIVE_COMMAND);
+        let intent = request(encode(&fixture.command, &cx).unwrap());
+        assert_eq!(intent.method, "session/start");
+        assert_eq!(intent.params["sessionId"], FRESH_ROOT);
+        assert_eq!(intent.params["commandId"], NATIVE_COMMAND);
+        // This encodes stable intent for the journal; it performs no send.
+        assert_eq!(request(encode(&fixture.command, &cx).unwrap()), intent);
+        cx.native_root_id = Some("foreign-existing-root");
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::NativeIdentityMismatch);
+    }
+
+    #[test]
+    fn muse_commands_durability_uses_pinned_absence_rule_without_unknown_fallback() {
+        assert_eq!(session_durability(&json!({})), SessionDurability::Durable);
+        assert_eq!(session_durability(&json!({"sessionDurability":"durable"})), SessionDurability::Durable);
+        assert_eq!(session_durability(&json!({"sessionDurability":"ephemeral"})), SessionDurability::Ephemeral);
+        for value in [json!({"sessionDurability":null}), json!({"sessionDurability":"future"}), Value::Null] {
+            assert_eq!(session_durability(&value), SessionDurability::Unrecognized);
         }
     }
 
@@ -966,7 +1031,8 @@ mod tests {
         let opened = encode(&fixture.command, &cx).unwrap();
         let sent = opened.first_request().unwrap();
         assert_eq!(sent.method, "session/start");
-        assert_eq!(sent.params.len(), 2); // workspaceRoot and commandId only.
+        assert_eq!(sent.params.len(), 3); // workspaceRoot, reserved sessionId and commandId.
+        assert_eq!(sent.params["sessionId"], FRESH_ROOT);
         match opened {
             CommandEncoding::Native { requested: Some(selection), .. } => assert!(selection == RequestedSelectors::default()),
             _ => panic!("open retains explicit selector omission"),
@@ -1117,6 +1183,7 @@ mod tests {
             let sent = request(encode(&fixture.command, &fixture.context()).unwrap());
             assert_eq!(sent.method, format!("goal/{action}"));
             assert_eq!(sent.params.contains_key("objective"), matches!(action, "set" | "edit"));
+            if matches!(action, "set" | "edit") { assert_eq!(sent.params["objective"], "objective"); }
             assert!(!sent.params.contains_key("reasoningEffort"));
         }
         let mut fixture = Fixture::new("agent.goal", json!({"action":"resume"}));
@@ -1236,37 +1303,51 @@ mod tests {
         let fixture = Fixture::new("agent.recover", json!({"expected_boot_id":BOOT}));
         let mut cx = fixture.context();
         assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::NativeFactsRequired);
-        for facts in [RecoveryFacts { durable: false, native_ready: false }, RecoveryFacts { durable: true, native_ready: true }] {
+        for facts in [
+            RecoveryFacts { durability: SessionDurability::Ephemeral, native_ready: false },
+            RecoveryFacts { durability: SessionDurability::Durable, native_ready: true },
+        ] {
             cx.recovery = Some(facts);
             assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::RecoveryNotPermitted);
         }
-        cx.recovery = Some(RecoveryFacts { durable: true, native_ready: false });
+        cx.recovery = Some(RecoveryFacts { durability: SessionDurability::Unrecognized, native_ready: false });
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::NativeFactsRequired);
+        cx.recovery = Some(RecoveryFacts { durability: SessionDurability::Durable, native_ready: false });
         cx.work.as_mut().unwrap().status = "notLoaded";
         let sent = request(encode(&fixture.command, &cx).unwrap());
         assert_eq!(sent.method, "session/resume"); assert_eq!(sent.params["sessionId"], ROOT);
         assert_eq!(sent.params["excludeItems"], true); assert_eq!(sent.params.len(), 3);
+        cx.work.as_mut().unwrap().read_method = "session/list";
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::NativeFactsRequired);
+        cx.work.as_mut().unwrap().read_method = "session/read";
+        cx.work.as_mut().unwrap().session_id = "foreign-root";
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::NativeIdentityMismatch);
     }
 
     #[test]
-    fn muse_commands_refresh_and_result_only_encode_pinned_non_consuming_first_reads() {
+    fn muse_commands_refresh_only_encodes_its_non_consuming_first_read() {
         let fixture = Fixture::new("agent.refresh", json!({"session_id":"ses_child"}));
         let sent = request(encode(&fixture.command, &fixture.context()).unwrap());
         assert_eq!(sent.method, "session/read"); assert!(!sent.params.contains_key("commandId"));
         assert_eq!(sent.params["sessionId"], "ses_child"); assert_eq!(sent.params["excludeItems"], true);
+    }
+
+    #[test]
+    fn muse_commands_result_delegates_exact_validated_input_without_a_parallel_codec() {
         let fixture = Fixture::new("agent.result", json!({"selector":{"kind":"message","session_id":"ses_child",
             "item_id":"exact-item","item_revision":3,"before_cursor":"opaque-cursor"},"offset_bytes":7,"length_bytes":9}));
-        let encoded = encode(&fixture.command, &fixture.context()).unwrap();
-        let CommandEncoding::ResultFirstRead { request, selector } = encoded else { panic!("pinned result read") };
-        assert_eq!(request.method, "view/page"); assert_eq!(request.params, json!({"sessionId":"ses_child","direction":"backward","limit":100,"cursor":"opaque-cursor"}).as_object().unwrap().clone());
-        assert_eq!(selector.item_revision, 3); assert_eq!(selector.item_id, "exact-item");
-        assert_eq!((selector.offset_bytes, selector.length_bytes), (7, 9));
-        for selector in [json!({"kind":"message","session_id":ROOT,"item_id":"i"}),
-            json!({"kind":"message","session_id":"foreign","item_id":"i","item_revision":1}),
-            json!({"kind":"output","session_id":ROOT,"item_id":"i","item_revision":1}),
-            json!({"kind":"message","session_id":ROOT,"item_id":"i","item_revision":1,"latest":true})] {
-            let fixture = Fixture::new("agent.result", json!({"selector":selector}));
-            assert_eq!(encode(&fixture.command, &fixture.context()).unwrap_err(), EncodeError::InvalidResultSelector);
-        }
+        let mut cx = fixture.context();
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::ResultRequestUnvalidated);
+        // Only the handoff contract is tested here. Result schema and paging
+        // vectors belong to results.rs and its ResultRequest::parse verifier.
+        cx.validated_result_input = Some(&fixture.command.input);
+        let encoded = encode(&fixture.command, &cx).unwrap();
+        assert!(encoded.first_request().is_none());
+        let CommandEncoding::ResultReadRequired { validated_input } = encoded else { panic!("results owner handoff") };
+        assert_eq!(validated_input, fixture.command.input);
+        let other_input = json!({"different":"input"});
+        cx.validated_result_input = Some(&other_input);
+        assert_eq!(encode(&fixture.command, &cx).unwrap_err(), EncodeError::ResultRequestUnvalidated);
     }
 
     #[test]
@@ -1280,5 +1361,21 @@ mod tests {
         assert_eq!(target.operation_id, "original-operation"); assert_eq!(target.input_sha256, "b".repeat(64));
         fixture.command.native_root_id = Some("foreign-root".into());
         assert_eq!(encode(&fixture.command, &fixture.context()).unwrap_err(), EncodeError::NativeIdentityMismatch);
+    }
+
+    #[test]
+    fn muse_commands_lost_start_ack_keeps_rootless_reconciliation_as_journal_only_target() {
+        let mut fixture = Fixture::new("agent.reconcile", json!({"operation_id":"pending-session-start"}));
+        fixture.command.native_root_id = None;
+        fixture.command.target_input_sha256 = Some("b".repeat(64));
+        let mut cx = fixture.context(); cx.native_root_id = None;
+        cx.fresh_root_session_id = Some(FRESH_ROOT);
+        let encoded = encode(&fixture.command, &cx).unwrap();
+        assert!(encoded.first_request().is_none());
+        let CommandEncoding::ReconciliationRequired(target) = encoded else { panic!("journal-owned lost start") };
+        assert_eq!(target.operation_id, "pending-session-start");
+        // The reserved ID remains only pending identity, never an adopted root.
+        assert_eq!(cx.native_root_id, None);
+        assert_eq!(fixture.command.native_root_id, None);
     }
 }
