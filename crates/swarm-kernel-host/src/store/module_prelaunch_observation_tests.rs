@@ -16,8 +16,7 @@ use swarm_supervisor::{
 use tokio::{task::JoinSet, time};
 use tokio_util::codec::{Framed, LinesCodec};
 
-const ADAPTER_CHILD: &str =
-    "store::module_prelaunch_observation_tests::prelaunch_adapter_child";
+const ADAPTER_CHILD: &str = "store::module_prelaunch_observation_tests::prelaunch_adapter_child";
 const CONFIG_CANARY: &str = "PRIVATE_PRELAUNCH_OPTIONS_MUST_NOT_ESCAPE";
 const UNSUPPORTED: &str = "MODULE_CONFIG_SCHEMA_UNSUPPORTED";
 const BOUND: Duration = Duration::from_secs(20);
@@ -70,9 +69,14 @@ async fn relay(
             let mut trace = trace.lock().unwrap();
             match request["method"].as_str() {
                 Some("module.supervisor.demand.page") => trace.demand_pages += 1,
-                Some("module.supervisor.credential.ensure" | "module.supervisor.credential.ready") => {
+                Some(
+                    "module.supervisor.credential.ensure" | "module.supervisor.credential.ready",
+                ) => {
                     let binding = request["params"]["binding_id"].as_str().unwrap();
-                    *trace.credential_calls.entry(binding.to_owned()).or_default() += 1;
+                    *trace
+                        .credential_calls
+                        .entry(binding.to_owned())
+                        .or_default() += 1;
                 }
                 _ => {}
             }
@@ -80,7 +84,9 @@ async fn relay(
         if host.send(line).await.is_err() {
             break;
         }
-        let Some(Ok(reply)) = host.next().await else { break };
+        let Some(Ok(reply)) = host.next().await else {
+            break;
+        };
         let response: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(request["id"], response["id"]);
         let mut withhold = false;
@@ -160,7 +166,14 @@ impl ConnectedStore {
                 joined.unwrap();
             }
         });
-        Self { owner, operator, config, trace, stop, accept }
+        Self {
+            owner,
+            operator,
+            config,
+            trace,
+            stop,
+            accept,
+        }
     }
 
     fn control(&self) -> SupervisorControlClient {
@@ -174,7 +187,11 @@ impl ConnectedStore {
 
     async fn call(&self, credential: &Credential, method: &str, params: Value) -> Value {
         swarm_client::call(
-            &self.config.storage.data_dir, credential, method, params, &self.config.ipc,
+            &self.config.storage.data_dir,
+            credential,
+            method,
+            params,
+            &self.config.ipc,
         )
         .await
         .unwrap_or_else(|error| panic!("fixture IPC {method}: {}", error.code))
@@ -182,24 +199,40 @@ impl ConnectedStore {
 
     async fn open(&self, manager: &Credential, route: &str) -> Value {
         let catalog = self.call(manager, "module.catalog.get", json!({})).await;
-        let descriptor = catalog["descriptors"].as_array().unwrap().iter()
+        let descriptor = catalog["descriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
             .find(|item| item["module_id"] == format!("fixture.prelaunch.{route}"))
             .unwrap();
-        self.call(manager, "module.route.select", json!({
-            "client_request_id":model::new_id(), "route_alias":route,
-            "module_id":descriptor["module_id"],
-            "artifact_id":descriptor["artifact"]["artifact_id"],
-            "version":descriptor["artifact"]["version"],
-            "expected_catalog_revision":catalog["catalog_revision"],
-        })).await;
-        self.call(manager, "agent.open", json!({
-            "client_request_id":model::new_id(), "lane_id":model::new_id(), "route":route,
-        })).await
+        self.call(
+            manager,
+            "module.route.select",
+            json!({
+                "client_request_id":model::new_id(), "route_alias":route,
+                "module_id":descriptor["module_id"],
+                "artifact_id":descriptor["artifact"]["artifact_id"],
+                "version":descriptor["artifact"]["version"],
+                "expected_catalog_revision":catalog["catalog_revision"],
+            }),
+        )
+        .await;
+        self.call(
+            manager,
+            "agent.open",
+            json!({
+                "client_request_id":model::new_id(), "lane_id":model::new_id(), "route":route,
+            }),
+        )
+        .await
     }
 
     async fn close(self) {
         self.stop.send(true).unwrap();
-        time::timeout(Duration::from_secs(3), self.accept).await.unwrap().unwrap();
+        time::timeout(Duration::from_secs(3), self.accept)
+            .await
+            .unwrap()
+            .unwrap();
         self.owner.close().await.unwrap();
     }
 }
@@ -214,18 +247,26 @@ impl FixtureFiles {
         let root = std::env::temp_dir().join(format!("swarm-prelaunch-{}", model::new_id()));
         fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        Self { release: root.join("release-adapter"), root }
+        Self {
+            release: root.join("release-adapter"),
+            root,
+        }
     }
 
     fn descriptor(&self, name: &str, blocked: bool) -> (PathBuf, ModuleDescriptor) {
         let directory = self.root.join("install").join(name);
         fs::create_dir_all(&directory).unwrap();
-        let executable = directory.join(if cfg!(windows) { "adapter.exe" } else { "adapter" });
+        let executable = directory.join(if cfg!(windows) {
+            "adapter.exe"
+        } else {
+            "adapter"
+        });
         fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         let executable_hash = model::digest(&fs::read(&executable).unwrap());
         let mut descriptor: Value = serde_json::from_str(include_str!(
             "../../../swarm-adapter-opencode/registration/descriptor.template.json"
-        )).unwrap();
+        ))
+        .unwrap();
         descriptor["module_id"] = json!(format!("fixture.prelaunch.{name}"));
         descriptor["artifact"] = json!({
             "artifact_id":format!("fixture.prelaunch.{name}.artifact"),
@@ -238,7 +279,9 @@ impl FixtureFiles {
         descriptor["workspace_option"] = Value::Null;
         descriptor["config_schema"] = if blocked {
             json!({"schema_id":"fixture.deliberately.unmapped", "version":"91", "sha256":"a".repeat(64)})
-        } else { Value::Null };
+        } else {
+            Value::Null
+        };
         descriptor["launch"]["executable"] = json!(executable);
         descriptor["launch"]["executable_sha256"] = json!(executable_hash);
         descriptor["launch"]["argv"] = json!([
@@ -256,15 +299,20 @@ impl FixtureFiles {
         let descriptor_file = directory.join("module-descriptor.json");
         let bytes = serde_json::to_vec(&descriptor).unwrap();
         fs::write(&descriptor_file, &bytes).unwrap();
-        fs::write(directory.join("install-receipt.json"), serde_json::to_vec(&json!({
-            "schema_version":1, "format":"eliot.module_install_receipt.v1",
-            "module_id":typed.module_id, "artifact_id":typed.artifact.artifact_id,
-            "version":typed.artifact.version, "build_id":typed.artifact.build_id,
-            "source_file":std::env::current_exe().unwrap(), "installed_file":executable,
-            "source_sha256":executable_hash, "staged_sha256":executable_hash,
-            "installed_sha256":executable_hash, "descriptor_file":descriptor_file,
-            "descriptor_sha256":model::digest(&bytes),
-        })).unwrap()).unwrap();
+        fs::write(
+            directory.join("install-receipt.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":1, "format":"eliot.module_install_receipt.v1",
+                "module_id":typed.module_id, "artifact_id":typed.artifact.artifact_id,
+                "version":typed.artifact.version, "build_id":typed.artifact.build_id,
+                "source_file":std::env::current_exe().unwrap(), "installed_file":executable,
+                "source_sha256":executable_hash, "staged_sha256":executable_hash,
+                "installed_sha256":executable_hash, "descriptor_file":descriptor_file,
+                "descriptor_sha256":model::digest(&bytes),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         (descriptor_file, typed)
     }
 }
@@ -284,30 +332,43 @@ fn route(name: &str) -> crate::config::Route {
         "alias":name, "runtime":"module", "enabled":true,
         "module_artifact_id":format!("fixture.prelaunch.{name}.artifact"),
         "native_options":{"private_fixture_option":CONFIG_CANARY},
-    })).unwrap()
+    }))
+    .unwrap()
 }
 
 async fn operation_snapshot(store: &Store) -> Value {
-    store.run_fixture(|db| {
-        let mut statement = db.prepare("SELECT operation_id FROM operations ORDER BY operation_id")?;
-        let ids = statement.query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        let rows = ids.iter().map(|id| operations::get_operation(db, id))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(json!(rows))
-    }).await.unwrap()
+    store
+        .run_fixture(|db| {
+            let mut statement =
+                db.prepare("SELECT operation_id FROM operations ORDER BY operation_id")?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let rows = ids
+                .iter()
+                .map(|id| operations::get_operation(db, id))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(json!(rows))
+        })
+        .await
+        .unwrap()
 }
 
 async fn observation_count(store: &Store, binding: &str, kind: &str) -> i64 {
     let binding = binding.to_owned();
     let kind = kind.to_owned();
-    store.run_fixture(move |db| {
-        db.query_row(
-            "SELECT count(*) FROM observations WHERE binding_id=?1 AND kind=?2",
-            params![binding, kind], |row| row.get(0),
-        ).map_err(Into::into)
-    }).await.unwrap()
+    store
+        .run_fixture(move |db| {
+            db.query_row(
+                "SELECT count(*) FROM observations WHERE binding_id=?1 AND kind=?2",
+                params![binding, kind],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap()
 }
 
 #[test]
@@ -318,7 +379,10 @@ fn prelaunch_adapter_child() {
     fs::write(marker, b"actual adapter child entered").unwrap();
     let deadline = std::time::Instant::now() + BOUND;
     while !release.exists() {
-        assert!(std::time::Instant::now() < deadline, "fixture child release deadline");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture child release deadline"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -327,44 +391,81 @@ fn prelaunch_adapter_child() {
 async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() {
     let helper = std::env::var_os("ELIOT_PRELAUNCH_TEST_OWNER_HELPER")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_exe().unwrap().with_file_name(
-            if cfg!(windows) { "swarm-module-owner.exe" } else { "swarm-module-owner" },
-        ));
-    assert!(helper.is_absolute() && helper.is_file(),
-        "stage the same-source swarm-module-owner beside the lib test executable, or set ELIOT_PRELAUNCH_TEST_OWNER_HELPER to its absolute path");
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .with_file_name(if cfg!(windows) {
+                    "swarm-module-owner.exe"
+                } else {
+                    "swarm-module-owner"
+                })
+        });
+    assert!(
+        helper.is_absolute() && helper.is_file(),
+        "stage the same-source swarm-module-owner beside the lib test executable, or set ELIOT_PRELAUNCH_TEST_OWNER_HELPER to its absolute path"
+    );
     let helper = helper.canonicalize().unwrap();
     let helper_hash = Sha256Digest::new(model::digest(&fs::read(&helper).unwrap())).unwrap();
     let files = FixtureFiles::new();
     let (blocked_file, blocked_descriptor) = files.descriptor("blocked", true);
     let (compatible_file, compatible_descriptor) = files.descriptor("compatible", false);
-    let connected = ConnectedStore::start(&files.root.join("store"),
-        vec![route("blocked"), route("compatible")]).await;
+    let connected = ConnectedStore::start(
+        &files.root.join("store"),
+        vec![route("blocked"), route("compatible")],
+    )
+    .await;
     let actor = model::new_id();
-    connected.owner.store.admit_module_supervisor_actor(&actor).await.unwrap();
-    let supervisor = Arc::new(StandaloneSupervisor::start_from_bootstrap(SupervisorBootstrap {
-        actor_instance_id: Some(actor.clone()),
-        config: StandaloneSupervisorConfig {
-            schema_version:1, root:connected.config.storage.data_dir.clone(),
-            ipc:connected.config.ipc.clone(),
-            supervisor_credential:connected.owner.module_supervisor_credential(),
-            install_root:files.root.join("install"),
-            descriptor_files:vec![blocked_file, compatible_file],
-            state_root:files.root.join("supervisor-state"),
-            resolver_root:files.root.join("resolver"), owner_helper:helper,
-            owner_helper_sha256:helper_hash, protected_files:BTreeMap::new(),
-            launch_configs:BTreeMap::new(),
-            route_config_mapper:StandaloneRouteConfigMapper::DescriptorSchema,
-        },
-    }).await.unwrap());
-    let manager = Credential { client_id:"prelaunch-manager".into(),
-        token:format!("{}{}", model::new_id(), model::new_id()) };
-    connected.call(&connected.operator, "client.register", json!({
-        "client_request_id":model::new_id(), "client_id":manager.client_id,
-        "role":"manager", "token_hash":model::digest(manager.token.as_bytes()),
-    })).await;
-    connected.call(&connected.operator, "host.mode", json!({
-        "client_request_id":model::new_id(), "new_work":"enabled",
-    })).await;
+    connected
+        .owner
+        .store
+        .admit_module_supervisor_actor(&actor)
+        .await
+        .unwrap();
+    let supervisor = Arc::new(
+        StandaloneSupervisor::start_from_bootstrap(SupervisorBootstrap {
+            actor_instance_id: Some(actor.clone()),
+            config: StandaloneSupervisorConfig {
+                schema_version: 1,
+                root: connected.config.storage.data_dir.clone(),
+                ipc: connected.config.ipc.clone(),
+                supervisor_credential: connected.owner.module_supervisor_credential(),
+                install_root: files.root.join("install"),
+                descriptor_files: vec![blocked_file, compatible_file],
+                state_root: files.root.join("supervisor-state"),
+                resolver_root: files.root.join("resolver"),
+                owner_helper: helper,
+                owner_helper_sha256: helper_hash,
+                protected_files: BTreeMap::new(),
+                launch_configs: BTreeMap::new(),
+                route_config_mapper: StandaloneRouteConfigMapper::DescriptorSchema,
+            },
+        })
+        .await
+        .unwrap(),
+    );
+    let manager = Credential {
+        client_id: "prelaunch-manager".into(),
+        token: format!("{}{}", model::new_id(), model::new_id()),
+    };
+    connected
+        .call(
+            &connected.operator,
+            "client.register",
+            json!({
+                "client_request_id":model::new_id(), "client_id":manager.client_id,
+                "role":"manager", "token_hash":model::digest(manager.token.as_bytes()),
+            }),
+        )
+        .await;
+    connected
+        .call(
+            &connected.operator,
+            "host.mode",
+            json!({
+                "client_request_id":model::new_id(), "new_work":"enabled",
+            }),
+        )
+        .await;
     let blocked = connected.open(&manager, "blocked").await;
     let held = connected.open(&manager, "blocked").await;
     let compatible = connected.open(&manager, "compatible").await;
@@ -377,53 +478,96 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
     // wrong module/artifact for the held binding. Store itself retains the
     // permanent rejection and quarantine before the genuine producer runs.
     let foreign = ModuleSupervisorObservation {
-        schema_version:1, actor_instance_id:actor.clone(),
-        event_id:format!("{actor}:9000"), sequence:9000,
-        module_id:compatible_descriptor.module_id.to_string(),
-        artifact_id:compatible_descriptor.artifact.artifact_id.to_string(),
-        artifact_version:compatible_descriptor.artifact.version.to_string(), build_id:None,
-        scope:ServiceScope { binding_id:held_id.clone(), generation:1 }, boot_id:None,
-        phase:ModuleSupervisorPhase::Isolated, effect_certainty:ModuleEffectCertainty::Unknown,
-        stage:Some(ModuleFailureStage::ValidateLaunch), error_code:Some(UNSUPPORTED.into()),
-        unknown_operation_ids:Vec::new(), unknown_operation_count:0,
-        unknown_operation_ids_truncated:false,
+        schema_version: 1,
+        actor_instance_id: actor.clone(),
+        event_id: format!("{actor}:9000"),
+        sequence: 9000,
+        module_id: compatible_descriptor.module_id.to_string(),
+        artifact_id: compatible_descriptor.artifact.artifact_id.to_string(),
+        artifact_version: compatible_descriptor.artifact.version.to_string(),
+        build_id: None,
+        scope: ServiceScope {
+            binding_id: held_id.clone(),
+            generation: 1,
+        },
+        boot_id: None,
+        phase: ModuleSupervisorPhase::Isolated,
+        effect_certainty: ModuleEffectCertainty::Unknown,
+        stage: Some(ModuleFailureStage::ValidateLaunch),
+        error_code: Some(UNSUPPORTED.into()),
+        unknown_operation_ids: Vec::new(),
+        unknown_operation_count: 0,
+        unknown_operation_ids_truncated: false,
     };
     let control = connected.control();
-    assert_eq!(control.record_observation(&foreign).await,
+    assert_eq!(
+        control.record_observation(&foreign).await,
         ObservationDeliveryDisposition::ScopedPermanentRejection {
-            error_code:"MODULE_OBSERVATION_IDENTITY_MISMATCH".into(),
-        });
-    assert_eq!(observation_count(&connected.owner.store, &held_id,
-        "module.supervisor_observation_rejected").await, 1);
+            error_code: "MODULE_OBSERVATION_IDENTITY_MISMATCH".into(),
+        }
+    );
+    assert_eq!(
+        observation_count(
+            &connected.owner.store,
+            &held_id,
+            "module.supervisor_observation_rejected"
+        )
+        .await,
+        1
+    );
 
     // Retained uncertainty is synthetic fixture input, never an inferred
     // native outcome. All three real unresolved states must survive; neither
     // queued opening nor terminal work belongs in unknown_operation_ids.
     let seed_binding = blocked_id.clone();
-    connected.owner.store.run_fixture(move |db| {
-        for (id, state) in [("unknown-sending", "sending"),
-            ("unknown-native", "native_accepted"), ("unknown-outcome", "outcome_unknown"),
-            ("terminal-settled", "settled")] {
-            db.execute(
-                "INSERT INTO operations(operation_id,caller_id,client_request_id,method,\
+    connected
+        .owner
+        .store
+        .run_fixture(move |db| {
+            for (id, state) in [
+                ("unknown-sending", "sending"),
+                ("unknown-native", "native_accepted"),
+                ("unknown-outcome", "outcome_unknown"),
+                ("terminal-settled", "settled"),
+            ] {
+                db.execute(
+                    "INSERT INTO operations(operation_id,caller_id,client_request_id,method,\
                     original_request_json,effective_request_json,binding_id,binding_generation,\
                     state,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) \
                  VALUES(?1,'prelaunch-manager',?1,'agent.send',\
                     '{\"delivery\":\"next_turn\"}','{}',?2,1,?3,?4,1,?5,1,1)",
-                params![id, seed_binding, state, (state == "settled").then_some("{}"),
-                    (state == "settled").then_some(2_i64)],
-            )?;
-        }
-        Ok(())
-    }).await.unwrap();
+                    params![
+                        id,
+                        seed_binding,
+                        state,
+                        (state == "settled").then_some("{}"),
+                        (state == "settled").then_some(2_i64)
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     let before = operation_snapshot(&connected.owner.store).await;
-    let unknown_before = serde_json::to_value(control.scope_readback(
-        blocked_descriptor.module_id.as_str(), &blocked_id, 1,
-    ).await.unwrap()).unwrap();
+    let unknown_before = serde_json::to_value(
+        control
+            .scope_readback(blocked_descriptor.module_id.as_str(), &blocked_id, 1)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(unknown_before["operations"].as_array().unwrap().len(), 3);
     let page = control.demand_page(None).await.unwrap();
-    assert!(page.blocked.is_empty(), "the mapper, not Store demand admission, must fail");
-    assert!(page.demands.iter().any(|demand| demand.binding_id == compatible_id));
+    assert!(
+        page.blocked.is_empty(),
+        "the mapper, not Store demand admission, must fail"
+    );
+    assert!(
+        page.demands
+            .iter()
+            .any(|demand| demand.binding_id == compatible_id)
+    );
     {
         let mut trace = connected.trace.lock().unwrap();
         trace.demand_pages = 0;
@@ -440,126 +584,272 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
                 return Err("supervisor stopped before scoped recovery/progress");
             }
             if acknowledged_at.is_some()
-                && !matches!(supervisor.registry().admission_state(), AdmissionState::Open) {
+                && !matches!(
+                    supervisor.registry().admission_state(),
+                    AdmissionState::Open
+                )
+            {
                 return Err("a scoped rejection closed global admission");
             }
             let (pages, acknowledged, rejected) = {
                 let trace = connected.trace.lock().unwrap();
-                (trace.demand_pages,
-                    trace.deliveries_for(&blocked_id).iter()
+                (
+                    trace.demand_pages,
+                    trace
+                        .deliveries_for(&blocked_id)
+                        .iter()
                         .any(|item| item.reply["disposition"] == "exact_duplicate"),
-                    trace.deliveries_for(&held_id).iter()
-                        .any(|item| item.reply["disposition"] == "scoped_permanent_rejection"))
+                    trace
+                        .deliveries_for(&held_id)
+                        .iter()
+                        .any(|item| item.reply["disposition"] == "scoped_permanent_rejection"),
+                )
             };
             if acknowledged && acknowledged_at.is_none() {
                 acknowledged_at = Some(pages);
             }
-            if acknowledged_at.is_some_and(|at| pages >= at + 2) && rejected
-                && files.root.join("compatible-adapter-started").is_file() {
+            if acknowledged_at.is_some_and(|at| pages >= at + 2)
+                && rejected
+                && files.root.join("compatible-adapter-started").is_file()
+            {
                 return Ok(());
             }
             time::sleep(Duration::from_millis(25)).await;
         }
-    }).await;
+    })
+    .await;
     // Stop first so assertion failures cannot leave the reconciliation loop
     // manufacturing further evidence while the test unwinds.
     let _ = stop.send(true);
     fs::write(&files.release, b"release").unwrap();
-    time::timeout(Duration::from_secs(3), &mut runner).await.unwrap().unwrap().unwrap();
+    time::timeout(Duration::from_secs(3), &mut runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     progress.expect("no connected duplicate ACK, scoped rejection, stable passes or compatible adapter start within the bound")
         .expect("scoped observation delivery disrupted the supervisor");
 
     let deliveries = connected.trace.lock().unwrap().deliveries_for(&blocked_id);
-    assert_eq!(deliveries.len(), 2, "stable preparation failure must not create new event IDs");
+    assert_eq!(
+        deliveries.len(),
+        2,
+        "stable preparation failure must not create new event IDs"
+    );
     assert!(deliveries[0].withheld);
     assert_eq!(deliveries[0].reply, json!({"disposition":"committed"}));
     assert!(!deliveries[1].withheld);
-    assert_eq!(deliveries[1].reply, json!({"disposition":"exact_duplicate"}));
-    assert_eq!(deliveries[0].observation, deliveries[1].observation,
-        "lost completion reply must resend the exact retained callback");
+    assert_eq!(
+        deliveries[1].reply,
+        json!({"disposition":"exact_duplicate"})
+    );
+    assert_eq!(
+        deliveries[0].observation, deliveries[1].observation,
+        "lost completion reply must resend the exact retained callback"
+    );
     let observation = &deliveries[0].observation;
     assert_eq!(observation["boot_id"], Value::Null);
     assert_eq!(observation["phase"], "isolated");
     assert_eq!(observation["effect_certainty"], "unknown");
     assert_eq!(observation["stage"], "validate_launch");
     assert_eq!(observation["error_code"], UNSUPPORTED);
-    assert_eq!(observation["unknown_operation_ids"],
-        json!(["unknown-native", "unknown-outcome", "unknown-sending"]));
+    assert_eq!(
+        observation["unknown_operation_ids"],
+        json!(["unknown-native", "unknown-outcome", "unknown-sending"])
+    );
     assert_eq!(observation["unknown_operation_count"], 3);
     assert_eq!(observation["unknown_operation_ids_truncated"], false);
     let held_deliveries = connected.trace.lock().unwrap().deliveries_for(&held_id);
-    assert_eq!(held_deliveries.len(), 1, "permanent ACK must remain scoped and stop callback retries");
-    assert_eq!(held_deliveries[0].reply["error_code"], "MODULE_OBSERVATION_SCOPE_QUARANTINED");
+    assert_eq!(
+        held_deliveries.len(),
+        1,
+        "permanent ACK must remain scoped and stop callback retries"
+    );
+    assert_eq!(
+        held_deliveries[0].reply["error_code"],
+        "MODULE_OBSERVATION_SCOPE_QUARANTINED"
+    );
     assert_eq!(held_deliveries[0].reply["retained"], true);
     for binding in [&blocked_id, &held_id] {
-        assert_eq!(connected.trace.lock().unwrap().credential_calls.get(binding), None);
-        assert!(supervisor.registry().status(blocked_descriptor.module_id.as_str(),
-            &ServiceScope { binding_id:binding.clone(), generation:1 }).await.is_none());
+        assert_eq!(
+            connected
+                .trace
+                .lock()
+                .unwrap()
+                .credential_calls
+                .get(binding),
+            None
+        );
+        assert!(
+            supervisor
+                .registry()
+                .status(
+                    blocked_descriptor.module_id.as_str(),
+                    &ServiceScope {
+                        binding_id: binding.clone(),
+                        generation: 1
+                    }
+                )
+                .await
+                .is_none()
+        );
     }
     assert!(!files.root.join("blocked-adapter-started").exists());
-    let blocked_state = files.root.join("supervisor-state")
-        .join(model::digest(blocked_descriptor.module_id.as_str().as_bytes()));
-    assert!(!blocked_state.exists(), "no blocked owner plan, helper launch or worker receipt");
-    assert!(connected.trace.lock().unwrap().credential_calls
-        .get(&compatible_id).is_some_and(|count| *count >= 2));
+    let blocked_state = files.root.join("supervisor-state").join(model::digest(
+        blocked_descriptor.module_id.as_str().as_bytes(),
+    ));
+    assert!(
+        !blocked_state.exists(),
+        "no blocked owner plan, helper launch or worker receipt"
+    );
+    assert!(
+        connected
+            .trace
+            .lock()
+            .unwrap()
+            .credential_calls
+            .get(&compatible_id)
+            .is_some_and(|count| *count >= 2)
+    );
     assert_eq!(operation_snapshot(&connected.owner.store).await, before);
-    assert_eq!(serde_json::to_value(control.scope_readback(
-        blocked_descriptor.module_id.as_str(), &blocked_id, 1,
-    ).await.unwrap()).unwrap(), unknown_before);
-    assert_eq!(observation_count(&connected.owner.store, &blocked_id,
-        "module.supervisor_observation").await, 1);
-    assert_eq!(observation_count(&connected.owner.store, &held_id,
-        "module.supervisor_observation").await, 0);
-    assert_eq!(observation_count(&connected.owner.store, &held_id,
-        "module.supervisor_observation_rejected").await, 2);
+    assert_eq!(
+        serde_json::to_value(
+            control
+                .scope_readback(blocked_descriptor.module_id.as_str(), &blocked_id, 1,)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        unknown_before
+    );
+    assert_eq!(
+        observation_count(
+            &connected.owner.store,
+            &blocked_id,
+            "module.supervisor_observation"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        observation_count(
+            &connected.owner.store,
+            &held_id,
+            "module.supervisor_observation"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        observation_count(
+            &connected.owner.store,
+            &held_id,
+            "module.supervisor_observation_rejected"
+        )
+        .await,
+        2
+    );
 
-    let state = connected.call(&manager, "agent.state", json!({
-        "binding_id":blocked_id, "generation":1,
-    })).await;
+    let state = connected
+        .call(
+            &manager,
+            "agent.state",
+            json!({
+                "binding_id":blocked_id, "generation":1,
+            }),
+        )
+        .await;
     assert_eq!(state["state"], "opening");
     let diagnostic = &state["observation"]["module_supervisor"];
-    for key in ["event_id", "module_id", "artifact_id", "artifact_version", "boot_id",
-        "phase", "effect_certainty", "stage", "error_code", "unknown_operation_ids",
-        "unknown_operation_count", "unknown_operation_ids_truncated"] {
+    for key in [
+        "event_id",
+        "module_id",
+        "artifact_id",
+        "artifact_version",
+        "boot_id",
+        "phase",
+        "effect_certainty",
+        "stage",
+        "error_code",
+        "unknown_operation_ids",
+        "unknown_operation_count",
+        "unknown_operation_ids_truncated",
+    ] {
         assert_eq!(diagnostic[key], observation[key], "agent.state field {key}");
     }
     assert_eq!(diagnostic["retry_authorized"], false);
-    let attention = connected.call(&manager, "report.attention", json!({"limit":100})).await;
-    let item = attention["items"].as_array().unwrap().iter().find(|item| {
-        item["kind"] == "module_supervisor_failure" && item["binding_id"] == blocked_id
-    }).expect("Manager attention must expose the blocked opening");
+    let attention = connected
+        .call(&manager, "report.attention", json!({"limit":100}))
+        .await;
+    let item = attention["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["kind"] == "module_supervisor_failure" && item["binding_id"] == blocked_id
+        })
+        .expect("Manager attention must expose the blocked opening");
     assert_eq!(item["address"]["error_code"], UNSUPPORTED);
     assert_eq!(item["address"]["stage"], "validate_launch");
     assert_eq!(item["address"]["retry_authorized"], false);
     assert_eq!(item["suggested_action"]["method"], "agent.state");
     for public in [&state, &attention, observation, &held_deliveries[0].reply] {
         let text = serde_json::to_string(public).unwrap();
-        for private in [CONFIG_CANARY, "native_options", "credential_file",
-            "the retained descriptor names a launch config schema with no supervisor mapper"] {
-            assert!(!text.contains(private), "private configuration/raw error escaped: {private}");
+        for private in [
+            CONFIG_CANARY,
+            "native_options",
+            "credential_file",
+            "the retained descriptor names a launch config schema with no supervisor mapper",
+        ] {
+            assert!(
+                !text.contains(private),
+                "private configuration/raw error escaped: {private}"
+            );
         }
     }
-    for bounded in [diagnostic, &item["address"], observation, &held_deliveries[0].reply] {
+    for bounded in [
+        diagnostic,
+        &item["address"],
+        observation,
+        &held_deliveries[0].reply,
+    ] {
         for raw in ["detail", "message", "error", "route_native_options"] {
             assert!(bounded.get(raw).is_none(), "raw error field escaped: {raw}");
         }
     }
-    assert!(matches!(control.admission().await.unwrap(), AdmissionState::Open));
+    assert!(matches!(
+        control.admission().await.unwrap(),
+        AdmissionState::Open
+    ));
     // Wait for actual helper-family retirement before closing Store/removing
     // the fixture root. Neither the marker nor direct child exit is proof.
     time::timeout(BOUND, async {
         loop {
-            if let Some(status) = supervisor.registry().status(
-                compatible_descriptor.module_id.as_str(),
-                &ServiceScope { binding_id:compatible_id.clone(), generation:1 },
-            ).await && matches!(status.lifecycle,
-                    LifecycleState::ProcessExited { exit_proven:true, .. }
-                    | LifecycleState::Completed { .. }) {
+            if let Some(status) = supervisor
+                .registry()
+                .status(
+                    compatible_descriptor.module_id.as_str(),
+                    &ServiceScope {
+                        binding_id: compatible_id.clone(),
+                        generation: 1,
+                    },
+                )
+                .await
+                && matches!(
+                    status.lifecycle,
+                    LifecycleState::ProcessExited {
+                        exit_proven: true,
+                        ..
+                    } | LifecycleState::Completed { .. }
+                )
+            {
                 break;
             }
             time::sleep(Duration::from_millis(25)).await;
         }
-    }).await.expect("actual compatible owner family did not retire");
+    })
+    .await
+    .expect("actual compatible owner family did not retire");
     drop(supervisor);
     connected.close().await;
     fs::remove_dir_all(&files.root).unwrap();

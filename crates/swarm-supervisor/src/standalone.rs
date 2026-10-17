@@ -2413,8 +2413,7 @@ mod prelaunch_observation_tests {
 
     #[test]
     fn prelaunch_readback_bound_preserves_count_and_rejects_foreign_scope() {
-        let (demand, mut readback) =
-            fixture(&["outcome_unknown"; MAX_PRELAUNCH_OPERATION_IDS + 1]);
+        let (demand, mut readback) = fixture(&["outcome_unknown"; MAX_PRELAUNCH_OPERATION_IDS + 1]);
         let status = prelaunch_failure_status(
             &demand,
             &readback,
@@ -2423,8 +2422,14 @@ mod prelaunch_observation_tests {
         )
         .unwrap();
         let event = ModuleSupervisorObservation::from_status(&status, ACTOR, 1).unwrap();
-        assert_eq!(event.unknown_operation_ids.len(), MAX_PRELAUNCH_OPERATION_IDS);
-        assert_eq!(event.unknown_operation_count, MAX_PRELAUNCH_OPERATION_IDS + 1);
+        assert_eq!(
+            event.unknown_operation_ids.len(),
+            MAX_PRELAUNCH_OPERATION_IDS
+        );
+        assert_eq!(
+            event.unknown_operation_count,
+            MAX_PRELAUNCH_OPERATION_IDS + 1
+        );
         assert!(event.unknown_operation_ids_truncated);
         assert!(status.readback_required);
 
