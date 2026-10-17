@@ -580,7 +580,7 @@ impl Drop for NativeWorkerRun {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerResultStatus {
-    Present,
+    Present { inner_tree_empty: bool },
     Missing,
     Malformed,
 }
@@ -588,10 +588,14 @@ enum WorkerResultStatus {
 impl WorkerResultStatus {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Present => "present",
+            Self::Present { .. } => "present",
             Self::Missing => "missing",
             Self::Malformed => "malformed",
         }
+    }
+
+    fn proves_inner_tree_empty(self) -> bool {
+        matches!(self, Self::Present { inner_tree_empty: true })
     }
 }
 
@@ -2634,10 +2638,159 @@ fn classify_worker_result(
         && (result["stderr_bytes"].is_null() || result["stderr_bytes"].is_u64())
         && (result["push_exit_code"].is_null() || result["push_exit_code"].is_i64());
     if result_matches {
-        Ok(WorkerResultStatus::Present)
+        // The full immutable, scope-matching result is required. Merely
+        // having Boolean custody fields does not prove inner Git cleanup.
+        Ok(WorkerResultStatus::Present {
+            inner_tree_empty: result["process_tree_empty"] == true
+                && result["process_tree_unconfirmed"] == false,
+        })
     } else {
         Ok(WorkerResultStatus::Malformed)
     }
+}
+
+fn worker_recovery_has_tree_hold(operation: &Value) -> bool {
+    // Missing legacy metadata is different from malformed retained metadata;
+    // only explicit false can negate a flag that is present.
+    operation["result"]
+        .get("process_tree_unconfirmed")
+        .is_some_and(|value| !matches!(value, Value::Bool(false)))
+}
+
+fn worker_recovery_ready_result(
+    operation: &Value,
+    receipt: &Value,
+    result_status: WorkerResultStatus,
+    now: i64,
+) -> Result<Value> {
+    if !matches!(
+        operation["state"].as_str(),
+        Some("sending" | "outcome_unknown")
+    ) || model::canonical(&operation["result"]["native_worker"])?
+        != model::canonical(receipt)?
+    {
+        return Err(Error::new(
+            "FORGE_WORKER_RECEIPT_CHANGED",
+            "the retained worker receipt changed during recovery",
+        ));
+    }
+    if (worker_recovery_has_tree_hold(operation)
+        || matches!(result_status, WorkerResultStatus::Present { inner_tree_empty: false }))
+        && !result_status.proves_inner_tree_empty()
+    {
+        // Outer worker departure is a separate fact. A missing/malformed
+        // result or an explicitly unconfirmed inner Git tree cannot release
+        // its prior repository hold, even if remote readback would match.
+        return Err(Error::new(
+            "FORGE_GIT_TREE_TERMINATION",
+            "retained worker result does not prove matching inner process-tree cleanup",
+        ));
+    }
+    let mut result = operation["result"].clone();
+    result["native_worker_recovery"] = json!({
+        "schema_version":1,
+        "status":"readback_permitted",
+        "job_id":receipt["job_id"],
+        "plan_sha256":receipt["plan_sha256"],
+        "process_family":"departed_empty",
+        "worker_result":result_status.as_str(),
+        "recorded_at_ms":now
+    });
+    result["process_tree_unconfirmed"] = json!(false);
+    result["process_tree_status"] = json!("departed_empty");
+    if result["reason"] == "process_tree_unconfirmed" {
+        result["reason"] = json!("exact_remote_readback_required");
+    }
+    if result["publication"] == "operator_intervention_required" {
+        result["publication"] = json!("requires_readback");
+    }
+    if let Some(fields) = result.as_object_mut() {
+        fields.remove("process_tree_cleanup");
+        fields.remove("resolution");
+    }
+    match receipt["kind"].as_str() {
+        Some("forge_publish") => {
+            result["publication_may_have_started"] = json!(true);
+        }
+        Some("github_pr_description") => {
+            result["write_attempted"] = json!(true);
+            result["readback"] = json!("unknown");
+        }
+        _ => return Err(worker_plan_scope_error()),
+    }
+    Ok(result)
+}
+
+fn worker_recovery_block_result(
+    operation: &Value,
+    error_code: &str,
+    now: i64,
+) -> Result<Value> {
+    let process_family_departed = matches!(
+        error_code,
+        "FORGE_WORKER_PLAN_SCOPE_MISMATCH"
+            | "FORGE_WORKER_RESULT_SCOPE_MISMATCH"
+            | "FORGE_WORKER_EVIDENCE_UNAVAILABLE"
+            | "FORGE_WORKER_EVIDENCE_INVALID"
+    );
+    let tree_unconfirmed = worker_recovery_has_tree_hold(operation)
+        || !process_family_departed;
+    let reason_code = match error_code {
+        "FORGE_WORKER_PLAN_SCOPE_MISMATCH" => "worker_plan_scope_mismatch",
+        "FORGE_WORKER_RESULT_SCOPE_MISMATCH" => "worker_result_scope_mismatch",
+        "FORGE_WORKER_RECEIPT_CHANGED" => "worker_receipt_changed",
+        "FORGE_WORKER_EVIDENCE_UNAVAILABLE" => "worker_evidence_unavailable",
+        "FORGE_WORKER_EVIDENCE_INVALID" => "worker_evidence_invalid",
+        "FORGE_GIT_TREE_TERMINATION" => "owner_or_process_family_unconfirmed",
+        _ => "recovery_evidence_unavailable",
+    };
+    if !matches!(
+        operation["method"].as_str(),
+        Some("forge.publish_ref" | "github.pull_request.update_description")
+    ) || !matches!(
+        operation["state"].as_str(),
+        Some("sending" | "outcome_unknown")
+    ) {
+        return Err(Error::conflict(
+            "the retained native worker Operation is no longer recovery-blocked",
+        ));
+    }
+    let mut result = operation["result"].clone();
+    result["native_worker_recovery"] = json!({
+        "schema_version":1,
+        "status":"blocked",
+        "reason_code":reason_code,
+        "process_family":if process_family_departed { "departed_empty" } else { "unconfirmed" },
+        "retryable":!process_family_departed || reason_code == "worker_evidence_unavailable",
+        "recorded_at_ms":now
+    });
+    result["outcome"] = json!("unknown");
+    result["reason"] = json!("native_worker_recovery_blocked");
+    result["current_state_read_method"] = json!("operation.get");
+    result["process_tree_unconfirmed"] = json!(tree_unconfirmed);
+    result["process_tree_status"] = json!(if tree_unconfirmed {
+        "unconfirmed"
+    } else {
+        "departed_empty"
+    });
+    if tree_unconfirmed {
+        result["process_tree_cleanup"] = operation["result"]
+            .get("process_tree_cleanup")
+            .cloned()
+            .unwrap_or_else(|| json!("native_worker_recovery_blocked"));
+        result["resolution"] = json!("manual_operator_intervention_required");
+    } else if let Some(fields) = result.as_object_mut() {
+        fields.remove("process_tree_cleanup");
+        fields.remove("resolution");
+    }
+    if operation["method"] == "forge.publish_ref" {
+        result["publication_may_have_started"] = json!(true);
+        result["publication"] = json!("operator_intervention_required");
+    } else {
+        result["write_attempted"] = json!(true);
+        result["readback"] = json!("unknown");
+    }
+    Ok(result)
 }
 
 fn worker_plan_scope_error() -> Error {
@@ -3446,6 +3599,10 @@ fn intent_attempt_task(db: &Connection, intent: &PublicationIntent) -> Result<St
 #[cfg(all(test, windows))]
 #[path = "forge_custody_tests.rs"]
 mod forge_custody_tests;
+
+#[cfg(test)]
+#[path = "forge_inner_recovery_tests.rs"]
+mod forge_inner_recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5667,49 +5824,7 @@ impl super::Store {
             let now = model::now_ms()?;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let operation = operations::get_operation(&tx, &operation_id)?;
-            if !matches!(
-                operation["state"].as_str(),
-                Some("sending" | "outcome_unknown")
-            ) || model::canonical(&operation["result"]["native_worker"])?
-                != model::canonical(&receipt)?
-            {
-                return Err(Error::new(
-                    "FORGE_WORKER_RECEIPT_CHANGED",
-                    "the retained worker receipt changed during recovery",
-                ));
-            }
-            let mut result = operation["result"].clone();
-            result["native_worker_recovery"] = json!({
-                "schema_version":1,
-                "status":"readback_permitted",
-                "job_id":receipt["job_id"],
-                "plan_sha256":receipt["plan_sha256"],
-                "process_family":"departed_empty",
-                "worker_result":result_status.as_str(),
-                "recorded_at_ms":now
-            });
-            result["process_tree_unconfirmed"] = json!(false);
-            result["process_tree_status"] = json!("departed_empty");
-            if result["reason"] == "process_tree_unconfirmed" {
-                result["reason"] = json!("exact_remote_readback_required");
-            }
-            if result["publication"] == "operator_intervention_required" {
-                result["publication"] = json!("requires_readback");
-            }
-            if let Some(fields) = result.as_object_mut() {
-                fields.remove("process_tree_cleanup");
-                fields.remove("resolution");
-            }
-            match receipt["kind"].as_str() {
-                Some("forge_publish") => {
-                    result["publication_may_have_started"] = json!(true);
-                }
-                Some("github_pr_description") => {
-                    result["write_attempted"] = json!(true);
-                    result["readback"] = json!("unknown");
-                }
-                _ => return Err(worker_plan_scope_error()),
-            }
+            let result = worker_recovery_ready_result(&operation, &receipt, result_status, now)?;
             let changed = tx.execute(
                 "UPDATE operations SET result_json=?2,updated_at_ms=?3 WHERE operation_id=?1 AND state IN ('sending','outcome_unknown')",
                 params![operation_id, model::canonical(&result)?, now],
@@ -5731,70 +5846,12 @@ impl super::Store {
         error: &Error,
     ) -> Result<()> {
         let operation_id = operation_id.to_owned();
-        let process_family_departed = matches!(
-            error.code.as_str(),
-            "FORGE_WORKER_PLAN_SCOPE_MISMATCH"
-                | "FORGE_WORKER_RESULT_SCOPE_MISMATCH"
-                | "FORGE_WORKER_EVIDENCE_UNAVAILABLE"
-                | "FORGE_WORKER_EVIDENCE_INVALID"
-        );
-        let tree_unconfirmed = !process_family_departed;
-        let reason_code = match error.code.as_str() {
-            "FORGE_WORKER_PLAN_SCOPE_MISMATCH" => "worker_plan_scope_mismatch",
-            "FORGE_WORKER_RESULT_SCOPE_MISMATCH" => "worker_result_scope_mismatch",
-            "FORGE_WORKER_RECEIPT_CHANGED" => "worker_receipt_changed",
-            "FORGE_WORKER_EVIDENCE_UNAVAILABLE" => "worker_evidence_unavailable",
-            "FORGE_WORKER_EVIDENCE_INVALID" => "worker_evidence_invalid",
-            "FORGE_GIT_TREE_TERMINATION" => "owner_or_process_family_unconfirmed",
-            _ => "recovery_evidence_unavailable",
-        };
+        let error_code = error.code.clone();
         self.run(move |db| {
             let now = model::now_ms()?;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let operation = operations::get_operation(&tx, &operation_id)?;
-            if !matches!(
-                operation["method"].as_str(),
-                Some("forge.publish_ref" | "github.pull_request.update_description")
-            ) || !matches!(
-                operation["state"].as_str(),
-                Some("sending" | "outcome_unknown")
-            ) {
-                return Err(Error::conflict(
-                    "the retained native worker Operation is no longer recovery-blocked",
-                ));
-            }
-            let mut result = operation["result"].clone();
-            result["native_worker_recovery"] = json!({
-                "schema_version":1,
-                "status":"blocked",
-                "reason_code":reason_code,
-                "process_family":if tree_unconfirmed { "unconfirmed" } else { "departed_empty" },
-                "retryable":tree_unconfirmed || reason_code == "worker_evidence_unavailable",
-                "recorded_at_ms":now
-            });
-            result["outcome"] = json!("unknown");
-            result["reason"] = json!("native_worker_recovery_blocked");
-            result["current_state_read_method"] = json!("operation.get");
-            result["process_tree_unconfirmed"] = json!(tree_unconfirmed);
-            result["process_tree_status"] = json!(if tree_unconfirmed {
-                "unconfirmed"
-            } else {
-                "departed_empty"
-            });
-            if tree_unconfirmed {
-                result["process_tree_cleanup"] = json!("native_worker_recovery_blocked");
-                result["resolution"] = json!("manual_operator_intervention_required");
-            } else if let Some(fields) = result.as_object_mut() {
-                fields.remove("process_tree_cleanup");
-                fields.remove("resolution");
-            }
-            if operation["method"] == "forge.publish_ref" {
-                result["publication_may_have_started"] = json!(true);
-                result["publication"] = json!("operator_intervention_required");
-            } else {
-                result["write_attempted"] = json!(true);
-                result["readback"] = json!("unknown");
-            }
+            let result = worker_recovery_block_result(&operation, &error_code, now)?;
             let changed = tx.execute(
                 "UPDATE operations SET state=?2,result_json=?3,settled_at_ms=NULL,updated_at_ms=?4 WHERE operation_id=?1 AND state IN ('sending','outcome_unknown')",
                 params![operation_id, "outcome_unknown", model::canonical(&result)?, now],
