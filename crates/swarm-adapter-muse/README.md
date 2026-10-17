@@ -53,5 +53,5 @@ Structured subagent results use explicitly versioned
 `rust_muse_result_json_v1` bytes, preserving native JSON integer values. This is
 not a relabelling of historical Node canonical bytes or a migration of their
 bindings. Message UTF-8 and native stored-output digest semantics are retained.
-The twelve local reader fixtures do not qualify installed Muse or host result
+The thirteen local reader fixtures do not qualify installed Muse or host result
 delivery; facade/journal integration remains required.

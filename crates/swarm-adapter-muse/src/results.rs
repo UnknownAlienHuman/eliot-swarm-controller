@@ -254,6 +254,16 @@ fn native_error(failure: RequestError) -> ResultReadError {
     result
 }
 
+fn validate_native_read(method: &str, value: &Value) -> Result<(), ResultReadError> {
+    let definition = match method {
+        "view/page" => "ViewPageResult",
+        "item/readOutput" => "ItemReadOutputResult",
+        _ => return Err(error("INVALID_NATIVE_RESULT_REQUEST")),
+    };
+    crate::schema::validate_definition(definition, value)
+        .map_err(|_| error("INVALID_NATIVE_RESULT_SCHEMA"))
+}
+
 /// The authorization predicate must bind CURRENT principal rights, artifact,
 /// binding generation, native namespace/family and any caller-supplied cursor.
 /// It is rechecked around native reads and before returning bytes.
@@ -280,11 +290,13 @@ pub async fn read_result(
                 .await
                 .map_err(|_| error("NATIVE_RESULT_READ_UNAVAILABLE"))?
                 .map_err(|_| error("NATIVE_RESULT_READ_UNAVAILABLE"))?;
-            pending
+            let value = pending
                 .response
                 .await
                 .map_err(|_| error("NATIVE_RESULT_READ_UNAVAILABLE"))?
-                .map_err(native_error)
+                .map_err(native_error)?;
+            validate_native_read(method, &value)?;
+            Ok(value)
         },
         allowed,
     )
@@ -574,6 +586,32 @@ mod tests {
         )
         .await;
         (result, calls)
+    }
+
+    #[test]
+    fn result_native_wire_uses_complete_pinned_schema_before_codec() {
+        assert!(validate_native_read("view/page", &view(vec![], Value::Null)).is_ok());
+        assert_eq!(
+            validate_native_read("view/page", &json!({"events":[],"nextCursor":17}))
+                .unwrap_err()
+                .code,
+            "INVALID_NATIVE_RESULT_SCHEMA"
+        );
+        let mut page = output_page("YWJj");
+        assert!(validate_native_read("item/readOutput", &page).is_ok());
+        page["encoding"] = json!("invented");
+        assert_eq!(
+            validate_native_read("item/readOutput", &page)
+                .unwrap_err()
+                .code,
+            "INVALID_NATIVE_RESULT_SCHEMA"
+        );
+        assert_eq!(
+            validate_native_read("subagent/readResult", &json!({}))
+                .unwrap_err()
+                .code,
+            "INVALID_NATIVE_RESULT_REQUEST"
+        );
     }
 
     #[test]
