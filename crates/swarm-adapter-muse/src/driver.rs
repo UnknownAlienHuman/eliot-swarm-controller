@@ -24,7 +24,7 @@ use jsonrpsee_core::server::RpcModule;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -103,6 +103,7 @@ struct State {
     restored: bool,
     workspace: Option<std::path::PathBuf>,
     transport: Option<Arc<MspTransport>>,
+    transport_ended: bool,
     start_attempted: bool,
     initialized: bool,
     ready: bool,
@@ -121,6 +122,7 @@ struct State {
     task_turns: BTreeMap<String, TaskTurn>,
     items: BTreeMap<String, ItemIdentity>,
     stream_sequences: BTreeMap<String, u64>,
+    prefix_loss: BTreeSet<String>,
     discovery_cursor: Option<String>,
     discovery_truncated: bool,
     dirty: u64,
@@ -137,6 +139,7 @@ impl State {
             restored: false,
             workspace: None,
             transport: None,
+            transport_ended: false,
             start_attempted: false,
             initialized: false,
             ready: false,
@@ -155,6 +158,7 @@ impl State {
             task_turns: BTreeMap::new(),
             items: BTreeMap::new(),
             stream_sequences: BTreeMap::new(),
+            prefix_loss: BTreeSet::new(),
             discovery_cursor: None,
             discovery_truncated: true,
             dirty: 1,
@@ -438,6 +442,7 @@ impl Driver {
                 && let Ok(mut s) = driver.lock()
             {
                 s.ready = false;
+                s.transport_ended = true;
                 s.close_usage(now());
                 s.diagnostic = Some("MUSE_NATIVE_TRANSPORT_ENDED");
                 s.changed();
@@ -496,7 +501,9 @@ impl Driver {
                 journal::Durability::from_initialize_declaration(init.get("sessionDurability")),
             )
             .map_err(jf)?;
-        if let (Some(p), Some(f)) = (&s.projector, &s.fence) {
+        if !s.transport_ended
+            && let (Some(p), Some(f)) = (&s.projector, &s.fence)
+        {
             s.projector = Some(
                 p.begin_usage_connection(f, &self.bootstrap.worker.boot_id, now())
                     .projector,
@@ -894,7 +901,9 @@ impl Driver {
                     s.requested = requested.clone();
                 }
                 s.confirmed_root = Some(scope.native_root_id.clone());
-                s.ready = true;
+                // An ACK is historical effect evidence. It cannot reopen a
+                // connection whose EOF/shutdown has already been reduced.
+                s.ready = !s.transport_ended && !self.stopping();
                 s.model = if s.restored {
                     ModelConfiguration::Unknown
                 } else {
@@ -936,6 +945,13 @@ impl Driver {
                         .task_turns
                         .get(&native_turn)
                         .is_some_and(|old| old.host_admitted);
+                    if s.prefix_loss.remove(&saved.receipt.operation_id) {
+                        // Reserve a missing prefix before any later content.
+                        // The Host exposes initial source_sequence > 1 as loss.
+                        s.stream_sequences
+                            .entry(saved.receipt.operation_id.clone())
+                            .or_insert(1);
+                    }
                     s.task_turns.insert(
                         native_turn.clone(),
                         TaskTurn {
@@ -1400,6 +1416,31 @@ impl Driver {
             s.versions.insert(session.into(), rev);
         }
         let is_delta = method == "item/delta";
+        let pending_tasks: Vec<String> = if s.confirmed_root.as_deref() == p["sessionId"].as_str()
+            && matches!(
+                method,
+                "item/started"
+                    | "item/updated"
+                    | "item/completed"
+                    | "item/delta"
+                    | "turn/started"
+                    | "turn/completed"
+                    | "session/tokenUsage"
+            ) {
+            s.contexts
+                .values()
+                .filter(|saved| saved.task.is_some() && saved.ack.is_none() && !saved.finished)
+                .map(|saved| saved.receipt.operation_id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !pending_tasks.is_empty() {
+            // Native events confer no Task authority. Retain only bounded loss
+            // metadata for an already prepared exact Task command until ACK.
+            s.prefix_loss.extend(pending_tasks.iter().cloned());
+            stream_gap(&mut s, "MUSE_STREAM_PREFIX_UNAVAILABLE");
+        }
         if let (Some(projector), Some(fence)) = (&s.projector, &s.fence) {
             let reduction = projector.apply_event(NativeEventInput {
                 fence,
@@ -1419,8 +1460,8 @@ impl Driver {
                 && !id.is_empty()
                 && id.len() <= 512
                 && item["revision"].as_u64().is_some_and(|r| r > 0)
-                && s.task_turns.contains_key(turn)
-                && s.items.len() < MAX_STREAM_ITEMS
+                && (s.task_turns.contains_key(turn) || !pending_tasks.is_empty())
+                && (s.items.len() < MAX_STREAM_ITEMS || s.items.contains_key(id))
             {
                 let kind = match item["kind"].as_str() {
                     Some("agentMessage") => Some(crate::streams::KnownItemKind::AgentMessage),
@@ -1475,7 +1516,7 @@ impl Driver {
                     stream_gap(&mut s, "MUSE_STREAM_PRODUCER_GAP");
                 }
             }
-        } else if is_delta && !s.task_turns.is_empty() {
+        } else if is_delta && (!s.task_turns.is_empty() || !pending_tasks.is_empty()) {
             stream_gap(&mut s, "MUSE_STREAM_SOURCE_SCOPE_UNAVAILABLE");
         }
         // Per-token content is never sent via module.observe. Stable lifecycle,
@@ -1609,11 +1650,18 @@ impl Driver {
     }
     pub async fn stop_native(&self) {
         self.request_stop();
-        let transport = self.lock().ok().and_then(|mut s| {
+        let transport = {
+            // Cleanup alone may recover poisoned state to close the retained
+            // transport. Normal command admission continues to reject poison.
+            let mut s = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.ready = false;
+            s.transport_ended = true;
             s.close_usage(now());
             s.transport.clone()
-        });
+        };
         if let Some(transport) = transport {
             let _ = transport.close().await;
         }
@@ -2555,5 +2603,171 @@ mod tests {
             assert_eq!(state.dirty, before);
         }
         shutdown(&driver, &runtime).await;
+    }
+
+    #[tokio::test]
+    async fn muse_driver_cleanup_after_consumer_poison_closes_pipe_and_joins() {
+        let dir = Directory::new();
+        let (driver, runtime, peer) = fixture(&dir.0);
+        let native = tokio::spawn(native_peer(
+            peer,
+            dir.0.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        ));
+        driver
+            .clone()
+            .execute(command(&driver, "01-open", "agent.open", json!({})))
+            .await
+            .unwrap();
+        let consumer_driver = driver.clone();
+        let failure = tokio::spawn(async move {
+            let _state = consumer_driver.state.lock().unwrap();
+            panic!("synthetic consumer failure while holding state");
+        })
+        .await
+        .unwrap_err();
+        assert!(failure.is_panic());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            shutdown(&driver, &runtime).await;
+            native.await.unwrap();
+        })
+        .await
+        .expect("cleanup must close stdin and join outside the failed consumer");
+        assert!(driver.stopping());
+        assert!(matches!(driver.lock(), Err(error) if error.code == "MUSE_DRIVER_LOCK_FAILED"));
+    }
+
+    #[tokio::test]
+    async fn muse_driver_lifecycle_ack_after_native_eof_keeps_readiness_closed() {
+        let dir = Directory::new();
+        let (driver, runtime, peer) = fixture(&dir.0);
+        let native = tokio::spawn(native_peer(
+            peer,
+            dir.0.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        ));
+        driver
+            .clone()
+            .execute(command(&driver, "01-open", "agent.open", json!({})))
+            .await
+            .unwrap();
+        let saved = driver.lock().unwrap().contexts["01-open"].clone();
+        let ack = saved.ack.clone().unwrap();
+        native.abort();
+        assert!(native.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if driver.lock().unwrap().transport_ended {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real peer EOF must reach the notification consumer");
+        driver.finish_ack(&saved, ack).unwrap();
+        assert_eq!(driver.hello()["native_ready"], false);
+        {
+            let state = driver.lock().unwrap();
+            assert!(!state.ready);
+            assert_eq!(
+                state.projector.as_ref().unwrap().observation().unwrap()["native_usage"]["freshness"],
+                "stale"
+            );
+        }
+        shutdown(&driver, &runtime).await;
+    }
+
+    #[tokio::test]
+    async fn muse_driver_pre_ack_items_cannot_authorize_stream_and_prefix_loss_survives_ack() {
+        let dir = Directory::new();
+        let (driver, runtime, peer) = fixture(&dir.0);
+        let native = tokio::spawn(native_peer(
+            peer,
+            dir.0.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        ));
+        driver
+            .clone()
+            .execute(command(&driver, "01-open", "agent.open", json!({})))
+            .await
+            .unwrap();
+        let dispatch = dispatch(&driver);
+        let receipt = driver.receipt(&dispatch).unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        let task = commands::validate_task_prompt(
+            &dispatch,
+            &EncodeContext {
+                expected_receipt: &receipt,
+                worker_boot_id: BOOT,
+                native_root_id: Some(ROOT),
+                fresh_root_session_id: None,
+                native_command_id: Some(&id),
+                initialized: true,
+                observed_children: &[],
+                requested: &RequestedSelectors::default(),
+                work: None,
+                pending_request: None,
+                recovery: None,
+                validated_result_input: None,
+                session_mcp_granted: false,
+            },
+        )
+        .unwrap();
+        let scope = driver.lock().unwrap().scope.clone().unwrap();
+        let invocation = NativeInvocation::new(
+            &scope,
+            "turn/start",
+            &id,
+            object(json!({"commandId":id,"sessionId":ROOT,"input":[{"type":"text","text":"abc"}]}))
+                .unwrap(),
+        )
+        .unwrap();
+        let saved = SavedCommand {
+            command: dispatch.clone(),
+            receipt,
+            invocation,
+            task: Some(Arc::new(task)),
+            requested: None,
+            work: None,
+            ack: None,
+            finished: false,
+        };
+        {
+            let mut state = driver.lock().unwrap();
+            state
+                .journal
+                .as_mut()
+                .unwrap()
+                .prepare_native(&scope, saved.receipt.clone(), saved.invocation.clone())
+                .unwrap();
+            state
+                .contexts
+                .insert(dispatch.operation_id.clone(), saved.clone());
+        }
+        driver.notification(Notification { envelope:json!({"method":"item/started","params":{"sessionId":ROOT,"viewCursor":"pre-ack:1","item":{"itemId":"early-item","revision":1,"kind":"agentMessage","status":"inProgress","turnId":"early-turn","text":""}}}) }).unwrap();
+        driver.notification(Notification { envelope:json!({"method":"item/delta","params":{"sessionId":ROOT,"itemId":"early-item","field":"text","delta":"lost prefix","viewCursor":"pre-ack:2"}}) }).unwrap();
+        {
+            let state = driver.lock().unwrap();
+            assert!(state.task_turns.is_empty());
+            assert!(state.items.contains_key("early-item"));
+            assert!(state.prefix_loss.contains(&dispatch.operation_id));
+        }
+        assert!(driver.stream_jobs.lock().await.try_recv().is_err());
+        driver.finish_ack(&saved, json!({"commandId":id,"status":"accepted","disposition":"started","startedNewTurn":true,"turnId":"early-turn"})).unwrap();
+        driver.notification(Notification { envelope:json!({"method":"item/delta","params":{"sessionId":ROOT,"itemId":"early-item","field":"text","delta":"later suffix","viewCursor":"post-ack:3"}}) }).unwrap();
+        let job = driver.stream_jobs.lock().await.try_recv().unwrap();
+        assert_eq!(job.facts.scope.operation_id, dispatch.operation_id);
+        assert_eq!(
+            job.prior_sequence, 1,
+            "missing pre-ACK prefix must remain visible to Host"
+        );
+        assert_eq!(job.facts.item.as_ref().unwrap().item_id, "early-item");
+        assert!(!driver.lock().unwrap().task_turns["early-turn"].host_admitted);
+        shutdown(&driver, &runtime).await;
+        native.await.unwrap();
     }
 }
