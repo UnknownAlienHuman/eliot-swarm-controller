@@ -1,8 +1,8 @@
 # Muse Rust adapter source
 
 This crate contains bounded bidirectional stdio transport, the durable adapter
-facade, an executable and a disabled module descriptor. Production activation
-and installed-native qualification remain gated as recorded in
+facade, a wired executable and a disabled module descriptor. Explicit production
+activation and installed-native qualification remain outstanding as recorded in
 [the integration guide](registration/INTEGRATION.md). The current product route
 remains [Node bridge.13](../../modules/muse/README.md); full Rust migration is
 incomplete.
@@ -32,7 +32,7 @@ ordering. They use synthetic pipes and do not qualify a native Muse executable.
 
 Command/TaskPrompt/model controls, private journals, Host delivery, observed
 children, result paging, explicit recovery and authorized streams are integrated
-source components. The coherent local library pass on 2026-10-17 completed 127
+source components. The coherent local library pass on 2026-10-17 completed 131
 tests with three explicit subprocess-entry fixtures ignored. Those synthetic
 checks do not qualify an installed account or the complete productive delivery
 chain. Native MCP inventory remains unavailable. Keep jsonrpsee payload trace

@@ -31,8 +31,8 @@
 //!
 //! The command/TaskPrompt/model facade, journal, Host delivery, child observations,
 //! results, explicit recovery and streams are integrated source components. The
-//! executable and descriptor remain gated pending their final source/native
-//! qualification; see registration/INTEGRATION.md. Native MCP inventory remains
+//! executable uses the joined runtime; its descriptor remains disabled pending
+//! platform/native qualification; see registration/INTEGRATION.md. MCP inventory remains
 //! unavailable. Keep jsonrpsee payload trace targets disabled in worker logging.
 //! Tests in `msp` are boundary fixtures written for Root to run, not qualification
 //! of the installed Muse executable or any account/authentication state.

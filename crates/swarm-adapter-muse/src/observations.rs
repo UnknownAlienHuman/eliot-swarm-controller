@@ -780,7 +780,10 @@ impl ObservationProjector {
             .map(|child| child.session_id.as_str())
     }
 
-    pub(crate) fn observed_child_provenance(&self, session: &str) -> Option<ObservedChildProvenance<'_>> {
+    pub(crate) fn observed_child_provenance(
+        &self,
+        session: &str,
+    ) -> Option<ObservedChildProvenance<'_>> {
         self.state
             .observed_children
             .iter()

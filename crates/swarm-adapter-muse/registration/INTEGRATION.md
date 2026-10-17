@@ -1,10 +1,10 @@
 # Rust Muse worker integration and qualification
 
-The new `muse-rust-controller.1@0.1.0` descriptor remains disabled. Its normal
-`run_owned` entry still returns `MUSE_HOST_MULTIPLEX_API_REQUIRED` until the
-integrated facade passes final source review and controlled native qualification.
-The original IPC dependency behind that diagnostic is now implemented locally;
-the diagnostic is retained as the existing activation fence.
+The new `muse-rust-controller.1@0.1.0` descriptor remains disabled pending final
+platform and controlled installed-native qualification. The executable's normal
+`run_owned` entry now uses the integrated shared-link loop and external native
+custodian. Explicit operator registration/route activation remains separate from
+source integration and candidate packaging.
 
 The current installed Node bridge.13 and its private state are separate. This
 artifact reads only its own Rust scope marker and versioned journal. It neither
@@ -61,7 +61,7 @@ use the disabled template and explicit native qualification gates below.
 ## Root verification
 
 Root runs Cargo and formatting sequentially. The coherent local library pass on
-2026-10-17 completed 127 tests with three explicit subprocess-entry fixtures
+2026-10-17 completed 131 tests with three explicit subprocess-entry fixtures
 ignored. It includes transport, journal, codec, schema, Driver, runtime lanes and
 the native-custodian external watchdog. Separate common-client transport and
 authenticated actual Host concurrency cases passed. Strict scoped all-target

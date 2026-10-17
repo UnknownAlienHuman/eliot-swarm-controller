@@ -321,16 +321,11 @@ impl ModuleOwnedBootstrap {
     }
 }
 
-/// Activation stays fenced until Root explicitly qualifies the whole facade.
-/// The retained gate is not a claim that the now-integrated client lacks mux.
+/// Normal executable entry. The external custodian outlives the consumer and
+/// uses the same shared-link runtime loop as the connected qualification seam.
 pub async fn run_owned(bootstrap: ModuleOwnedBootstrap) -> Result<()> {
-    // Created before any consumer/spawn; retained until join while Tokio lives.
     let native: Arc<dyn NativeRuntime> = Arc::new(JoinedNativeRuntime::new());
-    let _ = bootstrap;
-    let result: Result<()> = Err(fault("MUSE_HOST_MULTIPLEX_API_REQUIRED"));
-    let drains = native.drain_stdio().await;
-    let joined = native.join_custodians().await;
-    result.and(drains).and(joined)
+    run_owned_with(bootstrap, native).await
 }
 
 /// A retained outer owner, outside every abortable native consumer task.
@@ -1272,6 +1267,20 @@ mod runtime_tests {
         assert!(custody.joined.load(Ordering::SeqCst));
         assert_eq!(driver.native_writes.load(Ordering::SeqCst), 1);
         assert_eq!(facts.lock().unwrap().auth, 1);
+    }
+
+    #[tokio::test]
+    async fn muse_runtime_public_entry_enforces_admission_before_native_spawn() {
+        let directory = Directory::new();
+        let mut bootstrap = Arc::try_unwrap(bootstrap(&directory.0)).ok().unwrap();
+        bootstrap.host.ipc.max_inflight_per_connection = 2;
+        let error = tokio::time::timeout(DEADLINE, run_owned(bootstrap))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "MUSE_HOST_INFLIGHT_BOUND_UNSUPPORTED");
+        assert!(!directory.0.join("muse-rust-scope.v1.json").exists());
+        assert!(!directory.0.join("muse-rust-checkpoint.v1.json").exists());
     }
 
     include!("module_runtime_startup_shutdown_tests.rs");
