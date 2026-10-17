@@ -129,7 +129,7 @@ const fn mutation(
 /// classification plus the CLI's
 /// request-ID treatment (`agent.result` and `host.mode` are mutations).
 pub static TOOLS: &[(bool, ToolSpec)] = &TOOL_ITEMS;
-static TOOL_ITEMS: [(bool, ToolSpec); 161] = [
+static TOOL_ITEMS: [(bool, ToolSpec); 164] = [
     // Read-only methods.
     read(
         "swarm.tools.search",
@@ -703,6 +703,24 @@ static TOOL_ITEMS: [(bool, ToolSpec); 161] = [
         &["check_id"],
     ),
     read("check.profiles", "Configured check profiles.", &[], &[]),
+    read(
+        "stream.open",
+        "Open an ephemeral native content view using the existing Task/native-result content grant for an exact Store-derived live source. No model, native read, artifact or durable cursor is created.",
+        &[f("operation_id", S)],
+        &["operation_id"],
+    ),
+    read(
+        "stream.read",
+        "Read a bounded shared native stream ring; revalidate content rights and report cursor loss. Partial text stays unavailable until a complete logical record can be redacted.",
+        &[f("stream_id", S), f("after", I), f("limit", I)],
+        &["stream_id", "after"],
+    ),
+    read(
+        "stream.close",
+        "Release this connection's ephemeral content view without affecting native work.",
+        &[f("stream_id", S)],
+        &["stream_id"],
+    ),
     read(
         "artifact.get",
         "Artifact metadata.",
@@ -4249,6 +4267,9 @@ pub fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
             | "artifact.get"
             | "artifact.read"
             | "artifact.parts"
+            | "stream.open"
+            | "stream.read"
+            | "stream.close"
             | "report.delta"
             | "report.attention"
             | "report.capacity"
@@ -4306,6 +4327,9 @@ pub fn exposes_method(profile: McpToolProfile, method: &str) -> bool {
                 | "task.submission"
                 | "check.get"
                 | "artifact.read"
+                | "stream.open"
+                | "stream.read"
+                | "stream.close"
                 | "operation.get"
                 | "concilium.get"
                 | "concilium.list"
@@ -5033,6 +5057,45 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         &["artifact", "parts", "provenance", "manifest"],
         &["artifact_id"],
         "Bounded provenance page."
+    ),
+    entry_with_inputs!(
+        "stream.open",
+        Monitoring,
+        ASSIGNMENT_READ_AUDIENCES,
+        Searchable,
+        "Open one authorized shared ephemeral native content ring.",
+        "Use an exact current Task/Attempt dispatch. Store reuses its Task/native-result byte-grant branches; a Receipt or generic role is insufficient. Missing authority fails closed.",
+        &["native", "stream", "text", "reasoning", "content"],
+        &["operation_id"],
+        &[
+            "current unreleased Attempt",
+            "existing native content grant"
+        ],
+        "Ephemeral view handle; no model call, Observation or durable subscription."
+    ),
+    entry_with_inputs!(
+        "stream.read",
+        Monitoring,
+        ASSIGNMENT_READ_AUDIENCES,
+        Searchable,
+        "Read ordered native records with replacement and cursor-loss semantics.",
+        "Use the stream handle and returned cursor. Rights, current producer link, boot and binding generation are revalidated on every read.",
+        &["native", "stream", "read", "cursor", "gap"],
+        &["stream_id", "after"],
+        &["current content rights", "current module incarnation"],
+        "Bounded records; final text replaces deltas, cumulative usage replaces earlier usage; hidden reasoning is unavailable."
+    ),
+    entry_with_inputs!(
+        "stream.close",
+        Monitoring,
+        ASSIGNMENT_READ_AUDIENCES,
+        Searchable,
+        "Close one connection-owned ephemeral native view.",
+        "Use when the view is no longer needed; native work continues.",
+        &["native", "stream", "close"],
+        &["stream_id"],
+        &[],
+        "View release only; no native command."
     ),
     entry!(
         "report.delta",

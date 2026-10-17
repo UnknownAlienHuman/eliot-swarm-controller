@@ -490,4 +490,155 @@ mod tests {
         owner.close().await.expect("close Store");
         std::fs::remove_dir_all(directory).expect("remove unique Store root");
     }
+
+    #[tokio::test]
+    async fn ipc_mux_real_authenticated_host_pending_next_allows_same_link_publish_and_outcome() {
+        use swarm_contracts::native_stream::{
+            StreamPayload, StreamPublish, StreamScope, TextClass,
+        };
+        let directory = std::env::temp_dir().join(format!("swarm-ipc-mux-{}", model::new_id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let root = DataRoot::acquire(&directory).unwrap();
+        let operator = bootstrap_credential(&root.path).unwrap();
+        let mut config = Config::default();
+        config.storage.data_dir = root.path.clone();
+        config.ipc.max_inflight_per_connection = 8;
+        let owner = StoreOwner::start(root, Arc::new(config.clone()), operator)
+            .await
+            .unwrap();
+        let store = owner.store.clone();
+        // Same retained synthetic facts used by the real stream boundary
+        // fixtures: seed through Store's owner, never native/model dispatch.
+        store.run_fixture(|db|{
+            for (id,role) in [("mux-manager","manager"),("mux-module","module")] {
+                let mut registration=json!({"role":role,"disabled":false,"token_hash":model::digest(format!("{id}-token").as_bytes())});
+                if role=="module" {registration["binding_id"]=json!("mux-binding");registration["binding_generation"]=json!(1);}
+                crate::store::set_meta(db,&format!("client:{id}"),&registration)?;
+            }
+            db.execute("INSERT INTO tasks(task_id,project_id,revision,state,spec_json,created_at_ms,updated_at_ms) VALUES('mux-task','mux-project',1,'open','{}',1,1)",[])?;
+            db.execute("INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,module_artifact_id,state,native_scope_key,native_root_id,route_json,state_json,created_at_ms) VALUES('mux-binding',1,'mux-lane','mux-instance','mux-artifact','ready','mux-scope','mux-root','{\"module_artifact_id\":\"mux-artifact\",\"runtime\":\"module\"}',?1,1)",[json!({"module_client_id":"mux-module","bridge_boot_id":"mux-boot","connection":"connected"}).to_string()])?;
+            db.execute("INSERT INTO attempts(attempt_id,task_id,task_revision,task_snapshot_json,owner_id,start_owner,binding_id,binding_generation,state,created_at_ms,updated_at_ms) VALUES('mux-attempt','mux-task',1,'{\"revision\":1}','mux-manager','controller','mux-binding',1,'running',1,1)",[])?;
+            db.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,binding_id,binding_generation,state,native_refs_json,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES('mux-dispatch','mux-manager','mux-request','task.dispatch','{}','{}','mux-task','mux-attempt','mux-binding',1,'settled',?1,?2,1,1,1,1)",rusqlite::params![json!({"session_id":"mux-root","turn_id":"mux-turn"}).to_string(),json!({"outcome":"applied","details":{"artifact_refs":[]}}).to_string()])?;
+            db.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,binding_id,binding_generation,state,due_at_ms,created_at_ms,updated_at_ms) VALUES('mux-outcome','mux-manager','mux-outcome-request','agent.refresh','{}','{}','mux-binding',1,'sending',1,1,1)",[])?;
+            Ok(())
+        }).await.unwrap();
+        let mut listener = Listener::bind(&directory).unwrap();
+        let (stop, stopping) = watch::channel(false);
+        let serving_store = store.clone();
+        let ipc = Arc::new(config.ipc.clone());
+        // Exactly one accepted/authenticated physical connection. No second
+        // listener remains available to disguise cloning as another hello.
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            drop(listener);
+            serve_connection(stream, serving_store, ipc, stopping).await
+        });
+        let credential = Credential {
+            client_id: "mux-module".into(),
+            token: "mux-module-token".into(),
+        };
+        let mut link = swarm_client::ModuleLink::connect(&directory, &credential, &config.ipc)
+            .await
+            .unwrap();
+        assert_eq!(link.next().await.unwrap_err().code, "MODULE_HELLO_REQUIRED");
+        let hello =
+            json!({"boot_id":"mux-boot","module_artifact_id":"mux-artifact","native_ready":true});
+        let original = link.hello(hello.clone(), None).await.unwrap();
+        let current_link=store.run_fixture(|db|{let raw:String=db.query_row("SELECT state_json FROM bindings WHERE binding_id='mux-binding' AND generation=1",[],|r|r.get(0))?;Ok(serde_json::from_str::<Value>(&raw)?["module_link_id"].clone())}).await.unwrap();
+        let mut repeat = link.clone();
+        assert_eq!(repeat.hello(hello, None).await.unwrap(), original);
+        assert_eq!(
+            repeat
+                .hello(
+                    json!({"boot_id":"foreign","module_artifact_id":"mux-artifact"}),
+                    None
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "MODULE_HELLO_CONFLICT"
+        );
+        let mut next_link = link.clone();
+        let mut next = Box::pin(next_link.next());
+        tokio::select! {reply=&mut next=>panic!("next must be pending without queued work: {reply:?}"),_=tokio::time::sleep(Duration::from_millis(50))=>{}}
+        let mut publish = link.clone();
+        let mut outcome = link.clone();
+        let mut observe = link.clone();
+        let mut result = link.clone();
+        let frame = StreamPublish {
+            scope: StreamScope {
+                binding_id: "mux-binding".into(),
+                generation: 1,
+                boot_id: "mux-boot".into(),
+                task_id: "mux-task".into(),
+                task_revision: 1,
+                attempt_id: "mux-attempt".into(),
+                operation_id: "mux-dispatch".into(),
+                native_session_id: "mux-root".into(),
+                turn_id: "mux-turn".into(),
+            },
+            source_sequence: 1,
+            native_cursor: "opaque:one".into(),
+            item_id: "item".into(),
+            item_order: 0,
+            part_index: 0,
+            payload: StreamPayload::Text {
+                class: TextClass::Assistant,
+                text: "synthetic complete text".into(),
+                final_record: true,
+                revision: Some(1),
+            },
+        };
+        let before = store
+            .run_fixture(|db| {
+                Ok(db.query_row("SELECT COUNT(*) FROM observations", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+            })
+            .await
+            .unwrap();
+        let publication =
+            tokio::time::timeout(Duration::from_secs(2), publish.publish_stream(&frame))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(publication["published"], true);
+        let after = store
+            .run_fixture(|db| {
+                Ok(db.query_row("SELECT COUNT(*) FROM observations", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(before, after, "stream publication writes no Observation");
+        let (recorded,observed,refused)=tokio::time::timeout(Duration::from_secs(2),async {
+            tokio::join!(
+                outcome.outcome(json!({"operation_id":"mux-outcome","outcome":"unknown","native_scope_key":"mux-scope","native_root_id":"mux-root","turn_id":null,"details":{"diagnostic_code":"FIXTURE_READ_UNAVAILABLE"}})),
+                observe.observe(json!({"event_id":"mux-observation","sequence":1,"state":{"boot_id":"mux-boot","execution":"unknown","family_completeness":"partial"}})),
+                result.result(json!({"operation_id":"not-an-admitted-result","page":{}}))
+            )
+        }).await.unwrap();
+        assert_eq!(recorded.unwrap()["recorded"], true);
+        assert!(observed.is_ok());
+        assert_ne!(refused.unwrap_err().code, "OUTCOME_UNKNOWN");
+        assert!(link.is_connected());
+        tokio::select! {reply=&mut next=>panic!("side calls must not replace/cancel the retained next: {reply:?}"),_=tokio::time::sleep(Duration::from_millis(50))=>{}}
+        let same_link=store.run_fixture(|db|{let raw:String=db.query_row("SELECT state_json FROM bindings WHERE binding_id='mux-binding' AND generation=1",[],|r|r.get(0))?;Ok(serde_json::from_str::<Value>(&raw)?["module_link_id"].clone())}).await.unwrap();
+        assert_eq!(same_link, current_link);
+        // Retain this original future until the real Host's ten-second empty
+        // next completes; cancellation is not used to unlock another lane.
+        let empty = tokio::time::timeout(Duration::from_secs(12), next.as_mut())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(empty["command"].is_null());
+        drop(next);
+        link.close().await;
+        let _ = stop.send(true);
+        server.await.unwrap().unwrap();
+        drop(store);
+        owner.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

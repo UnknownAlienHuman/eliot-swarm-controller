@@ -2708,6 +2708,103 @@ fn native_source_grant(
     )
 }
 
+/// Live content identity derived only from an actual retained dispatch. It is
+/// not an ArtifactRecord and creates neither an artifact nor a new right.
+pub(super) struct NativeStreamContentSource {
+    target: OperationRow,
+    pub(super) identity: TaskGraphIdentity,
+}
+
+pub(super) type StreamContentGrant = ArtifactReadGrant;
+
+pub(super) fn native_stream_content_source(
+    db: &Connection,
+    operation_id: &str,
+) -> Result<Option<NativeStreamContentSource>> {
+    let Some(target) = load_operation(db, operation_id)? else {
+        return Ok(None);
+    };
+    if target.method != "task.dispatch"
+        || !matches!(
+            target.state.as_str(),
+            "native_accepted" | "settled" | "outcome_unknown"
+        )
+    {
+        return Ok(None);
+    }
+    let Some(identity) = operation_task_identity(db, &target)? else {
+        return Ok(None);
+    };
+    let Some(attempt_id) = identity.attempt_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(task_revision) = identity.task_revision else {
+        return Ok(None);
+    };
+    if identity.binding_id.is_none() || identity.binding_generation.is_none() {
+        return Ok(None);
+    }
+    // Live streams require the Task's current revision as well as its frozen,
+    // unreleased Attempt. Historical result/Receipt rights remain separate.
+    // This shared eligibility fence is deliberately not an owner/role grant.
+    let current: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.task_id=a.task_id \
+         WHERE a.attempt_id=?1 AND a.task_id=?2 AND a.task_revision=?3 \
+           AND a.released_at_ms IS NULL AND t.revision=?3)",
+        params![attempt_id, identity.task_id, task_revision],
+        |row| row.get(0),
+    )?;
+    Ok(current.then_some(NativeStreamContentSource { target, identity }))
+}
+
+pub(super) fn resolve_native_stream_content(
+    db: &Connection,
+    principal: &Principal,
+    source: &NativeStreamContentSource,
+) -> Result<Option<StreamContentGrant>> {
+    if !matches!(
+        principal.role,
+        Role::Operator | Role::Manager | Role::Participant
+    ) {
+        return Ok(None);
+    }
+    if principal.role == Role::Participant
+        && super::meta(db, &format!("client:{}", principal.client_id))?.is_some_and(
+            |registration| registration["participation_basis"]["kind"] == "sponsored_reviewer",
+        )
+    {
+        // A live ring has no immutable candidate relation to prove. A review
+        // Receipt or historical assignment must not become transcript access.
+        return Ok(None);
+    }
+    let Some(current) = native_stream_content_source(db, &source.target.operation_id)? else {
+        return Ok(None);
+    };
+    if current.identity != source.identity {
+        return Err(identity_damaged("live stream Task identity changed"));
+    }
+    let requested = ArtifactReadLevel::Bytes;
+    let task_grant = task_read_artifact_grant(db, principal, &current.identity, requested)?;
+    // Reuse the exact native-result producer/target/on-behalf branches. An
+    // ephemeral publication is attributed to its existing target dispatch,
+    // not to a manufactured producer Operation or fake artifact.
+    let relation = NativeResultSource {
+        producer_operation_id: Arc::new(current.target.operation_id.clone()),
+        target_operation_id: Arc::new(current.target.operation_id.clone()),
+        task_identity: Some(Arc::new(current.identity)),
+        producer_operation_rowid: current.target.rowid,
+        target_operation_rowid: current.target.rowid,
+    };
+    Ok(
+        native_source_grant(db, principal, &relation, task_grant, requested)?.map(|grant| {
+            ArtifactReadGrant {
+                level: grant.level.min(requested),
+                ..grant
+            }
+        }),
+    )
+}
+
 /// Resolve one artifact read. `Ok(None)` means no positive relation exists.
 /// Script artifact scope remains delegated to its existing retained validator.
 pub(crate) fn resolve_artifact_read(
