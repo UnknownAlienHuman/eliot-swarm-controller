@@ -3720,6 +3720,10 @@ mod forge_custody_tests;
 mod forge_inner_recovery_tests;
 
 #[cfg(test)]
+#[path = "forge_failure_witness.rs"]
+mod forge_failure_witness;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
@@ -3941,6 +3945,9 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn forge_owner_receipt_requires_exact_live_image_claims() {
+        let directory = std::env::temp_dir().join(format!("forge-owner-image-{}", model::new_id()));
+        fs::create_dir(&directory).unwrap();
+        let witness = forge_failure_witness::OwnerImageWitness(directory.clone());
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
@@ -3948,33 +3955,55 @@ mod tests {
                 "store::forge::tests::forge_owner_receipt_image_claims_child",
                 "--nocapture",
             ])
+            .env(forge_failure_witness::OWNER_WITNESS_ENV, &directory)
             .output()
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "isolated Forge owner spawn/wait failed: {:?}; witness={}",
+                    error.kind(),
+                    witness.summary(),
+                )
+            });
         assert!(
             output.status.success(),
-            "isolated Forge owner fixture failed: {:?}; stdout={}; stderr={}",
+            "isolated Forge owner fixture failed: {:?}; witness={}; stdout_bytes={}; stderr_bytes={}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+            witness.summary(),
+            output.stdout.len(),
+            output.stderr.len(),
         );
         assert!(
             String::from_utf8_lossy(&output.stdout)
                 .contains("FORGE_OWNER_IMAGE_CLAIMS_ASSERTIONS_COMPLETE"),
-            "isolated fixture must finish every receipt assertion"
+            "isolated fixture must finish every receipt assertion; witness={}",
+            witness.summary(),
         );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     #[ignore = "isolated process-wide Job/group fixture invoked by the parent test"]
     fn forge_owner_receipt_image_claims_child() {
-        eprintln!("FORGE_OWNER_IMAGE_PHASE entered");
+        let witness = forge_failure_witness::OwnerImageWitness::from_environment();
+        witness.install_panic_witness();
+        witness.phase("entered");
         let token = model::new_id();
         let group = swarm_process::Group::enter_module(&token).unwrap();
-        eprintln!("FORGE_OWNER_IMAGE_PHASE group_ready");
+        witness.phase("group_ready");
         let pid = std::process::id();
-        let image = swarm_process::process_image_identity(pid).unwrap();
-        eprintln!("FORGE_OWNER_IMAGE_PHASE image_observed");
+        #[cfg(target_os = "linux")]
+        witness.observe_self_exe_metadata();
+        witness.phase("image_observation");
+        let image = swarm_process::process_image_identity(pid);
+        witness.image_returned(
+            image
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| (error.code.as_str(), error.message.as_str())),
+        );
+        let image = image.unwrap();
+        witness.phase("image_observed");
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
         let directory = std::env::temp_dir().join(model::new_id());
         let job = NativeWorkerJob {
@@ -4001,9 +4030,9 @@ mod tests {
         process["image_path"] = image["image_path"].clone();
         process["image_sha256"] = image["image_sha256"].clone();
         let owner = json!({"version":1,"token":token,"process":process});
-        eprintln!("FORGE_OWNER_IMAGE_PHASE executable_pinned");
+        witness.phase("executable_pinned");
         validate_worker_owner(&job, pid, &owner).unwrap();
-        eprintln!("FORGE_OWNER_IMAGE_PHASE valid_owner_checked");
+        witness.phase("valid_owner_checked");
 
         for field in ["image_path", "image_sha256"] {
             let mut missing = owner.clone();
@@ -4031,11 +4060,12 @@ mod tests {
                 "changed {field} must not authorize publication"
             );
         }
-        eprintln!("FORGE_OWNER_IMAGE_PHASE invalid_claims_checked");
+        witness.phase("invalid_claims_checked");
         // Receipt serialization must preserve the exact restart image claims.
         let restored: Value = serde_json::from_slice(&serde_json::to_vec(&owner).unwrap()).unwrap();
         validate_worker_owner(&job, pid, &restored).unwrap();
-        eprintln!("FORGE_OWNER_IMAGE_PHASE roundtrip_checked");
+        witness.phase("roundtrip_checked");
+        witness.phase("assertions_complete");
         println!("FORGE_OWNER_IMAGE_CLAIMS_ASSERTIONS_COMPLETE");
     }
 
@@ -4191,25 +4221,29 @@ mod tests {
         config
     }
 
-    fn checked_fixture_git(command: &mut Command) -> Vec<u8> {
+    fn checked_fixture_git(command: &mut Command, trace_directory: &Path) -> Vec<u8> {
+        let trace = forge_failure_witness::attach_git_trace(command, trace_directory);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
         }
-        let output = command.output().unwrap();
+        let output = command.output().unwrap_or_else(|error| {
+            panic!(
+                "fixture Git spawn/wait failed: {:?}; trace={}",
+                error.kind(),
+                forge_failure_witness::git_trace_summary(&trace),
+            )
+        });
         assert!(
             output.status.success(),
             "fixture Git command failed: {}",
-            crate::redaction::value(json!({
-                "program":command.get_program().to_string_lossy(),
-                "argv":command.get_args().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
-                "cwd":command.get_current_dir().map(Path::to_path_buf)
-                    .or_else(|| std::env::current_dir().ok()),
+            json!({
                 "status":output.status.code(),
-                "stdout":String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(4096)]),
-                "stderr":String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(4096)]),
-            }))
+                "stdout_bytes":output.stdout.len(),
+                "stderr_bytes":output.stderr.len(),
+                "trace":forge_failure_witness::git_trace_summary(&trace),
+            })
         );
         output.stdout
     }
@@ -4223,13 +4257,24 @@ mod tests {
             .expect("native Git is available for the bare repository fixture")
     }
 
-    fn fixture_git_in(git: &Path, directory: &Path, args: &[&str]) -> Vec<u8> {
+    fn fixture_git_in(
+        git: &Path,
+        trace_directory: &Path,
+        directory: &Path,
+        args: &[&str],
+    ) -> Vec<u8> {
         let mut command = Command::new(git);
         command.arg("-C").arg(directory).args(args);
-        checked_fixture_git(&mut command)
+        checked_fixture_git(&mut command, trace_directory)
     }
 
-    fn fixture_fetch_ref(git: &Path, bare: &Path, source: &Path, source_ref: &str) {
+    fn fixture_fetch_ref(
+        git: &Path,
+        trace_directory: &Path,
+        bare: &Path,
+        source: &Path,
+        source_ref: &str,
+    ) {
         let refspec = format!("{source_ref}:refs/heads/main");
         let mut command = Command::new(git);
         command
@@ -4238,13 +4283,15 @@ mod tests {
             .args(["fetch", "--quiet"])
             .arg(source)
             .arg(refspec);
-        checked_fixture_git(&mut command);
+        checked_fixture_git(&mut command, trace_directory);
     }
 
     #[tokio::test]
     async fn exact_push_endpoint_controls_expected_old_and_readback_with_split_remote_urls() {
         let directory = std::env::temp_dir().join(format!("swarm-forge-split-{}", model::new_id()));
         std::fs::create_dir_all(&directory).unwrap();
+        let trace_directory = directory.join("trace");
+        fs::create_dir(&trace_directory).unwrap();
         let git = fixture_git_executable();
         let checkout = directory.join("checkout");
         let fetch_repository = directory.join("fetch.git");
@@ -4252,7 +4299,7 @@ mod tests {
 
         let mut command = Command::new(&git);
         command.arg("init").arg("--quiet").arg(&checkout);
-        checked_fixture_git(&mut command);
+        checked_fixture_git(&mut command, &trace_directory);
         for (message, branch_name) in [
             ("fetch-base", "fetch-base"),
             ("push-base", "push-base"),
@@ -4260,6 +4307,7 @@ mod tests {
         ] {
             fixture_git_in(
                 &git,
+                &trace_directory,
                 &checkout,
                 &[
                     "-c",
@@ -4275,11 +4323,12 @@ mod tests {
                     message,
                 ],
             );
-            fixture_git_in(&git, &checkout, &["branch", branch_name]);
+            fixture_git_in(&git, &trace_directory, &checkout, &["branch", branch_name]);
         }
         let oid = |reference: &str| {
             String::from_utf8(fixture_git_in(
                 &git,
+                &trace_directory,
                 &checkout,
                 &["rev-parse", "--verify", reference],
             ))
@@ -4294,10 +4343,22 @@ mod tests {
         for bare in [&fetch_repository, &push_repository] {
             let mut command = Command::new(&git);
             command.arg("init").arg("--bare").arg(bare);
-            checked_fixture_git(&mut command);
+            checked_fixture_git(&mut command, &trace_directory);
         }
-        fixture_fetch_ref(&git, &fetch_repository, &checkout, "refs/heads/fetch-base");
-        fixture_fetch_ref(&git, &push_repository, &checkout, "refs/heads/push-base");
+        fixture_fetch_ref(
+            &git,
+            &trace_directory,
+            &fetch_repository,
+            &checkout,
+            "refs/heads/fetch-base",
+        );
+        fixture_fetch_ref(
+            &git,
+            &trace_directory,
+            &push_repository,
+            &checkout,
+            "refs/heads/push-base",
+        );
 
         let mut command = Command::new(&git);
         command
@@ -4307,16 +4368,17 @@ mod tests {
             .arg("add")
             .arg("origin")
             .arg(&fetch_repository);
-        checked_fixture_git(&mut command);
+        checked_fixture_git(&mut command, &trace_directory);
         let mut command = Command::new(&git);
         command
             .arg("-C")
             .arg(&checkout)
             .args(["remote", "set-url", "--push", "origin"])
             .arg(&push_repository);
-        checked_fixture_git(&mut command);
+        checked_fixture_git(&mut command, &trace_directory);
         let fetch_url = String::from_utf8(fixture_git_in(
             &git,
+            &trace_directory,
             &checkout,
             &["remote", "get-url", "--all", "origin"],
         ))
@@ -4325,6 +4387,7 @@ mod tests {
         .to_owned();
         let push_url = String::from_utf8(fixture_git_in(
             &git,
+            &trace_directory,
             &checkout,
             &["remote", "get-url", "--push", "--all", "origin"],
         ))
@@ -4384,6 +4447,7 @@ mod tests {
         // the configured expected-old value not matching its destination.
         fixture_git_in(
             &git,
+            &trace_directory,
             &checkout,
             &["merge-base", "--is-ancestor", &push_base, &candidate],
         );
@@ -4391,7 +4455,13 @@ mod tests {
         // Model a misleading fetch mirror that already contains the candidate.
         // Restart readback must still query the push endpoint and remain
         // unknown, rather than confirming from the fetch-only mirror.
-        fixture_fetch_ref(&git, &fetch_repository, &checkout, "refs/heads/candidate");
+        fixture_fetch_ref(
+            &git,
+            &trace_directory,
+            &fetch_repository,
+            &checkout,
+            "refs/heads/candidate",
+        );
         let fetch_readback = fixture_with_forge_git(|git| {
             remote_ref_at(git, &config, &project, &intent, &fetch_url)
         })

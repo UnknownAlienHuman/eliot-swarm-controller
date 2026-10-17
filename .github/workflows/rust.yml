@@ -394,6 +394,25 @@ jobs:
             & cargo test --locked --package $hostPackages[0] --lib 'ipc::tests::ipc_mux_real_authenticated_host_pending_next_allows_same_link_publish_and_outcome' --target-dir $sharedTargetDir -- --exact
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      - name: Run selected Forge process failure witnesses
+        if: contains(needs.scope.outputs.changed_paths, 'crates/swarm-kernel-host/src/store/forge.rs') || contains(needs.scope.outputs.changed_paths, 'crates/swarm-kernel-host/src/store/forge_failure_witness.rs')
+        shell: pwsh
+        env:
+          PACKAGE_SPECS: ${{ needs.scope.outputs.clippy_packages }}
+        run: |
+          $hostPackages = @($env:PACKAGE_SPECS | ConvertFrom-Json | Where-Object {
+            ([string]$_).Split('@')[0] -ceq 'swarm-kernel-host'
+          })
+          if ($hostPackages.Count -ne 1) { throw 'Forge witness Host package selector must be unambiguous.' }
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          foreach ($filter in @(
+            'forge_failure_witness_',
+            'forge_owner_receipt_requires_exact_live_image_claims',
+            'exact_push_endpoint_controls_expected_old_and_readback_with_split_remote_urls'
+          )) {
+            & cargo test --locked --package $hostPackages[0] --lib $filter --target-dir $sharedTargetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Run selected Forge inner custody recovery regressions
         if: contains(needs.scope.outputs.changed_paths, 'crates/swarm-kernel-host/src/store/forge.rs') || contains(needs.scope.outputs.changed_paths, 'crates/swarm-kernel-host/src/store/forge_inner_recovery_tests.rs')
         shell: pwsh
