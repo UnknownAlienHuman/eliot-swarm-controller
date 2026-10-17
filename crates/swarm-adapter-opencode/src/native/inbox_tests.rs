@@ -472,6 +472,62 @@ impl RootReadbackFixture {
         json!({"expected_method":"POST","json_path":"/api/session","json_payload":{"data":self.session}})
     }
 
+    fn model_response(&self) -> Value {
+        let mut url = Url::parse("http://fixture/api/model").unwrap();
+        url.query_pairs_mut().append_pair(
+            "location[directory]",
+            &self.options.directory.to_string_lossy(),
+        );
+        json!({
+            "json_path":format!("{}?{}", url.path(), url.query().unwrap()),
+            "json_payload":{
+                "location":self.location,
+                "data":[{
+                    "id":self.session["model"]["id"],
+                    "providerID":self.session["model"]["providerID"],
+                    "enabled":true,
+                    "variants":[{"id":self.session["model"]["variant"]}]
+                }]
+            }
+        })
+    }
+
+    fn input_status_prefix(&self, sync_sequence: bool) -> Vec<Value> {
+        let mut responses = vec![
+            self.session_response(&self.session),
+            self.location_response(),
+        ];
+        if self.options.model.is_some() {
+            responses.push(self.model_response());
+        }
+        responses.extend([
+            self.empty_log(sync_sequence),
+            self.session_response(&self.session),
+            self.location_response(),
+        ]);
+        responses
+    }
+
+    fn user_message(&self, intent: &OperationIntent) -> Value {
+        assert_eq!(intent.native_root_id.as_deref(), Some(self.root.as_str()));
+        json!({
+            "id":intent.native_input_id,
+            "type":"user",
+            "time":{"created":1},
+            "text":"Documented task input",
+            "metadata":{"eliot":intent.marker}
+        })
+    }
+
+    fn input_message_response(&self, intent: &OperationIntent, message: &Value) -> Value {
+        json!({
+            "json_path":format!(
+                "/api/session/{}/message/{}", self.root, intent.native_input_id.as_deref().unwrap()
+            ),
+            "json_payload":{"data":message}
+        })
+    }
+
     fn saved_intent(&self, method: &str) -> OperationIntent {
         let mut command = self.command.clone();
         command.method = method.into();
@@ -843,18 +899,13 @@ async fn native_071_empty_root_readback_never_proves_input_admission_or_send_com
         assert!(evidence.prompted_sequence.is_none());
         assert_eq!(server.await.unwrap(), vec![Value::Null]);
         for input_status in [false, true] {
-            let (client, server) = http_fixture(
-                vec![
-                    fixture.session_response(&fixture.session),
-                    fixture.location_response(),
-                    fixture.empty_log(true),
-                    fixture.session_response(&fixture.session),
-                    fixture.location_response(),
-                    history.clone(),
-                ],
-                "GET",
-            )
-            .await;
+            let mut responses = fixture.input_status_prefix(true);
+            responses.push(if input_status {
+                fixture.input_message_response(&intent, &Value::Null)
+            } else {
+                history.clone()
+            });
+            let (client, server) = http_fixture(responses, "GET").await;
             let result = if input_status {
                 client
                     .read_input_status(&intent, &fixture.options)
@@ -874,6 +925,203 @@ async fn native_071_empty_root_readback_never_proves_input_admission_or_send_com
             assert_eq!(server.await.unwrap(), vec![Value::Null; 6]);
         }
     }
+}
+
+#[tokio::test]
+async fn native_072_input_status_reads_exact_user_without_input_history_events() {
+    for pinned_model in [false, true] {
+        for sync_sequence in [false, true] {
+            for method in ["task.dispatch", "agent.send"] {
+                let fixture = RootReadbackFixture::new(pinned_model);
+                let intent = fixture.saved_intent(method);
+                let message = fixture.user_message(&intent);
+                let mut responses = fixture.input_status_prefix(sync_sequence);
+                responses.extend([
+                    fixture.input_message_response(&intent, &message),
+                    fixture.input_message_response(&intent, &message),
+                ]);
+                let requests = responses.len();
+                let (mut client, server) = http_fixture(responses, "GET").await;
+                client.version = "2.0.31".into();
+                let evidence = client
+                    .read_input_status(&intent, &fixture.options)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    evidence.input_message_sha256,
+                    digest_json(&message).unwrap()
+                );
+                // Each request has an exact path: only root-proof log sync is
+                // expected, never an after-cursor input-history query or POST.
+                assert_eq!(server.await.unwrap(), vec![Value::Null; requests]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_072_input_status_rejects_foreign_user_identity_marker_and_text() {
+    for (pointer, replacement) in [
+        ("/id", json!("msg_swarm_foreign")),
+        ("/sessionID", json!("ses_swarm_foreign")),
+        ("/type", json!("assistant")),
+        ("/text", json!("documented task input")),
+        ("/metadata", Value::Null),
+        ("/metadata/eliot/binding", json!("foreign-binding")),
+        ("/metadata/eliot/generation", json!(2)),
+        ("/metadata/eliot/operation", json!("foreign-operation")),
+        ("/metadata/eliot/input_sha256", json!("f".repeat(64))),
+        ("/metadata/eliot/native_delivery", json!("steer")),
+    ] {
+        let fixture = RootReadbackFixture::new(false);
+        let intent = fixture.saved_intent("agent.send");
+        let mut message = fixture.user_message(&intent);
+        message["sessionID"] = json!(fixture.root);
+        *message.pointer_mut(pointer).unwrap() = replacement;
+        let mut responses = fixture.input_status_prefix(false);
+        responses.push(fixture.input_message_response(&intent, &message));
+        let requests = responses.len();
+        let (client, server) = http_fixture(responses, "GET").await;
+        assert_eq!(
+            client
+                .read_input_status(&intent, &fixture.options)
+                .await
+                .unwrap_err()
+                .code,
+            "NATIVE_EVIDENCE_UNAVAILABLE",
+            "user field {pointer}"
+        );
+        assert_eq!(server.await.unwrap(), vec![Value::Null; requests]);
+    }
+}
+
+#[tokio::test]
+async fn native_072_input_status_rejects_changed_immutable_intent_before_gets() {
+    for field in [
+        "scope", "route", "root", "input", "delivery", "marker", "receipt", "model", "method",
+    ] {
+        let fixture = RootReadbackFixture::new(false);
+        let mut intent = fixture.saved_intent("agent.send");
+        match field {
+            "scope" => intent.native_scope_key = "foreign-scope".into(),
+            "route" => intent.route_sha256 = "f".repeat(64),
+            "root" => intent.native_root_id = Some("ses_swarm_foreign".into()),
+            "input" => intent.native_input_id = Some("msg_swarm_foreign".into()),
+            "delivery" => intent.marker["native_delivery"] = json!("steer"),
+            "marker" => intent.marker["unexpected"] = json!(true),
+            "receipt" => intent.module_receipt.binding_generation = 2,
+            "model" => intent.model = json!({}),
+            "method" => intent.method = "native.opencode.loop_step".into(),
+            _ => unreachable!(),
+        }
+        let (client, server) = http_fixture(Vec::new(), "GET").await;
+        assert_eq!(
+            client
+                .read_input_status(&intent, &fixture.options)
+                .await
+                .unwrap_err()
+                .code,
+            "NATIVE_IDENTITY_MISMATCH",
+            "intent field {field}"
+        );
+        assert!(server.await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn native_072_input_status_rejects_foreign_root_scope_and_pinned_model() {
+    for (pointer, replacement) in [
+        ("/id", json!("ses_swarm_foreign")),
+        ("/parentID", json!("ses_swarm_foreign")),
+        ("/fork", json!({"sessionID":"ses_swarm_foreign"})),
+        ("/metadata/eliot/binding", json!("foreign-binding")),
+        ("/metadata/eliot/generation", json!(2)),
+        ("/location/directory", json!("foreign-directory")),
+        ("/model/id", json!("foreign-model")),
+        ("/model/providerID", json!("foreign-provider")),
+        ("/model/variant", json!("foreign-variant")),
+    ] {
+        let fixture = RootReadbackFixture::new(true);
+        let intent = fixture.saved_intent("agent.send");
+        let mut session = fixture.session.clone();
+        *session.pointer_mut(pointer).unwrap() = replacement;
+        let mut responses = vec![fixture.session_response(&session)];
+        if pointer != "/id" {
+            responses.push(fixture.location_response());
+        }
+        let requests = responses.len();
+        let (client, server) = http_fixture(responses, "GET").await;
+        assert_eq!(
+            client
+                .read_input_status(&intent, &fixture.options)
+                .await
+                .unwrap_err()
+                .code,
+            if pointer == "/id" {
+                "NATIVE_SCHEMA_ERROR"
+            } else {
+                "NATIVE_EVIDENCE_UNAVAILABLE"
+            },
+            "root field {pointer}"
+        );
+        assert_eq!(server.await.unwrap(), vec![Value::Null; requests]);
+    }
+}
+
+#[tokio::test]
+async fn native_072_input_status_requires_root_proof_and_selected_location() {
+    for second_root in [false, true] {
+        let fixture = RootReadbackFixture::new(false);
+        let intent = fixture.saved_intent("agent.send");
+        let (responses, code) = if second_root {
+            let mut responses = fixture.input_status_prefix(false);
+            responses[3]["json_payload"]["data"]["metadata"]["eliot"]["generation"] = json!(2);
+            (responses, "DURABLE_EVENT_PERSISTENCE_UNAVAILABLE")
+        } else {
+            let mut location = fixture.location_response();
+            location["json_payload"]["directory"] = json!("relative-location");
+            (
+                vec![fixture.session_response(&fixture.session), location],
+                "NATIVE_LOCATION_MISMATCH",
+            )
+        };
+        let requests = responses.len();
+        let (client, server) = http_fixture(responses, "GET").await;
+        assert_eq!(
+            client
+                .read_input_status(&intent, &fixture.options)
+                .await
+                .unwrap_err()
+                .code,
+            code
+        );
+        assert_eq!(server.await.unwrap(), vec![Value::Null; requests]);
+    }
+}
+
+#[tokio::test]
+async fn native_072_input_status_rejects_transient_user_projection() {
+    let fixture = RootReadbackFixture::new(false);
+    let intent = fixture.saved_intent("agent.send");
+    let first = fixture.user_message(&intent);
+    let mut second = first.clone();
+    second["time"]["created"] = json!(2);
+    let mut responses = fixture.input_status_prefix(false);
+    responses.extend([
+        fixture.input_message_response(&intent, &first),
+        fixture.input_message_response(&intent, &second),
+    ]);
+    let requests = responses.len();
+    let (client, server) = http_fixture(responses, "GET").await;
+    assert_eq!(
+        client
+            .read_input_status(&intent, &fixture.options)
+            .await
+            .unwrap_err()
+            .code,
+        "NATIVE_EVIDENCE_UNAVAILABLE"
+    );
+    assert_eq!(server.await.unwrap(), vec![Value::Null; requests]);
 }
 
 #[test]

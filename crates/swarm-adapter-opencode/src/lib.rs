@@ -5,6 +5,8 @@ mod app320_connected_consumer;
 mod config;
 #[cfg(test)]
 mod control_consumer_tests;
+#[cfg(test)]
+mod input_status_delivery_tests;
 mod journal;
 mod mcp_plugin;
 mod module_link;
@@ -1366,8 +1368,6 @@ fn input_status_result_page(
         "native_session_id":target_status.native_session_id,
         "native_input_id":target_status.native_input_id,
         "input_message_sha256":input_message_sha256,
-        "assistant_result_correlation":"not_exposed",
-        "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
         "task_completion":"unknown",
         "execution_complete":false
     }))?;
