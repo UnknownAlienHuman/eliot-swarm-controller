@@ -2364,7 +2364,11 @@ mod opencode_schema_projection_tests {
             let options = v4_defaults_options();
             let config = project(&descriptor, &options).unwrap();
 
-            assert_eq!(config.values.len(), 3, "artifact version {artifact_version}");
+            assert_eq!(
+                config.values.len(),
+                3,
+                "artifact version {artifact_version}"
+            );
             for (key, option) in [
                 ("OPENCODE_SERVICE_ID", "service_id"),
                 ("OPENCODE_CONNECTION_FILE", "connection_file"),
@@ -2393,7 +2397,10 @@ mod opencode_schema_projection_tests {
 
         for (pointer, replacement) in [
             ("/module_id", json!("eliot.other.v2")),
-            ("/artifact/artifact_id", json!("eliot-opencode-v2.rust-http.2")),
+            (
+                "/artifact/artifact_id",
+                json!("eliot-opencode-v2.rust-http.2"),
+            ),
             ("/config_schema/schema_id", json!("other-native-options")),
             ("/config_schema/version", json!("5")),
             (
@@ -2404,7 +2411,8 @@ mod opencode_schema_projection_tests {
         ] {
             let mut wrong_descriptor = descriptor.clone();
             *wrong_descriptor.pointer_mut(pointer).unwrap() = replacement;
-            let wrong_descriptor: ModuleDescriptor = serde_json::from_value(wrong_descriptor).unwrap();
+            let wrong_descriptor: ModuleDescriptor =
+                serde_json::from_value(wrong_descriptor).unwrap();
             assert_eq!(
                 project(&wrong_descriptor, &options).unwrap_err().code,
                 "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
@@ -2416,7 +2424,8 @@ mod opencode_schema_projection_tests {
     #[test]
     fn opencode_legacy_mapper_retains_artifact_release_gates() {
         for schema_version in ["1", "2", "3"] {
-            let mut descriptor = serde_json::to_value(descriptor_for_schema(schema_version)).unwrap();
+            let mut descriptor =
+                serde_json::to_value(descriptor_for_schema(schema_version)).unwrap();
             descriptor["artifact"]["version"] = json!("0.7.1");
             let descriptor: ModuleDescriptor = serde_json::from_value(descriptor).unwrap();
             let options = if schema_version == "3" {
