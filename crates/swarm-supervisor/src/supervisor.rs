@@ -263,6 +263,26 @@ pub struct SupervisorStatus {
 }
 
 impl SupervisorStatus {
+    fn has_proven_terminal(&self) -> bool {
+        matches!(
+            &self.lifecycle,
+            LifecycleState::Completed { .. }
+                | LifecycleState::ProcessExited {
+                    exit_proven: true,
+                    ..
+                }
+        )
+    }
+
+    fn set_prelaunch_lifecycle(&mut self, lifecycle: LifecycleState) {
+        // Demand, admission and restart accounting describe whether another
+        // launch may begin. They do not retract the exact prior departure.
+        // allocate_worker_boot replaces that attempt only after launch fences.
+        if !self.has_proven_terminal() {
+            self.lifecycle = lifecycle;
+        }
+    }
+
     fn matches_current_hello(&self, boot_id: &str) -> bool {
         self.worker_boot_id.as_deref() == Some(boot_id)
             && matches!(
@@ -1049,6 +1069,12 @@ struct Service {
     final_owner_timeout: Mutex<Option<Duration>>,
 }
 
+#[derive(Clone, Copy)]
+enum LifecycleRunExit {
+    Stopped,
+    WaitingForDemand,
+}
+
 struct RetainedHelperChild {
     child: Child,
     pid: Option<u32>,
@@ -1330,12 +1356,14 @@ impl Service {
                 | LifecycleState::OwnerIdentityUnknown
                 | LifecycleState::ProcessIdentityUnknown { .. }
         );
-        if matches!(
-            &current,
-            LifecycleState::Isolated { .. }
-                | LifecycleState::OwnerIdentityUnknown
-                | LifecycleState::ProcessIdentityUnknown { .. }
-        ) && !has_custody
+        if (self.scope_quarantined.load(Ordering::Acquire)
+            || matches!(
+                &current,
+                LifecycleState::Isolated { .. }
+                    | LifecycleState::OwnerIdentityUnknown
+                    | LifecycleState::ProcessIdentityUnknown { .. }
+            ))
+            && !has_custody
             && !ownership_pending
         {
             return Err(Error::new(
@@ -1373,8 +1401,8 @@ impl Service {
         let service = self.clone();
         *runner = Some(tokio::spawn(async move {
             let cleanup = service.clone();
-            service.run_lifecycle().await;
-            cleanup.after_runner_exit().await;
+            let exit = service.run_lifecycle().await;
+            cleanup.after_runner_exit(exit).await;
         }));
         Ok(())
     }
@@ -1563,7 +1591,10 @@ impl Service {
 
     // This cleanup may spawn another lifecycle task. A boxed Send boundary
     // avoids a recursive opaque-future type while preserving the runner mutex.
-    fn after_runner_exit(self: &Arc<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn after_runner_exit(
+        self: &Arc<Self>,
+        exit: LifecycleRunExit,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let mut runner = self.runner.lock().await;
             *runner = None;
@@ -1579,8 +1610,12 @@ impl Service {
                     self.admission.borrow().clone(),
                     AdmissionState::Closed { .. }
                 ) && !custody_pending)
+                || (self.scope_quarantined.load(Ordering::Acquire)
+                    && !custody_pending
+                    && !owner_pending)
                 || (!custody_pending
                     && !owner_pending
+                    && !matches!(exit, LifecycleRunExit::WaitingForDemand)
                     && !matches!(
                         &self.status.borrow().lifecycle,
                         LifecycleState::WaitingForDemand | LifecycleState::WaitingForKernel
@@ -1598,8 +1633,8 @@ impl Service {
             let service = self.clone();
             *runner = Some(tokio::spawn(async move {
                 let cleanup = service.clone();
-                service.run_lifecycle().await;
-                cleanup.after_runner_exit().await;
+                let exit = service.run_lifecycle().await;
+                cleanup.after_runner_exit(exit).await;
             }));
         })
     }
@@ -1882,9 +1917,9 @@ impl Service {
                 .as_ref()
                 .map(|failure| failure.code.clone())
                 .unwrap_or_else(|| error_code.to_owned());
-            status.lifecycle = LifecycleState::Isolated {
+            status.set_prelaunch_lifecycle(LifecycleState::Isolated {
                 reason: "module supervisor observation was permanently rejected".to_owned(),
-            };
+            });
             status.readback_required = true;
             status.last_failure = Some(FailureSummary {
                 code,
@@ -1895,7 +1930,7 @@ impl Service {
         Ok(())
     }
 
-    async fn run_lifecycle(self: Arc<Self>) {
+    async fn run_lifecycle(self: Arc<Self>) -> LifecycleRunExit {
         let policy = self.descriptor.restart;
         // A fresh binding has no scope directory yet. Verify/create the private
         // path before either reading its history or persisting the first budget.
@@ -1910,12 +1945,12 @@ impl Service {
                     "persisted restart budget is invalid or unavailable",
                 );
                 self.update_status(|status| {
-                    status.lifecycle = LifecycleState::Isolated {
+                    status.set_prelaunch_lifecycle(LifecycleState::Isolated {
                         reason: "restart history cannot be verified".to_owned(),
-                    };
+                    });
                     status.restart.exhausted = true;
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
         };
         if let Err(error) = self.reconcile_retained_helper_child().await {
@@ -1935,7 +1970,7 @@ impl Service {
                     status.lifecycle = LifecycleState::OwnerIdentityUnknown;
                 }
             });
-            return;
+            return LifecycleRunExit::Stopped;
         }
         let mut demand_epoch = self.demand_epoch.subscribe();
         let mut admission = self.admission.subscribe();
@@ -1944,38 +1979,40 @@ impl Service {
         loop {
             if self.scope_quarantined.load(Ordering::Acquire) {
                 self.update_status(|status| {
-                    status.lifecycle = LifecycleState::Isolated {
+                    status.set_prelaunch_lifecycle(LifecycleState::Isolated {
                         reason: "module supervisor observation was permanently rejected".to_owned(),
-                    };
+                    });
                     status.readback_required = true;
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
             if !self.has_demand() {
                 self.update_status(|status| {
-                    if !matches!(
-                        status.lifecycle,
-                        LifecycleState::OwnerGroupRetained { .. }
-                            | LifecycleState::OwnerIdentityUnknown
-                            | LifecycleState::ProcessIdentityUnknown { .. }
-                    ) {
+                    if !status.has_proven_terminal()
+                        && !matches!(
+                            status.lifecycle,
+                            LifecycleState::OwnerGroupRetained { .. }
+                                | LifecycleState::OwnerIdentityUnknown
+                                | LifecycleState::ProcessIdentityUnknown { .. }
+                        )
+                    {
                         status.lifecycle = LifecycleState::WaitingForDemand;
                         status.worker = None;
                         status.owner = None;
                         status.worker_boot_id = None;
                     }
                 });
-                return;
+                return LifecycleRunExit::WaitingForDemand;
             }
             if matches!(admission.borrow().clone(), AdmissionState::Closed { .. }) {
                 self.update_status(|status| {
                     status.admission = admission.borrow().clone();
-                    status.lifecycle = LifecycleState::WaitingForKernel;
+                    status.set_prelaunch_lifecycle(LifecycleState::WaitingForKernel);
                 });
                 tokio::select! {
                     _ = demand_epoch.changed() => {},
                     changed = admission.changed() => {
-                        if changed.is_err() { return; }
+                        if changed.is_err() { return LifecycleRunExit::Stopped; }
                     }
                 }
                 continue;
@@ -1987,12 +2024,12 @@ impl Service {
                 Err(error) => {
                     self.record_failure(&error.code, "system clock cannot verify restart policy");
                     self.update_status(|status| {
-                        status.lifecycle = LifecycleState::Isolated {
+                        status.set_prelaunch_lifecycle(LifecycleState::Isolated {
                             reason: "restart policy time cannot be verified".to_owned(),
-                        };
+                        });
                         status.restart.exhausted = true;
                     });
-                    return;
+                    return LifecycleRunExit::Stopped;
                 }
             };
             prune_starts(&mut starts, policy.window_ms, now);
@@ -2000,22 +2037,26 @@ impl Service {
                 self.update_status(|status| {
                     status.restart.starts_in_window = starts.len();
                     status.restart.exhausted = true;
-                    status.lifecycle = LifecycleState::Isolated {
+                    status.set_prelaunch_lifecycle(LifecycleState::Isolated {
                         reason: "restart budget exhausted; a changed valid descriptor is required"
                             .to_owned(),
-                    };
+                    });
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
+            self.update_status(|status| {
+                status.restart.starts_in_window = starts.len();
+                status.restart.exhausted = false;
+            });
             if !starts.is_empty() {
                 let delay = jittered_delay(&policy, starts.len().saturating_sub(1));
                 let deadline = Instant::now() + delay;
                 self.update_status(|status| {
                     status.restart.starts_in_window = starts.len();
                     status.restart.last_delay_ms = Some(delay.as_millis() as u64);
-                    status.lifecycle = LifecycleState::RestartBackoff {
+                    status.set_prelaunch_lifecycle(LifecycleState::RestartBackoff {
                         delay_ms: delay.as_millis() as u64,
-                    };
+                    });
                 });
                 loop {
                     if !self.has_demand()
@@ -2028,15 +2069,15 @@ impl Service {
                         _ = demand_epoch.changed() => {},
                         _ = recovery.changed() => {},
                         changed = admission.changed() => {
-                            if changed.is_err() { return; }
+                            if changed.is_err() { return LifecycleRunExit::Stopped; }
                         }
                     }
                 }
                 if !self.has_demand() {
                     self.update_status(|status| {
-                        status.lifecycle = LifecycleState::WaitingForDemand
+                        status.set_prelaunch_lifecycle(LifecycleState::WaitingForDemand)
                     });
-                    return;
+                    return LifecycleRunExit::WaitingForDemand;
                 }
                 if matches!(admission.borrow().clone(), AdmissionState::Closed { .. }) {
                     continue;
@@ -2049,16 +2090,16 @@ impl Service {
                     "module state directory is unavailable",
                 );
                 self.update_status(|status| {
-                    status.lifecycle = LifecycleState::Isolated {
+                    status.set_prelaunch_lifecycle(LifecycleState::Isolated {
                         reason: "module state directory could not be prepared".to_owned(),
-                    };
+                    });
                     status.restart.exhausted = true;
                     status.last_failure = Some(FailureSummary {
                         code: error.code,
                         detail: "module state directory could not be prepared".to_owned(),
                     });
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
             let departed_prior_owner = match self.wait_for_prior_owner_to_depart().await {
                 Ok(owner) => owner,
@@ -2074,7 +2115,7 @@ impl Service {
                         status.readback_required = true;
                     });
                     self.readback_required.store(true, Ordering::Release);
-                    return;
+                    return LifecycleRunExit::Stopped;
                 }
             };
             if !self.has_demand()
@@ -2088,13 +2129,13 @@ impl Service {
                     "launch config final environment name failed before restart accounting",
                 );
                 self.update_status(|status| {
-                    status.lifecycle = LifecycleState::Isolated {
+                    status.set_prelaunch_lifecycle(LifecycleState::Isolated {
                         reason: "launch config produces an invalid final environment name"
                             .to_owned(),
-                    };
+                    });
                     status.restart.exhausted = true;
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
             if let Err(error) = self.clear_prior_helper_result() {
                 self.record_failure(
@@ -2106,7 +2147,7 @@ impl Service {
                     status.readback_required = true;
                 });
                 self.readback_required.store(true, Ordering::Release);
-                return;
+                return LifecycleRunExit::Stopped;
             }
 
             // The helper requires the same ownership marker before any other
@@ -2117,12 +2158,12 @@ impl Service {
                 Err(error) => {
                     self.record_failure(&error.code, "module state marker could not be verified");
                     self.update_status(|status| {
-                        status.lifecycle = LifecycleState::Isolated {
+                        status.set_prelaunch_lifecycle(LifecycleState::Isolated {
                             reason: "module state marker initialization failed".to_owned(),
-                        };
+                        });
                         status.restart.exhausted = true;
                     });
-                    return;
+                    return LifecycleRunExit::Stopped;
                 }
             }
 
@@ -2140,7 +2181,7 @@ impl Service {
                     };
                     status.restart.exhausted = true;
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
             if let Err(error) = self.write_launch_attempt(&boot_id, None) {
                 self.record_failure(&error.code, "launch intent could not be persisted safely");
@@ -2150,7 +2191,7 @@ impl Service {
                     };
                     status.restart.exhausted = true;
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
 
             let (mut helper, _plan_path) = match self.spawn_owner_helper(&boot_id) {
@@ -2167,7 +2208,7 @@ impl Service {
                             };
                             status.restart.exhausted = true;
                         });
-                        return;
+                        return LifecycleRunExit::Stopped;
                     }
                     if let Err(cleanup_error) = self.remove_launch_attempt() {
                         self.record_failure(
@@ -2181,7 +2222,7 @@ impl Service {
                             };
                             status.restart.exhausted = true;
                         });
-                        return;
+                        return LifecycleRunExit::Stopped;
                     }
                     self.record_failure(&error.code, "module-owner helper could not be started");
                     self.update_status(|status| {
@@ -2216,7 +2257,7 @@ impl Service {
                     "MODULE_OWNER_IDENTITY",
                 )
                 .await;
-                return;
+                return LifecycleRunExit::Stopped;
             };
             let helper_identity = match capture_identity(pid) {
                 Ok(identity) => identity,
@@ -2238,7 +2279,7 @@ impl Service {
                         &error.code,
                     )
                     .await;
-                    return;
+                    return LifecycleRunExit::Stopped;
                 }
             };
             if let Err(error) = self.write_launch_attempt(&boot_id, Some(&helper_identity)) {
@@ -2259,7 +2300,7 @@ impl Service {
                     &error.code,
                 )
                 .await;
-                return;
+                return LifecycleRunExit::Stopped;
             }
             if !self.image_matches_helper(&helper_identity) {
                 self.record_failure(
@@ -2279,7 +2320,7 @@ impl Service {
                     "MODULE_OWNER_HELPER_MISMATCH",
                 )
                 .await;
-                return;
+                return LifecycleRunExit::Stopped;
             }
 
             self.update_status(|status| {
@@ -2308,7 +2349,7 @@ impl Service {
                         error,
                     )
                     .await;
-                    return;
+                    return LifecycleRunExit::Stopped;
                 }
             };
             if !attempt.safe_to_replace {
@@ -2337,7 +2378,7 @@ impl Service {
                         .unwrap_or("MODULE_LAUNCH_RESULT_MISSING"),
                 )
                 .await;
-                return;
+                return LifecycleRunExit::Stopped;
             }
             if let Err(error) = self.remove_plan(&boot_id) {
                 self.record_failure(
@@ -2353,7 +2394,7 @@ impl Service {
                     status.worker = attempt.worker.clone();
                     status.readback_required = true;
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
             if let Err(error) = self.remove_launch_attempt() {
                 self.record_failure(
@@ -2367,7 +2408,7 @@ impl Service {
                     status.worker = attempt.worker.clone();
                     status.readback_required = true;
                 });
-                return;
+                return LifecycleRunExit::Stopped;
             }
             if attempt.healthy_duration.is_some_and(|duration| {
                 duration >= Duration::from_millis(policy.reset_after_healthy_ms)
@@ -2388,7 +2429,7 @@ impl Service {
                         };
                         status.restart.exhausted = true;
                     });
-                    return;
+                    return LifecycleRunExit::Stopped;
                 }
             }
 
@@ -2398,55 +2439,13 @@ impl Service {
                     self.descriptor.lifecycle,
                     LifecycleOwnership::OwnedService | LifecycleOwnership::ExternalAttach
                 );
-            let needs_operation_readback = !attempt.exit.success() || restart_needed;
-            self.readback_required
-                .store(needs_operation_readback, Ordering::Release);
-            self.update_status(|status| {
-                status.lifecycle = if self.scope_quarantined.load(Ordering::Acquire) {
-                    LifecycleState::Isolated {
-                        reason: "module supervisor observation was permanently rejected".to_owned(),
-                    }
-                } else if attempt.exit.success()
-                    && !restart_needed
-                    && attempt.family_departure_proven
-                {
-                    LifecycleState::Completed {
-                        exit_code: attempt.exit.code(),
-                    }
-                } else {
-                    LifecycleState::ProcessExited {
-                        exit_code: attempt.exit.code(),
-                        exit_proven: attempt.family_departure_proven,
-                    }
-                };
-                status.owner = Some(helper_identity.clone());
-                status.worker = attempt.worker.clone();
-                status.worker_boot_id = Some(boot_id.clone());
-                status.worker_diagnostic_code = attempt.worker_diagnostic_code.clone();
-                status.readback_required = needs_operation_readback;
-                status.effect_certainty = attempt.effect_certainty;
-                status.failure_stage = attempt
-                    .failure_stage
-                    .as_deref()
-                    .and_then(ModuleFailureStage::from_helper);
-                status.restart.starts_in_window = starts.len();
-                status.restart.exhausted = false;
-                if needs_operation_readback {
-                    status.last_failure = Some(FailureSummary {
-                        code: attempt
-                            .failure_code
-                            .clone()
-                            .unwrap_or_else(|| "MODULE_EXITED".to_owned()),
-                        detail: if let Some(stage) = attempt.failure_stage.as_deref() {
-                            format!("helper certified no adapter start at {stage}; exact owner-family departure is proven and replacement begins in reconciliation-only mode")
-                        } else if restart_needed {
-                            "adapter exited while demand remained; exact owner-family departure is proven and replacement starts in reconciliation-only mode".to_owned()
-                        } else {
-                            "optional adapter exited; its outcome remains unknown until scoped Store readback or module.hello recovery".to_owned()
-                        },
-                    });
-                }
-            });
+            self.record_owner_helper_exit(
+                &attempt,
+                &helper_identity,
+                &boot_id,
+                starts.len(),
+                restart_needed,
+            );
             if restart_needed {
                 // A replacement adapter always begins at module.hello. The
                 // Store retains uncertain Operations as Unknown. This lifecycle
@@ -2454,9 +2453,80 @@ impl Service {
                 // disconnect as proof that the process or owner has exited.
                 continue;
             }
-            return;
+            // An owned service stopped only because demand was absent at the
+            // sampled restart decision. A newly admitted lease may already be
+            // waiting for runner cleanup; keep this scheduling fact separate
+            // from the retained terminal evidence. Finite jobs stay stopped.
+            if !self.scope_quarantined.load(Ordering::Acquire)
+                && matches!(
+                    self.descriptor.lifecycle,
+                    LifecycleOwnership::OwnedService | LifecycleOwnership::ExternalAttach
+                )
+            {
+                return LifecycleRunExit::WaitingForDemand;
+            }
+            return LifecycleRunExit::Stopped;
         }
     }
+    fn record_owner_helper_exit(
+        &self,
+        attempt: &OwnerHelperExit,
+        helper_identity: &ProcessIdentity,
+        boot_id: &str,
+        starts_in_window: usize,
+        restart_needed: bool,
+    ) {
+        let needs_operation_readback = !attempt.exit.success() || restart_needed;
+        self.readback_required
+            .store(needs_operation_readback, Ordering::Release);
+        self.update_status(|status| {
+            status.lifecycle = if self.scope_quarantined.load(Ordering::Acquire) {
+                LifecycleState::Isolated {
+                    reason: "module supervisor observation was permanently rejected".to_owned(),
+                }
+            } else if attempt.exit.success()
+                && !restart_needed
+                && attempt.family_departure_proven
+            {
+                LifecycleState::Completed {
+                    exit_code: attempt.exit.code(),
+                }
+            } else {
+                LifecycleState::ProcessExited {
+                    exit_code: attempt.exit.code(),
+                    exit_proven: attempt.family_departure_proven,
+                }
+            };
+            status.owner = Some(helper_identity.clone());
+            status.worker = attempt.worker.clone();
+            status.worker_boot_id = Some(boot_id.to_owned());
+            status.worker_diagnostic_code = attempt.worker_diagnostic_code.clone();
+            status.readback_required = needs_operation_readback;
+            status.effect_certainty = attempt.effect_certainty;
+            status.failure_stage = attempt
+                .failure_stage
+                .as_deref()
+                .and_then(ModuleFailureStage::from_helper);
+            status.restart.starts_in_window = starts_in_window;
+            status.restart.exhausted = false;
+            if needs_operation_readback {
+                status.last_failure = Some(FailureSummary {
+                    code: attempt
+                        .failure_code
+                        .clone()
+                        .unwrap_or_else(|| "MODULE_EXITED".to_owned()),
+                    detail: if let Some(stage) = attempt.failure_stage.as_deref() {
+                        format!("helper certified no adapter start at {stage}; exact owner-family departure is proven and replacement begins in reconciliation-only mode")
+                    } else if restart_needed {
+                        "adapter exited while demand remained; exact owner-family departure is proven and replacement starts in reconciliation-only mode".to_owned()
+                    } else {
+                        "optional adapter exited; its outcome remains unknown until scoped Store readback or module.hello recovery".to_owned()
+                    },
+                });
+            }
+        });
+    }
+
     fn spawn_owner_helper(&self, boot_id: &str) -> Result<(Child, PathBuf)> {
         let expected_hash = self
             .descriptor
@@ -5086,14 +5156,18 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     impl ConnectedOwnerFixture {
         async fn new() -> Self {
-            Self::new_inner(false).await
+            Self::new_inner(false, false).await
         }
 
         async fn new_with_grandchild() -> Self {
-            Self::new_inner(true).await
+            Self::new_inner(true, false).await
         }
 
-        async fn new_inner(with_grandchild: bool) -> Self {
+        async fn new_successful() -> Self {
+            Self::new_inner(false, true).await
+        }
+
+        async fn new_inner(with_grandchild: bool, successful_exit: bool) -> Self {
             let startup = StartupFixture::new_with_current_executable();
             startup.prepare_accounting();
             let boot_id = Uuid::new_v4().to_string();
@@ -5113,6 +5187,10 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("ELIOT_SWARM_SUPERVISOR_OWNER_FIXTURE", "1")
+                .env(
+                    "ELIOT_SWARM_SUPERVISOR_OWNER_FIXTURE_SUCCESS",
+                    if successful_exit { "1" } else { "0" },
+                )
                 .env("ELIOT_SWARM_SUPERVISOR_OWNER_STATE_DIR", state_dir)
                 .env("ELIOT_SWARM_SUPERVISOR_OWNER_BOOT_ID", &boot_id)
                 .env(
@@ -5425,7 +5503,13 @@ mod tests {
             std::process::exit(23);
         }
         worker.stop();
-        std::process::exit(23);
+        std::process::exit(
+            if std::env::var("ELIOT_SWARM_SUPERVISOR_OWNER_FIXTURE_SUCCESS").as_deref() == Ok("1") {
+                0
+            } else {
+                23
+            },
+        );
     }
 
     #[cfg(windows)]
@@ -5951,6 +6035,365 @@ mod tests {
                 .collect(),
             })
             .unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn terminal_retention_lease(service: &Arc<Service>) -> DemandLease {
+        let demand_key = "terminal-retention-demand".to_owned();
+        lock(&service.demands).insert(demand_key.clone(), 1);
+        DemandLease {
+            service: service.clone(),
+            demand_key,
+            released: false,
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn assert_terminal_retention(before: &SupervisorStatus, after: &SupervisorStatus) {
+        // Exact predicate used by the connected Core retirement wait in
+        // module_prelaunch_observation_tests.rs. Do not substitute helper exit,
+        // demand absence, a NotStarted result, or a synthetic empty-family flag.
+        assert!(matches!(
+            &after.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            } | LifecycleState::Completed { .. }
+        ));
+        assert_eq!(
+            serde_json::to_value(&after.lifecycle).unwrap(),
+            serde_json::to_value(&before.lifecycle).unwrap(),
+        );
+        assert_eq!(after.worker_boot_id, before.worker_boot_id);
+        assert!(after.worker_boot_id.is_some());
+        assert!(after.owner.is_some() && after.worker.is_some());
+        assert_eq!(
+            serde_json::to_value(&after.owner).unwrap(),
+            serde_json::to_value(&before.owner).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(&after.worker).unwrap(),
+            serde_json::to_value(&before.worker).unwrap(),
+        );
+        assert_eq!(after.effect_certainty, before.effect_certainty);
+        assert_eq!(after.readback_required, before.readback_required);
+        assert_eq!(after.unknown_operation_ids, before.unknown_operation_ids);
+        assert_eq!(
+            after.unknown_operation_count,
+            before.unknown_operation_count
+        );
+        assert_eq!(
+            after.unknown_operation_ids_truncated,
+            before.unknown_operation_ids_truncated
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    async fn terminal_retention_monitor_exit(
+        fixture: &mut ConnectedOwnerFixture,
+        restart_needed: bool,
+    ) {
+        let service = fixture.startup.service.clone();
+        service
+            .write_restart_history(&VecDeque::from([unix_time_ms().unwrap()]))
+            .unwrap();
+        // Production captures this exact query while the helper is live. Keep
+        // it before releasing the fixture, including on Windows.
+        service.remember_owner_family_query(
+            &fixture.owner_receipt["process"],
+            fixture.owner_receipt["token"].as_str().unwrap(),
+        );
+        let mut helper = fixture.helper.take().expect("exact helper Child");
+        fixture.release();
+        let attempt = time::timeout(
+            Duration::from_secs(5),
+            service.monitor_owner_helper(
+                &mut helper,
+                &fixture.boot_id,
+                &fixture.helper_identity,
+                None,
+                Instant::now() + Duration::from_secs(5),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(attempt.exit.success());
+        assert!(attempt.safe_to_replace && attempt.family_departure_proven);
+        service.record_owner_helper_exit(
+            &attempt,
+            &fixture.helper_identity,
+            &fixture.boot_id,
+            1,
+            restart_needed,
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn terminal_retention_completed_survives_no_demand_lease_drop() {
+        let mut fixture = ConnectedOwnerFixture::new_successful().await;
+        let service = fixture.startup.service.clone();
+        retain_hello_fixture_operations(&service);
+        let lease = terminal_retention_lease(&service);
+        drop(lease);
+        terminal_retention_monitor_exit(&mut fixture, false).await;
+        let before = service.current_status();
+        assert!(matches!(before.lifecycle, LifecycleState::Completed { .. }));
+        let launch_before = fs::read(service.state_dir.join("launch-attempt.json")).unwrap();
+        let history_before = fs::read(service.state_dir.join("restart-history.json")).unwrap();
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
+        assert_terminal_retention(&before, &service.current_status());
+        assert!(!service.has_demand());
+        assert!(aggregate_has_obligations(&service));
+        assert!(!service.can_replace_descriptor().await);
+        assert_eq!(
+            fs::read(service.state_dir.join("launch-attempt.json")).unwrap(),
+            launch_before
+        );
+        assert_eq!(
+            fs::read(service.state_dir.join("restart-history.json")).unwrap(),
+            history_before
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn terminal_retention_monitored_exit_survives_sampled_restart_then_lease_drop() {
+        let mut fixture = ConnectedOwnerFixture::new_successful().await;
+        let service = fixture.startup.service.clone();
+        retain_hello_fixture_operations(&service);
+        let lease = terminal_retention_lease(&service);
+        let restart_needed = service.has_demand();
+        assert!(restart_needed);
+        terminal_retention_monitor_exit(&mut fixture, restart_needed).await;
+        let before = service.current_status();
+        assert!(matches!(
+            before.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            }
+        ));
+        drop(lease);
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
+        assert_terminal_retention(&before, &service.current_status());
+        assert!(!service.has_demand());
+        assert!(service.readback_required.load(Ordering::Acquire));
+        assert!(aggregate_has_obligations(&service));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn terminal_retention_recovered_owner_is_not_erased_after_custody_reconciliation() {
+        let mut fixture = ConnectedOwnerFixture::new().await;
+        let service = fixture.startup.service.clone();
+        retain_hello_fixture_operations(&service);
+        let lease = terminal_retention_lease(&service);
+        service
+            .write_restart_history(&VecDeque::from([unix_time_ms().unwrap()]))
+            .unwrap();
+        let helper = fixture.helper.take().expect("exact helper Child");
+        service
+            .retain_helper_child_custody(
+                helper,
+                Some(fixture.helper_identity.clone()),
+                Some(fixture.boot_id.clone()),
+                "MODULE_WORKER_EXITED",
+            )
+            .await;
+        service.remember_owner_family_query(
+            &fixture.owner_receipt["process"],
+            fixture.owner_receipt["token"].as_str().unwrap(),
+        );
+        fixture.release();
+        {
+            let mut custody = service.helper_child_custody.lock().await;
+            let retained = custody.as_mut().unwrap();
+            assert_eq!(retained.child.wait().await.unwrap().code(), Some(23));
+        }
+        drop(lease);
+        let unknown_before = service.current_status().unknown_operation_ids;
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
+        let after = service.current_status();
+        // run_lifecycle itself must consume genuine family departure and publish
+        // exit_proven before its no-demand branch, not a test-created terminal.
+        assert!(matches!(
+            after.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            after.worker_boot_id.as_deref(),
+            Some(fixture.boot_id.as_str())
+        );
+        assert!(same_process_identity(
+            after.owner.as_ref().unwrap(),
+            &fixture.helper_identity
+        ));
+        assert!(same_process_identity(
+            after.worker.as_ref().unwrap(),
+            &fixture.worker_identity
+        ));
+        assert_eq!(after.unknown_operation_ids, unknown_before);
+        assert_eq!(after.unknown_operation_count, 2);
+        assert!(after.readback_required && service.readback_required.load(Ordering::Acquire));
+        assert_eq!(after.effect_certainty, ModuleEffectCertainty::Unknown);
+        assert!(service.helper_child_custody.lock().await.is_none());
+        assert!(aggregate_has_obligations(&service));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn terminal_retention_max_starts_one_preserves_exit_and_current_budget_flags() {
+        let mut fixture = ConnectedOwnerFixture::new_successful().await;
+        let service = fixture.startup.service.clone();
+        retain_hello_fixture_operations(&service);
+        let lease = terminal_retention_lease(&service);
+        terminal_retention_monitor_exit(&mut fixture, true).await;
+        let before = service.current_status();
+        assert_eq!(service.descriptor.restart.max_starts, 1);
+        let launch_before = fs::read(service.state_dir.join("launch-attempt.json")).unwrap();
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
+        let after = service.current_status();
+        assert_terminal_retention(&before, &after);
+        assert!(service.has_demand());
+        assert_eq!(after.restart.starts_in_window, 1);
+        assert!(after.restart.exhausted);
+        assert_eq!(
+            fs::read(service.state_dir.join("launch-attempt.json")).unwrap(),
+            launch_before
+        );
+        assert_eq!(service.read_restart_history().unwrap().len(), 1);
+        assert!(!service.can_replace_descriptor().await);
+        service.quarantine("MODULE_OBSERVATION_REJECTED").unwrap();
+        assert_terminal_retention(&before, &service.current_status());
+        assert!(service.scope_quarantined.load(Ordering::Acquire));
+        assert_eq!(
+            service.ensure_runner().await.unwrap_err().code,
+            "MODULE_ISOLATED"
+        );
+        drop(lease);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn terminal_retention_new_demand_during_runner_cleanup_rechecks_budget() {
+        let mut fixture = ConnectedOwnerFixture::new_successful().await;
+        let service = fixture.startup.service.clone();
+        retain_hello_fixture_operations(&service);
+        let prior_lease = terminal_retention_lease(&service);
+        terminal_retention_monitor_exit(&mut fixture, true).await;
+        drop(prior_lease);
+        let before = service.current_status();
+        let exit = time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
+        assert!(matches!(exit, LifecycleRunExit::WaitingForDemand));
+        assert!(!service.current_status().restart.exhausted);
+        // The new lease is admitted while the prior runner is finishing its
+        // no-demand path. Cleanup must schedule the ordinary gated runner even
+        // though the lifecycle truth stays terminal rather than WaitingForDemand.
+        let lease = terminal_retention_lease(&service);
+        let mut statuses = service.status.subscribe();
+        service.after_runner_exit(exit).await;
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if statuses.borrow().restart.exhausted {
+                    break;
+                }
+                statuses.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let runner = service.runner.lock().await.take();
+        if let Some(runner) = runner {
+            runner.await.unwrap();
+        }
+        assert_terminal_retention(&before, &service.current_status());
+        assert_eq!(service.current_status().restart.starts_in_window, 1);
+        assert_eq!(service.read_restart_history().unwrap().len(), 1);
+        assert!(service.has_demand());
+        drop(lease);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn terminal_retention_actual_boot_allocation_resets_only_attempt_identity() {
+        let mut fixture = ConnectedOwnerFixture::new_successful().await;
+        let service = fixture.startup.service.clone();
+        retain_hello_fixture_operations(&service);
+        terminal_retention_monitor_exit(&mut fixture, true).await;
+        let before = service.current_status();
+        // Exercise the actual allocator at the unchanged production launch
+        // boundary. This unit call is not permission to bypass launch fences.
+        let boot = service.allocate_worker_boot();
+        let starting = service.current_status();
+        assert_ne!(starting.worker_boot_id, before.worker_boot_id);
+        assert_eq!(starting.worker_boot_id.as_deref(), Some(boot.as_str()));
+        assert!(
+            matches!(&starting.lifecycle, LifecycleState::Starting { boot_id } if boot_id == &boot)
+        );
+        assert!(starting.owner.is_none() && starting.worker.is_none());
+        assert_eq!(starting.unknown_operation_ids, before.unknown_operation_ids);
+        assert_eq!(
+            starting.unknown_operation_count,
+            before.unknown_operation_count
+        );
+        assert_eq!(starting.readback_required, before.readback_required);
+        assert!(service.readback_required.load(Ordering::Acquire));
+        assert!(aggregate_has_obligations(&service));
+    }
+
+    #[tokio::test]
+    async fn terminal_retention_never_promotes_unproved_exit_or_owner_uncertainty() {
+        let fixture = StartupFixture::new();
+        retain_hello_fixture_operations(&fixture.service);
+        // The complete readback above legitimately clears its readback fence.
+        // Model a subsequent unproved exit, as the production failure path does,
+        // before verifying that administrative polling preserves uncertainty.
+        fixture
+            .service
+            .readback_required
+            .store(true, Ordering::Release);
+        fixture.service.update_status(|status| {
+            status.readback_required = true;
+            status.lifecycle = LifecycleState::ProcessExited {
+                exit_code: Some(0),
+                exit_proven: false,
+            };
+        });
+        fixture.service.clone().run_lifecycle().await;
+        let status = fixture.service.current_status();
+        assert!(!matches!(
+            status.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            } | LifecycleState::Completed { .. }
+        ));
+        assert!(status.readback_required);
+        assert_eq!(status.unknown_operation_count, 2);
+        fixture
+            .service
+            .update_status(|status| status.lifecycle = LifecycleState::OwnerIdentityUnknown);
+        fixture.service.clone().run_lifecycle().await;
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::OwnerIdentityUnknown
+        ));
+        assert!(fixture.service.readback_required.load(Ordering::Acquire));
     }
 
     #[test]

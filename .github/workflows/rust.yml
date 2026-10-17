@@ -366,6 +366,13 @@ jobs:
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
           & cargo test --locked --package $musePackages[0] --lib msp_transport_ --target-dir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run selected supervisor terminal retention regressions
+        if: contains(needs.scope.outputs.changed_paths, 'crates/swarm-supervisor/src/supervisor.rs')
+        shell: pwsh
+        run: |
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          & cargo test --locked --package swarm-supervisor --lib terminal_retention_ --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run changed integration targets only
         if: needs.scope.outputs.tests_changed == 'true'
         shell: pwsh
