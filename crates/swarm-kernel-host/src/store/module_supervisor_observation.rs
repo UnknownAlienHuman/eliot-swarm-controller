@@ -1168,8 +1168,7 @@ fn diagnostic_for_transition(
     // exit status. Retain that as a scoped diagnostic enrichment with the new
     // callback event identity; it is not a new lifecycle or Operation cause.
     let diagnostic_only_enrichment = same_boot
-        && previous["actor_instance_id"].as_str()
-            == Some(observation.actor_instance_id.as_str())
+        && previous["actor_instance_id"].as_str() == Some(observation.actor_instance_id.as_str())
         && matches!(
             previous_phase,
             Some("exited" | "exited_proven" | "restart_backoff")
@@ -1187,14 +1186,12 @@ fn diagnostic_for_transition(
         (Severity::Warn, Kind::ModuleStopped, Phase::ModuleExit, None)
     } else {
         match observation.phase {
-            ModuleSupervisorPhase::Ready if !same_boot || previous_phase == Some("starting") => {
-                (
-                    Severity::Info,
-                    Kind::ModuleStarted,
-                    Phase::ModuleStart,
-                    None,
-                )
-            }
+            ModuleSupervisorPhase::Ready if !same_boot || previous_phase == Some("starting") => (
+                Severity::Info,
+                Kind::ModuleStarted,
+                Phase::ModuleStart,
+                None,
+            ),
             ModuleSupervisorPhase::Exited
             | ModuleSupervisorPhase::RestartBackoff
             | ModuleSupervisorPhase::Completed
@@ -2600,10 +2597,10 @@ mod journal_regression_tests {
     use serde_json::Value;
     use swarm_supervisor::{
         AdmissionState as ProducerAdmission, FailureSummary as ProducerFailureSummary,
-        LifecycleState as ProducerLifecycleState,
-        ModuleEffectCertainty as ProducerCertainty, ModuleFailureStage as ProducerStage,
-        ModuleSupervisorObservation as ProducerObservation, ModuleSupervisorPhase as ProducerPhase,
-        RestartStatus as ProducerRestartStatus, ServiceScope, SupervisorStatus as ProducerStatus,
+        LifecycleState as ProducerLifecycleState, ModuleEffectCertainty as ProducerCertainty,
+        ModuleFailureStage as ProducerStage, ModuleSupervisorObservation as ProducerObservation,
+        ModuleSupervisorPhase as ProducerPhase, RestartStatus as ProducerRestartStatus,
+        ServiceScope, SupervisorStatus as ProducerStatus,
     };
 
     const BINDING_ID: &str = "binding-fixture";
@@ -2801,11 +2798,7 @@ mod journal_regression_tests {
     fn seed_ready_scope(db: &mut Connection) {
         let starting = producer_observation(1, ProducerPhase::Starting, None);
         let ready = producer_observation(2, ProducerPhase::Ready, None);
-        assert!(
-            record_in_transaction(db, &starting, 100)
-                .unwrap()
-                .inserted
-        );
+        assert!(record_in_transaction(db, &starting, 100).unwrap().inserted);
         assert!(record_in_transaction(db, &ready, 200).unwrap().inserted);
     }
 
@@ -2836,8 +2829,8 @@ mod journal_regression_tests {
         );
         assert!(!text.contains("PRIVATE_DIAGNOSTIC_DETAIL"));
 
-        let committed = record_in_transaction(&mut db, &observation, 300)
-            .expect("retain scoped status");
+        let committed =
+            record_in_transaction(&mut db, &observation, 300).expect("retain scoped status");
         assert!(committed.inserted);
         assert!(committed.diagnostic.is_some());
         let raw: String = db
@@ -2871,12 +2864,9 @@ mod journal_regression_tests {
         let mut db = fixture_db();
         seed_ready_scope(&mut db);
 
-        let generic = ProducerObservation::from_status(
-            &producer_status(None),
-            ACTOR_INSTANCE_ID,
-            3,
-        )
-        .expect("generic exit status is representable");
+        let generic =
+            ProducerObservation::from_status(&producer_status(None), ACTOR_INSTANCE_ID, 3)
+                .expect("generic exit status is representable");
         assert!(
             record_in_transaction(&mut db, &generic, 300)
                 .unwrap()
@@ -2960,8 +2950,7 @@ mod journal_regression_tests {
         assert_eq!(error.code, "MODULE_OBSERVATION_INVALID");
 
         let mut malformed_dto =
-            ProducerObservation::from_status(&producer_status(None), ACTOR_INSTANCE_ID, 5)
-                .unwrap();
+            ProducerObservation::from_status(&producer_status(None), ACTOR_INSTANCE_ID, 5).unwrap();
         malformed_dto.worker_diagnostic_code = Some("lowercase".to_owned());
         let mut malformed_db = fixture_db();
         assert_eq!(
@@ -2972,8 +2961,9 @@ mod journal_regression_tests {
 
     #[test]
     fn worker_diagnostic_none_preserves_old_optional_payload_bytes() {
-        let none_dto = ProducerObservation::from_status(&producer_status(None), ACTOR_INSTANCE_ID, 1)
-            .expect("status without a worker diagnostic remains valid");
+        let none_dto =
+            ProducerObservation::from_status(&producer_status(None), ACTOR_INSTANCE_ID, 1)
+                .expect("status without a worker diagnostic remains valid");
         assert!(
             serde_json::to_value(none_dto)
                 .expect("serialize None DTO")
