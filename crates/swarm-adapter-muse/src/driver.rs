@@ -197,6 +197,39 @@ impl State {
     fn revision(&self, session: &str) -> u64 {
         *self.versions.get(session).unwrap_or(&0)
     }
+    fn invalidate_native_event(&mut self, session: Option<&str>) -> Result<()> {
+        self.event_number = self
+            .event_number
+            .checked_add(1)
+            .ok_or_else(|| fault("MUSE_EVENT_REVISION_EXHAUSTED"))?;
+        let mut affected = BTreeSet::new();
+        match session {
+            Some(session) if self.member(session) => {
+                affected.insert(session.to_owned());
+            }
+            _ => {
+                // An unattributable native event can race any outstanding read.
+                // Include sessions with no prior event/version entry as well.
+                affected.extend(self.versions.keys().cloned());
+                affected.extend(self.children());
+                if let Some(scope) = &self.scope {
+                    affected.insert(scope.native_root_id.clone());
+                }
+            }
+        }
+        for session in affected {
+            let revision = self.revision(&session).saturating_add(1);
+            self.versions.insert(session, revision);
+        }
+        if let Some(scope) = &self.scope {
+            self.journal
+                .as_mut()
+                .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                .invalidate_observations(scope)
+                .map_err(jf)?;
+        }
+        Ok(())
+    }
     fn children(&self) -> Vec<String> {
         self.projector
             .as_ref()
@@ -222,6 +255,8 @@ pub struct Driver {
     event_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     streams: mpsc::Sender<StreamJob>,
     stream_jobs: tokio::sync::Mutex<mpsc::Receiver<StreamJob>>,
+    #[cfg(test)]
+    initialize_finalize_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 #[derive(Deserialize)]
@@ -313,6 +348,8 @@ impl Driver {
             event_task: tokio::sync::Mutex::new(None),
             streams,
             stream_jobs: tokio::sync::Mutex::new(receiver),
+            #[cfg(test)]
+            initialize_finalize_gate: Mutex::new(None),
         });
         Ok(driver)
     }
@@ -508,7 +545,20 @@ impl Driver {
             .await
             .map_err(|_| fault("MUSE_INITIALIZED_UNAVAILABLE"))?
             .map_err(|_| fault("MUSE_INITIALIZED_UNAVAILABLE"))?;
+        #[cfg(test)]
+        {
+            let gate = self.initialize_finalize_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.wait().await;
+                gate.wait().await;
+            }
+        }
         let mut s = self.lock()?;
+        // The successful flush is historical evidence. EOF/stop may have been
+        // reduced while this future was waiting to finalize initialization.
+        if s.transport_ended || self.stopping() {
+            return Err(fault("MUSE_NATIVE_CONNECTION_ENDED"));
+        }
         s.initialized = true;
         s.durability = commands::session_durability(&init);
         s.fingerprint_warning = init["schema"]["fingerprint"] != FINGERPRINT;
@@ -1668,30 +1718,18 @@ impl Driver {
     fn notification(&self, notification: Notification) -> Result<()> {
         let method = notification.envelope["method"].as_str().unwrap_or("");
         let p = &notification.envelope["params"];
-        match schema::validate_method_parameters(method, p) {
-            Ok(()) => {}
-            Err(schema::SchemaError::UnknownMethod(_)) => {}
-            Err(_) => return Err(fault("MUSE_NOTIFICATION_SCHEMA_INVALID")),
-        }
+        let valid = matches!(
+            schema::validate_method_parameters(method, p),
+            Ok(()) | Err(schema::SchemaError::UnknownMethod(_))
+        );
         let mut s = self.lock()?;
-        s.event_number = s
-            .event_number
-            .checked_add(1)
-            .ok_or_else(|| fault("MUSE_EVENT_REVISION_EXHAUSTED"))?;
-        if let Some(session) = p["sessionId"].as_str()
-            && s.member(session)
-        {
-            let rev = s.revision(session).saturating_add(1);
-            s.versions.insert(session.into(), rev);
+        // Even a known event with invalid params revokes the read/ticket fence.
+        // Optional stream publication errors never enter this native-only path.
+        s.invalidate_native_event(p["sessionId"].as_str().filter(|id| !id.is_empty()))?;
+        if !valid {
+            return Err(fault("MUSE_NOTIFICATION_SCHEMA_INVALID"));
         }
         let is_delta = method == "item/delta";
-        if let Some(scope) = s.scope.clone() {
-            s.journal
-                .as_mut()
-                .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
-                .invalidate_observations(&scope)
-                .map_err(jf)?;
-        }
         let pending_tasks: Vec<String> = if s.confirmed_root.as_deref() == p["sessionId"].as_str()
             && matches!(
                 method,
@@ -2367,6 +2405,7 @@ mod tests {
 
     const ROOT: &str = "019a0000-0000-7000-8000-000000000099";
     const BOOT: &str = "fixture-driver-boot";
+    include!("driver_native_event_fence_tests.rs");
     fn digest(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }
@@ -2975,6 +3014,7 @@ mod tests {
             .unwrap();
         let saved = driver.lock().unwrap().contexts["01-open"].clone();
         let ack = saved.ack.clone().unwrap();
+        let checkpoint = std::fs::read(dir.0.join("muse-rust-checkpoint.v1.json")).unwrap();
         let authority = {
             let s = driver.lock().unwrap();
             s.journal
@@ -2995,6 +3035,11 @@ mod tests {
         })
         .await
         .expect("real peer EOF must reach the notification consumer");
+        assert_eq!(
+            std::fs::read(dir.0.join("muse-rust-checkpoint.v1.json")).unwrap(),
+            checkpoint,
+            "EOF must preserve historical ACK, durability and Host outbox bytes"
+        );
         let late_read = json!({"session":ack["session"],"viewCursor":"late:read","history":{"mode":"none","items":null,"snapshot":null},"pendingRequests":[]});
         driver.finish_ack(&saved, ack).unwrap();
         assert_eq!(driver.hello()["native_ready"], false);
