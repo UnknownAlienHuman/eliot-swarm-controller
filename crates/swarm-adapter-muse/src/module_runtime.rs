@@ -268,15 +268,19 @@ impl ModuleOwnedBootstrap {
                 return Err(fault("MUSE_MODULE_CONTRACT_INVALID"));
             }
         }
-        if !contract.command_schemas.contains(
-            &swarm_contracts::module_contract::normalized_result_context_schema(),
-        ) || !contract.event_schemas.contains(
-            &swarm_contracts::module_contract::normalized_result_page_schema(),
-        ) {
+        if !contract
+            .command_schemas
+            .contains(&swarm_contracts::module_contract::normalized_result_context_schema())
+            || !contract
+                .event_schemas
+                .contains(&swarm_contracts::module_contract::normalized_result_page_schema())
+        {
             return Err(fault("MUSE_MODULE_CONTRACT_INVALID"));
         }
         for required_schema in [
-            "swarm.runtime_outcome", "swarm.task_dispatch_admission", "swarm.normalized_result_page",
+            "swarm.runtime_outcome",
+            "swarm.task_dispatch_admission",
+            "swarm.normalized_result_page",
         ] {
             if !contract
                 .event_schemas
@@ -729,12 +733,19 @@ mod runtime_tests {
     const DEADLINE: Duration = Duration::from_secs(4);
     #[test]
     fn muse_normalized_result_descriptor_version_and_typed_schemas_are_coherent() {
-        let descriptor: Value = serde_json::from_str(include_str!("../registration/descriptor.template.json")).unwrap();
+        let descriptor: Value =
+            serde_json::from_str(include_str!("../registration/descriptor.template.json")).unwrap();
         assert_eq!(descriptor["artifact"]["version"], ARTIFACT_VERSION);
         assert_eq!(descriptor["enabled"], false);
         for (field, schema) in [
-            ("command_schemas", swarm_contracts::module_contract::normalized_result_context_schema()),
-            ("event_schemas", swarm_contracts::module_contract::normalized_result_page_schema()),
+            (
+                "command_schemas",
+                swarm_contracts::module_contract::normalized_result_context_schema(),
+            ),
+            (
+                "event_schemas",
+                swarm_contracts::module_contract::normalized_result_page_schema(),
+            ),
         ] {
             let declared: Vec<swarm_contracts::module_catalog::SchemaDescriptor> =
                 serde_json::from_value(descriptor[field].clone()).unwrap();

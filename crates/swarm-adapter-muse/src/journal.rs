@@ -917,8 +917,13 @@ fn validate_host_envelope(scope: &Scope, command: &RuntimeCommand) -> Result<(),
             "operation_id",
         ],
         "agent.result" => &[
-            "client_request_id", "binding_id", "generation", "selector",
-            "offset_bytes", "length_bytes", "normalized_result_origin",
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "selector",
+            "offset_bytes",
+            "length_bytes",
+            "normalized_result_origin",
             "normalized_result_payload_identity",
         ],
         _ => return Err(Fault::InvalidState),
@@ -2442,7 +2447,9 @@ impl Journal {
         {
             return Err(Fault::ProvenanceRequired);
         }
-        context.validate_page(&page).map_err(|_| Fault::InvalidState)?;
+        context
+            .validate_page(&page)
+            .map_err(|_| Fault::InvalidState)?;
         self.queue(
             receipt.clone(),
             Delivery {
@@ -2451,7 +2458,9 @@ impl Journal {
             },
             true,
             Some(authority.proof.clone()),
-            Some(SavedJson::new(&serde_json::to_value(command).map_err(|_| Fault::InvalidState)?)?),
+            Some(SavedJson::new(
+                &serde_json::to_value(command).map_err(|_| Fault::InvalidState)?,
+            )?),
         )
     }
     fn queue_result_inner(
@@ -2936,7 +2945,10 @@ fn validate_state(scope: &Scope, state: &State) -> Result<(), Fault> {
     for (id, operation) in &state.operations {
         if operation.result_command.is_some()
             && (operation.native.is_some()
-                || operation.final_delivery.as_ref().is_none_or(|delivery| delivery.method != DeliveryMethod::Result))
+                || operation
+                    .final_delivery
+                    .as_ref()
+                    .is_none_or(|delivery| delivery.method != DeliveryMethod::Result))
         {
             return Err(Fault::InvalidState);
         }
@@ -3068,19 +3080,26 @@ fn validate_delivery(
                 return Err(Fault::InvalidState);
             }
             if value["page"]["source"]["schema_id"] == "swarm.normalized_result_page" {
-                let retained = state.operations.get(&receipt.operation_id)
+                let retained = state
+                    .operations
+                    .get(&receipt.operation_id)
                     .and_then(|operation| operation.result_command.as_ref())
                     .ok_or(Fault::ContextRequired)?;
-                let command: RuntimeCommand = serde_json::from_value(retained.value()?)
-                    .map_err(|_| Fault::InvalidState)?;
-                if serde_json::to_value(&command).map_err(|_| Fault::InvalidState)? != retained.value()? {
+                let command: RuntimeCommand =
+                    serde_json::from_value(retained.value()?).map_err(|_| Fault::InvalidState)?;
+                if serde_json::to_value(&command).map_err(|_| Fault::InvalidState)?
+                    != retained.value()?
+                {
                     return Err(Fault::InvalidState);
                 }
                 result_context(scope, state, receipt, &command)?
-                    .validate_page(&value["page"]).map_err(|_| Fault::InvalidState)?;
+                    .validate_page(&value["page"])
+                    .map_err(|_| Fault::InvalidState)?;
                 return Ok(());
             }
-            if state.operations.get(&receipt.operation_id)
+            if state
+                .operations
+                .get(&receipt.operation_id)
                 .is_some_and(|operation| operation.result_command.is_some())
             {
                 return Err(Fault::InvalidState);
@@ -3110,20 +3129,38 @@ fn result_context(
     }
     let (request, _) = crate::results::validate_normalized_request(command, receipt)
         .map_err(|_| Fault::InvalidState)?;
-    let target_id = request.selector().input_operation_id().ok_or(Fault::ContextRequired)?;
-    let dispatch = state.operations.get(target_id).ok_or(Fault::ContextRequired)?;
-    let context = state.contexts.get(target_id).ok_or(Fault::ContextRequired)?;
+    let target_id = request
+        .selector()
+        .input_operation_id()
+        .ok_or(Fault::ContextRequired)?;
+    let dispatch = state
+        .operations
+        .get(target_id)
+        .ok_or(Fault::ContextRequired)?;
+    let context = state
+        .contexts
+        .get(target_id)
+        .ok_or(Fault::ContextRequired)?;
     let native = dispatch.native.as_ref().ok_or(Fault::ContextRequired)?;
     if context.command.method != "task.dispatch" || native.invocation.method != "turn/start" {
         return Err(Fault::IntentConflict);
     }
     let task = context.task_prompt(scope)?.ok_or(Fault::ContextRequired)?;
-    let ack = native.ack.as_ref().ok_or(Fault::FreshChecksRequired)?.value()?;
+    let ack = native
+        .ack
+        .as_ref()
+        .ok_or(Fault::FreshChecksRequired)?
+        .value()?;
     validate_ack(scope, &native.invocation, &ack)?;
     crate::results::NormalizedResultContext::for_dispatch(
-        command, receipt, &dispatch.receipt, &task, native.invocation.command_id(),
+        command,
+        receipt,
+        &dispatch.receipt,
+        &task,
+        native.invocation.command_id(),
         ack["turnId"].as_str().ok_or(Fault::InvalidState)?,
-    ).map_err(|_| Fault::IntentConflict)
+    )
+    .map_err(|_| Fault::IntentConflict)
 }
 fn present(path: &Path) -> Result<bool, Fault> {
     match fs::symlink_metadata(path) {
@@ -3613,60 +3650,139 @@ mod tests {
         // Store-sealed result enrichment retains the ORIGINAL request digest;
         // it is not a newly rendered request or permission to replay dispatch.
         let ack = fixture.ack(&invocation);
-        journal.record_native_ack(&fixture.scope, "host-dispatch", invocation.command_id(), ack.clone()).unwrap();
+        journal
+            .record_native_ack(
+                &fixture.scope,
+                "host-dispatch",
+                invocation.command_id(),
+                ack.clone(),
+            )
+            .unwrap();
         fixture.work_read(&mut journal, 100);
         let selector = json!({"kind":"message","input_operation_id":"host-dispatch",
             "session_id":fixture.scope.native_root_id,"item_id":"terminal","item_revision":2,"before_cursor":""});
-        let mut result = host_command(&fixture, "host-result", "agent.result", json!({
-            "client_request_id":"result-request","binding_id":fixture.scope.binding_id,
-            "generation":fixture.scope.generation,"selector":selector,
-            "offset_bytes":0,"length_bytes":65_536,
-        }));
+        let mut result = host_command(
+            &fixture,
+            "host-result",
+            "agent.result",
+            json!({
+                "client_request_id":"result-request","binding_id":fixture.scope.binding_id,
+                "generation":fixture.scope.generation,"selector":selector,
+                "offset_bytes":0,"length_bytes":65_536,
+            }),
+        );
         result.target_input_sha256 = Some(receipt.input_sha256.clone());
         result.input["normalized_result_origin"] = crate::results::fixture_origin(
-            &receipt, &task, invocation.command_id(), &result.input["selector"],
+            &receipt,
+            &task,
+            invocation.command_id(),
+            &result.input["selector"],
         );
         let result_receipt = host_receipt(&fixture, &result);
-        let context = journal.result_context(&fixture.scope, &result_receipt, &result).unwrap();
+        let context = journal
+            .result_context(&fixture.scope, &result_receipt, &result)
+            .unwrap();
         let body = b"exact terminal bytes";
         use base64::{Engine, engine::general_purpose::STANDARD};
-        let page = context.normalize_page(json!({
-            "source":{"native_session_id":fixture.scope.native_root_id,"item_id":"terminal",
-                "item_revision":2,"turn_id":ack["turnId"],"kind":"message",
-                "content_digest":format!("sha256:{:x}", Sha256::digest(body))},
-            "offset_bytes":0,"byte_length":body.len(),"total_bytes":body.len(),"eof":true,
-            "media_type":"text/plain","content_base64":STANDARD.encode(body),
-            "page_sha256":format!("{:x}", Sha256::digest(body)),
-        })).unwrap();
-        let authority = journal.authorize_session(&fixture.scope, &fixture.scope.native_root_id).unwrap();
+        let page = context
+            .normalize_page(json!({
+                "source":{"native_session_id":fixture.scope.native_root_id,"item_id":"terminal",
+                    "item_revision":2,"turn_id":ack["turnId"],"kind":"message",
+                    "content_digest":format!("sha256:{:x}", Sha256::digest(body))},
+                "offset_bytes":0,"byte_length":body.len(),"total_bytes":body.len(),"eof":true,
+                "media_type":"text/plain","content_base64":STANDARD.encode(body),
+                "page_sha256":format!("{:x}", Sha256::digest(body)),
+            }))
+            .unwrap();
+        let authority = journal
+            .authorize_session(&fixture.scope, &fixture.scope.native_root_id)
+            .unwrap();
         let before = fs::read(&journal.path).unwrap();
         for (pointer, value) in [
             ("/normalized_result_origin/task_revision", json!(99)),
-            ("/normalized_result_origin/producer/native_input_id", json!("foreign-input")),
+            (
+                "/normalized_result_origin/producer/native_input_id",
+                json!("foreign-input"),
+            ),
         ] {
             let mut bad = result.clone();
             *bad.input.pointer_mut(pointer).unwrap() = value;
-            assert!(journal.queue_normalized_result_for(&fixture.scope, result_receipt.clone(), &bad, page.clone(), &authority).is_err());
+            assert!(
+                journal
+                    .queue_normalized_result_for(
+                        &fixture.scope,
+                        result_receipt.clone(),
+                        &bad,
+                        page.clone(),
+                        &authority
+                    )
+                    .is_err()
+            );
             assert_eq!(fs::read(&journal.path).unwrap(), before);
         }
         let mut private = result.clone();
         private.input["private_auth"] = json!({"token":"must-not-be-retained"});
-        assert!(journal.queue_normalized_result_for(&fixture.scope, result_receipt.clone(), &private, page.clone(), &authority).is_err());
+        assert!(
+            journal
+                .queue_normalized_result_for(
+                    &fixture.scope,
+                    result_receipt.clone(),
+                    &private,
+                    page.clone(),
+                    &authority
+                )
+                .is_err()
+        );
         assert_eq!(fs::read(&journal.path).unwrap(), before);
-        journal.queue_normalized_result_for(&fixture.scope, result_receipt.clone(), &result, page, &authority).unwrap();
-        let saved = journal.state.operations["host-result"].result_command.as_ref().unwrap().value().unwrap();
+        journal
+            .queue_normalized_result_for(
+                &fixture.scope,
+                result_receipt.clone(),
+                &result,
+                page,
+                &authority,
+            )
+            .unwrap();
+        let saved = journal.state.operations["host-result"]
+            .result_command
+            .as_ref()
+            .unwrap()
+            .value()
+            .unwrap();
         assert_eq!(saved, serde_json::to_value(&result).unwrap());
-        let exact = journal.outbox(&fixture.scope).unwrap().into_iter()
-            .find(|ticket| ticket.operation_id() == "host-result").unwrap();
+        let exact = journal
+            .outbox(&fixture.scope)
+            .unwrap()
+            .into_iter()
+            .find(|ticket| ticket.operation_id() == "host-result")
+            .unwrap();
         drop(journal);
         let mut reopened = fixture.reopen();
-        let retained = reopened.outbox(&fixture.scope).unwrap().into_iter()
-            .find(|ticket| ticket.operation_id() == "host-result").unwrap();
+        let retained = reopened
+            .outbox(&fixture.scope)
+            .unwrap()
+            .into_iter()
+            .find(|ticket| ticket.operation_id() == "host-result")
+            .unwrap();
         assert_eq!(retained.params_json(), exact.params_json());
-        assert!(reopened.authorize_session(&fixture.scope, &fixture.scope.native_root_id).is_err());
+        assert!(
+            reopened
+                .authorize_session(&fixture.scope, &fixture.scope.native_root_id)
+                .is_err()
+        );
         let params: Value = serde_json::from_str(exact.params_json()).unwrap();
         let before = fs::read(&reopened.path).unwrap();
-        assert!(reopened.queue_normalized_result_for(&fixture.scope, result_receipt, &result, params["page"].clone(), &authority).is_err());
+        assert!(
+            reopened
+                .queue_normalized_result_for(
+                    &fixture.scope,
+                    result_receipt,
+                    &result,
+                    params["page"].clone(),
+                    &authority
+                )
+                .is_err()
+        );
         assert_eq!(fs::read(&reopened.path).unwrap(), before);
     }
 

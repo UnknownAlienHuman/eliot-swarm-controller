@@ -194,31 +194,58 @@ pub(crate) fn validate_normalized_request(
     command: &RuntimeCommand,
     receipt: &ModuleReceiptIdentity,
 ) -> Result<(ResultRequest, NormalizedResultOriginContext), ResultReadError> {
-    let input = command.input.as_object().ok_or_else(|| error("RESULT_CONTEXT_INVALID"))?;
-    if input.keys().any(|key| ![
-        "client_request_id", "binding_id", "generation", "selector", "offset_bytes",
-        "length_bytes", "normalized_result_origin", "normalized_result_payload_identity",
-    ].contains(&key.as_str())) {
+    let input = command
+        .input
+        .as_object()
+        .ok_or_else(|| error("RESULT_CONTEXT_INVALID"))?;
+    if input.keys().any(|key| {
+        ![
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "selector",
+            "offset_bytes",
+            "length_bytes",
+            "normalized_result_origin",
+            "normalized_result_payload_identity",
+        ]
+        .contains(&key.as_str())
+    }) {
         return Err(error("RESULT_CONTEXT_INVALID"));
     }
     if let Some(expected) = input.get("normalized_result_payload_identity") {
-        let expected = expected.as_object().ok_or_else(|| error("RESULT_PAYLOAD_MISMATCH"))?;
+        let expected = expected
+            .as_object()
+            .ok_or_else(|| error("RESULT_PAYLOAD_MISMATCH"))?;
         if expected.len() != 3
-            || !expected.get("sha256").and_then(Value::as_str).is_some_and(|digest| {
-                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
-            || expected.get("byte_length").and_then(Value::as_u64).is_none_or(|bytes| bytes > MAX_SAFE_INTEGER)
+            || !expected
+                .get("sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            || expected
+                .get("byte_length")
+                .and_then(Value::as_u64)
+                .is_none_or(|bytes| bytes > MAX_SAFE_INTEGER)
             || expected.get("complete").and_then(Value::as_bool) != Some(true)
         {
             return Err(error("RESULT_PAYLOAD_MISMATCH"));
         }
     }
     let request = ResultRequest::parse(&command.input)?;
-    let origin: NormalizedResultOriginContext = serde_json::from_value(
-        command.input["normalized_result_origin"].clone(),
-    ).map_err(|_| error("RESULT_ORIGIN_INVALID"))?;
-    origin.validate().map_err(|_| error("RESULT_ORIGIN_INVALID"))?;
-    receipt.validate().map_err(|_| error("RESULT_CONTEXT_INVALID"))?;
+    let origin: NormalizedResultOriginContext =
+        serde_json::from_value(command.input["normalized_result_origin"].clone())
+            .map_err(|_| error("RESULT_ORIGIN_INVALID"))?;
+    origin
+        .validate()
+        .map_err(|_| error("RESULT_ORIGIN_INVALID"))?;
+    receipt
+        .validate()
+        .map_err(|_| error("RESULT_CONTEXT_INVALID"))?;
     let selector_sha256 = Sha256Digest::of_canonical_json(&command.input["selector"])
         .map_err(|_| error("RESULT_CONTEXT_INVALID"))?;
     if command.method != "agent.result"
@@ -235,8 +262,12 @@ pub(crate) fn validate_normalized_request(
         || origin.producer.module_receipt.module_id != receipt.module_id
         || origin.producer.module_receipt.artifact != receipt.artifact
         || origin.producer.module_receipt.protocol != receipt.protocol
-        || input.get("binding_id").is_some_and(|id| id.as_str() != Some(command.binding_id.as_str()))
-        || input.get("generation").is_some_and(|generation| generation.as_i64() != Some(command.generation))
+        || input
+            .get("binding_id")
+            .is_some_and(|id| id.as_str() != Some(command.binding_id.as_str()))
+        || input
+            .get("generation")
+            .is_some_and(|generation| generation.as_i64() != Some(command.generation))
         || command.native_root_id.as_deref() != Some(request.selector.session_id())
     {
         return Err(error("RESULT_ORIGIN_MISMATCH"));
@@ -276,17 +307,23 @@ impl NormalizedResultContext {
             return Err(error("RESULT_DISPATCH_MISMATCH"));
         }
         Ok(Self {
-            command: command.clone(), receipt: receipt.clone(), origin, request,
+            command: command.clone(),
+            receipt: receipt.clone(),
+            origin,
+            request,
             native_turn_id: native_turn_id.to_owned(),
         })
     }
 
-    pub(crate) fn request(&self) -> &ResultRequest { &self.request }
+    pub(crate) fn request(&self) -> &ResultRequest {
+        &self.request
+    }
 
     fn native_identity(&self) -> Result<String, ResultReadError> {
         let digest = Sha256Digest::of_canonical_json(&json!({
             "selector":self.command.input["selector"], "native_turn_id":self.native_turn_id,
-        })).map_err(|_| error("RESULT_CONTEXT_INVALID"))?;
+        }))
+        .map_err(|_| error("RESULT_CONTEXT_INVALID"))?;
         Ok(format!("muse:result:{}", digest.as_str()))
     }
 
@@ -302,17 +339,26 @@ impl NormalizedResultContext {
         {
             return Err(error("RESULT_NATIVE_SCOPE_MISMATCH"));
         }
-        let payload_sha256 = native["content_digest"].as_str()
+        let payload_sha256 = native["content_digest"]
+            .as_str()
             .and_then(|digest| digest.strip_prefix("sha256:"))
-            .ok_or_else(|| error("RESULT_PAYLOAD_IDENTITY_UNAVAILABLE"))?.to_owned();
+            .ok_or_else(|| error("RESULT_PAYLOAD_IDENTITY_UNAVAILABLE"))?
+            .to_owned();
         let source = NormalizedResultPageSource {
-            schema_id: "swarm.normalized_result_page".into(), schema_version: 1,
-            origin: self.origin.clone(), result_operation_id: self.receipt.operation_id.clone(),
+            schema_id: "swarm.normalized_result_page".into(),
+            schema_version: 1,
+            origin: self.origin.clone(),
+            result_operation_id: self.receipt.operation_id.clone(),
             result_input_sha256: self.receipt.input_sha256.clone(),
-            result_module_receipt: self.receipt.clone(), payload_sha256,
-            payload_bytes: page["total_bytes"].as_u64().ok_or_else(|| error("RESULT_PAGE_INVALID"))?,
-            native_response_identity: Some(self.native_identity()?), execution_complete: false,
-            task_completion: "unknown".into(), native_replay: false,
+            result_module_receipt: self.receipt.clone(),
+            payload_sha256,
+            payload_bytes: page["total_bytes"]
+                .as_u64()
+                .ok_or_else(|| error("RESULT_PAGE_INVALID"))?,
+            native_response_identity: Some(self.native_identity()?),
+            execution_complete: false,
+            task_completion: "unknown".into(),
+            native_replay: false,
         };
         page["source"] = serde_json::to_value(source).map_err(|_| error("RESULT_PAGE_INVALID"))?;
         self.validate_page(&page)?;
@@ -320,16 +366,23 @@ impl NormalizedResultContext {
     }
 
     pub(crate) fn validate_page(&self, page: &Value) -> Result<(), ResultReadError> {
-        let page: NormalizedPage = serde_json::from_value(page.clone())
+        let page: NormalizedPage =
+            serde_json::from_value(page.clone()).map_err(|_| error("RESULT_PAGE_INVALID"))?;
+        page.source
+            .validate()
             .map_err(|_| error("RESULT_PAGE_INVALID"))?;
-        page.source.validate().map_err(|_| error("RESULT_PAGE_INVALID"))?;
-        let bytes = STANDARD.decode(&page.content_base64).map_err(|_| error("RESULT_PAGE_INVALID"))?;
-        let end = page.offset_bytes.checked_add(page.byte_length)
+        let bytes = STANDARD
+            .decode(&page.content_base64)
+            .map_err(|_| error("RESULT_PAGE_INVALID"))?;
+        let end = page
+            .offset_bytes
+            .checked_add(page.byte_length)
             .ok_or_else(|| error("RESULT_PAGE_INVALID"))?;
         if page.source.origin != self.origin
             || page.source.result_module_receipt != self.receipt
             || page.source.result_operation_id != self.command.operation_id
-            || page.source.native_response_identity.as_deref() != Some(self.native_identity()?.as_str())
+            || page.source.native_response_identity.as_deref()
+                != Some(self.native_identity()?.as_str())
             || page.source.payload_bytes != page.total_bytes
             || page.total_bytes > MAX_SAFE_INTEGER
             || page.offset_bytes != self.request.offset_bytes()
@@ -341,16 +394,20 @@ impl NormalizedResultContext {
             || page.byte_length == 0 && !page.eof
             || STANDARD.encode(&bytes) != page.content_base64
             || hash(&bytes) != page.page_sha256
-            || page.media_type.is_empty() || page.media_type.len() > 256
+            || page.media_type.is_empty()
+            || page.media_type.len() > 256
             || page.media_type.chars().any(char::is_control)
             || page.offset_bytes == 0 && page.eof && hash(&bytes) != page.source.payload_sha256
         {
             return Err(error("RESULT_PAGE_MISMATCH"));
         }
         if let Some(expected) = self.command.input.get("normalized_result_payload_identity") {
-            let expected = expected.as_object().ok_or_else(|| error("RESULT_PAYLOAD_MISMATCH"))?;
+            let expected = expected
+                .as_object()
+                .ok_or_else(|| error("RESULT_PAYLOAD_MISMATCH"))?;
             if expected.len() != 3
-                || expected.get("sha256").and_then(Value::as_str) != Some(page.source.payload_sha256.as_str())
+                || expected.get("sha256").and_then(Value::as_str)
+                    != Some(page.source.payload_sha256.as_str())
                 || expected.get("byte_length").and_then(Value::as_u64) != Some(page.total_bytes)
                 || expected.get("complete").and_then(Value::as_bool) != Some(true)
             {
@@ -856,7 +913,9 @@ mod tests {
     }
 
     fn normalized_fixture() -> (
-        RuntimeCommand, ModuleReceiptIdentity, ModuleReceiptIdentity,
+        RuntimeCommand,
+        ModuleReceiptIdentity,
+        ModuleReceiptIdentity,
         crate::commands::ValidatedTaskPrompt,
     ) {
         let target: ModuleReceiptIdentity = serde_json::from_value(json!({
@@ -864,19 +923,22 @@ mod tests {
             "artifact":{"artifact_id":"muse-rust-controller.1","version":"0.1.2","build_id":null},
             "protocol":{"major":1,"minor":0},"binding_id":"binding","binding_generation":1,
             "operation_id":"dispatch","input_sha256":"a".repeat(64),
-        })).unwrap();
+        }))
+        .unwrap();
         let task = crate::commands::ValidatedTaskPrompt {
             envelope: serde_json::from_value(json!({
                 "schema_id":"swarm.task_prompt","schema_version":1,"task_id":"task",
                 "task_revision":2,"attempt_id":"attempt","task_snapshot_sha256":"b".repeat(64),
                 "prompt":"rendered abc","prompt_sha256":hash(b"rendered abc"),"prompt_bytes":12,
-            })).unwrap(),
+            }))
+            .unwrap(),
             context: serde_json::from_value(json!({
                 "schema_version":1,"operation_id":"dispatch","binding_id":"binding",
                 "binding_generation":1,"worker_boot_id":"boot","task_id":"task",
                 "task_revision":2,"attempt_id":"attempt","task_snapshot_sha256":"b".repeat(64),
                 "source_text_sha256":hash(b"abc"),"source_text_bytes":3,
-            })).unwrap(),
+            }))
+            .unwrap(),
         };
         let mut receipt = target.clone();
         receipt.operation_id = "result".into();
@@ -889,13 +951,19 @@ mod tests {
         request["generation"] = json!(1);
         request["offset_bytes"] = json!(0);
         request["length_bytes"] = json!(65_536);
-        request["normalized_result_origin"] = fixture_origin(&target, &task, "native-input", &request["selector"]);
+        request["normalized_result_origin"] =
+            fixture_origin(&target, &task, "native-input", &request["selector"]);
         let command = RuntimeCommand {
-            operation_id:"result".into(), method:"agent.result".into(), created_at_ms:1,
-            binding_id:"binding".into(), generation:1, native_root_id:Some("root".into()),
-            route:json!({"alias":"muse","runtime":"module","enabled":true,"module_artifact_id":"muse-rust-controller.1"}),
-            input:request, input_sha256:Some(receipt.input_sha256.clone()),
-            target_input_sha256:Some(target.input_sha256.clone()),
+            operation_id: "result".into(),
+            method: "agent.result".into(),
+            created_at_ms: 1,
+            binding_id: "binding".into(),
+            generation: 1,
+            native_root_id: Some("root".into()),
+            route: json!({"alias":"muse","runtime":"module","enabled":true,"module_artifact_id":"muse-rust-controller.1"}),
+            input: request,
+            input_sha256: Some(receipt.input_sha256.clone()),
+            target_input_sha256: Some(target.input_sha256.clone()),
         };
         (command, receipt, target, task)
     }
@@ -903,31 +971,68 @@ mod tests {
     #[tokio::test]
     async fn muse_normalized_result_host_envelope_to_typed_page_preserves_selector_and_bytes() {
         let (command, receipt, target, task) = normalized_fixture();
-        let context = NormalizedResultContext::for_dispatch(&command, &receipt, &target, &task, "native-input", "turn").unwrap();
-        assert_eq!(context.request().to_input()["selector"], command.input["selector"]);
+        let context = NormalizedResultContext::for_dispatch(
+            &command,
+            &receipt,
+            &target,
+            &task,
+            "native-input",
+            "turn",
+        )
+        .unwrap();
+        assert_eq!(
+            context.request().to_input()["selector"],
+            command.input["selector"]
+        );
         let body = "hello π";
         let calls = Calls::default();
-        let raw = read_result_with(context.request().clone(), fake(vec![view(vec![event(message(body))], Value::Null)], calls.clone()), |_| true).await.unwrap();
+        let raw = read_result_with(
+            context.request().clone(),
+            fake(
+                vec![view(vec![event(message(body))], Value::Null)],
+                calls.clone(),
+            ),
+            |_| true,
+        )
+        .await
+        .unwrap();
         let page = context.normalize_page(raw).unwrap();
-        let source: NormalizedResultPageSource = serde_json::from_value(page["source"].clone()).unwrap();
+        let source: NormalizedResultPageSource =
+            serde_json::from_value(page["source"].clone()).unwrap();
         source.validate().unwrap();
-        assert_eq!(source.origin, serde_json::from_value::<NormalizedResultOriginContext>(command.input["normalized_result_origin"].clone()).unwrap());
+        assert_eq!(
+            source.origin,
+            serde_json::from_value::<NormalizedResultOriginContext>(
+                command.input["normalized_result_origin"].clone()
+            )
+            .unwrap()
+        );
         assert_eq!(source.result_module_receipt, receipt);
         assert_eq!(source.payload_sha256, hash(body.as_bytes()));
-        assert_eq!(STANDARD.decode(page["content_base64"].as_str().unwrap()).unwrap(), body.as_bytes());
+        assert_eq!(
+            STANDARD
+                .decode(page["content_base64"].as_str().unwrap())
+                .unwrap(),
+            body.as_bytes()
+        );
         assert!(!source.execution_complete && !source.native_replay);
         assert_eq!(source.task_completion, "unknown");
         assert_eq!(calls.lock().unwrap()[0].0, "view/page");
         assert_eq!(calls.lock().unwrap()[0].1["cursor"], "");
         for (pointer, value) in [
             ("/source/origin/task_revision", json!(3)),
-            ("/source/result_module_receipt/input_sha256", json!("d".repeat(64))),
+            (
+                "/source/result_module_receipt/input_sha256",
+                json!("d".repeat(64)),
+            ),
             ("/source/native_response_identity", json!("another-item")),
             ("/source/payload_sha256", json!("d".repeat(64))),
             ("/source/execution_complete", json!(true)),
             ("/source/native_replay", json!(true)),
-            ("/offset_bytes", json!(1)), ("/byte_length", json!(0)),
-            ("/total_bytes", json!(99)), ("/eof", json!(false)),
+            ("/offset_bytes", json!(1)),
+            ("/byte_length", json!(0)),
+            ("/total_bytes", json!(99)),
+            ("/eof", json!(false)),
             ("/content_base64", json!("c3Vic3RpdHV0ZWQ=")),
         ] {
             let mut bad = page.clone();
@@ -941,34 +1046,75 @@ mod tests {
         let (command, receipt, target, task) = normalized_fixture();
         for (pointer, value) in [
             ("/normalized_result_origin/task_revision", json!(3)),
-            ("/normalized_result_origin/attempt_id", json!("other-attempt")),
-            ("/normalized_result_origin/producer/native_payload_sha256", json!("d".repeat(64))),
-            ("/normalized_result_origin/producer/native_input_id", json!("another-input")),
-            ("/normalized_result_origin/producer/module_receipt/artifact/version", json!("0.1.1")),
+            (
+                "/normalized_result_origin/attempt_id",
+                json!("other-attempt"),
+            ),
+            (
+                "/normalized_result_origin/producer/native_payload_sha256",
+                json!("d".repeat(64)),
+            ),
+            (
+                "/normalized_result_origin/producer/native_input_id",
+                json!("another-input"),
+            ),
+            (
+                "/normalized_result_origin/producer/module_receipt/artifact/version",
+                json!("0.1.1"),
+            ),
             ("/selector/session_id", json!("foreign-root")),
             ("/selector/input_operation_id", json!("other-dispatch")),
             ("/selector/item_revision", json!(8)),
         ] {
             let mut bad = command.clone();
             *bad.input.pointer_mut(pointer).unwrap() = value;
-            assert!(NormalizedResultContext::for_dispatch(&bad, &receipt, &target, &task, "native-input", "turn").is_err(), "{pointer}");
+            assert!(
+                NormalizedResultContext::for_dispatch(
+                    &bad,
+                    &receipt,
+                    &target,
+                    &task,
+                    "native-input",
+                    "turn"
+                )
+                .is_err(),
+                "{pointer}"
+            );
         }
         let mut bad = command.clone();
         bad.input["normalized_result_origin"]["private_auth"] = json!("must-not-be-retained");
         assert!(validate_normalized_request(&bad, &receipt).is_err());
         bad.input = command.input.clone();
-        bad.input.as_object_mut().unwrap().remove("normalized_result_origin");
+        bad.input
+            .as_object_mut()
+            .unwrap()
+            .remove("normalized_result_origin");
         assert!(validate_normalized_request(&bad, &receipt).is_err());
     }
 
     #[tokio::test]
     async fn muse_normalized_result_rejects_foreign_native_turn_before_page_publication() {
         let (command, receipt, target, task) = normalized_fixture();
-        let context = NormalizedResultContext::for_dispatch(&command, &receipt, &target, &task, "native-input", "turn").unwrap();
+        let context = NormalizedResultContext::for_dispatch(
+            &command,
+            &receipt,
+            &target,
+            &task,
+            "native-input",
+            "turn",
+        )
+        .unwrap();
         let mut item = message("other turn");
         item["turnId"] = json!("foreign-turn");
-        let (page, _) = run(command.input.clone(), vec![view(vec![event(item)], Value::Null)]).await;
-        assert_eq!(context.normalize_page(page.unwrap()).unwrap_err().code, "RESULT_NATIVE_SCOPE_MISMATCH");
+        let (page, _) = run(
+            command.input.clone(),
+            vec![view(vec![event(item)], Value::Null)],
+        )
+        .await;
+        assert_eq!(
+            context.normalize_page(page.unwrap()).unwrap_err().code,
+            "RESULT_NATIVE_SCOPE_MISMATCH"
+        );
     }
 
     #[tokio::test]
@@ -979,16 +1125,44 @@ mod tests {
         command.input["normalized_result_payload_identity"] = json!({
             "sha256":hash(b"abcdef"),"byte_length":6,"complete":true,
         });
-        let context = NormalizedResultContext::for_dispatch(&command, &receipt, &target, &task, "native-input", "turn").unwrap();
-        let (page, _) = run(command.input.clone(), vec![view(vec![event(message("abcdef"))], Value::Null)]).await;
+        let context = NormalizedResultContext::for_dispatch(
+            &command,
+            &receipt,
+            &target,
+            &task,
+            "native-input",
+            "turn",
+        )
+        .unwrap();
+        let (page, _) = run(
+            command.input.clone(),
+            vec![view(vec![event(message("abcdef"))], Value::Null)],
+        )
+        .await;
         let page = context.normalize_page(page.unwrap()).unwrap();
-        assert_eq!(STANDARD.decode(page["content_base64"].as_str().unwrap()).unwrap(), b"bc");
+        assert_eq!(
+            STANDARD
+                .decode(page["content_base64"].as_str().unwrap())
+                .unwrap(),
+            b"bc"
+        );
         assert_eq!(page["source"]["payload_sha256"], hash(b"abcdef"));
         assert_eq!(page["total_bytes"], 6);
         assert_eq!(page["eof"], false);
         command.input["normalized_result_payload_identity"]["sha256"] = json!("d".repeat(64));
-        let changed = NormalizedResultContext::for_dispatch(&command, &receipt, &target, &task, "native-input", "turn").unwrap();
-        assert_eq!(changed.validate_page(&page).unwrap_err().code, "RESULT_PAYLOAD_MISMATCH");
+        let changed = NormalizedResultContext::for_dispatch(
+            &command,
+            &receipt,
+            &target,
+            &task,
+            "native-input",
+            "turn",
+        )
+        .unwrap();
+        assert_eq!(
+            changed.validate_page(&page).unwrap_err().code,
+            "RESULT_PAYLOAD_MISMATCH"
+        );
     }
 
     #[test]

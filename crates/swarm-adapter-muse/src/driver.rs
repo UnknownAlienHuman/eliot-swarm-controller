@@ -17,8 +17,7 @@ use crate::{
         ChildSnapshotInput, NativeEventInput, ObservationProjector, PendingInventoryInput,
         ProjectionFence, ReadMethod, ReductionStatus, RootSnapshotInput,
     },
-    results,
-    schema,
+    results, schema,
 };
 use jsonrpsee_core::server::RpcModule;
 use serde::Deserialize;
@@ -796,8 +795,16 @@ impl Driver {
         }
         let result_input = if command.method == "agent.result" {
             let s = self.lock()?;
-            s.journal.as_ref().ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
-                .result_context(s.scope.as_ref().ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?, receipt, command)
+            s.journal
+                .as_ref()
+                .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                .result_context(
+                    s.scope
+                        .as_ref()
+                        .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?,
+                    receipt,
+                    command,
+                )
                 .map_err(jf)?;
             Some(command.input.clone())
         } else {
@@ -950,8 +957,16 @@ impl Driver {
             CommandEncoding::ResultReadRequired { validated_input } => {
                 let context = {
                     let s = self.lock()?;
-                    s.journal.as_ref().ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
-                        .result_context(s.scope.as_ref().ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?, receipt, command)
+                    s.journal
+                        .as_ref()
+                        .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                        .result_context(
+                            s.scope
+                                .as_ref()
+                                .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?,
+                            receipt,
+                            command,
+                        )
                         .map_err(jf)?
                 };
                 let session = context.request().selector().session_id();
@@ -986,7 +1001,9 @@ impl Driver {
                 })
                 .await
                 .map_err(|e| fault(e.code))?;
-                let page = context.normalize_page(page).map_err(|error| fault(error.code))?;
+                let page = context
+                    .normalize_page(page)
+                    .map_err(|error| fault(error.code))?;
                 let mut s = self.lock()?;
                 let scope = s
                     .scope
@@ -2644,16 +2661,23 @@ mod tests {
         c
     }
     fn normalized_result_command(driver: &Driver) -> RuntimeCommand {
-        let mut command = command(driver, "03-result", "agent.result", json!({
-            "selector":{"kind":"message","input_operation_id":"02-dispatch",
-                "session_id":ROOT,"item_id":"answer","item_revision":7,"before_cursor":""},
-            "offset_bytes":0,"length_bytes":65_536,
-        }));
+        let mut command = command(
+            driver,
+            "03-result",
+            "agent.result",
+            json!({
+                "selector":{"kind":"message","input_operation_id":"02-dispatch",
+                    "session_id":ROOT,"item_id":"answer","item_revision":7,"before_cursor":""},
+                "offset_bytes":0,"length_bytes":65_536,
+            }),
+        );
         let state = driver.lock().unwrap();
         let saved = &state.contexts["02-dispatch"];
         command.target_input_sha256 = Some(saved.receipt.input_sha256.clone());
         command.input["normalized_result_origin"] = results::fixture_origin(
-            &saved.receipt, saved.task.as_ref().unwrap(), saved.invocation.command_id(),
+            &saved.receipt,
+            saved.task.as_ref().unwrap(),
+            saved.invocation.command_id(),
             &command.input["selector"],
         );
         command
@@ -2869,7 +2893,8 @@ mod tests {
 
     #[test]
     fn muse_driver_family_wire_keeps_unknown_inventory_and_child_freshness_distinct() {
-        let missing = family_wire_observation(json!({"execution":"unknown","family_completeness":"partial"}));
+        let missing =
+            family_wire_observation(json!({"execution":"unknown","family_completeness":"partial"}));
         assert_eq!(missing["observed_children"], json!([]));
         assert_eq!(missing["observed_children_state"], "unavailable");
         assert_eq!(missing["family_completeness"], "partial");
@@ -2978,7 +3003,11 @@ mod tests {
             assert_eq!(restored.inventories[0].session_id(), ROOT);
         }
         driver.clone().execute(dispatch(&driver)).await.unwrap();
-        driver.clone().execute(normalized_result_command(&driver)).await.unwrap();
+        driver
+            .clone()
+            .execute(normalized_result_command(&driver))
+            .await
+            .unwrap();
         let records = Arc::new(Mutex::new(Vec::new()));
         let host = host_pair(&dir.0, records.clone());
         let mut first = driver.bootstrap.link(&driver).await.unwrap();
@@ -3042,7 +3071,10 @@ mod tests {
         }
         {
             let observed = records.lock().unwrap();
-            for frame in observed.iter().filter(|frame| frame["method"] == "module.observe") {
+            for frame in observed
+                .iter()
+                .filter(|frame| frame["method"] == "module.observe")
+            {
                 assert!(frame["params"]["state"]["observed_children"].is_array());
             }
         }
