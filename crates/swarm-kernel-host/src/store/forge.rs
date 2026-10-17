@@ -3696,10 +3696,13 @@ mod tests {
     #[test]
     #[ignore = "isolated process-wide Job/group fixture invoked by the parent test"]
     fn forge_owner_receipt_image_claims_child() {
+        eprintln!("FORGE_OWNER_IMAGE_PHASE entered");
         let token = model::new_id();
         let group = swarm_process::Group::enter_module(&token).unwrap();
+        eprintln!("FORGE_OWNER_IMAGE_PHASE group_ready");
         let pid = std::process::id();
         let image = swarm_process::process_image_identity(pid).unwrap();
+        eprintln!("FORGE_OWNER_IMAGE_PHASE image_observed");
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
         let directory = std::env::temp_dir().join(model::new_id());
         let job = NativeWorkerJob {
@@ -3726,7 +3729,9 @@ mod tests {
         process["image_path"] = image["image_path"].clone();
         process["image_sha256"] = image["image_sha256"].clone();
         let owner = json!({"version":1,"token":token,"process":process});
+        eprintln!("FORGE_OWNER_IMAGE_PHASE executable_pinned");
         validate_worker_owner(&job, pid, &owner).unwrap();
+        eprintln!("FORGE_OWNER_IMAGE_PHASE valid_owner_checked");
 
         for field in ["image_path", "image_sha256"] {
             let mut missing = owner.clone();
@@ -3754,9 +3759,11 @@ mod tests {
                 "changed {field} must not authorize publication"
             );
         }
+        eprintln!("FORGE_OWNER_IMAGE_PHASE invalid_claims_checked");
         // Receipt serialization must preserve the exact restart image claims.
         let restored: Value = serde_json::from_slice(&serde_json::to_vec(&owner).unwrap()).unwrap();
         validate_worker_owner(&job, pid, &restored).unwrap();
+        eprintln!("FORGE_OWNER_IMAGE_PHASE roundtrip_checked");
         println!("FORGE_OWNER_IMAGE_CLAIMS_ASSERTIONS_COMPLETE");
     }
 
