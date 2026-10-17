@@ -11,6 +11,12 @@ SDK. Its stateful checkpoint, recovery and native-control code is still Node;
 the Rust adapter migration required by the [modular architecture](../../docs/agent-operations/modularity.md#6-implementation-sequence-and-completion-criteria)
 remains incomplete. The bridge's fixture results apply to this implementation.
 
+The prospective [Rust transport library](../../crates/swarm-adapter-muse/README.md)
+uses complete generic Rust RPC/codec crates and passes 19 local synthetic-pipe
+fixtures. It has no executable/descriptor and does not replace this bridge's
+commands, checkpoint, recovery or results. Those Rust migration steps and native
+qualification remain open.
+
 ## Ownership and setup
 
 The bridge owns one `muse serve` connection. Host IPC exposes `module.hello/next/outcome/observe/result`; its credential is scoped to the reserved binding/generation and cannot accept Tasks or become GM. Native subscription/auth, tools and model loop remain in Muse.
