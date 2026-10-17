@@ -123,6 +123,7 @@ struct State {
     items: BTreeMap<String, ItemIdentity>,
     stream_sequences: BTreeMap<String, u64>,
     prefix_loss: BTreeSet<String>,
+    discovery_page: Option<journal::ChildDiscovery>,
     discovery_cursor: Option<String>,
     discovery_truncated: bool,
     dirty: u64,
@@ -159,6 +160,7 @@ impl State {
             items: BTreeMap::new(),
             stream_sequences: BTreeMap::new(),
             prefix_loss: BTreeSet::new(),
+            discovery_page: None,
             discovery_cursor: None,
             discovery_truncated: true,
             dirty: 1,
@@ -248,6 +250,35 @@ impl Driver {
                 // The root in a prepared intent is not proof it ever existed.
                 state.diagnostic = Some("MUSE_RESTORED_CONTEXT_READ_REQUIRED");
                 install_projector(&mut state, &scope, &bootstrap.worker.boot_id)?;
+                if let Some(restored) = state
+                    .journal
+                    .as_ref()
+                    .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                    .restored_observations(&scope)
+                    .map_err(jf)?
+                {
+                    state.projector = Some(
+                        ObservationProjector::restore(
+                            state
+                                .fence
+                                .clone()
+                                .ok_or_else(|| fault("MUSE_PROJECTION_UNAVAILABLE"))?,
+                            restored.projection,
+                        )
+                        .map_err(|_| fault("MUSE_RESTORED_PROJECTION_INVALID"))?,
+                    );
+                    if let Some(page) = restored
+                        .discovery
+                        .into_iter()
+                        .find(|page| page.parent_session_id == scope.native_root_id)
+                    {
+                        state.discovery_cursor = page.next.clone();
+                        state.discovery_truncated = !page.complete;
+                        state.discovery_page = Some(page);
+                    }
+                    // Pending payloads remain retained historical facts in the
+                    // journal. Only a new stable native inventory enables replies.
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(fault("MUSE_SCOPE_READ_UNKNOWN")),
@@ -496,10 +527,7 @@ impl Driver {
         s.journal
             .as_mut()
             .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
-            .record_durability(
-                &scope,
-                journal::Durability::from_initialize_declaration(init.get("sessionDurability")),
-            )
+            .record_initialize(&scope, &scope.native_namespace, &init)
             .map_err(jf)?;
         if !s.transport_ended
             && let (Some(p), Some(f)) = (&s.projector, &s.fence)
@@ -641,14 +669,6 @@ impl Driver {
         } else if !ready {
             return Err(fault("MUSE_NATIVE_RECOVERY_REQUIRED"));
         }
-        if restored
-            && !matches!(
-                command.method.as_str(),
-                "agent.recover" | "agent.refresh" | "agent.result"
-            )
-        {
-            return Err(fault("MUSE_DURABLE_CONTEXT_EXTENSION_REQUIRED"));
-        }
         if command.method == "agent.reply" {
             let session = command.input["reply"]["params"]["sessionId"]
                 .as_str()
@@ -663,12 +683,8 @@ impl Driver {
         };
         let needs_work = matches!(
             command.method.as_str(),
-            "agent.send" | "task.dispatch" | "agent.recover"
-        ) || command.method == "agent.goal"
-            && matches!(
-                command.input["action"].as_str(),
-                Some("set" | "edit" | "resume")
-            );
+            "agent.send" | "task.dispatch" | "agent.recover" | "agent.configure" | "agent.goal"
+        );
         let work = if needs_work {
             Some(self.snapshot(&transport, &root).await?)
         } else {
@@ -743,20 +759,12 @@ impl Driver {
                     if s.contexts.len() >= MAX_CONTEXTS {
                         return Err(fault("MUSE_COMMAND_CONTEXT_CAPACITY"));
                     }
-                    // These exact public payloads need a journal contract extension.
-                    // Do not flatten model, discard MCP fields or retarget a child.
-                    if request.params["sessionId"] != scope.native_root_id {
-                        return Err(fault("MUSE_JOURNAL_CHILD_REPLY_EXTENSION_REQUIRED"));
-                    }
-                    if request.params.contains_key("config") {
-                        return Err(fault("MUSE_JOURNAL_MCP_EXTENSION_REQUIRED"));
-                    }
-                    if request.params.contains_key("model") {
-                        return Err(fault("MUSE_JOURNAL_MODEL_EXTENSION_REQUIRED"));
-                    }
-                    let invocation =
-                        NativeInvocation::new(&scope, request.method, &id, request.params)
-                            .map_err(jf)?;
+                    let invocation = s
+                        .journal
+                        .as_ref()
+                        .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                        .native_invocation(&scope, request.method, &id, request.params)
+                        .map_err(jf)?;
                     if needs_work
                         && (s.revision(&root) != revision
                             || work.as_ref().is_some_and(|w| w.revision != revision))
@@ -781,11 +789,22 @@ impl Driver {
                         finished: false,
                     };
                     let (method, params) = {
+                        let selectors = journal::RetainedSelectors {
+                            model_id: s.requested.model_id.clone(),
+                            provider_id: s.requested.provider_id.clone(),
+                            reasoning_effort: s.requested.reasoning_effort.clone(),
+                        };
                         let guard = s
                             .journal
                             .as_mut()
                             .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
-                            .prepare_native(&scope, receipt.clone(), invocation.clone())
+                            .prepare_command(
+                                &scope,
+                                receipt.clone(),
+                                command.clone(),
+                                invocation.clone(),
+                                selectors,
+                            )
                             .map_err(jf)?;
                         let exact = guard.invocation();
                         // Final event/work check and enqueue have no intervening
@@ -807,8 +826,37 @@ impl Driver {
                 self.queue(receipt,EffectOutcome::Applied,json!({"completion_condition":"native_read_completed","execution_complete":false}),None,None)
             }
             CommandEncoding::ResultReadRequired { validated_input } => {
+                let requested =
+                    ResultRequest::parse(&validated_input).map_err(|error| fault(error.code))?;
+                let session = requested.selector().session_id();
+                self.refresh(&transport, &root).await?;
+                if session != root {
+                    self.refresh_one(&transport, session).await?;
+                }
+                let authority = {
+                    let s = self.lock()?;
+                    s.journal
+                        .as_ref()
+                        .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                        .authorize_session(
+                            s.scope
+                                .as_ref()
+                                .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?,
+                            session,
+                        )
+                        .map_err(jf)?
+                };
                 let page = results::read_result(&transport, &validated_input, |selector| {
-                    !self.stopping() && self.lock().is_ok_and(|s| s.member(selector.session_id()))
+                    !self.stopping()
+                        && selector.session_id() == session
+                        && self.lock().is_ok_and(|s| {
+                            !s.transport_ended
+                                && s.scope.as_ref().zip(s.journal.as_ref()).is_some_and(
+                                    |(scope, journal)| {
+                                        journal.authority_is_current(scope, &authority)
+                                    },
+                                )
+                        })
                 })
                 .await
                 .map_err(|e| fault(e.code))?;
@@ -820,7 +868,7 @@ impl Driver {
                 s.journal
                     .as_mut()
                     .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
-                    .queue_result(&scope, receipt.clone(), page)
+                    .queue_result_for(&scope, receipt.clone(), page, &authority)
                     .map_err(jf)
             }
             CommandEncoding::ReconciliationRequired(_) => {
@@ -978,7 +1026,14 @@ impl Driver {
             }
             "session/setModel" => {
                 s.model = ModelConfiguration::Pending;
-                return Err(fault("MUSE_JOURNAL_MODEL_EXTENSION_REQUIRED"));
+                let params = saved.invocation.params().map_err(jf)?;
+                s.requested.model_id = params["model"]["modelId"].as_str().map(str::to_owned);
+                s.requested.provider_id = params["model"]["providerId"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                details["completion_condition"] = json!("native_model_selection_admitted");
+                details["effective_configuration_verified"] = json!(false);
             }
             _ => {
                 details["completion_condition"] = json!(if method.starts_with("goal/") {
@@ -1018,16 +1073,60 @@ impl Driver {
         let target = command.input["operation_id"]
             .as_str()
             .ok_or_else(|| fault("MUSE_RECONCILIATION_TARGET_INVALID"))?;
-        let saved = {
+        let (saved, restored_context, needs_saved_work) = {
             let s = self.lock()?;
-            s.contexts
-                .get(target)
-                .cloned()
-                .ok_or_else(|| fault("MUSE_DURABLE_RECONCILIATION_CONTEXT_REQUIRED"))?
+            if let Some(saved) = s.contexts.get(target) {
+                (saved.clone(), false, saved.work.is_some())
+            } else {
+                let scope = s
+                    .scope
+                    .as_ref()
+                    .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?;
+                let journal = s
+                    .journal
+                    .as_ref()
+                    .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?;
+                let retained = journal
+                    .retained_command(scope, target)
+                    .map_err(jf)?
+                    .ok_or_else(|| fault("MUSE_RECONCILIATION_CONTEXT_UNAVAILABLE"))?;
+                let selectors = retained.requested();
+                (
+                    SavedCommand {
+                        command: retained.command().clone(),
+                        receipt: retained.original_receipt().clone(),
+                        invocation: journal
+                            .retained_invocation(scope, target)
+                            .map_err(jf)?
+                            .clone(),
+                        task: retained.task_prompt(scope).map_err(jf)?.map(Arc::new),
+                        requested: Some(RequestedSelectors {
+                            model_id: selectors.model_id.clone(),
+                            provider_id: selectors.provider_id.clone(),
+                            reasoning_effort: selectors.reasoning_effort.clone(),
+                        }),
+                        work: None,
+                        ack: None,
+                        finished: false,
+                    },
+                    true,
+                    retained.work_fence().is_some(),
+                )
+            }
         };
+        let root = self
+            .lock()?
+            .scope
+            .as_ref()
+            .map(|scope| scope.native_root_id.clone())
+            .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?;
         if command.target_input_sha256.as_deref() != Some(saved.receipt.input_sha256.as_str())
             || target == command.operation_id
-            || command.native_root_id != self.lock()?.confirmed_root
+            || command
+                .native_root_id
+                .as_deref()
+                .is_some_and(|value| value != root)
+            || command.native_root_id.is_none() && saved.command.method != "agent.open"
         {
             return Err(fault("MUSE_RECONCILIATION_TARGET_INVALID"));
         }
@@ -1038,21 +1137,34 @@ impl Driver {
             self.complete(&saved, ack.clone(), transport).await?;
             return self.queue(receipt,EffectOutcome::Applied,json!({"target_operation_id":target,"resubmitted":false,"disposition":"native_ack_readback"}),None,None);
         }
+        let current_root = if saved.command.method != "agent.open" {
+            let fresh = self.snapshot(transport, &root).await?;
+            let mut s = self.lock()?;
+            if s.revision(&root) != fresh.revision || s.transport_ended {
+                return Err(fault("MUSE_RECONCILIATION_FENCE_CHANGED"));
+            }
+            s.confirmed_root = Some(root.clone());
+            Some(fresh)
+        } else {
+            None
+        };
         if saved.command.method == "agent.reply" {
             let session = saved.command.input["reply"]["params"]["sessionId"]
                 .as_str()
                 .ok_or_else(|| fault("MUSE_REPLY_SESSION_INVALID"))?;
-            self.refresh_one(transport, session).await?;
+            self.refresh(transport, &root).await?;
+            if session != root {
+                self.refresh_one(transport, session).await?;
+            }
         }
-        let fresh_work = if let Some(original) = &saved.work {
-            let root = self
-                .lock()?
-                .scope
+        let fresh_work = if needs_saved_work {
+            let fresh =
+                current_root.ok_or_else(|| fault("MUSE_RECONCILIATION_WORK_UNAVAILABLE"))?;
+            if saved
+                .work
                 .as_ref()
-                .map(|s| s.native_root_id.clone())
-                .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?;
-            let fresh = self.snapshot(transport, &root).await?;
-            if !same_work(original, &fresh.value) {
+                .is_some_and(|original| !same_work(original, &fresh.value))
+            {
                 self.block_target(target, "MUSE_RECONCILIATION_WORK_CHANGED")?;
                 return Err(fault("MUSE_RECONCILIATION_WORK_CHANGED"));
             }
@@ -1066,14 +1178,15 @@ impl Driver {
                 .scope
                 .clone()
                 .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?;
-            if validate_retry(
-                &s,
-                &scope,
-                &self.bootstrap.worker.boot_id,
-                &saved,
-                fresh_work.as_ref(),
-            )
-            .is_err()
+            if !restored_context
+                && validate_retry(
+                    &s,
+                    &scope,
+                    &self.bootstrap.worker.boot_id,
+                    &saved,
+                    fresh_work.as_ref(),
+                )
+                .is_err()
             {
                 s.journal
                     .as_mut()
@@ -1086,7 +1199,7 @@ impl Driver {
                 .journal
                 .as_mut()
                 .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
-                .explicit_reconcile(&scope, target, saved.invocation.payload_sha256())
+                .reconcile_command(&scope, command, receipt)
                 .map_err(jf)?;
             match action {
                 journal::Reconciliation::Write(guard) => {
@@ -1167,7 +1280,7 @@ impl Driver {
             return Err(fault("MUSE_SESSION_READ_RACED"));
         }
         {
-            let s = self.lock()?;
+            let mut s = self.lock()?;
             if s.scope
                 .as_ref()
                 .is_some_and(|scope| scope.native_root_id == session)
@@ -1176,6 +1289,35 @@ impl Driver {
                 })
             {
                 return Err(fault("MUSE_NATIVE_WORKSPACE_MISMATCH"));
+            }
+            if let Some(scope) = s
+                .scope
+                .clone()
+                .filter(|scope| scope.native_root_id == session)
+            {
+                if read["session"]["status"] == "idle"
+                    && read["session"]["activeTurnId"].is_null()
+                    && commands::validate_requested_readback(
+                        &s.requested,
+                        read["session"]["modelId"].as_str(),
+                        read["session"]["providerId"].as_str(),
+                    )
+                    .is_ok()
+                {
+                    s.model = ModelConfiguration::Settled;
+                }
+                let model = match s.model {
+                    ModelConfiguration::Unknown => journal::RetainedModelState::Unknown,
+                    ModelConfiguration::Pending => journal::RetainedModelState::Pending,
+                    ModelConfiguration::Settled => journal::RetainedModelState::Settled,
+                };
+                let effort = s.standing_effort.clone();
+                let current = s.revision(session);
+                s.journal
+                    .as_mut()
+                    .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                    .record_work_read(&scope, revision, current, &read, model, effort)
+                    .map_err(jf)?;
             }
         }
         Ok(Snapshot {
@@ -1188,10 +1330,12 @@ impl Driver {
         })
     }
     async fn refresh(&self, transport: &Arc<MspTransport>, session: &str) -> Result<()> {
-        self.refresh_one(transport, session).await?;
         let root = self.lock()?.confirmed_root.clone();
         if root.as_deref() == Some(session) {
             self.discover_children(transport, session).await?;
+            // Discovery events revoke the prior parent snapshot. Read the
+            // parent again before issuing authority for child inventories.
+            self.refresh_one(transport, session).await?;
             let children = self.lock()?.children();
             // One bounded family pass, never a child runner or subagent result
             // fetch. Unread children remain explicit partial observations.
@@ -1200,6 +1344,8 @@ impl Driver {
                     self.mark_gap("MUSE_CHILD_READ_UNAVAILABLE");
                 }
             }
+        } else {
+            self.refresh_one(transport, session).await?;
         }
         Ok(())
     }
@@ -1218,6 +1364,13 @@ impl Driver {
             schema::validate_definition("ViewPageResult", &page)
                 .map_err(|_| fault("MUSE_DISCOVERY_PAGE_INVALID"))?;
             let mut s = self.lock()?;
+            if let Some(scope) = s.scope.clone() {
+                s.journal
+                    .as_mut()
+                    .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                    .invalidate_observations(&scope)
+                    .map_err(jf)?;
+            }
             for event in page["events"]
                 .as_array()
                 .ok_or_else(|| fault("MUSE_DISCOVERY_PAGE_INVALID"))?
@@ -1257,8 +1410,15 @@ impl Driver {
                 }
             }
             if page["nextCursor"].is_null() {
+                s.discovery_page = Some(journal::ChildDiscovery {
+                    parent_session_id: root.into(),
+                    after: cursor.clone(),
+                    next: None,
+                    complete: true,
+                });
                 s.discovery_cursor = None;
                 s.discovery_truncated = false;
+                Self::retain_projection(&mut s, Vec::new())?;
                 s.changed();
                 return Ok(());
             }
@@ -1270,8 +1430,15 @@ impl Driver {
                 return Err(fault("MUSE_DISCOVERY_CURSOR_STALLED"));
             }
             cursor = Some(next.into());
+            s.discovery_page = Some(journal::ChildDiscovery {
+                parent_session_id: root.into(),
+                after: s.discovery_cursor.clone(),
+                next: cursor.clone(),
+                complete: false,
+            });
             s.discovery_cursor = cursor.clone();
             s.discovery_truncated = true;
+            Self::retain_projection(&mut s, Vec::new())?;
             s.changed();
         }
         Ok(())
@@ -1287,14 +1454,41 @@ impl Driver {
             json!({"sessionId":session,"after":snapshot.view_cursor}),
         )
         .await?;
-        let pending_revision = self.lock()?.revision(session);
+        self.apply_snapshot(session, &snapshot)?;
+        let (pending_revision, projected_revision, authority) = {
+            let s = self.lock()?;
+            let scope = s
+                .scope
+                .as_ref()
+                .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?;
+            let authority = s
+                .journal
+                .as_ref()
+                .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                .authorize_session(scope, session)
+                .map_err(jf)?;
+            (
+                s.revision(session),
+                s.projector
+                    .as_ref()
+                    .ok_or_else(|| fault("MUSE_PROJECTION_UNAVAILABLE"))?
+                    .session_revision(session),
+                authority,
+            )
+        };
         let inventory = read_rpc(
             transport,
             "approval/listPending",
             json!({"sessionId":session}),
         )
         .await?;
-        self.apply_refresh(session, &snapshot, pending_revision, &inventory)?;
+        self.apply_inventory(
+            session,
+            pending_revision,
+            projected_revision,
+            &authority,
+            &inventory,
+        )?;
         let (usage_generation, fence) = {
             let s = self.lock()?;
             (
@@ -1316,13 +1510,7 @@ impl Driver {
         }
         Ok(())
     }
-    fn apply_refresh(
-        &self,
-        session: &str,
-        snapshot: &Snapshot,
-        pending_revision: u64,
-        inventory: &Value,
-    ) -> Result<()> {
+    fn apply_snapshot(&self, session: &str, snapshot: &Snapshot) -> Result<()> {
         let mut s = self.lock()?;
         let fence = s
             .fence
@@ -1333,7 +1521,7 @@ impl Driver {
             .as_ref()
             .ok_or_else(|| fault("MUSE_PROJECTION_UNAVAILABLE"))?;
         let local_revision = p.session_revision(session);
-        if s.revision(session) != snapshot.revision || pending_revision != snapshot.revision {
+        if s.revision(session) != snapshot.revision {
             return Err(fault("MUSE_SESSION_READ_RACED"));
         }
         let reduced = if session == fence.native_root_id {
@@ -1375,9 +1563,63 @@ impl Driver {
         if reduced.status != ReductionStatus::Applied {
             return Err(fault("MUSE_REFRESH_PROJECTION_UNRESOLVED"));
         }
-        let p = reduced.projector;
+        s.projector = Some(reduced.projector);
+        Self::retain_projection(&mut s, Vec::new())?;
+        s.changed();
+        Ok(())
+    }
+
+    fn retain_projection(s: &mut State, inventories: Vec<journal::PendingInventory>) -> Result<()> {
+        let scope = s
+            .scope
+            .as_ref()
+            .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?;
+        let projector = s
+            .projector
+            .as_ref()
+            .ok_or_else(|| fault("MUSE_PROJECTION_UNAVAILABLE"))?;
+        let journal = s
+            .journal
+            .as_mut()
+            .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?;
+        let projection = journal.capture_projection(scope, projector).map_err(jf)?;
+        journal
+            .retain_observations(
+                scope,
+                projection,
+                s.discovery_page.iter().cloned().collect(),
+                inventories,
+            )
+            .map_err(jf)
+    }
+
+    fn apply_inventory(
+        &self,
+        session: &str,
+        pending_revision: u64,
+        projected_revision: u64,
+        authority: &journal::SessionAuthority,
+        inventory: &Value,
+    ) -> Result<()> {
+        let mut s = self.lock()?;
+        let scope = s
+            .scope
+            .clone()
+            .ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?;
+        if s.revision(session) != pending_revision || s.transport_ended {
+            return Err(fault("MUSE_PENDING_REQUEST_STALE"));
+        }
+        let p = s
+            .projector
+            .as_ref()
+            .ok_or_else(|| fault("MUSE_PROJECTION_UNAVAILABLE"))?;
+        let current = p.session_revision(session);
+        let fence = s
+            .fence
+            .as_ref()
+            .ok_or_else(|| fault("MUSE_PROJECTION_UNAVAILABLE"))?;
         let replaced = p.replace_pending(PendingInventoryInput {
-            fence: &fence,
+            fence,
             session_id: session,
             expected_session_revision: p.session_revision(session),
             inventory,
@@ -1385,6 +1627,18 @@ impl Driver {
         if replaced.status != ReductionStatus::Applied {
             return Err(fault("MUSE_PENDING_INVENTORY_UNRESOLVED"));
         }
+        let captured = s
+            .journal
+            .as_mut()
+            .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+            .capture_pending_inventory(
+                &scope,
+                authority,
+                projected_revision,
+                current,
+                inventory.clone(),
+            )
+            .map_err(jf)?;
         let replacement = inventory_controls(session, inventory, pending_revision)?;
         s.pending.retain(|_, p| p.params["sessionId"] != session);
         if s.pending.len().saturating_add(replacement.len()) > MAX_PENDING {
@@ -1392,6 +1646,7 @@ impl Driver {
         }
         s.pending.extend(replacement);
         s.projector = Some(replaced.projector);
+        Self::retain_projection(&mut s, vec![captured])?;
         s.changed();
         Ok(())
     }
@@ -1416,6 +1671,13 @@ impl Driver {
             s.versions.insert(session.into(), rev);
         }
         let is_delta = method == "item/delta";
+        if let Some(scope) = s.scope.clone() {
+            s.journal
+                .as_mut()
+                .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                .invalidate_observations(&scope)
+                .map_err(jf)?;
+        }
         let pending_tasks: Vec<String> = if s.confirmed_root.as_deref() == p["sessionId"].as_str()
             && matches!(
                 method,
@@ -1435,12 +1697,17 @@ impl Driver {
         } else {
             Vec::new()
         };
-        if !pending_tasks.is_empty() {
+        let mut new_prefix_loss = false;
+        for operation in &pending_tasks {
+            new_prefix_loss |= s.prefix_loss.insert(operation.clone());
+        }
+        if new_prefix_loss {
             // Native events confer no Task authority. Retain only bounded loss
             // metadata for an already prepared exact Task command until ACK.
-            s.prefix_loss.extend(pending_tasks.iter().cloned());
             stream_gap(&mut s, "MUSE_STREAM_PREFIX_UNAVAILABLE");
         }
+        let mut observation_changed = !is_delta;
+        let mut stream_allowed = false;
         if let (Some(projector), Some(fence)) = (&s.projector, &s.fence) {
             let reduction = projector.apply_event(NativeEventInput {
                 fence,
@@ -1448,6 +1715,15 @@ impl Driver {
                 at_ms: now(),
                 event: &notification.envelope,
             });
+            let current = !matches!(
+                reduction.status,
+                ReductionStatus::Duplicate
+                    | ReductionStatus::ForeignFence
+                    | ReductionStatus::Raced
+                    | ReductionStatus::Ignored
+            );
+            observation_changed &= current;
+            stream_allowed = current && (!is_delta || reduction.stream_handoff.is_some());
             s.projector = Some(reduction.projector);
         }
         // Full native items establish item->turn only after a Task ACK bound
@@ -1504,7 +1780,9 @@ impl Driver {
                 // queue/link/ACK is lost. Later delivery exposes an actual gap.
                 s.stream_sequences
                     .insert(facts.scope.operation_id.clone(), last.source_sequence);
-                if self
+                if !stream_allowed {
+                    stream_gap(&mut s, "MUSE_STREAM_PROJECTION_GAP");
+                } else if self
                     .streams
                     .try_send(StreamJob {
                         facts,
@@ -1516,12 +1794,12 @@ impl Driver {
                     stream_gap(&mut s, "MUSE_STREAM_PRODUCER_GAP");
                 }
             }
-        } else if is_delta && (!s.task_turns.is_empty() || !pending_tasks.is_empty()) {
+        } else if is_delta && !s.task_turns.is_empty() && pending_tasks.is_empty() {
             stream_gap(&mut s, "MUSE_STREAM_SOURCE_SCOPE_UNAVAILABLE");
         }
         // Per-token content is never sent via module.observe. Stable lifecycle,
         // pending inventory and usage reductions use its bounded projection.
-        if !is_delta {
+        if observation_changed {
             s.changed();
         }
         Ok(())
@@ -2467,6 +2745,25 @@ mod tests {
             .await
             .unwrap();
         assert!(driver.lock().unwrap().ready);
+        {
+            let s = driver.lock().unwrap();
+            let scope = s.scope.as_ref().unwrap();
+            let journal = s.journal.as_ref().unwrap();
+            assert!(
+                journal
+                    .retained_command(scope, "01-open")
+                    .unwrap()
+                    .is_some()
+            );
+            let restored = journal.restored_observations(scope).unwrap().unwrap();
+            assert_eq!(restored.freshness, journal::RestoredFreshness::Stale);
+            assert_eq!(
+                restored.projection["state"]["root_snapshot_freshness"],
+                "stale"
+            );
+            assert_eq!(restored.inventories.len(), 1);
+            assert_eq!(restored.inventories[0].session_id(), ROOT);
+        }
         driver.clone().execute(dispatch(&driver)).await.unwrap();
         driver.clone().execute(command(&driver,"03-result","agent.result",json!({"selector":{"kind":"message","session_id":ROOT,"item_id":"answer","item_revision":7}}))).await.unwrap();
         let records = Arc::new(Mutex::new(Vec::new()));
@@ -2757,6 +3054,45 @@ mod tests {
             assert!(state.prefix_loss.contains(&dispatch.operation_id));
         }
         assert!(driver.stream_jobs.lock().await.try_recv().is_err());
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let host = host_pair(&dir.0, records.clone());
+        let mut first = driver.bootstrap.link(&driver).await.unwrap();
+        driver.flush(&mut first).await.unwrap();
+        let observations = || {
+            records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "module.observe")
+                .count()
+        };
+        let before = observations();
+        let counters = {
+            let s = driver.lock().unwrap();
+            (s.dirty, s.stream_gaps)
+        };
+        for n in 0..10 {
+            driver.notification(Notification { envelope:json!({"method":"item/delta","params":{"sessionId":ROOT,"itemId":"early-item","field":"text","delta":"more missing text","viewCursor":format!("pre-ack:more:{n}")}}) }).unwrap();
+            driver.flush(&mut first).await.unwrap();
+        }
+        assert_eq!(
+            observations(),
+            before,
+            "equivalent pre-ACK deltas must not produce durable per-token Observations"
+        );
+        assert_eq!(
+            {
+                let s = driver.lock().unwrap();
+                (s.dirty, s.stream_gaps)
+            },
+            counters
+        );
+        first.close().await;
+        drop(first);
+        let second = driver.bootstrap.link(&driver).await.unwrap();
+        second.close().await;
+        drop(second);
+        host.await.unwrap();
         driver.finish_ack(&saved, json!({"commandId":id,"status":"accepted","disposition":"started","startedNewTurn":true,"turnId":"early-turn"})).unwrap();
         driver.notification(Notification { envelope:json!({"method":"item/delta","params":{"sessionId":ROOT,"itemId":"early-item","field":"text","delta":"later suffix","viewCursor":"post-ack:3"}}) }).unwrap();
         let job = driver.stream_jobs.lock().await.try_recv().unwrap();
@@ -2769,5 +3105,71 @@ mod tests {
         assert!(!driver.lock().unwrap().task_turns["early-turn"].host_admitted);
         shutdown(&driver, &runtime).await;
         native.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn muse_driver_explicit_reconcile_reads_retained_context_after_cache_loss_without_native_replay()
+     {
+        let dir = Directory::new();
+        let (driver, runtime, peer) = fixture(&dir.0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let native = tokio::spawn(native_peer(peer, dir.0.clone(), calls.clone(), false));
+        driver
+            .clone()
+            .execute(command(&driver, "01-open", "agent.open", json!({})))
+            .await
+            .unwrap();
+        let original = dispatch(&driver);
+        driver.clone().execute(original.clone()).await.unwrap();
+        let native_id = {
+            let mut s = driver.lock().unwrap();
+            let saved = s.contexts.remove("02-dispatch").unwrap();
+            let retained = s
+                .journal
+                .as_ref()
+                .unwrap()
+                .retained_command(s.scope.as_ref().unwrap(), "02-dispatch")
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.command().input, original.input);
+            assert_eq!(retained.original_receipt(), &saved.receipt);
+            saved.invocation.command_id().to_owned()
+        };
+        let mut reconcile = command(
+            &driver,
+            "04-reconcile",
+            "agent.reconcile",
+            json!({"operation_id":"02-dispatch"}),
+        );
+        reconcile.target_input_sha256 = original.input_sha256.clone();
+        driver.clone().execute(reconcile).await.unwrap();
+        let outcome: Value = {
+            let state = driver.lock().unwrap();
+            let ticket = state
+                .journal
+                .as_ref()
+                .unwrap()
+                .outbox(state.scope.as_ref().unwrap())
+                .unwrap()
+                .into_iter()
+                .find(|ticket| ticket.operation_id() == "04-reconcile")
+                .unwrap();
+            serde_json::from_str(ticket.params_json()).unwrap()
+        };
+        assert_eq!(outcome["outcome"], "applied");
+        assert_eq!(outcome["details"]["resubmitted"], false);
+        shutdown(&driver, &runtime).await;
+        native.await.unwrap();
+        let calls = calls.lock().unwrap();
+        let inputs: Vec<_> = calls
+            .iter()
+            .filter(|call| call["method"] == "turn/start")
+            .collect();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0]["params"]["commandId"], native_id);
+        assert_eq!(
+            inputs[0]["params"]["input"],
+            json!([{"type":"text","text":"abc"}])
+        );
     }
 }

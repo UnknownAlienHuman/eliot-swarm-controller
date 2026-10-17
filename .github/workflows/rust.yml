@@ -352,7 +352,7 @@ jobs:
             --target-dir $sharedTargetDir `
             --packages-json $env:PACKAGE_SPECS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run selected Muse transport boundary fixtures
+      - name: Run selected Muse library qualification
         if: needs.scope.outputs.packages != '[]'
         shell: pwsh
         env:
@@ -362,9 +362,9 @@ jobs:
             ([string]$_).Split('@')[0] -ceq 'swarm-adapter-muse'
           })
           if ($musePackages.Count -eq 0) { exit 0 }
-          if ($musePackages.Count -ne 1) { throw 'Muse transport package selector must be unambiguous.' }
+          if ($musePackages.Count -ne 1) { throw 'Muse library package selector must be unambiguous.' }
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
-          & cargo test --locked --package $musePackages[0] --lib msp_transport_ --target-dir $sharedTargetDir
+          & cargo test --locked --package $musePackages[0] --lib --target-dir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run selected supervisor terminal retention regressions
         if: contains(needs.scope.outputs.changed_paths, 'crates/swarm-supervisor/src/supervisor.rs')
