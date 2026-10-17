@@ -297,11 +297,37 @@ pub(crate) fn probe_resource_conflicts(
 pub(crate) struct ProbeCleanupOwner {
     custody: ProbeHelperCustody,
     scope: Option<ProbeCleanupScope>,
+    #[cfg(test)]
+    handoff_diagnostic: Option<ProbeHandoffDiagnostic>,
+}
+
+#[cfg(test)]
+struct ProbeHandoffDiagnostic {
+    control: PathBuf,
+    explicit_release: bool,
+    snapshot: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ProbeCleanupOwner {
     pub(crate) fn poll(&mut self) {
         self.custody.poll();
+        #[cfg(test)]
+        if let Some(diagnostic) = &self.handoff_diagnostic {
+            // Keep only closed diagnostic fields, before completed custody can
+            // be removed and Drop can delete its response capture. No process
+            // handles or fixture lifetime are retained by this snapshot.
+            let mut snapshot = tests::ProbeCustodyFixture::owner_readiness_diagnostic(
+                self,
+                &diagnostic.control,
+                diagnostic.explicit_release,
+            );
+            // The diagnostic contains only ASCII labels, booleans and numbers.
+            snapshot.truncate(4096);
+            *diagnostic
+                .snapshot
+                .lock()
+                .expect("probe handoff diagnostic lock") = Some(snapshot);
+        }
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -366,6 +392,7 @@ pub(crate) fn pending_probe_cleanup_owner_for_test(
             cleanup_complete: false,
         },
         scope,
+        handoff_diagnostic: None,
     }
 }
 
@@ -1459,6 +1486,8 @@ fn command_output_with_cleanup(
                 Some(ProbeCleanupOwner {
                     custody,
                     scope: None,
+                    #[cfg(test)]
+                    handoff_diagnostic: None,
                 }),
             );
         }
@@ -3407,6 +3436,7 @@ pub(crate) mod tests {
         directory: PathBuf,
         control: PathBuf,
         helper_pid: u32,
+        handoff_snapshot: std::sync::Arc<std::sync::Mutex<Option<String>>>,
         helper_launch_identity: Option<Value>,
         helper_family_token: Option<String>,
         #[cfg(windows)]
@@ -3469,12 +3499,26 @@ pub(crate) mod tests {
             owner: &ProbeCleanupOwner,
             explicit_release: bool,
         ) -> String {
-            let target_identity =
-                probe_custody_file(&self.control, "target.identity.json").is_file();
+            Self::owner_readiness_diagnostic(owner, &self.control, explicit_release)
+        }
+
+        pub(crate) fn handoff_diagnostic(&self) -> Option<String> {
+            self.handoff_snapshot
+                .lock()
+                .expect("probe handoff diagnostic lock")
+                .clone()
+        }
+
+        pub(super) fn owner_readiness_diagnostic(
+            owner: &ProbeCleanupOwner,
+            control: &Path,
+            explicit_release: bool,
+        ) -> String {
+            let target_identity = probe_custody_file(control, "target.identity.json").is_file();
             let descendant_identity =
-                probe_custody_file(&self.control, "descendant.identity.json").is_file();
+                probe_custody_file(control, "descendant.identity.json").is_file();
             let identity_pid = |name: &str| {
-                File::open(probe_custody_file(&self.control, name))
+                File::open(probe_custody_file(control, name))
                     .ok()
                     .and_then(|file| read_bounded(file, 16 * 1024).ok())
                     .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -3482,20 +3526,40 @@ pub(crate) mod tests {
             };
             let target_pid = identity_pid("target.identity.json");
             let descendant_pid = identity_pid("descendant.identity.json");
-            let target_ready = probe_custody_file(&self.control, "target.ready").is_file();
-            let descendant_ready = probe_custody_file(&self.control, "descendant.ready").is_file();
-            let target_exit = probe_custody_file(&self.control, "target.exit").is_file();
-            let descendant_exit = probe_custody_file(&self.control, "descendant.exit").is_file();
-            let owner_record = self.directory.join("probe-owner.json").is_file();
-            let response_path = self.directory.join(PROBE_HELPER_RESPONSE_FILE);
+            let target_ready = probe_custody_file(control, "target.ready").is_file();
+            let descendant_ready = probe_custody_file(control, "descendant.ready").is_file();
+            let target_exit = probe_custody_file(control, "target.exit").is_file();
+            let descendant_exit = probe_custody_file(control, "descendant.exit").is_file();
+            let owner_record = owner.custody.directory.join("probe-owner.json").is_file();
+            let response_path = owner.custody.directory.join(PROBE_HELPER_RESPONSE_FILE);
             let response_bytes = fs::metadata(&response_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
             let response = File::open(&response_path)
-                .ok()
-                .and_then(|file| read_bounded(file, PROBE_RESPONSE_LIMIT).ok())
-                .and_then(|bytes| decode_probe_response(&bytes).ok())
-                .map(|response| {
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::NotFound => "missing",
+                    _ => "open_failed",
+                })
+                .and_then(|file| {
+                    read_bounded(file, PROBE_RESPONSE_LIMIT).map_err(|_| "read_failed")
+                })
+                .and_then(|bytes| {
+                    decode_probe_response(&bytes)
+                        .map(|response| ("decoded", response))
+                        .or_else(|_| {
+                            // Like the existing nested-family assertion, inspect
+                            // a libtest-prefixed frame only for diagnostics. This
+                            // never changes custody's full-stream classification.
+                            let start = bytes
+                                .windows(PROBE_MAGIC.len())
+                                .position(|window| window == PROBE_MAGIC)
+                                .ok_or("invalid_frame")?;
+                            decode_probe_response(&bytes[start..])
+                                .map(|response| ("invalid_full_frame_diagnostic_tail", response))
+                                .map_err(|_| "invalid_frame")
+                        })
+                })
+                .map(|(classification, response)| {
                     let message_kind = if response
                         .message
                         .starts_with("unable to start input probe:")
@@ -3510,15 +3574,22 @@ pub(crate) mod tests {
                         "membership_failed"
                     } else if response.message == "input probe left descendants after its command exited" {
                         "descendants_remained"
+                    } else if response.message == "input probe direct exit observation recovered after a transient status error" {
+                        "status_observation_recovered"
+                    } else if response.message == "input probe output capture ended without natural EOF or complete bytes" {
+                        "capture_incomplete"
+                    } else if response.message.contains("capture could not be made pollable") {
+                        "capture_setup_failed"
                     } else if response.message.is_empty() {
                         "empty"
                     } else {
                         "other"
                     };
                     format!(
-                        "decoded(success={},timed_out={},exit_code={:?},group_empty={},message_kind={},stdout_bytes={},stderr_bytes={})",
+                        "{classification}(success={},timed_out={},output_limited={},exit_code={:?},group_empty={},message_kind={},stdout_bytes={},stderr_bytes={})",
                         response.success,
                         response.timed_out,
+                        response.output_limited,
                         response.exit_code,
                         response.group_empty,
                         message_kind,
@@ -3526,9 +3597,9 @@ pub(crate) mod tests {
                         response.stderr.len(),
                     )
                 })
-                .unwrap_or_else(|| "unavailable".to_string());
+                .unwrap_or_else(|classification| classification.to_string());
             let capture = owner.custody.capture.as_ref();
-            let helper_pid = self.helper_pid;
+            let helper_pid = owner.custody.child_pid;
             let helper_running = owner.custody.exit_status.is_none();
             let helper_exit_code = owner
                 .custody
@@ -3547,8 +3618,9 @@ pub(crate) mod tests {
             let capture_finished = capture.is_some_and(CaptureStream::is_finished);
             let capture_reader_failed = capture.is_some_and(CaptureStream::reader_failed);
             let capture_truncated = capture.is_some_and(CaptureStream::truncated);
+            let response_group_empty = owner.custody.response_group_empty;
             format!(
-                "fixture_producer={{helper_pid={helper_pid},target_pid={target_pid:?},descendant_pid={descendant_pid:?},target_identity={target_identity},descendant_identity={descendant_identity},target_ready={target_ready},descendant_ready={descendant_ready},target_exit={target_exit},descendant_exit={descendant_exit},owner_record={owner_record},explicit_release={explicit_release},helper_running={helper_running},helper_exit_code={helper_exit_code:?},helper_exit_success={helper_exit_success:?},owner_pending={owner_pending},status_observation_failed={status_observation_failed},capture_setup_failed={capture_setup_failed},capture_started={capture_started},capture_finished={capture_finished},capture_reader_failed={capture_reader_failed},capture_truncated={capture_truncated},response_bytes={response_bytes},response={response}}}"
+                "fixture_producer={{helper_pid={helper_pid},target_pid={target_pid:?},descendant_pid={descendant_pid:?},target_identity={target_identity},descendant_identity={descendant_identity},target_ready={target_ready},descendant_ready={descendant_ready},target_exit={target_exit},descendant_exit={descendant_exit},owner_record={owner_record},explicit_release={explicit_release},helper_running={helper_running},helper_exit_code={helper_exit_code:?},helper_exit_success={helper_exit_success:?},owner_pending={owner_pending},status_observation_failed={status_observation_failed},capture_setup_failed={capture_setup_failed},capture_started={capture_started},capture_finished={capture_finished},capture_reader_failed={capture_reader_failed},capture_truncated={capture_truncated},response_group_empty={response_group_empty:?},response_bytes={response_bytes},response={response}}}"
             )
         }
 
@@ -3668,6 +3740,7 @@ pub(crate) mod tests {
             directory: directory.clone(),
             control: control.clone(),
             helper_pid,
+            handoff_snapshot: Default::default(),
             helper_launch_identity: None,
             helper_family_token: None,
             #[cfg(windows)]
@@ -3701,6 +3774,7 @@ pub(crate) mod tests {
         let mut owner = ProbeCleanupOwner {
             custody,
             scope: Some(scope),
+            handoff_diagnostic: None,
         };
         let target_identity_path = probe_custody_file(&control, "target.identity.json");
         let descendant_identity_path = probe_custody_file(&control, "descendant.identity.json");
@@ -3756,6 +3830,11 @@ pub(crate) mod tests {
                 .expect("retain the fixture's exact helper Job observation"),
             );
         }
+        owner.handoff_diagnostic = Some(ProbeHandoffDiagnostic {
+            control,
+            explicit_release,
+            snapshot: fixture.handoff_snapshot.clone(),
+        });
         (owner, fixture)
     }
 
