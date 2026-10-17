@@ -262,6 +262,18 @@ pub struct SupervisorStatus {
     pub last_failure: Option<FailureSummary>,
 }
 
+impl SupervisorStatus {
+    fn matches_current_hello(&self, boot_id: &str) -> bool {
+        self.worker_boot_id.as_deref() == Some(boot_id)
+            && matches!(
+                &self.lifecycle,
+                LifecycleState::Starting { boot_id: current }
+                    | LifecycleState::ProcessRunning { boot_id: current }
+                    if current == boot_id
+            )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationSnapshot {
@@ -829,9 +841,28 @@ impl SupervisorRegistry {
         service.confirm_module_hello(boot_id)
     }
 
-    /// Retain a bounded reason when Store's accepted hello cannot be matched
-    /// to the exact worker. The failed Store boot is kept separately from the
-    /// locally observed worker identity and the scope remains non-Ready.
+    /// Reconcile a retained Store hello only against the current eligible boot.
+    /// Historical hellos and scopes without a current service remain readback
+    /// context; they do not replace a new attempt's failure or worker identity.
+    pub(crate) async fn reconcile_retained_module_hello(
+        &self,
+        module_id: &str,
+        scope: &ServiceScope,
+        boot_id: &str,
+    ) -> Result<()> {
+        let services = self.services.lock().await;
+        let Some(service) = services
+            .iter()
+            .find(|(key, _)| key.module_id == module_id && &key.scope == scope)
+            .map(|(_, service)| service.clone())
+        else {
+            return Ok(());
+        };
+        service.reconcile_retained_module_hello(boot_id)
+    }
+
+    /// Retain a bounded reason for the current eligible hello only. A stale
+    /// diagnostic cannot change a newer attempt or an owner/custody hold.
     pub async fn record_module_hello_failure(
         &self,
         module_id: &str,
@@ -845,7 +876,9 @@ impl SupervisorRegistry {
             .find(|(key, _)| key.module_id == module_id && &key.scope == scope)
             .map(|(_, service)| service.clone())
             .ok_or_else(|| Error::new("MODULE_NOT_ACTIVE", "module service scope is not active"))?;
-        service.record_module_hello_failure(boot_id, error_code)
+        service
+            .record_module_hello_failure(boot_id, error_code)
+            .map(|_| ())
     }
 
     /// Stop only the exact permanently rejected scope while preserving the
@@ -1774,7 +1807,24 @@ impl Service {
         Ok(())
     }
 
-    fn record_module_hello_failure(&self, boot_id: &str, error_code: &str) -> Result<()> {
+    fn reconcile_retained_module_hello(&self, boot_id: &str) -> Result<()> {
+        if !self.status.borrow().matches_current_hello(boot_id) {
+            return Ok(());
+        }
+        match self.confirm_module_hello(boot_id) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Recheck under the status write lock: the attempt may have
+                // changed during the strict worker identity probe above.
+                if self.record_module_hello_failure(boot_id, &error.code)? {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn record_module_hello_failure(&self, boot_id: &str, error_code: &str) -> Result<bool> {
         if boot_id.is_empty()
             || boot_id.len() > 128
             || boot_id.chars().any(char::is_control)
@@ -1792,13 +1842,13 @@ impl Service {
             boot_id: boot_id.to_owned(),
             error_code: error_code.to_owned(),
         };
-        self.update_status(|status| {
-            if matches!(
-                status.lifecycle,
-                LifecycleState::Starting { .. } | LifecycleState::ProcessRunning { .. }
-            ) {
+        let recorded = self.status.send_if_modified(|status| {
+            if !status.matches_current_hello(boot_id) {
+                return false;
+            }
+            if let LifecycleState::ProcessRunning { boot_id: current } = &status.lifecycle {
                 status.lifecycle = LifecycleState::Starting {
-                    boot_id: boot_id.to_owned(),
+                    boot_id: current.clone(),
                 };
             }
             status.hello_failure = Some(failure.clone());
@@ -1807,9 +1857,10 @@ impl Service {
                 detail: "the exact Store module.hello boot could not be confirmed".to_owned(),
             });
             status.readback_required = true;
+            self.readback_required.store(true, Ordering::Release);
+            true
         });
-        self.readback_required.store(true, Ordering::Release);
-        Ok(())
+        Ok(recorded)
     }
 
     fn quarantine(&self, error_code: &str) -> Result<()> {
@@ -2075,19 +2126,7 @@ impl Service {
                 }
             }
 
-            let boot_id = Uuid::new_v4().to_string();
-            self.update_status(|status| {
-                status.lifecycle = LifecycleState::Starting {
-                    boot_id: boot_id.clone(),
-                };
-                status.owner = None;
-                status.worker = None;
-                status.worker_boot_id = Some(boot_id.clone());
-                status.worker_diagnostic_code = None;
-                status.effect_certainty = ModuleEffectCertainty::Unknown;
-                status.failure_stage = None;
-                status.last_failure = None;
-            });
+            let boot_id = self.allocate_worker_boot();
             starts.push_back(now);
             if let Err(error) = self.write_restart_history(&starts) {
                 self.record_failure(
@@ -4007,6 +4046,26 @@ impl Service {
         swarm_process::private_permissions(&self.state_dir, true)
     }
 
+    fn allocate_worker_boot(&self) -> String {
+        let boot_id = Uuid::new_v4().to_string();
+        self.update_status(|status| {
+            status.lifecycle = LifecycleState::Starting {
+                boot_id: boot_id.clone(),
+            };
+            status.owner = None;
+            status.worker = None;
+            status.worker_boot_id = Some(boot_id.clone());
+            // This diagnostic belongs to the prior attempt, whose retained
+            // Store observations and owner receipts remain unchanged.
+            status.hello_failure = None;
+            status.worker_diagnostic_code = None;
+            status.effect_certainty = ModuleEffectCertainty::Unknown;
+            status.failure_stage = None;
+            status.last_failure = None;
+        });
+        boot_id
+    }
+
     fn record_failure(&self, code: &str, detail: &str) {
         self.update_status(|status| {
             status.last_failure = Some(FailureSummary {
@@ -5870,6 +5929,278 @@ mod tests {
             status.worker = Some(worker.clone());
             status.worker_boot_id = Some(boot_id.to_owned());
         });
+    }
+
+    fn retain_hello_fixture_operations(service: &Service) {
+        service
+            .apply_readback(OperationReadback {
+                scope: service.scope.clone(),
+                complete: true,
+                operations: [
+                    ("queued-input", "queued"),
+                    ("pending-result", "sending"),
+                    ("pending-refresh", "outcome_unknown"),
+                ]
+                .into_iter()
+                .map(|(operation_id, state)| OperationSnapshot {
+                    operation_id: operation_id.to_owned(),
+                    binding_id: service.scope.binding_id.clone(),
+                    generation: service.scope.generation,
+                    state: state.to_owned(),
+                })
+                .collect(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn historical_hello_new_boot_failure_projects_new_attempt_before_confirmation() {
+        let fixture = StartupFixture::new();
+        retain_hello_fixture_operations(&fixture.service);
+        let boot_a = fixture.service.allocate_worker_boot();
+        assert!(
+            fixture
+                .service
+                .record_module_hello_failure(&boot_a, "MODULE_WORKER_IDENTITY_UNKNOWN")
+                .unwrap()
+        );
+        let event_a = crate::ModuleSupervisorObservation::from_status(
+            &fixture.service.current_status(),
+            "fixture-actor",
+            1,
+        )
+        .unwrap();
+        assert_eq!(event_a.boot_id.as_deref(), Some(boot_a.as_str()));
+        assert_eq!(
+            event_a.error_code.as_deref(),
+            Some("MODULE_WORKER_IDENTITY_UNKNOWN")
+        );
+
+        let boot_b = fixture.service.allocate_worker_boot();
+        assert_ne!(boot_a, boot_b);
+        let starting = fixture.service.current_status();
+        assert!(starting.hello_failure.is_none());
+        assert!(starting.last_failure.is_none());
+        assert!(starting.failure_stage.is_none());
+        fixture.service.record_failure(
+            "MODULE_OWNER_HELPER_MISMATCH",
+            "current helper failed before worker confirmation",
+        );
+        fixture.service.update_status(|status| {
+            status.lifecycle = LifecycleState::OwnerIdentityUnknown;
+        });
+        fixture
+            .service
+            .reconcile_retained_module_hello(&boot_a)
+            .unwrap();
+
+        let failed = fixture.service.current_status();
+        assert_eq!(failed.worker_boot_id.as_deref(), Some(boot_b.as_str()));
+        assert!(failed.hello_failure.is_none());
+        assert!(failed.owner.is_none());
+        assert!(failed.worker.is_none());
+        assert!(failed.readback_required);
+        assert!(fixture.service.readback_required.load(Ordering::Acquire));
+        assert!(lock(&fixture.service.confirmed_ready).is_none());
+        let event_b =
+            crate::ModuleSupervisorObservation::from_status(&failed, "fixture-actor", 2).unwrap();
+        assert_eq!(event_b.boot_id.as_deref(), Some(boot_b.as_str()));
+        assert_eq!(event_b.event_id, format!("{boot_b}:fixture-actor:2"));
+        assert_eq!(
+            event_b.error_code.as_deref(),
+            Some("MODULE_OWNER_HELPER_MISMATCH")
+        );
+        assert_eq!(event_b.stage, Some(ModuleFailureStage::Owner));
+        assert_eq!(event_b.effect_certainty, ModuleEffectCertainty::Unknown);
+        assert_eq!(event_b.unknown_operation_count, 2);
+        assert_eq!(
+            event_b.unknown_operation_ids,
+            ["pending-refresh", "pending-result"]
+        );
+    }
+
+    #[test]
+    fn historical_hello_without_new_receipts_preserves_attempt_and_primary_failure() {
+        let fixture = StartupFixture::new();
+        retain_hello_fixture_operations(&fixture.service);
+        for worker_boot in [Some("new-boot"), Some("old-boot"), None] {
+            fixture.service.update_status(|status| {
+                status.lifecycle = LifecycleState::Starting {
+                    boot_id: "new-boot".to_owned(),
+                };
+                status.worker_boot_id = worker_boot.map(str::to_owned);
+                status.failure_stage = Some(ModuleFailureStage::Owner);
+                status.last_failure = Some(FailureSummary {
+                    code: "MODULE_START_RECEIPT_TIMEOUT".to_owned(),
+                    detail: "current helper has no startup receipt".to_owned(),
+                });
+                status.readback_required = true;
+            });
+            fixture
+                .service
+                .readback_required
+                .store(true, Ordering::Release);
+            let before = serde_json::to_value(fixture.service.current_status()).unwrap();
+
+            fixture
+                .service
+                .reconcile_retained_module_hello("old-boot")
+                .unwrap();
+            assert!(
+                !fixture
+                    .service
+                    .record_module_hello_failure("old-boot", "MODULE_WORKER_BOOT_MISMATCH")
+                    .unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(fixture.service.current_status()).unwrap(),
+                before
+            );
+            assert!(fixture.service.readback_required.load(Ordering::Acquire));
+            assert!(lock(&fixture.service.confirmed_ready).is_none());
+        }
+    }
+
+    #[test]
+    fn historical_hello_matching_boot_preserves_ineligible_owner_and_lifecycle_holds() {
+        let fixture = StartupFixture::new();
+        retain_hello_fixture_operations(&fixture.service);
+        for lifecycle in [
+            LifecycleState::OwnerIdentityUnknown,
+            LifecycleState::OwnerGroupRetained {
+                owner_pid: std::process::id(),
+                reason: OwnerRetainedReason::OwnerFamilyObservationUnknown,
+            },
+            LifecycleState::ProcessIdentityUnknown { pid: None },
+            LifecycleState::RestartBackoff { delay_ms: 1 },
+            LifecycleState::WaitingForKernel,
+            LifecycleState::Completed { exit_code: None },
+        ] {
+            fixture.service.update_status(|status| {
+                status.lifecycle = lifecycle;
+                status.worker_boot_id = Some("current-boot".to_owned());
+                status.failure_stage = Some(ModuleFailureStage::Owner);
+                status.last_failure = Some(FailureSummary {
+                    code: "MODULE_OWNER_FAMILY_OBSERVATION_UNKNOWN".to_owned(),
+                    detail: "current owner proof is unresolved".to_owned(),
+                });
+            });
+            let before = serde_json::to_value(fixture.service.current_status()).unwrap();
+            fixture
+                .service
+                .reconcile_retained_module_hello("current-boot")
+                .unwrap();
+            assert!(
+                !fixture
+                    .service
+                    .record_module_hello_failure("current-boot", "MODULE_WORKER_IDENTITY_UNKNOWN")
+                    .unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(fixture.service.current_status()).unwrap(),
+                before
+            );
+            assert!(!fixture.service.readback_required.load(Ordering::Acquire));
+            assert!(lock(&fixture.service.confirmed_ready).is_none());
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn historical_hello_matching_current_worker_confirms_without_releasing_unknown_ops() {
+        let fixture = StartupFixture::new();
+        let worker = WorkerProcessFixture::new();
+        let owner = capture_identity(std::process::id()).unwrap();
+        retain_hello_fixture_operations(&fixture.service);
+        set_worker_status(
+            &fixture.service,
+            &owner,
+            &worker.identity,
+            "current-boot",
+            LifecycleState::Starting {
+                boot_id: "current-boot".to_owned(),
+            },
+        );
+
+        fixture
+            .service
+            .reconcile_retained_module_hello("current-boot")
+            .unwrap();
+        let ready = fixture.service.current_status();
+        assert!(matches!(
+            ready.lifecycle,
+            LifecycleState::ProcessRunning { ref boot_id } if boot_id == "current-boot"
+        ));
+        assert_eq!(ready.unknown_operation_count, 2);
+        assert_eq!(
+            ready.unknown_operation_ids,
+            ["pending-refresh", "pending-result"]
+        );
+        assert!(!ready.readback_required);
+        assert!(ready.hello_failure.is_none());
+        assert!(!fixture.service.can_replace_descriptor().await);
+        let before = serde_json::to_value(&ready).unwrap();
+        fixture
+            .service
+            .reconcile_retained_module_hello("old-boot")
+            .unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .confirm_module_hello("old-boot")
+                .unwrap_err()
+                .code,
+            "MODULE_WORKER_BOOT_MISMATCH"
+        );
+        fixture
+            .service
+            .reconcile_retained_module_hello("current-boot")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(fixture.service.current_status()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn historical_hello_current_failure_retains_exact_code_and_unknown_ops() {
+        let fixture = StartupFixture::new();
+        retain_hello_fixture_operations(&fixture.service);
+        fixture.service.update_status(|status| {
+            status.lifecycle = LifecycleState::Starting {
+                boot_id: "current-boot".to_owned(),
+            };
+            status.worker_boot_id = Some("current-boot".to_owned());
+        });
+        assert_eq!(
+            fixture
+                .service
+                .reconcile_retained_module_hello("current-boot")
+                .unwrap_err()
+                .code,
+            "MODULE_WORKER_IDENTITY_UNKNOWN"
+        );
+        let status = fixture.service.current_status();
+        assert!(matches!(
+            status.lifecycle,
+            LifecycleState::Starting { ref boot_id } if boot_id == "current-boot"
+        ));
+        assert!(status.readback_required);
+        assert!(fixture.service.readback_required.load(Ordering::Acquire));
+        assert!(lock(&fixture.service.confirmed_ready).is_none());
+        let event =
+            crate::ModuleSupervisorObservation::from_status(&status, "fixture-actor", 1).unwrap();
+        assert_eq!(event.boot_id.as_deref(), Some("current-boot"));
+        assert_eq!(
+            event.error_code.as_deref(),
+            Some("MODULE_WORKER_IDENTITY_UNKNOWN")
+        );
+        assert_eq!(event.effect_certainty, ModuleEffectCertainty::Unknown);
+        assert_eq!(event.unknown_operation_count, 2);
+        assert_eq!(
+            event.unknown_operation_ids,
+            ["pending-refresh", "pending-result"]
+        );
     }
 
     #[cfg(any(windows, target_os = "linux"))]

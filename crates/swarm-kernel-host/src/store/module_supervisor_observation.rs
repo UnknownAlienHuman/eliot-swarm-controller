@@ -61,9 +61,19 @@ impl super::Store {
         observation: T,
     ) -> Result<ObservationDisposition> {
         let observation = parse(observation)?;
-        let (disposition, diagnostic) = self
+        let (disposition, diagnostic, committed_change) = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                // A lost denial ACK must replay its retained disposition before
+                // the quarantine it created can derive a different rejection.
+                if let Some(error_code) = replay_retained_rejection(&tx, &observation)? {
+                    tx.commit()?;
+                    return Ok((
+                        ObservationDisposition::ScopedPermanentRejection { error_code },
+                        None,
+                        false,
+                    ));
+                }
                 let now_ms = model::now_ms()?;
                 tx.execute_batch("SAVEPOINT module_supervisor_observation_write")?;
                 let result = record(&tx, &observation, now_ms);
@@ -78,6 +88,7 @@ impl super::Store {
                                 ObservationDisposition::ExactDuplicate
                             },
                             committed.diagnostic,
+                            committed.inserted,
                         ))
                     }
                     Err(error) if is_permanent_observation_error(&error.code) => {
@@ -97,6 +108,7 @@ impl super::Store {
                                 error_code: error.code,
                             },
                             None,
+                            true,
                         ))
                     }
                     Err(error) => {
@@ -106,7 +118,7 @@ impl super::Store {
                 }
             })
             .await?;
-        if !matches!(&disposition, ObservationDisposition::ExactDuplicate) {
+        if committed_change {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
@@ -236,6 +248,82 @@ fn is_permanent_observation_error(code: &str) -> bool {
     )
 }
 
+fn rejection_facts(observation: &ModuleSupervisorObservation, error_code: &str) -> Result<Value> {
+    let generation = i64::try_from(observation.scope.generation)
+        .map_err(|_| invalid("module supervisor generation exceeds the Store range"))?;
+    // Hash every parsed observation field, not only the rejection's address.
+    // The receipt retains no Operation inputs, config or raw error text.
+    let canonical = model::canonical(&serde_json::to_value(observation)?)?;
+    if canonical.len() > MAX_RECORD_BYTES {
+        return Err(invalid(
+            "module supervisor observation exceeds its record bound",
+        ));
+    }
+    Ok(json!({
+        "schema_version":1,
+        "disposition":"scoped_permanent_rejection",
+        "actor_instance_id":observation.actor_instance_id,
+        "event_id":observation.event_id,
+        "sequence":observation.sequence,
+        "module_id":observation.module_id,
+        "binding_id":observation.scope.binding_id,
+        "generation":generation,
+        "boot_id":observation.boot_id,
+        "error_code":error_code,
+        "observation_sha256":model::digest(canonical.as_bytes()),
+    }))
+}
+
+fn rejection_conflict() -> Error {
+    Error::new(
+        "MODULE_OBSERVATION_REJECTION_CONFLICT",
+        "permanent rejection retry does not match fully retained observation facts",
+    )
+}
+
+fn replay_retained_rejection(
+    tx: &Transaction<'_>,
+    observation: &ModuleSupervisorObservation,
+) -> Result<Option<String>> {
+    type RetainedRejectionRow = (Option<String>, Option<String>, Option<i64>, String);
+    let generation = i64::try_from(observation.scope.generation)
+        .map_err(|_| invalid("module supervisor generation exceeds the Store range"))?;
+    let source_stream_id = format!(
+        "{STREAM_PREFIX}:{}:{generation}",
+        observation.scope.binding_id
+    );
+    let retained: Option<RetainedRejectionRow> = tx
+        .query_row(
+            "SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=4096 \
+                         THEN payload_json END,binding_id,binding_generation,kind FROM observations \
+             WHERE source_stream_id=?1 AND source_event_key=?2",
+            params![source_stream_id, format!("rejected:{}", observation.event_id)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((raw, binding_id, retained_generation, kind)) = retained else {
+        return Ok(None);
+    };
+    let raw = raw.ok_or_else(rejection_conflict)?;
+    if binding_id.as_deref() != Some(observation.scope.binding_id.as_str())
+        || retained_generation != Some(generation)
+        || kind != REJECTION_EVENT_KIND
+    {
+        return Err(rejection_conflict());
+    }
+    let facts: Value = serde_json::from_str(&raw).map_err(|_| rejection_conflict())?;
+    let error_code = facts["error_code"]
+        .as_str()
+        .filter(|code| is_permanent_observation_error(code))
+        .ok_or_else(rejection_conflict)?;
+    // Legacy receipts omit the digest, so equality cannot establish a full
+    // retry identity. Leave them unchanged and fail closed rather than upgrade.
+    if facts != rejection_facts(observation, error_code)? {
+        return Err(rejection_conflict());
+    }
+    Ok(Some(error_code.to_owned()))
+}
+
 fn retain_scoped_rejection(
     tx: &Transaction<'_>,
     observation: &ModuleSupervisorObservation,
@@ -251,18 +339,7 @@ fn retain_scoped_rejection(
         observation.scope.binding_id
     );
     let source_event_key = format!("rejected:{}", observation.event_id);
-    let rejection = json!({
-        "schema_version":1,
-        "disposition":"scoped_permanent_rejection",
-        "actor_instance_id":observation.actor_instance_id,
-        "event_id":observation.event_id,
-        "sequence":observation.sequence,
-        "module_id":observation.module_id,
-        "binding_id":observation.scope.binding_id,
-        "generation":generation,
-        "boot_id":observation.boot_id,
-        "error_code":error_code,
-    });
+    let rejection = rejection_facts(observation, error_code)?;
     let rejection_json = model::canonical(&rejection)?;
     if rejection_json.len() > 4096 {
         return Err(invalid(
@@ -279,10 +356,7 @@ fn retain_scoped_rejection(
         .optional()?;
     if let Some(previous) = previous {
         if previous != rejection_json {
-            return Err(Error::new(
-                "MODULE_OBSERVATION_REJECTION_CONFLICT",
-                "permanent rejection identity was reused with different facts",
-            ));
+            return Err(rejection_conflict());
         }
     } else {
         tx.execute(
@@ -301,7 +375,7 @@ fn retain_scoped_rejection(
             ],
         )?;
     }
-    if quarantine && !binding["module_supervisor_quarantine"].is_object() {
+    if quarantine && !binding["observation"]["module_supervisor_quarantine"].is_object() {
         let quarantine = json!({
             "schema_version":1,
             "actor_instance_id":observation.actor_instance_id,
@@ -718,7 +792,7 @@ pub(super) fn record(
         });
     }
 
-    if binding["module_supervisor_quarantine"].is_object() {
+    if binding["observation"]["module_supervisor_quarantine"].is_object() {
         return Err(Error::new(
             "MODULE_OBSERVATION_SCOPE_QUARANTINED",
             "module supervisor scope requires explicit recovery after permanent rejection",
@@ -738,8 +812,16 @@ pub(super) fn record(
     }
     validate_phase_transition(tx, current, observation)?;
     let transition = lifecycle_transition(current, observation);
-    let nonterminal = nonterminal_transition(observation);
-    let operation_link = validate_operation_ids(tx, observation, generation)?;
+    let validated = validate_operation_ids(tx, observation, generation)?;
+    let operation_link = validated.active_link;
+    // A raced prelaunch callback is a retained status sample, not a new
+    // Operation cause. The nonterminal writer otherwise links a sole sampled
+    // ID without consulting the validated active link.
+    let nonterminal = if validated.terminal_prelaunch_sample {
+        None
+    } else {
+        nonterminal_transition(observation)
+    };
     let diagnostic = diagnostic_for_transition(current, observation, operation_link.as_ref());
 
     tx.execute(
@@ -2035,11 +2117,16 @@ struct ValidatedOperationLink {
     owner_id: Option<String>,
 }
 
+struct ValidatedOperationSnapshot {
+    active_link: Option<ValidatedOperationLink>,
+    terminal_prelaunch_sample: bool,
+}
+
 fn validate_operation_ids(
     tx: &Transaction<'_>,
     observation: &ModuleSupervisorObservation,
     generation: i64,
-) -> Result<Option<ValidatedOperationLink>> {
+) -> Result<ValidatedOperationSnapshot> {
     type OperationValidationRow = (
         String,
         Option<String>,
@@ -2052,6 +2139,14 @@ fn validate_operation_ids(
         && observation.unknown_operation_ids.len() == 1
         && !observation.unknown_operation_ids_truncated;
     let mut exact_link = None;
+    // The caller has already fenced the current actor and exact immutable
+    // binding/descriptor identity. Only this bootless diagnostic shape may
+    // retain IDs that settled after the supervisor's sampled readback.
+    let prelaunch_sample = observation.boot_id.is_none()
+        && matches!(observation.phase, ModuleSupervisorPhase::Isolated)
+        && matches!(observation.effect_certainty, ModuleEffectCertainty::Unknown)
+        && matches!(observation.stage, Some(ModuleFailureStage::ValidateLaunch));
+    let mut terminal_prelaunch_sample = false;
     for operation_id in &observation.unknown_operation_ids {
         let row: Option<OperationValidationRow> = tx
             .query_row(
@@ -2090,12 +2185,13 @@ fn validate_operation_ids(
             state.as_str(),
             "sending" | "native_accepted" | "outcome_unknown"
         ) {
-            if matches!(observation.phase, ModuleSupervisorPhase::Ready)
+            if (matches!(observation.phase, ModuleSupervisorPhase::Ready) || prelaunch_sample)
                 && matches!(state.as_str(), "settled" | "rejected" | "cancelled")
             {
-                // The immutable hello snapshot may wait behind delivery while
-                // an exact scoped Operation settles. Keep the sampled ID but
-                // do not attach terminal work as an active lifecycle cause.
+                // Preserve the immutable sampled ID, count and event. Continue
+                // checking every listed ID; queued, missing and foreign work
+                // never becomes a tolerated terminal sample.
+                terminal_prelaunch_sample |= prelaunch_sample;
                 continue;
             }
             return Err(Error::new(
@@ -2131,7 +2227,10 @@ fn validate_operation_ids(
             });
         }
     }
-    Ok(exact_link)
+    Ok(ValidatedOperationSnapshot {
+        active_link: exact_link,
+        terminal_prelaunch_sample,
+    })
 }
 
 fn payload(observation: &ModuleSupervisorObservation, generation: i64) -> Value {
@@ -2429,6 +2528,10 @@ fn valid_version(value: &str) -> Result<()> {
 fn invalid(message: &'static str) -> Error {
     Error::new("MODULE_OBSERVATION_INVALID", message)
 }
+
+#[cfg(test)]
+#[path = "module_supervisor_rejection_retry_tests.rs"]
+mod rejection_retry_tests;
 
 #[cfg(test)]
 mod journal_regression_tests {
