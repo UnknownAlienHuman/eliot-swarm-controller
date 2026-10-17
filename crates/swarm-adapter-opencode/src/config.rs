@@ -12,7 +12,7 @@ use swarm_contracts::{
 };
 
 pub const ARTIFACT_ID: &str = "eliot-opencode-v2.rust-http.1";
-pub const ARTIFACT_VERSION: &str = "0.7.1";
+pub const ARTIFACT_VERSION: &str = "0.7.2";
 pub const MODULE_ID: &str = "eliot.opencode.v2";
 pub const RUNTIME: &str = "module";
 const MAX_CONFIG_BYTES: usize = 64 * 1024;

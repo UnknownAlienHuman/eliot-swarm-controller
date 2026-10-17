@@ -451,7 +451,24 @@ impl NativeClient {
         intent: &OperationIntent,
         options: &NativeOptions,
     ) -> Result<InputStatusEvidence> {
-        if native_delivery_for_method(&intent.method).is_none()
+        let delivery = native_delivery_for_method(&intent.method).ok_or_else(|| {
+            Error::new(
+                "NATIVE_IDENTITY_MISMATCH",
+                "saved input method has no exact native delivery",
+            )
+        })?;
+        let expected_marker = json!({
+            "binding":intent.binding_id,
+            "generation":intent.generation,
+            "operation":intent.operation_id,
+            "input_sha256":intent.module_receipt.input_sha256,
+            "native_delivery":delivery,
+        });
+        if intent.marker != expected_marker
+            || intent.module_receipt.operation_id != intent.operation_id
+            || intent.module_receipt.binding_id != intent.binding_id
+            || intent.module_receipt.binding_generation != intent.generation
+            || intent.model != serde_json::to_value(&options.model)?
             || intent.native_scope_key != options.scope_key()
             || intent.route_sha256 != digest_json(&serde_json::to_value(options)?)?
         {
@@ -504,14 +521,10 @@ impl NativeClient {
         self.require_durable_root_creation_for_intent(root, intent, options)
             .await?;
 
-        let history = self.read_input_history(root, input, intent, None).await?;
-        if history.admitted_sequence.is_none() && history.prompted_sequence.is_none() {
-            return Err(Error::new(
-                "NATIVE_EVIDENCE_UNAVAILABLE",
-                "exact input admission was not observed in durable session history",
-            ));
-        }
-
+        // In public v2.0.31, InboxDelivered projects the immutable input ID
+        // into this exact User row even when Bus persist=false. Input status
+        // uses that projection only; ordinary send/history reconciliation
+        // still requires its own durable admission and delivery evidence.
         let first = self
             .get(&format!("/api/session/{root}/message/{input}"), &[])
             .await?;
