@@ -46,12 +46,22 @@ const IMAGE_REASONS: &[&str] = &[
 fn classify_image_error(code: &str, message: &str) -> &'static str {
     // Exact literals from process_group.rs, never substrings or raw diagnostics.
     match (code, message) {
-        ("PROCESS_IDENTITY", "process executable path is not valid Unicode") => "image_path_not_unicode",
-        ("PROCESS_IDENTITY", "process executable path is outside the supported boundary") => "image_path_boundary",
-        ("PROCESS_IDENTITY", "process executable is outside the supported file boundary") => "image_file_boundary",
+        ("PROCESS_IDENTITY", "process executable path is not valid Unicode") => {
+            "image_path_not_unicode"
+        }
+        ("PROCESS_IDENTITY", "process executable path is outside the supported boundary") => {
+            "image_path_boundary"
+        }
+        ("PROCESS_IDENTITY", "process executable is outside the supported file boundary") => {
+            "image_file_boundary"
+        }
         ("PROCESS_IDENTITY", "process image size overflow") => "image_size_overflow",
-        ("PROCESS_IDENTITY", "process executable exceeds the supported hash boundary") => "image_hash_boundary",
-        ("PROCESS_IDENTITY", "process executable changed during bounded hashing") => "image_hash_changed",
+        ("PROCESS_IDENTITY", "process executable exceeds the supported hash boundary") => {
+            "image_hash_boundary"
+        }
+        ("PROCESS_IDENTITY", "process executable changed during bounded hashing") => {
+            "image_hash_changed"
+        }
         ("PROCESS_IDENTITY", "invalid proc stat") => "proc_stat_invalid",
         ("PROCESS_IDENTITY", "incomplete proc stat") => "proc_stat_incomplete",
         ("PROCESS_IDENTITY", "invalid process group") => "proc_group_invalid",
@@ -60,10 +70,15 @@ fn classify_image_error(code: &str, message: &str) -> &'static str {
         ("PROCESS_IDENTITY", "kernel executable path is not absolute") => "exe_path_not_absolute",
         // This source branch combines birth/liveness/path/device/inode checks;
         // its reason does not identify which individual condition failed.
-        ("PROCESS_IDENTITY", "process birth or executable image changed during bounded hashing") => "post_hash_identity_changed",
+        (
+            "PROCESS_IDENTITY",
+            "process birth or executable image changed during bounded hashing",
+        ) => "post_hash_identity_changed",
         ("PROCESS_GONE", "process is no longer live") => "process_gone",
         ("PROCESS_GONE", "process executable disappeared") => "process_executable_gone",
-        ("PROCESS_GONE", "process birth changed while opening its executable") => "process_birth_changed_on_open",
+        ("PROCESS_GONE", "process birth changed while opening its executable") => {
+            "process_birth_changed_on_open"
+        }
         ("PROCESS_GONE", "process exited during inventory") => "process_gone_during_inventory",
         _ => "unclassified",
     }
@@ -405,7 +420,10 @@ fn forge_failure_witness_owner_return_is_distinct_from_missing_and_invalid_evide
     assert_eq!(identity["image_reason"], "unclassified");
     assert!(!identity.to_string().contains("SECRET"));
     let boundary = "process executable is outside the supported file boundary";
-    assert_eq!(classify_image_error("PROCESS_IDENTITY", boundary), "image_file_boundary");
+    assert_eq!(
+        classify_image_error("PROCESS_IDENTITY", boundary),
+        "image_file_boundary"
+    );
     assert_eq!(classify_image_error("IO_ERROR", boundary), "unclassified");
     assert_eq!(
         classify_image_error("PROCESS_IDENTITY", &format!("{boundary} SECRET_SUFFIX")),
