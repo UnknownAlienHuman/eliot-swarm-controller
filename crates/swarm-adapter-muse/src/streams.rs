@@ -46,9 +46,7 @@ fn opaque_cursor<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
         .and_then(Value::as_str)
-        .filter(|cursor| {
-            cursor.len() <= MAX_CURSOR_BYTES && !cursor.chars().any(char::is_control)
-        })
+        .filter(|cursor| cursor.len() <= MAX_CURSOR_BYTES && !cursor.chars().any(char::is_control))
         .ok_or_else(|| Error::invalid("native stream cursor is unavailable or outside bounds"))
 }
 
@@ -413,15 +411,20 @@ mod tests {
         assert_eq!(whitespace_frames[0].native_cursor, "  ");
 
         let mut missing_cursor = delta.envelope.clone();
-        missing_cursor["params"].as_object_mut().unwrap().remove("viewCursor");
-        assert!(encode_notification(
-            &facts,
-            &Notification {
-                envelope: missing_cursor,
-            },
-            5,
-        )
-        .is_err());
+        missing_cursor["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("viewCursor");
+        assert!(
+            encode_notification(
+                &facts,
+                &Notification {
+                    envelope: missing_cursor,
+                },
+                5,
+            )
+            .is_err()
+        );
 
         for cursor in [
             Value::Null,
@@ -431,14 +434,16 @@ mod tests {
         ] {
             let mut invalid_cursor = delta.envelope.clone();
             invalid_cursor["params"]["viewCursor"] = cursor;
-            assert!(encode_notification(
-                &facts,
-                &Notification {
-                    envelope: invalid_cursor,
-                },
-                6,
-            )
-            .is_err());
+            assert!(
+                encode_notification(
+                    &facts,
+                    &Notification {
+                        envelope: invalid_cursor,
+                    },
+                    6,
+                )
+                .is_err()
+            );
         }
         assert!(matches!(
             frames[0].payload,

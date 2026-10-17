@@ -1008,7 +1008,10 @@ mod tests {
     #[tokio::test]
     async fn result_event_cursor_must_be_present_and_bounded_string() {
         let mut missing = event(message("pinned"));
-        missing["params"].as_object_mut().unwrap().remove("viewCursor");
+        missing["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("viewCursor");
         let mut events = vec![missing];
         for cursor in [
             Value::Null,
@@ -1021,11 +1024,7 @@ mod tests {
             events.push(item);
         }
         for item in events {
-            let (result, _) = run(
-                input("message"),
-                vec![view(vec![item], Value::Null)],
-            )
-            .await;
+            let (result, _) = run(input("message"), vec![view(vec![item], Value::Null)]).await;
             assert_eq!(result.unwrap_err().code, "RESULT_REQUIRED_TEXT_MISSING");
         }
     }
