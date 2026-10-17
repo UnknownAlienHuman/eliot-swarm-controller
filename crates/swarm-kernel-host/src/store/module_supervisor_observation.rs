@@ -285,13 +285,14 @@ fn replay_retained_rejection(
     tx: &Transaction<'_>,
     observation: &ModuleSupervisorObservation,
 ) -> Result<Option<String>> {
+    type RetainedRejectionRow = (Option<String>, Option<String>, Option<i64>, String);
     let generation = i64::try_from(observation.scope.generation)
         .map_err(|_| invalid("module supervisor generation exceeds the Store range"))?;
     let source_stream_id = format!(
         "{STREAM_PREFIX}:{}:{generation}",
         observation.scope.binding_id
     );
-    let retained: Option<(Option<String>, Option<String>, Option<i64>, String)> = tx
+    let retained: Option<RetainedRejectionRow> = tx
         .query_row(
             "SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=4096 \
                          THEN payload_json END,binding_id,binding_generation,kind FROM observations \
