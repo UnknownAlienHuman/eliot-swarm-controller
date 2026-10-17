@@ -301,7 +301,7 @@ fn retain_scoped_rejection(
             ],
         )?;
     }
-    if quarantine && !binding["module_supervisor_quarantine"].is_object() {
+    if quarantine && !binding["observation"]["module_supervisor_quarantine"].is_object() {
         let quarantine = json!({
             "schema_version":1,
             "actor_instance_id":observation.actor_instance_id,
@@ -718,7 +718,7 @@ pub(super) fn record(
         });
     }
 
-    if binding["module_supervisor_quarantine"].is_object() {
+    if binding["observation"]["module_supervisor_quarantine"].is_object() {
         return Err(Error::new(
             "MODULE_OBSERVATION_SCOPE_QUARANTINED",
             "module supervisor scope requires explicit recovery after permanent rejection",
