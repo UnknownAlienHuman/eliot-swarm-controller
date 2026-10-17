@@ -1366,8 +1366,6 @@ fn input_status_result_page(
         "native_session_id":target_status.native_session_id,
         "native_input_id":target_status.native_input_id,
         "input_message_sha256":input_message_sha256,
-        "assistant_result_correlation":"not_exposed",
-        "assistant_result_correlation_reason":"assistant_message_has_no_input_parent_in_public_projection",
         "task_completion":"unknown",
         "execution_complete":false
     }))?;

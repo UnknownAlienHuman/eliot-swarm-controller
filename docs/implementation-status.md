@@ -2,6 +2,23 @@
 
 ## Current state
 
+### Exact OpenCode input-status delivery (2026-10-16; PR #167)
+
+[PR #167](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/167)
+prepares `eliot-opencode-v2.rust-http.1@0.7.3`. Exact repeated native User
+projections can prove input delivery without retained inbox events; this does
+not correlate assistant output, finish a Task or change the original input
+Operation. The adapter status body follows Store's existing exact byte contract.
+
+The development 0.7.2 package produced a retained native input-status page, but
+its two extra correlation body fields prevented Store acknowledgement. Read-only
+comparison proved the saved body was 582 bytes versus the expected 438, with
+exact equality after removing those fields. Correlation limitations remain in
+source metadata. This is a source diagnosis, not a settled native result: the
+0.7.2 outbox, artifacts, binding and unknown read Operation remain unchanged.
+No native input was replayed. Whole-product, inference, family, native restart
+and release qualification remain open.
+
 ### Delivery through PR #162 (2026-10-16; main `a5e70bd39c148a2ed218f4ae06fb779113c6fb86`)
 
 [PR #162](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/162) delivers standalone OpenCode artifact `eliot-opencode-v2.rust-http.1@0.7.1`. A complete empty synchronized log permits only exact session/location root readback; ordinary input history still requires numeric cursor coverage. Host common-command admission and the supervisor schema-v4 mapper now use the retained capability/schema contract across compatible artifact releases. Legacy schema and vendor loop-step restrictions remain closed. Native harnesses retain provider authorization, model configuration and handshake ownership.
