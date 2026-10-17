@@ -735,6 +735,20 @@ impl MspTransport {
         Self::attach(input, output, server, options)
     }
 
+    #[cfg(test)]
+    pub(crate) fn attach_fixture<R, W>(
+        input: R,
+        output: W,
+        server: RpcModule<()>,
+        options: Options,
+    ) -> Result<(Self, mpsc::Receiver<Notification>), TransportEnd>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::attach(input, output, server, options)
+    }
+
     fn attach<R, W>(
         input: R,
         output: W,

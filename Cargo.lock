@@ -2472,6 +2472,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "jsonrpsee-core",
+ "jsonrpsee-types",
  "jsonschema",
  "serde",
  "serde_json",
@@ -2481,6 +2482,7 @@ dependencies = [
  "swarm-process",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]

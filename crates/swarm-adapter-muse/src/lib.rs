@@ -37,7 +37,9 @@
 //! of the installed Muse executable or any account/authentication state.
 
 pub mod commands;
+pub mod driver;
 pub mod journal;
+pub mod module_runtime;
 pub mod msp;
 pub mod native_owner;
 pub(crate) mod observations;

@@ -458,6 +458,11 @@ impl Journal {
         let (dir, boot) = owned_directory(&scope)?;
         Self::open_at(&dir, scope, boot)
     }
+    #[cfg(test)]
+    pub(crate) fn create_fixture(dir: &Path, scope: Scope, boot: String) -> Result<Self, Fault> {
+        Self::create_at(dir, scope, boot)
+    }
+
     fn create_at(dir: &Path, scope: Scope, boot: String) -> Result<Self, Fault> {
         scope.validate()?;
         reject_legacy(dir)?;
