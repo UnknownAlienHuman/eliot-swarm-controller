@@ -44,6 +44,12 @@ reviews each returned diff and integrates the complete producer-to-consumer path
 - New abstractions need concrete consumers and a deletion. Extend an existing
   package for a small primitive. Keep adapter-specific journal/recovery semantics
   with the adapter; share mechanics already owned by `swarm-process`.
+- Report net owned-source change across Rust, SDK drivers and new glue; count
+  tests separately. Moving files/tests or replacing a match with another DSL is
+  not a code reduction. Keep unrelated feature expansion out of an extraction.
+- Route new requests to one executor. Preserve versioned historical readers and
+  unresolved-work reconciliation separately; old records alone do not require
+  retaining the old executable implementation forever.
 - Keep new integration suites/fixture executables outside production `src/`.
   Move existing suites alongside the relevant extraction without exposing private
   production APIs solely for test access. Small unit tests may remain next to code.
@@ -63,4 +69,5 @@ gate and needs no Rust build.
 Update the current contract/status entry when behavior changes. Keep receipts in
 the existing evidence location and link their source/scope. Do not append each
 attempt log to normative specifications or create parallel documentation-only
-handoff PRs for the same work.
+handoff PRs for the same work. Link the owning document instead of copying its
+rules, status matrix or work queue into another index.

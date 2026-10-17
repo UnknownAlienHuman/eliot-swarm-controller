@@ -1,147 +1,47 @@
 # Shared package boundaries
 
-V3 requires one lockfile and strict downward dependency edges. The table describes the target responsibilities and relevant dependencies, not the current Cargo graph. The [refactoring map](refactoring.md#3-current-gaps-against-v3) records current links, reader coverage and donor use. Kernel/CLI entrypoints consume shared packages; shared packages never import the host or adapters. Add a dependency only where its API is actually consumed.
+This is the V3 ownership map, not a claim that the target Cargo graph is complete.
+Use the [refactoring map](refactoring.md#remove-worker-implementation-edges) for current
+edges and their removal. One workspace lockfile records resolved dependencies.
+Add a library where its API has a real consumer and replaces an existing mechanism.
 
-| Package | V3 responsibility | Relevant local / donor dependencies |
-|---|---|---|
-| `swarm-contracts` | Credential, JSON-RPC Request, runtime command/outcome and receipt identity, error classification, module catalog and typed hello claim | `serde`, `serde_json` (forward-compatible internal readers) |
-| `swarm-client` | Authenticated bounded sequential local IPC client, endpoint computation and typed `ModuleLink` | `swarm-contracts` |
-| `swarm-checks` | Kernel-admitted bounded native check executor and authenticated CheckRun status readback (Claw `CheckRunner` pattern) | `swarm-client`, `swarm-contracts`, `swarm-process` |
-| `swarm-process` | OS process/group ownership, identity/departure checks, private files and scoped module-owner bootstrap | `swarm-contracts`, `cccc-windows-process`, `sysinfo` |
-| `swarm-store` | SQLite WAL connections (1 serialized `IMMEDIATE` writer + pooled read-only connections), schema-identity checks and transaction primitives; domain DDL/conversion stays with Store | `rusqlite` |
-| `swarm-kernel` | Single bounded writer actor for mutations, WAL read-pool dispatch for queries, readiness and contiguous typed job batching | `swarm-store`, `swarm-contracts` |
-| `swarm-telemetry` | Structured `tracing` producer, dynamic `reload` filter, `tracing-appender` non-blocking writer, `atlas-redact` scrubbing, and local drop/failure counters | `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact` |
+| Package | Owns | Local / donor dependencies at the target boundary |
+| --- | --- | --- |
+| `swarm-contracts` | Shared wire DTOs, request/outcome/receipt identity, method policy and module catalog. No SQLite, process or vendor runtime types. | `serde`, `serde_json` |
+| `swarm-client` | Authenticated bounded local IPC, endpoint discovery and typed `ModuleLink`. | `swarm-contracts` |
+| `swarm-checks` | Bounded admitted native-check execution and authenticated status readback. Store retains admission/custody; host sheds the executor dependency. | `swarm-client`, `swarm-contracts`, `swarm-process` |
+| `swarm-process` | OS ownership, exact birth/departure checks, private durable files and module-owner bootstrap. | `swarm-contracts`, `cccc-windows-process`, selective `sysinfo` observation |
+| `swarm-store` | WAL connection/transaction mechanics and database identity checks. Store owns domain DDL/conversion. | `rusqlite` |
+| `swarm-kernel` | One bounded writer actor, readiness, contiguous typed-job batching and bounded reader dispatch. | `swarm-store`, `swarm-contracts` |
+| `swarm-telemetry` | Structured events, reloadable filters, redaction, bounded sinks and local loss counters. | `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact` |
 
-`swarm-kernel-host` owns authentication policy, domain transactions, server IPC, and dispatch routing, but **must not** link worker crates (`swarm-automation`, `swarm-bus`, `swarm-checks`, `swarm-forge-worker`, `swarm-observer`, `swarm-script-worker`, `swarm-supervisor`) or `swarm-adapter-*` crates in `[dependencies]`. Keep integration suites and fixture executables outside production `src/`; small `#[cfg(test)]` unit tests may remain beside code, as specified in [modularity](modularity.md#52-independent-update-build-and-production-src-hygiene). Shared contracts have no SQLite, native vendor DTO or process dependency.
+`swarm-kernel-host` owns authentication policy, domain transactions, server IPC and
+routing. It must not link `swarm-adapter-*` or worker implementations: automation,
+bus, checks, forge, observer, script-worker or supervisor. Shared packages never
+import the host or adapters. Move shared DTOs to their existing owner; do not add a
+new general-purpose crate for each extraction. Package movement reduces coupling;
+the [deletion queue](refactoring.md#code-reduction-candidates) separately reduces code.
 
-The target Store uses `swarm-kernel` for its single writer thread (bounded FIFO mutation queue) while serving read-only queries (`*.get`, `*.list`, `dashboard`, `report.delta`, `automation.config.explain`, `runtime.catalog`) concurrently through `swarm-store`'s **read-only WAL connection pool** (`SQLITE_OPEN_READ_ONLY`, `query_only = ON`). The DataRoot lock stays on the writer thread through database initialization and shutdown. Readiness returns the original initializer error; only contiguous typed message jobs are batched, with the same limit and pending non-message job ordering.
+## Contract boundaries
 
-The module catalog validates data and selects an exact artifact with compatible
-protocol/capabilities. It reads no files and starts no process. Launch metadata
-keeps protected references for later trusted resolution; unknown prior launch
-evidence permits readback only. Metadata IDs are opaque, not filesystem path
-components: supervisors must encode or hash them, including Windows drive-like
-names. Exact `.` and `..` identifiers/versions are rejected. These contracts
-do not prove an installed binary's identity.
+| Boundary | Preserve | Canonical detail |
+| --- | --- | --- |
+| Module catalog | Data-only selection; exact admitted descriptor, catalog-revision CAS and receipt identity. Catalog lookup neither reads an executable nor proves its provenance. IDs are opaque; path components require encoding. | [Module protocol](modularity.md#3-module-protocol-and-registration) |
+| Client | Named-pipe/Unix-socket discovery and hello; retries only before application traffic. An uncertain/malformed reply poisons the link and permits no blind request replay. | [Module contract](../agent_swarm.module-contract-v2.md), [`swarm-client`](../../crates/swarm-client/src/lib.rs) |
+| Process owner | Nonkilling module groups on owner loss; check/script cancellation remains separately scoped. Exact process birth is not native-session identity; unknown reads are not departure. | [Lifecycle](modularity.md#5-demand-driven-lifecycle-unified-supervision-and-recovery), [`swarm-process`](../../crates/swarm-process/src/lib.rs) |
+| Check execution | Durable Store Go precedes source resolution/launch, bounded capture keeps pipes drained, and uncertain family disposition retains custody. Diagnostics do not change check/cache input identity. | [CheckRunner](../check-runner.md) |
+| Module bootstrap | Absolute private plan, explicit resolver, cleared child environment and exact owner/artifact receipts. Pre-spawn `not_started` still requires exact owner/family readback before replacement. | [Module installation](module-installation.md), [ModuleLink contract](../agent_swarm.module-contract-v2.md) |
+| Database | DataRoot lock remains on the writer through initialization/shutdown. Domain schema and reconciliation share existing transactional initialization; callback errors pass through unchanged. Preserve parsed-JSON digest comparison and both existing empty-database identity cases. Reads authorize and project in one short read-only snapshot. | [Store boundary](architecture.md#12-transaction-relational-sqlite-and-wal-read-pool-boundaries), [migration detail](refactoring.md#relational-conversion-detail) |
+| Diagnostics | Redact before persistence/fanout; bound records and bytes, count sink loss independently. Diagnostic acceptance/sequence is neither a business ACK nor a durable event cursor. | [Observability](observability.md) |
 
-At the reviewed baseline, the Store's trusted descriptor registry uses its existing
-writer and metadata table; migrate its domain records through the same Store schema
-owner under the V3 relational target. A host-generated supervisor credential has a positive one-method scope
-for registration; it cannot use normal writer or Manager methods. Registration
-does not inspect or launch an executable. The trusted installer/supervisor must
-first establish the installed artifact's provenance.
+The process child-membership helper checks an exact distinct native child against
+an existing live module owner; it does not adopt/start a process, validate the
+worker as its own child or prove whole-family departure. Preserve the existing
+family scan before replacement. Private-path checks do not claim an atomic race
+barrier or a same-user sandbox.
 
-Managers select registered versions for their own future bindings. The stable
-caller and route identify a selection, with catalog-revision CAS; no current-GM
-session is required. Admission captures the selected immutable descriptor in the
-binding. `ModuleLink` supplies a typed claim that Store compares with that exact
-selector. An unselected legacy binding is explicitly unverified and cannot accept
-a self-asserted versioned claim. Negotiated capabilities remain compatibility
-metadata rather than effect authority.
-
-Module IDs remain opaque identities. The configured runtime label is checked
-by the host's route contract, and selection binds its exact artifact to the
-trusted descriptor. The four standalone `.1` route contracts validate their
-native options and forward only the workspace already admitted by the host.
-A cold hello may omit both native identity fields and receives the retained
-Store-owned pair; a supplied pair must match it exactly.
-
-Runtime commands include the canonical original Operation request digest before
-dynamic enrichment. For selected bindings, one Store validator checks every
-outcome's `ModuleReceiptIdentity` against the retained descriptor and exact
-Operation/binding/generation. A reconcile target has its own receipt and digest,
-distinct from the reconcile Operation. Registered recovery uses the retained
-descriptor's reconcile and target-method capabilities as compatibility gates.
-Store checks the exact admitted request before accepting a fresh reconcile-linked
-target outcome, after its byte-identical duplicate path. Reconcile cannot report
-resolution before the target is terminal and cannot authorize another native
-effect. Adapter registration and supervisor activation still need their real
-host integrations.
-
-The client retains the existing named-pipe/Unix-socket discovery convention,
-hello handshake and bounded request/reply exchange. Establishment retry happens
-before an application request; uncertain application traffic is never replayed.
-A malformed/mismatched/lost response poisons its link. Its two existing poison
-checks now belong to the client package; the host keeps its handshake and Store
-connection-service checks.
-
-The process package preserves serialized owner receipts and check/script
-cancellation. Module-purpose groups reject explicit cancellation and remain
-nonkilling on owner loss. `spawned_identity`/`spawned_departed` are existing
-check-worker primitives; they do not prove departure of an arbitrary module
-child. Exact process identity is not native-session identity. Launch/recovery
-policy remains with the caller.
-
-`module_child_belongs_to_owner` checks a distinct native child's exact image and
-birth receipt against an existing live module owner and its nonkilling Job or
-process group. Unknown OS reads return errors. It neither adopts nor starts a
-process and does not prove whole-family departure; the existing departure scan
-remains required before replacement. A worker cannot use this child API to
-validate itself as the owner.
-
-The existing CheckRun worker consumes `swarm-checks::execute_with_plan`: it
-publishes the same exact worker owner and waits for durable Store Go before
-kernel-side source resolution and command launch. Output capture is bounded and
-the pipes remain drained. Cancellation targets that check's group only. Process
-observation errors retain ownership until whole-family emptiness is known;
-the existing Store supervisor validates private diagnostics and projects fixed
-metadata through authorized `check.get`. Runtime diagnostics do not change the
-immutable check/cache input identity. This is an executor extraction inside the
-existing worker, not an independently deployed checks process.
-
-The `swarm-module-owner` binary accepts one absolute private plan and an explicit
-resolver map. Each invocation owns its own nonkilling group and OS lock, publishes
-the existing v1 owner envelope and an exact distinct adapter image receipt, then
-retains ownership through direct-child exit and native-family drain. Its plan
-contains scope, artifact/version, boot identity and protected references; the
-resolver passes existing credential-file paths, without serializing token bytes
-or placing them in argv. The child starts with a cleared environment, an explicit
-Windows OS/home/config baseline and the validated plan's literals and protected
-file paths. Arbitrary ambient provider credentials are excluded. Trusted plan
-values can override the baseline. Explicit path metadata checks
-reject symlink/reparse components; they do not provide a same-user sandbox or
-an atomic filesystem-race guarantee.
-
-A resolver/launch-validation error before child spawn writes a boot/owner/scope
-bound `launch-result.json` with `not_started`, only after an empty-family check.
-The supervisor must still verify that exact wrapper/family departed before a
-replacement. A missing, stale or post-spawn result proves no absence of native
-effects and permits no input replay. This shared bootstrap is source integration;
-its installation, live OS behavior and supervisor/adapter activation remain
-separate work.
-
-The Store package opens its writer from the existing owner thread while that
-thread retains the DataRoot lock. Base schema initialization and the kernel's
-credential checks, extensions and restart reconciliation share one Immediate
-transaction. The kernel callback's errors pass through unchanged. The status
-reader remains read-only/query-only and retains host principal checks. Parsed
-JSON digest comparison and both existing empty-database identity cases are
-preserved. No migration SQL, authorization or domain handler moved into shared
-contracts, and no second database or writer was introduced.
-
-Store disconnect failures use only known client/link identifiers and fixed
-metadata categories, without raw error messages, paths, credentials or native
-frames. Queued records and bytes are bounded, writer failure counts losses, and
-the Store returns its original error. Queue acceptance is a diagnostic result,
-never acknowledgement of business work. This initial stderr producer does not
-provide M5 logging reload, retention, live monitoring or metrics RPCs.
-Its local sequence identifies emission attempts, including losses; concurrent
-writers can queue them in another order. It is not a durable journal cursor or
-proof of complete event history.
-
-Format and check explicit packages; do not blanket-format the Atlas donor.
-For a changed package, the intended developer commands are:
-
-```sh
-cargo fmt -p swarm-client -- --check
-cargo clippy --locked -p swarm-client --lib --bins --no-deps -- -D warnings
-cargo build --locked -p swarm-client --profile iterate
-```
-
-The `iterate` profile keeps line-table debug information and incremental
-compilation; release packaging remains separate. Its presence is not a speed
-benchmark. No `cargo clean` or repeated full workspace/release gate is required
-for a writer fragment. Shared changes also require checking actual reverse
-dependencies. See [the modularity program](modularity.md) for M2–M6 acceptance.
-
-These shared packages establish the compile-time and IPC contract boundaries consumed by the kernel, frontends, standalone workers and runtime adapters. Historical CI run logs and commit receipts are tracked in [Implementation Status](../implementation-status.md).
+Implementation status and historical receipts belong in [Implementation status](../implementation-status.md).
+Build/delegation rules belong in [AGENTS.md](../../AGENTS.md) and [scoped builds](../ci-scoped-builds.md).
+Large integration suites move with their real seam; small local unit tests may
+remain beside code. Neither moving tests nor splitting files deletes production
+behavior or demonstrates a performance improvement.

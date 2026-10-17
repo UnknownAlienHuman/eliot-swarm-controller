@@ -1,30 +1,23 @@
 # Donor Map — Rust Operations and Manager-Owned Automation
 
-Revision 7 · V3 source/target reconciliation 2026-10-17. Waku, Paseo loading and CCCC suspended-child source were rechecked at their recorded commits; other source observations retain their recorded dates.
+Revision 8 · V3 source/target reconciliation 2026-10-17. Waku, Paseo loading, CCCC suspended-child and Muse SDK source were rechecked at recorded commits; Schemars documentation was inspected at 1.2.2. Other observations retain their dates.
 
 `CODE` means an inspected source behavior; `DOC` means official/library documentation; `OWNER_AUDIT` means supplied operating evidence; `DESIGN` means an ELIOT proposal. Earlier inspections are not new live qualification. Commit/blob identities locate evidence, not required installed versions.
 
 ## 1. Product decisions are not inferred from donors
 
-**DESIGN, owner direction:** management is manual by default. Each manager enables the helpers they want, acting on their behalf inside existing rights. No global operating modes, extra stage-activation ledger or Root approval for already permitted actions. Rust owns every internal subsystem; Python/PowerShell are optional external extensions.
+**DESIGN, owner direction:** management is manual by default. Each manager enables the helpers they want, acting on their behalf inside existing rights. No global operating modes, extra stage-activation ledger or Root approval for already permitted actions. Rust owns the control plane and durable work; native SDK drivers follow section 9. Python/PowerShell user scripts are optional external extensions.
 
 The operations program now also includes [Modular Runtime](modularity.md) and [Observability](observability.md), requested on 2026-10-05. They define build/process and diagnostic boundaries, not an extra workflow or permission engine. Source study does not prove the proposed combined system works; earlier donor observations below remain historical unless explicitly rechecked.
 
 ## 2. Earlier ELIOT evidence
 
-Inspected main baseline: `504199d14135c030ad3951a3c5023a098a3d03f0`. Recheck current symbols when implementation starts.
-
-| Unit | Source fact | Reuse/required change |
-|---|---|---|
-| [`src/model.rs`](../../crates/swarm-kernel-host/src/model.rs) | Manager actor has no invented generation; internal Scheduler has a special ownership path; negative not-observer is not a complete capability model. | Keep identity semantics; new on-behalf actions resolve their manager, not the Scheduler shortcut. |
-| [`src/store/mod.rs`](../../crates/swarm-kernel-host/src/store/mod.rs) | Store owns serialized DB work and shared change notification; several effects use dedicated outer methods. | One common action/authorization boundary, no recursive public IPC in a transaction; notification is not durable delivery. |
-| [`src/store/schedules.rs`](../../crates/swarm-kernel-host/src/store/schedules.rs), [`docs/schedules.md`](../schedules.md) | Considered cursor, request identity and scheduled check admission are coupled in one transaction. | Extend this property to event routing/pending subjects; preserve legacy slots and receipts. |
-| [`src/store/submissions.rs`](../../crates/swarm-kernel-host/src/store/submissions.rs) | Reserve is queued; finish commits applied `task.submission`; feedback is guarded and not a native prompt. | Applied-submission triggers; explicit auditor result versus manager disposition versus repair delivery. |
-| [`docs/task-policy.md`](../task-policy.md), [`docs/owner-decisions.md`](../owner-decisions.md) | Frozen policy/source/Attempt evidence, one manager worktree, GM-fenced effects and current first-slice restrictions. | Add accepted policy and shared code deliberately; keep earlier evidence recognizable. A design document does not silently grant rights. |
-| [`docs/forge-publication.md`](../forge-publication.md) | Accepted non-force publication, process disposition and readback; preflight is not atomic remote old-ref CAS. | Preserve actual guarantees for manual/automatic callers and separate upload/merge. |
-| [`src/mcp/subscriptions.rs`](../../crates/swarm-mcp/src/mcp/subscriptions.rs) | Existing bounded committed-fact polling and lag/resync. | Shared projectors plus separate live-native rings, not a transcript per subscriber. |
-
-PR #22's proposed reviewer core included `task.request_changes`, while its Participant path forbids Task transitions. PR #23 supplies `review.assign/submit`. **DESIGN:** reconcile the two at implementation: assigned auditor submits its anchored verdict; manager or manager-owned automation applies guarded feedback. No role escalation by MCP visibility.
+Earlier ELIOT inspection used `504199d14135c030ad3951a3c5023a098a3d03f0`.
+Use the [current refactoring map](refactoring.md) for the recheck at `f1b854b6`,
+including completed audit fixes, actual dependency use and current call sites.
+The [architecture](architecture.md), [delivery contract](delivery.md) and frozen
+[owner policies](../owner-decisions.md) own the product rules; source observations
+here neither grant rights nor transfer historical qualification to new artifacts.
 
 ## 3. Mandatory Rust Crate Donors (No Handwritten Reinvention)
 
@@ -99,12 +92,40 @@ The [donor inventory](../agent_swarm.donors-20260929.toml) distinguishes complet
 
 ## 9. Official Vendor SDKs and Native Protocol Boundaries
 
-Native references: [Codex app-server](https://developers.openai.com/codex/app-server/), [Claude Agent SDK / CLI](https://code.claude.com/docs/en/cli-reference), [OpenCode Server & SDK](https://opencode.ai/docs/plugins/), [Muse SDK integration](../../modules/muse/README.md), [Agent Client Protocol (ACP)](https://docs.rs/agent-client-protocol/latest/agent_client_protocol/).
+Use official protocol crates at actual protocol boundaries: ACP through
+`agent-client-protocol`, MCP through `rmcp`. Documented native APIs such as
+[Codex app-server](https://developers.openai.com/codex/app-server/) and
+[OpenCode HTTP/SSE](https://opencode.ai/docs/) may be called directly from Rust.
+A vendor SDK may supply native transport/session handles through a thin driver;
+Rust owns `ModuleLink`, supervision, admitted identity and durable Store receipts.
+No SDK introduces a second Eliot job ledger or independent uncertain-input replay.
 
-**Effective SDK delegation rule:**
-1. Where an official Rust protocol crate exists (`agent-client-protocol` for ACP-speaking adapters, `rmcp` for MCP) or the vendor exposes a clean documented JSON-RPC/HTTP contract (Codex `app-server`, OpenCode HTTP/SSE), the Rust adapter (`swarm-adapter-*`) speaks that contract directly and owns `ModuleLink`, process supervision, request/prompt digests, and Store receipts.
-2. Where a vendor's session state machine, authentication handshake, or streaming assembly is packaged in an official non-Rust SDK (`@muse-code/sdk` in `modules/muse`, `@anthropic-ai/claude-agent-sdk` in `modules/claude`, `openai-codex` in `modules/codex`, `acpx` in `modules/acpx`), **retain and use the official vendor SDK as a thin, stateless protocol driver** behind the Rust adapter boundary until feature-complete parity is proven. **Never rewrite complex vendor SDK internals from scratch into half-broken Rust parsers or block model results because a handwritten parser lacks session state.**
-3. Accept installed vendor runtimes (Bun, Node, Python, OpenCode, Claude CLI, Codex) by **protocol and capability compatibility**, not by hardcoded version strings (such as `Bun == 1.4.0`) or rigid global binary hashes.
+**CODE, Muse SDK rechecked at recorded source commit `a7c10c5`:**
+[`Connection`](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/connection/connection.ts)
+accepts a transport and a caller-supplied `CommandOptions.commandId`.
+The high-level [`Session`](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/facade/session.ts)
+creates pending-command/turn/gap helpers and drives command replay during recovery.
+[`SessionFold`](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/fold/session-fold.ts)
+provides a separate in-memory event projection. This source observation does not
+prove equality with the installed npm tarball; the [donor inventory](../agent_swarm.donors-20260929.toml)
+records `published_artifact_version_verified = false` for this SDK source pin.
+
+**DESIGN, bounded replacement candidate:** compare lower-level `Connection` and
+direct event-fold reuse with the existing Rust transport and Node bridge, without
+the `Session` recovery coordinator. Rust must
+persist `NativePending` before I/O and validate/retain the exact command/boot/ACK
+identity. Direct adoption of `Session` would add another replay owner and is not
+accepted as that replacement. The [Rust transport](../../crates/swarm-adapter-muse/src/msp.rs)
+is 1,597 physical lines, with 927 preceding its explicit test module; these are not
+927 removable lines. It already uses `jsonrpsee` and `tokio-util`. A new Rust–Node
+bridge could exceed the saving. Count all
+owned languages, IPC glue and retained compatibility before adopting it; do not
+build a new wrapper solely to move Rust lines elsewhere.
+
+Accept installed runtimes by documented protocol/capability compatibility.
+Selected local artifact digests and historical request/checkpoint bytes remain
+exact. Source refactoring does not wait for all-runtime native qualification;
+retire old executors separately from their historical decoders.
 
 GitHub references:
 
@@ -115,22 +136,33 @@ GitHub references:
 
 ## 10. Owner operating evidence
 
-The supplied MANAGER-BRIEF and control-plane audit are historical evidence with changing instructions, not current product defaults. Do not copy old fixed versions, mandatory counts/timers, stage policies or cleanup commands.
+Historical MANAGER-BRIEF and control-plane audits motivated current ownership,
+retained candidate/review identity, durable routing, immutable invocation inputs
+and scoped recovery. Their old versions, mandatory counts/timers, stage policies
+and cleanup commands are not current defaults. The active [configuration](configuration.md),
+[delivery](delivery.md) and [recovery](architecture.md#11-recovery-and-failure-isolation)
+contracts own the resulting rules; do not copy incident tables into agent tasks.
 
-| Incident | ELIOT contract response |
-|---|---|
-| Stale queue snapshots created duplicate ownership. | Current shared manual/automatic reservation in relational SQLite tables. |
-| Late A review/return changed B. | Candidate/review-attempt anchors and historical late results. |
-| Deliveries were lost behind marker variants/backlogs. | Durable routing cursor coupled with action or pending state; bounded current-work inclusion. |
-| Native Goal/children revived an old manager. | One real continuation/lifecycle owner, not wrapper-based detection. |
-| Reminders became a model's entire assignment. | Notices are information; separate authorized work delivery. |
-| Same checklist blocked repaired code; new whitespace bypassed old defects. | Relevant source/evidence progression rather than bytes of checklist or random event IDs. |
-| Scripts changed while executing. | Captured invocation inputs; future admissions use new settings. |
-| Malformed data or failed Git read broke every queue. | Scoped gaps, last valid state and fair pending-subject reevaluation. |
-| GitBookkeeping failure repeated real work. | Separate projections/effects and retained remote result. |
-| Long shared logs/tool catalog overwhelmed participants. | Bounded streams/current context and deferred schemas; no transcript copies per observer. |
-| Reported missing-parent result refusals and launcher MCP readiness holds. | V3 Operation-owned turn correlation and asynchronous MCP discovery; verify each runtime path before calling a hold a circular deadlock. |
+## 11. Donor integration discipline
 
-## 11. Summary of Donor Boundary Discipline
+A dependency is integrated when a real caller uses it and its replaced mechanism
+is removed. Pattern-only donors do not justify importing another workflow engine.
+Use the [package ownership map](shared-packages.md) and [deletion candidates](refactoring.md#code-reduction-candidates)
+for the concrete boundary, preserving one durable effect and retry owner.
 
-The intended result is a small, high-performance shared Rust kernel/protocol (`swarm-contracts`, `swarm-store`, `swarm-kernel`), independently compiled execution/observer workers (`swarm-bus`, `swarm-automation`, `swarm-checks`, `swarm-forge-worker`, `swarm-script-worker`, `swarm-observer`), and thin, reliable runtime adapters (`swarm-adapter-*`) that leverage official vendor SDKs and vetted Rust donor crates (`rmcp`, `agent-client-protocol`, `octocrab`, `croner`, `sysinfo`, `notify`, `tracing`, `atlas-redact`, `cccc-windows-process`) to their full potential.
+## 12. Schema generation candidate
+
+**DOC, inspected 2026-10-17:** [Schemars 1.2.2](https://docs.rs/schemars/1.2.2/schemars/)
+derives JSON Schema from Rust DTOs and recognizes Serde field rules.
+[SchemaSettings](https://docs.rs/schemars/1.2.2/schemars/generate/struct.SchemaSettings.html)
+selects schema dialect and serialization/deserialization purpose; defaults and
+schema structure are not a stable wire-output guarantee across crate updates.
+`Cargo.lock` already contains 1.2.2 transitively; contracts do not yet use it directly.
+
+**DESIGN:** pilot one existing shared request family, generate its input schema at
+the existing catalog boundary and delete its handwritten schema/refinement branches.
+Preserve wire required/nullability/bounds/descriptions, the chosen dialect and
+catalog revision/cache behavior. Use the existing DTO, not a second schema model
+or code-generation pipeline. Runtime cross-field, authorization and UTF-8 byte
+checks remain domain rules; schema string length counts characters. Retained
+digests/IDs and historical payloads do not change merely because schemas are generated.

@@ -25,12 +25,20 @@ This preparation inspected manifests and the critical Store, launch, result,
 worker and journal paths. It is not an exhaustive line-by-line audit or a new
 runtime/qualification pass.
 
-A reproducible size baseline is 479 owned `.rs` files / 534,926 physical lines,
-including comments, blank lines and tests, excluding `vendor/`; 366,932 lines are
-under `crates/swarm-kernel-host`. Files whose path contains `tests` or whose stem
-contains `test`/`fixture` account for 85,087 lines; other files also contain inline
-tests. These counts are navigation data, not production SLOC or measured runtime
-cost. The structural problem is responsibility and dependency concentration.
+Size at this unchanged Rust baseline (`git ls-files '*.rs'`, excluding `vendor/`):
+
+| Scope | Physical lines | Explicit test-only estimate | Remaining text, upper bound |
+| --- | ---: | ---: | ---: |
+| All 479 owned Rust files | 534,926 | 172,511 | 362,415 |
+| `crates/swarm-kernel-host` | 366,932 | 128,996 | 237,936 |
+
+The test estimate follows `tests/` paths, test-required `cfg` items and their
+resolvable out-of-line module descendants, with comments/literals masked for
+delimiter matching. It does not compile features or establish production reachability;
+macro-generated/atypical modules can be missed. Physical lines include comments
+and blanks; the remainder is not production SLOC. The older filename-only 85,087
+test/fixture count understated embedded suites. None of these figures measures
+performance or establishes that every remaining line is needed.
 
 ## 2. Audit findings already addressed
 
@@ -97,6 +105,36 @@ candidate boundaries, not new permanent Issues.
 | M2–M4: worker boundaries | The edge-removal table below. | Each worker-only edit leaves the host outside its actual Cargo reverse-dependency closure; one production owner remains. |
 | O4: GitHub donor | Existing `github/client.rs` traits plus issue/label/PR consumers. | One shared octocrab backend replaces `run_gh_api`; current account/host, bounded responses and Store-owned write/readback survive. Native Git publication keeps its own process boundary. |
 | M5/O2: observation donors | `swarm-telemetry`, `swarm-observer`, config/watch and `swarm-process`. | tracing replaces duplicate logging plumbing; notify replaces matching file polling; sysinfo supplies metrics; CCCC supplies suspended-child bootstrap where that launch path exists. Complete one donor/consumer replacement per candidate. |
+
+### Code reduction candidates
+
+These refine the same O/M queue. CLI/catalog cleanup can proceed alongside the
+productive-path fixes. Keep broader O4–O9 feature completion off this reduction
+pass's critical path; existing requirements remain in [O1–O11](implementation.md).
+Estimate the old surface before work, then report actual deleted/added owned lines
+and the resulting owner after integration. Count Rust, JS/Python drivers and IPC
+glue together, with tests separately; vendoring or moving code is not deletion.
+
+| Candidate / source owner | Replacement and deletion | Limits of the estimate |
+| --- | --- | --- |
+| O10: duplicate application CLI — [`swarm-cli::command_uses_host`](../../crates/swarm-cli/src/main.rs), [`host main`](../../crates/swarm-kernel-host/src/main.rs) | Keep application parsing/request mapping in `swarm-cli`; delete host Task/route/review and other duplicate application variants/mappers. Keep daemon, Gateway, module/worker bootstrap and delegated local admin commands. The root `swarm-host` stays a thin launcher. | About 700–900 old production lines across the host enums/mapping are candidates, not a measured net diff. No direct host application callers were found in the repo; update any documented compatibility surface/caller discovered during removal. No new shared CLI crate. |
+| O10: handwritten MCP input schemas — [`mcp_catalog.rs`](../../crates/swarm-contracts/src/mcp_catalog.rs) | Derive one existing shared DTO family's input schemas with [Schemars](donor-map.md#12-schema-generation-candidate), then remove its manual `TOOL_ITEMS`/refinement definitions. Preserve descriptions, dialect, bounds and public wire behavior. | The file is 8,012 physical lines including metadata/tests, not 8,012 deletable lines. Do not add parallel DTOs or a new schema DSL; a host-owned wire DTO moves to contracts before reuse. |
+| O10: repeated catalog exposure lists — same catalog and [`method_policy.rs`](../../crates/swarm-contracts/src/method_policy.rs) | Make one explicit declaration own exact frontend profile exposure; remove the repeated `exposes_method` inventory after preserving every current method/profile pair. | `exposes_method` spans about 230 lines. `ToolMetadata.audiences` describes intended fit, not exact exposure: do not substitute membership blindly. Store authorization, method classification and smaller eager-core lists serve different purposes and remain. |
+| M2/O1: capacity persistence — [`capacity.rs`](../../crates/swarm-kernel-host/src/store/capacity.rs) | Indexed scope/entry rows replace hex-key codecs, header/entry serializers, `meta` scans and orphan stitching as each scope cuts over. Reuse the existing installer and reservation domain code. | A 5,630-line file is not a deletion estimate. Reservation correctness, held/unknown capacity and damaged-source isolation are real behavior; only the replaced persistence machinery is removed. |
+| M3/M4: parallel runtime implementations | Select one owner for new admissions; keep narrow historical decoding/readback, then remove the retired executor as described below. | Potentially larger than helper cleanup, but active routes and saved formats differ. No whole-runtime saving is claimed before the caller/cutover diff. |
+| O4: GitHub API subprocess — [`github/client.rs`](../../crates/swarm-kernel-host/src/github/client.rs) | One `octocrab` backend behind existing API traits replaces `run_gh_api` and its `gh api` argument glue. Keep native Git publication separate. | `run_gh_api` is about 104 lines; with caller glue the old surface is roughly 150–250 lines. It is not a large handwritten HTTP stack, and octocrab is not yet a direct dependency. |
+
+### Retire executors without losing history
+
+| Runtime | Current distinction | Source reduction boundary |
+| --- | --- | --- |
+| Codex | [`config.rs`](../../crates/swarm-kernel-host/src/config.rs) rejects the old Python artifact for new bindings; Rust is the selected new-admission path. [`runtime/codex.rs`](../../crates/swarm-kernel-host/src/runtime/codex.rs) still validates historical native/thread/turn/input identity. | Inventory retained bindings and unresolved executable consumers. Remove retired Python orchestration/package paths when those consumers are handled, retaining the versioned decoder and historical bytes. It is unnecessary to erase every old Operation to retire its producer. |
+| OpenCode | Built-in `http.2` and standalone `rust-http.1` both have real routes and different integration coverage. Fresh-owned service start is already rejected; substantial helper code is test-only. | Migrate required new-admission/session/result consumers to one runtime owner. Retire the replaced executor and dormant producer helpers, preserving exact old-artifact readback and owner/family disposition. Do not delete all `owned_service.rs` or recreate an SDK service merely because that file remains. |
+| Muse | Node bridge.13 remains a current path; Rust 0.1.2 is a disabled candidate with a different durable journal. | Select one owner for new admissions. Retain each format's compatible readback/reconcile path for saved work before retiring its executor; Rust does not adopt/rewrite Node checkpoints ([integration boundary](../../crates/swarm-adapter-muse/registration/INTEGRATION.md)). A thin SDK driver must shrink total owned transport/fold/glue; full SDK `Session` adds automatic replay ([inspected boundary](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries)). |
+
+Native route cutover has its own later operational validation. It is not a gate
+on source extraction or removal of independently unreachable code. Retained
+unknown work requires its actual reconciliation path, not a second general runtime.
 
 ### WAL migration detail
 
