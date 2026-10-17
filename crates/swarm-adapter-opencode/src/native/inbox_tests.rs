@@ -947,7 +947,10 @@ async fn native_072_input_status_reads_exact_user_without_input_history_events()
                     .read_input_status(&intent, &fixture.options)
                     .await
                     .unwrap();
-                assert_eq!(evidence.input_message_sha256, digest_json(&message).unwrap());
+                assert_eq!(
+                    evidence.input_message_sha256,
+                    digest_json(&message).unwrap()
+                );
                 // Each request has an exact path: only root-proof log sync is
                 // expected, never an after-cursor input-history query or POST.
                 assert_eq!(server.await.unwrap(), vec![Value::Null; requests]);
@@ -1043,7 +1046,10 @@ async fn native_072_input_status_rejects_foreign_root_scope_and_pinned_model() {
         let mut session = fixture.session.clone();
         *session.pointer_mut(pointer).unwrap() = replacement;
         let (client, server) = http_fixture(
-            vec![fixture.session_response(&session), fixture.location_response()],
+            vec![
+                fixture.session_response(&session),
+                fixture.location_response(),
+            ],
             "GET",
         )
         .await;
