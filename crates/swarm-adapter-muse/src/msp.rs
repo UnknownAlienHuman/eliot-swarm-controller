@@ -95,6 +95,7 @@ pub enum TransportEnd {
     DuplicateServerId,
     UnexpectedClientFrame,
     ClientDisconnected,
+    RequestTimedOut,
     InvalidOptions,
     OwnerUnverified,
 }
@@ -668,7 +669,12 @@ async fn coordinator(
                     .expect("ticket lock")
                     .as_ref()
                     .is_some_and(|ticket| ticket.serial == serial);
-                if not_submitted {
+                // jsonrpsee retains a timed-out request until its response.
+                // End this connection before releasing its admission permit;
+                // otherwise successive timeouts grow that retained map.
+                if matches!(&result, Err(jsonrpsee_core::client::Error::RequestTimeout)) {
+                    task_shared.fail(TransportEnd::RequestTimedOut);
+                } else if not_submitted {
                     task_shared.fail(TransportEnd::ClientDisconnected);
                 }
                 let _ = response.send(result.map_err(RequestError::Rpc));
@@ -1135,6 +1141,45 @@ mod tests {
         )
         .await;
         assert_eq!(end(&transport).await, TransportEnd::UncorrelatedError);
+    }
+
+    #[tokio::test]
+    async fn msp_transport_request_timeout_fences_admission_without_erasing_submission() {
+        let options = Options {
+            max_in_flight: 1,
+            request_timeout: Duration::from_millis(100),
+            ..Options::default()
+        };
+        let (transport, _events, mut input, _output) = fixture(options, RpcModule::new(()), 512);
+        let pending = transport
+            .submit_request("turn/start", params(json!({"commandId":"unanswered"})))
+            .unwrap();
+        let sent = read_frame(&mut input).await;
+        let submitted = pending.submitted.await.unwrap().unwrap();
+        assert_eq!(submitted.request_id.as_ref(), Some(&sent["id"]));
+        assert!(matches!(
+            timeout(DEADLINE, pending.response).await.unwrap().unwrap(),
+            Err(RequestError::Rpc(
+                jsonrpsee_core::client::Error::RequestTimeout
+            ))
+        ));
+        assert_eq!(end(&transport).await, TransportEnd::RequestTimedOut);
+        assert!(matches!(
+            transport.submit_request("turn/start", params(json!({"commandId":"another"}))),
+            Err(TransportEnd::RequestTimedOut)
+        ));
+        let mut trailing = Vec::new();
+        timeout(DEADLINE, input.read_to_end(&mut trailing))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            trailing.is_empty(),
+            "no new or replayed request after timeout"
+        );
+        // The successful write receipt remains evidence of attempted native
+        // work. Transport termination neither cancels nor completes that work.
+        assert_eq!(submitted.request_id.as_ref(), Some(&sent["id"]));
     }
 
     #[tokio::test]

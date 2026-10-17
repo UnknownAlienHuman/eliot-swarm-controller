@@ -12,6 +12,9 @@ submissions before stdin close. The caller supplies pipes from an already owned
 child; existing module-owner membership is verified. EOF never proves child or
 descendant departure. A submission receipt proves flushed bytes, not native
 admission, execution or Task completion. No request is automatically replayed.
+An RPC request timeout ends transport admission before releasing its slot,
+bounding the library's retained requests. Successful write receipts remain
+valid evidence of attempted work; the native effect remains unknown.
 
 The official Muse SDK `1.3.0` at
 `a7c10c5dd3f66be412077d29f9d11111af70317b` remains the public wire/conformance
@@ -20,7 +23,7 @@ RPC adoption is recorded in the [donor inventory](../../docs/agent_swarm.donors-
 and `lib.rs`; the exact jsonrpsee license is retained under `third-party/`.
 Native Muse retains authentication, provider configuration and inference.
 
-Nineteen local boundary fixtures and strict all-target Clippy passed on
+Twenty local boundary fixtures and strict all-target Clippy passed on
 2026-10-16. They cover typed IDs, server requests, split UTF-8, frame bounds,
 malformed/truncated input, pressure, cancelled receipts, write failure and close
 ordering. They use synthetic pipes and do not qualify a native Muse executable.

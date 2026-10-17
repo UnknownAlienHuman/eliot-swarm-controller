@@ -12,7 +12,7 @@ the Rust adapter migration required by the [modular architecture](../../docs/age
 remains incomplete. The bridge's fixture results apply to this implementation.
 
 The prospective [Rust transport library](../../crates/swarm-adapter-muse/README.md)
-uses complete generic Rust RPC/codec crates and passes 19 local synthetic-pipe
+uses complete generic Rust RPC/codec crates and passes 20 local synthetic-pipe
 fixtures. It has no executable/descriptor and does not replace this bridge's
 commands, checkpoint, recovery or results. Those Rust migration steps and native
 qualification remain open.
