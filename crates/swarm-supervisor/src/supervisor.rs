@@ -1356,12 +1356,14 @@ impl Service {
                 | LifecycleState::OwnerIdentityUnknown
                 | LifecycleState::ProcessIdentityUnknown { .. }
         );
-        if (self.scope_quarantined.load(Ordering::Acquire) || matches!(
-            &current,
-            LifecycleState::Isolated { .. }
-                | LifecycleState::OwnerIdentityUnknown
-                | LifecycleState::ProcessIdentityUnknown { .. }
-        )) && !has_custody
+        if (self.scope_quarantined.load(Ordering::Acquire)
+            || matches!(
+                &current,
+                LifecycleState::Isolated { .. }
+                    | LifecycleState::OwnerIdentityUnknown
+                    | LifecycleState::ProcessIdentityUnknown { .. }
+            ))
+            && !has_custody
             && !ownership_pending
         {
             return Err(Error::new(
@@ -1609,7 +1611,8 @@ impl Service {
                     AdmissionState::Closed { .. }
                 ) && !custody_pending)
                 || (self.scope_quarantined.load(Ordering::Acquire)
-                    && !custody_pending && !owner_pending)
+                    && !custody_pending
+                    && !owner_pending)
                 || (!custody_pending
                     && !owner_pending
                     && !matches!(exit, LifecycleRunExit::WaitingForDemand)
@@ -1985,12 +1988,14 @@ impl Service {
             }
             if !self.has_demand() {
                 self.update_status(|status| {
-                    if !status.has_proven_terminal() && !matches!(
-                        status.lifecycle,
-                        LifecycleState::OwnerGroupRetained { .. }
-                            | LifecycleState::OwnerIdentityUnknown
-                            | LifecycleState::ProcessIdentityUnknown { .. }
-                    ) {
+                    if !status.has_proven_terminal()
+                        && !matches!(
+                            status.lifecycle,
+                            LifecycleState::OwnerGroupRetained { .. }
+                                | LifecycleState::OwnerIdentityUnknown
+                                | LifecycleState::ProcessIdentityUnknown { .. }
+                        )
+                    {
                         status.lifecycle = LifecycleState::WaitingForDemand;
                         status.worker = None;
                         status.owner = None;
@@ -5499,9 +5504,7 @@ mod tests {
         }
         worker.stop();
         std::process::exit(
-            if std::env::var("ELIOT_SWARM_SUPERVISOR_OWNER_FIXTURE_SUCCESS").as_deref()
-                == Ok("1")
-            {
+            if std::env::var("ELIOT_SWARM_SUPERVISOR_OWNER_FIXTURE_SUCCESS").as_deref() == Ok("1") {
                 0
             } else {
                 23
@@ -6052,8 +6055,10 @@ mod tests {
         // demand absence, a NotStarted result, or a synthetic empty-family flag.
         assert!(matches!(
             &after.lifecycle,
-            LifecycleState::ProcessExited { exit_proven: true, .. }
-                | LifecycleState::Completed { .. }
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            } | LifecycleState::Completed { .. }
         ));
         assert_eq!(
             serde_json::to_value(&after.lifecycle).unwrap(),
@@ -6073,8 +6078,14 @@ mod tests {
         assert_eq!(after.effect_certainty, before.effect_certainty);
         assert_eq!(after.readback_required, before.readback_required);
         assert_eq!(after.unknown_operation_ids, before.unknown_operation_ids);
-        assert_eq!(after.unknown_operation_count, before.unknown_operation_count);
-        assert_eq!(after.unknown_operation_ids_truncated, before.unknown_operation_ids_truncated);
+        assert_eq!(
+            after.unknown_operation_count,
+            before.unknown_operation_count
+        );
+        assert_eq!(
+            after.unknown_operation_ids_truncated,
+            before.unknown_operation_ids_truncated
+        );
     }
 
     #[cfg(any(windows, target_os = "linux"))]
@@ -6083,7 +6094,9 @@ mod tests {
         restart_needed: bool,
     ) {
         let service = fixture.startup.service.clone();
-        service.write_restart_history(&VecDeque::from([unix_time_ms().unwrap()])).unwrap();
+        service
+            .write_restart_history(&VecDeque::from([unix_time_ms().unwrap()]))
+            .unwrap();
         // Production captures this exact query while the helper is live. Keep
         // it before releasing the fixture, including on Windows.
         service.remember_owner_family_query(
@@ -6092,14 +6105,19 @@ mod tests {
         );
         let mut helper = fixture.helper.take().expect("exact helper Child");
         fixture.release();
-        let attempt = time::timeout(Duration::from_secs(5), service.monitor_owner_helper(
-            &mut helper,
-            &fixture.boot_id,
-            &fixture.helper_identity,
-            None,
-            Instant::now() + Duration::from_secs(5),
-        ))
-        .await.unwrap().unwrap();
+        let attempt = time::timeout(
+            Duration::from_secs(5),
+            service.monitor_owner_helper(
+                &mut helper,
+                &fixture.boot_id,
+                &fixture.helper_identity,
+                None,
+                Instant::now() + Duration::from_secs(5),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(attempt.exit.success());
         assert!(attempt.safe_to_replace && attempt.family_departure_proven);
         service.record_owner_helper_exit(
@@ -6124,13 +6142,21 @@ mod tests {
         assert!(matches!(before.lifecycle, LifecycleState::Completed { .. }));
         let launch_before = fs::read(service.state_dir.join("launch-attempt.json")).unwrap();
         let history_before = fs::read(service.state_dir.join("restart-history.json")).unwrap();
-        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle()).await.unwrap();
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
         assert_terminal_retention(&before, &service.current_status());
         assert!(!service.has_demand());
         assert!(aggregate_has_obligations(&service));
         assert!(!service.can_replace_descriptor().await);
-        assert_eq!(fs::read(service.state_dir.join("launch-attempt.json")).unwrap(), launch_before);
-        assert_eq!(fs::read(service.state_dir.join("restart-history.json")).unwrap(), history_before);
+        assert_eq!(
+            fs::read(service.state_dir.join("launch-attempt.json")).unwrap(),
+            launch_before
+        );
+        assert_eq!(
+            fs::read(service.state_dir.join("restart-history.json")).unwrap(),
+            history_before
+        );
     }
 
     #[cfg(any(windows, target_os = "linux"))]
@@ -6144,9 +6170,17 @@ mod tests {
         assert!(restart_needed);
         terminal_retention_monitor_exit(&mut fixture, restart_needed).await;
         let before = service.current_status();
-        assert!(matches!(before.lifecycle, LifecycleState::ProcessExited { exit_proven: true, .. }));
+        assert!(matches!(
+            before.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            }
+        ));
         drop(lease);
-        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle()).await.unwrap();
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
         assert_terminal_retention(&before, &service.current_status());
         assert!(!service.has_demand());
         assert!(service.readback_required.load(Ordering::Acquire));
@@ -6160,14 +6194,18 @@ mod tests {
         let service = fixture.startup.service.clone();
         retain_hello_fixture_operations(&service);
         let lease = terminal_retention_lease(&service);
-        service.write_restart_history(&VecDeque::from([unix_time_ms().unwrap()])).unwrap();
+        service
+            .write_restart_history(&VecDeque::from([unix_time_ms().unwrap()]))
+            .unwrap();
         let helper = fixture.helper.take().expect("exact helper Child");
-        service.retain_helper_child_custody(
-            helper,
-            Some(fixture.helper_identity.clone()),
-            Some(fixture.boot_id.clone()),
-            "MODULE_WORKER_EXITED",
-        ).await;
+        service
+            .retain_helper_child_custody(
+                helper,
+                Some(fixture.helper_identity.clone()),
+                Some(fixture.boot_id.clone()),
+                "MODULE_WORKER_EXITED",
+            )
+            .await;
         service.remember_owner_family_query(
             &fixture.owner_receipt["process"],
             fixture.owner_receipt["token"].as_str().unwrap(),
@@ -6180,14 +6218,31 @@ mod tests {
         }
         drop(lease);
         let unknown_before = service.current_status().unknown_operation_ids;
-        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle()).await.unwrap();
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
         let after = service.current_status();
         // run_lifecycle itself must consume genuine family departure and publish
         // exit_proven before its no-demand branch, not a test-created terminal.
-        assert!(matches!(after.lifecycle, LifecycleState::ProcessExited { exit_proven: true, .. }));
-        assert_eq!(after.worker_boot_id.as_deref(), Some(fixture.boot_id.as_str()));
-        assert!(same_process_identity(after.owner.as_ref().unwrap(), &fixture.helper_identity));
-        assert!(same_process_identity(after.worker.as_ref().unwrap(), &fixture.worker_identity));
+        assert!(matches!(
+            after.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            after.worker_boot_id.as_deref(),
+            Some(fixture.boot_id.as_str())
+        );
+        assert!(same_process_identity(
+            after.owner.as_ref().unwrap(),
+            &fixture.helper_identity
+        ));
+        assert!(same_process_identity(
+            after.worker.as_ref().unwrap(),
+            &fixture.worker_identity
+        ));
         assert_eq!(after.unknown_operation_ids, unknown_before);
         assert_eq!(after.unknown_operation_count, 2);
         assert!(after.readback_required && service.readback_required.load(Ordering::Acquire));
@@ -6207,19 +6262,27 @@ mod tests {
         let before = service.current_status();
         assert_eq!(service.descriptor.restart.max_starts, 1);
         let launch_before = fs::read(service.state_dir.join("launch-attempt.json")).unwrap();
-        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle()).await.unwrap();
+        time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
         let after = service.current_status();
         assert_terminal_retention(&before, &after);
         assert!(service.has_demand());
         assert_eq!(after.restart.starts_in_window, 1);
         assert!(after.restart.exhausted);
-        assert_eq!(fs::read(service.state_dir.join("launch-attempt.json")).unwrap(), launch_before);
+        assert_eq!(
+            fs::read(service.state_dir.join("launch-attempt.json")).unwrap(),
+            launch_before
+        );
         assert_eq!(service.read_restart_history().unwrap().len(), 1);
         assert!(!service.can_replace_descriptor().await);
         service.quarantine("MODULE_OBSERVATION_REJECTED").unwrap();
         assert_terminal_retention(&before, &service.current_status());
         assert!(service.scope_quarantined.load(Ordering::Acquire));
-        assert_eq!(service.ensure_runner().await.unwrap_err().code, "MODULE_ISOLATED");
+        assert_eq!(
+            service.ensure_runner().await.unwrap_err().code,
+            "MODULE_ISOLATED"
+        );
         drop(lease);
     }
 
@@ -6233,7 +6296,9 @@ mod tests {
         terminal_retention_monitor_exit(&mut fixture, true).await;
         drop(prior_lease);
         let before = service.current_status();
-        let exit = time::timeout(Duration::from_secs(5), service.clone().run_lifecycle()).await.unwrap();
+        let exit = time::timeout(Duration::from_secs(5), service.clone().run_lifecycle())
+            .await
+            .unwrap();
         assert!(matches!(exit, LifecycleRunExit::WaitingForDemand));
         assert!(!service.current_status().restart.exhausted);
         // The new lease is admitted while the prior runner is finishing its
@@ -6244,12 +6309,18 @@ mod tests {
         service.after_runner_exit(exit).await;
         time::timeout(Duration::from_secs(5), async {
             loop {
-                if statuses.borrow().restart.exhausted { break; }
+                if statuses.borrow().restart.exhausted {
+                    break;
+                }
                 statuses.changed().await.unwrap();
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let runner = service.runner.lock().await.take();
-        if let Some(runner) = runner { runner.await.unwrap(); }
+        if let Some(runner) = runner {
+            runner.await.unwrap();
+        }
         assert_terminal_retention(&before, &service.current_status());
         assert_eq!(service.current_status().restart.starts_in_window, 1);
         assert_eq!(service.read_restart_history().unwrap().len(), 1);
@@ -6271,10 +6342,15 @@ mod tests {
         let starting = service.current_status();
         assert_ne!(starting.worker_boot_id, before.worker_boot_id);
         assert_eq!(starting.worker_boot_id.as_deref(), Some(boot.as_str()));
-        assert!(matches!(&starting.lifecycle, LifecycleState::Starting { boot_id } if boot_id == &boot));
+        assert!(
+            matches!(&starting.lifecycle, LifecycleState::Starting { boot_id } if boot_id == &boot)
+        );
         assert!(starting.owner.is_none() && starting.worker.is_none());
         assert_eq!(starting.unknown_operation_ids, before.unknown_operation_ids);
-        assert_eq!(starting.unknown_operation_count, before.unknown_operation_count);
+        assert_eq!(
+            starting.unknown_operation_count,
+            before.unknown_operation_count
+        );
         assert_eq!(starting.readback_required, before.readback_required);
         assert!(service.readback_required.load(Ordering::Acquire));
         assert!(aggregate_has_obligations(&service));
@@ -6284,19 +6360,39 @@ mod tests {
     async fn terminal_retention_never_promotes_unproved_exit_or_owner_uncertainty() {
         let fixture = StartupFixture::new();
         retain_hello_fixture_operations(&fixture.service);
+        // The complete readback above legitimately clears its readback fence.
+        // Model a subsequent unproved exit, as the production failure path does,
+        // before verifying that administrative polling preserves uncertainty.
+        fixture
+            .service
+            .readback_required
+            .store(true, Ordering::Release);
         fixture.service.update_status(|status| {
-            status.lifecycle = LifecycleState::ProcessExited { exit_code: Some(0), exit_proven: false };
+            status.readback_required = true;
+            status.lifecycle = LifecycleState::ProcessExited {
+                exit_code: Some(0),
+                exit_proven: false,
+            };
         });
         fixture.service.clone().run_lifecycle().await;
         let status = fixture.service.current_status();
-        assert!(!matches!(status.lifecycle,
-            LifecycleState::ProcessExited { exit_proven: true, .. } | LifecycleState::Completed { .. }
+        assert!(!matches!(
+            status.lifecycle,
+            LifecycleState::ProcessExited {
+                exit_proven: true,
+                ..
+            } | LifecycleState::Completed { .. }
         ));
         assert!(status.readback_required);
         assert_eq!(status.unknown_operation_count, 2);
-        fixture.service.update_status(|status| status.lifecycle = LifecycleState::OwnerIdentityUnknown);
+        fixture
+            .service
+            .update_status(|status| status.lifecycle = LifecycleState::OwnerIdentityUnknown);
         fixture.service.clone().run_lifecycle().await;
-        assert!(matches!(fixture.service.current_status().lifecycle, LifecycleState::OwnerIdentityUnknown));
+        assert!(matches!(
+            fixture.service.current_status().lifecycle,
+            LifecycleState::OwnerIdentityUnknown
+        ));
         assert!(fixture.service.readback_required.load(Ordering::Acquire));
     }
 
