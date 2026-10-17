@@ -29,6 +29,16 @@
 //! method and payload. An ambiguous start stays the same explicit session/start,
 //! never another root/adoption/prompt; an exact initialize grant is required
 //! again for its session MCP config. MCP admission proves no server liveness.
+//! The retained MCP profile permits no HTTP header or environment additions:
+//! headers/env must be absent or empty, even for nominally non-secret values.
+//! HTTP addresses cannot contain userinfo, queries or fragments. This is a
+//! deliberately narrow admission profile, not a detector for every secret in
+//! arbitrary command arguments, names or path text. Admitted bytes stay exact;
+//! rejected payloads are never redacted or rewritten for replay. Host-private
+//! credential-file references remain a separate Host mechanism: this journal
+//! does not resolve them or read native auth/settings/HOME files.
+//! Existing checkpoints outside this profile fail validation without scrubbing,
+//! discarding their unknown intents, adopting fresh state or replaying them.
 //!
 //! restored_observations rebinds through the shared reducer's STALE restore path.
 //! Pending payloads and paired opaque discovery cursors remain historical only;
@@ -214,7 +224,8 @@ impl SavedJson {
 
 // The public generated schema is additive on the wire. Retention deliberately
 // accepts only its declared fields, recursively, plus explicitly typed maps.
-// Thus full known ACKs survive, while arbitrary future/credential fields do not.
+// Full known ACKs survive; undeclared fields are refused. This is shape
+// validation, not general secret detection. MCP retention has a narrower profile.
 fn closed_shape(s: &Value, v: &Value, depth: usize) -> Result<(), Fault> {
     if depth > 64 { return Err(Fault::Capacity); }
     if let Some(reference) = s["$ref"].as_str() {
@@ -262,6 +273,27 @@ fn definition(name: &str, v: &Value) -> Result<(), Fault> {
     schema::validate_definition(name, v).map_err(|_| Fault::InvalidState)?;
     closed_shape(schema::definition_schema(name).map_err(|_| Fault::InvalidState)?, v, 0)?;
     reject_private_keys(v)
+}
+// Auth-bearing map names cannot be exhaustively enumerated: deny the entire
+// inline header/environment channel. In particular a real sessionMcp grant is
+// authorization to request a server, not authority to persist its credentials.
+fn validate_retained_mcp_profile(servers:&Value)->Result<(),Fault> {
+    let servers=servers.as_object().ok_or(Fault::InvalidState)?;
+    if servers.len()>MAX_OPERATIONS{return Err(Fault::Capacity);}
+    for (name,server) in servers {
+        if !atom(name){return Err(Fault::InvalidState);}
+        definition("SessionMcpServerConfig",server)?;
+        for field in ["headers","env"] {
+            if server.get(field).is_some_and(|value|value.as_object().is_none_or(|map|!map.is_empty())) {return Err(Fault::InvalidState);}
+        }
+        if server["transport"]=="streamableHttp" {
+            let url=server["url"].as_str().ok_or(Fault::InvalidState)?;
+            let tail=url.strip_prefix("https://").or_else(||url.strip_prefix("http://")).ok_or(Fault::InvalidState)?;
+            let authority=tail.split('/').next().ok_or(Fault::InvalidState)?;
+            if authority.is_empty() || authority.chars().any(|c|!c.is_ascii_alphanumeric()&&!matches!(c,'.'|'-'|':'|'['|']')) || url.chars().any(|c|c.is_control()||c.is_whitespace()||matches!(c,'@'|'?'|'#'|'\\')) {return Err(Fault::InvalidState);}
+        }
+    }
+    Ok(())
 }
 fn reply_method(method: &str) -> bool { matches!(method, "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify") }
 fn ack_definition(method: &str) -> Result<&'static str, Fault> {
@@ -334,6 +366,7 @@ impl NativeInvocation {
         if let Some(config)=params.get("config")
             && (self.method!="session/start" || config.as_object().is_none_or(|object|object.len()!=1 || !object.contains_key("mcpServers")))
         {return Err(Fault::InvalidState);}
+        if let Some(config)=params.get("config") {validate_retained_mcp_profile(&config["mcpServers"])?;}
         if self.method == "session/resume" && params["excludeItems"] != true { return Err(Fault::InvalidState); }
         if matches!(self.method.as_str(), "goal/set" | "goal/edit") {
             let objective = params["objective"].as_str().ok_or(Fault::InvalidState)?;
@@ -567,6 +600,7 @@ impl RetainedCommandContext {
         if let Some(options)=route.get("native_options") {
             let options=options.as_object().ok_or(Fault::InvalidState)?;
             if options.keys().any(|k| !["workspaceRoot","nativeExecutable","modelId","providerId","reasoningEffort","approvalMode","mcpServers"].contains(&k.as_str())) {return Err(Fault::InvalidState);}
+            if let Some(servers)=options.get("mcpServers"){validate_retained_mcp_profile(servers)?;}
         }
         let allowed:&[&str]=match self.command.method.as_str() {
             "agent.open"=>&[], "agent.send"=>&["text","delivery","expected_turn_id"],
@@ -1044,6 +1078,8 @@ impl Journal {
     /// comes from this journal's CURRENT validated initialize result, never a
     /// caller boolean/requested capability. Closed schema validation retains
     /// only the admitted mcpServers union; preparation/replay recheck the grant.
+    /// Retention additionally refuses every non-empty headers/env map; no
+    /// header-name/token-name blacklist or auth-file resolution is performed.
     pub fn native_invocation(&self,scope:&Scope,method:&str,command_id:&str,params:Map<String,Value>)->Result<NativeInvocation,Fault> {
         self.healthy(scope)?;
         if params.contains_key("config") && (!self.initialized || !self.session_mcp_granted) {return Err(Fault::GrantRequired);}
@@ -2127,6 +2163,71 @@ mod tests {
         fixture.initialize(&mut journal,true);
         match journal.explicit_reconcile(&fixture.scope,"open",invocation.payload_sha256()).unwrap(){Reconciliation::Write(p)=>assert_eq!(p.invocation(),&invocation),_=>panic!("explicit exact start only")}
     }
+
+    #[test]
+    fn muse_journal_inline_mcp_auth_and_all_nonempty_header_env_maps_never_publish() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,true);
+        let before=read_private_durable(&fixture.directory.join(CHECKPOINT),MAX_FILE).unwrap();
+        // Synthetic values only. Even neutral additions are outside this closed
+        // retention profile; names are not treated as an exhaustive secret list.
+        let cases=[
+            json!({"http":{"transport":"streamableHttp","url":"https://example.invalid/mcp","headers":{"Authorization":"Bearer synthetic-not-a-real-token"}}}),
+            json!({"http":{"transport":"streamableHttp","url":"https://example.invalid/mcp","headers":{"X-Request-Tag":"synthetic-non-secret"}}}),
+            json!({"stdio":{"transport":"stdio","command":"explicit-binary","env":{"MCP_TOKEN":"synthetic-not-a-real-token"}}}),
+            json!({"stdio":{"transport":"stdio","command":"explicit-binary","env":{"SAFE_MODE":"synthetic-non-secret"}}}),
+            json!({"http":{"transport":"streamableHttp","url":"https://synthetic:credential@example.invalid/mcp"}}),
+            json!({"http":{"transport":"streamableHttp","url":"https://example.invalid/mcp?token=synthetic"}}),
+        ];
+        for (index,servers) in cases.into_iter().enumerate() {
+            let base=fixture.invocation(index as u64+20,"session/start");
+            let mut params=base.params().unwrap();params.insert("config".into(),json!({"mcpServers":servers}));
+            assert!(matches!(journal.native_invocation(&fixture.scope,"session/start",base.command_id(),params.clone()),Err(Fault::InvalidState)));
+            // Also exercise the effect gate on an untrusted/deserialized value,
+            // bypassing the public constructor only inside this private fixture.
+            let value=Value::Object(params);
+            let untrusted=NativeInvocation{method:"session/start".into(),command_id:base.command_id().into(),params:SavedJson::new(&value).unwrap(),payload_sha256:digest(&json!({"method":"session/start","params":value})).unwrap()};
+            let operation=format!("rejected-{index}");let mut command=fixture.command(&operation,"agent.open",json!({}));
+            command.route["native_options"]["mcpServers"]=servers;
+            assert!(matches!(journal.prepare_command(&fixture.scope,fixture.receipt(&operation),command,untrusted,RetainedSelectors::default()),Err(Fault::InvalidState)));
+            assert_eq!(read_private_durable(&fixture.directory.join(CHECKPOINT),MAX_FILE).unwrap(),before);
+            assert!(journal.unresolved_native(&fixture.scope).unwrap().is_empty());
+            assert!(journal.state.operations.is_empty());
+            assert!(journal.state.contexts.is_empty());
+            assert!(journal.outbox(&fixture.scope).unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn muse_journal_inline_mcp_auth_in_original_route_never_enters_context() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,true);fixture.work_read(&mut journal,0);
+        let before=read_private_durable(&fixture.directory.join(CHECKPOINT),MAX_FILE).unwrap();
+        // agent.send does not put MCP config in its native request. Its original
+        // route is independently checked before that route can be checkpointed.
+        let mut command=fixture.command("send","agent.send",json!({"text":"exact fixture input"}));
+        command.route["native_options"]["mcpServers"]=json!({"http":{"transport":"streamableHttp","url":"https://example.invalid/mcp","headers":{"Authorization":"Bearer synthetic-not-a-real-token"}}});
+        assert!(matches!(journal.prepare_command(&fixture.scope,fixture.receipt("send"),command,fixture.invocation(30,"turn/start"),RetainedSelectors::default()),Err(Fault::InvalidState)));
+        assert_eq!(read_private_durable(&fixture.directory.join(CHECKPOINT),MAX_FILE).unwrap(),before);
+        assert!(journal.unresolved_native(&fixture.scope).unwrap().is_empty());
+        assert!(journal.state.operations.is_empty());
+        assert!(journal.state.contexts.is_empty());
+    }
+    #[test]
+    fn muse_journal_nonsecret_mcp_profile_retains_exact_empty_maps_without_rewrite() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,true);
+        let servers=json!({
+            "stdio":{"transport":"stdio","command":"explicit-binary","args":["--explicit"],"mode":"required","env":{}},
+            "http":{"transport":"streamableHttp","url":"https://example.invalid/mcp","mode":"optional","headers":{}}
+        });
+        let base=fixture.invocation(31,"session/start");let mut params=base.params().unwrap();params.insert("config".into(),json!({"mcpServers":servers}));
+        let invocation=journal.native_invocation(&fixture.scope,"session/start",base.command_id(),params.clone()).unwrap();
+        assert_eq!(invocation.params().unwrap(),params);
+        let mut command=fixture.command("open","agent.open",json!({}));command.route["native_options"]["mcpServers"]=servers;
+        drop(journal.prepare_command(&fixture.scope,fixture.receipt("open"),command.clone(),invocation,RetainedSelectors::default()).unwrap());
+        assert_eq!(journal.retained_invocation(&fixture.scope,"open").unwrap().params().unwrap(),params);
+        assert_eq!(serde_json::to_value(journal.retained_command(&fixture.scope,"open").unwrap().unwrap().command()).unwrap(),serde_json::to_value(command).unwrap());
+        drop(journal);let journal=fixture.reopen();
+        assert_eq!(journal.retained_invocation(&fixture.scope,"open").unwrap().params().unwrap(),params);
+    }
+
     #[test]
     fn muse_journal_task_context_cross_worker_preserves_original_prompt_receipt_and_native_id() {
         use sha2::{Digest,Sha256};
