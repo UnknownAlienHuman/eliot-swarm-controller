@@ -441,6 +441,13 @@ where
             if s.output_ref.as_deref() != Some(native_ref) {
                 return Err(error("OUTPUT_REFERENCE_MISMATCH"));
             }
+            let declared_media_type = optional_text(reference, "mediaType")?;
+            if s.kind == ResultKind::Patch
+                && (reference["kind"] != "tool_patch"
+                    || declared_media_type.as_deref() != Some("application/json"))
+            {
+                return Err(error("PATCH_REFERENCE_PROVENANCE_INVALID"));
+            }
             let total = integer(reference.get("byteLen"), None, 0)?;
             if request.offset_bytes > total {
                 return Err(error("RESULT_OFFSET_OUT_OF_RANGE"));
@@ -463,6 +470,13 @@ where
             )
             .await?;
             authorize(s, &allowed)?;
+            let media_type = text(&page, "mediaType")?;
+            if declared_media_type
+                .as_deref()
+                .is_some_and(|declared| declared != media_type)
+            {
+                return Err(error("NATIVE_OUTPUT_MEDIA_TYPE_MISMATCH"));
+            }
             let content = page["content"]
                 .as_str()
                 .ok_or_else(|| error("INVALID_NATIVE_OUTPUT_CONTENT"))?;
@@ -491,7 +505,7 @@ where
             {
                 return Err(error("NATIVE_OUTPUT_RANGE_MISMATCH"));
             }
-            (bytes, total, text(&page, "mediaType")?.to_owned(), digest)
+            (bytes, total, media_type.to_owned(), digest)
         }
     };
     if s.expected_digest
@@ -797,6 +811,63 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap_err().code, "NATIVE_OUTPUT_NOT_ADVANCING");
+    }
+
+    #[tokio::test]
+    async fn result_patch_kind_and_media_type_are_bound_to_the_reference() {
+        let digest = format!("sha256:{}", hash(b"abc"));
+        let mut valid = output_item(&digest);
+        valid["patchRef"] = valid["outputRef"].clone();
+        valid["patchRef"]["kind"] = json!("tool_patch");
+        valid["patchRef"]["mediaType"] = json!("application/json");
+        for (key, value) in [
+            ("kind", json!("tool_output")),
+            ("mediaType", json!("text/plain")),
+            ("mediaType", Value::Null),
+        ] {
+            let mut item = valid.clone();
+            item["patchRef"][key] = value;
+            let (result, calls) =
+                run(input("patch"), vec![view(vec![event(item)], Value::Null)]).await;
+            assert!(result.is_err());
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                1,
+                "invalid patch ref is not fetched"
+            );
+        }
+        let (result, calls) = run(
+            input("patch"),
+            vec![
+                view(vec![event(valid.clone())], Value::Null),
+                output_page("YWJj"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "NATIVE_OUTPUT_MEDIA_TYPE_MISMATCH"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        let mut page = output_page("YWJj");
+        page["mediaType"] = json!("application/json");
+        let (result, _) = run(
+            input("patch"),
+            vec![view(vec![event(valid)], Value::Null), page],
+        )
+        .await;
+        assert_eq!(result.unwrap()["media_type"], "application/json");
+        let mut output = output_item(&digest);
+        output["outputRef"]["mediaType"] = json!("text/plain");
+        let (result, _) = run(
+            input("output"),
+            vec![view(vec![event(output)], Value::Null), output_page("YWJj")],
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "NATIVE_OUTPUT_MEDIA_TYPE_MISMATCH"
+        );
     }
 
     #[tokio::test]
