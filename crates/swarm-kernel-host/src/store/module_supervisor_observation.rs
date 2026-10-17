@@ -2412,6 +2412,11 @@ pub(super) fn public_projection(value: &Value) -> Value {
         }
         _ => return Value::Null,
     };
+    let worker_diagnostic_code = match value.get("worker_diagnostic_code") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(code)) if valid_closed_code(code, 64) => Some(code.as_str()),
+        _ => return Value::Null,
+    };
     if stage.is_some() && error_code.is_none()
         || certainty == "not_started"
             // A certified pre-spawn not_started stage is resolve_refs,
@@ -2446,7 +2451,7 @@ pub(super) fn public_projection(value: &Value) -> Value {
         return Value::Null;
     }
     let build_id = value.get("build_id").and_then(Value::as_str);
-    json!({
+    let mut projection = json!({
         "schema_version":1,
         "actor_instance_id":actor_instance_id,
         "event_id":value["event_id"],
@@ -2468,7 +2473,11 @@ pub(super) fn public_projection(value: &Value) -> Value {
         "unknown_operation_ids_truncated":truncated,
         "retry_authorized":false,
         "recorded_at_ms":value["recorded_at_ms"],
-    })
+    });
+    if let Some(code) = worker_diagnostic_code {
+        projection["worker_diagnostic_code"] = json!(code);
+    }
+    projection
 }
 
 /// Manager-only presentation through the existing `report.attention`
@@ -2509,7 +2518,7 @@ pub(super) fn manager_attention_item(
     if !(unresolved || degraded_phase || failed_start) {
         return None;
     }
-    let address = json!({
+    let mut address = json!({
         "binding_id":binding_id,
         "generation":generation,
         "module_id":observation["module_id"],
@@ -2529,6 +2538,9 @@ pub(super) fn manager_attention_item(
         "retry_authorized":false,
         "next_step":"read this binding and its listed unresolved Operations; if IDs are truncated, enumerate this generation's Operations; do not replay unresolved native work",
     });
+    if let Some(code) = observation["worker_diagnostic_code"].as_str() {
+        address["worker_diagnostic_code"] = json!(code);
+    }
     Some(json!({
         "kind":"module_supervisor_failure",
         "scope_key":scope_key,
@@ -2844,6 +2856,55 @@ mod journal_regression_tests {
         assert_eq!(payload["error_code"], "MODULE_EXITED");
         assert_eq!(payload["worker_diagnostic_code"], "HOST_RETRY_EXHAUSTED");
         assert!(!raw.contains("PRIVATE_DIAGNOSTIC_DETAIL"));
+        let mut cached = payload.clone();
+        cached["recorded_at_ms"] = json!(300);
+        let projected = public_projection(&cached);
+        assert_eq!(projected["worker_diagnostic_code"], "HOST_RETRY_EXHAUSTED");
+        assert_eq!(projected["error_code"], "MODULE_EXITED");
+        let attention = manager_attention_item(
+            &cached,
+            "fixture-scope",
+            BINDING_ID,
+            GENERATION as i64,
+            301,
+            60_000,
+        )
+        .expect("scoped failure is actionable");
+        assert_eq!(
+            attention["address"]["worker_diagnostic_code"],
+            "HOST_RETRY_EXHAUSTED"
+        );
+        assert_eq!(attention["address"]["error_code"], "MODULE_EXITED");
+        for invalid in [
+            json!("lowercase"),
+            json!("SECRET\nDATA"),
+            json!(17),
+            json!("X".repeat(65)),
+        ] {
+            let mut damaged = cached.clone();
+            damaged["worker_diagnostic_code"] = invalid;
+            assert!(public_projection(&damaged).is_null());
+            assert!(
+                manager_attention_item(
+                    &damaged,
+                    "fixture-scope",
+                    BINDING_ID,
+                    GENERATION as i64,
+                    301,
+                    60_000
+                )
+                .is_none()
+            );
+        }
+        cached
+            .as_object_mut()
+            .unwrap()
+            .remove("worker_diagnostic_code");
+        assert!(
+            public_projection(&cached)
+                .get("worker_diagnostic_code")
+                .is_none()
+        );
         let operation_id: Option<String> = db
             .query_row(
                 "SELECT operation_id FROM observations WHERE source_event_key=?1 AND kind=?2",
