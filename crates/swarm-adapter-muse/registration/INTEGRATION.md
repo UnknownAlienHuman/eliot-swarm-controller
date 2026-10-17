@@ -52,6 +52,12 @@ path, or an installer must pin another existing absolute path with
 provider credential setup or global configuration change is performed. Omitted
 native model/provider/effort selectors remain omitted.
 
+The existing `build-module-package.ps1` policy recognizes the exact
+`swarm-adapter-muse` package and `swarm-muse-adapter` target. This permits a
+source-pinned candidate build after the source gates pass. The builder still
+generates no descriptor, installs or registers nothing, and enables no route;
+use the disabled template and explicit native qualification gates below.
+
 ## Root verification
 
 Root runs Cargo and formatting sequentially. The coherent local library pass on
