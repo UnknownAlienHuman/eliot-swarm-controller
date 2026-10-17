@@ -541,7 +541,6 @@ fn opencode_schema_supported(descriptor: &ModuleDescriptor) -> bool {
                             && matches!(descriptor.artifact.version.as_str(), "0.5.0" | "0.6.0")
                             && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V3)
                         || (schema.version == OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_V4
-                            && descriptor.artifact.version.as_str() == "0.7.0"
                             && digest.as_str() == OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V4)
                 })
         })
@@ -2354,6 +2353,83 @@ mod opencode_schema_projection_tests {
             )),
             super::OPENCODE_NATIVE_OPTIONS_SCHEMA_SHA256_V4
         );
+    }
+
+    #[test]
+    fn opencode_v4_mapper_accepts_compatible_artifact_releases() {
+        for artifact_version in ["0.7.1", "0.8.0"] {
+            let mut descriptor = serde_json::to_value(descriptor_for_schema("4")).unwrap();
+            descriptor["artifact"]["version"] = json!(artifact_version);
+            let descriptor: ModuleDescriptor = serde_json::from_value(descriptor).unwrap();
+            let options = v4_defaults_options();
+            let config = project(&descriptor, &options).unwrap();
+
+            assert_eq!(config.values.len(), 3, "artifact version {artifact_version}");
+            for (key, option) in [
+                ("OPENCODE_SERVICE_ID", "service_id"),
+                ("OPENCODE_CONNECTION_FILE", "connection_file"),
+                ("OPENCODE_DIRECTORY", "directory"),
+            ] {
+                assert_eq!(
+                    literal(&config, key),
+                    options[option].as_str().unwrap(),
+                    "artifact version {artifact_version}"
+                );
+            }
+            assert_eq!(
+                project(&descriptor, &owned_options(OWNER_NONCE))
+                    .unwrap_err()
+                    .code,
+                "MODULE_CONFIG_SCHEMA_MISMATCH"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_v4_mapper_rejects_wrong_identity_schema_and_digest() {
+        let mut descriptor = serde_json::to_value(descriptor_for_schema("4")).unwrap();
+        descriptor["artifact"]["version"] = json!("0.7.1");
+        let options = v4_defaults_options();
+
+        for (pointer, replacement) in [
+            ("/module_id", json!("eliot.other.v2")),
+            ("/artifact/artifact_id", json!("eliot-opencode-v2.rust-http.2")),
+            ("/config_schema/schema_id", json!("other-native-options")),
+            ("/config_schema/version", json!("5")),
+            (
+                "/config_schema/sha256",
+                json!("0000000000000000000000000000000000000000000000000000000000000000"),
+            ),
+            ("/config_schema/sha256", Value::Null),
+        ] {
+            let mut wrong_descriptor = descriptor.clone();
+            *wrong_descriptor.pointer_mut(pointer).unwrap() = replacement;
+            let wrong_descriptor: ModuleDescriptor = serde_json::from_value(wrong_descriptor).unwrap();
+            assert_eq!(
+                project(&wrong_descriptor, &options).unwrap_err().code,
+                "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
+                "descriptor field {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_legacy_mapper_retains_artifact_release_gates() {
+        for schema_version in ["1", "2", "3"] {
+            let mut descriptor = serde_json::to_value(descriptor_for_schema(schema_version)).unwrap();
+            descriptor["artifact"]["version"] = json!("0.7.1");
+            let descriptor: ModuleDescriptor = serde_json::from_value(descriptor).unwrap();
+            let options = if schema_version == "3" {
+                v3_external_options()
+            } else {
+                external_options()
+            };
+            assert_eq!(
+                project(&descriptor, &options).unwrap_err().code,
+                "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
+                "schema version {schema_version}"
+            );
+        }
     }
 
     #[test]
