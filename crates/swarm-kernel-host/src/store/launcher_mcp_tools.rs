@@ -21,6 +21,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use swarm_contracts::module_catalog::Sha256Digest;
 
 const RECORD_KEY_PREFIX: &str = "launcher:native_mcp_tools:v1:";
 const SUPERVISOR_KEY_PREFIX: &str = "launcher:native_mcp_tools:supervisor:v1:";
@@ -2065,7 +2066,9 @@ pub(super) fn queue_native_mcp_operation(
         .get(artifact_key)
         .filter(|artifact| artifact.is_object())
         .ok_or_else(|| Error::invalid("native MCP private artifact is missing"))?;
-    let artifact_sha256 = model::digest(model::canonical(artifact)?.as_bytes());
+    let artifact_sha256 = Sha256Digest::of_canonical_json(artifact)?
+        .as_str()
+        .to_owned();
     let operation_id = model::new_id();
     let request_id = format!("native-mcp:{}", operation_id);
     let now = model::now_ms()?;
