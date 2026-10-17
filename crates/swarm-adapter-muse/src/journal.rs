@@ -15,6 +15,9 @@
 //! V1 has no same-live-MSP-connection proof. A no-ACK reconciliation therefore
 //! requires a fresh current-boot durable-host declaration; ephemeral same-link
 //! replay stays unavailable instead of assuming persisted native idempotency.
+//! The driver completes initialize -> initialized before any native command.
+//! Neither a journal write nor a native ACK establishes execution/result/Task
+//! acceptance. A resume additionally needs a fresh exact-root session/read fact.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -38,6 +41,7 @@ pub enum Fault {
     OwnerUnverified, ScopeMismatch, LegacyState, StateAlreadyExists, MissingState,
     InvalidState, Capacity, PersistenceUnknown, Poisoned, IntentConflict,
     ExplicitReconcileRequired, AckConflict, OutcomeConflict, DurabilityUnavailable,
+    ExactRootReadRequired,
 }
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.code()) }
@@ -60,6 +64,7 @@ impl Fault {
             Self::AckConflict => "MUSE_JOURNAL_ACK_CONFLICT",
             Self::OutcomeConflict => "MUSE_JOURNAL_OUTCOME_CONFLICT",
             Self::DurabilityUnavailable => "MUSE_JOURNAL_DURABILITY_UNAVAILABLE",
+            Self::ExactRootReadRequired => "MUSE_JOURNAL_EXACT_ROOT_READ_REQUIRED",
         }
     }
 }
@@ -183,12 +188,30 @@ impl NativeInvocation {
                 || self.method == "turn/steer" && params.get("expectedTurnId").and_then(Value::as_str).is_none_or(str::is_empty)
             { return Err(Fault::InvalidState); }
         }
+        if matches!(self.method.as_str(), "goal/set" | "goal/edit") {
+            let objective = params.get("objective").and_then(Value::as_str).ok_or(Fault::InvalidState)?;
+            // SS3.18 defines the trimmed string as the payload. Never silently
+            // change an already digested command; reject a noncanonical input.
+            if objective.is_empty() || objective.trim() != objective { return Err(Fault::InvalidState); }
+        }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Durability { Durable, Ephemeral, Unrecognized }
+impl Durability {
+    /// SDK 1.3.0 InitializeResult/SS2.13: missing is durable for compatibility;
+    /// explicit null or an unfamiliar declaration guarantees nothing.
+    pub fn from_initialize_declaration(value: Option<&Value>) -> Self {
+        match value {
+            None => Self::Durable,
+            Some(Value::String(value)) if value == "durable" => Self::Durable,
+            Some(Value::String(value)) if value == "ephemeral" => Self::Ephemeral,
+            _ => Self::Unrecognized,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DurabilityFact { profile: Durability, observed_boot: String }
@@ -269,7 +292,11 @@ pub enum Reconciliation<'a> {
 /// must not open concurrent writers; the existing owner holds the directory OS
 /// lock. No second lock, scheduler, Task DB, or automatic retention GC is added.
 /// Capacity is explicit until safe result/reference reclamation is implemented.
-pub struct Journal { path: PathBuf, scope: Scope, boot: String, state: State, poisoned: bool }
+pub struct Journal {
+    path: PathBuf, scope: Scope, boot: String, state: State, poisoned: bool,
+    // Read freshness is connection-local, never restored from a checkpoint.
+    exact_root_read: bool,
+}
 
 impl Journal {
     /// Only for a new Rust binding. The caller must have selected a native root
@@ -294,7 +321,7 @@ impl Journal {
         let state = State { revision: 0, durability: None, operations: BTreeMap::new(), outbox: BTreeMap::new() };
         let path = dir.join(CHECKPOINT);
         write_private_new(&path, &encode(&scope, &state)?).map_err(|_| Fault::PersistenceUnknown)?;
-        Ok(Self { path, scope, boot, state, poisoned: false })
+        Ok(Self { path, scope, boot, state, poisoned: false, exact_root_read: false })
     }
     fn open_at(dir: &Path, scope: Scope, boot: String) -> Result<Self, Fault> {
         scope.validate()?;
@@ -309,7 +336,7 @@ impl Journal {
         if checkpoint.format != FORMAT || checkpoint.version != VERSION || checkpoint.scope != scope { return Err(Fault::ScopeMismatch); }
         if checkpoint.sha256 != state_digest(&scope, &checkpoint.state)? { return Err(Fault::InvalidState); }
         validate_state(&scope, &checkpoint.state)?;
-        Ok(Self { path, scope, boot, state: checkpoint.state, poisoned: false })
+        Ok(Self { path, scope, boot, state: checkpoint.state, poisoned: false, exact_root_read: false })
     }
     fn healthy(&self, scope: &Scope) -> Result<(), Fault> {
         if self.poisoned { return Err(Fault::Poisoned); }
@@ -330,10 +357,26 @@ impl Journal {
     }
     pub fn record_durability(&mut self, scope: &Scope, profile: Durability) -> Result<(), Fault> {
         self.healthy(scope)?;
+        // Called for each newly initialized native connection. An old read
+        // cannot qualify a different connection, even in the same worker boot.
+        self.exact_root_read = false;
         let mut next = self.state.clone();
         next.durability = Some(DurabilityFact { profile, observed_boot: self.boot.clone() });
         self.commit(next)
     }
+    /// Caller has completed an actual session/read without load/attach and
+    /// validated its native namespace/model/location. This retains only the
+    /// exact root identity check; it does not itself contact or adopt a session.
+    pub fn record_exact_root_read(&mut self, scope: &Scope, observed_session_id: &str) -> Result<(), Fault> {
+        self.healthy(scope)?;
+        self.exact_root_read = false;
+        if observed_session_id != scope.native_root_id.as_str() { return Err(Fault::ScopeMismatch); }
+        self.exact_root_read = true;
+        Ok(())
+    }
+    /// Driver must have flushed initialized on its current MSP connection.
+    /// agent.open uses this same durable ledger with session/start and an
+    /// already chosen fresh root sessionId, never a special unjournaled send.
     pub fn prepare_native(&mut self, scope: &Scope, receipt: ModuleReceiptIdentity, invocation: NativeInvocation) -> Result<PreparedNative<'_>, Fault> {
         self.healthy(scope)?;
         scope.receipt(&receipt)?;
@@ -348,6 +391,8 @@ impl Journal {
         if invocation.method == "session/resume" && self.state.durability.as_ref().is_none_or(|fact| {
             fact.profile != Durability::Durable || fact.observed_boot != self.boot
         }) { return Err(Fault::DurabilityUnavailable); }
+        let resume = invocation.method == "session/resume";
+        if resume && !self.exact_root_read { return Err(Fault::ExactRootReadRequired); }
         let operation_id = receipt.operation_id.clone();
         let mut next = self.state.clone();
         let operation = next.operations.entry(operation_id.clone()).or_insert_with(|| Operation {
@@ -355,6 +400,7 @@ impl Journal {
         });
         operation.native = Some(NativePending { invocation, submission_boot: self.boot.clone(), ack: None, reconcile_block: None });
         self.commit(next)?;
+        self.exact_root_read = false;
         Ok(PreparedNative { journal: self, operation_id })
     }
     /// Records the bounded native admission ACK only; application/readback is a
@@ -396,7 +442,10 @@ impl Journal {
         if self.state.durability.as_ref().is_none_or(|fact| {
             fact.profile != Durability::Durable || fact.observed_boot != self.boot
         }) { return Err(Fault::DurabilityUnavailable); }
+        let resume = native.invocation.method == "session/resume";
+        if resume && !self.exact_root_read { return Err(Fault::ExactRootReadRequired); }
         self.commit(self.state.clone())?;
+        self.exact_root_read = false;
         Ok(Reconciliation::Write(PreparedNative { journal: self, operation_id: operation_id.into() }))
     }
     /// Metadata only: (Operation, original submission boot, ACK present).
@@ -887,6 +936,9 @@ mod tests {
         let invocation = fixture.invocation(1, "session/resume");
         assert!(matches!(journal.prepare_native(&fixture.scope, fixture.receipt("recover"), invocation.clone()), Err(Fault::DurabilityUnavailable)));
         journal.record_durability(&fixture.scope, Durability::Durable).unwrap();
+        assert!(matches!(journal.prepare_native(&fixture.scope, fixture.receipt("recover"), invocation.clone()), Err(Fault::ExactRootReadRequired)));
+        assert_eq!(journal.record_exact_root_read(&fixture.scope, "foreign-root"), Err(Fault::ScopeMismatch));
+        journal.record_exact_root_read(&fixture.scope, &fixture.scope.native_root_id).unwrap();
         drop(journal.prepare_native(&fixture.scope, fixture.receipt("recover"), invocation.clone()).unwrap());
         drop(journal);
         let mut journal = fixture.reopen();
@@ -894,7 +946,10 @@ mod tests {
         journal.record_durability(&fixture.scope, Durability::Ephemeral).unwrap();
         assert!(matches!(journal.explicit_reconcile(&fixture.scope, "recover", invocation.payload_sha256()), Err(Fault::DurabilityUnavailable)));
         journal.record_durability(&fixture.scope, Durability::Durable).unwrap();
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope, "recover", invocation.payload_sha256()), Err(Fault::ExactRootReadRequired)));
+        journal.record_exact_root_read(&fixture.scope, &fixture.scope.native_root_id).unwrap();
         assert!(matches!(journal.explicit_reconcile(&fixture.scope, "recover", invocation.payload_sha256()).unwrap(), Reconciliation::Write(_)));
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope, "recover", invocation.payload_sha256()), Err(Fault::ExactRootReadRequired)));
         assert_eq!(journal.unresolved_native(&fixture.scope).unwrap()[0].1, BOOT_A);
     }
 
@@ -938,5 +993,122 @@ mod tests {
         assert!(NativeInvocation::new(&fixture.scope, "session/start", "019a0000-0000-7000-8000-000000000002", params).is_err());
         let mut ack = fixture.ack(&invocation); ack["history"] = json!({"mode":"inline","items":[{"text":"transcript"}],"snapshot":null});
         assert!(validate_ack(&fixture.scope, &invocation, &ack).is_err());
+    }
+
+    #[test]
+    fn muse_journal_root_creation_lost_ack_retains_exact_session_and_command_before_send() {
+        let fixture = Fixture::new();
+        let host_operation_v4 = "9f6ce9ca-5d89-4bc0-84ce-91a2d0b1acbe";
+        let invocation = fixture.invocation(1, "session/start");
+        assert_ne!(invocation.command_id(), host_operation_v4);
+        let params_before = invocation.params().unwrap();
+        assert_eq!(params_before["sessionId"], fixture.scope.native_root_id);
+        assert_eq!(params_before["commandId"], invocation.command_id());
+        let mut journal = fixture.create();
+        // A permit is returned only after the complete intent checkpoint. No
+        // native process is invoked; drop models an ambiguous write/lost ACK.
+        let prepared = journal.prepare_native(&fixture.scope, fixture.receipt(host_operation_v4), invocation.clone()).unwrap();
+        let checkpoint: Value = serde_json::from_slice(&read_private_durable(&fixture.directory.join(CHECKPOINT), MAX_FILE).unwrap()).unwrap();
+        let saved = &checkpoint["state"]["operations"][host_operation_v4]["native"]["invocation"];
+        assert_eq!(saved["method"], "session/start");
+        assert_eq!(saved["command_id"], invocation.command_id());
+        assert_eq!(serde_json::from_str::<Value>(saved["params"]["utf8"].as_str().unwrap()).unwrap(), Value::Object(params_before.clone()));
+        assert_eq!(prepared.invocation().payload_sha256(), invocation.payload_sha256());
+        drop(prepared);
+        drop(journal);
+        let mut journal = fixture.reopen();
+        assert_eq!(journal.unresolved_native(&fixture.scope).unwrap(), vec![(host_operation_v4, BOOT_A, false)]);
+        assert!(journal.outbox(&fixture.scope).unwrap().is_empty());
+        assert!(matches!(journal.prepare_native(&fixture.scope, fixture.receipt(host_operation_v4), invocation.clone()), Err(Fault::ExplicitReconcileRequired)));
+        journal.record_durability(&fixture.scope, Durability::from_initialize_declaration(None)).unwrap();
+        match journal.explicit_reconcile(&fixture.scope, host_operation_v4, invocation.payload_sha256()).unwrap() {
+            Reconciliation::Write(prepared) => {
+                assert_eq!(prepared.invocation(), &invocation);
+                assert_eq!(prepared.invocation().params().unwrap(), params_before);
+            }
+            _ => panic!("root creation must retain its original sessionId, commandId, method and payload"),
+        }
+        // A matching native deduplicated ACK is a separate explicit observation;
+        // journal retention still does not turn it into Task acceptance.
+        let ack = json!({"session":{"sessionId":fixture.scope.native_root_id},"viewCursor":"opaque"});
+        journal.record_native_ack(&fixture.scope, host_operation_v4, invocation.command_id(), ack.clone()).unwrap();
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope, host_operation_v4, invocation.payload_sha256()).unwrap(), Reconciliation::AckReadback(saved) if saved == ack));
+        assert!(journal.outbox(&fixture.scope).unwrap().is_empty());
+    }
+
+    #[test]
+    fn muse_journal_root_conflict_never_adopts_foreign_root_or_changes_creation_intent() {
+        let fixture = Fixture::new();
+        let invocation = fixture.invocation(1, "session/start");
+        let mut journal = fixture.create();
+        drop(journal.prepare_native(&fixture.scope, fixture.receipt("open"), invocation.clone()).unwrap());
+        let foreign_ack = json!({"session":{"sessionId":"foreign-root"},"viewCursor":"opaque"});
+        assert_eq!(journal.record_native_ack(&fixture.scope, "open", invocation.command_id(), foreign_ack), Err(Fault::InvalidState));
+        journal.block_reconciliation(&fixture.scope, "open", "NATIVE_SESSION_ID_CONFLICT").unwrap();
+        drop(journal);
+        let mut journal = fixture.reopen();
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope, "open", invocation.payload_sha256()).unwrap(), Reconciliation::Blocked(_)));
+        assert!(matches!(journal.prepare_native(&fixture.scope, fixture.receipt("open"), fixture.invocation(2, "session/start")), Err(Fault::IntentConflict)));
+        assert!(journal.outbox(&fixture.scope).unwrap().is_empty());
+        assert_eq!(journal.unresolved_native(&fixture.scope).unwrap(), vec![("open", BOOT_A, false)]);
+    }
+
+    #[test]
+    fn muse_journal_native_command_id_is_uuid_v7_not_host_uuid_or_rpc_id() {
+        let fixture = Fixture::new();
+        let original = fixture.invocation(1, "session/start");
+        let host_v4 = "9f6ce9ca-5d89-4bc0-84ce-91a2d0b1acbe";
+        let mut params = original.params().unwrap();
+        params.insert("commandId".into(), json!(host_v4));
+        assert!(matches!(NativeInvocation::new(&fixture.scope, "session/start", host_v4, params.clone()), Err(Fault::InvalidState)));
+        params.insert("commandId".into(), json!(17));
+        assert!(NativeInvocation::new(&fixture.scope, "session/start", "17", params).is_err());
+        assert!(NativeInvocation::new(&fixture.scope, "session/fork", original.command_id(), original.params().unwrap()).is_err());
+    }
+
+    #[test]
+    fn muse_journal_goal_objective_is_canonical_or_rejected_without_rewrite() {
+        let fixture = Fixture::new();
+        let id = "019a0000-0000-7000-8000-000000000001";
+        for method in ["goal/set", "goal/edit"] {
+            for objective in ["", " ", " leading", "trailing ", "\u{2003}goal\u{2003}"] {
+                let params = json!({"commandId":id,"sessionId":fixture.scope.native_root_id,"objective":objective});
+                assert!(matches!(NativeInvocation::new(&fixture.scope, method, id, params.as_object().unwrap().clone()), Err(Fault::InvalidState)));
+            }
+            let params = json!({"commandId":id,"sessionId":fixture.scope.native_root_id,"objective":"exact goal"});
+            let invocation = NativeInvocation::new(&fixture.scope, method, id, params.as_object().unwrap().clone()).unwrap();
+            assert_eq!(invocation.params().unwrap()["objective"], "exact goal");
+        }
+    }
+
+    #[test]
+    fn muse_journal_pin_durability_absence_is_durable_but_unknown_is_not() {
+        assert_eq!(Durability::from_initialize_declaration(None), Durability::Durable);
+        assert_eq!(Durability::from_initialize_declaration(Some(&json!("durable"))), Durability::Durable);
+        assert_eq!(Durability::from_initialize_declaration(Some(&json!("ephemeral"))), Durability::Ephemeral);
+        for value in [Value::Null, json!("future-profile"), json!("Ephemeral"), json!(true)] {
+            assert_eq!(Durability::from_initialize_declaration(Some(&value)), Durability::Unrecognized);
+        }
+    }
+
+    #[test]
+    fn muse_journal_resume_read_is_not_reused_across_connection_or_native_write() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.create();
+        let resume = fixture.invocation(1, "session/resume");
+        journal.record_durability(&fixture.scope, Durability::Durable).unwrap();
+        journal.record_exact_root_read(&fixture.scope, &fixture.scope.native_root_id).unwrap();
+        // A new initialize observation in the same worker invalidates old read
+        // freshness; neither a checkpoint nor the worker boot proves the link.
+        journal.record_durability(&fixture.scope, Durability::Durable).unwrap();
+        assert!(matches!(journal.prepare_native(&fixture.scope, fixture.receipt("recover"), resume.clone()), Err(Fault::ExactRootReadRequired)));
+        journal.record_exact_root_read(&fixture.scope, &fixture.scope.native_root_id).unwrap();
+        assert_eq!(journal.record_exact_root_read(&fixture.scope, "foreign-root"), Err(Fault::ScopeMismatch));
+        assert!(matches!(journal.prepare_native(&fixture.scope, fixture.receipt("recover"), resume.clone()), Err(Fault::ExactRootReadRequired)));
+        journal.record_exact_root_read(&fixture.scope, &fixture.scope.native_root_id).unwrap();
+        drop(journal.prepare_native(&fixture.scope, fixture.receipt("send"), fixture.invocation(2, "turn/start")).unwrap());
+        assert!(matches!(journal.prepare_native(&fixture.scope, fixture.receipt("recover"), resume.clone()), Err(Fault::ExactRootReadRequired)));
+        journal.record_exact_root_read(&fixture.scope, &fixture.scope.native_root_id).unwrap();
+        drop(journal.prepare_native(&fixture.scope, fixture.receipt("recover"), resume).unwrap());
     }
 }
