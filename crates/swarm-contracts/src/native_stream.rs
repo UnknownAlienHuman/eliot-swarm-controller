@@ -52,8 +52,12 @@ pub enum StreamPayload {
         output_tokens: u64,
         total_tokens: u64,
     },
-    Lifecycle { state: StreamLifecycle },
-    Unavailable { reason: StreamUnavailable },
+    Lifecycle {
+        state: StreamLifecycle,
+    },
+    Unavailable {
+        reason: StreamUnavailable,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

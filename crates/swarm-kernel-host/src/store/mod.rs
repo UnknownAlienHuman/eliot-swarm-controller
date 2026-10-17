@@ -455,7 +455,9 @@ impl StoreOwner {
             }
         };
         let store = Store {
-            native_streams: Arc::new(std::sync::Mutex::new(native_streams::NativeStreams::default())),
+            native_streams: Arc::new(std::sync::Mutex::new(
+                native_streams::NativeStreams::default(),
+            )),
             kernel: kernel_handle,
             status_reader,
             config: config.clone(),
@@ -1900,7 +1902,10 @@ impl Store {
                 "method is outside this participant's scoped surface",
             ));
         }
-        if matches!(method.as_str(), "module.stream.publish" | "stream.open" | "stream.read" | "stream.close") {
+        if matches!(
+            method.as_str(),
+            "module.stream.publish" | "stream.open" | "stream.read" | "stream.close"
+        ) {
             return native_streams::call(self, principal, method, params).await;
         }
         if method == "host.status" {
@@ -5344,8 +5349,12 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                         Some("attempt_owner" | "producer_ref")
                     ) {
                         allowed.extend([
-                            "source.capture", "task.submit", "artifact.read",
-                            "stream.open", "stream.read", "stream.close",
+                            "source.capture",
+                            "task.submit",
+                            "artifact.read",
+                            "stream.open",
+                            "stream.read",
+                            "stream.close",
                         ]);
                     } else if registration["participation_basis"]["kind"] == "sponsored_reviewer" {
                         allowed.extend([

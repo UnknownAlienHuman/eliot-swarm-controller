@@ -2721,17 +2721,27 @@ pub(super) fn native_stream_content_source(
     db: &Connection,
     operation_id: &str,
 ) -> Result<Option<NativeStreamContentSource>> {
-    let Some(target) = load_operation(db, operation_id)? else { return Ok(None) };
+    let Some(target) = load_operation(db, operation_id)? else {
+        return Ok(None);
+    };
     if target.method != "task.dispatch"
-        || !matches!(target.state.as_str(), "native_accepted" | "settled" | "outcome_unknown")
+        || !matches!(
+            target.state.as_str(),
+            "native_accepted" | "settled" | "outcome_unknown"
+        )
     {
         return Ok(None);
     }
-    let Some(identity) = operation_task_identity(db, &target)? else { return Ok(None) };
-    let Some(attempt_id) = identity.attempt_id.as_deref() else { return Ok(None) };
-    let Some(task_revision) = identity.task_revision else { return Ok(None) };
-    if identity.binding_id.is_none() || identity.binding_generation.is_none()
-    {
+    let Some(identity) = operation_task_identity(db, &target)? else {
+        return Ok(None);
+    };
+    let Some(attempt_id) = identity.attempt_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(task_revision) = identity.task_revision else {
+        return Ok(None);
+    };
+    if identity.binding_id.is_none() || identity.binding_generation.is_none() {
         return Ok(None);
     }
     // Live streams require the Task's current revision as well as its frozen,
@@ -2741,7 +2751,8 @@ pub(super) fn native_stream_content_source(
         "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.task_id=a.task_id \
          WHERE a.attempt_id=?1 AND a.task_id=?2 AND a.task_revision=?3 \
            AND a.released_at_ms IS NULL AND t.revision=?3)",
-        params![attempt_id, identity.task_id, task_revision], |row| row.get(0),
+        params![attempt_id, identity.task_id, task_revision],
+        |row| row.get(0),
     )?;
     Ok(current.then_some(NativeStreamContentSource { target, identity }))
 }
@@ -2751,12 +2762,16 @@ pub(super) fn resolve_native_stream_content(
     principal: &Principal,
     source: &NativeStreamContentSource,
 ) -> Result<Option<StreamContentGrant>> {
-    if !matches!(principal.role, Role::Operator | Role::Manager | Role::Participant) {
+    if !matches!(
+        principal.role,
+        Role::Operator | Role::Manager | Role::Participant
+    ) {
         return Ok(None);
     }
     if principal.role == Role::Participant
-        && super::meta(db, &format!("client:{}", principal.client_id))?
-            .is_some_and(|registration| registration["participation_basis"]["kind"] == "sponsored_reviewer")
+        && super::meta(db, &format!("client:{}", principal.client_id))?.is_some_and(
+            |registration| registration["participation_basis"]["kind"] == "sponsored_reviewer",
+        )
     {
         // A live ring has no immutable candidate relation to prove. A review
         // Receipt or historical assignment must not become transcript access.
@@ -2780,8 +2795,14 @@ pub(super) fn resolve_native_stream_content(
         producer_operation_rowid: current.target.rowid,
         target_operation_rowid: current.target.rowid,
     };
-    Ok(native_source_grant(db, principal, &relation, task_grant, requested)?
-        .map(|grant| ArtifactReadGrant { level: grant.level.min(requested), ..grant }))
+    Ok(
+        native_source_grant(db, principal, &relation, task_grant, requested)?.map(|grant| {
+            ArtifactReadGrant {
+                level: grant.level.min(requested),
+                ..grant
+            }
+        }),
+    )
 }
 
 /// Resolve one artifact read. `Ok(None)` means no positive relation exists.

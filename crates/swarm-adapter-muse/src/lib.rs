@@ -43,3 +43,4 @@ pub mod native_owner;
 pub(crate) mod observations;
 pub mod results;
 pub mod schema;
+pub mod streams;

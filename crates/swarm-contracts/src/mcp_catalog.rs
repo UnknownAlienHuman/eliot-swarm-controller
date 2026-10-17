@@ -5059,16 +5059,25 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "Bounded provenance page."
     ),
     entry_with_inputs!(
-        "stream.open", Monitoring, ASSIGNMENT_READ_AUDIENCES, Searchable,
+        "stream.open",
+        Monitoring,
+        ASSIGNMENT_READ_AUDIENCES,
+        Searchable,
         "Open one authorized shared ephemeral native content ring.",
         "Use an exact current Task/Attempt dispatch. Store reuses its Task/native-result byte-grant branches; a Receipt or generic role is insufficient. Missing authority fails closed.",
         &["native", "stream", "text", "reasoning", "content"],
         &["operation_id"],
-        &["current unreleased Attempt", "existing native content grant"],
+        &[
+            "current unreleased Attempt",
+            "existing native content grant"
+        ],
         "Ephemeral view handle; no model call, Observation or durable subscription."
     ),
     entry_with_inputs!(
-        "stream.read", Monitoring, ASSIGNMENT_READ_AUDIENCES, Searchable,
+        "stream.read",
+        Monitoring,
+        ASSIGNMENT_READ_AUDIENCES,
+        Searchable,
         "Read ordered native records with replacement and cursor-loss semantics.",
         "Use the stream handle and returned cursor. Rights, current producer link, boot and binding generation are revalidated on every read.",
         &["native", "stream", "read", "cursor", "gap"],
@@ -5077,7 +5086,10 @@ pub const TOOL_METADATA: &[ToolMetadata] = &[
         "Bounded records; final text replaces deltas, cumulative usage replaces earlier usage; hidden reasoning is unavailable."
     ),
     entry_with_inputs!(
-        "stream.close", Monitoring, ASSIGNMENT_READ_AUDIENCES, Searchable,
+        "stream.close",
+        Monitoring,
+        ASSIGNMENT_READ_AUDIENCES,
+        Searchable,
         "Close one connection-owned ephemeral native view.",
         "Use when the view is no longer needed; native work continues.",
         &["native", "stream", "close"],
