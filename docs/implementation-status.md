@@ -2,6 +2,12 @@
 
 ## Current state
 
+### Muse normalized exact-result native verification — 2026-10-17
+
+The existing Core `7edacae6` qualifier hot-installed `muse-rust-controller.1@0.1.2`, built from `ba2e0d8d`; its Muse source is unchanged at integrated `b835c30c`. Native Muse Code `1.4.0-R4161.1` used its existing provider/model configuration with requested `xhigh` reasoning. Provider authentication stays in the native harness. The repository's Rust descriptor template remains disabled.
+
+The completed Task dispatch and exact durable revision-1 result both settled `applied`. Public `artifact.get` and `artifact.read` returned 1,023 bytes with a verified SHA-256. The earlier revision-2 request remains `outcome_unknown / RESULT_REVISION_NOT_AVAILABLE`: native live and reconstructed-history revisions differed, and no input was replayed. The [verification receipt](remediation/2026-10-17/MUSE-NORMALIZED-RESULT-NATIVE-VERIFICATION.json) records the exact identities and digest. This qualifies the module result path on the retained Core only. Remaining method coverage, complete native family/recovery, M6/Forge publication and full CI remain open.
+
 ### Exact OpenCode input-status delivery (2026-10-16; PR #167)
 
 [PR #167](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/167)

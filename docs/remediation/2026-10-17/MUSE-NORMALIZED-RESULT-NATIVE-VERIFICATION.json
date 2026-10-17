@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-17T11:26:07.7258228Z",
+  "record": "MUSE-NORMALIZED-RESULT-NATIVE-VERIFICATION",
+  "scope": "Native normalized exact-result contract for muse-rust-controller.1@0.1.2 on the existing Core 7edacae6 qualifier DataRoot. Module-scope evidence only: no final-head-core claim and no full-project claim.",
+  "source": {
+    "core": "7edacae62656d8088cb0290b3269eaae42dc89d6",
+    "module_source": "ba2e0d8d86189c989b474985afa3b2b6383b4de2",
+    "module_artifact": "muse-rust-controller.1@0.1.2",
+    "module_binary_sha256": "38dc46caf72a366b642ed77ae290ac0bf499ce607c54056703f19e24dd4ed123",
+    "module_binary_bytes": 11214336,
+    "module_binary_profile": "release",
+    "source_equivalence": "Muse source paths are identical between module build ba2e0d8d86189c989b474985afa3b2b6383b4de2 and integrated b835c30cb06f03ca3b2db8374a61c8527fe7e9ef; no current-Core runtime claim",
+    "evidence_dir": "muse-qualification-7edacae6-20261017bd"
+  },
+  "native_harness": {
+    "executable": "muse-bin-1.4.0-R4161.1.exe",
+    "observed_provider_id": "meta",
+    "observed_model_id": "muse-spark-1.3-contributor",
+    "route_reasoning_effort": "xhigh",
+    "auth": "Provider authentication and settings belong to the already-authenticated native harness",
+    "session_id": "01a14978-4ef2-732e-ad51-8d8f5073e19d",
+    "turn_id": "01a1497b-8675-7183-8516-22c25aaa8840",
+    "task_snapshot_sha256": "a5be730d0f0d630d9940fd843bd2fbd6689c9d64307ecfda728516e518f1e4ad"
+  },
+  "binding": {
+    "binding_id": "bc7af210-0916-4511-b27c-d23222795e73",
+    "generation": 1,
+    "lane_id": "muse-v012-result-contract-qualification-20261017bf",
+    "open_operation_id": "ad66c211-4f59-4d30-b095-f39cbbe44fb6",
+    "open_state": "settled",
+    "dispatch_operation_id": "7f419663-ef04-455d-ae66-94ae2846a0d7",
+    "dispatch_state": "settled",
+    "task_id": "bc3c6c4c-1da0-46a8-8d3c-8cad564b0812",
+    "attempt_id": "60b98263-2828-44c7-aae0-57eca7dac24a",
+    "initial_dispatch_reply": {
+      "admission": "durable_local",
+      "state": "queued",
+      "native_admission": "not_observed"
+    },
+    "dispatch_outcome": "applied"
+  },
+  "exact_reads": {
+    "item_id": "d2ca35e1-43a7-4807-b166-1ddbf5f45d03",
+    "original_revision_2": {
+      "client_request_id": "muse-v012-exact-result-20261017cg",
+      "observed_operation_id": "b13a340e-6fe6-449f-a958-d0fe899b9f33",
+      "observed_state": "outcome_unknown",
+      "reply_state": "queued",
+      "verdict": "unknown correctly preserved, no fabrication"
+    },
+    "durable_revision_1": {
+      "client_request_id": "muse-v012-durable-exact-result-20261017cg",
+      "observed_operation_id": "0904beab-88c3-46a3-a595-e779a8ea6aa5",
+      "observed_state": "settled",
+      "observed_outcome": "applied",
+      "verdict": "durable exact rev1 new read settles"
+    },
+    "revision_divergence": {
+      "durable_item_revision": 1,
+      "live_item_revision": 2,
+      "diagnostic_code": "RESULT_REVISION_NOT_AVAILABLE",
+      "native_input_replayed": false
+    }
+  },
+  "public_result": {
+    "artifact_id": "result-3d81c70a0104d0c31f9d3328877b1258b5030ea959b411065828c6a89eda55a7",
+    "operation_id": "0904beab-88c3-46a3-a595-e779a8ea6aa5",
+    "byte_length": 1023,
+    "sha256": "ddafe4f9e62080fa853ab10a54f6f05d2c3cbe936c776653e513978a51786ac7",
+    "digest_verified": true,
+    "public_read_verified": true,
+    "page_offset_bytes": 0,
+    "page_eof": true,
+    "page_sha256_match": true,
+    "no_native_input_replayed": true,
+    "native_replay": false,
+    "task_completion": "unknown"
+  },
+  "stream": {
+    "records": 26,
+    "stop_reason": "exact_final_assistant_record_observed",
+    "after": 31,
+    "elapsed_seconds": 10.9271006,
+    "native_cursor": "v:01a14978-4ef2-732e-ad51-8d8f5073e19d:6",
+    "no_native_input_replayed": true
+  },
+  "preserved": {
+    "binding_0_1_1": "60cdad45-ad58-446d-9e51-463a876f5349",
+    "entry_0_1_0": "unchanged",
+    "repo_descriptor_artifact": "muse-rust-controller.1@0.1.2",
+    "repo_descriptor_enabled": false
+  },
+  "still_pending": [
+    "remaining method coverage",
+    "native family completeness",
+    "recovery qualification",
+    "M6/Forge publication",
+    "full CI"
+  ],
+  "hygiene": "No auth bytes, no controller credential bytes, no raw local runtime contents and no absolute local paths in this receipt.",
+  "family_read": {
+    "family_completeness": "partial",
+    "refresh_operation_id": "b98cce20-3ae9-4c7b-9626-7ea96758db79",
+    "refresh_outcome": "applied",
+    "refresh_state": "settled",
+    "complete_family_not_qualified": true
+  }
+}
