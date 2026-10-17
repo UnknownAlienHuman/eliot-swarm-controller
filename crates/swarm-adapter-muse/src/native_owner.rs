@@ -23,8 +23,7 @@ use jsonrpsee_core::server::RpcModule;
 use std::{
     error::Error,
     ffi::OsString,
-    fmt,
-    io,
+    fmt, io,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex, Weak},
@@ -75,7 +74,9 @@ impl NativeClientSpec {
 pub enum NativeStderrResult {
     /// The pipe reached EOF. error_code is present only for the exact bounded
     /// {"error_code":"UPPERCASE_CODE"} diagnostic record.
-    Closed { error_code: Option<String> },
+    Closed {
+        error_code: Option<String>,
+    },
     ReadFailed,
     DrainTaskFailed,
     Unavailable,
@@ -101,9 +102,10 @@ impl DirectState {
         if self.observed_exit.is_some() {
             return Ok(self.observed_exit);
         }
-        let child = self.child.as_mut().ok_or_else(|| {
-            io::Error::other("MUSE_NATIVE_CHILD_NOT_STARTED")
-        })?;
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("MUSE_NATIVE_CHILD_NOT_STARTED"))?;
         #[cfg(test)]
         let result = if self.injected_wait_errors > 0 {
             self.injected_wait_errors -= 1;
@@ -168,14 +170,22 @@ impl NativeChildCustodian {
 
     /// Recover an observer even after the consumer/start error was dropped.
     pub fn direct_child(&self) -> Option<NativeDirectChild> {
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.child.as_ref()?;
-        Some(NativeDirectChild { state: Arc::downgrade(&self.state) })
+        Some(NativeDirectChild {
+            state: Arc::downgrade(&self.state),
+        })
     }
 
     /// Observation failures remain inspectable while join is still pending.
     pub fn wait_failures(&self) -> NativeWaitFailures {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).wait_failures
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wait_failures
     }
 
     /// None means no successful OS spawn in this custodian. Otherwise wait
@@ -184,14 +194,21 @@ impl NativeChildCustodian {
     /// remains uncertain. Descendants may hold stderr open after direct exit;
     /// this join intentionally retains its drain until EOF/task completion.
     pub async fn join(&mut self) -> Option<NativeCustodianObservation> {
-        if self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .child.is_none()
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .child
+            .is_none()
         {
             return None;
         }
         let status = loop {
-            let observed = self.state.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner).poll_exit();
+            let observed = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .poll_exit();
             if let Ok(Some(status)) = observed {
                 break status;
             }
@@ -213,9 +230,16 @@ impl NativeChildCustodian {
         }
         Some(NativeCustodianObservation {
             direct_child: status,
-            stderr: self.stderr_result.as_ref().expect("cached drain result").clone(),
-            wait_failures: self.state.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner).wait_failures,
+            stderr: self
+                .stderr_result
+                .as_ref()
+                .expect("cached drain result")
+                .clone(),
+            wait_failures: self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .wait_failures,
         })
     }
 }
@@ -228,7 +252,9 @@ pub struct NativeDirectChild {
 
 impl fmt::Debug for NativeDirectChild {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NativeDirectChild").field("pid", &self.id()).finish()
+        f.debug_struct("NativeDirectChild")
+            .field("pid", &self.id())
+            .finish()
     }
 }
 
@@ -236,7 +262,9 @@ impl NativeDirectChild {
     /// None is not departure proof (it also covers a lost driver custodian).
     pub fn id(&self) -> Option<u32> {
         let state = self.state.upgrade()?;
-        let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.observed_exit.is_some() {
             None
         } else {
@@ -248,11 +276,14 @@ impl NativeDirectChild {
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         loop {
             let observed = {
-                let state = self.state.upgrade().ok_or_else(|| {
-                    io::Error::other("MUSE_NATIVE_CUSTODIAN_LOST")
-                })?;
-                let observed = state.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner).poll_exit();
+                let state = self
+                    .state
+                    .upgrade()
+                    .ok_or_else(|| io::Error::other("MUSE_NATIVE_CUSTODIAN_LOST"))?;
+                let observed = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .poll_exit();
                 observed
             };
             if let Some(status) = observed? {
@@ -306,7 +337,9 @@ pub enum NativeOwnerStartError {
         kind: io::ErrorKind,
         direct_child: NativeDirectChild,
     },
-    PipedStdioUnavailable { direct_child: NativeDirectChild },
+    PipedStdioUnavailable {
+        direct_child: NativeDirectChild,
+    },
     TransportUnavailable {
         reason: TransportEnd,
         direct_child: NativeDirectChild,
@@ -419,28 +452,32 @@ fn spawn_piped(
     // std Command::spawn is the OS-creation boundary. Unlike Tokio 1.53.1
     // Command::spawn, it performs no subsequent reactor/pidfd registration.
     // Install direct custody before the first fallible async pipe conversion.
-    let mut state = custodian.state.lock()
+    let mut state = custodian
+        .state
+        .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if state.child.is_some() {
         return Err(NativeOwnerStartError::CustodianAlreadyUsed);
     }
     state.child = Some(command.spawn().map_err(NativeOwnerStartError::Spawn)?);
-    let direct_child = NativeDirectChild { state: Arc::downgrade(&custodian.state) };
+    let direct_child = NativeDirectChild {
+        state: Arc::downgrade(&custodian.state),
+    };
     let child = state.child.as_mut().expect("installed OS child");
-    let (Some(stdin), Some(stdout), Some(stderr)) = (
-        child.stdin.take(),
-        child.stdout.take(),
-        child.stderr.take(),
-    ) else {
+    let (Some(stdin), Some(stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
         return Err(NativeOwnerStartError::PipedStdioUnavailable { direct_child });
     };
     drop(state);
     let (stdin, stdout, stderr) = match attach(stdin, stdout, stderr) {
         Ok(pipes) => pipes,
-        Err(error) => return Err(NativeOwnerStartError::AsyncStdioUnavailable {
-            kind: error.kind(),
-            direct_child,
-        }),
+        Err(error) => {
+            return Err(NativeOwnerStartError::AsyncStdioUnavailable {
+                kind: error.kind(),
+                direct_child,
+            });
+        }
     };
     custodian.stderr_drain = Some(tokio::spawn(read_closed_stderr(stderr)));
     Ok((direct_child, stdin, stdout))
@@ -533,8 +570,16 @@ mod tests {
     const PAYLOAD_BYTES: usize = 512 * 1_024;
 
     fn fixture_args(test: &str) -> Vec<OsString> {
-        ["--exact", test, "--ignored", "--nocapture", "--test-threads=1"]
-            .into_iter().map(OsString::from).collect()
+        [
+            "--exact",
+            test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
     }
 
     fn fixture_spec(test: &str) -> NativeClientSpec {
@@ -591,20 +636,36 @@ mod tests {
     #[test]
     fn current_thread_drop_paths_external_watchdog() {
         for case in [
-            "return", "cancel_close", "abort_task", "unwind",
-            "wait_failure", "attach_failure", "raw_prompt", "oversized",
+            "return",
+            "cancel_close",
+            "abort_task",
+            "unwind",
+            "wait_failure",
+            "attach_failure",
+            "raw_prompt",
+            "oversized",
         ] {
             let parent = std::fs::canonicalize(std::env::temp_dir()).expect("fixture parent");
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let root = parent.join(format!("muse-custody-{}-{nonce}-{case}", std::process::id()));
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = parent.join(format!(
+                "muse-custody-{}-{nonce}-{case}",
+                std::process::id()
+            ));
             std::fs::create_dir(&root).expect("fresh fixture scope");
             let root = std::fs::canonicalize(root).expect("canonical fixture scope");
             assert_eq!(root.parent(), Some(parent.as_path()));
             let mut owner = Command::new(std::env::current_exe().unwrap())
                 .args(fixture_args(OWNER_TEST))
-                .env(ROOT_ENV, &root).env(CASE_ENV, case)
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-                .spawn().expect("controlled module-owner test process");
+                .env(ROOT_ENV, &root)
+                .env(CASE_ENV, case)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("controlled module-owner test process");
             let started = Instant::now();
             let mut expired = false;
             let mut abort_started = None;
@@ -623,15 +684,35 @@ mod tests {
                     // marker; retain the scope for diagnosis, never remove it.
                     let _ = owner.kill();
                     let _ = owner.wait();
-                    panic!("fixture owner cleanup failed for {case}: {}", root.display());
+                    panic!(
+                        "fixture owner cleanup failed for {case}: {}",
+                        root.display()
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(10));
             };
-            assert!(!expired, "external watchdog caught {case} deadlock: {}", root.display());
-            assert!(status.success(), "fixture owner failed for {case}: {}", root.display());
-            assert!(root.join("worker-joined").is_file(), "driver must join custody");
-            assert!(root.join("owner-family-empty").is_file(), "outer owner must finish separately");
-            assert!(root.join("native-observed").is_file(), "native EOF/frame check must run");
+            assert!(
+                !expired,
+                "external watchdog caught {case} deadlock: {}",
+                root.display()
+            );
+            assert!(
+                status.success(),
+                "fixture owner failed for {case}: {}",
+                root.display()
+            );
+            assert!(
+                root.join("worker-joined").is_file(),
+                "driver must join custody"
+            );
+            assert!(
+                root.join("owner-family-empty").is_file(),
+                "outer owner must finish separately"
+            );
+            assert!(
+                root.join("native-observed").is_file(),
+                "native EOF/frame check must run"
+            );
             // Only this fresh, canonical, direct child of the temp directory.
             assert_eq!(std::fs::canonicalize(&root).unwrap(), root);
             assert_eq!(root.parent(), Some(parent.as_path()));
@@ -642,12 +723,16 @@ mod tests {
     #[test]
     #[ignore = "invoked only by the external watchdog parent"]
     fn synthetic_module_owner_fixture() {
-        let Some((root, case)) = fixture_context() else { return };
+        let Some((root, case)) = fixture_context() else {
+            return;
+        };
         let plan = ModuleOwnerPlan {
             state_dir: root.join("module-state"),
             executable: std::env::current_exe().unwrap(),
-            argv: fixture_args(WORKER_TEST).into_iter()
-                .map(|arg| arg.into_string().unwrap()).collect(),
+            argv: fixture_args(WORKER_TEST)
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect(),
             protected_refs: Vec::new(),
             environment: vec![
                 (ROOT_ENV.to_owned(), root.to_str().unwrap().to_owned()),
@@ -684,16 +769,21 @@ mod tests {
         std::future::poll_fn(|context| {
             assert!(future.as_mut().poll(context).is_pending());
             Poll::Ready(())
-        }).await;
+        })
+        .await;
     }
 
     #[test]
     #[ignore = "verified worker launched by the real generic module owner"]
     fn synthetic_adapter_worker_fixture() {
-        let Some((root, case)) = fixture_context() else { return };
+        let Some((root, case)) = fixture_context() else {
+            return;
+        };
         let watchdog = FixtureAbortWatch::arm(&root, "worker");
         let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().expect("watched single-thread runtime");
+            .enable_all()
+            .build()
+            .expect("watched single-thread runtime");
         runtime.block_on(async {
             // The helper publishes worker.json just after spawn. Wait for that
             // real proof; never substitute a test-only membership bypass.
@@ -703,7 +793,19 @@ mod tests {
             let mut custody = NativeChildCustodian::new(); // Outside the consumer!
             let command = build_command(&fixture_spec(CLIENT_TEST));
             if case == "attach_failure" {
-                let error = match spawn_piped(&mut custody, command, |_, _, _| {
+                let error = match spawn_piped(&mut custody, command, |stdin, stdout, stderr| {
+                    // Keep the synthetic child's pipes open through libtest's
+                    // banner. Otherwise injected attachment failure can make
+                    // that banner fail before the fixture body even starts.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !root.join("native-entry-ready").is_file() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "synthetic native entry did not start"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    drop((stdin, stdout, stderr));
                     Err(io::Error::other("fixture-local post-spawn attach failure"))
                 }) {
                     Err(error) => error,
@@ -718,7 +820,9 @@ mod tests {
                 };
                 assert!(pid.is_some());
                 drop(error); // Ordinary error return/drop cannot release custody.
-                let mut recovered = custody.direct_child().expect("recover observer after error drop");
+                let mut recovered = custody
+                    .direct_child()
+                    .expect("recover observer after error drop");
                 assert_eq!(recovered.id(), pid);
                 assert_eq!(recovered.wait().await.unwrap().code(), Some(23));
                 let joined = custody.join().await.unwrap();
@@ -736,7 +840,9 @@ mod tests {
                 loop {
                     assert_ne!(stdout.read_until(b'\n', &mut prelude).await.unwrap(), 0);
                     assert!(prelude.len() <= 4_096);
-                    if prelude.ends_with(b"MUSE_FIXTURE_READY\n") { break; }
+                    if prelude.ends_with(b"MUSE_FIXTURE_READY\n") {
+                        break;
+                    }
                 }
                 let pid = direct_child.id();
                 let mut waiting = Box::pin(direct_child.wait());
@@ -746,19 +852,33 @@ mod tests {
                 if case == "wait_failure" {
                     custody.state.lock().unwrap().injected_wait_errors = 2;
                     let pid = direct_child.id();
-                    assert_eq!(direct_child.wait().await.unwrap_err().kind(), io::ErrorKind::Other);
+                    assert_eq!(
+                        direct_child.wait().await.unwrap_err().kind(),
+                        io::ErrorKind::Other
+                    );
                     assert_eq!(direct_child.id(), pid);
                 }
                 let (transport, notifications) = MspTransport::attach_owned_stdio(
-                    stdout, stdin, RpcModule::new(()), Options::default(),
-                ).expect("actual owner-verified MSP attachment");
-                let consumer = NativeOwnedChild { transport, notifications, direct_child };
+                    stdout,
+                    stdin,
+                    RpcModule::new(()),
+                    Options::default(),
+                )
+                .expect("actual owner-verified MSP attachment");
+                let consumer = NativeOwnedChild {
+                    transport,
+                    notifications,
+                    direct_child,
+                };
                 let (armed, started) = tokio::sync::oneshot::channel();
                 let mode = case.clone();
                 let mut task = tokio::spawn(async move {
                     let mut consumer = consumer;
                     for data in ["x".repeat(PAYLOAD_BYTES), "second".into()] {
-                        let params = serde_json::json!({ "data": data }).as_object().unwrap().clone();
+                        let params = serde_json::json!({ "data": data })
+                            .as_object()
+                            .unwrap()
+                            .clone();
                         // Cancelling a receipt does not cancel the admitted frame.
                         drop(consumer.transport.notify("fixture.frame", params).unwrap());
                     }
@@ -775,8 +895,12 @@ mod tests {
                     }
                     drop(consumer); // 80a freezes here, before MSP can close stdin.
                 });
-                started.await.expect("consumer admitted both ordered frames");
-                if case == "abort_task" { task.abort(); }
+                started
+                    .await
+                    .expect("consumer admitted both ordered frames");
+                if case == "abort_task" {
+                    task.abort();
+                }
                 let completion = (&mut task).await;
                 match case.as_str() {
                     "abort_task" => assert!(completion.unwrap_err().is_cancelled()),
@@ -796,13 +920,21 @@ mod tests {
                 std::fs::write(root.join("read"), b"consumer joined; runtime stays alive").unwrap();
                 let joined = custody.join().await.expect("retained direct child");
                 assert!(joined.direct_child.success());
-                assert_eq!(joined.wait_failures.count, if case == "wait_failure" { 2 } else { 0 });
+                assert_eq!(
+                    joined.wait_failures.count,
+                    if case == "wait_failure" { 2 } else { 0 }
+                );
                 let expected = if matches!(case.as_str(), "raw_prompt" | "oversized") {
                     None
                 } else {
                     Some("SYNTHETIC_CHILD_ERROR".to_owned())
                 };
-                assert_eq!(joined.stderr, NativeStderrResult::Closed { error_code: expected });
+                assert_eq!(
+                    joined.stderr,
+                    NativeStderrResult::Closed {
+                        error_code: expected
+                    }
+                );
                 assert_eq!(custody.direct_child().unwrap().id(), None);
                 assert_eq!(custody.join().await.unwrap().stderr, joined.stderr);
             }
@@ -814,18 +946,26 @@ mod tests {
     #[test]
     #[ignore = "synthetic native client; never an account/model/harness call"]
     fn synthetic_native_child_fixture() {
-        let Some((root, case)) = fixture_context() else { return };
+        let Some((root, case)) = fixture_context() else {
+            return;
+        };
         let watchdog = FixtureAbortWatch::arm(&root, "native");
+        std::fs::write(root.join("native-entry-ready"), b"fixture body entered").unwrap();
         if case != "attach_failure" {
-            std::io::stdout().write_all(b"MUSE_FIXTURE_READY\n").unwrap();
+            std::io::stdout()
+                .write_all(b"MUSE_FIXTURE_READY\n")
+                .unwrap();
             std::io::stdout().flush().unwrap();
             match case.as_str() {
                 "raw_prompt" => std::io::stderr()
-                    .write_all(b"synthetic prompt and API_KEY=fixture-only\n").unwrap(),
+                    .write_all(b"synthetic prompt and API_KEY=fixture-only\n")
+                    .unwrap(),
                 "oversized" => std::io::stderr()
-                    .write_all(&vec![b'x'; 128 * 1_024]).unwrap(),
+                    .write_all(&vec![b'x'; 128 * 1_024])
+                    .unwrap(),
                 _ => std::io::stderr()
-                    .write_all(b"{\"error_code\":\"SYNTHETIC_CHILD_ERROR\"}\n").unwrap(),
+                    .write_all(b"{\"error_code\":\"SYNTHETIC_CHILD_ERROR\"}\n")
+                    .unwrap(),
             }
             std::io::stderr().flush().unwrap();
             while !root.join("read").exists() {
@@ -833,22 +973,32 @@ mod tests {
             }
         }
         let mut input = Vec::new();
-        std::io::stdin().read_to_end(&mut input).expect("EOF after MSP submission barrier");
+        std::io::stdin()
+            .read_to_end(&mut input)
+            .expect("EOF after MSP submission barrier");
         if case == "attach_failure" {
             assert!(input.is_empty());
         } else {
             assert_eq!(input.last(), Some(&b'\n'));
-            let frames: Vec<serde_json::Value> = input.split(|byte| *byte == b'\n')
+            let frames: Vec<serde_json::Value> = input
+                .split(|byte| *byte == b'\n')
                 .filter(|line| !line.is_empty())
                 .map(|line| serde_json::from_slice(line).expect("complete admitted MSP frame"))
                 .collect();
             assert_eq!(frames.len(), 2);
             assert_eq!(frames[0]["method"], "fixture.frame");
             assert_eq!(frames[1]["method"], "fixture.frame");
-            assert_eq!(frames[0]["params"]["data"].as_str().unwrap(), "x".repeat(PAYLOAD_BYTES));
+            assert_eq!(
+                frames[0]["params"]["data"].as_str().unwrap(),
+                "x".repeat(PAYLOAD_BYTES)
+            );
             assert_eq!(frames[1]["params"]["data"], "second");
         }
-        std::fs::write(root.join("native-observed"), b"ordered frames then stdin EOF").unwrap();
+        std::fs::write(
+            root.join("native-observed"),
+            b"ordered frames then stdin EOF",
+        )
+        .unwrap();
         watchdog.stop();
         // Avoid libtest's trailing stdout/stderr, which is not MSP traffic.
         std::process::exit(if case == "attach_failure" { 23 } else { 0 });

@@ -39,6 +39,7 @@
 pub mod commands;
 pub mod journal;
 pub mod msp;
+pub mod native_owner;
 pub(crate) mod observations;
 pub mod results;
 pub mod schema;
