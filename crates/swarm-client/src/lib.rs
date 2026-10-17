@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod endpoint;
 mod module_link;
+mod multiplex;
 
 pub use client::Client;
 pub use config::{HostConnectionConfig, IpcConfig};
