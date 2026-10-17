@@ -5962,7 +5962,10 @@ mod tests {
                 });
                 status.readback_required = true;
             });
-            fixture.service.readback_required.store(true, Ordering::Release);
+            fixture
+                .service
+                .readback_required
+                .store(true, Ordering::Release);
             let before = serde_json::to_value(fixture.service.current_status()).unwrap();
 
             fixture
@@ -6055,7 +6058,10 @@ mod tests {
             LifecycleState::ProcessRunning { ref boot_id } if boot_id == "current-boot"
         ));
         assert_eq!(ready.unknown_operation_count, 2);
-        assert_eq!(ready.unknown_operation_ids, ["pending-refresh", "pending-result"]);
+        assert_eq!(
+            ready.unknown_operation_ids,
+            ["pending-refresh", "pending-result"]
+        );
         assert!(!ready.readback_required);
         assert!(ready.hello_failure.is_none());
         assert!(!fixture.service.can_replace_descriptor().await);
@@ -6065,7 +6071,11 @@ mod tests {
             .reconcile_retained_module_hello("old-boot")
             .unwrap();
         assert_eq!(
-            fixture.service.confirm_module_hello("old-boot").unwrap_err().code,
+            fixture
+                .service
+                .confirm_module_hello("old-boot")
+                .unwrap_err()
+                .code,
             "MODULE_WORKER_BOOT_MISMATCH"
         );
         fixture
@@ -6104,13 +6114,19 @@ mod tests {
         assert!(status.readback_required);
         assert!(fixture.service.readback_required.load(Ordering::Acquire));
         assert!(lock(&fixture.service.confirmed_ready).is_none());
-        let event = crate::ModuleSupervisorObservation::from_status(&status, "fixture-actor", 1)
-            .unwrap();
+        let event =
+            crate::ModuleSupervisorObservation::from_status(&status, "fixture-actor", 1).unwrap();
         assert_eq!(event.boot_id.as_deref(), Some("current-boot"));
-        assert_eq!(event.error_code.as_deref(), Some("MODULE_WORKER_IDENTITY_UNKNOWN"));
+        assert_eq!(
+            event.error_code.as_deref(),
+            Some("MODULE_WORKER_IDENTITY_UNKNOWN")
+        );
         assert_eq!(event.effect_certainty, ModuleEffectCertainty::Unknown);
         assert_eq!(event.unknown_operation_count, 2);
-        assert_eq!(event.unknown_operation_ids, ["pending-refresh", "pending-result"]);
+        assert_eq!(
+            event.unknown_operation_ids,
+            ["pending-refresh", "pending-result"]
+        );
     }
 
     #[cfg(any(windows, target_os = "linux"))]
