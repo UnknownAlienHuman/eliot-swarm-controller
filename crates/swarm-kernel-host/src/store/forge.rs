@@ -595,12 +595,7 @@ impl WorkerResultStatus {
     }
 
     fn proves_inner_tree_empty(self) -> bool {
-        matches!(
-            self,
-            Self::Present {
-                inner_tree_empty: true
-            }
-        )
+        matches!(self, Self::Present { inner_tree_empty: true })
     }
 }
 
@@ -1771,6 +1766,89 @@ fn dispatch_authorized(
     Ok(DispatchAuthorization::Authorized)
 }
 
+// Called only after wait_worker_owner validated this exact child and retained
+// its family query. Commit the readback attempt before allowing its Git work;
+// the original write receipt and private per-job files remain unchanged.
+fn readback_authorized(
+    db: &mut Connection,
+    work: &ForgeWork,
+    config: &Config,
+    job: &NativeWorkerJob,
+    owner: &Value,
+) -> Result<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let operation = operations::get_operation(&tx, &work.intent.operation_id)?;
+    let actor = actor_for_operation(&tx, &work.intent.operation_id, &operation)?;
+    if work.mode != WorkMode::ReadbackOnly
+        || operation["method"] != "forge.publish_ref"
+        || operation["state"] != "outcome_unknown"
+        || operation["caller_id"] != actor.caller_id()
+        || job.kind != "forge_publish"
+        || job.phase_name != "readback_only"
+        || job.operation_id != work.intent.operation_id
+        || owner["token"] != job.owner_token
+        || owner["process"]["purpose"] != "module"
+    {
+        return Err(worker_plan_scope_error());
+    }
+    let saved = saved_intent(&tx, &work.intent.operation_id)?;
+    actor.require_intent_matches(&saved)?;
+    if saved != work.intent {
+        return Err(worker_plan_scope_error());
+    }
+    if matches!(actor, ForgeActor::OnBehalf(_)) {
+        actor.require_readback_authority(&tx, config)?;
+    }
+    require_no_process_tree_hold(&tx, &saved.canonical_repository)?;
+    let receipt = native_worker_receipt(job, owner);
+    let now = model::now_ms()?;
+    let changed = tx.execute(
+        "UPDATE operations SET result_json=json_remove(json_set(COALESCE(result_json,'{}'),'$.native_worker_readback',json(?2),'$.process_tree_unconfirmed',json('true'),'$.process_tree_status','in_flight','$.process_tree_cleanup','readback_worker_confirmation_pending','$.resolution','manual_operator_intervention_required'),'$.native_worker_readback_result','$.native_worker_recovery'),updated_at_ms=?3 WHERE operation_id=?1 AND method='forge.publish_ref' AND state='outcome_unknown'",
+        params![work.intent.operation_id, model::canonical(&receipt)?, now],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict("publication left its readback phase"));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+// The caller has already confirmed the retained outer family is empty through
+// wait_forge_worker. This transaction binds only that attempt's inner result.
+fn readback_worker_completed(db: &mut Connection, receipt: &Value, result: &Value) -> Result<()> {
+    let operation_id = model::text(receipt, "operation_id")?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let operation = operations::get_operation(&tx, operation_id)?;
+    if operation["method"] != "forge.publish_ref"
+        || operation["state"] != "outcome_unknown"
+        || receipt["kind"] != "forge_publish"
+        || receipt["phase"] != "readback_only"
+        || operation["result"].get("native_worker_readback") != Some(receipt)
+    {
+        return Err(Error::new(
+            "FORGE_WORKER_RECEIPT_CHANGED",
+            "readback worker changed before completion",
+        ));
+    }
+    let status = classify_worker_result(
+        &operation,
+        receipt,
+        RetainedWorkerFile::Bytes(serde_json::to_vec(result)?),
+    )?;
+    let now = model::now_ms()?;
+    let mut recovered = worker_recovery_ready_result(&operation, receipt, status, now)?;
+    recovered["native_worker_readback_result"] = result.clone();
+    let changed = tx.execute(
+        "UPDATE operations SET result_json=?2,updated_at_ms=?3 WHERE operation_id=?1 AND state='outcome_unknown'",
+        params![operation_id, model::canonical(&recovered)?, now],
+    )?;
+    if changed != 1 {
+        return Err(Error::conflict("publication left its readback completion phase"));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn forge_worker_executable() -> Result<PathBuf> {
     let host = std::env::current_exe()?.canonicalize()?;
     let name = if cfg!(windows) {
@@ -2545,7 +2623,11 @@ fn classify_worker_result(
         "process_tree_empty",
         "process_tree_unconfirmed",
     ];
-    let stored = operation["result"].get("native_worker_result");
+    let stored = if operation["result"].get("native_worker_readback").is_some() {
+        operation["result"].get("native_worker_readback_result")
+    } else {
+        operation["result"].get("native_worker_result")
+    };
     if let Some(stored_result) = stored
         && stored_result.is_object()
     {
@@ -2662,6 +2744,14 @@ fn worker_recovery_has_tree_hold(operation: &Value) -> bool {
         .is_some_and(|value| !matches!(value, Value::Bool(false)))
 }
 
+fn current_native_worker(operation: &Value) -> Option<&Value> {
+    // A malformed current readback receipt must never fall back to an older
+    // write receipt whose clean result says nothing about this attempt.
+    operation["result"]
+        .get("native_worker_readback")
+        .or_else(|| operation["result"].get("native_worker"))
+}
+
 fn worker_recovery_ready_result(
     operation: &Value,
     receipt: &Value,
@@ -2671,20 +2761,27 @@ fn worker_recovery_ready_result(
     if !matches!(
         operation["state"].as_str(),
         Some("sending" | "outcome_unknown")
-    ) || model::canonical(&operation["result"]["native_worker"])? != model::canonical(receipt)?
+    ) || current_native_worker(operation) != Some(receipt)
     {
         return Err(Error::new(
             "FORGE_WORKER_RECEIPT_CHANGED",
             "the retained worker receipt changed during recovery",
         ));
     }
+    let prior_cleanup = &operation["result"]["native_worker_recovery"];
+    if worker_recovery_has_tree_hold(operation)
+        && (prior_cleanup["status"] == "readback_permitted"
+            || prior_cleanup["cleanup_previously_consumed"] == true)
+    {
+        // A later hold cannot consume the same departed worker's proof again.
+        // This also fences old Hosts that failed to retain a readback receipt.
+        return Err(Error::new(
+            "FORGE_GIT_TREE_TERMINATION",
+            "earlier worker cleanup cannot release a subsequent process-tree hold",
+        ));
+    }
     if (worker_recovery_has_tree_hold(operation)
-        || matches!(
-            result_status,
-            WorkerResultStatus::Present {
-                inner_tree_empty: false
-            }
-        ))
+        || matches!(result_status, WorkerResultStatus::Present { inner_tree_empty: false }))
         && !result_status.proves_inner_tree_empty()
     {
         // Outer worker departure is a separate fact. A missing/malformed
@@ -2730,7 +2827,11 @@ fn worker_recovery_ready_result(
     Ok(result)
 }
 
-fn worker_recovery_block_result(operation: &Value, error_code: &str, now: i64) -> Result<Value> {
+fn worker_recovery_block_result(
+    operation: &Value,
+    error_code: &str,
+    now: i64,
+) -> Result<Value> {
     let process_family_departed = matches!(
         error_code,
         "FORGE_WORKER_PLAN_SCOPE_MISMATCH"
@@ -2738,7 +2839,8 @@ fn worker_recovery_block_result(operation: &Value, error_code: &str, now: i64) -
             | "FORGE_WORKER_EVIDENCE_UNAVAILABLE"
             | "FORGE_WORKER_EVIDENCE_INVALID"
     );
-    let tree_unconfirmed = worker_recovery_has_tree_hold(operation) || !process_family_departed;
+    let tree_unconfirmed = worker_recovery_has_tree_hold(operation)
+        || !process_family_departed;
     let reason_code = match error_code {
         "FORGE_WORKER_PLAN_SCOPE_MISMATCH" => "worker_plan_scope_mismatch",
         "FORGE_WORKER_RESULT_SCOPE_MISMATCH" => "worker_result_scope_mismatch",
@@ -2760,9 +2862,13 @@ fn worker_recovery_block_result(operation: &Value, error_code: &str, now: i64) -
         ));
     }
     let mut result = operation["result"].clone();
+    let prior_cleanup = &operation["result"]["native_worker_recovery"];
+    let cleanup_previously_consumed = prior_cleanup["status"] == "readback_permitted"
+        || prior_cleanup["cleanup_previously_consumed"] == true;
     result["native_worker_recovery"] = json!({
         "schema_version":1,
         "status":"blocked",
+        "cleanup_previously_consumed":cleanup_previously_consumed,
         "reason_code":reason_code,
         "process_family":if process_family_departed { "departed_empty" } else { "unconfirmed" },
         "retryable":!process_family_departed || reason_code == "worker_evidence_unavailable",
@@ -3552,11 +3658,16 @@ fn finish(db: &mut Connection, id: &str, outcome: ForgeOutcome) -> Result<()> {
     let (mut result, mut state) = outcome_value(id, &outcome);
     result["publication_may_have_started"] =
         json!(publication_may_have_started(&operation["result"]));
-    if let Some(worker_receipt) = operation["result"].get("native_worker") {
-        result["native_worker"] = worker_receipt.clone();
-    }
-    if let Some(recovery) = operation["result"].get("native_worker_recovery") {
-        result["native_worker_recovery"] = recovery.clone();
+    for field in [
+        "native_worker",
+        "native_worker_result",
+        "native_worker_readback",
+        "native_worker_readback_result",
+        "native_worker_recovery",
+    ] {
+        if let Some(value) = operation["result"].get(field) {
+            result[field] = value.clone();
+        }
     }
     preserve_process_tree_hold(&operation["result"], &mut result, &mut state);
     if state == "settled" && !matches!(outcome, ForgeOutcome::Coalesced { .. }) {
@@ -5534,7 +5645,27 @@ impl super::Store {
 
         let mut deferred_outcome = None;
         let authorized = if work.mode == WorkMode::ReadbackOnly {
-            true
+            let auth_work = work.clone();
+            let config = self.config.clone();
+            let auth_job = job.clone();
+            let auth_owner = owner_record.clone();
+            match self
+                .run(move |db| readback_authorized(db, &auth_work, &config, &auth_job, &auth_owner))
+                .await
+            {
+                Ok(()) => true,
+                Err(_) => {
+                    deferred_outcome = Some(worker_unknown(
+                        "worker_authorization_delivery_failed",
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                    ));
+                    false
+                }
+            }
         } else {
             let auth_work = work.clone();
             let config = self.config.clone();
@@ -5605,7 +5736,27 @@ impl super::Store {
             };
         }
         match result {
-            Ok(result) => map_forge_worker_result(&job, &work.intent, &result),
+            Ok(result) => {
+                if work.mode == WorkMode::ReadbackOnly {
+                    let receipt = native_worker_receipt(&job, &owner_record);
+                    let retained = result.clone();
+                    if self
+                        .run(move |db| readback_worker_completed(db, &receipt, &retained))
+                        .await
+                        .is_err()
+                    {
+                        return worker_unknown(
+                            "git_process_tree_unconfirmed",
+                            None,
+                            false,
+                            None,
+                            None,
+                            true,
+                        );
+                    }
+                }
+                map_forge_worker_result(&job, &work.intent, &result)
+            }
             Err(error) => ForgeOutcome::Unknown {
                 reason: if error.code == "FORGE_GIT_TREE_TERMINATION" {
                     "git_process_tree_unconfirmed"
@@ -5637,7 +5788,7 @@ impl super::Store {
         let operation = self
             .run(move |db| operations::get_operation(db, &id))
             .await?;
-        let Some(receipt) = operation["result"].get("native_worker") else {
+        let Some(receipt) = current_native_worker(&operation) else {
             return Ok(());
         };
         let receipt_fields = receipt
