@@ -207,10 +207,15 @@ pub(crate) fn prepare_and_spawn(
             // Retain only a closed reason in test artifacts, at the exact failed
             // observation. Unknown messages never enter this diagnostic.
             #[cfg(test)]
-            let message = format!(
-                "{message}; image_reason={}",
-                crate::platform::process_group::classify_image_error(&error.code, &error.message),
-            );
+            let message = {
+                let metadata = std::fs::metadata(&executor.executable).ok();
+                let bytes = metadata.as_ref().map(std::fs::Metadata::len);
+                let is_file = metadata.as_ref().map(std::fs::Metadata::is_file);
+                format!(
+                    "{message}; image_reason={}; configured_image_bytes={bytes:?}; configured_image_is_file={is_file:?}",
+                    crate::platform::process_group::classify_image_error(&error.code, &error.message),
+                )
+            };
             Error::new("CHECK_EXECUTOR_MISMATCH", message).with_secondary_error(error)
         })?;
         let image_path = canonical_path_text(&image["image_path"]).map_err(|error| {
