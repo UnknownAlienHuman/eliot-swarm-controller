@@ -5,14 +5,36 @@
 //! delivery until ACK, and no native replay on reopen/reconnect. Native wire,
 //! work/model fences, authorization and outcome evidence remain caller duties.
 //!
-//! Format v1 is exclusive to a NEW Rust binding state directory. The existing
-//! module owner owns its lock/custody; this module never acquires another owner
-//! or reads/adopts Node checkpoint.json. A native root in Scope is an identity
-//! fence, not evidence that it exists. session/start requires the public explicit
-//! sessionId field, so the intended identity is retained before possible I/O.
-//! Child provenance, session MCP launch config, family/settings projections and
-//! facade activation are outside this v1 slice; unsupported params fail closed.
-//! V1 has no same-live-MSP-connection proof. A no-ACK reconciliation therefore
+//! Checkpoint v2 retains original commands, receipts, selectors and work fences
+//! alongside the exact native invocation; the immutable scope marker/file names
+//! remain v1 for existing NEW-Rust bindings. Old v1 checkpoints load without
+//! inventing context: their outbox remains deliverable and native intent remains
+//! held, but no legacy native replay/ACK application is enabled. Node
+//! checkpoint.json is never read, adopted, rewritten or used as a fallback.
+//! The existing module owner owns the directory lock/custody.
+//!
+//! Driver integration order (all final checks/enqueue under its event mutex):
+//! record_initialize AFTER initialize/initialized flush; invalidate_observations
+//! BEFORE every native event/connection change; record_work_read for a stable
+//! exact-root read; capture_projection/retain_observations for the shared fold;
+//! authorize_session before and after child reads; capture_pending_inventory
+//! and atomically pair its reduced projector using retain_observations; finally
+//! prepare_command and synchronously enqueue PreparedNative's exact invocation.
+//! The compatibility prepare_native seam is same-worker/root-only; it cannot
+//! supply context, child authority or an MCP grant. Driver must use prepare_command.
+//! Cross-worker agent.reconcile uses retained_command/retained_invocation and
+//! reconcile_command, preserving the ORIGINAL receipt, TaskPrompt boot, UUIDv7,
+//! method and payload. An ambiguous start stays the same explicit session/start,
+//! never another root/adoption/prompt; an exact initialize grant is required
+//! again for its session MCP config. MCP admission proves no server liveness.
+//!
+//! restored_observations rebinds through the shared reducer's STALE restore path.
+//! Pending payloads and paired opaque discovery cursors remain historical only;
+//! no authority is restored. Events, native preparation, connection changes and
+//! journal instance replacement revoke opaque session/capture tickets.
+//! Host authorization, actual native reads, final current-event checks and
+//! enqueue correlation remain Driver duties; this module performs no native IO.
+//! There is no same-live-MSP-connection proof. A no-ACK reconciliation therefore
 //! requires a fresh current-boot durable-host declaration; ephemeral same-link
 //! replay stays unavailable instead of assuming persisted native idempotency.
 //! The driver completes initialize -> initialized before any native command.
@@ -22,23 +44,26 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
 };
 use swarm_contracts::{
     module_catalog::{ArtifactIdentity, ModuleId, Sha256Digest},
-    runtime::{EffectOutcome, ModuleReceiptIdentity, RuntimeOutcome},
+    runtime::{EffectOutcome, ModuleReceiptIdentity, RuntimeCommand, RuntimeOutcome},
 };
 use swarm_process::{read_private_durable, replace_private_durable, write_private_new};
+use crate::{commands, schema, observations::{ObservationProjector, ProjectionFence}};
 
 const FORMAT: &str = "eliot.muse.rust-private-state";
 const VERSION: u16 = 1;
+const CHECKPOINT_VERSION: u16 = 2;
 const MARKER: &str = "muse-rust-scope.v1.json";
 const CHECKPOINT: &str = "muse-rust-checkpoint.v1.json";
 const MAX_FILE: u64 = 16 * 1024 * 1024;
 const MAX_ENTRY: usize = 1024 * 1024;
+const MAX_CONTEXT: usize = 3 * 1024 * 1024;
 const MAX_OPERATIONS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +83,10 @@ pub enum Fault {
     OutcomeConflict,
     DurabilityUnavailable,
     ExactRootReadRequired,
+    ContextRequired,
+    FreshChecksRequired,
+    GrantRequired,
+    ProvenanceRequired,
 }
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,6 +112,10 @@ impl Fault {
             Self::OutcomeConflict => "MUSE_JOURNAL_OUTCOME_CONFLICT",
             Self::DurabilityUnavailable => "MUSE_JOURNAL_DURABILITY_UNAVAILABLE",
             Self::ExactRootReadRequired => "MUSE_JOURNAL_EXACT_ROOT_READ_REQUIRED",
+            Self::ContextRequired => "MUSE_JOURNAL_CONTEXT_REQUIRED",
+            Self::FreshChecksRequired => "MUSE_JOURNAL_FRESH_CHECKS_REQUIRED",
+            Self::GrantRequired => "MUSE_JOURNAL_SESSION_MCP_GRANT_REQUIRED",
+            Self::ProvenanceRequired => "MUSE_JOURNAL_FAMILY_PROVENANCE_REQUIRED",
         }
     }
 }
@@ -133,6 +166,12 @@ fn atom(value: &str) -> bool {
 fn digest(value: &Value) -> Result<Sha256Digest, Fault> {
     Sha256Digest::of_canonical_json(value).map_err(|_| Fault::InvalidState)
 }
+fn instance_token(boot:&str)->Result<String,Fault> {
+    use std::sync::atomic::{AtomicU64,Ordering};
+    static NEXT:AtomicU64=AtomicU64::new(0);
+    let sequence=NEXT.fetch_update(Ordering::SeqCst,Ordering::SeqCst,|n|n.checked_add(1)).map_err(|_|Fault::Capacity)?;
+    Ok(digest(&json!({"boot":boot,"process":std::process::id(),"instance":sequence}))?.as_str().to_owned())
+}
 
 /// Exact saved JSON plus SHA-256 of its canonical JSON value, matching the
 /// public SDK's value-equivalent command signature contract. Byte equality is
@@ -164,6 +203,71 @@ impl SavedJson {
         }
         Ok(value)
     }
+}
+
+// The public generated schema is additive on the wire. Retention deliberately
+// accepts only its declared fields, recursively, plus explicitly typed maps.
+// Thus full known ACKs survive, while arbitrary future/credential fields do not.
+fn closed_shape(s: &Value, v: &Value, depth: usize) -> Result<(), Fault> {
+    if depth > 64 { return Err(Fault::Capacity); }
+    if let Some(reference) = s["$ref"].as_str() {
+        let name = reference.strip_prefix("#/$defs/").ok_or(Fault::InvalidState)?;
+        return closed_shape(schema::definition_schema(name).map_err(|_| Fault::InvalidState)?, v, depth + 1);
+    }
+    for union in ["oneOf", "anyOf"] {
+        if let Some(arms) = s[union].as_array() {
+            return if arms.iter().any(|arm| closed_shape(arm, v, depth + 1).is_ok()) { Ok(()) } else { Err(Fault::InvalidState) };
+        }
+    }
+    if let Some(value) = s.get("const") { if value != v { return Err(Fault::InvalidState); } }
+    if let Some(values) = s["enum"].as_array() { if !values.contains(v) { return Err(Fault::InvalidState); } }
+    if let Some(ty) = s.get("type") {
+        let matches = |ty: &str| match ty { "object" => v.is_object(), "array" => v.is_array(), "string" => v.is_string(), "null" => v.is_null(), "boolean" => v.is_boolean(), "integer" => v.as_i64().is_some() || v.as_u64().is_some(), "number" => v.is_number(), _ => false };
+        if !ty.as_str().is_some_and(matches) && !ty.as_array().is_some_and(|types| types.iter().any(|ty| ty.as_str().is_some_and(matches))) { return Err(Fault::InvalidState); }
+    }
+    if let Some(object) = v.as_object() {
+        if let Some(required) = s["required"].as_array() {
+            if required.iter().any(|key| key.as_str().is_none_or(|key| !object.contains_key(key))) { return Err(Fault::InvalidState); }
+        }
+        for (key, value) in object {
+            if let Some(property) = s["properties"].get(key) { closed_shape(property, value, depth + 1)?; }
+            else if let Some(additional) = s.get("additionalProperties").filter(|s| s.is_object()) { closed_shape(additional, value, depth + 1)?; }
+            else { return Err(Fault::InvalidState); }
+        }
+    }
+    if let Some(items) = v.as_array() {
+        let item_schema = s.get("items").ok_or(Fault::InvalidState)?;
+        for item in items { closed_shape(item_schema, item, depth + 1)?; }
+    }
+    Ok(())
+}
+fn reject_private_keys(v: &Value) -> Result<(), Fault> {
+    match v {
+        Value::Object(object) => for (key, value) in object {
+            if ["modelproviderkey", "providerapikey"].contains(&key.to_ascii_lowercase().as_str()) { return Err(Fault::InvalidState); }
+            if key=="env" && value.as_object().is_some_and(|env|env.keys().any(|key|key.eq_ignore_ascii_case("HOME")||key.to_ascii_uppercase().starts_with("XDG_"))) {return Err(Fault::InvalidState);}
+            reject_private_keys(value)?;
+        },
+        Value::Array(items) => for item in items { reject_private_keys(item)?; },
+        _ => {},
+    }
+    Ok(())
+}
+fn definition(name: &str, v: &Value) -> Result<(), Fault> {
+    schema::validate_definition(name, v).map_err(|_| Fault::InvalidState)?;
+    closed_shape(schema::definition_schema(name).map_err(|_| Fault::InvalidState)?, v, 0)?;
+    reject_private_keys(v)
+}
+fn reply_method(method: &str) -> bool { matches!(method, "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify") }
+fn ack_definition(method: &str) -> Result<&'static str, Fault> {
+    Ok(match method {
+        "session/start" => "SessionStartResult", "session/resume" => "SessionResumeResult",
+        "turn/start" => "TurnStartResult", "turn/steer" => "TurnSteerResult",
+        "session/setModel" => "SessionSetModelResult", "session/setReasoningEffort" => "SessionSetReasoningEffortResult", "session/setApprovalMode" => "SessionSetApprovalModeResult",
+        "approval/decide" => "ApprovalDecideResult", "userInput/answer" => "UserInputAnswerResult", "userInput/cancel" => "UserInputCancelResult", "userInput/clarify" => "UserInputClarifyResult",
+        "goal/set" | "goal/edit" | "goal/pause" | "goal/resume" | "goal/clear" => "GoalCommandResult",
+        _ => return Err(Fault::InvalidState),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +312,26 @@ impl NativeInvocation {
             .ok_or(Fault::InvalidState)
     }
     fn validate(&self, scope: &Scope) -> Result<(), Fault> {
+        let params = Value::Object(self.params()?);
+        let target = params["sessionId"].as_str().filter(|id| atom(id)).ok_or(Fault::InvalidState)?;
+        ack_definition(&self.method)?;
+        commands::validate_native_command_id(&self.command_id).map_err(|_| Fault::InvalidState)?;
+        if params["commandId"] != self.command_id
+            || self.payload_sha256 != digest(&json!({"method":self.method,"params":params}))?
+            || target != scope.native_root_id && !reply_method(&self.method)
+        { return Err(Fault::ScopeMismatch); }
+        schema::validate_method_parameters(&self.method, &params).map_err(|_| Fault::InvalidState)?;
+        closed_shape(schema::method_parameters_schema(&self.method).map_err(|_| Fault::InvalidState)?, &params, 0)?;
+        if self.method == "session/resume" && params["excludeItems"] != true { return Err(Fault::InvalidState); }
+        if matches!(self.method.as_str(), "goal/set" | "goal/edit") {
+            let objective = params["objective"].as_str().ok_or(Fault::InvalidState)?;
+            if objective.is_empty() || objective.trim() != objective { return Err(Fault::InvalidState); }
+        }
+        reject_private_keys(&params)?;
+        Ok(())
+    }
+    // Read-only compatibility for v1, never an implicit upgrade/replay permit.
+    fn validate_v1(&self, scope: &Scope) -> Result<(), Fault> {
         let id = self.command_id.as_bytes();
         if id.len() != 36
             || id[14] != b'7'
@@ -344,13 +468,224 @@ struct Delivery {
     method: DeliveryMethod,
     params: SavedJson,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+/// Omitted selectors remain omitted. These are constraints, never observations.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedSelectors {
+    pub model_id: Option<String>,
+    pub provider_id: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+impl RetainedSelectors {
+    fn encoder(&self) -> commands::RequestedSelectors {
+        commands::RequestedSelectors { model_id:self.model_id.clone(), provider_id:self.provider_id.clone(), reasoning_effort:self.reasoning_effort.clone() }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetainedModelState { Unknown, Pending, Settled }
+/// Compact, exact session/read work sample. No log path, preview or transcript.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedWorkFence {
+    session_id: String,
+    model_id: Option<String>,
+    provider_id: Option<String>,
+    workspace_root: Option<String>,
+    status: String,
+    active_turn_id: Option<String>,
+    model_state: RetainedModelState,
+    standing_effort: Option<String>,
+    sampled_revision: u64,
+}
+impl RetainedWorkFence {
+    pub fn session_id(&self) -> &str { &self.session_id }
+    pub fn revision(&self) -> u64 { self.sampled_revision }
+    fn facts(&self) -> commands::WorkFacts<'_> {
+        commands::WorkFacts { read_method:"session/read",session_id:&self.session_id,model_id:self.model_id.as_deref(),provider_id:self.provider_id.as_deref(),status:&self.status,active_turn_id:self.active_turn_id.as_deref(),sampled_event_version:self.sampled_revision,current_event_version:self.sampled_revision,model_configuration:match self.model_state {RetainedModelState::Unknown=>commands::ModelConfiguration::Unknown,RetainedModelState::Pending=>commands::ModelConfiguration::Pending,RetainedModelState::Settled=>commands::ModelConfiguration::Settled},standing_effort:self.standing_effort.as_deref() }
+    }
+    fn same_work(&self, other: &Self) -> bool {
+        self.session_id==other.session_id && self.model_id==other.model_id && self.provider_id==other.provider_id && self.workspace_root==other.workspace_root && self.status==other.status && self.active_turn_id==other.active_turn_id && self.model_state==other.model_state && self.standing_effort==other.standing_effort
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedPending { method:String, params:SavedJson, revision:u64 }
+
+/// The original Host command, original receipt and original worker boot survive
+/// replacement. TaskPrompt lives once, inside command.input; task_prompt()
+/// revalidates that exact typed envelope/context rather than rebinding its boot.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedCommandContext {
+    command: RuntimeCommand,
+    original_receipt: ModuleReceiptIdentity,
+    original_boot: String,
+    native_command_id: String,
+    payload_sha256: String,
+    requested: RetainedSelectors,
+    work: Option<RetainedWorkFence>,
+    pending: Option<RetainedPending>,
+    family: Option<FamilyProof>,
+    session_mcp_granted: bool,
+}
+impl RetainedCommandContext {
+    pub fn command(&self) -> &RuntimeCommand { &self.command }
+    pub fn original_receipt(&self) -> &ModuleReceiptIdentity { &self.original_receipt }
+    pub fn original_boot(&self) -> &str { &self.original_boot }
+    pub fn native_command_id(&self) -> &str { &self.native_command_id }
+    pub fn payload_sha256(&self) -> &str { &self.payload_sha256 }
+    pub fn requested(&self) -> &RetainedSelectors { &self.requested }
+    pub fn work_fence(&self) -> Option<&RetainedWorkFence> { self.work.as_ref() }
+    pub fn task_prompt(&self, scope:&Scope) -> Result<Option<commands::ValidatedTaskPrompt>, Fault> {
+        match self.encoding(scope)? { commands::CommandEncoding::Native {task_prompt,..} => Ok(task_prompt.map(|prompt|*prompt)), _ => Err(Fault::InvalidState) }
+    }
+    fn encoding(&self, scope:&Scope) -> Result<commands::CommandEncoding, Fault> {
+        scope.receipt(&self.original_receipt)?;
+        if !atom(&self.original_boot) || self.command.operation_id!=self.original_receipt.operation_id || self.command.input_sha256.as_deref()!=Some(self.original_receipt.input_sha256.as_str()) {return Err(Fault::ScopeMismatch);}
+        if let Some(work)=&self.work {
+            if work.session_id!=scope.native_root_id || !matches!(work.status.as_str(),"idle"|"running"|"notLoaded") || work.model_id.iter().chain(work.provider_id.iter()).chain(work.workspace_root.iter()).chain(work.active_turn_id.iter()).chain(work.standing_effort.iter()).any(|s|!atom(s))
+                || work.status=="idle" && work.active_turn_id.is_some() || work.status=="running" && work.active_turn_id.is_none()
+                || self.command.route["native_options"].get("workspaceRoot").is_some_and(|v|v.as_str()!=work.workspace_root.as_deref())
+            {return Err(Fault::InvalidState);}
+        }
+        reject_private_keys(&serde_json::to_value(&self.command).map_err(|_|Fault::InvalidState)?)?;
+        let route=self.command.route.as_object().ok_or(Fault::InvalidState)?;
+        if route.keys().any(|k| !["module_artifact_id","native_options"].contains(&k.as_str())) {return Err(Fault::InvalidState);}
+        if let Some(options)=route.get("native_options") {
+            let options=options.as_object().ok_or(Fault::InvalidState)?;
+            if options.keys().any(|k| !["workspaceRoot","nativeExecutable","modelId","providerId","reasoningEffort","approvalMode","mcpServers"].contains(&k.as_str())) {return Err(Fault::InvalidState);}
+        }
+        let allowed:&[&str]=match self.command.method.as_str() {
+            "agent.open"=>&[], "agent.send"=>&["text","delivery","expected_turn_id"],
+            "task.dispatch"=>&["text","delivery","expected_turn_id","task_prompt","task_dispatch_context","attempt_id"],
+            "agent.reply"=>&["reply"], "agent.configure"=>&["settings"],
+            "agent.goal"=>&["action","objective"], "agent.recover"=>&["expected_boot_id"],
+            _=>return Err(Fault::InvalidState),
+        };
+        if self.command.input.as_object().is_none_or(|v|v.keys().any(|k|!allowed.contains(&k.as_str()))) {return Err(Fault::InvalidState);}
+        let children=self.family.as_ref().map_or_else(Vec::new,|f|f.edges.iter().map(|e|e.child_session_id.clone()).collect());
+        let pending=self.pending.as_ref().map(|p|p.params.value()).transpose()?;
+        let requested=self.requested.encoder();
+        let cx=commands::EncodeContext {
+            expected_receipt:&self.original_receipt,worker_boot_id:&self.original_boot,
+            native_root_id:if self.command.method=="agent.open"{None}else{Some(scope.native_root_id.as_str())},
+            fresh_root_session_id:if self.command.method=="agent.open"{Some(scope.native_root_id.as_str())}else{None},
+            native_command_id:Some(&self.native_command_id),initialized:true,observed_children:&children,requested:&requested,
+            work:self.work.as_ref().map(RetainedWorkFence::facts),
+            pending_request:self.pending.as_ref().zip(pending.as_ref()).map(|(p,params)|commands::PendingRequestFacts{method:&p.method,params,sampled_event_version:p.revision,current_event_version:p.revision}),
+            recovery:Some(commands::RecoveryFacts{durability:commands::SessionDurability::Durable,native_ready:false}),
+            validated_result_input:None,session_mcp_granted:self.session_mcp_granted,
+        };
+        commands::encode(&self.command,&cx).map_err(|_|Fault::InvalidState)
+    }
+    fn validate(&self,scope:&Scope,invocation:&NativeInvocation)->Result<(),Fault> {
+        if self.native_command_id!=invocation.command_id || self.payload_sha256!=invocation.payload_sha256() {return Err(Fault::IntentConflict);}
+        if let Some(family)=&self.family {family.validate(scope,invocation.params()?["sessionId"].as_str().ok_or(Fault::InvalidState)?)?;}
+        match self.encoding(scope)? {
+            commands::CommandEncoding::Native{request,requested,..} if request.method==invocation.method && request.params==invocation.params()? => {
+                if let Some(requested)=requested {if requested!=self.requested.encoder(){return Err(Fault::IntentConflict);}}
+                Ok(())
+            },
+            _=>Err(Fault::IntentConflict),
+        }
+    }
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FamilyEdge { parent_session_id:String, child_session_id:String, item_id:String, parent_turn_id:Option<String>, item_revision:u64, kind:String }
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FamilyProof { projection_sha256:Sha256Digest, edges:Vec<FamilyEdge> }
+impl FamilyProof {
+    fn validate(&self,scope:&Scope,target:&str)->Result<(),Fault> {
+        let mut parent=scope.native_root_id.as_str();let mut seen=BTreeSet::new();seen.insert(parent);
+        if self.edges.len()>128{return Err(Fault::Capacity);}
+        for edge in &self.edges {
+            if edge.parent_session_id!=parent || !atom(&edge.child_session_id) || !atom(&edge.item_id) || edge.item_revision==0 || !matches!(edge.kind.as_str(),"subagent"|"reminderChild") || !seen.insert(&edge.child_session_id) || edge.parent_turn_id.as_ref().is_some_and(|t|!atom(t)) {return Err(Fault::ProvenanceRequired);}
+            parent=&edge.child_session_id;
+        }
+        if parent!=target{return Err(Fault::ProvenanceRequired);}Ok(())
+    }
+}
+/// Opaque, bounded projection from the shared observation reducer. There is no
+/// public constructor from an arbitrary session argument or caller-authored JSON.
+#[derive(Clone)]
+pub struct ProjectionSnapshot { checkpoint:SavedJson, capture:CaptureStamp }
+impl ProjectionSnapshot {
+    fn from_projector(projector:&ObservationProjector,capture:CaptureStamp)->Result<Self,Fault> {
+        Ok(Self{checkpoint:SavedJson::new(&projector.checkpoint().map_err(|_|Fault::InvalidState)?)?,capture})
+    }
+}
+/// Both opaque boundaries are retained together. complete is only this parent's
+/// scan status; it is never whole-family completion or permission to discard.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildDiscovery {
+    pub parent_session_id:String,
+    pub after:Option<String>,
+    pub next:Option<String>,
+    pub complete:bool,
+}
+impl ChildDiscovery {
+    fn validate(&self)->Result<(),Fault> {
+        if !atom(&self.parent_session_id) || self.after.iter().chain(self.next.iter()).any(|s|!atom(s)) || self.complete!=self.next.is_none() || self.next.is_some() && self.after==self.next {return Err(Fault::InvalidState);}Ok(())
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingInventory {
+    session_id:String,
+    sampled_revision:u64,
+    inventory:SavedJson,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture:Option<CaptureStamp>,
+}
+impl PendingInventory {
+    /// before/after are sampled under the Driver's event mutex around the read.
+    fn from_read(session_id:&str,before:u64,after:u64,inventory:Value)->Result<Self,Fault> {
+        if !atom(session_id)||before!=after{return Err(Fault::FreshChecksRequired);}
+        definition("ApprovalListPendingResult",&inventory)?;
+        let mut seen=BTreeSet::new();
+        for (key,id) in [("approvals","approvalId"),("userInputs","userInputId")] {
+            for row in inventory[key].as_array().ok_or(Fault::InvalidState)? {
+                let identity=row[id].as_str().filter(|id|atom(id)).ok_or(Fault::InvalidState)?;
+                if row["sessionId"]!=session_id || !seen.insert((key,identity)) {return Err(Fault::ProvenanceRequired);}
+            }
+        }
+        Ok(Self{session_id:session_id.into(),sampled_revision:before,inventory:SavedJson::new(&inventory)?,capture:None})
+    }
+    pub fn session_id(&self)->&str{&self.session_id}
+    pub fn value(&self)->Result<Value,Fault>{self.inventory.value()}
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationBundle { source_boot:String, projection:SavedJson, discovery:Vec<ChildDiscovery>, inventories:Vec<PendingInventory> }
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureStamp { instance:String, connection:u64, epoch:u64 }
+/// Issued only from a retained CURRENT connection projection. A checkpoint
+/// restore, connection change, event invalidation or native write revokes it.
+#[derive(Clone)]
+pub struct SessionAuthority { session_id:String, instance:String, connection:u64, epoch:u64, scope_sha256:Sha256Digest, proof:FamilyProof }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RestoredFreshness { Stale }
+pub struct RestoredObservations {
+    pub projection:Value,
+    pub discovery:Vec<ChildDiscovery>,
+    pub inventories:Vec<PendingInventory>,
+    pub freshness:RestoredFreshness,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Operation {
     receipt: ModuleReceiptIdentity,
     native: Option<NativePending>,
     final_delivery: Option<Delivery>,
     final_host_acked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    family: Option<FamilyProof>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -358,13 +693,19 @@ struct Slot {
     revision: u64,
     delivery: Delivery,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
     revision: u64,
     durability: Option<DurabilityFact>,
     operations: BTreeMap<String, Operation>,
     outbox: BTreeMap<String, Slot>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    contexts: BTreeMap<String, RetainedCommandContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observations: Option<ObservationBundle>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    legacy_operations: BTreeSet<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -443,6 +784,15 @@ pub struct Journal {
     poisoned: bool,
     // Read freshness is connection-local, never restored from a checkpoint.
     exact_root_read: bool,
+    restored: bool,
+    initialized: bool,
+    durability_observed: bool,
+    session_mcp_granted: bool,
+    connection: u64,
+    observation_epoch: u64,
+    observations_fresh: bool,
+    fresh_work: Option<RetainedWorkFence>,
+    instance: String,
 }
 
 impl Journal {
@@ -465,6 +815,7 @@ impl Journal {
 
     fn create_at(dir: &Path, scope: Scope, boot: String) -> Result<Self, Fault> {
         scope.validate()?;
+        let instance=instance_token(&boot)?;
         reject_legacy(dir)?;
         if present(&dir.join(MARKER))? || present(&dir.join(CHECKPOINT))? {
             return Err(Fault::StateAlreadyExists);
@@ -484,6 +835,9 @@ impl Journal {
             durability: None,
             operations: BTreeMap::new(),
             outbox: BTreeMap::new(),
+            contexts: BTreeMap::new(),
+            observations: None,
+            legacy_operations: BTreeSet::new(),
         };
         let path = dir.join(CHECKPOINT);
         write_private_new(&path, &encode(&scope, &state)?)
@@ -495,10 +849,14 @@ impl Journal {
             state,
             poisoned: false,
             exact_root_read: false,
+            restored: false, initialized: false, durability_observed: false, session_mcp_granted: false,
+            connection: 0, observation_epoch: 0, observations_fresh: false, fresh_work: None,
+            instance,
         })
     }
     fn open_at(dir: &Path, scope: Scope, boot: String) -> Result<Self, Fault> {
         scope.validate()?;
+        let instance=instance_token(&boot)?;
         reject_legacy(dir)?;
         if !present(&dir.join(MARKER))? || !present(&dir.join(CHECKPOINT))? {
             return Err(Fault::MissingState);
@@ -512,16 +870,22 @@ impl Journal {
             return Err(Fault::ScopeMismatch);
         }
         let path = dir.join(CHECKPOINT);
-        let checkpoint: Checkpoint = serde_json::from_slice(
-            &read_private_durable(&path, MAX_FILE).map_err(|_| Fault::PersistenceUnknown)?,
-        )
-        .map_err(|_| Fault::InvalidState)?;
-        if checkpoint.format != FORMAT || checkpoint.version != VERSION || checkpoint.scope != scope
+        let bytes=read_private_durable(&path, MAX_FILE).map_err(|_| Fault::PersistenceUnknown)?;
+        let raw:Value=serde_json::from_slice(&bytes).map_err(|_|Fault::InvalidState)?;
+        let mut checkpoint: Checkpoint = serde_json::from_value(raw.clone()).map_err(|_| Fault::InvalidState)?;
+        if checkpoint.format != FORMAT || ![VERSION,CHECKPOINT_VERSION].contains(&checkpoint.version) || checkpoint.scope != scope
         {
             return Err(Fault::ScopeMismatch);
         }
-        if checkpoint.sha256 != state_digest(&scope, &checkpoint.state)? {
+        if checkpoint.sha256 != digest(&json!({"format":FORMAT,"version":checkpoint.version,"scope":scope,"state":raw["state"]}))?
+            || serde_json::to_value(&checkpoint.state).map_err(|_|Fault::InvalidState)? != raw["state"] {
             return Err(Fault::InvalidState);
+        }
+        if checkpoint.version==VERSION {
+            // Historical NEW-Rust state stays readable/deliverable. It carries
+            // no validated v2 context; never infer missing facts or replay it.
+            if !checkpoint.state.contexts.is_empty() || checkpoint.state.observations.is_some() || !checkpoint.state.legacy_operations.is_empty() {return Err(Fault::InvalidState);}
+            checkpoint.state.legacy_operations=checkpoint.state.operations.keys().cloned().collect();
         }
         validate_state(&scope, &checkpoint.state)?;
         Ok(Self {
@@ -531,6 +895,9 @@ impl Journal {
             state: checkpoint.state,
             poisoned: false,
             exact_root_read: false,
+            restored: true, initialized: false, durability_observed: false, session_mcp_granted: false,
+            connection: 0, observation_epoch: 0, observations_fresh: false, fresh_work: None,
+            instance,
         })
     }
     fn healthy(&self, scope: &Scope) -> Result<(), Fault> {
@@ -556,17 +923,198 @@ impl Journal {
         self.state = next;
         Ok(())
     }
+
+    fn invalidate_freshness(&mut self)->Result<(),Fault> {
+        self.observations_fresh=false;self.fresh_work=None;self.exact_root_read=false;
+        let Some(epoch)=self.observation_epoch.checked_add(1) else{self.poisoned=true;return Err(Fault::Capacity);};
+        self.observation_epoch=epoch;Ok(())
+    }
+    fn capture_stamp(&self)->CaptureStamp {CaptureStamp{instance:self.instance.clone(),connection:self.connection,epoch:self.observation_epoch}}
+    /// Capture and retain under the same Driver event mutex, with no await in
+    /// between. Events revoke the capture, so an old fold cannot regain freshness.
+    pub(crate) fn capture_projection(&self,scope:&Scope,projector:&ObservationProjector)->Result<ProjectionSnapshot,Fault> {
+        self.healthy(scope)?;if !self.initialized{return Err(Fault::FreshChecksRequired);}
+        ProjectionSnapshot::from_projector(projector,self.capture_stamp())
+    }
+    /// Call after a stable listPending read, using the authority held across
+    /// that read. Retained inventories from an earlier instance cannot be reused.
+    pub fn capture_pending_inventory(&mut self,scope:&Scope,authority:&SessionAuthority,before:u64,after:u64,value:Value)->Result<PendingInventory,Fault> {
+        if !self.authority_is_current(scope,authority){return Err(Fault::FreshChecksRequired);}
+        let mut inventory=match PendingInventory::from_read(&authority.session_id,before,after,value){Ok(value)=>value,Err(error)=>{self.invalidate_freshness()?;return Err(error);}};
+        inventory.capture=Some(self.capture_stamp());Ok(inventory)
+    }
+    /// Driver calls under its event/mutation mutex BEFORE reducing any native
+    /// event or changing connections. Coarse revocation is intentionally safe.
+    pub fn invalidate_observations(&mut self,scope:&Scope)->Result<(),Fault> {
+        self.healthy(scope)?;self.invalidate_freshness()
+    }
+    /// Call only after the correlated initialize result and initialized flush
+    /// on the same connection. Validate the full result, persist only durability;
+    /// museHome/userAgent/provider settings are never copied into the journal.
+    pub fn record_initialize(&mut self,scope:&Scope,observed_namespace:&str,initialize:&Value)->Result<(),Fault> {
+        self.healthy(scope)?;
+        self.initialized=false;self.durability_observed=false;self.session_mcp_granted=false;self.invalidate_freshness()?;
+        if observed_namespace!=scope.native_namespace{return Err(Fault::ScopeMismatch);}
+        let profile=Durability::from_initialize_declaration(initialize.get("sessionDurability"));
+        let mut compatible=initialize.clone();
+        if profile==Durability::Unrecognized {compatible.as_object_mut().ok_or(Fault::InvalidState)?.remove("sessionDurability");}
+        schema::validate_definition("InitializeResult",&compatible).map_err(|_|Fault::InvalidState)?;
+        if initialize["schema"]["version"]!=1{return Err(Fault::InvalidState);}
+        self.record_durability(scope,profile)?;
+        self.initialized=true;
+        self.session_mcp_granted=initialize["grantedCapabilities"].as_array().is_some_and(|grants|grants.iter().any(|grant|grant=="sessionMcp"));
+        Ok(())
+    }
+    /// Stable exact-root read, not load/attach/list. The Driver supplies before
+    /// and after event versions sampled around this actual native read.
+    pub fn record_work_read(&mut self,scope:&Scope,before:u64,after:u64,read:&Value,model_state:RetainedModelState,standing_effort:Option<String>)->Result<RetainedWorkFence,Fault> {
+        self.healthy(scope)?;self.invalidate_freshness()?;
+        if !self.initialized || before!=after{return Err(Fault::FreshChecksRequired);}
+        definition("SessionReadResult",read)?;
+        if read["session"]["sessionId"]!=scope.native_root_id || read["history"]["mode"]!="none" || !read["history"]["items"].is_null() || !read["history"]["snapshot"].is_null() {return Err(Fault::ScopeMismatch);}
+        let session=&read["session"];
+        let sample=RetainedWorkFence {
+            session_id:scope.native_root_id.clone(),model_id:session["modelId"].as_str().map(str::to_owned),provider_id:session["providerId"].as_str().map(str::to_owned),
+            workspace_root:session["workspaceRoot"].as_str().map(str::to_owned),status:session["status"].as_str().ok_or(Fault::InvalidState)?.into(),
+            active_turn_id:session["activeTurnId"].as_str().map(str::to_owned),model_state,standing_effort,sampled_revision:before,
+        };
+        if sample.status=="idle" && sample.active_turn_id.is_some() || sample.status=="running" && sample.active_turn_id.is_none(){return Err(Fault::InvalidState);}
+        self.exact_root_read=true;self.fresh_work=Some(sample.clone());Ok(sample)
+    }
+    /// One atomic checkpoint pairs the SHARED projector with its parent cursor
+    /// boundaries and exact pending inventories. No second state file exists.
+    pub fn retain_observations(&mut self,scope:&Scope,projection:ProjectionSnapshot,discovery:Vec<ChildDiscovery>,inventories:Vec<PendingInventory>)->Result<(),Fault> {
+        self.healthy(scope)?;
+        if !self.initialized{return Err(Fault::FreshChecksRequired);}
+        if projection.capture!=self.capture_stamp() || inventories.iter().any(|i|i.capture.as_ref()!=Some(&self.capture_stamp())){return Err(Fault::FreshChecksRequired);}
+        let bundle=ObservationBundle{source_boot:self.boot.clone(),projection:projection.checkpoint,discovery,inventories};
+        if let Err(error)=validate_bundle(scope,&bundle){self.invalidate_freshness()?;return Err(error);}
+        self.invalidate_freshness()?;
+        let mut next=self.state.clone();next.observations=Some(bundle);self.commit(next)?;
+        self.observations_fresh=true;Ok(())
+    }
+    /// Restore through the shared reducer's stale path, preserving parent
+    /// provenance/cursor pairs and pending payloads only as historical facts.
+    /// No authority ticket can be obtained until CURRENT facts are retained.
+    pub fn restored_observations(&self,scope:&Scope)->Result<Option<RestoredObservations>,Fault> {
+        self.healthy(scope)?;
+        let Some(bundle)=&self.state.observations else{return Ok(None);};
+        let old=projection_fence(scope,&bundle.source_boot);
+        let restored=ObservationProjector::restore(old,bundle.projection.value()?).map_err(|_|Fault::InvalidState)?;
+        let mut checkpoint=restored.checkpoint().map_err(|_|Fault::InvalidState)?;
+        checkpoint["fence"]["bridge_boot_id"]=json!(self.boot);
+        let current=ObservationProjector::restore(projection_fence(scope,&self.boot),checkpoint).map_err(|_|Fault::InvalidState)?;
+        Ok(Some(RestoredObservations{projection:current.checkpoint().map_err(|_|Fault::InvalidState)?,discovery:bundle.discovery.clone(),inventories:bundle.inventories.clone(),freshness:RestoredFreshness::Stale}))
+    }
+    pub fn authorize_session(&self,scope:&Scope,session_id:&str)->Result<SessionAuthority,Fault> {
+        self.healthy(scope)?;
+        if !self.initialized{return Err(Fault::FreshChecksRequired);}
+        let proof=if self.observations_fresh {
+            family_proof(scope,&self.state.observations.as_ref().ok_or(Fault::ProvenanceRequired)?.projection.value()?,session_id,true)?
+        }else if session_id==scope.native_root_id && self.fresh_work.is_some() {
+            FamilyProof{projection_sha256:digest(&serde_json::to_value(&self.fresh_work).map_err(|_|Fault::InvalidState)?)?,edges:Vec::new()}
+        }else{return Err(Fault::FreshChecksRequired);};
+        Ok(SessionAuthority{session_id:session_id.into(),instance:self.instance.clone(),connection:self.connection,epoch:self.observation_epoch,scope_sha256:digest(&serde_json::to_value(scope).map_err(|_|Fault::InvalidState)?)?,proof})
+    }
+    /// Use as results reader's authority callback before AND after every read.
+    pub fn authority_is_current(&self,scope:&Scope,authority:&SessionAuthority)->bool {
+        self.healthy(scope).is_ok() && self.initialized && authority.instance==self.instance && authority.connection==self.connection && authority.epoch==self.observation_epoch
+            && digest(&serde_json::to_value(scope).unwrap_or(Value::Null)).is_ok_and(|hash|hash==authority.scope_sha256)
+            && authority.proof.validate(scope,&authority.session_id).is_ok()
+    }
+    pub fn retained_command(&self,scope:&Scope,operation_id:&str)->Result<Option<&RetainedCommandContext>,Fault> {
+        self.healthy(scope)?;Ok(self.state.contexts.get(operation_id))
+    }
+    pub fn retained_invocation(&self,scope:&Scope,operation_id:&str)->Result<&NativeInvocation,Fault> {
+        self.healthy(scope)?;self.state.operations.get(operation_id).and_then(|op|op.native.as_ref()).map(|n|&n.invocation).ok_or(Fault::IntentConflict)
+    }
+    /// Persist context AND intent in one replacement before returning a permit.
+    /// Required Driver entry for durable cross-worker commands. The caller must
+    /// still check current Host authorization immediately at native enqueue.
+    pub fn prepare_command(&mut self,scope:&Scope,receipt:ModuleReceiptIdentity,command:RuntimeCommand,invocation:NativeInvocation,requested:RetainedSelectors)->Result<PreparedNative<'_>,Fault> {
+        self.healthy(scope)?;
+        if !self.initialized{return Err(Fault::FreshChecksRequired);}
+        invocation.validate(scope)?;
+        let params=invocation.params()?;
+        let target=params["sessionId"].as_str().ok_or(Fault::InvalidState)?;
+        let authority=if command.method=="agent.open"{None}else{Some(self.authorize_session(scope,target)?)};
+        let pending=if command.method=="agent.reply"{Some(self.pending_for(&invocation)?)}else{None};
+        let needs_work=matches!(command.method.as_str(),"agent.send"|"task.dispatch"|"agent.recover") || command.method=="agent.goal" && matches!(command.input["action"].as_str(),Some("set"|"edit"|"resume"));
+        let work=if needs_work {Some(self.fresh_work.clone().ok_or(Fault::FreshChecksRequired)?)}else{None};
+        if params.contains_key("config") && !self.session_mcp_granted{return Err(Fault::GrantRequired);}
+        let mut context=RetainedCommandContext{command,original_receipt:receipt.clone(),original_boot:self.boot.clone(),native_command_id:invocation.command_id.clone(),payload_sha256:invocation.payload_sha256().into(),requested,work,pending,family:authority.map(|a|a.proof),session_mcp_granted:self.session_mcp_granted};
+        if let commands::CommandEncoding::Native{requested:Some(selectors),..}=context.encoding(scope)? {
+            context.requested=RetainedSelectors{model_id:selectors.model_id,provider_id:selectors.provider_id,reasoning_effort:selectors.reasoning_effort};
+        }
+        context.validate(scope,&invocation)?;
+        self.prepare(scope,receipt,invocation,Some(context))
+    }
+    fn pending_for(&self,invocation:&NativeInvocation)->Result<RetainedPending,Fault> {
+        if !self.observations_fresh{return Err(Fault::FreshChecksRequired);}
+        let params=invocation.params()?;
+        let approval=invocation.method=="approval/decide";
+        let (list,id,method)=if approval{("approvals","approvalId","approval/request")}else{("userInputs","userInputId","userInput/request")};
+        for inventory in &self.state.observations.as_ref().ok_or(Fault::ProvenanceRequired)?.inventories {
+            if params["sessionId"]!=inventory.session_id{continue;}
+            let value=inventory.value()?;
+            if let Some(row)=value[list].as_array().and_then(|rows|rows.iter().find(|row|row[id]==params[id])) {
+                return Ok(RetainedPending{method:method.into(),params:SavedJson::new(row)?,revision:inventory.sampled_revision});
+            }
+        }
+        Err(Fault::ProvenanceRequired)
+    }
+    fn validate_replay(&self,scope:&Scope,context:&RetainedCommandContext,invocation:&NativeInvocation)->Result<(),Fault> {
+        if !self.initialized{return Err(Fault::FreshChecksRequired);}
+        context.validate(scope,invocation)?;
+        let params=invocation.params()?;
+        if params.contains_key("config") && !self.session_mcp_granted{return Err(Fault::GrantRequired);}
+        if invocation.method!="session/start" {
+            let current=self.authorize_session(scope,params["sessionId"].as_str().ok_or(Fault::InvalidState)?)?;
+            if context.family.as_ref().is_some_and(|original|original.edges!=current.proof.edges){return Err(Fault::ProvenanceRequired);}
+        }
+        if let Some(original)=&context.work {
+            if self.fresh_work.as_ref().is_none_or(|fresh|!original.same_work(fresh)){return Err(Fault::FreshChecksRequired);}
+            commands::validate_requested_readback(&context.requested.encoder(),original.model_id.as_deref(),original.provider_id.as_deref()).map_err(|_|Fault::FreshChecksRequired)?;
+        }
+        if let Some(original)=&context.pending {
+            let fresh=self.pending_for(invocation)?;
+            if fresh.method!=original.method || fresh.params!=original.params{return Err(Fault::FreshChecksRequired);}
+        }
+        Ok(())
+    }
+    /// Explicit new Host operation targets the ORIGINAL immutable receipt hash.
+    /// A lost session/start ACK retains rootless original command identity; no
+    /// adopt/start/fork fallback or replacement TaskPrompt is synthesized.
+    pub fn reconcile_command(&mut self,scope:&Scope,request:&RuntimeCommand,request_receipt:&ModuleReceiptIdentity)->Result<Reconciliation<'_>,Fault> {
+        self.healthy(scope)?;scope.receipt(request_receipt)?;
+        let target=request.input["operation_id"].as_str().ok_or(Fault::InvalidState)?;
+        let context=self.state.contexts.get(target).ok_or(Fault::ContextRequired)?;
+        if request.method!="agent.reconcile" || request.operation_id==target || request.operation_id!=request_receipt.operation_id || request.input_sha256.as_deref()!=Some(request_receipt.input_sha256.as_str())
+            || request.binding_id!=scope.binding_id || request.generation!=scope.generation || request.route["module_artifact_id"]!=scope.artifact.artifact_id.as_str()
+            || request.target_input_sha256.as_deref()!=Some(context.original_receipt.input_sha256.as_str())
+            || request.native_root_id.as_deref().is_some_and(|root|root!=scope.native_root_id)
+            || request.native_root_id.is_none() && context.command.method!="agent.open"
+        {return Err(Fault::ScopeMismatch);}
+        let hash=context.payload_sha256.clone();
+        self.explicit_reconcile(scope,target,&hash)
+    }
     pub fn record_durability(&mut self, scope: &Scope, profile: Durability) -> Result<(), Fault> {
         self.healthy(scope)?;
         // Called for each newly initialized native connection. An old read
         // cannot qualify a different connection, even in the same worker boot.
         self.exact_root_read = false;
+        self.initialized = false;
+        self.durability_observed = false;
+        self.session_mcp_granted = false;
+        self.connection=self.connection.checked_add(1).ok_or(Fault::Capacity)?;
+        self.invalidate_freshness()?;
         let mut next = self.state.clone();
         next.durability = Some(DurabilityFact {
             profile,
             observed_boot: self.boot.clone(),
         });
-        self.commit(next)
+        self.commit(next)?;
+        self.durability_observed=true;Ok(())
     }
     /// Caller has completed an actual session/read without load/attach and
     /// validated its native namespace/model/location. This retains only the
@@ -593,6 +1141,15 @@ impl Journal {
         receipt: ModuleReceiptIdentity,
         invocation: NativeInvocation,
     ) -> Result<PreparedNative<'_>, Fault> {
+        // Compatibility seam for same-worker root-only callers. Driver must
+        // use prepare_command for retained context, MCP config and children.
+        self.healthy(scope)?;
+        if self.restored && !self.state.operations.contains_key(&receipt.operation_id) {return Err(Fault::ContextRequired);}
+        if invocation.params()?["sessionId"]!=scope.native_root_id {return Err(Fault::ProvenanceRequired);}
+        if invocation.params()?.contains_key("config"){return Err(Fault::GrantRequired);}
+        self.prepare(scope,receipt,invocation,None)
+    }
+    fn prepare(&mut self,scope:&Scope,receipt:ModuleReceiptIdentity,invocation:NativeInvocation,context:Option<RetainedCommandContext>)->Result<PreparedNative<'_>,Fault> {
         self.healthy(scope)?;
         scope.receipt(&receipt)?;
         invocation.validate(scope)?;
@@ -612,9 +1169,9 @@ impl Journal {
             return Err(Fault::ExplicitReconcileRequired);
         }
         if invocation.method == "session/resume"
-            && self.state.durability.as_ref().is_none_or(|fact| {
+            && (!self.durability_observed || self.state.durability.as_ref().is_none_or(|fact| {
                 fact.profile != Durability::Durable || fact.observed_boot != self.boot
-            })
+            }))
         {
             return Err(Fault::DurabilityUnavailable);
         }
@@ -632,6 +1189,7 @@ impl Journal {
                 native: None,
                 final_delivery: None,
                 final_host_acked: false,
+                family: context.as_ref().and_then(|c|c.family.clone()),
             });
         operation.native = Some(NativePending {
             invocation,
@@ -639,8 +1197,9 @@ impl Journal {
             ack: None,
             reconcile_block: None,
         });
+        if let Some(context)=context {next.contexts.insert(operation_id.clone(),context);}
         self.commit(next)?;
-        self.exact_root_read = false;
+        self.invalidate_freshness()?;
         Ok(PreparedNative {
             journal: self,
             operation_id,
@@ -727,12 +1286,13 @@ impl Journal {
             });
         }
         if let Some(ack) = &native.ack {
+            if self.state.legacy_operations.contains(operation_id){return Err(Fault::ContextRequired);}
             return Ok(Reconciliation::AckReadback(ack.value()?));
         }
         if let Some(code) = &native.reconcile_block {
             return Ok(Reconciliation::Blocked(code.clone()));
         }
-        if self.state.durability.as_ref().is_none_or(|fact| {
+        if !self.durability_observed || self.state.durability.as_ref().is_none_or(|fact| {
             fact.profile != Durability::Durable || fact.observed_boot != self.boot
         }) {
             return Err(Fault::DurabilityUnavailable);
@@ -741,8 +1301,11 @@ impl Journal {
         if resume && !self.exact_root_read {
             return Err(Fault::ExactRootReadRequired);
         }
+        if self.state.legacy_operations.contains(operation_id) {return Err(Fault::ContextRequired);}
+        if let Some(context)=self.state.contexts.get(operation_id) {self.validate_replay(scope,context,&native.invocation)?;}
+        else if native.submission_boot!=self.boot {return Err(Fault::ContextRequired);}
         self.commit(self.state.clone())?;
-        self.exact_root_read = false;
+        self.invalidate_freshness()?;
         Ok(Reconciliation::Write(PreparedNative {
             journal: self,
             operation_id: operation_id.into(),
@@ -819,6 +1382,7 @@ impl Journal {
                 params: SavedJson::new(&value)?,
             },
             final_delivery,
+            None,
         )
     }
     /// Stores exact caller-produced result page bytes; the facade and Store
@@ -829,6 +1393,15 @@ impl Journal {
         receipt: ModuleReceiptIdentity,
         page: Value,
     ) -> Result<(), Fault> {
+        self.queue_result_inner(scope,receipt,page,None)
+    }
+    /// The reader must check authority_is_current before/after native reads;
+    /// retirement additionally checks the same opaque authority here.
+    pub fn queue_result_for(&mut self,scope:&Scope,receipt:ModuleReceiptIdentity,page:Value,authority:&SessionAuthority)->Result<(),Fault> {
+        if !self.authority_is_current(scope,authority) || page["source"]["native_session_id"]!=authority.session_id {return Err(Fault::ProvenanceRequired);}
+        self.queue_result_inner(scope,receipt,page,Some(authority.proof.clone()))
+    }
+    fn queue_result_inner(&mut self,scope:&Scope,receipt:ModuleReceiptIdentity,page:Value,family:Option<FamilyProof>)->Result<(),Fault> {
         self.healthy(scope)?;
         scope.receipt(&receipt)?;
         if !page.is_object()
@@ -841,7 +1414,7 @@ impl Journal {
             return Err(Fault::IntentConflict);
         }
         if page["source"]["native_session_id"] != scope.native_root_id {
-            return Err(Fault::ScopeMismatch);
+            family.as_ref().ok_or(Fault::ScopeMismatch)?.validate(scope,page["source"]["native_session_id"].as_str().ok_or(Fault::InvalidState)?)?;
         }
         let params = SavedJson::new(&json!({"operation_id":receipt.operation_id,"page":page}))?;
         self.queue(
@@ -851,6 +1424,7 @@ impl Journal {
                 params,
             },
             true,
+            family,
         )
     }
     fn queue(
@@ -858,6 +1432,7 @@ impl Journal {
         receipt: ModuleReceiptIdentity,
         delivery: Delivery,
         final_delivery: bool,
+        family: Option<FamilyProof>,
     ) -> Result<(), Fault> {
         let id = receipt.operation_id.clone();
         if let Some(operation) = self.state.operations.get(&id) {
@@ -889,7 +1464,12 @@ impl Journal {
                 native: None,
                 final_delivery: None,
                 final_host_acked: false,
+                family: family.clone(),
             });
+        if let Some(family)=family {
+            if operation.family.as_ref().is_some_and(|old|old!=&family){return Err(Fault::IntentConflict);}
+            operation.family=Some(family);
+        }
         if final_delivery {
             operation.final_delivery = Some(delivery.clone());
         }
@@ -937,13 +1517,68 @@ impl Journal {
     }
 }
 
+
+fn projection_fence(scope:&Scope,boot:&str)->ProjectionFence {
+    ProjectionFence{binding_id:scope.binding_id.clone(),binding_generation:scope.generation,native_root_id:scope.native_root_id.clone(),native_scope_key:scope.native_namespace.clone(),bridge_boot_id:boot.into()}
+}
+fn family_proof(scope:&Scope,checkpoint:&Value,target:&str,fresh:bool)->Result<FamilyProof,Fault> {
+    if !atom(target){return Err(Fault::ProvenanceRequired);}
+    let state=&checkpoint["state"];
+    if fresh && (state["root_snapshot_freshness"]!="fresh" || state["session"]["sessionId"]!=scope.native_root_id){return Err(Fault::FreshChecksRequired);}
+    let children=state["observed_children"].as_array().ok_or(Fault::InvalidState)?;
+    let mut edges=Vec::new();let mut child=target.to_owned();let mut seen=BTreeSet::new();
+    while child!=scope.native_root_id {
+        if edges.len()>=128 || !seen.insert(child.clone()){return Err(Fault::ProvenanceRequired);}
+        let row=children.iter().find(|row|row["sessionId"]==child).ok_or(Fault::ProvenanceRequired)?;
+        if fresh && (row["snapshot_freshness"]!="fresh" || row["snapshot"]["sessionId"]!=child){return Err(Fault::FreshChecksRequired);}
+        let edge=FamilyEdge {
+            parent_session_id:row["parentSessionId"].as_str().ok_or(Fault::ProvenanceRequired)?.into(),child_session_id:child,
+            item_id:row["itemId"].as_str().ok_or(Fault::ProvenanceRequired)?.into(),
+            parent_turn_id:row["parentTurnId"].as_str().map(str::to_owned),
+            item_revision:row["revision"].as_u64().ok_or(Fault::ProvenanceRequired)?,
+            kind:row["kind"].as_str().ok_or(Fault::ProvenanceRequired)?.into(),
+        };
+        child=edge.parent_session_id.clone();edges.push(edge);
+    }
+    edges.reverse();let proof=FamilyProof{projection_sha256:digest(checkpoint)?,edges};proof.validate(scope,target)?;Ok(proof)
+}
+fn validate_bundle(scope:&Scope,bundle:&ObservationBundle)->Result<(),Fault> {
+    if !atom(&bundle.source_boot) || bundle.discovery.len()>129 || bundle.inventories.len()>129{return Err(Fault::Capacity);}
+    let value=bundle.projection.value()?;
+    let fence=projection_fence(scope,&bundle.source_boot);
+    if value["fence"]!=serde_json::to_value(&fence).map_err(|_|Fault::InvalidState)? {return Err(Fault::ScopeMismatch);}
+    ObservationProjector::restore(fence,value.clone()).map_err(|_|Fault::InvalidState)?;
+    reject_private_keys(&value)?;
+    let mut parents=BTreeSet::new();
+    for discovery in &bundle.discovery {
+        discovery.validate()?;family_proof(scope,&value,&discovery.parent_session_id,false)?;
+        if !parents.insert(&discovery.parent_session_id){return Err(Fault::InvalidState);}
+    }
+    let mut sessions=BTreeSet::new();
+    for inventory in &bundle.inventories {
+        if inventory.capture.as_ref().is_none_or(|s|!atom(&s.instance)||s.connection==0){return Err(Fault::InvalidState);}
+        family_proof(scope,&value,&inventory.session_id,false)?;
+        PendingInventory::from_read(&inventory.session_id,inventory.sampled_revision,inventory.sampled_revision,inventory.value()?)?;
+        let inventory_value=inventory.value()?;
+        let mut native_ids=BTreeSet::new();
+        for (key,id,kind) in [("approvals","approvalId","approval"),("userInputs","userInputId","user_input")] {
+            for row in inventory_value[key].as_array().ok_or(Fault::InvalidState)? {native_ids.insert((kind.to_owned(),row[id].as_str().ok_or(Fault::InvalidState)?.to_owned()));}
+        }
+        let projected_ids=value["state"]["pending_requests"].as_array().ok_or(Fault::InvalidState)?.iter().filter(|p|p["session_id"]==inventory.session_id).map(|p|Ok((p["kind"].as_str().ok_or(Fault::InvalidState)?.to_owned(),p["request_id"].as_str().ok_or(Fault::InvalidState)?.to_owned()))).collect::<Result<BTreeSet<_>,Fault>>()?;
+        if native_ids!=projected_ids{return Err(Fault::ProvenanceRequired);}
+        let revision=value["session_revisions"].as_array().and_then(|rows|rows.iter().find(|row|row["session_id"]==inventory.session_id)).and_then(|row|row["revision"].as_u64()).unwrap_or(0);
+        if revision!=inventory.sampled_revision || !sessions.insert(&inventory.session_id){return Err(Fault::FreshChecksRequired);}
+    }
+    Ok(())
+}
+
 fn state_digest(scope: &Scope, state: &State) -> Result<Sha256Digest, Fault> {
-    digest(&json!({"format":FORMAT,"version":VERSION,"scope":scope,"state":state}))
+    digest(&json!({"format":FORMAT,"version":CHECKPOINT_VERSION,"scope":scope,"state":state}))
 }
 fn encode(scope: &Scope, state: &State) -> Result<Vec<u8>, Fault> {
     let bytes = serde_json::to_vec(&Checkpoint {
         format: FORMAT.into(),
-        version: VERSION,
+        version: CHECKPOINT_VERSION,
         scope: scope.clone(),
         state: state.clone(),
         sha256: state_digest(scope, state)?,
@@ -955,6 +1590,20 @@ fn encode(scope: &Scope, state: &State) -> Result<Vec<u8>, Fault> {
     Ok(bytes)
 }
 fn validate_ack(scope: &Scope, invocation: &NativeInvocation, ack: &Value) -> Result<(), Fault> {
+    definition(ack_definition(&invocation.method)?, ack)?;
+    if matches!(invocation.method.as_str(), "session/start" | "session/resume") {
+        if ack["session"]["sessionId"] != scope.native_root_id || ack["viewCursor"].as_str().is_none_or(str::is_empty) { return Err(Fault::ScopeMismatch); }
+        if invocation.method == "session/resume" && (ack["history"]["mode"] != "none" || !ack["history"]["items"].is_null() || !ack["history"]["snapshot"].is_null()) { return Err(Fault::InvalidState); }
+    } else if ack["commandId"] != invocation.command_id || ack["status"] != "accepted" { return Err(Fault::InvalidState); }
+    if invocation.method == "turn/start" && ack["startedNewTurn"].as_bool() != Some(ack["disposition"] == "started") { return Err(Fault::InvalidState); }
+    if matches!(invocation.method.as_str(), "turn/start" | "turn/steer") && ack["turnId"].as_str().is_none_or(str::is_empty) { return Err(Fault::InvalidState); }
+    let params = invocation.params()?;
+    if invocation.method == "approval/decide" && ack["approvalId"] != params["approvalId"]
+        || invocation.method.starts_with("userInput/") && ack["userInputId"] != params["userInputId"]
+    { return Err(Fault::AckConflict); }
+    Ok(())
+}
+fn validate_ack_v1(scope: &Scope, invocation: &NativeInvocation, ack: &Value) -> Result<(), Fault> {
     let object = ack.as_object().ok_or(Fault::InvalidState)?;
     let lifecycle = matches!(
         invocation.method.as_str(),
@@ -1040,8 +1689,17 @@ fn validate_ack(scope: &Scope, invocation: &NativeInvocation, ack: &Value) -> Re
     Ok(())
 }
 fn validate_state(scope: &Scope, state: &State) -> Result<(), Fault> {
-    if state.operations.len() > MAX_OPERATIONS || state.outbox.len() > MAX_OPERATIONS {
+    if state.operations.len() > MAX_OPERATIONS || state.outbox.len() > MAX_OPERATIONS || state.contexts.len()>MAX_OPERATIONS {
         return Err(Fault::Capacity);
+    }
+    if state.legacy_operations.iter().any(|id|!state.operations.contains_key(id)||state.contexts.contains_key(id)){return Err(Fault::InvalidState);}
+    if let Some(bundle)=&state.observations{validate_bundle(scope,bundle)?;}
+    for (id,context) in &state.contexts {
+        if serde_json::to_vec(context).map_err(|_|Fault::InvalidState)?.len()>MAX_CONTEXT{return Err(Fault::Capacity);}
+        let operation=state.operations.get(id).ok_or(Fault::InvalidState)?;
+        let native=operation.native.as_ref().ok_or(Fault::InvalidState)?;
+        if context.original_receipt!=operation.receipt || context.original_boot!=native.submission_boot || context.family!=operation.family {return Err(Fault::IntentConflict);}
+        context.validate(scope,&native.invocation)?;
     }
     if state
         .durability
@@ -1057,14 +1715,19 @@ fn validate_state(scope: &Scope, state: &State) -> Result<(), Fault> {
             return Err(Fault::InvalidState);
         }
         if let Some(native) = &operation.native {
-            native.invocation.validate(scope)?;
+            if state.legacy_operations.contains(id){native.invocation.validate_v1(scope)?;}else{native.invocation.validate(scope)?;}
+            let params=native.invocation.params()?;
+            if params["sessionId"]!=scope.native_root_id {
+                operation.family.as_ref().ok_or(Fault::ProvenanceRequired)?.validate(scope,params["sessionId"].as_str().ok_or(Fault::InvalidState)?)?;
+                if !state.contexts.contains_key(id){return Err(Fault::ContextRequired);}
+            }
             if !atom(&native.submission_boot)
                 || !native_ids.insert(native.invocation.command_id.clone())
             {
                 return Err(Fault::IntentConflict);
             }
             if let Some(ack) = &native.ack {
-                validate_ack(scope, &native.invocation, &ack.value()?)?;
+                if state.legacy_operations.contains(id){validate_ack_v1(scope,&native.invocation,&ack.value()?)?;}else{validate_ack(scope, &native.invocation, &ack.value()?)?;}
             }
             if native.reconcile_block.as_ref().is_some_and(|code| {
                 code.is_empty()
@@ -1077,7 +1740,7 @@ fn validate_state(scope: &Scope, state: &State) -> Result<(), Fault> {
             }
         }
         if let Some(delivery) = &operation.final_delivery {
-            validate_delivery(scope, &operation.receipt, delivery)?;
+            validate_delivery(scope, &operation.receipt, delivery, operation.family.as_ref())?;
             let params = delivery.params.value()?;
             if delivery.method == DeliveryMethod::Outcome
                 && !matches!(params["outcome"].as_str(), Some("applied" | "rejected"))
@@ -1094,7 +1757,7 @@ fn validate_state(scope: &Scope, state: &State) -> Result<(), Fault> {
     }
     for (id, slot) in &state.outbox {
         let operation = state.operations.get(id).ok_or(Fault::InvalidState)?;
-        validate_delivery(scope, &operation.receipt, &slot.delivery)?;
+        validate_delivery(scope, &operation.receipt, &slot.delivery, operation.family.as_ref())?;
         if slot.revision == 0
             || slot.revision > state.revision
             || slot.delivery.params.value()?["operation_id"] != *id
@@ -1112,6 +1775,7 @@ fn validate_delivery(
     scope: &Scope,
     receipt: &ModuleReceiptIdentity,
     delivery: &Delivery,
+    family: Option<&FamilyProof>,
 ) -> Result<(), Fault> {
     let value = delivery.params.value()?;
     if value["operation_id"] != receipt.operation_id {
@@ -1144,7 +1808,7 @@ fn validate_delivery(
                 return Err(Fault::InvalidState);
             }
             if value["page"]["source"]["native_session_id"] != scope.native_root_id {
-                return Err(Fault::ScopeMismatch);
+                family.ok_or(Fault::ScopeMismatch)?.validate(scope,value["page"]["source"]["native_session_id"].as_str().ok_or(Fault::InvalidState)?)?;
             }
         }
     }
@@ -1280,6 +1944,7 @@ mod tests {
         fn invocation(&self, n: u64, method: &str) -> NativeInvocation {
             let id = format!("019a0000-0000-7000-8000-{n:012x}");
             let mut params = json!({"commandId":id,"sessionId":self.scope.native_root_id});
+            if method=="session/start" {params["workspaceRoot"]=json!("/synthetic-work");}
             if method == "turn/start" {
                 params["input"] = json!([{"type":"text","text":"exact fixture input"}]);
                 params["ifBusy"] = json!("queue");
@@ -1307,7 +1972,27 @@ mod tests {
             }
         }
         fn ack(&self, invocation: &NativeInvocation) -> Value {
-            json!({"commandId":invocation.command_id(),"status":"accepted","turnId":"fixture-turn"})
+            match invocation.method() {
+                "turn/start"=>json!({"commandId":invocation.command_id(),"status":"accepted","turnId":"fixture-turn","disposition":"started","startedNewTurn":true}),
+                "session/start"=>json!({"session":self.session(&self.scope.native_root_id),"viewCursor":"opaque"}),
+                "session/resume"=>json!({"session":self.session(&self.scope.native_root_id),"viewCursor":"opaque","history":{"mode":"none","items":null,"snapshot":null},"pendingRequests":[]}),
+                _=>json!({"commandId":invocation.command_id(),"status":"accepted"}),
+            }
+        }
+
+        fn command(&self,operation:&str,method:&str,input:Value)->RuntimeCommand {
+            RuntimeCommand{operation_id:operation.into(),method:method.into(),created_at_ms:1,binding_id:self.scope.binding_id.clone(),generation:self.scope.generation,native_root_id:if method=="agent.open"{None}else{Some(self.scope.native_root_id.clone())},route:json!({"module_artifact_id":self.scope.artifact.artifact_id,"native_options":{"workspaceRoot":"/synthetic-work"}}),input_sha256:Some(self.receipt(operation).input_sha256),input,target_input_sha256:None}
+        }
+        fn initialize(&self,journal:&mut Journal,grant:bool) {
+            let init=json!({"experimentalApi":false,"grantedCapabilities":if grant{vec!["sessionMcp"]}else{vec![]},"museHome":"/observed-not-copied","platformFamily":"unix","platformOs":"linux","schema":{"version":1,"fingerprint":"sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81"},"serverInfo":{"name":"fixture","version":"1.3.0"},"userAgent":"fixture","sessionDurability":"durable"});
+            journal.record_initialize(&self.scope,&self.scope.native_namespace,&init).unwrap();
+        }
+        fn session(&self,id:&str)->Value {
+            json!({"sessionId":id,"status":"idle","activeTurnId":null,"createdAt":"2026-10-17T00:00:00Z","updatedAt":"2026-10-17T00:00:00Z","forkedFrom":null,"modelId":null,"providerId":null,"path":"synthetic-native-log","turnCount":0,"workspaceRoot":"/synthetic-work"})
+        }
+        fn work_read(&self,journal:&mut Journal,revision:u64)->RetainedWorkFence {
+            let read=json!({"session":self.session(&self.scope.native_root_id),"viewCursor":"opaque:root","history":{"mode":"none","items":null,"snapshot":null},"pendingRequests":[]});
+            journal.record_work_read(&self.scope,revision,revision,&read,RetainedModelState::Settled,None).unwrap()
         }
     }
     impl Drop for Fixture {
@@ -1323,6 +2008,256 @@ mod tests {
             );
             fs::remove_dir_all(&self.directory).unwrap();
         }
+    }
+
+
+    fn family_projector(fixture:&Fixture,boot:&str)->ObservationProjector {
+        use crate::observations::{NativeEventInput,RootSnapshotInput,ChildSnapshotInput,ReadMethod,ReductionStatus};
+        let f=projection_fence(&fixture.scope,boot);
+        let p=ObservationProjector::new(f.clone()).unwrap();
+        let event=json!({"method":"item/updated","params":{"sessionId":fixture.scope.native_root_id,"turnId":"parent-turn","viewCursor":"opaque:child","item":{"kind":"subagent","childSessionId":"child","itemId":"parent-item","subagentId":"sub","revision":1,"status":"running","controlStatus":"running"}}});
+        let p=p.apply_event(NativeEventInput{fence:&f,event_revision:1,at_ms:1,event:&event}).projector;
+        let root=fixture.session(&fixture.scope.native_root_id);
+        let r=p.apply_root_snapshot(RootSnapshotInput{fence:&f,expected_session_revision:p.session_revision(&fixture.scope.native_root_id),at_ms:2,read_method:ReadMethod::SessionRead,snapshot:&root});
+        assert_eq!(r.status,ReductionStatus::Applied);
+        let p=r.projector;let child=fixture.session("child");
+        let r=p.apply_child_snapshot(ChildSnapshotInput{fence:&f,child_session_id:"child",parent_session_id:&fixture.scope.native_root_id,item_id:"parent-item",parent_turn_id:Some("parent-turn"),item_revision:1,expected_session_revision:p.session_revision("child"),at_ms:3,read_method:ReadMethod::SessionRead,snapshot:Some(&child),failure:None});
+        assert_eq!(r.status,ReductionStatus::Applied);r.projector
+    }
+    fn retain_family(fixture:&Fixture,journal:&mut Journal,with_pending:bool) {
+        let projector=family_projector(fixture,&journal.boot);
+        let discovery=vec![ChildDiscovery{parent_session_id:fixture.scope.native_root_id.clone(),after:Some("opaque:after".into()),next:Some("opaque:next".into()),complete:false}];
+        let snapshot=journal.capture_projection(&fixture.scope,&projector).unwrap();
+        journal.retain_observations(&fixture.scope,snapshot,discovery.clone(),Vec::new()).unwrap();
+        if with_pending {
+            let authority=journal.authorize_session(&fixture.scope,"child").unwrap();
+            let row=json!({"sessionId":"child","userInputId":"question","itemId":"input-item","toolCallId":"tool-call","toolName":"request","turnId":"child-turn","viewCursor":"opaque:pending","questions":[]});
+            let value=json!({"approvals":[],"userInputs":[row]});
+            let inventory=journal.capture_pending_inventory(&fixture.scope,&authority,0,0,value.clone()).unwrap();
+            let f=projection_fence(&fixture.scope,&journal.boot);
+            let reduced=projector.replace_pending(crate::observations::PendingInventoryInput{fence:&f,session_id:"child",expected_session_revision:0,inventory:&value});
+            assert_eq!(reduced.status,crate::observations::ReductionStatus::Applied);
+            let snapshot=journal.capture_projection(&fixture.scope,&reduced.projector).unwrap();
+            journal.retain_observations(&fixture.scope,snapshot,discovery,vec![inventory]).unwrap();
+        }
+    }
+    #[test]
+    fn muse_journal_full_schema_ack_keeps_disposition_started_and_apply_outcome() {
+        let fixture=Fixture::new();let mut journal=fixture.create();
+        let invocation=fixture.invocation(1,"turn/start");
+        drop(journal.prepare_native(&fixture.scope,fixture.receipt("send"),invocation.clone()).unwrap());
+        let mut ack=fixture.ack(&invocation);
+        for disposition in ["queued","steered","started"] {
+            ack["disposition"]=json!(disposition);ack["startedNewTurn"]=json!(disposition=="started");
+            validate_ack(&fixture.scope,&invocation,&ack).unwrap();
+        }
+        let mut inconsistent=ack.clone();inconsistent["startedNewTurn"]=json!(false);
+        assert!(validate_ack(&fixture.scope,&invocation,&inconsistent).is_err());
+        let mut missing=ack.clone();missing.as_object_mut().unwrap().remove("disposition");
+        assert!(validate_ack(&fixture.scope,&invocation,&missing).is_err());
+        let mut foreign=ack.clone();foreign["unrecognized"] = json!({"modelProviderKey":"never"});
+        assert!(validate_ack(&fixture.scope,&invocation,&foreign).is_err());
+        journal.record_native_ack(&fixture.scope,"send",invocation.command_id(),ack.clone()).unwrap();
+        drop(journal);let mut journal=fixture.reopen();
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope,"send",invocation.payload_sha256()).unwrap(),Reconciliation::AckReadback(saved) if saved==ack));
+        let id="019a0000-0000-7000-8000-000000000002";
+        let params=json!({"commandId":id,"sessionId":fixture.scope.native_root_id,"mode":"onRequest"});
+        let setting=NativeInvocation::new(&fixture.scope,"session/setApprovalMode",id,params.as_object().unwrap().clone()).unwrap();
+        let setting_ack=json!({"commandId":id,"status":"accepted","applyOutcome":"noop","effectiveMode":{"mode":"onRequest","source":"session","lastCommandId":id}});
+        // The enum is read from the complete public schema, not hand guessed.
+        let mut setting_ack=setting_ack;
+        let source=schema::definition_schema("ApprovalModeSource").unwrap()["enum"][0].clone();
+        setting_ack["effectiveMode"]["source"]=source;
+        validate_ack(&fixture.scope,&setting,&setting_ack).unwrap();
+        let mut bad=setting_ack.clone();bad["applyOutcome"]=json!("invented");
+        assert!(validate_ack(&fixture.scope,&setting,&bad).is_err());
+        let params=json!({"commandId":id,"sessionId":fixture.scope.native_root_id,"approvalId":"approval","choiceId":"choice","requirementId":{"approvalId":"approval","sourceIndex":0}});
+        let reply=NativeInvocation::new(&fixture.scope,"approval/decide",id,params.as_object().unwrap().clone()).unwrap();
+        validate_ack(&fixture.scope,&reply,&json!({"commandId":id,"status":"accepted","approvalId":"approval","terminal":false})).unwrap();
+    }
+    #[test]
+    fn muse_journal_model_object_and_real_mcp_grant_are_retained_without_flattening() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,false);fixture.work_read(&mut journal,0);
+        let id="019a0000-0000-7000-8000-000000000003";
+        let params=json!({"commandId":id,"sessionId":fixture.scope.native_root_id,"model":{"modelId":"selected","providerId":"requested-provider"}});
+        let invocation=NativeInvocation::new(&fixture.scope,"session/setModel",id,params.as_object().unwrap().clone()).unwrap();
+        let command=fixture.command("configure","agent.configure",json!({"settings":{"model":params["model"]}}));
+        drop(journal.prepare_command(&fixture.scope,fixture.receipt("configure"),command,invocation.clone(),RetainedSelectors::default()).unwrap());
+        assert_eq!(journal.retained_invocation(&fixture.scope,"configure").unwrap().params().unwrap()["model"],params["model"]);
+        let mut bad=params.clone();bad["model"]["modelProviderKey"]=json!("forbidden");
+        assert!(NativeInvocation::new(&fixture.scope,"session/setModel",id,bad.as_object().unwrap().clone()).is_err());
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,false);
+        let servers=json!({"explicit":{"transport":"stdio","command":"explicit-binary","args":["--explicit"],"mode":"required"}});
+        let mut command=fixture.command("open","agent.open",json!({}));command.route["native_options"]["mcpServers"]=servers.clone();
+        let base=fixture.invocation(4,"session/start");let mut params=base.params().unwrap();params.insert("config".into(),json!({"mcpServers":servers}));
+        let invocation=NativeInvocation::new(&fixture.scope,"session/start",base.command_id(),params.clone()).unwrap();
+        assert!(matches!(journal.prepare_command(&fixture.scope,fixture.receipt("open"),command.clone(),invocation.clone(),RetainedSelectors::default()),Err(Fault::GrantRequired)));
+        let mut invalid=Value::Object(params);invalid["config"]["mcpServers"]["explicit"]["transport"]=json!("futureTransport");
+        assert!(NativeInvocation::new(&fixture.scope,"session/start",base.command_id(),invalid.as_object().unwrap().clone()).is_err());
+        fixture.initialize(&mut journal,true);
+        drop(journal.prepare_command(&fixture.scope,fixture.receipt("open"),command,invocation.clone(),RetainedSelectors::default()).unwrap());
+        drop(journal);let mut journal=fixture.reopen();fixture.initialize(&mut journal,false);
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope,"open",invocation.payload_sha256()),Err(Fault::GrantRequired)));
+        fixture.initialize(&mut journal,true);
+        match journal.explicit_reconcile(&fixture.scope,"open",invocation.payload_sha256()).unwrap(){Reconciliation::Write(p)=>assert_eq!(p.invocation(),&invocation),_=>panic!("explicit exact start only")}
+    }
+    #[test]
+    fn muse_journal_task_context_cross_worker_preserves_original_prompt_receipt_and_native_id() {
+        use sha2::{Digest,Sha256};
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,false);fixture.work_read(&mut journal,7);
+        let invocation=fixture.invocation(5,"turn/start");
+        let prompt="exact fixture input";
+        let envelope=json!({"schema_id":"swarm.task_prompt","schema_version":1,"task_id":"task","task_revision":2,"attempt_id":"attempt","task_snapshot_sha256":"a".repeat(64),"prompt_sha256":format!("{:x}",Sha256::digest(prompt.as_bytes())),"prompt_bytes":prompt.len(),"prompt":prompt});
+        let context=json!({"schema_version":1,"operation_id":"dispatch","binding_id":fixture.scope.binding_id,"binding_generation":fixture.scope.generation,"worker_boot_id":BOOT_A,"attempt_id":"attempt","task_id":"task","task_revision":2,"task_snapshot_sha256":"a".repeat(64),"source_text_sha256":format!("{:x}",Sha256::digest(b"abc")),"source_text_bytes":3});
+        let command=fixture.command("dispatch","task.dispatch",json!({"text":"abc","task_prompt":envelope,"task_dispatch_context":context}));
+        drop(journal.prepare_command(&fixture.scope,fixture.receipt("dispatch"),command.clone(),invocation.clone(),RetainedSelectors::default()).unwrap());
+        let saved=journal.retained_command(&fixture.scope,"dispatch").unwrap().unwrap();
+        assert_eq!(saved.original_receipt(),&fixture.receipt("dispatch"));
+        assert_eq!(saved.task_prompt(&fixture.scope).unwrap().unwrap().context.worker_boot_id,BOOT_A);
+        drop(journal);let mut journal=fixture.reopen();
+        let saved=journal.retained_command(&fixture.scope,"dispatch").unwrap().unwrap();
+        assert_eq!(serde_json::to_value(saved.command()).unwrap(),serde_json::to_value(&command).unwrap());
+        let mut request=fixture.command("reconcile","agent.reconcile",json!({"operation_id":"dispatch"}));
+        request.target_input_sha256=Some(fixture.receipt("dispatch").input_sha256);
+        assert!(matches!(journal.reconcile_command(&fixture.scope,&request,&fixture.receipt("reconcile")),Err(Fault::DurabilityUnavailable)));
+        fixture.initialize(&mut journal,false);
+        assert!(matches!(journal.reconcile_command(&fixture.scope,&request,&fixture.receipt("reconcile")),Err(Fault::FreshChecksRequired)));
+        fixture.work_read(&mut journal,99);
+        let mut bad=request.clone();bad.target_input_sha256=Some("b".repeat(64));
+        assert!(matches!(journal.reconcile_command(&fixture.scope,&bad,&fixture.receipt("reconcile")),Err(Fault::ScopeMismatch)));
+        match journal.reconcile_command(&fixture.scope,&request,&fixture.receipt("reconcile")).unwrap(){Reconciliation::Write(p)=>assert_eq!(p.invocation(),&invocation),_=>panic!("same original native intent required")}
+        assert_eq!(journal.retained_command(&fixture.scope,"dispatch").unwrap().unwrap().task_prompt(&fixture.scope).unwrap().unwrap().context.worker_boot_id,BOOT_A);
+    }
+    #[test]
+    fn muse_journal_child_result_authority_revokes_on_events_and_restores_stale_paired_facts() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,false);retain_family(&fixture,&mut journal,true);
+        let authority=journal.authorize_session(&fixture.scope,"child").unwrap();
+        assert!(journal.authorize_session(&fixture.scope,"arbitrary").is_err());
+        let page=json!({"source":{"native_session_id":"child","item_id":"answer","item_revision":7},"content_base64":"ZXhhY3Q=","offset_bytes":0,"eof":true});
+        assert_eq!(journal.queue_result(&fixture.scope,fixture.receipt("read"),page.clone()),Err(Fault::ScopeMismatch));
+        journal.queue_result_for(&fixture.scope,fixture.receipt("read"),page.clone(),&authority).unwrap();
+        let ticket=journal.outbox(&fixture.scope).unwrap().remove(0);
+        journal.invalidate_observations(&fixture.scope).unwrap();
+        assert!(!journal.authority_is_current(&fixture.scope,&authority));
+        assert_eq!(journal.queue_result_for(&fixture.scope,fixture.receipt("read2"),page,&authority),Err(Fault::ProvenanceRequired));
+        drop(journal);let mut journal=fixture.reopen();fixture.initialize(&mut journal,false);
+        let restored=journal.restored_observations(&fixture.scope).unwrap().unwrap();
+        assert_eq!(restored.freshness,RestoredFreshness::Stale);
+        assert_eq!(restored.projection["state"]["root_snapshot_freshness"],"stale");
+        assert_eq!(restored.projection["state"]["observed_children"][0]["snapshot_freshness"],"stale");
+        assert_eq!(restored.projection["state"]["family_completeness"],"partial");
+        assert_eq!(restored.discovery[0].after.as_deref(),Some("opaque:after"));
+        assert_eq!(restored.discovery[0].next.as_deref(),Some("opaque:next"));
+        assert_eq!(restored.inventories.len(),1);
+        assert!(journal.authorize_session(&fixture.scope,"child").is_err());
+        let projector=family_projector(&fixture,BOOT_B);let snapshot=journal.capture_projection(&fixture.scope,&projector).unwrap();
+        assert_eq!(journal.retain_observations(&fixture.scope,snapshot,restored.discovery,restored.inventories),Err(Fault::FreshChecksRequired));
+        assert_eq!(journal.outbox(&fixture.scope).unwrap(),vec![ticket.clone()]);
+        journal.acknowledge(&fixture.scope,&ticket).unwrap();
+    }
+    #[test]
+    fn muse_journal_child_reply_requires_exact_fresh_inventory_and_original_edge() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,false);
+        let id="019a0000-0000-7000-8000-000000000006";
+        let params=json!({"commandId":id,"sessionId":"child","userInputId":"question"});
+        let invocation=NativeInvocation::new(&fixture.scope,"userInput/cancel",id,params.as_object().unwrap().clone()).unwrap();
+        let command=fixture.command("reply","agent.reply",json!({"reply":{"method":"userInput/cancel","params":{"sessionId":"child","userInputId":"question"}}}));
+        assert!(matches!(journal.prepare_native(&fixture.scope,fixture.receipt("reply"),invocation.clone()),Err(Fault::ProvenanceRequired)));
+        assert!(journal.prepare_command(&fixture.scope,fixture.receipt("reply"),command.clone(),invocation.clone(),RetainedSelectors::default()).is_err());
+        retain_family(&fixture,&mut journal,true);
+        let mut wrong=command.clone();wrong.input["reply"]["params"]["userInputId"]=json!("other");
+        assert!(journal.prepare_command(&fixture.scope,fixture.receipt("reply"),wrong,invocation.clone(),RetainedSelectors::default()).is_err());
+        drop(journal.prepare_command(&fixture.scope,fixture.receipt("reply"),command,invocation.clone(),RetainedSelectors::default()).unwrap());
+        drop(journal);let mut journal=fixture.reopen();fixture.initialize(&mut journal,false);
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope,"reply",invocation.payload_sha256()),Err(Fault::FreshChecksRequired)));
+        retain_family(&fixture,&mut journal,true);
+        match journal.explicit_reconcile(&fixture.scope,"reply",invocation.payload_sha256()).unwrap(){Reconciliation::Write(p)=>assert_eq!(p.invocation(),&invocation),_=>panic!("exact observed child command")}
+    }
+    #[test]
+    fn muse_journal_v1_new_rust_state_remains_readable_but_never_infers_context() {
+        let fixture=Fixture::new();let mut journal=fixture.create();let invocation=fixture.invocation(7,"turn/start");
+        drop(journal.prepare_native(&fixture.scope,fixture.receipt("old"),invocation.clone()).unwrap());
+        journal.queue_outcome(&fixture.scope,fixture.receipt("old"),fixture.outcome("old",EffectOutcome::Unknown)).unwrap();
+        let ticket=journal.outbox(&fixture.scope).unwrap().remove(0);drop(journal);
+        let path=fixture.directory.join(CHECKPOINT);
+        let mut value:Value=serde_json::from_slice(&read_private_durable(&path,MAX_FILE).unwrap()).unwrap();
+        value["version"]=json!(1);value["sha256"]=json!(digest(&json!({"format":FORMAT,"version":1,"scope":value["scope"],"state":value["state"]})).unwrap());
+        replace_private_durable(&path,&serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut journal=fixture.reopen();
+        assert_eq!(journal.outbox(&fixture.scope).unwrap(),vec![ticket.clone()]);
+        fixture.initialize(&mut journal,false);
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope,"old",invocation.payload_sha256()),Err(Fault::ContextRequired)));
+        assert!(journal.retained_command(&fixture.scope,"old").unwrap().is_none());
+        journal.acknowledge(&fixture.scope,&ticket).unwrap();
+        assert_eq!(journal.unresolved_native(&fixture.scope).unwrap(),vec![("old",BOOT_A,false)]);
+    }
+    #[test]
+    fn muse_journal_context_and_intent_publish_atomically_and_poison_is_sticky() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,false);
+        let invocation=fixture.invocation(8,"session/start");
+        let failed_path=fixture.directory.join(CHECKPOINT);
+        let hook=scoped_durability_barrier(move|path|if path==failed_path {Err(swarm_contracts::error::Error::new("INJECTED","fixture"))}else{Ok(())});
+        assert!(matches!(journal.prepare_command(&fixture.scope,fixture.receipt("open"),fixture.command("open","agent.open",json!({})),invocation.clone(),RetainedSelectors::default()),Err(Fault::PersistenceUnknown)));
+        assert!(matches!(journal.retained_command(&fixture.scope,"open"),Err(Fault::Poisoned)));
+        drop(hook);drop(journal);
+        let mut journal=fixture.reopen();
+        assert!(journal.retained_command(&fixture.scope,"open").unwrap().is_some());
+        assert_eq!(journal.unresolved_native(&fixture.scope).unwrap(),vec![("open",BOOT_A,false)]);
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope,"open",invocation.payload_sha256()),Err(Fault::DurabilityUnavailable)));
+    }
+    #[test]
+    fn muse_journal_capacity_refuses_new_effect_without_evicting_any_unknown() {
+        let fixture=Fixture::new();let mut journal=fixture.create();let mut next=journal.state.clone();
+        for n in 0..MAX_OPERATIONS {
+            let id=format!("unknown-{n}");let invocation=fixture.invocation(n as u64+100,"turn/start");
+            next.operations.insert(id.clone(),Operation{receipt:fixture.receipt(&id),native:Some(NativePending{invocation,submission_boot:BOOT_A.into(),ack:None,reconcile_block:None}),final_delivery:None,final_host_acked:false,family:None});
+        }
+        journal.commit(next).unwrap();let before=read_private_durable(&fixture.directory.join(CHECKPOINT),MAX_FILE).unwrap();
+        assert!(matches!(journal.prepare_native(&fixture.scope,fixture.receipt("overflow"),fixture.invocation(999,"turn/start")),Err(Fault::Capacity)));
+        assert_eq!(read_private_durable(&fixture.directory.join(CHECKPOINT),MAX_FILE).unwrap(),before);
+        assert_eq!(journal.unresolved_native(&fixture.scope).unwrap().len(),MAX_OPERATIONS);
+    }
+
+
+    #[test]
+    fn muse_journal_capture_race_and_duplicate_inventory_fail_before_publication() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,false);
+        let p=family_projector(&fixture,BOOT_A);
+        let snapshot=journal.capture_projection(&fixture.scope,&p).unwrap();
+        journal.invalidate_observations(&fixture.scope).unwrap();
+        let before=read_private_durable(&fixture.directory.join(CHECKPOINT),MAX_FILE).unwrap();
+        assert_eq!(journal.retain_observations(&fixture.scope,snapshot,Vec::new(),Vec::new()),Err(Fault::FreshChecksRequired));
+        assert_eq!(read_private_durable(&fixture.directory.join(CHECKPOINT),MAX_FILE).unwrap(),before);
+        retain_family(&fixture,&mut journal,false);
+        let authority=journal.authorize_session(&fixture.scope,"child").unwrap();
+        assert!(journal.capture_pending_inventory(&fixture.scope,&authority,1,2,json!({"approvals":[],"userInputs":[]})).is_err());
+        retain_family(&fixture,&mut journal,false);
+        let authority=journal.authorize_session(&fixture.scope,"child").unwrap();
+        let row=json!({"sessionId":"child","userInputId":"same","itemId":"item","questions":[],"toolCallId":"call","toolName":"tool","turnId":"turn","viewCursor":"cursor"});
+        assert!(journal.capture_pending_inventory(&fixture.scope,&authority,0,0,json!({"approvals":[],"userInputs":[row.clone(),row]})).is_err());
+    }
+    #[test]
+    fn muse_journal_context_native_identity_is_checked_even_with_recomputed_outer_hash() {
+        let fixture=Fixture::new();let mut journal=fixture.create();fixture.initialize(&mut journal,false);
+        let invocation=fixture.invocation(10,"session/start");
+        drop(journal.prepare_command(&fixture.scope,fixture.receipt("open"),fixture.command("open","agent.open",json!({})),invocation,RetainedSelectors::default()).unwrap());
+        drop(journal);let path=fixture.directory.join(CHECKPOINT);
+        let mut value:Value=serde_json::from_slice(&read_private_durable(&path,MAX_FILE).unwrap()).unwrap();
+        value["state"]["contexts"]["open"]["native_command_id"]=json!("019a0000-0000-7000-8000-000000009999");
+        value["sha256"]=json!(digest(&json!({"format":FORMAT,"version":CHECKPOINT_VERSION,"scope":value["scope"],"state":value["state"]})).unwrap());
+        replace_private_durable(&path,&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(Journal::open_at(&fixture.directory,fixture.scope.clone(),BOOT_B.into()),Err(Fault::IntentConflict)));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn muse_journal_rejects_linked_checkpoint_and_linked_ancestor_without_adoption() {
+        let fixture=Fixture::new();drop(fixture.create());
+        let path=fixture.directory.join(CHECKPOINT);let saved=fixture.directory.join("saved.json");
+        fs::rename(&path,&saved).unwrap();std::os::unix::fs::symlink(&saved,&path).unwrap();
+        assert!(matches!(Journal::open_at(&fixture.directory,fixture.scope.clone(),BOOT_B.into()),Err(Fault::PersistenceUnknown)));
+        let other=Fixture::new();let alias=other.directory.join("alias");std::os::unix::fs::symlink(&fixture.directory,&alias).unwrap();
+        assert!(Journal::open_at(&alias,fixture.scope.clone(),BOOT_B.into()).is_err());
+        assert!(!read_private_durable(&saved,MAX_FILE).unwrap().is_empty());
     }
 
     #[test]
@@ -1363,15 +2298,7 @@ mod tests {
         journal
             .record_durability(&fixture.scope, Durability::Durable)
             .unwrap();
-        match journal
-            .explicit_reconcile(&fixture.scope, "send", invocation.payload_sha256())
-            .unwrap()
-        {
-            Reconciliation::Write(prepared) => assert_eq!(prepared.invocation(), &invocation),
-            _ => {
-                panic!("only explicit same-command reconciliation may expose stored native payload")
-            }
-        }
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope,"send",invocation.payload_sha256()),Err(Fault::ContextRequired)));
         assert_eq!(
             journal.unresolved_native(&fixture.scope).unwrap()[0].1,
             BOOT_A
@@ -1535,13 +2462,7 @@ mod tests {
         journal
             .record_durability(&fixture.scope, Durability::Durable)
             .unwrap();
-        match journal
-            .explicit_reconcile(&fixture.scope, "send", invocation.payload_sha256())
-            .unwrap()
-        {
-            Reconciliation::Write(prepared) => assert_eq!(prepared.invocation(), &invocation),
-            _ => panic!("retained intent is uncertain, never invented NotStarted or completed"),
-        }
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope,"send",invocation.payload_sha256()),Err(Fault::ContextRequired)));
     }
 
     #[test]
@@ -1902,15 +2823,10 @@ mod tests {
         journal
             .record_exact_root_read(&fixture.scope, &fixture.scope.native_root_id)
             .unwrap();
-        assert!(matches!(
-            journal
-                .explicit_reconcile(&fixture.scope, "recover", invocation.payload_sha256())
-                .unwrap(),
-            Reconciliation::Write(_)
-        ));
+        assert!(matches!(journal.explicit_reconcile(&fixture.scope,"recover",invocation.payload_sha256()),Err(Fault::ContextRequired)));
         assert!(matches!(
             journal.explicit_reconcile(&fixture.scope, "recover", invocation.payload_sha256()),
-            Err(Fault::ExactRootReadRequired)
+            Err(Fault::ContextRequired)
         ));
         assert_eq!(
             journal.unresolved_native(&fixture.scope).unwrap()[0].1,
@@ -2012,13 +2928,16 @@ mod tests {
         assert_eq!(params_before["sessionId"], fixture.scope.native_root_id);
         assert_eq!(params_before["commandId"], invocation.command_id());
         let mut journal = fixture.create();
+        fixture.initialize(&mut journal,false);
         // A permit is returned only after the complete intent checkpoint. No
         // native process is invoked; drop models an ambiguous write/lost ACK.
         let prepared = journal
-            .prepare_native(
+            .prepare_command(
                 &fixture.scope,
                 fixture.receipt(host_operation_v4),
+                fixture.command(host_operation_v4,"agent.open",json!({})),
                 invocation.clone(),
+                RetainedSelectors::default(),
             )
             .unwrap();
         let checkpoint: Value = serde_json::from_slice(
@@ -2052,12 +2971,7 @@ mod tests {
             ),
             Err(Fault::ExplicitReconcileRequired)
         ));
-        journal
-            .record_durability(
-                &fixture.scope,
-                Durability::from_initialize_declaration(None),
-            )
-            .unwrap();
+        fixture.initialize(&mut journal,false);
         match journal
             .explicit_reconcile(
                 &fixture.scope,
@@ -2076,8 +2990,7 @@ mod tests {
         }
         // A matching native deduplicated ACK is a separate explicit observation;
         // journal retention still does not turn it into Task acceptance.
-        let ack =
-            json!({"session":{"sessionId":fixture.scope.native_root_id},"viewCursor":"opaque"});
+        let ack = fixture.ack(&invocation);
         journal
             .record_native_ack(
                 &fixture.scope,
@@ -2102,10 +3015,11 @@ mod tests {
                 .prepare_native(&fixture.scope, fixture.receipt("open"), invocation.clone())
                 .unwrap(),
         );
-        let foreign_ack = json!({"session":{"sessionId":"foreign-root"},"viewCursor":"opaque"});
+        let mut foreign_ack = fixture.ack(&invocation);
+        foreign_ack["session"]["sessionId"]=json!("foreign-root");
         assert_eq!(
             journal.record_native_ack(&fixture.scope, "open", invocation.command_id(), foreign_ack),
-            Err(Fault::InvalidState)
+            Err(Fault::ScopeMismatch)
         );
         journal
             .block_reconciliation(&fixture.scope, "open", "NATIVE_SESSION_ID_CONFLICT")
