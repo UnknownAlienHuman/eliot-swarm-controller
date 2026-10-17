@@ -427,6 +427,24 @@ jobs:
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
           & cargo test --locked --package $musePackages[0] --lib msp_transport_ --target-dir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run selected connected prelaunch ownership regression
+        if: contains(needs.scope.outputs.changed_paths, 'crates/swarm-kernel-host/src/store/module_prelaunch_observation_tests.rs')
+        shell: pwsh
+        env:
+          PACKAGE_SPECS: ${{ needs.scope.outputs.packages }}
+        run: |
+          $hostPackages = @($env:PACKAGE_SPECS | ConvertFrom-Json | Where-Object {
+            ([string]$_).Split('@')[0] -ceq 'swarm-kernel-host'
+          })
+          if ($hostPackages.Count -ne 1) { throw 'Prelaunch Host package selector must be unambiguous.' }
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          & cargo build --locked --package swarm-process --bin swarm-module-owner --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exeSuffix = if ($IsWindows) { '.exe' } else { '' }
+          $env:ELIOT_PRELAUNCH_TEST_OWNER_HELPER = Join-Path (Join-Path $sharedTargetDir 'debug') ('swarm-module-owner' + $exeSuffix)
+          if (-not (Test-Path -LiteralPath $env:ELIOT_PRELAUNCH_TEST_OWNER_HELPER -PathType Leaf)) { throw 'Same-source prelaunch helper was not built.' }
+          & cargo test --locked --package $hostPackages[0] --lib store::module_prelaunch_observation_tests::connected_prelaunch_observation_is_scoped_idempotent_and_status_only --target-dir $sharedTargetDir -- --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run selected supervisor terminal retention regressions
         if: contains(needs.scope.outputs.changed_paths, 'crates/swarm-supervisor/src/supervisor.rs')
         shell: pwsh
