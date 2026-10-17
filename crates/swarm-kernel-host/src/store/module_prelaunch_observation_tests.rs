@@ -430,7 +430,11 @@ fn prelaunch_adapter_child() {
         std::thread::sleep(Duration::from_millis(20));
     }
     // Test-body return is diagnostic only, never OS/family departure proof.
-    fs::write(marker.with_extension("returned"), b"adapter test body returning").unwrap();
+    fs::write(
+        marker.with_extension("returned"),
+        b"adapter test body returning",
+    )
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -898,10 +902,7 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
         loop {
             let status = supervisor
                 .registry()
-                .status(
-                    compatible_descriptor.module_id.as_str(),
-                    &compatible_scope,
-                )
+                .status(compatible_descriptor.module_id.as_str(), &compatible_scope)
                 .await;
             let terminal = status.as_ref().is_some_and(|status| {
                 matches!(
