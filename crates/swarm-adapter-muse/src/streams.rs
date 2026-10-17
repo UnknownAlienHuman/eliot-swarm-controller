@@ -12,6 +12,8 @@ use swarm_contracts::{
     native_stream::*,
 };
 
+const MAX_CURSOR_BYTES: usize = 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnownItemKind {
     AgentMessage,
@@ -39,6 +41,15 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Error::invalid("native stream identity/content is unavailable"))
+}
+fn opaque_cursor<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|cursor| {
+            cursor.len() <= MAX_CURSOR_BYTES && !cursor.chars().any(char::is_control)
+        })
+        .ok_or_else(|| Error::invalid("native stream cursor is unavailable or outside bounds"))
 }
 
 /// Pure codec. Native cursors are relayed verbatim, never parsed or sorted.
@@ -78,7 +89,7 @@ pub fn encode_notification(
             "notification is outside known Root Task",
         ));
     }
-    let cursor = text(p, "viewCursor")?.to_owned();
+    let cursor = opaque_cursor(p, "viewCursor")?.to_owned();
     let mut payloads = Vec::new();
     let (item_id, item_order) = if method == "session/tokenUsage" {
         if text(p, "turnId")? != facts.scope.turn_id {
@@ -377,6 +388,58 @@ mod tests {
         let frames = encode_notification(&facts, &delta, 1).unwrap();
         assert_eq!(frames[0].scope.operation_id, "dispatch");
         assert_eq!(frames[0].item_order, 2);
+        let mut empty_cursor = delta.envelope.clone();
+        empty_cursor["params"]["viewCursor"] = json!("");
+        let empty_frames = encode_notification(
+            &facts,
+            &Notification {
+                envelope: empty_cursor,
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(empty_frames[0].native_cursor, "");
+
+        let mut whitespace_cursor = delta.envelope.clone();
+        whitespace_cursor["params"]["viewCursor"] = json!("  ");
+        let whitespace_frames = encode_notification(
+            &facts,
+            &Notification {
+                envelope: whitespace_cursor,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(whitespace_frames[0].native_cursor, "  ");
+
+        let mut missing_cursor = delta.envelope.clone();
+        missing_cursor["params"].as_object_mut().unwrap().remove("viewCursor");
+        assert!(encode_notification(
+            &facts,
+            &Notification {
+                envelope: missing_cursor,
+            },
+            5,
+        )
+        .is_err());
+
+        for cursor in [
+            Value::Null,
+            json!(17),
+            json!("x".repeat(MAX_CURSOR_BYTES + 1)),
+            json!("line\nbreak"),
+        ] {
+            let mut invalid_cursor = delta.envelope.clone();
+            invalid_cursor["params"]["viewCursor"] = cursor;
+            assert!(encode_notification(
+                &facts,
+                &Notification {
+                    envelope: invalid_cursor,
+                },
+                6,
+            )
+            .is_err());
+        }
         assert!(matches!(
             frames[0].payload,
             StreamPayload::Text {

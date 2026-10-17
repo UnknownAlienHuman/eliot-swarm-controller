@@ -18,6 +18,7 @@ use std::{collections::HashSet, fmt, future::Future};
 
 pub const MAX_PAGE_BYTES: u64 = 65_536;
 pub const MAX_HISTORY_PAGES: usize = 64;
+const MAX_CURSOR_BYTES: usize = 1024;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,7 +117,7 @@ impl ResultRequest {
             item_revision: integer(value.get("item_revision"), None, 1)?,
             output_ref: optional_text(value, "output_ref")?,
             expected_digest: optional_text(value, "expected_digest")?,
-            before_cursor: optional_text(value, "before_cursor")?,
+            before_cursor: optional_cursor_text(value, "before_cursor")?,
         };
         if matches!(kind, ResultKind::Result | ResultKind::Message) && selected.output_ref.is_some()
         {
@@ -207,6 +208,23 @@ fn optional_text(value: &Value, key: &str) -> Result<Option<String>, ResultReadE
         .get(key)
         .map(|_| text(value, key).map(str::to_owned))
         .transpose()
+}
+fn valid_cursor(cursor: &str) -> bool {
+    cursor.len() <= MAX_CURSOR_BYTES && !cursor.chars().any(char::is_control)
+}
+fn cursor_text<'a>(value: &'a Value, key: &str) -> Result<&'a str, ResultReadError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|cursor| valid_cursor(cursor))
+        .ok_or_else(|| error("RESULT_REQUIRED_TEXT_MISSING"))
+}
+fn optional_cursor_text(value: &Value, key: &str) -> Result<Option<String>, ResultReadError> {
+    match value.get(key) {
+        None => Ok(None),
+        Some(Value::String(cursor)) if valid_cursor(cursor) => Ok(Some(cursor.clone())),
+        _ => Err(error("RESULT_REQUIRED_TEXT_MISSING")),
+    }
 }
 fn integer(
     value: Option<&Value>,
@@ -336,7 +354,7 @@ where
             .ok_or_else(|| error("INVALID_NATIVE_RESULT_PAGE"))?;
         let next = match page.get("nextCursor") {
             Some(Value::Null) => None,
-            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+            Some(Value::String(value)) if valid_cursor(value) => Some(value.clone()),
             _ => return Err(error("INVALID_NATIVE_RESULT_PAGE")),
         };
         for event in events.iter().rev() {
@@ -350,7 +368,7 @@ where
             {
                 continue;
             }
-            selected = Some((p["item"].clone(), text(p, "viewCursor")?.to_owned()));
+            selected = Some((p["item"].clone(), cursor_text(p, "viewCursor")?.to_owned()));
             break;
         }
         if selected.is_some() {
@@ -605,6 +623,8 @@ mod tests {
     #[test]
     fn result_native_wire_uses_complete_pinned_schema_before_codec() {
         assert!(validate_native_read("view/page", &view(vec![], Value::Null)).is_ok());
+        assert!(validate_native_read("view/page", &view(vec![], json!(""))).is_ok());
+        assert!(validate_native_read("view/page", &view(vec![], json!("  "))).is_ok());
         assert_eq!(
             validate_native_read("view/page", &json!({"events":[],"nextCursor":17}))
                 .unwrap_err()
@@ -664,6 +684,29 @@ mod tests {
                 .length_bytes(),
             MAX_PAGE_BYTES
         );
+    }
+
+    #[test]
+    fn result_selector_preserves_bounded_opaque_cursor_bytes() {
+        for cursor in ["", "  "] {
+            let mut request = input("message");
+            request["selector"]["before_cursor"] = json!(cursor);
+            let parsed = ResultRequest::parse(&request).unwrap();
+            assert_eq!(parsed.selector().before_cursor(), Some(cursor));
+            assert_eq!(ResultRequest::parse(&parsed.to_input()).unwrap(), parsed);
+        }
+
+        for cursor in ["cursor\nline", "cursor\u{0007}"] {
+            let mut request = input("message");
+            request["selector"]["before_cursor"] = json!(cursor);
+            assert!(ResultRequest::parse(&request).is_err());
+        }
+        let mut oversized = input("message");
+        oversized["selector"]["before_cursor"] = json!("x".repeat(MAX_CURSOR_BYTES + 1));
+        assert!(ResultRequest::parse(&oversized).is_err());
+        let mut wrong_type = input("message");
+        wrong_type["selector"]["before_cursor"] = json!(17);
+        assert!(ResultRequest::parse(&wrong_type).is_err());
     }
 
     #[tokio::test]
@@ -935,6 +978,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn result_read_preserves_empty_and_whitespace_opaque_cursors() {
+        let mut request = input("message");
+        request["selector"]["before_cursor"] = json!("");
+        let mut item = event(message("pinned"));
+        item["params"]["viewCursor"] = json!("");
+        let (result, calls) = run(
+            request,
+            vec![view(vec![], json!("  ")), view(vec![item], Value::Null)],
+        )
+        .await;
+
+        let page = result.unwrap();
+        assert_eq!(page["source"]["view_cursor"], "");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0].1["cursor"], "");
+        assert_eq!(calls[1].1["cursor"], "  ");
+    }
+
+    #[tokio::test]
+    async fn result_empty_cursor_cycle_remains_a_pagination_failure() {
+        let mut request = input("message");
+        request["selector"]["before_cursor"] = json!("");
+        let (result, calls) = run(request, vec![view(vec![], json!(""))]).await;
+        assert_eq!(result.unwrap_err().code, "NATIVE_PAGINATION_NOT_ADVANCING");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn result_event_cursor_must_be_present_and_bounded_string() {
+        let mut missing = event(message("pinned"));
+        missing["params"].as_object_mut().unwrap().remove("viewCursor");
+        let mut events = vec![missing];
+        for cursor in [
+            Value::Null,
+            json!(17),
+            json!("x".repeat(MAX_CURSOR_BYTES + 1)),
+            json!("line\nbreak"),
+        ] {
+            let mut item = event(message("pinned"));
+            item["params"]["viewCursor"] = cursor;
+            events.push(item);
+        }
+        for item in events {
+            let (result, _) = run(
+                input("message"),
+                vec![view(vec![item], Value::Null)],
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code, "RESULT_REQUIRED_TEXT_MISSING");
+        }
+    }
+
+    #[tokio::test]
     async fn result_bounded_scan_returns_observed_scoped_continuation_not_false_unavailability() {
         let pages = (0..MAX_HISTORY_PAGES)
             .map(|n| view(vec![], json!(format!("opaque-{n}"))))
@@ -952,11 +1048,14 @@ mod tests {
 
     #[tokio::test]
     async fn result_malformed_page_cannot_supply_a_revision_or_cursor() {
-        for page in [
+        let malformed_pages = vec![
             json!({"events":{},"nextCursor":null}),
             json!({"events":[]}),
-            json!({"events":[],"nextCursor":""}),
-        ] {
+            json!({"events":[],"nextCursor":17}),
+            view(vec![], json!("x".repeat(MAX_CURSOR_BYTES + 1))),
+            view(vec![], json!("line\nbreak")),
+        ];
+        for page in malformed_pages {
             let (result, _) = run(input("message"), vec![page]).await;
             assert_eq!(result.unwrap_err().code, "INVALID_NATIVE_RESULT_PAGE");
         }
