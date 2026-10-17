@@ -15,10 +15,11 @@ use crate::control::{
 use crate::descriptor::extend_descriptor_catalog;
 use crate::{
     AdmissionState, BindingLaunchConfig, BindingMapPublication, CapabilityId, DemandCause,
-    DemandLease, DescriptorCatalog, KernelFault, LaunchValue, ModuleBindingCredential,
-    ModuleDemandCursor, ModuleDemandRecord, ModuleDescriptor, ModuleOwnerExecutable,
-    ModuleSupervisorObservation, OperationReadback, OperationSnapshot, ProtectedResolverContext,
-    ResolverMapDirectory, ServiceScope, Sha256Digest, SupervisorControlClient, SupervisorRegistry,
+    DemandLease, DescriptorCatalog, FailureSummary, KernelFault, LaunchValue, LifecycleState,
+    ModuleBindingCredential, ModuleDemandCursor, ModuleDemandRecord, ModuleDescriptor,
+    ModuleEffectCertainty, ModuleFailureStage, ModuleOwnerExecutable, ModuleSupervisorObservation,
+    OperationReadback, OperationSnapshot, ProtectedResolverContext, ResolverMapDirectory,
+    RestartStatus, ServiceScope, Sha256Digest, SupervisorControlClient, SupervisorRegistry,
     SupervisorRegistryConfig, SupervisorStatus, load_installed_descriptor, module_contract_claim,
 };
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,7 @@ const MAX_DESCRIPTOR_FILES: usize = 512;
 const MAX_PROTECTED_FILES: usize = 128;
 const MAX_LAUNCH_CONFIGS: usize = 256;
 const MAX_STATUS_QUEUE: usize = 1_024;
+const MAX_PRELAUNCH_OPERATION_IDS: usize = 256;
 const MODULE_SUPERVISOR_CLIENT_ID: &str = "eliot-module-supervisor-v1";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_ID: &str = "opencode-v2-native-options";
 const OPENCODE_NATIVE_OPTIONS_SCHEMA_VERSION_LEGACY: &str = "1";
@@ -1091,6 +1093,7 @@ impl StandaloneSupervisor {
         tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut recovered = false;
         let mut held = HashMap::<DemandKey, DemandLease>::new();
+        let mut prelaunch = HashMap::<(String, ServiceScope), SupervisorStatus>::new();
         let mut last_status = HashMap::<(String, ServiceScope), String>::new();
         let mut pending = VecDeque::<PendingStatusObservation>::new();
         let mut delivery_quarantines = HashMap::<(String, ServiceScope), String>::new();
@@ -1121,7 +1124,15 @@ impl StandaloneSupervisor {
                         }
                     }
                     if recovered {
-                        match self.reconcile_demands(&mut held, &mut scoped_error).await {
+                        match self
+                            .reconcile_demands(
+                                &mut held,
+                                &mut prelaunch,
+                                &delivery_quarantines,
+                                &mut scoped_error,
+                            )
+                            .await
+                        {
                             Ok(found) => saw_demand = found,
                             Err(error) => {
                                 self.registry
@@ -1163,6 +1174,7 @@ impl StandaloneSupervisor {
             }
             match self
                 .collect_status_events(
+                    &mut prelaunch,
                     &mut last_status,
                     &mut pending,
                     &mut sequence,
@@ -1173,6 +1185,7 @@ impl StandaloneSupervisor {
                 Err(error) => {
                     self.registry
                         .close_durable_admission(KernelFault::StoreUnavailable);
+                    recovered = false;
                     cycle_error.get_or_insert_with(|| error.code.clone());
                     eprintln!("module supervisor observation: {}", error.code);
                 }
@@ -1440,6 +1453,8 @@ impl StandaloneSupervisor {
     async fn reconcile_demands(
         &self,
         held: &mut HashMap<DemandKey, DemandLease>,
+        prelaunch: &mut HashMap<(String, ServiceScope), SupervisorStatus>,
+        quarantined: &HashMap<(String, ServiceScope), String>,
         scoped_error: &mut Option<String>,
     ) -> Result<bool> {
         let mut cursor = None::<ModuleDemandCursor>;
@@ -1530,6 +1545,12 @@ impl StandaloneSupervisor {
                     binding_id: demand.binding_id.clone(),
                     generation: demand.generation,
                 };
+                if let Some(error_code) = quarantined.get(&(key.module_id.clone(), scope.clone())) {
+                    // A rejected prelaunch observation has no registry service
+                    // to quarantine. Keep the same local fence before any setup.
+                    scoped_error.get_or_insert_with(|| safe_health_code(error_code));
+                    continue;
+                }
                 let stored = match self
                     .control
                     .scope_readback(
@@ -1589,13 +1610,40 @@ impl StandaloneSupervisor {
                         scoped_error.get_or_insert_with(|| safe_health_code(&error.code));
                     }
                 }
-                match self.start_demand(&demand, readback).await {
+                match self.start_demand(&demand, &readback).await {
                     Ok(lease) => {
+                        prelaunch.remove(&(key.module_id.clone(), scope.clone()));
                         held.insert(key, lease);
                     }
-                    Err(error) if is_control_failure(&error) => return Err(error),
                     Err(error) => {
-                        eprintln!("module demand isolated: {}", error.code);
+                        let error_code = safe_health_code(&error.code);
+                        if self.registry.status(&key.module_id, &scope).await.is_none() {
+                            let status_key = (key.module_id.clone(), scope.clone());
+                            if prelaunch.len() < MAX_STATUS_QUEUE
+                                || prelaunch.contains_key(&status_key)
+                            {
+                                // Preparation failed before the registry owns a service.
+                                // This diagnostic must not create a worker or a lease.
+                                prelaunch.insert(
+                                    status_key,
+                                    prelaunch_failure_status(
+                                        &demand,
+                                        &readback,
+                                        self.registry.admission_state(),
+                                        &error_code,
+                                    )?,
+                                );
+                            } else {
+                                scoped_error.get_or_insert_with(|| {
+                                    "MODULE_PRELAUNCH_STATUS_LIMIT".to_owned()
+                                });
+                            }
+                        }
+                        if is_control_failure(&error) {
+                            return Err(error);
+                        }
+                        eprintln!("module demand isolated: {error_code}");
+                        scoped_error.get_or_insert(error_code);
                     }
                 }
             }
@@ -1604,6 +1652,11 @@ impl StandaloneSupervisor {
                 break;
             }
         }
+        let seen_scopes: HashSet<_> = seen
+            .iter()
+            .map(|key| (key.module_id.clone(), key.scope.clone()))
+            .collect();
+        prelaunch.retain(|key, _| seen_scopes.contains(key));
         let stale = held
             .keys()
             .filter(|key| !seen.contains(*key))
@@ -1737,7 +1790,7 @@ impl StandaloneSupervisor {
     async fn start_demand(
         &self,
         demand: &ModuleDemandRecord,
-        readback: OperationReadback,
+        readback: &OperationReadback,
     ) -> Result<DemandLease> {
         if !matches!(self.registry.admission_state(), AdmissionState::Open) {
             return Err(Error::new(
@@ -1840,7 +1893,7 @@ impl StandaloneSupervisor {
                 },
                 launch_config,
                 module_client_id: ready.module_client_id,
-                readback: Some(readback),
+                readback: Some(readback.clone()),
             })
             .await
             .map_err(module_error)
@@ -1848,6 +1901,7 @@ impl StandaloneSupervisor {
 
     async fn collect_status_events(
         &self,
+        prelaunch: &mut HashMap<(String, ServiceScope), SupervisorStatus>,
         last_status: &mut HashMap<(String, ServiceScope), String>,
         pending: &mut VecDeque<PendingStatusObservation>,
         sequence: &mut u64,
@@ -1855,7 +1909,14 @@ impl StandaloneSupervisor {
     ) -> Result<Option<String>> {
         let mut health_code = None;
         let mut overflow = false;
-        for status in self.registry.observation_statuses().await {
+        let mut statuses = self.registry.observation_statuses().await;
+        // Actual registry evidence, including retained Ready, supersedes local
+        // preparation failures. Already queued events keep their exact identity.
+        for status in &statuses {
+            prelaunch.remove(&(status.module_id.clone(), status.scope.clone()));
+        }
+        statuses.extend(prelaunch.values().cloned());
+        for status in statuses {
             let key = (status.module_id.clone(), status.scope.clone());
             if quarantined.contains_key(&key) {
                 continue;
@@ -1914,10 +1975,12 @@ impl StandaloneSupervisor {
                         break;
                     };
                     let key = (front.status.module_id.clone(), front.status.scope.clone());
-                    self.registry
-                        .quarantine_scope(&key.0, &key.1, &error_code)
-                        .await
-                        .map_err(module_error)?;
+                    if self.registry.status(&key.0, &key.1).await.is_some() {
+                        self.registry
+                            .quarantine_scope(&key.0, &key.1, &error_code)
+                            .await
+                            .map_err(module_error)?;
+                    }
                     if let Some(item) = pending.pop_front() {
                         last_status.insert(key.clone(), item.fingerprint);
                         quarantined.insert(key, error_code.clone());
@@ -2013,6 +2076,70 @@ fn demand_key(demand: &ModuleDemandRecord) -> DemandKey {
         },
         operation_id: demand.operation_id.clone(),
     }
+}
+
+fn prelaunch_failure_status(
+    demand: &ModuleDemandRecord,
+    readback: &OperationReadback,
+    admission: AdmissionState,
+    error_code: &str,
+) -> Result<SupervisorStatus> {
+    let scope = ServiceScope {
+        binding_id: demand.binding_id.clone(),
+        generation: demand.generation,
+    };
+    readback.validate_for(&scope).map_err(module_error)?;
+    let unresolved: BTreeSet<_> = readback
+        .operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.state.as_str(),
+                "sending" | "native_accepted" | "outcome_unknown"
+            )
+        })
+        .map(|operation| operation.operation_id.as_str())
+        .collect();
+    let unknown_operation_count = unresolved.len();
+    let unknown_operation_ids: Vec<_> = unresolved
+        .into_iter()
+        .take(MAX_PRELAUNCH_OPERATION_IDS)
+        .map(str::to_owned)
+        .collect();
+    let truncated = unknown_operation_count > unknown_operation_ids.len();
+    let error_code = safe_health_code(error_code);
+    Ok(SupervisorStatus {
+        module_id: demand.descriptor.module_id.to_string(),
+        artifact_id: demand.descriptor.artifact.artifact_id.to_string(),
+        artifact_version: demand.descriptor.artifact.version.to_string(),
+        build_id: demand.descriptor.artifact.build_id.clone(),
+        scope,
+        admission,
+        lifecycle: LifecycleState::Isolated {
+            reason: error_code.clone(),
+        },
+        owner: None,
+        worker: None,
+        worker_boot_id: None,
+        hello_failure: None,
+        worker_diagnostic_code: None,
+        // A mapper/credential failure is not the helper's pre-spawn receipt.
+        effect_certainty: ModuleEffectCertainty::Unknown,
+        failure_stage: ModuleFailureStage::from_failure_code(&error_code),
+        readback_required: truncated,
+        unknown_operation_ids,
+        unknown_operation_count,
+        unknown_operation_ids_truncated: truncated,
+        restart: RestartStatus {
+            starts_in_window: 0,
+            last_delay_ms: None,
+            exhausted: false,
+        },
+        last_failure: Some(FailureSummary {
+            code: error_code,
+            detail: String::new(),
+        }),
+    })
 }
 
 fn operation_readback_for_scope(
@@ -2180,6 +2307,171 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+mod prelaunch_observation_tests {
+    use super::{MAX_PRELAUNCH_OPERATION_IDS, prelaunch_failure_status};
+    use crate::{
+        AdmissionState, ModuleDemandRecord, ModuleDescriptor, ModuleEffectCertainty,
+        ModuleFailureStage, ModuleSupervisorObservation, ModuleSupervisorPhase, OperationReadback,
+        OperationSnapshot, ServiceScope,
+    };
+    use serde_json::json;
+
+    const ACTOR: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn fixture(states: &[&str]) -> (ModuleDemandRecord, OperationReadback) {
+        let descriptor: ModuleDescriptor = serde_json::from_str(include_str!(
+            "../../swarm-adapter-opencode/registration/descriptor.template.json"
+        ))
+        .unwrap();
+        let scope = ServiceScope {
+            binding_id: "prelaunch-binding".to_owned(),
+            generation: 7,
+        };
+        let demand = ModuleDemandRecord {
+            module_id: descriptor.module_id.to_string(),
+            artifact_id: descriptor.artifact.artifact_id.to_string(),
+            artifact_version: descriptor.artifact.version.to_string(),
+            descriptor,
+            descriptor_revision: 1,
+            operation_id: "operation-0000".to_owned(),
+            required_capability: "runtime.open".to_owned(),
+            binding_id: scope.binding_id.clone(),
+            generation: scope.generation,
+            module_client_id: None,
+            credential_ref: None,
+            route_native_options: json!({"private": "prelaunch-private-marker"}),
+            operation_readback: Vec::new(),
+        };
+        let readback = OperationReadback {
+            operations: states
+                .iter()
+                .enumerate()
+                .map(|(index, state)| OperationSnapshot {
+                    operation_id: format!("operation-{index:04}"),
+                    binding_id: scope.binding_id.clone(),
+                    generation: scope.generation,
+                    state: (*state).to_owned(),
+                })
+                .collect(),
+            scope,
+            complete: true,
+        };
+        (demand, readback)
+    }
+
+    #[test]
+    fn prelaunch_wire_observation_retains_scope_and_only_unresolved_operations() {
+        let (demand, readback) = fixture(&[
+            "queued",
+            "sending",
+            "native_accepted",
+            "outcome_unknown",
+            "settled",
+            "rejected",
+            "cancelled",
+        ]);
+        let status = prelaunch_failure_status(
+            &demand,
+            &readback,
+            AdmissionState::Open,
+            "MODULE_CONFIG_SCHEMA_UNSUPPORTED",
+        )
+        .unwrap();
+        assert!(status.owner.is_none());
+        assert!(status.worker.is_none());
+        assert!(status.worker_boot_id.is_none());
+        assert!(!status.readback_required);
+        let event = ModuleSupervisorObservation::from_status(&status, ACTOR, 1).unwrap();
+        assert_eq!(event.actor_instance_id, ACTOR);
+        assert_eq!(event.event_id, format!("{ACTOR}:1"));
+        assert_eq!(event.module_id, demand.module_id);
+        assert_eq!(event.artifact_id, demand.artifact_id);
+        assert_eq!(event.artifact_version, demand.artifact_version);
+        assert_eq!(event.build_id, demand.descriptor.artifact.build_id);
+        assert_eq!(event.scope, readback.scope);
+        assert_eq!(event.boot_id, None);
+        assert_eq!(event.phase, ModuleSupervisorPhase::Isolated);
+        assert_eq!(event.effect_certainty, ModuleEffectCertainty::Unknown);
+        assert_eq!(event.stage, Some(ModuleFailureStage::ValidateLaunch));
+        assert_eq!(
+            event.error_code.as_deref(),
+            Some("MODULE_CONFIG_SCHEMA_UNSUPPORTED")
+        );
+        assert_eq!(event.unknown_operation_count, 3);
+        assert_eq!(
+            event.unknown_operation_ids,
+            ["operation-0001", "operation-0002", "operation-0003"]
+        );
+        assert!(!event.unknown_operation_ids_truncated);
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(!wire.contains("prelaunch-private-marker"));
+        assert!(!wire.contains("operation-0000"));
+    }
+
+    #[test]
+    fn prelaunch_readback_bound_preserves_count_and_rejects_foreign_scope() {
+        let (demand, mut readback) =
+            fixture(&["outcome_unknown"; MAX_PRELAUNCH_OPERATION_IDS + 1]);
+        let status = prelaunch_failure_status(
+            &demand,
+            &readback,
+            AdmissionState::Open,
+            "MODULE_CONFIG_INVALID",
+        )
+        .unwrap();
+        let event = ModuleSupervisorObservation::from_status(&status, ACTOR, 1).unwrap();
+        assert_eq!(event.unknown_operation_ids.len(), MAX_PRELAUNCH_OPERATION_IDS);
+        assert_eq!(event.unknown_operation_count, MAX_PRELAUNCH_OPERATION_IDS + 1);
+        assert!(event.unknown_operation_ids_truncated);
+        assert!(status.readback_required);
+
+        readback.operations[0].binding_id = "foreign-binding".to_owned();
+        assert_eq!(
+            prelaunch_failure_status(
+                &demand,
+                &readback,
+                AdmissionState::Open,
+                "MODULE_CONFIG_INVALID",
+            )
+            .unwrap_err()
+            .code,
+            "MODULE_READBACK_SCOPE_MISMATCH"
+        );
+        readback.operations[0].binding_id = demand.binding_id.clone();
+        readback.complete = false;
+        assert_eq!(
+            prelaunch_failure_status(
+                &demand,
+                &readback,
+                AdmissionState::Open,
+                "MODULE_CONFIG_INVALID",
+            )
+            .unwrap_err()
+            .code,
+            "MODULE_READBACK_INCOMPLETE"
+        );
+    }
+
+    #[test]
+    fn prelaunch_invalid_code_is_bounded_and_queued_is_not_unknown() {
+        let (demand, readback) = fixture(&["queued"]);
+        let status = prelaunch_failure_status(
+            &demand,
+            &readback,
+            AdmissionState::Open,
+            "raw error with private details",
+        )
+        .unwrap();
+        let event = ModuleSupervisorObservation::from_status(&status, ACTOR, 1).unwrap();
+        assert_eq!(event.error_code.as_deref(), Some("SUPERVISOR_ERROR"));
+        assert!(event.unknown_operation_ids.is_empty());
+        assert_eq!(event.unknown_operation_count, 0);
+        assert_eq!(event.effect_certainty, ModuleEffectCertainty::Unknown);
+        assert!(!serde_json::to_string(&event).unwrap().contains("private"));
+    }
 }
 
 #[cfg(test)]
