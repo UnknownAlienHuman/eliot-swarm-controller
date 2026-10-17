@@ -114,6 +114,39 @@ impl Fixture {
             .unwrap()
     }
 
+    async fn settle_sampled_operation(&self, state: &str) {
+        let state = state.to_owned();
+        self.store()
+            .run_fixture(move |db| {
+                db.execute(
+                "UPDATE operations SET state=?1,result_json='{}',settled_at_ms=2,updated_at_ms=2 \
+                 WHERE operation_id='unresolved-sentinel'",
+                [state],
+            )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn held_observations(&self) -> Vec<(String, Option<String>, String)> {
+        self.store()
+            .run_fixture(|db| {
+                let mut statement = db.prepare(
+                    "SELECT kind,operation_id,payload_json FROM observations \
+                 WHERE binding_id=?1 ORDER BY observation_id",
+                )?;
+                let rows = statement
+                    .query_map([HELD_BINDING], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap()
+    }
+
     async fn close(self) {
         self.owner.close().await.unwrap();
         fs::remove_dir_all(self.root).unwrap();
@@ -174,8 +207,13 @@ async fn discard_first_denial(fixture: &Fixture, event: &Value) -> Value {
 #[tokio::test]
 async fn lost_first_permanent_ack_replays_original_denial_and_other_scope_progresses() {
     let fixture = Fixture::start().await;
+    let mut changes = fixture.store().subscribe_module_demand_changes();
+    let initial_revision = *changes.borrow_and_update();
     let event = foreign_observation();
     let retained = discard_first_denial(&fixture, &event).await;
+    assert!(changes.has_changed().unwrap());
+    let denial_revision = *changes.borrow_and_update();
+    assert_eq!(denial_revision, initial_revision.wrapping_add(1));
     // Its existing quarantine would now derive SCOPE_QUARANTINED; an exact
     // callback retry must instead return the original retained denial.
     for _ in 0..2 {
@@ -190,6 +228,11 @@ async fn lost_first_permanent_ack_replays_original_denial_and_other_scope_progre
             }
         );
         assert_eq!(fixture.held_snapshot().await, retained);
+        assert!(
+            !changes.has_changed().unwrap(),
+            "a denial retry must not wake consumers"
+        );
+        assert_eq!(*changes.borrow(), denial_revision);
     }
     assert_eq!(
         fixture
@@ -198,6 +241,11 @@ async fn lost_first_permanent_ack_replays_original_denial_and_other_scope_progre
             .await
             .unwrap(),
         ObservationDisposition::Committed
+    );
+    assert!(changes.has_changed().unwrap());
+    assert_eq!(
+        *changes.borrow_and_update(),
+        denial_revision.wrapping_add(1)
     );
     let other = fixture
         .store()
@@ -289,7 +337,7 @@ async fn legacy_rejection_without_digest_remains_held_and_is_not_upgraded() {
 }
 
 #[tokio::test]
-async fn operation_state_denials_replay_without_relaxing_queued_or_terminal_guards() {
+async fn operation_state_denials_replay_without_relaxing_other_stage_guards() {
     for state in ["queued", "settled"] {
         let fixture = Fixture::start().await;
         if state == "settled" {
@@ -307,10 +355,11 @@ async fn operation_state_denials_replay_without_relaxing_queued_or_terminal_guar
                 .unwrap();
         }
         let mut event = observation(HELD_BINDING, 1);
+        event["stage"] = json!("worker");
         event["unknown_operation_ids"] = json!(["queued-sentinel"]);
         event["unknown_operation_count"] = json!(1);
-        // Both states intentionally retain today's denial policy. This test
-        // changes ACK replay, not the terminal-settlement race semantics.
+        // Neither queued IDs nor terminal IDs at another stage qualify for
+        // the narrow bootless ValidateLaunch sample exception.
         let _ = fixture
             .store()
             .record_module_supervisor_observation(&event)
@@ -330,6 +379,298 @@ async fn operation_state_denials_replay_without_relaxing_queued_or_terminal_guar
             }
         );
         assert_eq!(fixture.held_snapshot().await, retained);
+        fixture.close().await;
+    }
+}
+
+fn sampled_event() -> Value {
+    let mut event = observation(HELD_BINDING, 1);
+    event["unknown_operation_ids"] = json!(["unresolved-sentinel"]);
+    event["unknown_operation_count"] = json!(1);
+    event
+}
+
+#[tokio::test]
+async fn terminal_prelaunch_sample_preserves_snapshot_without_terminal_cause_and_can_progress() {
+    for (terminal, mixed) in [
+        ("settled", false),
+        ("rejected", false),
+        ("cancelled", false),
+        ("settled", true),
+    ] {
+        let fixture = Fixture::start().await;
+        if mixed {
+            fixture.store().run_fixture(|db| {
+                db.execute("UPDATE operations SET state='sending' WHERE operation_id='queued-sentinel'", [])?;
+                Ok(())
+            }).await.unwrap();
+        }
+        // Construct the producer sample while the actual fixture Operation is
+        // unresolved, then make the Store settlement win the delivery race.
+        let sampled = fixture.held_snapshot().await;
+        assert!(sampled["operations"].as_array().unwrap().iter().any(|row| {
+            let value: Value = serde_json::from_str(row.as_str().unwrap()).unwrap();
+            value["id"] == "unresolved-sentinel" && value["state"] == "outcome_unknown"
+        }));
+        let mut event = sampled_event();
+        if mixed {
+            event["unknown_operation_ids"] = json!(["queued-sentinel", "unresolved-sentinel"]);
+            event["unknown_operation_count"] = json!(2);
+        }
+        fixture.settle_sampled_operation(terminal).await;
+        let before = fixture.held_snapshot().await;
+        assert_eq!(
+            fixture
+                .store()
+                .record_module_supervisor_observation(&event)
+                .await
+                .unwrap(),
+            ObservationDisposition::Committed
+        );
+        let retained = fixture.held_snapshot().await;
+        assert_eq!(retained["operations"], before["operations"]);
+        assert!(retained["receipts"].as_array().unwrap().is_empty());
+        assert!(
+            retained["binding"]["observation"]
+                .get("module_supervisor_quarantine")
+                .is_none()
+        );
+        let rows = fixture.held_observations().await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "raced sample must not emit any derived cause trigger"
+        );
+        assert_eq!(rows[0].0, EVENT_KIND);
+        assert!(rows[0].1.is_none());
+        let original =
+            serde_json::to_value(parse_retained_observation(&rows[0].2).unwrap()).unwrap();
+        assert_eq!(
+            original, event,
+            "preserve every sampled fact, including ID/count/event identity"
+        );
+
+        let public = fixture
+            .store()
+            .run_fixture(|db| operations::get_binding_public(db, HELD_BINDING, GENERATION))
+            .await
+            .unwrap();
+        let diagnostic = &public["observation"]["module_supervisor"];
+        let attention = manager_attention_item(
+            diagnostic,
+            "fixture-scope",
+            HELD_BINDING,
+            GENERATION,
+            model::now_ms().unwrap(),
+            60_000,
+        )
+        .unwrap();
+        assert_eq!(
+            diagnostic["unknown_operation_ids"],
+            event["unknown_operation_ids"]
+        );
+        assert_eq!(
+            diagnostic["unknown_operation_count"],
+            event["unknown_operation_count"]
+        );
+        assert_eq!(diagnostic["stage"], "validate_launch");
+        assert_eq!(
+            attention["address"]["unknown_operation_ids"],
+            event["unknown_operation_ids"]
+        );
+        assert_eq!(attention["address"]["retry_authorized"], false);
+
+        // A fresh preparation/readback sample can follow without a local or
+        // durable rejection fence. It no longer lists the settled work.
+        let mut fresh = observation(HELD_BINDING, 2);
+        if mixed {
+            fresh["unknown_operation_ids"] = json!(["queued-sentinel"]);
+            fresh["unknown_operation_count"] = json!(1);
+        }
+        assert_eq!(
+            fixture
+                .store()
+                .record_module_supervisor_observation(&fresh)
+                .await
+                .unwrap(),
+            ObservationDisposition::Committed
+        );
+        let mut changes = fixture.store().subscribe_module_demand_changes();
+        let revision = *changes.borrow_and_update();
+        assert_eq!(
+            fixture
+                .store()
+                .record_module_supervisor_observation(&event)
+                .await
+                .unwrap(),
+            ObservationDisposition::ExactDuplicate
+        );
+        assert!(!changes.has_changed().unwrap());
+        assert_eq!(*changes.borrow(), revision);
+        let after = fixture.held_snapshot().await;
+        assert_eq!(after["operations"], before["operations"]);
+        assert_eq!(
+            after["binding"]["observation"]["module_supervisor"]["event_id"],
+            fresh["event_id"]
+        );
+        let rows = fixture.held_observations().await;
+        assert_eq!(
+            serde_json::to_value(parse_retained_observation(&rows[0].2).unwrap()).unwrap(),
+            event
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.1.as_deref() != Some("unresolved-sentinel")),
+            "terminal ID must never become a cause"
+        );
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+async fn prelaunch_terminal_tolerance_validates_all_ids_and_exact_generation() {
+    for (case, expected) in [
+        ("queued", "MODULE_OBSERVATION_OPERATION_TERMINAL"),
+        ("missing", "MODULE_OBSERVATION_OPERATION_SCOPE"),
+        ("foreign", "MODULE_OBSERVATION_OPERATION_SCOPE"),
+        ("generation", "MODULE_OBSERVATION_OPERATION_SCOPE"),
+        ("invalid", "MODULE_OBSERVATION_OPERATION_TERMINAL"),
+    ] {
+        let fixture = Fixture::start().await;
+        let mut event = sampled_event();
+        // Terminal ID sorts first: accepting it must not skip validation of
+        // any later queued, foreign, missing or corrupt scoped Operation.
+        event["unknown_operation_ids"] = json!(["unresolved-sentinel", "z-bad-id"]);
+        event["unknown_operation_count"] = json!(2);
+        fixture.settle_sampled_operation("settled").await;
+        fixture.store().run_fixture(move |db| {
+            if case == "missing" {
+                return Ok(());
+            }
+            if case == "generation" {
+                db.execute(
+                    "INSERT INTO bindings(binding_id,generation,lane_id,module_instance_id,\
+                         module_artifact_id,state,route_json,state_json,created_at_ms) \
+                     SELECT binding_id,8,'other-generation','other-generation',\
+                         module_artifact_id,state,route_json,state_json,created_at_ms \
+                     FROM bindings WHERE binding_id=?1 AND generation=?2",
+                    params![HELD_BINDING, GENERATION],
+                )?;
+            }
+            if case == "invalid" {
+                db.execute_batch("PRAGMA ignore_check_constraints=ON;")?;
+            }
+            db.execute(
+                "INSERT INTO operations(operation_id,caller_id,client_request_id,method,\
+                     original_request_json,effective_request_json,binding_id,\
+                     binding_generation,state,due_at_ms,created_at_ms,updated_at_ms) \
+                 VALUES('z-bad-id','retry-fixture','z-bad-id','agent.send','{}','{}',?1,?2,?3,1,1,1)",
+                params![if case == "foreign" { OTHER_BINDING } else { HELD_BINDING },
+                    if case == "generation" { 8 } else { GENERATION },
+                    match case { "queued" => "queued", "invalid" => "invalid-state", _ => "sending" }],
+            )?;
+            if case == "invalid" {
+                db.execute_batch("PRAGMA ignore_check_constraints=OFF;")?;
+            }
+            Ok(())
+        }).await.unwrap();
+        let before = fixture.held_snapshot().await;
+        assert_eq!(
+            fixture
+                .store()
+                .record_module_supervisor_observation(event)
+                .await
+                .unwrap(),
+            ObservationDisposition::ScopedPermanentRejection {
+                error_code: expected.to_owned()
+            }
+        );
+        let after = fixture.held_snapshot().await;
+        assert_eq!(after["operations"], before["operations"]);
+        assert_eq!(after["receipts"].as_array().unwrap().len(), 1);
+        assert!(after["binding"]["observation"]["module_supervisor_quarantine"].is_object());
+        assert!(
+            after["binding"]["observation"]
+                .get("module_supervisor")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .held_observations()
+                .await
+                .iter()
+                .all(|row| row.0 == REJECTION_EVENT_KIND)
+        );
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+async fn terminal_sample_does_not_release_existing_quarantine_or_rewrite_receipts() {
+    let fixture = Fixture::start().await;
+    let old = discard_first_denial(&fixture, &foreign_observation()).await;
+    fixture.settle_sampled_operation("settled").await;
+    let before = fixture.held_snapshot().await;
+    let mut event = sampled_event();
+    event["sequence"] = json!(2);
+    event["event_id"] = json!(format!("{ACTOR}:2"));
+    assert_eq!(
+        fixture
+            .store()
+            .record_module_supervisor_observation(event)
+            .await
+            .unwrap(),
+        ObservationDisposition::ScopedPermanentRejection {
+            error_code: "MODULE_OBSERVATION_SCOPE_QUARANTINED".to_owned(),
+        }
+    );
+    let after = fixture.held_snapshot().await;
+    assert_eq!(after["binding"], old["binding"]);
+    assert_eq!(after["receipts"][0], old["receipts"][0]);
+    assert_eq!(after["operations"], before["operations"]);
+    assert_eq!(after["receipts"].as_array().unwrap().len(), 2);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn terminal_tolerance_requires_bootless_isolated_unknown_shape() {
+    for case in ["boot", "phase", "certainty"] {
+        let fixture = Fixture::start().await;
+        let mut event = sampled_event();
+        fixture.settle_sampled_operation("settled").await;
+        // These are adversarial negative callbacks, never evidence of a real
+        // helper boot or a certified NotStarted outcome.
+        match case {
+            "boot" => {
+                event["boot_id"] = json!("unproven-test-boot");
+                event["event_id"] = json!(format!("unproven-test-boot:{ACTOR}:1"));
+            }
+            "phase" => event["phase"] = json!("waiting_for_kernel"),
+            "certainty" => event["effect_certainty"] = json!("not_started"),
+            _ => unreachable!(),
+        }
+        let before = fixture.held_snapshot().await;
+        assert_eq!(
+            fixture
+                .store()
+                .record_module_supervisor_observation(event)
+                .await
+                .unwrap(),
+            ObservationDisposition::ScopedPermanentRejection {
+                error_code: "MODULE_OBSERVATION_OPERATION_TERMINAL".to_owned(),
+            }
+        );
+        let after = fixture.held_snapshot().await;
+        assert_eq!(after["operations"], before["operations"]);
+        assert_eq!(after["receipts"].as_array().unwrap().len(), 1);
+        assert!(after["binding"]["observation"]["module_supervisor_quarantine"].is_object());
+        assert!(
+            fixture
+                .held_observations()
+                .await
+                .iter()
+                .all(|row| row.0 == REJECTION_EVENT_KIND)
+        );
         fixture.close().await;
     }
 }
