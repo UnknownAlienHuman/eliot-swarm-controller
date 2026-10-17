@@ -33,3 +33,25 @@ children, result paging, recovery, authorized streams, packaging and installed
 native qualification remain outstanding. Native MCP inventory remains
 unavailable; this library does not authorize dispatch. The eventual worker must
 keep jsonrpsee payload trace targets disabled in its logging configuration.
+
+## Native result reader
+
+`results` validates exact session/item/revision selectors and uses only
+`view/page` and `item/readOutput`. It does not consume `subagent/readResult`,
+follow stored paths/URLs, select the latest assistant message or accept a Task.
+The caller must authorize the current binding/family and any supplied cursor;
+that predicate is rechecked around native reads and before returning bytes.
+
+A historical lookup reads at most 64 native pages per call, keeping one page
+and bounded cursor digests. If more history remains, it returns the exact
+observed continuation rather than claiming the revision is unavailable.
+The continuation itself grants no read rights. Byte pages are capped at 65536;
+the reader validates source references, range/EOF/base64 and whole digests when
+available. Unknown item statuses do not establish terminal results.
+
+Structured subagent results use explicitly versioned
+`rust_muse_result_json_v1` bytes, preserving native JSON integer values. This is
+not a relabelling of historical Node canonical bytes or a migration of their
+bindings. Message UTF-8 and native stored-output digest semantics are retained.
+The twelve local reader fixtures do not qualify installed Muse or host result
+delivery; facade/journal integration remains required.

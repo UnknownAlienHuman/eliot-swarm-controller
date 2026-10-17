@@ -2468,10 +2468,12 @@ dependencies = [
 name = "swarm-adapter-muse"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "jsonrpsee-core",
  "serde_json",
+ "sha2",
  "swarm-process",
  "tokio",
  "tokio-util",
