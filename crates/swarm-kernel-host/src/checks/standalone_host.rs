@@ -203,11 +203,15 @@ pub(crate) fn prepare_and_spawn(
             )
         })?;
         let image = process_image_identity(pid).map_err(|error| {
-            Error::new(
-                "CHECK_EXECUTOR_MISMATCH",
-                "checks executor image could not be verified before Store Go",
-            )
-            .with_secondary_error(error)
+            let message = "checks executor image could not be verified before Store Go";
+            // Retain only a closed reason in test artifacts, at the exact failed
+            // observation. Unknown messages never enter this diagnostic.
+            #[cfg(test)]
+            let message = format!(
+                "{message}; image_reason={}",
+                crate::platform::process_group::classify_image_error(&error.code, &error.message),
+            );
+            Error::new("CHECK_EXECUTOR_MISMATCH", message).with_secondary_error(error)
         })?;
         let image_path = canonical_path_text(&image["image_path"]).map_err(|error| {
             Error::new(
