@@ -1522,21 +1522,14 @@ impl StandaloneSupervisor {
                         eprintln!("module operation apply: {}", error.code);
                     } else if let Some(boot_id) = readback.module_hello_boot_id.as_deref()
                         && let Err(error) = self
-                            .confirm_module_hello(&key.module_id, &scope, boot_id)
+                            .registry
+                            .reconcile_retained_module_hello(&key.module_id, &scope, boot_id)
                             .await
+                            .map_err(module_error)
                     {
                         if is_control_failure(&error) {
                             return Err(error);
                         }
-                        self.registry
-                            .record_module_hello_failure(
-                                &key.module_id,
-                                &scope,
-                                boot_id,
-                                &error.code,
-                            )
-                            .await
-                            .map_err(module_error)?;
                         scoped_error.get_or_insert_with(|| safe_health_code(&error.code));
                     }
                     continue;
@@ -1592,21 +1585,14 @@ impl StandaloneSupervisor {
                     }
                     if let Some(boot_id) = stored.module_hello_boot_id.as_deref()
                         && let Err(error) = self
-                            .confirm_module_hello(&demand.module_id, &scope, boot_id)
+                            .registry
+                            .reconcile_retained_module_hello(&demand.module_id, &scope, boot_id)
                             .await
+                            .map_err(module_error)
                     {
                         if is_control_failure(&error) {
                             return Err(error);
                         }
-                        self.registry
-                            .record_module_hello_failure(
-                                &demand.module_id,
-                                &scope,
-                                boot_id,
-                                &error.code,
-                            )
-                            .await
-                            .map_err(module_error)?;
                         scoped_error.get_or_insert_with(|| safe_health_code(&error.code));
                     }
                 }
@@ -1699,16 +1685,14 @@ impl StandaloneSupervisor {
             }
             if let Some(boot_id) = readback.module_hello_boot_id.as_deref()
                 && let Err(error) = self
-                    .confirm_module_hello(&key.module_id, &scope, boot_id)
+                    .registry
+                    .reconcile_retained_module_hello(&key.module_id, &scope, boot_id)
                     .await
+                    .map_err(module_error)
             {
                 if is_control_failure(&error) {
                     return Err(error);
                 }
-                self.registry
-                    .record_module_hello_failure(&key.module_id, &scope, boot_id, &error.code)
-                    .await
-                    .map_err(module_error)?;
                 scoped_error.get_or_insert_with(|| safe_health_code(&error.code));
             }
             let pending = readback
