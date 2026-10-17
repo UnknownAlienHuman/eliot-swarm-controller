@@ -63,7 +63,7 @@
           "adapter": "OpenCode",
           "module_id": "eliot.opencode.v2",
           "artifact_id": "eliot-opencode-v2.rust-http.1",
-          "version": "0.7.1"
+          "version": "0.7.2"
         }
       ]
     },
