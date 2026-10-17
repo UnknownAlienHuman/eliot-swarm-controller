@@ -38,3 +38,4 @@
 
 pub mod msp;
 pub mod results;
+pub mod schema;

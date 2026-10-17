@@ -11,6 +11,7 @@ base64 = "=0.22.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 jsonrpsee-core = { version = "=0.26.1", default-features = false, features = ["async-client", "server"] }
+jsonschema = { version = "=0.58.6", default-features = false }
 serde_json = "1"
 sha2 = "0.10"
 swarm-process = { path = "../swarm-process" }

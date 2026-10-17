@@ -79,9 +79,9 @@ impl fmt::Display for SchemaError {
 impl Error for SchemaError {}
 
 fn document() -> Result<&'static Value, SchemaError> {
-    match DOCUMENT.get_or_init(|| {
-        serde_json::from_str(MSP_SCHEMA_JSON).map_err(|error| error.to_string())
-    }) {
+    match DOCUMENT
+        .get_or_init(|| serde_json::from_str(MSP_SCHEMA_JSON).map_err(|error| error.to_string()))
+    {
         Ok(document) => Ok(document),
         Err(message) => Err(SchemaError::InvalidBundledSchema(message.clone())),
     }
@@ -153,25 +153,21 @@ fn schema_info_property(name: &str) -> Result<&'static Value, SchemaError> {
         .get("properties")
         .and_then(|properties| properties.get(name))
         .ok_or_else(|| {
-            SchemaError::InvalidBundledSchema(format!(
-                "missing SchemaInfo.properties.{name}"
-            ))
+            SchemaError::InvalidBundledSchema(format!("missing SchemaInfo.properties.{name}"))
         })
 }
 
-fn validate_pointer(
-    pointer: &str,
-    target: String,
-    value: &Value,
-) -> Result<(), SchemaError> {
+fn validate_pointer(pointer: &str, target: String, value: &Value) -> Result<(), SchemaError> {
     let validator = validators()?
         .get(pointer)
         .ok_or_else(|| SchemaError::CompiledValidatorMissing(pointer.to_owned()))?;
-    validator.validate(value).map_err(|error| SchemaError::InvalidValue {
-        target,
-        instance_path: error.instance_path().to_string(),
-        schema_path: error.schema_path().to_string(),
-    })
+    validator
+        .validate(value)
+        .map_err(|error| SchemaError::InvalidValue {
+            target,
+            instance_path: error.instance_path().to_string(),
+            schema_path: error.schema_path().to_string(),
+        })
 }
 
 /// Validate a JSON value against one upstream `$defs` entry.
@@ -218,14 +214,18 @@ mod tests {
     fn initialize_schema_info_uses_the_pinned_fingerprint_rule() {
         let fingerprint_schema = initialize_schema_fingerprint_schema().unwrap();
         assert_eq!(
-            fingerprint_schema.get("pattern").and_then(|value| value.as_str()),
+            fingerprint_schema
+                .get("pattern")
+                .and_then(|value| value.as_str()),
             Some("^sha256:[0-9a-f]{64}$")
         );
-        assert!(fingerprint_schema
-            .get("description")
-            .and_then(|value| value.as_str())
-            .unwrap()
-            .contains("stable-surface bundle"));
+        assert!(
+            fingerprint_schema
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap()
+                .contains("stable-surface bundle")
+        );
 
         let version_schema = initialize_schema_version_schema().unwrap();
         assert_eq!(
