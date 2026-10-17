@@ -11,7 +11,8 @@ use swarm_supervisor::{
     AdmissionState, LaunchValue, LifecycleState, ModuleDescriptor, ModuleEffectCertainty,
     ModuleFailureStage, ModuleSupervisorObservation, ModuleSupervisorPhase, ServiceScope,
     Sha256Digest, StandaloneRouteConfigMapper, StandaloneSupervisor, StandaloneSupervisorConfig,
-    SupervisorBootstrap, SupervisorControlClient, control::ObservationDeliveryDisposition,
+    SupervisorBootstrap, SupervisorControlClient, SupervisorStatus,
+    control::ObservationDeliveryDisposition,
 };
 use tokio::{task::JoinSet, time};
 use tokio_util::codec::{Framed, LinesCodec};
@@ -20,6 +21,49 @@ const ADAPTER_CHILD: &str = "store::module_prelaunch_observation_tests::prelaunc
 const CONFIG_CANARY: &str = "PRIVATE_PRELAUNCH_OPTIONS_MUST_NOT_ESCAPE";
 const UNSUPPORTED: &str = "MODULE_CONFIG_SCHEMA_UNSUPPORTED";
 const BOUND: Duration = Duration::from_secs(20);
+
+fn compatible_status_diagnostic(status: Option<&SupervisorStatus>) -> Value {
+    let Some(status) = status else {
+        return json!({"snapshot_available":false});
+    };
+    let lifecycle = serde_json::to_value(&status.lifecycle).unwrap();
+    let closed_code = |code: Option<&str>| {
+        code.filter(|code| {
+            !code.is_empty()
+                && code.len() <= 128
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        })
+        .map(str::to_owned)
+    };
+    let retained_reason = match &status.lifecycle {
+        LifecycleState::OwnerGroupRetained { reason, .. } => Some(*reason),
+        _ => None,
+    };
+    // Whitelist bounded metadata only. Never print Isolated.reason,
+    // last_failure.detail, process image/path/birth, configuration or input.
+    json!({
+        "snapshot_available":true,
+        "phase":lifecycle["state"],
+        "exit_code":lifecycle["exit_code"],
+        "exit_proven":lifecycle["exit_proven"],
+        "retained_reason":retained_reason,
+        "boot_present":status.worker_boot_id.is_some(),
+        "boot_id":status.worker_boot_id.as_deref().filter(|id| uuid::Uuid::parse_str(id).is_ok()),
+        "owner_pid":status.owner.as_ref().map(|owner| owner.pid),
+        "worker_pid":status.worker.as_ref().map(|worker| worker.pid),
+        "admission":status.admission,
+        "readback_required":status.readback_required,
+        "unknown_operation_count":status.unknown_operation_count,
+        "unknown_operation_ids_truncated":status.unknown_operation_ids_truncated,
+        "restart":status.restart,
+        "effect_certainty":status.effect_certainty,
+        "failure_stage":status.failure_stage,
+        "failure_code":closed_code(status.last_failure.as_ref().map(|failure| failure.code.as_str())),
+        "worker_diagnostic_code":closed_code(status.worker_diagnostic_code.as_deref()),
+    })
+}
 
 #[derive(Clone)]
 struct Delivery {
@@ -376,7 +420,7 @@ async fn observation_count(store: &Store, binding: &str, kind: &str) -> i64 {
 fn prelaunch_adapter_child() {
     let marker = PathBuf::from(std::env::var_os("ELIOT_PRELAUNCH_MARKER").unwrap());
     let release = PathBuf::from(std::env::var_os("ELIOT_PRELAUNCH_RELEASE").unwrap());
-    fs::write(marker, b"actual adapter child entered").unwrap();
+    fs::write(&marker, b"actual adapter child entered").unwrap();
     let deadline = std::time::Instant::now() + BOUND;
     while !release.exists() {
         assert!(
@@ -385,6 +429,8 @@ fn prelaunch_adapter_child() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Test-body return is diagnostic only, never OS/family departure proof.
+    fs::write(marker.with_extension("returned"), b"adapter test body returning").unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -472,6 +518,10 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
     let blocked_id = blocked["binding_id"].as_str().unwrap().to_owned();
     let held_id = held["binding_id"].as_str().unwrap().to_owned();
     let compatible_id = compatible["binding_id"].as_str().unwrap().to_owned();
+    let compatible_scope = ServiceScope {
+        binding_id: compatible_id.clone(),
+        generation: 1,
+    };
     assert_eq!(blocked["state"], "queued");
 
     // Negative authority case, not a launch receipt: bootless/Unknown and the
@@ -578,6 +628,7 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
     let (stop, stopping) = watch::channel(false);
     let runner_supervisor = supervisor.clone();
     let mut runner = tokio::spawn(async move { runner_supervisor.run(stopping).await });
+    let mut compatible_start_status = None;
     let progress = time::timeout(BOUND, async {
         let mut acknowledged_at = None;
         loop {
@@ -613,7 +664,22 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
                 && rejected
                 && files.root.join("compatible-adapter-started").is_file()
             {
-                return Ok(());
+                // The child's entry marker can precede the owner's image
+                // capture and worker.json publication (module_owner.rs:572).
+                // Keep the child live until the real supervisor has validated
+                // that receipt; early release can make Linux /proc image
+                // capture fail and correctly leave retirement unprovable.
+                compatible_start_status = supervisor
+                    .registry()
+                    .status(compatible_descriptor.module_id.as_str(), &compatible_scope)
+                    .await;
+                if compatible_start_status.as_ref().is_some_and(|status| {
+                    status.owner.is_some()
+                        && status.worker.is_some()
+                        && status.worker_boot_id.is_some()
+                }) {
+                    return Ok(());
+                }
             }
             time::sleep(Duration::from_millis(25)).await;
         }
@@ -628,7 +694,10 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
         .unwrap()
         .unwrap()
         .unwrap();
-    progress.expect("no connected duplicate ACK, scoped rejection, stable passes or compatible adapter start within the bound")
+    progress.unwrap_or_else(|error| panic!(
+        "no connected duplicate ACK, scoped rejection, stable passes or receipt-validated compatible adapter start within the bound: {error:?}; compatible={}",
+        compatible_status_diagnostic(compatible_start_status.as_ref()),
+    ))
         .expect("scoped observation delivery disrupted the supervisor");
 
     let deliveries = connected.trace.lock().unwrap().deliveries_for(&blocked_id);
@@ -824,33 +893,41 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
     ));
     // Wait for actual helper-family retirement before closing Store/removing
     // the fixture root. Neither the marker nor direct child exit is proof.
-    time::timeout(BOUND, async {
+    let mut last_retirement_status = None;
+    let retirement = time::timeout(BOUND, async {
         loop {
-            if let Some(status) = supervisor
+            let status = supervisor
                 .registry()
                 .status(
                     compatible_descriptor.module_id.as_str(),
-                    &ServiceScope {
-                        binding_id: compatible_id.clone(),
-                        generation: 1,
-                    },
+                    &compatible_scope,
                 )
-                .await
-                && matches!(
-                    status.lifecycle,
+                .await;
+            let terminal = status.as_ref().is_some_and(|status| {
+                matches!(
+                    &status.lifecycle,
                     LifecycleState::ProcessExited {
                         exit_proven: true,
                         ..
                     } | LifecycleState::Completed { .. }
                 )
-            {
+            });
+            last_retirement_status = status;
+            if terminal {
                 break;
             }
             time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .expect("actual compatible owner family did not retire");
+    .await;
+    retirement.unwrap_or_else(|error| panic!(
+        "actual compatible owner family did not retire: {error:?}; start={}; last={}; adapter_started={}; release_written={}; adapter_body_returned={}",
+        compatible_status_diagnostic(compatible_start_status.as_ref()),
+        compatible_status_diagnostic(last_retirement_status.as_ref()),
+        files.root.join("compatible-adapter-started").is_file(),
+        files.release.is_file(),
+        files.root.join("compatible-adapter-started").with_extension("returned").is_file(),
+    ));
     drop(supervisor);
     connected.close().await;
     fs::remove_dir_all(&files.root).unwrap();
