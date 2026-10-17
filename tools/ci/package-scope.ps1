@@ -573,8 +573,14 @@ function Invoke-FullOwnedRustChecks([string] $TargetDir) {
     $testArgs = @('test', '--locked', '--target-dir', $resolvedTarget)
     foreach ($package in $testSpecs) { $testArgs += @('--package', $package) }
     Write-Host "cargo $($testArgs -join ' ')"
-    & cargo @testArgs
-    if ($LASTEXITCODE -ne 0) { throw "Full owned-package cargo test failed with exit code $LASTEXITCODE." }
+    $previousPrelaunchOwnerHelper = $env:ELIOT_PRELAUNCH_TEST_OWNER_HELPER
+    try {
+        $env:ELIOT_PRELAUNCH_TEST_OWNER_HELPER = Join-Path (Join-Path $resolvedTarget 'debug') ('swarm-module-owner' + $exeSuffix)
+        & cargo @testArgs
+        if ($LASTEXITCODE -ne 0) { throw "Full owned-package cargo test failed with exit code $LASTEXITCODE." }
+    } finally {
+        $env:ELIOT_PRELAUNCH_TEST_OWNER_HELPER = $previousPrelaunchOwnerHelper
+    }
 }
 
 function Invoke-DiffCheck($Changes) {
