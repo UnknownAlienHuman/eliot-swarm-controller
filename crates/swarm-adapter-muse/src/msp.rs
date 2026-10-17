@@ -318,7 +318,13 @@ fn id_key(id: &Value) -> Option<String> {
                 return Some(format!("n:{n}"));
             }
             let n = value.as_f64()?;
-            (n.is_finite() && n.fract() == 0.0).then(|| format!("n:{n:.0}"))
+            (n.is_finite() && n.fract() == 0.0).then(|| {
+                if n == 0.0 {
+                    "n:0".to_owned()
+                } else {
+                    format!("n:{n:.0}")
+                }
+            })
         }
         _ => None,
     }
@@ -1217,26 +1223,32 @@ mod tests {
 
     #[tokio::test]
     async fn msp_transport_duplicate_inbound_id_fails_closed_while_in_flight() {
-        let (transport, _events, mut input, mut output) = fixture(
-            Options::default(),
-            slow_router(Arc::new(Notify::new())),
-            512,
-        );
-        let request = json!({"jsonrpc":"2.0","id":1,"method":"slow/request","params":{}});
-        output
-            .write_all(format!("{request}\n{request}\n").as_bytes())
-            .await
-            .unwrap();
-        assert_eq!(end(&transport).await, TransportEnd::DuplicateServerId);
-        let mut trailing = Vec::new();
-        timeout(DEADLINE, input.read_to_end(&mut trailing))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            trailing.is_empty(),
-            "no invented ACK or decision for a collision"
-        );
+        // Numeric -0.0 and 0 identify the same request even though their JSON
+        // spellings differ. Neither form may bypass the in-flight ID fence.
+        for (first_id, second_id) in [(json!(1), json!(1)), (json!(0), json!(-0.0))] {
+            let (transport, _events, mut input, mut output) = fixture(
+                Options::default(),
+                slow_router(Arc::new(Notify::new())),
+                512,
+            );
+            let first = json!({"jsonrpc":"2.0","id":first_id,"method":"slow/request","params":{}});
+            let second =
+                json!({"jsonrpc":"2.0","id":second_id,"method":"slow/request","params":{}});
+            output
+                .write_all(format!("{first}\n{second}\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(end(&transport).await, TransportEnd::DuplicateServerId);
+            let mut trailing = Vec::new();
+            timeout(DEADLINE, input.read_to_end(&mut trailing))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                trailing.is_empty(),
+                "no invented ACK or decision for a collision"
+            );
+        }
     }
 
     #[tokio::test]
