@@ -55,7 +55,7 @@ native model/provider/effort selectors remain omitted.
 ## Root verification
 
 Root runs Cargo and formatting sequentially. The coherent local library pass on
-2026-10-17 completed 119 tests with three explicit subprocess-entry fixtures
+2026-10-17 completed 127 tests with three explicit subprocess-entry fixtures
 ignored. It includes transport, journal, codec, schema, Driver, runtime lanes and
 the native-custodian external watchdog. Separate common-client transport and
 authenticated actual Host concurrency cases passed. Strict scoped all-target
