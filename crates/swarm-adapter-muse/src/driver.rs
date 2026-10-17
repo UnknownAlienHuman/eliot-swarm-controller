@@ -60,6 +60,56 @@ fn jf(error: journal::Fault) -> Error {
     fault(error.code())
 }
 
+// The pinned MSP document separates notifications from client methods. Use
+// their exact generated definitions through the shared full-schema validator;
+// an UnknownMethod result must not hide a known native event's invalid params.
+const NATIVE_NOTIFICATION_DEFINITIONS: &[(&str, &str)] = &[
+    ("approval/requested", "ApprovalRequestParams"),
+    ("approval/resolved", "ApprovalResolvedParams"),
+    ("approval/updated", "ApprovalUpdatedParams"),
+    ("item/completed", "ItemCompletedParams"),
+    ("item/delta", "ItemDeltaParams"),
+    ("item/started", "ItemStartedParams"),
+    ("item/updated", "ItemUpdatedParams"),
+    ("session/approvalModeChanged", "SessionApprovalModeChangedParams"),
+    ("session/branchChanged", "SessionBranchChangedParams"),
+    ("session/contextUsage", "SessionContextUsageParams"),
+    ("session/goalChanged", "SessionGoalChangedParams"),
+    ("session/listChanged", "SessionListChangedParams"),
+    ("session/modelChanged", "SessionModelChangedParams"),
+    ("session/modelRouteUnserved", "SessionModelRouteUnservedParams"),
+    ("session/nameChanged", "SessionNameChangedParams"),
+    ("session/reasoningEffortChanged", "SessionReasoningEffortChangedParams"),
+    ("session/statusChanged", "SessionStatusChangedParams"),
+    ("session/todoListChanged", "SessionTodoListChangedParams"),
+    ("session/tokenUsage", "SessionTokenUsageParams"),
+    ("session/viewHealthChanged", "SessionViewHealthChangedParams"),
+    ("skill/changed", "SkillChangedParams"),
+    ("turn/completed", "TurnCompletedParams"),
+    ("turn/retracted", "TurnRetractedParams"),
+    ("turn/retryScheduled", "TurnRetryScheduledParams"),
+    ("turn/started", "TurnStartedParams"),
+    ("turn/unqueued", "TurnUnqueuedParams"),
+    ("usage/changed", "SubscriptionUsage"),
+    ("userInput/requested", "UserInputRequestParams"),
+    ("userInput/settled", "UserInputSettledParams"),
+    ("view/gap", "ViewGapParams"),
+];
+
+fn validate_native_notification_parameters(
+    method: &str,
+    params: &Value,
+) -> std::result::Result<(), schema::SchemaError> {
+    if let Some(definition) = NATIVE_NOTIFICATION_DEFINITIONS
+        .iter()
+        .find_map(|(name, definition)| (*name == method).then_some(*definition))
+    {
+        schema::validate_definition(definition, params)
+    } else {
+        schema::validate_method_parameters(method, params)
+    }
+}
+
 #[derive(Clone)]
 struct ControlRequest {
     method: String,
@@ -1719,7 +1769,7 @@ impl Driver {
         let method = notification.envelope["method"].as_str().unwrap_or("");
         let p = &notification.envelope["params"];
         let valid = matches!(
-            schema::validate_method_parameters(method, p),
+            validate_native_notification_parameters(method, p),
             Ok(()) | Err(schema::SchemaError::UnknownMethod(_))
         );
         let mut s = self.lock()?;

@@ -11,7 +11,7 @@ mod native_event_fences {
     }
 
     async fn wait_for(driver: &Driver, condition: impl Fn(&State) -> bool) {
-        bounded(async {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let reached = {
                     let state = driver.lock().unwrap();
@@ -22,8 +22,48 @@ mod native_event_fences {
                 }
                 tokio::task::yield_now().await;
             }
-        })
-        .await;
+        }).await;
+        if let Err(error) = waited {
+            let state = driver.lock().unwrap();
+            panic!(
+                "native event fence fixture deadline: {error:?}; event_number={}; root_revision={}; diagnostic={:?}; transport_ended={}; ready={}",
+                state.event_number, state.revision(ROOT), state.diagnostic,
+                state.transport_ended, state.ready,
+            );
+        }
+    }
+
+    #[test]
+    fn muse_driver_native_notification_definitions_match_pinned_schema() {
+        let document: Value = serde_json::from_str(schema::MSP_SCHEMA_JSON).unwrap();
+        let notifications = document["notifications"].as_object().unwrap();
+        let mut definitions = 0;
+        for (name, notification) in notifications {
+            let Some(params) = notification.get("params") else {
+                assert_eq!(name, "initialized");
+                continue;
+            };
+            let expected = params["$ref"].as_str().unwrap()
+                .strip_prefix("#/$defs/").unwrap();
+            let selected: Vec<_> = NATIVE_NOTIFICATION_DEFINITIONS.iter()
+                .filter(|entry| entry.0 == name.as_str()).collect();
+            assert_eq!(selected.len(), 1, "notification mapping for {name}");
+            assert_eq!(selected[0].1, expected, "notification definition for {name}");
+            definitions += 1;
+        }
+        assert_eq!(definitions, NATIVE_NOTIFICATION_DEFINITIONS.len());
+
+        let valid = json!({"sessionId":ROOT,"modelId":"changed-model","source":"user",
+            "viewCursor":"model:1","sourceRange":{"stream":{"kind":"session","id":ROOT},
+            "first":{"id":"synthetic-model-change","sequence":1},
+            "last":{"id":"synthetic-model-change","sequence":1}}});
+        validate_native_notification_parameters("session/modelChanged", &valid).unwrap();
+        let mut invalid = valid;
+        invalid.as_object_mut().unwrap().remove("sourceRange");
+        assert!(matches!(
+            validate_native_notification_parameters("session/modelChanged", &invalid),
+            Err(schema::SchemaError::InvalidValue { .. })
+        ));
     }
 
     #[derive(Debug)]
@@ -170,7 +210,10 @@ mod native_event_fences {
                 params["sessionId"] = session_id;
             }
             // Missing required source/sourceRange, despite a valid RPC envelope.
-            assert!(schema::validate_method_parameters("session/modelChanged", &params).is_err());
+            assert!(matches!(
+                validate_native_notification_parameters("session/modelChanged", &params),
+                Err(schema::SchemaError::InvalidValue { .. })
+            ));
             let frame = json!({"jsonrpc":"2.0","method":"session/modelChanged","params":params});
             for repeated in 0..2 {
                 let (flushed, flushed_rx) = oneshot::channel();
