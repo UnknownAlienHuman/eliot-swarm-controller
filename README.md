@@ -10,7 +10,9 @@ remains usable; the conditional `eliot_compile_packet_l3` request is recorded in
 the [integration contract](docs/eliot-memory-os-integration.md), not claimed as an
 implemented packet capability.
 
-The current owner scope is contracts and integration preparation only. Runtime implementation and use await a separate owner instruction.
+For the Memory OS integration, the current owner scope is contract and boundary
+preparation only; runtime integration awaits a separate owner instruction.
+Standalone controller development and ordinary verification continue independently.
 
 ## Current implementation — 0.1.0
 

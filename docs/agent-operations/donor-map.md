@@ -1,6 +1,6 @@
 # Donor Map — Rust Operations and Manager-Owned Automation
 
-Revision 8 · V3 source/target reconciliation 2026-10-17. Waku, Paseo loading, CCCC suspended-child and Muse SDK source were rechecked at recorded commits; Schemars documentation was inspected at 1.2.2. Other observations retain their dates.
+Revision 9 · V3 source/target reconciliation 2026-10-17. Waku, Paseo loading, CCCC suspended-child and Muse SDK source were rechecked at recorded commits; Schemars documentation was inspected at 1.2.2. Other observations retain their dates.
 
 `CODE` means an inspected source behavior; `DOC` means official/library documentation; `OWNER_AUDIT` means supplied operating evidence; `DESIGN` means an ELIOT proposal. Earlier inspections are not new live qualification. Commit/blob identities locate evidence, not required installed versions.
 
@@ -159,10 +159,17 @@ selects schema dialect and serialization/deserialization purpose; defaults and
 schema structure are not a stable wire-output guarantee across crate updates.
 `Cargo.lock` already contains 1.2.2 transitively; contracts do not yet use it directly.
 
-**DESIGN:** pilot one existing shared request family, generate its input schema at
-the existing catalog boundary and delete its handwritten schema/refinement branches.
-Preserve wire required/nullability/bounds/descriptions, the chosen dialect and
-catalog revision/cache behavior. Use the existing DTO, not a second schema model
-or code-generation pipeline. Runtime cross-field, authorization and UTF-8 byte
-checks remain domain rules; schema string length counts characters. Retained
-digests/IDs and historical payloads do not change merely because schemas are generated.
+**CODE / decision, rechecked at `f1b854b6`:** no direct shared-input DTO replacement
+was established for the inspected MCP families. `TOOL_ITEMS` defines fields and
+required lists; `build_input_schema` adds request-ID behavior and method refinements.
+`TaskSpec` and coordination request parsers are host-owned; script schemas describe
+user-defined values. The shared descriptor-install request is a different local
+Operator contract. Generating these schemas would first require type moves or new
+models, so this is not a ready code-reduction assignment.
+
+Revisit alongside an independently needed wire-type extraction only if it deletes
+more owned schema/refinement code than it adds. Preserve required/null handling,
+bounds/descriptions, dialect, request-ID rules and catalog revision/cache behavior.
+Keep runtime authorization, cross-field and UTF-8 byte validation at their current
+owners. Do not introduce parallel DTOs, another schema DSL or a generated-code
+pipeline to claim a donor integration. Historical payload/digest bytes stay exact.

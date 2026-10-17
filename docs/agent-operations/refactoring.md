@@ -101,14 +101,14 @@ candidate boundaries, not new permanent Issues.
 | O3/O10: direct launcher dispatch | `store/launcher_dispatch.rs`, `launcher.rs`, native-MCP reconciliation and public progress projection. | Ready binding accepts the first dispatch with valid Task/workspace/caller scope; MCP observations arrive asynchronously. Remove the `require_current_dispatch_capability` admission dependency and its duplicate pre-effect readiness gate, retaining ancestry/receipt checks. |
 | M2/O2: WAL readers | `swarm-store`, `status_reader.rs`, `Store::call` and selected read handlers. | Existing status/monitor plus a first bounded query family use concurrent read-only snapshots; delete their writer-queue branches. Expand method families separately as below. |
 | M2/O1: relational capacity | Existing schema installer and `store/capacity.rs`. | Convert scopes with held reservations intact, switch all scope reads/writes to indexed rows, then retire migrated `capacity:*` / `capacity-entry:*` representations. |
-| M2/O1–O2: relational automation | `automation/config.rs`, `store/automation*.rs`, existing schema installer. | Entry/config first, then cursor/pending/review families in separate candidates; remove each replaced key codec and scan when its consumers switch. |
+| M2/O1–O2: relational automation | `automation/config.rs::{entry_key,load_entry}`, `store/automation.rs::scoped_entries`, existing schema installer. | First migrate the owner/project entry family and its get/preview/apply consumers; replace prefix/key scans with indexed scoped queries. Cursor, pending, review and due families are later separate candidates. Preserve sealed payload validation, identity and scope/page bounds. |
 | M2–M4: worker boundaries | The edge-removal table below. | Each worker-only edit leaves the host outside its actual Cargo reverse-dependency closure; one production owner remains. |
 | O4: GitHub donor | Existing `github/client.rs` traits plus issue/label/PR consumers. | One shared octocrab backend replaces `run_gh_api`; current account/host, bounded responses and Store-owned write/readback survive. Native Git publication keeps its own process boundary. |
 | M5/O2: observation donors | `swarm-telemetry`, `swarm-observer`, config/watch and `swarm-process`. | tracing replaces duplicate logging plumbing; notify replaces matching file polling; sysinfo supplies metrics; CCCC supplies suspended-child bootstrap where that launch path exists. Complete one donor/consumer replacement per candidate. |
 
 ### Code reduction candidates
 
-These refine the same O/M queue. CLI/catalog cleanup can proceed alongside the
+These refine the same O/M queue. CLI cleanup can proceed alongside the
 productive-path fixes. Keep broader O4–O9 feature completion off this reduction
 pass's critical path; existing requirements remain in [O1–O11](implementation.md).
 Estimate the old surface before work, then report actual deleted/added owned lines
@@ -118,11 +118,25 @@ glue together, with tests separately; vendoring or moving code is not deletion.
 | Candidate / source owner | Replacement and deletion | Limits of the estimate |
 | --- | --- | --- |
 | O10: duplicate application CLI — [`swarm-cli::command_uses_host`](../../crates/swarm-cli/src/main.rs), [`host main`](../../crates/swarm-kernel-host/src/main.rs) | Keep application parsing/request mapping in `swarm-cli`; delete host Task/route/review and other duplicate application variants/mappers. Keep daemon, Gateway, module/worker bootstrap and delegated local admin commands. The root `swarm-host` stays a thin launcher. | About 700–900 old production lines across the host enums/mapping are candidates, not a measured net diff. No direct host application callers were found in the repo; update any documented compatibility surface/caller discovered during removal. No new shared CLI crate. |
-| O10: handwritten MCP input schemas — [`mcp_catalog.rs`](../../crates/swarm-contracts/src/mcp_catalog.rs) | Derive one existing shared DTO family's input schemas with [Schemars](donor-map.md#12-schema-generation-candidate), then remove its manual `TOOL_ITEMS`/refinement definitions. Preserve descriptions, dialect, bounds and public wire behavior. | The file is 8,012 physical lines including metadata/tests, not 8,012 deletable lines. Do not add parallel DTOs or a new schema DSL; a host-owned wire DTO moves to contracts before reuse. |
-| O10: repeated catalog exposure lists — same catalog and [`method_policy.rs`](../../crates/swarm-contracts/src/method_policy.rs) | Make one explicit declaration own exact frontend profile exposure; remove the repeated `exposes_method` inventory after preserving every current method/profile pair. | `exposes_method` spans about 230 lines. `ToolMetadata.audiences` describes intended fit, not exact exposure: do not substitute membership blindly. Store authorization, method classification and smaller eager-core lists serve different purposes and remain. |
 | M2/O1: capacity persistence — [`capacity.rs`](../../crates/swarm-kernel-host/src/store/capacity.rs) | Indexed scope/entry rows replace hex-key codecs, header/entry serializers, `meta` scans and orphan stitching as each scope cuts over. Reuse the existing installer and reservation domain code. | A 5,630-line file is not a deletion estimate. Reservation correctness, held/unknown capacity and damaged-source isolation are real behavior; only the replaced persistence machinery is removed. |
 | M3/M4: parallel runtime implementations | Select one owner for new admissions; keep narrow historical decoding/readback, then remove the retired executor as described below. | Potentially larger than helper cleanup, but active routes and saved formats differ. No whole-runtime saving is claimed before the caller/cutover diff. |
 | O4: GitHub API subprocess — [`github/client.rs`](../../crates/swarm-kernel-host/src/github/client.rs) | One `octocrab` backend behind existing API traits replaces `run_gh_api` and its `gh api` argument glue. Keep native Git publication separate. | `run_gh_api` is about 104 lines; with caller glue the old surface is roughly 150–250 lines. It is not a large handwritten HTTP stack, and octocrab is not yet a direct dependency. |
+
+### MCP hypotheses rechecked
+
+The catalog's size is not evidence of another implementation. Exact exposure already
+has one owner, `swarm-contracts::mcp_catalog::exposes_method`; the MCP frontend only
+forwards to it. Its approximately 230 lines are not a duplicate-policy deletion.
+For example, `task.get` lists Participant/AssignedReviewer as intended audiences
+but is not exposed to either profile. Keep descriptive audiences, exact profile
+exposure, Store authorization and eager defaults distinct. Two redundant Concilium
+literals are incidental cleanup, not a new policy-matrix project.
+
+[Schemars](donor-map.md#12-schema-generation-candidate) remains a researched option,
+not the next source assignment: the surveyed tool inputs use `Value`/manual parsing
+or host-owned types, not an existing shared input DTO ready for derivation. Do not
+add 164 DTOs or another schema DSL just to replace `TOOL_ITEMS` with generated code.
+Revisit only with a concrete existing-type extraction and a measured net deletion.
 
 ### Retire executors without losing history
 
@@ -172,6 +186,9 @@ Use `Store::initialize_database` / `install_schema_extension` and the existing
 mechanics, while Store owns domain DDL and conversions; no second migration runner.
 Capacity rows need explicit scope/entry keys, identity, state and indexes used by
 reservation and reporting queries. Keep Operation/Attempt records authoritative.
+Store bounded versioned payloads in their domain row when needed; relationalization
+does not require changing their digest/byte contract or making a table per JSON leaf.
+Use existing SQLite/`rusqlite` facilities rather than adding a migration runner or ORM.
 
 Create tables once, then convert bounded scopes on the writer with a resumable
 cutover marker and a single authoritative representation per scope. Validate
@@ -180,6 +197,21 @@ source for the existing scoped isolation/readback path. Never treat unknown
 capacity as free. Keep v1/v2 reads until the relevant saved scopes are migrated;
 remove old key writes/rows when their cutover is committed. Do not introduce
 permanent dual-write ledgers or migrate data from a read request.
+
+For the first automation-entry conversion, `scoped_entries` currently scans keys
+and calls `load_entry` again for every row. Replace that path with one bounded
+owner/project query through the existing config Store owner. Keep authorization,
+automation-ID ordering, the over-limit error and sealed-record validation; update
+get/preview/apply together. This removes redundant lookup/key plumbing, not the
+entry's on-behalf policy or every automation record family.
+
+Cron due-row shape belongs with `automation_cron::DueIndex`. Its candidate validator
+and `automation_scheduler::valid_cron_due_index` overlap but are not equivalent:
+the scheduler also checks closed fields/nonempty/SHA identity and records damaged
+source evidence, while cron checks live DB state and classifies the candidate.
+Share only identical shape/key rules during that family's migration; keep each
+consumer's error/quarantine behavior. Do not introduce a generic validator framework
+or treat the scheduler's entire 37-line check as free deletion.
 
 ### Remove worker implementation edges
 

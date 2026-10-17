@@ -580,7 +580,7 @@ Keep #22's small eager cores. Config get/preview/apply/explain/transfer and deta
 
 For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
 
-## 11. OpenCode service integration (`external_attach` and `owned_service`)
+## 11. OpenCode external attach and retained service ownership
 
 ### 11.1 Existing native OpenCode service (`external_attach`)
 
@@ -588,34 +588,20 @@ OpenCode owns its provider accounts, authorization, configuration, and model loo
 
 Set `routes.native_options.connection_file` to the native service registration used by the installed OpenCode client (`@opencode/client/service`), which records `url`, `pid`, and optional `version`, `id`, and local HTTP `password`. This local service-access record is distinct from provider authorization. The controller reads it in place and checks the loopback endpoint and live PID without rewriting the record or replacing the service. Provider/model/variant selection comes from that native service's catalog (or native defaults when omitted).
 
-### 11.2 Isolated owned OpenCode service (`owned_service`)
+### 11.2 Retained owned-service compatibility
 
-When an operator explicitly configures a dedicated isolated service (`eliot-opencode-v2.http.2`), Store starts the service only after an exact Manager/Operator admission for the opening binding, Task revision, Attempt, and held workspace lease:
+Fresh `fresh_owned_service` launches are retired in the current source.
+[`prepare_owned_service` and `start_foreground`](../../crates/swarm-kernel-host/src/runtime/opencode_v2/owned_service.rs)
+reject that origin; the [helper entrypoint](../../crates/swarm-kernel-host/src/runtime/opencode_v2.rs)
+also returns the native-harness-required error. Do not configure a fresh private
+Bun/OpenCode server or rebuild that launch path from an old example. New service
+connections use the native registration described above.
 
-~~~toml
-[[routes]]
-alias = "opencode-owned"
-runtime = "opencode_v2"
-module_artifact_id = "eliot-opencode-v2.http.2"
-enabled = true
-native_options = {}
-
-[routes.owned_service]
-origin = "fresh_owned_service"
-service_id = "opencode-owned"
-model = { id = "approved-model-id", providerID = "approved-provider", variant = "approved-variant" }
-model_catalog = "offline"
-bun_executable = "C:/approved/runtime/bun.exe"
-server_program = "C:/approved/repo/modules/opencode/serve.mjs"
-state_root = "C:/approved/private-state/opencode"
-port = 0
-~~~
-
-The Bun path must identify a regular file supporting a compatible Bun runtime (`>= 1.1`), and optional `bun_sha256` / `server_program_sha256` fields, when supplied, are verified as normalized 64-character lowercase hex digests before spawn; do not hardcode a single minor Bun version (such as `1.4.0`) or freeze `@opencode/server` to a single historical patch string in code. `state_root` must be a canonical, non-reparse directory restricted to the service owner. Port `0` requests an OS-selected loopback port.
-
-Each admitted owned launch receives its own retained owner nonce and private state directory under `state_root/launches/<owner_nonce>`. The controller keeps its helper child's stdin open while the service is owned; closing stdin sends EOF as the graceful-stop signal. Before spawn, Store reserves one durable start; if spawn was attempted and the outcome is uncertain, the disposition remains `outcome_unknown` and is resolved via readback rather than blind replay.
-
-For current retained-run and qualification evidence, see [Implementation Status](../implementation-status.md). The execution and no-replay rules above remain normative.
+Retained service-owner records, nonce/process identity, departure checks and
+uncertain-outcome readback remain compatibility obligations. Their presence does
+not make the old producer a supported new-launch mode. Retire dormant producer
+code separately from this readback under the [runtime reduction boundary](refactoring.md#retire-executors-without-losing-history).
+Current source/native evidence remains in [Implementation status](../implementation-status.md).
 
 ### Windows Git metadata path admission
 

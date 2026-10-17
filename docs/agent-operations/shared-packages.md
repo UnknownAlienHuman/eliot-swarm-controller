@@ -12,7 +12,7 @@ Add a library where its API has a real consumer and replaces an existing mechani
 | `swarm-checks` | Bounded admitted native-check execution and authenticated status readback. Store retains admission/custody; host sheds the executor dependency. | `swarm-client`, `swarm-contracts`, `swarm-process` |
 | `swarm-process` | OS ownership, exact birth/departure checks, private durable files and module-owner bootstrap. | `swarm-contracts`, `cccc-windows-process`, selective `sysinfo` observation |
 | `swarm-store` | WAL connection/transaction mechanics and database identity checks. Store owns domain DDL/conversion. | `rusqlite` |
-| `swarm-kernel` | One bounded writer actor, readiness, contiguous typed-job batching and bounded reader dispatch. | `swarm-store`, `swarm-contracts` |
+| `swarm-kernel` | Existing pure Task/dispatch/review/acceptance policy, bounded writer actor/readiness/batching, and target bounded reader dispatch. Host Store retains DB/rights/receipts. | `swarm-store`, `swarm-contracts` |
 | `swarm-telemetry` | Structured events, reloadable filters, redaction, bounded sinks and local loss counters. | `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact` |
 
 `swarm-kernel-host` owns authentication policy, domain transactions, server IPC and

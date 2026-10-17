@@ -1,8 +1,8 @@
 # Modular Runtime — Build, Process and Authority Boundaries
 
 Owner direction: 2026-10-05. **Implementation specification, not an implementation claim.**
-Source reviewed: `2aec51bb1e3c8122da7d496142ac8e25a21969a3`.
-[Review and defects](modularity-review-2026-10-05.md) records what exists;
+Current source boundaries: [refactoring map](refactoring.md) at `f1b854b6`.
+[Review and defects](modularity-review-2026-10-05.md) retains the earlier `2aec51bb` inspection;
 [Observability](observability.md) defines logging/live monitoring;
 [Donor map](donor-map.md) records inspected mechanisms and rejected assumptions.
 
@@ -26,45 +26,38 @@ not a resumed native execution. Implement all three deliberately.
 
 ## 2. Package and process map
 
-Use one Cargo workspace and lockfile. Names below are target package names;
-they do not imply that these crates or commands exist at the reviewed revision.
-Keep platform-specific unsafe code inside the small platform package.
+Use one Cargo workspace/lockfile and the existing [shared package map](shared-packages.md).
+The kernel process is `swarm-kernel-host`; `swarm-kernel` and `swarm-store` are
+libraries inside it. Do not create another daemon or move domain migrations into
+`swarm-store` to satisfy an old package sketch.
 
-| Package / responsibility | Existing source to extract | Runtime boundary |
-|---|---|---|
-| `swarm-contracts` | Common DTOs from `src/model.rs`, `src/runtime/mod.rs`, IPC envelopes | Small data-only library: IDs, commands, events, outcomes, capabilities and protocol versions. No vendor DTOs, DB, process launch or runtime singleton. |
-| `swarm-client` | Client side of `src/ipc.rs` and framing | Library shared by CLI, MCP and worker binaries. Connection/authentication/framing only; no Task policy. |
-| `swarm-store` | DB writer, migrations, receipts, artifact metadata | Library inside the kernel process. One authoritative database/writer. Transaction API rather than unrestricted DB handles in plugins. |
-| `swarm-kernel` | Generic admission, Task/Attempt, review/acceptance and routing state from `src/store/` | `swarm-kernel` process. Owns committed state, not native transports. Organize domain handlers internally; no crate per SQL table. |
-| `swarm-bus` | Shared observation routing, subscriptions, consumer/cursor delivery | Independently built dispatcher process. Reads/acknowledges through kernel IPC; never owns a second authoritative event database. |
-| `swarm-process` + `swarm-supervisor` | `src/platform/`, generic ownership from `src/launcher/`, `src/host.rs` | Small platform library and supervisor binary. Supervise kernel/selected workers; do not link provider implementations. |
-| `swarm-adapter-<runtime>` | Each `src/runtime/<runtime>` plus its owned `modules/<runtime>` glue and vendor-specific Store interpretation | One independently built executable/package per adapter. Multiplex compatible bindings in one service worker where its native contract permits. |
-| `swarm-scripts` | `src/scripts/`, effect execution from `src/store/scripts.rs` | On-demand runner. Each versioned script bundle is a separately replaceable module; one-shot invocations are transient, not permanent daemons. |
-| `swarm-automation` | Timers/rules/hooks/Goal coordination from existing automation/scheduler/hooks units | Optional worker using the existing typed action handlers. One due queue/shared source readers, not one timer process per rule. |
-| `swarm-checks`, `swarm-forge` | Existing check process and Git/GitHub execution boundaries | Separate on-demand execution workers. Admission, acceptance and unknown-effect state stay in the kernel. |
-| `swarm-telemetry`, `swarm-observer` | Existing diagnostic emission, reports and live projections | Small producer library; independently replaceable recorder/live-query worker. No mandatory cloud backend. |
-| `swarm-cli`, `swarm-mcp`, `swarm-gateway` | `src/main.rs`, `src/mcp*`, `src/gateway*` | Independent frontends using `swarm-client`. CLI keeps the public `swarm` executable. Gateway is optional and off until configured. |
+| Runtime responsibility | Package / process boundary |
+| --- | --- |
+| Durable domain authority | Host Store owns authentication, domain SQL/migrations, receipts and routing. `swarm-kernel` owns its existing pure Task/dispatch/review/acceptance rules and bounded writer actor; `swarm-store` owns connection mechanics. |
+| Worker lifecycle | `swarm-supervisor` uses shared contracts/client/process primitives; it starts selected worker executables without linking their implementations. |
+| Native execution | Each `swarm-adapter-*` is independently built. Compatible bindings may share a worker where the native contract permits. It owns protocol/native lifecycle, not a second Task database. |
+| Durable bus / optional automation | `swarm-bus` delivers facts; `swarm-automation` coordinates eligible actions/timers through bounded kernel IPC. Cursor/action commits remain in Store. |
+| Checks / Forge / scripts | `swarm-checks`, `swarm-forge-worker`, `swarm-script-worker` execute admitted work on demand. `swarm-scripts` remains shared planning/contracts, not a second runner. |
+| Observation | `swarm-telemetry` is the shared producer; `swarm-observer` is the independently replaceable recorder/live reader. |
+| Frontends | `swarm-cli`, `swarm-mcp`, `swarm-gateway` consume `swarm-client`. CLI keeps public `swarm`; the launcher starts the host. Gateway is optional. |
 
-Extraction follows responsibility, not file ownership alone: `store/scripts.rs`
-contains both transactional decisions and external execution; move the latter,
-not the whole DB authority, to a worker. Do the same for checks, Forge and native
-adapters. Do not ship a crate that imports the original monolithic library as a
-shortcut: that retains both the compilation dependency and old failure domain.
+Extract external execution from Store without moving its transactional admission,
+custody or acceptance into a worker. Keep shared DTOs/pure matching in existing
+contract owners; neither importing the host from a worker nor linking the old
+worker through a new wrapper establishes an independent boundary.
 
-Dependency direction:
+**Dependency rules:**
 
-```text
-contracts <- client <- CLI / MCP / gateway / bus / optional workers / adapters
-contracts <- store (1 writer + WAL read pool) <- kernel domain handlers
-contracts <- process primitives (cccc-windows-process + sysinfo) <- supervisor / owned execution workers
-telemetry producer (tracing + atlas-redact) <- components that emit diagnostics
-observer <- client + telemetry decoding; not kernel or adapter implementations
-```
-
-**Strict package dependency rules (anti-monolith):**
-1. `swarm-kernel` / `swarm-kernel-host`, `swarm-supervisor` and frontends (`swarm-cli`, `swarm-mcp`, `swarm-gateway`) must have **no Cargo `[dependencies]` on any `swarm-adapter-*` package**. Adapter A must not depend on adapter B.
-2. `swarm-kernel` / `swarm-kernel-host` must have **no Cargo `[dependencies]` on optional worker packages** (`swarm-automation`, `swarm-bus`, `swarm-checks`, `swarm-forge-worker`, `swarm-observer`, `swarm-script-worker`, `swarm-supervisor`). Communication between the kernel and workers occurs strictly over IPC using `swarm-contracts` and `swarm-client`. Importing worker crates into `swarm-kernel-host` defeats separate compilation and recreates a monolithic failure domain.
-3. **No CLI duplication:** `swarm-cli` (`swarm`) is the sole owner of operator/manager CLI subcommand definitions. `swarm-host` and `swarm-kernel-host` parse only daemon bootstrap flags (`--config`, `--data-dir`, `--endpoint`); they must never duplicate `swarm-cli`'s subcommand parser.
+1. Host/kernel, supervisor and frontends do not link adapter implementations;
+   adapters do not depend on one another. Shared libraries never import the host.
+2. Host/kernel do not link worker implementations (automation, bus, checks, Forge,
+   observer, script-worker or supervisor). Worker communication uses the existing
+   contracts/client IPC; remove transitive edges as well as direct manifest entries.
+3. `swarm-cli` owns public application command parsing and request mapping. Host
+   keeps daemon/worker bootstrap and the local administrative commands explicitly
+   delegated by `command_uses_host`; remove its repeated Task/route/review mapping.
+   Migrating a remaining delegated local command is its own connected change, not
+   a reason to delete bootstrap or recreate the public CLI inside another crate.
 
 ### 2.1 Bus modularity without broken transactions
 
@@ -325,9 +318,9 @@ Instrumentation starts immediately so the refactor's own failures are visible.
 | Step | Concrete change and initial owners | Completion condition |
 |---|---|---|
 | M1 — usable manager and visible failures | `src/store/tasks.rs`, `src/model.rs`, shared method authorization; `Store::disconnected`, host error handling and small telemetry producer | Manager and current GM create/revise without operator token; observers/modules cannot. An ordinary Manager cannot revise another Manager's unreleased Attempt; the explicit current-GM/Operator path validates the same exact scope and revision. A disconnect persistence error is visible, not coerced into `false`. No unrelated native prerequisites on planning. |
-| M2 — real build boundaries | Root manifest/Justfile/CI; extract contracts/client/store/kernel/process/telemetry, preserve public CLI/serialized data | Explicit package graph with no adapter-to-kernel reverse dependency; existing database/receipts still readable. Independent build recipe works on Windows and Linux. |
+| M2 — real build boundaries | Root manifest/Justfile/CI and existing shared packages; finish the [verified dependency removals](refactoring.md#remove-worker-implementation-edges), preserving public CLI/serialized data | Explicit package graph with no adapter-to-kernel reverse dependency; existing database/receipts still readable. Independent build recipe works on Windows and Linux. |
 | M3 — bus and one complete adapter | Generic module descriptor/handshake in supervisor; extract OpenCode translation plus vendor Store paths; independent bus dispatcher and atomic cursor admission | Adapter replacement leaves kernel hash/PID unchanged; bus restart resumes cursor without duplicate command; a second minimal executor needs registration, not a new Store runtime-name switch. |
-| M4 — remaining executors and lazy workers | Extract each real adapter, then checks/Forge/scripts/automation and optional frontends | Each has a named owner, demand predicate, bounded queues and local restart. No empty supervisor loops for disabled modules; no Rust migration claim while stateful owned JS/Python control remains. |
+| M4 — remaining executors and lazy workers | Extract each real adapter, then checks/Forge/scripts/automation and optional frontends | Each has a named owner, demand predicate, bounded queues and local restart. No empty supervisor loops for disabled modules; no Rust orchestration claim while durable Eliot control remains in JS/Python; native SDK handles follow the donor boundary. |
 | M5 — recorder and live view | Complete `swarm-observer`, log configuration/reload and projections in [Observability](observability.md) | Show manager/agent/module/operation timeline, exact crash/restart facts, lag/loss and selected active resource metrics; changing depth does not restart work. |
 | M6 — integrated product qualification | Existing productive O7/O11 delivery path using real manager identity, two distinct adapters and the same common contracts | Task → dispatch → result → independent audit → correction → re-audit → acceptance → exact publication; optional failure and restart do not repeat effects or stop unrelated agents. Record exact evidence and unresolved native gaps. |
 

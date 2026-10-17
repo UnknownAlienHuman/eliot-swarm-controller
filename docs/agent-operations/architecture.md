@@ -1,6 +1,6 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 16 · 2026-10-17 · Canonical Version 3 Architecture.
+Revision 17 · 2026-10-17 · Canonical Version 3 Architecture.
 
 This is the refactoring target. The [source map](refactoring.md) identifies its current gaps and existing owners; historical implementation/qualification claims remain revision-scoped.
 
@@ -8,7 +8,12 @@ This is the refactoring target. The [source map](refactoring.md) identifies its 
 
 ## 1. One Rust control plane with effective donor and SDK reuse
 
-All owned host/Store, authorization, configuration, IPC, supervision, monitoring, GitHub, hooks, distribution/review, cron, Goal, MCP/gateway and script-runner orchestration is Rust. Within Rust, subsystems use maintained donor libraries (`rmcp`, `agent-client-protocol`, `octocrab`, `croner`, `sysinfo`, `notify`, `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact`, `cccc-windows-process`) rather than handwritten reimplementations. For vendor runtimes whose official protocol is shipped as an official SDK (`@muse-code/sdk`, `@anthropic-ai/claude-agent-sdk`, `@opencode/server`, `openai-codex`), the Rust adapter owns `ModuleLink`, supervision, digests and Store receipts while using the official Rust protocol crate, the documented native protocol directly (for example Codex app-server or OpenCode HTTP/SSE), or a thin official-SDK driver as specified in the [donor map](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries). A driver may retain native protocol/session handles; durable ELIOT work, ownership and retry policy stay in Rust/Store. Python/PowerShell remain optional external script extensions. New adapter settings do not restart existing work implicitly.
+Rust owns controller orchestration, authority and durable work. Use the existing
+[shared package owners](shared-packages.md) and [donor boundaries](donor-map.md),
+including direct documented native protocols or a thin official-SDK driver.
+Drivers may retain native handles; Eliot admission, retained identity and retry
+ownership remain with their existing Rust/Store owners. Python/PowerShell user
+scripts are optional extensions. New settings do not restart existing work.
 
 ### 1.0 Build, process and observability boundaries
 
@@ -134,10 +139,24 @@ the applicable identity and authority checks. An uncertain remote effect stays
 uncertain until exact readback; restarting a host or changing managers does not
 authorize a second effect or rewrite its original actor.
 
-**SQLite architecture and storage discipline:**
-1. **Single writer, pooled WAL readers:** `swarm-store` / `swarm-kernel` maintains one serialized `IMMEDIATE` writer connection for state mutations and a **read-only WAL connection pool** (`SQLITE_OPEN_READ_ONLY`, `PRAGMA query_only = ON`) for all read-only operations (`*.get`, `*.list`, `dashboard`, `report.delta`, `automation.config.explain`, `runtime.catalog`). Read queries must execute directly against the WAL read pool and **must never block in the single writer actor queue**. Route by inspected handler semantics, not a `get`/`list` suffix: stream registry operations, dequeue/admission and DB-plus-file reads have separate owners. Each SQL read uses one short snapshot for current-principal validation, authorization and projection. The [migration map](refactoring.md#wal-migration-detail) defines incremental cutover from the current reader.
-2. **Relational tables, never `meta` key-value blobs:** The `meta` table is reserved strictly for scalar database/host identity (schema version, data-root identity, host epoch). Storing collections, queues, cursors, task projections, hex-encoded composite keys, or a serialized `CapacityLedger` JSON blob in `meta` is **forbidden**. All domain records, per-entry cursors, pending subjects, review slots, and capacity reservations must live in dedicated relational tables with proper primary/foreign keys and SQL indexes. Preserve active-plus-reserved accounting from the [Agent of Empires pattern](donor-map.md#8-architectural-donor-patterns); relational durability is ELIOT's implementation requirement.
-3. **Single-copy payload storage:** Large assistant outputs, normalized result pages, and check/script `stdout`/`stderr` captures are persisted once (in content-addressed artifact storage or the dedicated result page table) and referenced by ID and SHA-256 digest. Never duplicate full result bodies across `operations.result_json`, `observations.payload_json`, and `meta`.
+**SQLite storage boundaries:**
+
+| Responsibility | Required implementation |
+| --- | --- |
+| Mutation/admission | One serialized `IMMEDIATE` writer. Its SELECTs, current-rights checks, reservations and updates remain in that same transaction. Do not move precondition reads to another connection. |
+| Read-only SQL RPC projection | A bounded read-only/query-only WAL pool, with current-principal validation, authorization, data and any journal cut in one short snapshot. These handlers leave the writer queue as each family migrates. |
+| Composite read | Stream registries, dequeue/admission and database-plus-file operations retain their own state/cache/I/O boundary. A `get`/`list` name is not a routing decision. See [reader migration](refactoring.md#wal-migration-detail). |
+| Domain persistence | Indexed tables own entities, cursors, pending subjects, semantic slots and capacity entries/reservations. `meta` remains scalar database/host metadata at the target; use the existing Store schema installer and bounded family cutovers. |
+| Payload | Keep versioned configuration/evidence JSON in its owning row or artifact when its exact representation is required. Queryable identity, state, due/cursor and relationship fields need columns/indexes; do not split every JSON leaf into another table or build an ORM/EAV framework. |
+| Large result body | Persist the same finalized body once within its owner, referencing it from Operation/Observation projections. Required native ACK/recovery capture and normalized/redacted output have different contracts; deduplicate only when identity, authorization and retention agree. Do not copy full bodies into `meta`. |
+
+The [relational conversion rules](refactoring.md#relational-conversion-detail)
+preserve active-plus-reserved capacity, old evidence and unknown effects.
+[SQLite supports JSON values in ordinary columns](https://www.sqlite.org/json1.html);
+relational indexing does not require rewriting retained JSON bytes or normalizing
+every nested field. Domain DDL/conversion stays in Store; `swarm-store` owns
+connection mechanics and `swarm-kernel` supplies the actor/pure policy library.
+These libraries run inside `swarm-kernel-host`, not an additional kernel daemon.
 
 For committed `rejected`, `cancelled` and `outcome_unknown` state, the Store-level capture
 also commits in that transaction. A speculative exception is not an observed
