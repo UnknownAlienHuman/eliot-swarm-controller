@@ -339,7 +339,9 @@ pub async fn run_owned(bootstrap: ModuleOwnedBootstrap) -> Result<()> {
 /// Dropping the owner itself unjoined violates the native custodian contract;
 /// neither async Drop nor arbitrary runtime destruction is claimed safe.
 #[must_use = "retain outside the consumer and join before Tokio teardown"]
-pub struct OwnedModuleRun { owner: RunOwner<Driver> }
+pub struct OwnedModuleRun {
+    owner: RunOwner<Driver>,
+}
 
 #[derive(Clone)]
 pub struct ModuleRunControl {
@@ -347,29 +349,46 @@ pub struct ModuleRunControl {
     abort: tokio::task::AbortHandle,
 }
 impl ModuleRunControl {
-    pub fn request_stop(&self) { self.stop.send_replace(true); }
+    pub fn request_stop(&self) {
+        self.stop.send_replace(true);
+    }
     /// Abort the consumer only; the external owner and command pool survive.
     /// The caller must still join OwnedModuleRun while Tokio is alive.
-    pub fn abort_consumer(&self) { self.request_stop(); self.abort.abort(); }
+    pub fn abort_consumer(&self) {
+        self.request_stop();
+        self.abort.abort();
+    }
 }
 impl OwnedModuleRun {
-    pub fn control(&self) -> ModuleRunControl { self.owner.control() }
-    pub async fn join(&mut self) -> Result<()> { self.owner.join().await }
+    pub fn control(&self) -> ModuleRunControl {
+        self.owner.control()
+    }
+    pub async fn join(&mut self) -> Result<()> {
+        self.owner.join().await
+    }
 }
 
 /// Construct the retained owner before any consumer can start native work.
 /// On constructor error no new native start was issued; an already populated
 /// caller-supplied NativeRuntime remains the caller's custody obligation.
-pub fn start_owned_with(bootstrap: ModuleOwnedBootstrap, native: &Arc<dyn NativeRuntime>) -> Result<OwnedModuleRun> {
+pub fn start_owned_with(
+    bootstrap: ModuleOwnedBootstrap,
+    native: &Arc<dyn NativeRuntime>,
+) -> Result<OwnedModuleRun> {
     let bootstrap = Arc::new(bootstrap);
     let driver = Driver::new(bootstrap.clone(), native.clone())?;
-    Ok(OwnedModuleRun { owner: RunOwner::start(bootstrap, driver, native.clone()) })
+    Ok(OwnedModuleRun {
+        owner: RunOwner::start(bootstrap, driver, native.clone()),
+    })
 }
 
 /// Convenience outer entry; do not put this whole owner in an abortable task.
 /// Callers needing cancellation use start_owned_with, retain OwnedModuleRun,
 /// signal/abort its CONSUMER via control(), then rejoin the retained owner.
-pub async fn run_owned_with(bootstrap: ModuleOwnedBootstrap, native: Arc<dyn NativeRuntime>) -> Result<()> {
+pub async fn run_owned_with(
+    bootstrap: ModuleOwnedBootstrap,
+    native: Arc<dyn NativeRuntime>,
+) -> Result<()> {
     let mut run = match start_owned_with(bootstrap, &native) {
         Ok(run) => run,
         Err(error) => {
@@ -402,55 +421,109 @@ type LoopCall<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 trait ConsumerDriver: Send + Sync + 'static {
     fn hello(&self) -> Value;
     fn request_stop(&self);
-    fn execute(self: Arc<Self>, command: swarm_contracts::RuntimeCommand) -> LoopCall<'static, Result<()>>;
+    fn execute(
+        self: Arc<Self>,
+        command: swarm_contracts::RuntimeCommand,
+    ) -> LoopCall<'static, Result<()>>;
     fn flush<'a>(&'a self, link: &'a mut ModuleLink) -> LoopCall<'a, Result<()>>;
     fn publish<'a>(&'a self, link: &'a mut ModuleLink) -> LoopCall<'a, bool>;
     fn stop_native(&self) -> LoopCall<'_, ()>;
 }
 impl ConsumerDriver for Driver {
-    fn hello(&self) -> Value { Driver::hello(self) }
-    fn request_stop(&self) { Driver::request_stop(self); }
-    fn execute(self: Arc<Self>, command: swarm_contracts::RuntimeCommand) -> LoopCall<'static, Result<()>> { Box::pin(Driver::execute(self, command)) }
-    fn flush<'a>(&'a self, link: &'a mut ModuleLink) -> LoopCall<'a, Result<()>> { Box::pin(Driver::flush(self, link)) }
-    fn publish<'a>(&'a self, link: &'a mut ModuleLink) -> LoopCall<'a, bool> { Box::pin(Driver::publish_next_stream(self, link)) }
-    fn stop_native(&self) -> LoopCall<'_, ()> { Box::pin(Driver::stop_native(self)) }
+    fn hello(&self) -> Value {
+        Driver::hello(self)
+    }
+    fn request_stop(&self) {
+        Driver::request_stop(self);
+    }
+    fn execute(
+        self: Arc<Self>,
+        command: swarm_contracts::RuntimeCommand,
+    ) -> LoopCall<'static, Result<()>> {
+        Box::pin(Driver::execute(self, command))
+    }
+    fn flush<'a>(&'a self, link: &'a mut ModuleLink) -> LoopCall<'a, Result<()>> {
+        Box::pin(Driver::flush(self, link))
+    }
+    fn publish<'a>(&'a self, link: &'a mut ModuleLink) -> LoopCall<'a, bool> {
+        Box::pin(Driver::publish_next_stream(self, link))
+    }
+    fn stop_native(&self) -> LoopCall<'_, ()> {
+        Box::pin(Driver::stop_native(self))
+    }
 }
 
 type Commands = Arc<tokio::sync::Mutex<tokio::task::JoinSet<Result<()>>>>;
 type ActiveLink = Arc<tokio::sync::Mutex<Option<ModuleLink>>>;
 struct RunOwner<D: ConsumerDriver> {
-    driver: Arc<D>, native: Arc<dyn NativeRuntime>, commands: Commands,
+    driver: Arc<D>,
+    native: Arc<dyn NativeRuntime>,
+    commands: Commands,
     active_link: ActiveLink,
     consumer: Option<tokio::task::JoinHandle<Result<()>>>,
-    control: ModuleRunControl, primary: Option<Result<()>>, finished: bool,
+    control: ModuleRunControl,
+    primary: Option<Result<()>>,
+    finished: bool,
 }
 impl<D: ConsumerDriver> RunOwner<D> {
-    fn start(bootstrap: Arc<ModuleOwnedBootstrap>, driver: Arc<D>, native: Arc<dyn NativeRuntime>) -> Self {
+    fn start(
+        bootstrap: Arc<ModuleOwnedBootstrap>,
+        driver: Arc<D>,
+        native: Arc<dyn NativeRuntime>,
+    ) -> Self {
         let commands = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
         let active_link = Arc::new(tokio::sync::Mutex::new(None));
         let (stop, stopping) = tokio::sync::watch::channel(false);
         // NativeRuntime/custodian and commands are retained by this outer
         // frame before consumer spawn and remain retained on consumer unwind.
-        let worker = driver.clone(); let work = commands.clone(); let transport = active_link.clone();
-        let consumer = tokio::spawn(async move { consume(bootstrap, worker, work, transport, stopping).await });
-        let control = ModuleRunControl { stop, abort: consumer.abort_handle() };
-        Self { driver, native, commands, active_link, consumer: Some(consumer), control, primary: None, finished: false }
+        let worker = driver.clone();
+        let work = commands.clone();
+        let transport = active_link.clone();
+        let consumer =
+            tokio::spawn(
+                async move { consume(bootstrap, worker, work, transport, stopping).await },
+            );
+        let control = ModuleRunControl {
+            stop,
+            abort: consumer.abort_handle(),
+        };
+        Self {
+            driver,
+            native,
+            commands,
+            active_link,
+            consumer: Some(consumer),
+            control,
+            primary: None,
+            finished: false,
+        }
     }
-    fn control(&self) -> ModuleRunControl { self.control.clone() }
-    fn retain(&mut self, result: Result<()>) { if self.primary.as_ref().is_none_or(|primary| primary.is_ok()) && result.is_err() { self.primary = Some(result); } }
+    fn control(&self) -> ModuleRunControl {
+        self.control.clone()
+    }
+    fn retain(&mut self, result: Result<()>) {
+        if self.primary.as_ref().is_none_or(|primary| primary.is_ok()) && result.is_err() {
+            self.primary = Some(result);
+        }
+    }
     async fn join(&mut self) -> Result<()> {
-        if self.finished { return self.primary.clone().unwrap_or(Ok(())); }
+        if self.finished {
+            return self.primary.clone().unwrap_or(Ok(()));
+        }
         if let Some(consumer) = self.consumer.as_mut() {
             let result = match consumer.await {
                 Ok(result) => result,
                 Err(error) if error.is_cancelled() => Err(fault("MUSE_CONSUMER_TASK_ABORTED")),
                 Err(_) => Err(fault("MUSE_CONSUMER_TASK_FAILED")),
             };
-            self.primary = Some(result); self.consumer = None;
+            self.primary = Some(result);
+            self.consumer = None;
         }
         {
             let mut active = self.active_link.lock().await;
-            if let Some(link) = active.as_ref() { link.close().await; }
+            if let Some(link) = active.as_ref() {
+                link.close().await;
+            }
             *active = None;
         }
         self.driver.request_stop();
@@ -465,13 +538,17 @@ impl<D: ConsumerDriver> RunOwner<D> {
             // Preserve original consumer failure over shutdown consequences.
             match result {
                 Ok(result) => self.retain(result),
-                Err(error) if error.is_cancelled() => self.retain(Err(fault("MUSE_COMMAND_TASK_ABORTED"))),
+                Err(error) if error.is_cancelled() => {
+                    self.retain(Err(fault("MUSE_COMMAND_TASK_ABORTED")))
+                }
                 Err(_) => self.retain(Err(fault("MUSE_COMMAND_TASK_FAILED"))),
             }
         }
         drop(commands);
-        let drains = self.native.drain_stdio().await; self.retain(drains);
-        let joined = self.native.join_custodians().await; self.retain(joined);
+        let drains = self.native.drain_stdio().await;
+        self.retain(drains);
+        let joined = self.native.join_custodians().await;
+        self.retain(joined);
         self.finished = true;
         self.primary.clone().unwrap_or(Ok(()))
     }
@@ -483,19 +560,38 @@ const DELIVERY_TICK: Duration = Duration::from_millis(250);
 const DELIVERY_RETRY: Duration = Duration::from_secs(1);
 type Slot<T> = Option<LoopCall<'static, T>>;
 async fn wait_slot<T: Send + 'static>(slot: &mut Slot<T>) -> T {
-    match slot { Some(call) => call.as_mut().await, None => std::future::pending().await }
+    match slot {
+        Some(call) => call.as_mut().await,
+        None => std::future::pending().await,
+    }
 }
 fn terminal_host(error: &Error) -> bool {
-    matches!(error.code.as_str(), "UNAUTHORIZED" | "FORBIDDEN" | "BINDING_CLOSED" | "STALE_LINK" | "MUSE_HOST_BINDING_CHANGED")
-        || error.code.starts_with("MUSE_JOURNAL_")
+    matches!(
+        error.code.as_str(),
+        "UNAUTHORIZED"
+            | "FORBIDDEN"
+            | "BINDING_CLOSED"
+            | "STALE_LINK"
+            | "MUSE_HOST_BINDING_CHANGED"
+    ) || error.code.starts_with("MUSE_JOURNAL_")
 }
 
-async fn consume<D: ConsumerDriver>(bootstrap: Arc<ModuleOwnedBootstrap>, driver: Arc<D>, commands: Commands, active_link: ActiveLink, mut stopping: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+async fn consume<D: ConsumerDriver>(
+    bootstrap: Arc<ModuleOwnedBootstrap>,
+    driver: Arc<D>,
+    commands: Commands,
+    active_link: ActiveLink,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     // Reserve capacity for one retained next, one durable delivery and at most
     // one optional publication. There is no unbounded task/request producer.
-    if bootstrap.host.ipc.max_inflight_per_connection < 3 { return Err(fault("MUSE_HOST_INFLIGHT_BOUND_UNSUPPORTED")); }
+    if bootstrap.host.ipc.max_inflight_per_connection < 3 {
+        return Err(fault("MUSE_HOST_INFLIGHT_BOUND_UNSUPPORTED"));
+    }
     loop {
-        if *stopping.borrow() { return Ok(()); }
+        if *stopping.borrow() {
+            return Ok(());
+        }
         let mut link = tokio::select! {
             _ = stopping.changed() => return Ok(()),
             link = bootstrap.link_hello(driver.hello()) => match link {
@@ -510,10 +606,19 @@ async fn consume<D: ConsumerDriver>(bootstrap: Arc<ModuleOwnedBootstrap>, driver
         // lost next/outcome/stream ACK never requests another native write.
         link.close().await;
         *active_link.lock().await = None;
-        match result { Ok(false) => return Ok(()), Ok(true) => {}, Err(error) => return Err(error) }
+        match result {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(error) => return Err(error),
+        }
     }
 }
-async fn epoch<D: ConsumerDriver>(link: &mut ModuleLink, driver: Arc<D>, commands: &Commands, stopping: &mut tokio::sync::watch::Receiver<bool>) -> Result<bool> {
+async fn epoch<D: ConsumerDriver>(
+    link: &mut ModuleLink,
+    driver: Arc<D>,
+    commands: &Commands,
+    stopping: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<bool> {
     let mut next: Slot<Result<Value>> = None;
     let mut delivery: Slot<Result<()>> = None;
     let mut publication: Slot<bool> = None;
@@ -522,12 +627,20 @@ async fn epoch<D: ConsumerDriver>(link: &mut ModuleLink, driver: Arc<D>, command
     let mut deliver_at = tokio::time::Instant::now();
     let mut publish_at = tokio::time::Instant::now();
     loop {
-        if *stopping.borrow() { return Ok(false); }
-        if !link.is_connected() { return Ok(true); }
+        if *stopping.borrow() {
+            return Ok(false);
+        }
+        if !link.is_connected() {
+            return Ok(true);
+        }
         let count = {
             let mut tasks = commands.lock().await;
             while let Some(completed) = tasks.try_join_next() {
-                match completed { Ok(Ok(())) => {}, Ok(Err(error)) => return Err(error), Err(_) => return Err(fault("MUSE_COMMAND_TASK_FAILED")) }
+                match completed {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => return Err(fault("MUSE_COMMAND_TASK_FAILED")),
+                }
             }
             tasks.len()
         };
@@ -537,11 +650,13 @@ async fn epoch<D: ConsumerDriver>(link: &mut ModuleLink, driver: Arc<D>, command
         }
         let now = tokio::time::Instant::now();
         if delivery.is_none() && now >= deliver_at {
-            let worker = driver.clone(); let mut handle = link.clone();
+            let worker = driver.clone();
+            let mut handle = link.clone();
             delivery = Some(Box::pin(async move { worker.flush(&mut handle).await }));
         }
         if publication.is_none() && now >= publish_at {
-            let worker = driver.clone(); let mut handle = link.clone();
+            let worker = driver.clone();
+            let mut handle = link.clone();
             publication = Some(Box::pin(async move { worker.publish(&mut handle).await }));
         }
         tokio::select! {
@@ -586,199 +701,573 @@ async fn epoch<D: ConsumerDriver>(link: &mut ModuleLink, driver: Arc<D>, command
 mod runtime_tests {
     use super::*;
     use crate::msp::Options;
-    use std::{collections::{BTreeMap,VecDeque},sync::{Mutex,atomic::{AtomicBool,AtomicUsize,Ordering}}};
-    use swarm_contracts::{RuntimeCommand,module_catalog::ModuleDescriptor,native_stream::{StreamPublish,StreamScope,StreamPayload,TextClass}};
-    use tokio::{io::{AsyncBufReadExt,AsyncRead,AsyncWrite,AsyncWriteExt,BufReader,DuplexStream},sync::Notify,task::JoinHandle};
-    const DEADLINE:Duration=Duration::from_secs(4);
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+    use swarm_contracts::{
+        RuntimeCommand,
+        module_catalog::ModuleDescriptor,
+        native_stream::{StreamPayload, StreamPublish, StreamScope, TextClass},
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+        sync::Notify,
+        task::JoinHandle,
+    };
+    const DEADLINE: Duration = Duration::from_secs(4);
     struct Directory(PathBuf);
-    impl Directory {fn new()->Self {let path=env::temp_dir().join(format!("sm-loop-{}",uuid::Uuid::now_v7()));std::fs::create_dir(&path).unwrap();Self(path.canonicalize().unwrap())}}
-    impl Drop for Directory {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
-    fn bootstrap(path:&Path)->Arc<ModuleOwnedBootstrap> {
-        let executable=env::current_exe().unwrap();
-        let mut descriptor:Value=serde_json::from_str(include_str!("../registration/descriptor.template.json")).unwrap();descriptor["launch"]["executable"]=json!(executable);
-        let descriptor:ModuleDescriptor=serde_json::from_value(descriptor).unwrap();
-        let contract=ModuleContractClaim::from_descriptor(&descriptor,ProtocolVersion{major:1,minor:0}).unwrap();
-        Arc::new(ModuleOwnedBootstrap{host:HostConnectionConfig{schema_version:1,host_data_dir:path.into(),ipc:swarm_client::IpcConfig::default()},credential:Credential{client_id:"fixture-module".into(),token:"fixture-only".into()},worker:VerifiedModuleWorker{boot_id:"fixture-boot".into(),owner_record:json!({"token":"fixture-owner","process":{"pid":1}}),process_image_identity:json!({})},contract,binding_id:"binding".into(),generation:1,state_dir:path.into(),native_executable:executable})
+    impl Directory {
+        fn new() -> Self {
+            let path = env::temp_dir().join(format!("sm-loop-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
     }
-    fn command(operation:&str,method:&str)->Value {
-        serde_json::to_value(RuntimeCommand{operation_id:operation.into(),method:method.into(),created_at_ms:1,binding_id:"binding".into(),generation:1,native_root_id:Some("root".into()),route:json!({"module_artifact_id":ARTIFACT_ID}),input:json!({"text":"abc"}),input_sha256:Some("a".repeat(64)),target_input_sha256:None}).unwrap()
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
-    async fn send<W:AsyncWrite+Unpin>(writer:&mut W,value:Value){writer.write_all(format!("{value}\n").as_bytes()).await.unwrap();writer.flush().await.unwrap();}
-    async fn reply<W:AsyncWrite+Unpin>(writer:&mut W,id:&Value,value:Value){send(writer,json!({"jsonrpc":"2.0","id":id,"result":value})).await;}
+    fn bootstrap(path: &Path) -> Arc<ModuleOwnedBootstrap> {
+        let executable = env::current_exe().unwrap();
+        let mut descriptor: Value =
+            serde_json::from_str(include_str!("../registration/descriptor.template.json")).unwrap();
+        descriptor["launch"]["executable"] = json!(executable);
+        let descriptor: ModuleDescriptor = serde_json::from_value(descriptor).unwrap();
+        let contract = ModuleContractClaim::from_descriptor(
+            &descriptor,
+            ProtocolVersion { major: 1, minor: 0 },
+        )
+        .unwrap();
+        Arc::new(ModuleOwnedBootstrap {
+            host: HostConnectionConfig {
+                schema_version: 1,
+                host_data_dir: path.into(),
+                ipc: swarm_client::IpcConfig::default(),
+            },
+            credential: Credential {
+                client_id: "fixture-module".into(),
+                token: "fixture-only".into(),
+            },
+            worker: VerifiedModuleWorker {
+                boot_id: "fixture-boot".into(),
+                owner_record: json!({"token":"fixture-owner","process":{"pid":1}}),
+                process_image_identity: json!({}),
+            },
+            contract,
+            binding_id: "binding".into(),
+            generation: 1,
+            state_dir: path.into(),
+            native_executable: executable,
+        })
+    }
+    fn command(operation: &str, method: &str) -> Value {
+        serde_json::to_value(RuntimeCommand {
+            operation_id: operation.into(),
+            method: method.into(),
+            created_at_ms: 1,
+            binding_id: "binding".into(),
+            generation: 1,
+            native_root_id: Some("root".into()),
+            route: json!({"module_artifact_id":ARTIFACT_ID}),
+            input: json!({"text":"abc"}),
+            input_sha256: Some("a".repeat(64)),
+            target_input_sha256: None,
+        })
+        .unwrap()
+    }
+    async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) {
+        writer
+            .write_all(format!("{value}\n").as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    async fn reply<W: AsyncWrite + Unpin>(writer: &mut W, id: &Value, value: Value) {
+        send(writer, json!({"jsonrpc":"2.0","id":id,"result":value})).await;
+    }
 
     // This fixture implements only the loop's native/Host seams. It exercises
     // real MSP and ModuleLink transports, not Driver/journal/Task qualification.
     // The production ConsumerDriver impl above delegates solely to real Driver.
     struct LoopDriver {
-        transport:Arc<MspTransport>,
-        outbox:Mutex<BTreeMap<String,Value>>, events:Mutex<VecDeque<Value>>,
-        turn:Mutex<Option<String>>, intents:AtomicUsize, native_writes:AtomicUsize,
-        acknowledged:AtomicBool, stopped:AtomicBool, pump_done:AtomicBool,
-        pump:tokio::sync::Mutex<Option<JoinHandle<()>>>, panic_hello:AtomicBool,
-        fail_flush:AtomicBool,
+        transport: Arc<MspTransport>,
+        outbox: Mutex<BTreeMap<String, Value>>,
+        events: Mutex<VecDeque<Value>>,
+        turn: Mutex<Option<String>>,
+        intents: AtomicUsize,
+        native_writes: AtomicUsize,
+        acknowledged: AtomicBool,
+        stopped: AtomicBool,
+        pump_done: AtomicBool,
+        pump: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+        panic_hello: AtomicBool,
+        fail_flush: AtomicBool,
     }
     impl ConsumerDriver for LoopDriver {
-        fn hello(&self)->Value {
-            assert!(!self.panic_hello.load(Ordering::SeqCst),"fixture consumer panic");
+        fn hello(&self) -> Value {
+            assert!(
+                !self.panic_hello.load(Ordering::SeqCst),
+                "fixture consumer panic"
+            );
             json!({"boot_id":"fixture-boot","module_artifact_id":ARTIFACT_ID,"native_ready":true})
         }
-        fn request_stop(&self){self.stopped.store(true,Ordering::SeqCst);}
-        fn execute(self:Arc<Self>,command:RuntimeCommand)->LoopCall<'static,Result<()>> {
+        fn request_stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+        fn execute(self: Arc<Self>, command: RuntimeCommand) -> LoopCall<'static, Result<()>> {
             Box::pin(async move {
-                let method=match command.method.as_str(){"task.dispatch"=>"turn/start","agent.reply"=>"userInput/answer",_=>return Err(fault("FIXTURE_UNEXPECTED_COMMAND"))};
+                let method = match command.method.as_str() {
+                    "task.dispatch" => "turn/start",
+                    "agent.reply" => "userInput/answer",
+                    _ => return Err(fault("FIXTURE_UNEXPECTED_COMMAND")),
+                };
                 // A test-only intent marker precedes the real transport write.
                 // This is not a durable journal implementation or proof.
-                self.intents.fetch_add(1,Ordering::SeqCst);
-                let id=if method=="turn/start"{"019a0000-0000-7000-8000-000000000001"}else{"019a0000-0000-7000-8000-000000000002"};
-                let params=if method=="turn/start"{json!({"commandId":id,"sessionId":"root","input":[{"type":"text","text":"abc"}],"ifBusy":"queue"})}else{json!({"commandId":id,"sessionId":"root","userInputId":"question","answers":[]})};
-                let request=self.transport.submit_request(method,params.as_object().unwrap().clone()).map_err(|_|fault("FIXTURE_NATIVE_UNKNOWN"))?;
-                self.native_writes.fetch_add(1,Ordering::SeqCst);
-                request.submitted.await.map_err(|_|fault("FIXTURE_NATIVE_UNKNOWN"))?.map_err(|_|fault("FIXTURE_NATIVE_UNKNOWN"))?;
-                let ack=request.response.await.map_err(|_|fault("FIXTURE_NATIVE_UNKNOWN"))?.map_err(|_|fault("FIXTURE_NATIVE_UNKNOWN"))?;
-                if method=="turn/start" {*self.turn.lock().unwrap()=ack["turnId"].as_str().map(str::to_owned);}
+                self.intents.fetch_add(1, Ordering::SeqCst);
+                let id = if method == "turn/start" {
+                    "019a0000-0000-7000-8000-000000000001"
+                } else {
+                    "019a0000-0000-7000-8000-000000000002"
+                };
+                let params = if method == "turn/start" {
+                    json!({"commandId":id,"sessionId":"root","input":[{"type":"text","text":"abc"}],"ifBusy":"queue"})
+                } else {
+                    json!({"commandId":id,"sessionId":"root","userInputId":"question","answers":[]})
+                };
+                let request = self
+                    .transport
+                    .submit_request(method, params.as_object().unwrap().clone())
+                    .map_err(|_| fault("FIXTURE_NATIVE_UNKNOWN"))?;
+                self.native_writes.fetch_add(1, Ordering::SeqCst);
+                request
+                    .submitted
+                    .await
+                    .map_err(|_| fault("FIXTURE_NATIVE_UNKNOWN"))?
+                    .map_err(|_| fault("FIXTURE_NATIVE_UNKNOWN"))?;
+                let ack = request
+                    .response
+                    .await
+                    .map_err(|_| fault("FIXTURE_NATIVE_UNKNOWN"))?
+                    .map_err(|_| fault("FIXTURE_NATIVE_UNKNOWN"))?;
+                if method == "turn/start" {
+                    *self.turn.lock().unwrap() = ack["turnId"].as_str().map(str::to_owned);
+                }
                 self.outbox.lock().unwrap().insert(command.operation_id.clone(),json!({"operation_id":command.operation_id,"outcome":"applied","native_root_id":"root","native_scope_key":"fixture-scope","turn_id":ack["turnId"],"details":{"execution_complete":false}}));
                 Ok(())
             })
         }
-        fn flush<'a>(&'a self,link:&'a mut ModuleLink)->LoopCall<'a,Result<()>> {
+        fn flush<'a>(&'a self, link: &'a mut ModuleLink) -> LoopCall<'a, Result<()>> {
             Box::pin(async move {
-                if self.fail_flush.load(Ordering::SeqCst){return Err(fault("MUSE_JOURNAL_PERSISTENCE_UNKNOWN"));}
-                let pending=self.outbox.lock().unwrap().clone();
-                for (id,value) in pending {
-                    link.outcome(value.clone()).await?;
-                    let mut outbox=self.outbox.lock().unwrap();
-                    if outbox.get(&id)==Some(&value){outbox.remove(&id);}
-                    if id=="dispatch"{self.acknowledged.store(true,Ordering::SeqCst);}
+                if self.fail_flush.load(Ordering::SeqCst) {
+                    return Err(fault("MUSE_JOURNAL_PERSISTENCE_UNKNOWN"));
                 }
-                link.observe(json!({"event_id":"fixture-summary","state":{"boot_id":"fixture-boot","execution":"unknown"}})).await?;Ok(())
+                let pending = self.outbox.lock().unwrap().clone();
+                for (id, value) in pending {
+                    link.outcome(value.clone()).await?;
+                    let mut outbox = self.outbox.lock().unwrap();
+                    if outbox.get(&id) == Some(&value) {
+                        outbox.remove(&id);
+                    }
+                    if id == "dispatch" {
+                        self.acknowledged.store(true, Ordering::SeqCst);
+                    }
+                }
+                link.observe(json!({"event_id":"fixture-summary","state":{"boot_id":"fixture-boot","execution":"unknown"}})).await?;
+                Ok(())
             })
         }
-        fn publish<'a>(&'a self,link:&'a mut ModuleLink)->LoopCall<'a,bool> {
+        fn publish<'a>(&'a self, link: &'a mut ModuleLink) -> LoopCall<'a, bool> {
             Box::pin(async move {
-                if !self.acknowledged.load(Ordering::SeqCst){return false;}
-                let event=self.events.lock().unwrap().pop_front();let Some(event)=event else{return false;};
-                let turn=self.turn.lock().unwrap().clone();if turn.as_deref()!=event["params"]["item"]["turnId"].as_str(){return false;}
-                let revision=event["params"]["item"]["revision"].as_u64().unwrap();
-                let frame=StreamPublish{scope:StreamScope{binding_id:"binding".into(),generation:1,boot_id:"fixture-boot".into(),task_id:"task".into(),task_revision:1,attempt_id:"attempt".into(),operation_id:"dispatch".into(),native_session_id:"root".into(),turn_id:turn.unwrap()},source_sequence:revision,native_cursor:format!("opaque:{revision}"),item_id:"item".into(),item_order:0,part_index:0,payload:StreamPayload::Text{class:TextClass::Assistant,text:"synthetic".into(),final_record:true,revision:Some(revision)}};
+                if !self.acknowledged.load(Ordering::SeqCst) {
+                    return false;
+                }
+                let event = self.events.lock().unwrap().pop_front();
+                let Some(event) = event else {
+                    return false;
+                };
+                let turn = self.turn.lock().unwrap().clone();
+                if turn.as_deref() != event["params"]["item"]["turnId"].as_str() {
+                    return false;
+                }
+                let revision = event["params"]["item"]["revision"].as_u64().unwrap();
+                let frame = StreamPublish {
+                    scope: StreamScope {
+                        binding_id: "binding".into(),
+                        generation: 1,
+                        boot_id: "fixture-boot".into(),
+                        task_id: "task".into(),
+                        task_revision: 1,
+                        attempt_id: "attempt".into(),
+                        operation_id: "dispatch".into(),
+                        native_session_id: "root".into(),
+                        turn_id: turn.unwrap(),
+                    },
+                    source_sequence: revision,
+                    native_cursor: format!("opaque:{revision}"),
+                    item_id: "item".into(),
+                    item_order: 0,
+                    part_index: 0,
+                    payload: StreamPayload::Text {
+                        class: TextClass::Assistant,
+                        text: "synthetic".into(),
+                        final_record: true,
+                        revision: Some(revision),
+                    },
+                };
                 link.publish_stream(&frame).await.is_ok()
             })
         }
-        fn stop_native(&self)->LoopCall<'_,()> {
+        fn stop_native(&self) -> LoopCall<'_, ()> {
             Box::pin(async move {
-                self.stopped.store(true,Ordering::SeqCst);let _=self.transport.close().await;
-                let mut pump=self.pump.lock().await;if let Some(task)=pump.as_mut(){let _=task.await;}*pump=None;
+                self.stopped.store(true, Ordering::SeqCst);
+                let _ = self.transport.close().await;
+                let mut pump = self.pump.lock().await;
+                if let Some(task) = pump.as_mut() {
+                    let _ = task.await;
+                }
+                *pump = None;
             })
         }
     }
     struct Custody {
-        driver:Arc<LoopDriver>, peer:tokio::sync::Mutex<Option<JoinHandle<()>>>,
-        drained:AtomicBool, joined:AtomicBool,
+        driver: Arc<LoopDriver>,
+        peer: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+        drained: AtomicBool,
+        joined: AtomicBool,
     }
     impl NativeRuntime for Custody {
-        fn start<'a>(&'a self,_:&'a NativeOptions,_:jsonrpsee_core::server::RpcModule<()>)->NativeFuture<'a,NativeAttachment>{Box::pin(async{Err(fault("FIXTURE_NO_NATIVE_SPAWN"))})}
-        fn drain_stdio(&self)->NativeFuture<'_,()> {
-            Box::pin(async move {let mut peer=self.peer.lock().await;if let Some(task)=peer.as_mut(){task.await.map_err(|_|fault("FIXTURE_PEER_FAILED"))?;}*peer=None;self.drained.store(true,Ordering::SeqCst);Ok(())})
+        fn start<'a>(
+            &'a self,
+            _: &'a NativeOptions,
+            _: jsonrpsee_core::server::RpcModule<()>,
+        ) -> NativeFuture<'a, NativeAttachment> {
+            Box::pin(async { Err(fault("FIXTURE_NO_NATIVE_SPAWN")) })
         }
-        fn join_custodians(&self)->NativeFuture<'_,()> {
-            Box::pin(async move {assert!(self.driver.stopped.load(Ordering::SeqCst));assert!(self.driver.pump_done.load(Ordering::SeqCst));assert!(self.drained.load(Ordering::SeqCst));self.joined.store(true,Ordering::SeqCst);Ok(())})
+        fn drain_stdio(&self) -> NativeFuture<'_, ()> {
+            Box::pin(async move {
+                let mut peer = self.peer.lock().await;
+                if let Some(task) = peer.as_mut() {
+                    task.await.map_err(|_| fault("FIXTURE_PEER_FAILED"))?;
+                }
+                *peer = None;
+                self.drained.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+        fn join_custodians(&self) -> NativeFuture<'_, ()> {
+            Box::pin(async move {
+                assert!(self.driver.stopped.load(Ordering::SeqCst));
+                assert!(self.driver.pump_done.load(Ordering::SeqCst));
+                assert!(self.drained.load(Ordering::SeqCst));
+                self.joined.store(true, Ordering::SeqCst);
+                Ok(())
+            })
         }
     }
-    fn fixture_native(hold_ack:bool)->(Arc<LoopDriver>,Arc<Custody>,Arc<Notify>) {
-        let (owned,peer)=tokio::io::duplex(64*1024);let (read,write)=tokio::io::split(owned);
-        let (transport,mut events)=MspTransport::attach_fixture(read,write,jsonrpsee_core::server::RpcModule::new(()),Options::default()).unwrap();
-        let driver=Arc::new(LoopDriver{transport:Arc::new(transport),outbox:Mutex::new(BTreeMap::new()),events:Mutex::new(VecDeque::new()),turn:Mutex::new(None),intents:AtomicUsize::new(0),native_writes:AtomicUsize::new(0),acknowledged:AtomicBool::new(false),stopped:AtomicBool::new(false),pump_done:AtomicBool::new(false),pump:tokio::sync::Mutex::new(None),panic_hello:AtomicBool::new(false),fail_flush:AtomicBool::new(false)});
-        let weak=Arc::downgrade(&driver);let pump=tokio::spawn(async move {while let Some(event)=events.recv().await {if let Some(driver)=weak.upgrade(){let mut queue=driver.events.lock().unwrap();assert!(queue.len()<8);queue.push_back(event.envelope);}}if let Some(driver)=weak.upgrade(){driver.pump_done.store(true,Ordering::SeqCst);}});
-        *driver.pump.try_lock().unwrap()=Some(pump);
-        let received=Arc::new(Notify::new());let seen=received.clone();let weak=Arc::downgrade(&driver);
-        let peer=tokio::spawn(async move {
-            let (read,mut write)=tokio::io::split(peer);let mut lines=BufReader::new(read).lines();
-            while let Some(line)=lines.next_line().await.unwrap(){let call:Value=serde_json::from_str(&line).unwrap();assert!(weak.upgrade().unwrap().intents.load(Ordering::SeqCst)>0);seen.notify_one();if hold_ack{continue;}
-                reply(&mut write,&call["id"],json!({"commandId":call["params"]["commandId"],"status":"accepted","turnId":"native-turn"})).await;
-                if call["method"]=="turn/start"{for revision in [1,2]{send(&mut write,json!({"jsonrpc":"2.0","method":"item/completed","params":{"sessionId":"root","viewCursor":format!("opaque:{revision}"),"item":{"itemId":"item","turnId":"native-turn","revision":revision,"kind":"agentMessage","status":"completed","text":"synthetic"}}})).await;}}
+    fn fixture_native(hold_ack: bool) -> (Arc<LoopDriver>, Arc<Custody>, Arc<Notify>) {
+        let (owned, peer) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(owned);
+        let (transport, mut events) = MspTransport::attach_fixture(
+            read,
+            write,
+            jsonrpsee_core::server::RpcModule::new(()),
+            Options::default(),
+        )
+        .unwrap();
+        let driver = Arc::new(LoopDriver {
+            transport: Arc::new(transport),
+            outbox: Mutex::new(BTreeMap::new()),
+            events: Mutex::new(VecDeque::new()),
+            turn: Mutex::new(None),
+            intents: AtomicUsize::new(0),
+            native_writes: AtomicUsize::new(0),
+            acknowledged: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            pump_done: AtomicBool::new(false),
+            pump: tokio::sync::Mutex::new(None),
+            panic_hello: AtomicBool::new(false),
+            fail_flush: AtomicBool::new(false),
+        });
+        let weak = Arc::downgrade(&driver);
+        let pump = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let Some(driver) = weak.upgrade() {
+                    let mut queue = driver.events.lock().unwrap();
+                    assert!(queue.len() < 8);
+                    queue.push_back(event.envelope);
+                }
+            }
+            if let Some(driver) = weak.upgrade() {
+                driver.pump_done.store(true, Ordering::SeqCst);
             }
         });
-        let custody=Arc::new(Custody{driver:driver.clone(),peer:tokio::sync::Mutex::new(Some(peer)),drained:AtomicBool::new(false),joined:AtomicBool::new(false)});(driver,custody,received)
+        *driver.pump.try_lock().unwrap() = Some(pump);
+        let received = Arc::new(Notify::new());
+        let seen = received.clone();
+        let weak = Arc::downgrade(&driver);
+        let peer = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(peer);
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let call: Value = serde_json::from_str(&line).unwrap();
+                assert!(weak.upgrade().unwrap().intents.load(Ordering::SeqCst) > 0);
+                seen.notify_one();
+                if hold_ack {
+                    continue;
+                }
+                reply(&mut write,&call["id"],json!({"commandId":call["params"]["commandId"],"status":"accepted","turnId":"native-turn"})).await;
+                if call["method"] == "turn/start" {
+                    for revision in [1, 2] {
+                        send(&mut write,json!({"jsonrpc":"2.0","method":"item/completed","params":{"sessionId":"root","viewCursor":format!("opaque:{revision}"),"item":{"itemId":"item","turnId":"native-turn","revision":revision,"kind":"agentMessage","status":"completed","text":"synthetic"}}})).await;
+                    }
+                }
+            }
+        });
+        let custody = Arc::new(Custody {
+            driver: driver.clone(),
+            peer: tokio::sync::Mutex::new(Some(peer)),
+            drained: AtomicBool::new(false),
+            joined: AtomicBool::new(false),
+        });
+        (driver, custody, received)
     }
 
-    trait FixtureIo:AsyncRead+AsyncWrite+Unpin+Send {}
-    impl<T:AsyncRead+AsyncWrite+Unpin+Send> FixtureIo for T {}
+    trait FixtureIo: AsyncRead + AsyncWrite + Unpin + Send {}
+    impl<T: AsyncRead + AsyncWrite + Unpin + Send> FixtureIo for T {}
     #[derive(Default)]
-    struct HostFacts { auth:usize, hello:usize, next:usize, outcomes:usize, rejected_stream:usize, stalled_stream:usize }
-    async fn host(mut stream:Box<dyn FixtureIo>,facts:Arc<Mutex<HostFacts>>,done:Arc<Notify>) {
-        let (read,mut write)=tokio::io::split(&mut stream);let mut lines=BufReader::new(read).lines();let mut pending=None;let mut reply_sent=false;
+    struct HostFacts {
+        auth: usize,
+        hello: usize,
+        next: usize,
+        outcomes: usize,
+        rejected_stream: usize,
+        stalled_stream: usize,
+    }
+    async fn host(mut stream: Box<dyn FixtureIo>, facts: Arc<Mutex<HostFacts>>, done: Arc<Notify>) {
+        let (read, mut write) = tokio::io::split(&mut stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut pending = None;
+        let mut reply_sent = false;
         // Consumer error/abort deliberately closes this pipe while a request
         // may already be admitted. Only expected peer-close IO is tolerated;
         // all phase/content/count assertions below remain mandatory.
-        macro_rules! output {($value:expr)=>{{
-            let bytes=format!("{}\n",$value);
-            let written=async {write.write_all(bytes.as_bytes()).await?;write.flush().await}.await;
-            if let Err(error)=written {
-                assert!(matches!(error.kind(),std::io::ErrorKind::BrokenPipe|std::io::ErrorKind::ConnectionReset|std::io::ErrorKind::NotConnected),"unexpected fixture Host write failure");return;
-            }
-        }};}
+        macro_rules! output {
+            ($value:expr) => {{
+                let bytes = format!("{}\n", $value);
+                let written = async {
+                    write.write_all(bytes.as_bytes()).await?;
+                    write.flush().await
+                }
+                .await;
+                if let Err(error) = written {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::NotConnected
+                        ),
+                        "unexpected fixture Host write failure"
+                    );
+                    return;
+                }
+            }};
+        }
         macro_rules! respond {($id:expr,$value:expr)=>{output!(json!({"jsonrpc":"2.0","id":$id,"result":$value}))};}
-        while let Some(line)=lines.next_line().await.unwrap(){let call:Value=serde_json::from_str(&line).unwrap();let id=call["id"].clone();
-            match call["method"].as_str().unwrap(){
-                "client.hello"=>{assert_eq!(call["params"]["token"],"fixture-only");facts.lock().unwrap().auth+=1;respond!(&id,json!({}));},
-                "module.hello"=>{facts.lock().unwrap().hello+=1;respond!(&id,json!({"binding_id":"binding","generation":1}));},
-                "module.next"=>{
-                    let count={let mut f=facts.lock().unwrap();f.next+=1;f.next};
-                    if count==1{respond!(&id,json!({"command":command("dispatch","task.dispatch")}));}else{assert!(pending.is_none(),"pending next must never be resent on a tick or side reply");pending=Some(id.clone());}
-                },
-                "module.outcome"=>{facts.lock().unwrap().outcomes+=1;respond!(&id,json!({"recorded":true}));if call["params"]["operation_id"]=="reply"{done.notify_one();}},
-                "module.observe"=>respond!(&id,json!({"recorded":true})),
-                "module.stream.publish"=>{
-                    let first={let f=facts.lock().unwrap();f.rejected_stream==0};
-                    if first{facts.lock().unwrap().rejected_stream+=1;output!(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"fixture capacity","data":{"code":"STREAM_CAPACITY"}}}));}
-                    else{facts.lock().unwrap().stalled_stream+=1;/* deliberately no ACK, while control remains usable */}
-                },
-                _=>panic!("unexpected fixture Host method"),
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let call: Value = serde_json::from_str(&line).unwrap();
+            let id = call["id"].clone();
+            match call["method"].as_str().unwrap() {
+                "client.hello" => {
+                    assert_eq!(call["params"]["token"], "fixture-only");
+                    facts.lock().unwrap().auth += 1;
+                    respond!(&id, json!({}));
+                }
+                "module.hello" => {
+                    facts.lock().unwrap().hello += 1;
+                    respond!(&id, json!({"binding_id":"binding","generation":1}));
+                }
+                "module.next" => {
+                    let count = {
+                        let mut f = facts.lock().unwrap();
+                        f.next += 1;
+                        f.next
+                    };
+                    if count == 1 {
+                        respond!(&id, json!({"command":command("dispatch","task.dispatch")}));
+                    } else {
+                        assert!(
+                            pending.is_none(),
+                            "pending next must never be resent on a tick or side reply"
+                        );
+                        pending = Some(id.clone());
+                    }
+                }
+                "module.outcome" => {
+                    facts.lock().unwrap().outcomes += 1;
+                    respond!(&id, json!({"recorded":true}));
+                    if call["params"]["operation_id"] == "reply" {
+                        done.notify_one();
+                    }
+                }
+                "module.observe" => respond!(&id, json!({"recorded":true})),
+                "module.stream.publish" => {
+                    let first = {
+                        let f = facts.lock().unwrap();
+                        f.rejected_stream == 0
+                    };
+                    if first {
+                        facts.lock().unwrap().rejected_stream += 1;
+                        output!(
+                            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"fixture capacity","data":{"code":"STREAM_CAPACITY"}}})
+                        );
+                    } else {
+                        facts.lock().unwrap().stalled_stream += 1; /* deliberately no ACK, while control remains usable */
+                    }
+                }
+                _ => panic!("unexpected fixture Host method"),
             }
-            let can_reply={let f=facts.lock().unwrap();f.outcomes>=1 && f.rejected_stream>=1};
-            if can_reply && !reply_sent && let Some(id)=pending.take(){reply_sent=true;respond!(&id,json!({"command":command("reply","agent.reply")}));}
+            let can_reply = {
+                let f = facts.lock().unwrap();
+                f.outcomes >= 1 && f.rejected_stream >= 1
+            };
+            if can_reply
+                && !reply_sent
+                && let Some(id) = pending.take()
+            {
+                reply_sent = true;
+                respond!(&id, json!({"command":command("reply","agent.reply")}));
+            }
         }
     }
-    fn host_task(path:&Path,facts:Arc<Mutex<HostFacts>>,done:Arc<Notify>)->JoinHandle<()> {
-        let endpoint=swarm_client::ipc_endpoint(path).unwrap();
-        #[cfg(unix)] {let listener=tokio::net::UnixListener::bind(endpoint).unwrap();tokio::spawn(async move{let (stream,_)=listener.accept().await.unwrap();drop(listener);host(Box::new(stream),facts,done).await;})}
-        #[cfg(windows)] {let listener=tokio::net::windows::named_pipe::ServerOptions::new().first_pipe_instance(true).create(endpoint).unwrap();tokio::spawn(async move{listener.connect().await.unwrap();host(Box::new(listener),facts,done).await;})}
+    fn host_task(path: &Path, facts: Arc<Mutex<HostFacts>>, done: Arc<Notify>) -> JoinHandle<()> {
+        let endpoint = swarm_client::ipc_endpoint(path).unwrap();
+        #[cfg(unix)]
+        {
+            let listener = tokio::net::UnixListener::bind(endpoint).unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(listener);
+                host(Box::new(stream), facts, done).await;
+            })
+        }
+        #[cfg(windows)]
+        {
+            let listener = tokio::net::windows::named_pipe::ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(endpoint)
+                .unwrap();
+            tokio::spawn(async move {
+                listener.connect().await.unwrap();
+                host(Box::new(listener), facts, done).await;
+            })
+        }
     }
 
     #[tokio::test]
     async fn muse_runtime_same_link_pending_next_delivery_and_optional_stream_loss() {
-        let directory=Directory::new();let bootstrap=bootstrap(&directory.0);let (driver,custody,_)=fixture_native(false);
-        let facts=Arc::new(Mutex::new(HostFacts::default()));let done=Arc::new(Notify::new());let host=host_task(&directory.0,facts.clone(),done.clone());
-        let mut owner=RunOwner::start(bootstrap,driver.clone(),custody.clone());
-        tokio::time::timeout(DEADLINE,done.notified()).await.unwrap();
+        let directory = Directory::new();
+        let bootstrap = bootstrap(&directory.0);
+        let (driver, custody, _) = fixture_native(false);
+        let facts = Arc::new(Mutex::new(HostFacts::default()));
+        let done = Arc::new(Notify::new());
+        let host = host_task(&directory.0, facts.clone(), done.clone());
+        let mut owner = RunOwner::start(bootstrap, driver.clone(), custody.clone());
+        tokio::time::timeout(DEADLINE, done.notified())
+            .await
+            .unwrap();
         // Wait for the second optional publication to become pending. Control
         // has already delivered the reply outcome through that same session.
-        tokio::time::timeout(DEADLINE,async{loop{if facts.lock().unwrap().stalled_stream==1 && driver.outbox.lock().unwrap().is_empty(){break;}tokio::task::yield_now().await;}}).await.unwrap();
-        {let f=facts.lock().unwrap();assert_eq!(f.auth,1);assert_eq!(f.hello,1);assert_eq!(f.outcomes,2);assert_eq!(f.rejected_stream,1);assert_eq!(f.next,3);}
-        owner.control().request_stop();tokio::time::timeout(DEADLINE,owner.join()).await.unwrap().unwrap();host.await.unwrap();
-        assert_eq!(driver.native_writes.load(Ordering::SeqCst),2);assert!(custody.joined.load(Ordering::SeqCst));
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                if facts.lock().unwrap().stalled_stream == 1
+                    && driver.outbox.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let f = facts.lock().unwrap();
+            assert_eq!(f.auth, 1);
+            assert_eq!(f.hello, 1);
+            assert_eq!(f.outcomes, 2);
+            assert_eq!(f.rejected_stream, 1);
+            assert_eq!(f.next, 3);
+        }
+        owner.control().request_stop();
+        tokio::time::timeout(DEADLINE, owner.join())
+            .await
+            .unwrap()
+            .unwrap();
+        host.await.unwrap();
+        assert_eq!(driver.native_writes.load(Ordering::SeqCst), 2);
+        assert!(custody.joined.load(Ordering::SeqCst));
     }
     #[tokio::test]
     async fn muse_runtime_consumer_panic_retains_outer_custody_until_stdio_join() {
-        let directory=Directory::new();let (driver,custody,_)=fixture_native(false);driver.panic_hello.store(true,Ordering::SeqCst);
-        let mut owner=RunOwner::start(bootstrap(&directory.0),driver.clone(),custody.clone());
-        let error=tokio::time::timeout(DEADLINE,owner.join()).await.unwrap().unwrap_err();assert_eq!(error.code,"MUSE_CONSUMER_TASK_FAILED");assert!(custody.joined.load(Ordering::SeqCst));assert_eq!(driver.native_writes.load(Ordering::SeqCst),0);
+        let directory = Directory::new();
+        let (driver, custody, _) = fixture_native(false);
+        driver.panic_hello.store(true, Ordering::SeqCst);
+        let mut owner = RunOwner::start(bootstrap(&directory.0), driver.clone(), custody.clone());
+        let error = tokio::time::timeout(DEADLINE, owner.join())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "MUSE_CONSUMER_TASK_FAILED");
+        assert!(custody.joined.load(Ordering::SeqCst));
+        assert_eq!(driver.native_writes.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
     async fn muse_runtime_consumer_error_retains_primary_failure_until_custody_join() {
-        let directory=Directory::new();let (driver,custody,_)=fixture_native(false);driver.fail_flush.store(true,Ordering::SeqCst);
-        let host=host_task(&directory.0,Arc::new(Mutex::new(HostFacts::default())),Arc::new(Notify::new()));
-        let mut owner=RunOwner::start(bootstrap(&directory.0),driver,custody.clone());
-        let error=tokio::time::timeout(DEADLINE,owner.join()).await.unwrap().unwrap_err();assert_eq!(error.code,"MUSE_JOURNAL_PERSISTENCE_UNKNOWN");host.await.unwrap();assert!(custody.joined.load(Ordering::SeqCst));
+        let directory = Directory::new();
+        let (driver, custody, _) = fixture_native(false);
+        driver.fail_flush.store(true, Ordering::SeqCst);
+        let host = host_task(
+            &directory.0,
+            Arc::new(Mutex::new(HostFacts::default())),
+            Arc::new(Notify::new()),
+        );
+        let mut owner = RunOwner::start(bootstrap(&directory.0), driver, custody.clone());
+        let error = tokio::time::timeout(DEADLINE, owner.join())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "MUSE_JOURNAL_PERSISTENCE_UNKNOWN");
+        host.await.unwrap();
+        assert!(custody.joined.load(Ordering::SeqCst));
     }
     #[tokio::test]
     async fn muse_runtime_cancelled_join_then_consumer_abort_rejoins_without_native_replay() {
-        let directory=Directory::new();let (driver,custody,received)=fixture_native(true);
-        let facts=Arc::new(Mutex::new(HostFacts::default()));let host=host_task(&directory.0,facts.clone(),Arc::new(Notify::new()));
-        let mut owner=RunOwner::start(bootstrap(&directory.0),driver.clone(),custody.clone());
-        tokio::time::timeout(DEADLINE,received.notified()).await.unwrap();
-        let mut joined=Box::pin(owner.join());assert!(futures_util::poll!(joined.as_mut()).is_pending());drop(joined);
-        assert!(!custody.joined.load(Ordering::SeqCst));owner.control().abort_consumer();
-        let error=tokio::time::timeout(DEADLINE,owner.join()).await.unwrap().unwrap_err();assert_eq!(error.code,"MUSE_CONSUMER_TASK_ABORTED");host.await.unwrap();
-        assert!(custody.joined.load(Ordering::SeqCst));assert_eq!(driver.native_writes.load(Ordering::SeqCst),1);assert_eq!(facts.lock().unwrap().auth,1);
+        let directory = Directory::new();
+        let (driver, custody, received) = fixture_native(true);
+        let facts = Arc::new(Mutex::new(HostFacts::default()));
+        let host = host_task(&directory.0, facts.clone(), Arc::new(Notify::new()));
+        let mut owner = RunOwner::start(bootstrap(&directory.0), driver.clone(), custody.clone());
+        tokio::time::timeout(DEADLINE, received.notified())
+            .await
+            .unwrap();
+        let mut joined = Box::pin(owner.join());
+        assert!(futures_util::poll!(joined.as_mut()).is_pending());
+        drop(joined);
+        assert!(!custody.joined.load(Ordering::SeqCst));
+        owner.control().abort_consumer();
+        let error = tokio::time::timeout(DEADLINE, owner.join())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "MUSE_CONSUMER_TASK_ABORTED");
+        host.await.unwrap();
+        assert!(custody.joined.load(Ordering::SeqCst));
+        assert_eq!(driver.native_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(facts.lock().unwrap().auth, 1);
     }
 }
