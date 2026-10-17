@@ -44,6 +44,7 @@ members = [
     "crates/swarm-adapter-command",
     "crates/swarm-adapter-claude",
     "crates/swarm-adapter-opencode",
+    "crates/swarm-adapter-muse",
     "crates/swarm-contracts",
     "crates/swarm-client",
     "crates/swarm-cli",

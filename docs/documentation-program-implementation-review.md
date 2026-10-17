@@ -413,6 +413,18 @@ Add module guide table:
 
 On SDK upgrade, tests must compare ELIOT behavior with donor invariants, not only import/syntax.
 
+**Prospective Rust transport boundary (2026-10-16):**
+`crates/swarm-adapter-muse` adopts the complete `jsonrpsee-core 0.26.1`
+async client and public server router, plus the complete `tokio-util 0.7.19`
+bounded line codec. This is generic Rust RPC adoption, not an official Rust MSP
+client or copied Muse facade/router implementation. Official MSP schema and
+conformance vectors remain the wire reference. The table above still describes
+the current Node bridge; its owned checkpoint/control path remains until full
+Rust facade, recovery, results and native qualification are implemented. The
+library has no runnable module artifact and supplies no native inventory proof.
+See the [transport boundary](../crates/swarm-adapter-muse/README.md) and the
+`jsonrpsee-muse-transport` donor entry for the exact dependency and verifier scope.
+
 Sources:
 - [`modules/muse/bridge.mjs`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c99a71fbba2de2f663e2709a31e3ccc205621df3/modules/muse/bridge.mjs)
 - [Muse SDK `turn-submit.ts`](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/facade/turn-submit.ts)

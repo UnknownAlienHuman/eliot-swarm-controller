@@ -12,6 +12,19 @@ Copyright 2026 Adib Mohsin. Atlas is Apache-2.0; the complete [upstream license]
 
 The existing Muse module uses the complete `@muse-code/sdk` 1.3.0 package through its module-local lockfile. Canonical donor source is `meta-models/muse-code-sdk@a7c10c5dd3f66be412077d29f9d11111af70317b` (MIT). SDK installation and its package notices stay module-local; the source and binary archives do not bundle node_modules. See [Muse setup](modules/muse/README.md) and [JavaScript provenance](docs/javascript-provenance.md).
 
+## Muse Rust transport — complete generic RPC dependencies
+
+The prospective `crates/swarm-adapter-muse` library uses the complete published
+`jsonrpsee-core` and `jsonrpsee-types` 0.26.1 crates from `paritytech/jsonrpsee`,
+source commit `bcc84901f3c882f4233f293e5acf018643cbd412`. They are MIT, copyright
+2021 Parity Technologies Limited; the exact upstream
+[license](crates/swarm-adapter-muse/third-party/jsonrpsee-LICENSE) is retained.
+The complete dependency closure is checksum-locked in `Cargo.lock`; bounded line
+framing reuses the existing locked MIT `tokio-util` 0.7.19 crate. This library has
+no runnable Muse module artifact. The official Muse schema remains the MSP wire
+reference and the current Node bridge remains the product route while full Rust
+facade and recovery work is incomplete.
+
 ## rmcp — MCP facade dependency
 
 The C02 MCP facade uses the official `rmcp` 3.5.0 crate (modelcontextprotocol/rust-sdk, Apache-2.0) as an ordinary Cargo dependency with `server`, `transport-io` (stdio), and `transport-streamable-http-server` features explicitly enabled in the current root manifest (`default-features = false`). It is not vendored or modified. Enabling the HTTP feature for the optional gateway does not itself open a listener. The exact version and checksum are locked in `Cargo.lock`.
