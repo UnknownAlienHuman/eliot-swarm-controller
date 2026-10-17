@@ -3983,7 +3983,12 @@ mod tests {
             .expect("native Git is available for the bare repository fixture")
     }
 
-    fn fixture_git_in(git: &Path, trace_directory: &Path, directory: &Path, args: &[&str]) -> Vec<u8> {
+    fn fixture_git_in(
+        git: &Path,
+        trace_directory: &Path,
+        directory: &Path,
+        args: &[&str],
+    ) -> Vec<u8> {
         let mut command = Command::new(git);
         command.arg("-C").arg(directory).args(args);
         checked_fixture_git(&mut command, trace_directory)
