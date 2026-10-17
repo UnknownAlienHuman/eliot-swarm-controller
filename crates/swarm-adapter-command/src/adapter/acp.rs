@@ -6547,7 +6547,7 @@ mod tests {
             token: "fake-store-token".to_owned(),
         };
         let fake_ipc_config = swarm_client::IpcConfig::default();
-        let fake_module_link =
+        let mut fake_module_link =
             swarm_client::ModuleLink::connect(&fake_host_dir, &fake_credential, &fake_ipc_config)
                 .await?;
         let mut descriptor_value: Value =
@@ -6580,6 +6580,19 @@ mod tests {
                 credential_file: fake_host_dir.join("fake-credential.json"),
             },
         };
+        fake_module_link
+            .hello(
+                json!({
+                    "boot_id": owner.host.boot_id,
+                    "module_artifact_id": owner.host.profile.artifact_id(),
+                    "native_root_id": session.id,
+                    "native_scope_key": "production-cancel-unknown-fixture",
+                    "native_ready": true,
+                    "managed_owner": owner.record
+                }),
+                Some(&owner.host.claim),
+            )
+            .await?;
         let config = super::super::Config {
             module_artifact_id: crate::ACP_ARTIFACT_ID.to_owned(),
             command: std::env::temp_dir().join("unused-production-cancel"),

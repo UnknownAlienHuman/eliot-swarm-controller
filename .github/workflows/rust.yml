@@ -426,20 +426,21 @@ jobs:
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
           & cargo test --locked --package $hostPackages[0] --lib forge_inner_recovery_ --target-dir $sharedTargetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run selected Muse library qualification
+      - name: Run selected Muse and Command library qualification
         if: needs.scope.outputs.packages != '[]'
         shell: pwsh
         env:
           PACKAGE_SPECS: ${{ needs.scope.outputs.packages }}
         run: |
-          $musePackages = @($env:PACKAGE_SPECS | ConvertFrom-Json | Where-Object {
-            ([string]$_).Split('@')[0] -ceq 'swarm-adapter-muse'
-          })
-          if ($musePackages.Count -eq 0) { exit 0 }
-          if ($musePackages.Count -ne 1) { throw 'Muse library package selector must be unambiguous.' }
+          $packages = @($env:PACKAGE_SPECS | ConvertFrom-Json)
           $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
-          & cargo test --locked --package $musePackages[0] --lib --target-dir $sharedTargetDir
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($name in @('swarm-adapter-muse', 'swarm-adapter-command')) {
+            $selected = @($packages | Where-Object { ([string]$_).Split('@')[0] -ceq $name })
+            if ($selected.Count -eq 0) { continue }
+            if ($selected.Count -ne 1) { throw "$name library package selector must be unambiguous." }
+            & cargo test --locked --package $selected[0] --lib --target-dir $sharedTargetDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Run selected connected prelaunch ownership regression
         if: contains(needs.scope.outputs.changed_paths, 'crates/swarm-kernel-host/src/store/module_prelaunch_observation_tests.rs')
         shell: pwsh
