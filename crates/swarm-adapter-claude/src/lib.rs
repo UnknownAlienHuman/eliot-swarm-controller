@@ -4544,12 +4544,24 @@ mod failed_prepare_lifecycle_fixture {
             )
             .expect("write local fake SDK manifest");
             let query_marker = root.join("fake-sdk-query-called");
+            let imported_marker = root.join("fake-sdk-imported");
+            let startup_marker = root.join("fake-sdk-startup-entered");
+            let closed_marker = root.join("fake-sdk-warm-closed");
             let query_marker_json = serde_json::to_string(&query_marker.to_string_lossy().as_ref())
                 .expect("encode fake SDK marker path");
+            let imported_marker_json =
+                serde_json::to_string(&imported_marker.to_string_lossy().as_ref())
+                    .expect("encode fake SDK import marker path");
+            let startup_marker_json =
+                serde_json::to_string(&startup_marker.to_string_lossy().as_ref())
+                    .expect("encode fake SDK startup marker path");
+            let closed_marker_json =
+                serde_json::to_string(&closed_marker.to_string_lossy().as_ref())
+                    .expect("encode fake SDK close marker path");
             fs::write(
                 sdk_directory.join("sdk.mjs"),
                 format!(
-                    "import {{ writeFileSync }} from 'node:fs';\nconst marker = {query_marker_json};\nexport async function startup() {{ return {{ query() {{ writeFileSync(marker, 'called'); throw new Error('fake query must not run'); }}, close() {{}} }}; }}\n"
+                    "import {{ writeFileSync }} from 'node:fs';\nconst marker = {query_marker_json};\nwriteFileSync({imported_marker_json}, 'imported');\nexport async function startup() {{ writeFileSync({startup_marker_json}, 'entered'); return {{ query() {{ writeFileSync(marker, 'called'); throw new Error('fake query must not run'); }}, close() {{ writeFileSync({closed_marker_json}, 'closed'); }} }}; }}\n"
                 ),
             )
             .expect("write fake SDK startup implementation");
@@ -4612,13 +4624,20 @@ mod failed_prepare_lifecycle_fixture {
                     ),
                 )
                 .await
-                .expect("prepared SDK frame arrives while the original next is pending");
+                .unwrap_or_else(|_| panic!(
+                    "prepared SDK frame arrives while the original next is pending; sdk_imported={}; startup_entered={}; warm_closed={}; query_called={}; frame_channel_closed={}; buffered_frames={}; ipc_events={:?}",
+                    imported_marker.is_file(), startup_marker.is_file(),
+                    closed_marker.is_file(), query_marker.is_file(), frame_rx.is_closed(), frame_rx.len(),
+                    events.lock().expect("read bounded fixture IPC stages"),
+                ));
                 let prepared = match prepared {
                     ModuleNextPoll::Frame(Some(HarnessFrame::Message(frame))) => frame,
                     _ => panic!("expected the fake SDK prepared frame before module.next replied"),
                 };
                 assert_eq!(prepared["kind"], "prepared");
                 assert_eq!(prepared["operation_id"], operation_id);
+                assert!(imported_marker.is_file() && startup_marker.is_file());
+                assert!(!closed_marker.exists() && !query_marker.exists());
                 let mut harness_alive = false;
                 let mut native_prepared = false;
                 let mut latest_state = Value::Null;

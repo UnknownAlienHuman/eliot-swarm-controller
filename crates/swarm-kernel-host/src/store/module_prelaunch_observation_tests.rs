@@ -495,6 +495,7 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
         effect_certainty: ModuleEffectCertainty::Unknown,
         stage: Some(ModuleFailureStage::ValidateLaunch),
         error_code: Some(UNSUPPORTED.into()),
+        worker_diagnostic_code: None,
         unknown_operation_ids: Vec::new(),
         unknown_operation_count: 0,
         unknown_operation_ids_truncated: false,
