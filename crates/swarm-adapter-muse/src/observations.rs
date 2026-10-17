@@ -710,6 +710,14 @@ pub(crate) struct ChildSnapshotInput<'a> {
     pub(crate) failure: Option<ChildReadFailure>,
 }
 
+/// Retained parent-item identity only, never a fresh read/permission ticket.
+pub(crate) struct ObservedChildProvenance<'a> {
+    pub(crate) parent_session_id: &'a str,
+    pub(crate) item_id: &'a str,
+    pub(crate) parent_turn_id: Option<&'a str>,
+    pub(crate) item_revision: u64,
+}
+
 struct TurnContext<'a> {
     session_id: &'a str,
     turn_id: &'a str,
@@ -761,6 +769,28 @@ impl ObservationProjector {
 
     pub(crate) fn checkpoint(&self) -> Result<Value, ProjectionError> {
         serde_json::to_value(self).map_err(|_| ProjectionError::Serialization)
+    }
+
+    /// Complete internally retained IDs, bounded by MAX_CHILDREN. Reporting
+    /// may omit rows; its byte budget must not become a membership/read fence.
+    pub(crate) fn observed_child_ids(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
+        self.state
+            .observed_children
+            .iter()
+            .map(|child| child.session_id.as_str())
+    }
+
+    pub(crate) fn observed_child_provenance(&self, session: &str) -> Option<ObservedChildProvenance<'_>> {
+        self.state
+            .observed_children
+            .iter()
+            .find(|child| child.session_id == session)
+            .map(|child| ObservedChildProvenance {
+                parent_session_id: &child.parent_session_id,
+                item_id: &child.item_id,
+                parent_turn_id: child.parent_turn_id.as_deref(),
+                item_revision: child.revision,
+            })
     }
 
     pub(crate) fn restore(fence: ProjectionFence, value: Value) -> Result<Self, ProjectionError> {

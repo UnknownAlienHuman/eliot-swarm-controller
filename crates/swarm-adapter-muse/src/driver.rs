@@ -295,12 +295,8 @@ impl State {
     fn children(&self) -> Vec<String> {
         self.projector
             .as_ref()
-            .and_then(|p| p.observation().ok())
-            .and_then(|p| p["observed_children"].as_array().cloned())
+            .map(|p| p.observed_child_ids().map(str::to_owned).collect())
             .unwrap_or_default()
-            .iter()
-            .filter_map(|c| c["sessionId"].as_str().map(str::to_owned))
-            .collect()
     }
     fn member(&self, session: &str) -> bool {
         self.confirmed_root.as_deref() == Some(session)
@@ -1659,26 +1655,16 @@ impl Driver {
                 snapshot: &snapshot.value,
             })
         } else {
-            let observation = p
-                .observation()
-                .map_err(|_| fault("MUSE_PROJECTION_UNAVAILABLE"))?;
-            let child = observation["observed_children"]
-                .as_array()
-                .and_then(|rows| rows.iter().find(|c| c["sessionId"] == session))
+            let child = p
+                .observed_child_provenance(session)
                 .ok_or_else(|| fault("MUSE_CHILD_PROVENANCE_UNAVAILABLE"))?;
             p.apply_child_snapshot(ChildSnapshotInput {
                 fence: &fence,
                 child_session_id: session,
-                parent_session_id: child["parentSessionId"]
-                    .as_str()
-                    .ok_or_else(|| fault("MUSE_CHILD_PROVENANCE_UNAVAILABLE"))?,
-                item_id: child["itemId"]
-                    .as_str()
-                    .ok_or_else(|| fault("MUSE_CHILD_PROVENANCE_UNAVAILABLE"))?,
-                parent_turn_id: child["parentTurnId"].as_str(),
-                item_revision: child["revision"]
-                    .as_u64()
-                    .ok_or_else(|| fault("MUSE_CHILD_PROVENANCE_UNAVAILABLE"))?,
+                parent_session_id: child.parent_session_id,
+                item_id: child.item_id,
+                parent_turn_id: child.parent_turn_id,
+                item_revision: child.item_revision,
                 expected_session_revision: local_revision,
                 at_ms: now(),
                 read_method: ReadMethod::SessionRead,

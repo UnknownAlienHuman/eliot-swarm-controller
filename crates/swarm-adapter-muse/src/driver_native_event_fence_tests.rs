@@ -90,12 +90,15 @@ mod native_event_fences {
         let mut lines = BufReader::new(read).lines();
         let mut initialized = false;
         let mut current_session = session(&workspace);
+        let mut child_sessions = BTreeMap::new();
         let mut hold_next_read: Option<oneshot::Sender<()>> = None;
         let mut held_response = None;
+        let mut held_session: Option<String> = None;
         loop {
             tokio::select! {
                 _ = release_read.notified(), if held_response.is_some() => {
                     send(&mut write, held_response.take().unwrap()).await;
+                    held_session = None;
                 }
                 action = actions.recv() => {
                     match action {
@@ -105,9 +108,24 @@ mod native_event_fences {
                             armed.send(()).unwrap();
                         }
                         Some(PeerAction::Notification { frame, flushed }) => {
+                            if frame["method"] == "item/completed"
+                                && frame["params"]["item"]["kind"] == "subagent"
+                            {
+                                let child_id = frame["params"]["item"]["childSessionId"].as_str().unwrap();
+                                let mut child = session(&workspace);
+                                child["sessionId"] = json!(child_id);
+                                child_sessions.insert(child_id.to_owned(), child);
+                            }
                             // The held response was captured before this change.
                             // A subsequent real read must see the new peer state.
-                            current_session["modelId"] = frame["params"]["modelId"].clone();
+                            if frame["method"] == "session/modelChanged" {
+                                let target = held_session.as_deref().unwrap_or(ROOT);
+                                if target == ROOT {
+                                    current_session["modelId"] = frame["params"]["modelId"].clone();
+                                } else {
+                                    child_sessions.get_mut(target).unwrap()["modelId"] = frame["params"]["modelId"].clone();
+                                }
+                            }
                             send(&mut write, frame).await;
                             flushed.send(()).unwrap();
                         }
@@ -137,8 +155,13 @@ mod native_event_fences {
                             json!({"session":current_session,"viewCursor":"root:0"})
                         }
                         "session/read" => {
-                            assert_eq!(request["params"]["sessionId"], ROOT);
-                            json!({"session":current_session,"viewCursor":"root:1",
+                            let target = request["params"]["sessionId"].as_str().unwrap();
+                            let snapshot = if target == ROOT {
+                                &current_session
+                            } else {
+                                child_sessions.get(target).expect("read requires an emitted parent-item child edge")
+                            };
+                            json!({"session":snapshot,"viewCursor":"root:1",
                                 "history":{"mode":"none","items":null,"snapshot":null},
                                 "pendingRequests":[]})
                         }
@@ -153,6 +176,7 @@ mod native_event_fences {
                         && let Some(received) = hold_next_read.take()
                     {
                         assert!(held_response.replace(response).is_none());
+                        held_session = Some(request["params"]["sessionId"].as_str().unwrap().to_owned());
                         received.send(()).unwrap();
                     } else {
                         send(&mut write, response).await;
@@ -253,6 +277,180 @@ mod native_event_fences {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.iter().filter(|call| call["method"] == "session/start").count(), 1);
         assert!(!calls.iter().any(|call| call["method"] == "turn/start"));
+        assert_eq!(runtime.starts.load(Ordering::SeqCst), 1);
+    }
+
+    async fn emit_valid(driver: &Driver, actions: &mpsc::Sender<PeerAction>, frame: Value) {
+        validate_native_notification_parameters(
+            frame["method"].as_str().unwrap(), &frame["params"],
+        ).unwrap();
+        let before = driver.lock().unwrap().event_number;
+        let (flushed, flushed_rx) = oneshot::channel();
+        bounded(actions.send(PeerAction::Notification { frame, flushed })).await.unwrap();
+        bounded(flushed_rx).await.unwrap();
+        wait_for(driver, |state| state.event_number > before).await;
+    }
+
+    fn opaque_cursor(index: usize) -> String {
+        // Native cursors are opaque. Exercise the existing 1024-byte limit.
+        format!("{index:04}:{}", "v".repeat(1019))
+    }
+
+    fn source_range(index: usize) -> Value {
+        let record = format!("{index:04}:{}", "r".repeat(480));
+        json!({"stream":{"kind":"session","id":ROOT},
+            "first":{"id":record,"sequence":index + 1},
+            "last":{"id":record,"sequence":index + 1}})
+    }
+
+    #[tokio::test]
+    async fn muse_driver_publicly_omitted_child_actual_read_is_fenced_without_granting_authority() {
+        let dir = Directory::new();
+        let (driver, runtime, peer) = fixture(&dir.0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (actions, receiver) = mpsc::channel(16);
+        let release = Arc::new(Notify::new());
+        let native = tokio::spawn(gated_peer(
+            peer, dir.0.clone(), calls.clone(), receiver, release.clone(),
+        ));
+        bounded(driver.clone().execute(command(&driver, "01-open", "agent.open", json!({}))))
+            .await.unwrap();
+        let transport = driver.lock().unwrap().transport.clone().unwrap();
+        let parent_turn = uuid::Uuid::now_v7().to_string();
+        let mut children = Vec::new();
+        let mut items = Vec::new();
+        // Every child enters through a schema-valid native parent-item event.
+        // No fabricated projection row or change to any reducer budget.
+        for index in 0..96 {
+            let child = uuid::Uuid::now_v7().to_string();
+            let item = uuid::Uuid::now_v7().to_string();
+            emit_valid(&driver, &actions, json!({"jsonrpc":"2.0","method":"item/completed",
+                "params":{"sessionId":ROOT,"viewCursor":opaque_cursor(index),
+                    "sourceRange":source_range(index),"item":{"itemId":item,
+                        "kind":"subagent","status":"completed","revision":1,
+                        "turnId":parent_turn,"childSessionId":child,"subagentId":child,
+                        "result":{"artifactRefs":[],"evidenceRefs":[],"summary":"synthetic"}}}})).await;
+            children.push(child);
+            items.push(item);
+        }
+        let child = children[0].clone();
+        {
+            let state = driver.lock().unwrap();
+            assert_eq!(state.children(), children);
+            assert!(!state.versions.contains_key(&child));
+            let public = state.projector.as_ref().unwrap().observation().unwrap();
+            assert!(public["observed_children"].as_array().unwrap().iter()
+                .any(|row| row["sessionId"] == child));
+        }
+        let (armed, armed_rx) = oneshot::channel();
+        let (received, received_rx) = oneshot::channel();
+        actions.send(PeerAction::HoldRead { armed, received }).await.unwrap();
+        bounded(armed_rx).await.unwrap();
+        let reading_driver = driver.clone();
+        let reading_transport = transport.clone();
+        let reading_child = child.clone();
+        let read = tokio::spawn(async move {
+            reading_driver.refresh_one(&reading_transport, &reading_child).await
+        });
+        bounded(received_rx).await.unwrap();
+
+        // Valid retained history triggers the REAL public fallback, which
+        // keeps only the latest 32 children. The outstanding child read has
+        // no versions entry and root-only events must not change that.
+        let mut omitted = false;
+        for index in 96..96 + 256 {
+            emit_valid(&driver, &actions, json!({"jsonrpc":"2.0","method":"turn/completed",
+                "params":{"sessionId":ROOT,"turnId":uuid::Uuid::now_v7().to_string(),
+                    "terminal":"completed","viewCursor":opaque_cursor(index),
+                    "sourceRange":source_range(index)}})).await;
+            let state = driver.lock().unwrap();
+            let public = state.projector.as_ref().unwrap().observation().unwrap();
+            if public["observation_projection_state"] == "partial" {
+                assert!(!public["observed_children"].as_array().unwrap().iter()
+                    .any(|row| row["sessionId"] == child));
+                omitted = true;
+                break;
+            }
+        }
+        assert!(omitted, "existing bounded native history must reach public child omission");
+        let event_number = {
+            let state = driver.lock().unwrap();
+            assert!(!state.versions.contains_key(&child));
+            let projector = state.projector.as_ref().unwrap();
+            assert_eq!(projector.observed_child_ids().len(), children.len());
+            assert!(projector.observed_child_ids().any(|id| id == child));
+            let edge = projector.observed_child_provenance(&child).unwrap();
+            assert_eq!(edge.parent_session_id, ROOT);
+            assert_eq!(edge.item_id, items[0]);
+            assert_eq!(edge.parent_turn_id, Some(parent_turn.as_str()));
+            assert_eq!(edge.item_revision, 1);
+            // Keep this regression inside the existing Journal entry budget.
+            assert!(serde_json::to_vec(&projector.checkpoint().unwrap()).unwrap().len() < 1024 * 1024);
+            let journal = state.journal.as_ref().unwrap();
+            assert!(journal.authorize_session(state.scope.as_ref().unwrap(), &child).is_err());
+            state.event_number
+        };
+        let checkpoint = std::fs::read(dir.0.join("muse-rust-checkpoint.v1.json")).unwrap();
+        // Deliberately unattributable AND rejected by the notification $def.
+        // Receipt by the event consumer, rather than a desired child revision,
+        // is the gate: the original omission bug must reach the read assertion.
+        let params = json!({"modelId":"child-after-change","viewCursor":"invalid:child"});
+        assert!(matches!(
+            validate_native_notification_parameters("session/modelChanged", &params),
+            Err(schema::SchemaError::InvalidValue { .. })
+        ));
+        let (flushed, flushed_rx) = oneshot::channel();
+        actions.send(PeerAction::Notification {
+            frame: json!({"jsonrpc":"2.0","method":"session/modelChanged","params":params}),
+            flushed,
+        }).await.unwrap();
+        bounded(flushed_rx).await.unwrap();
+        wait_for(&driver, |state| state.event_number > event_number
+            && state.diagnostic == Some("MUSE_NOTIFICATION_PROJECTION_UNAVAILABLE")).await;
+        assert_eq!(std::fs::read(dir.0.join("muse-rust-checkpoint.v1.json")).unwrap(), checkpoint);
+        release.notify_one();
+        match bounded(read).await.unwrap() {
+            Err(error) => assert_eq!(error.code, "MUSE_SESSION_READ_RACED"),
+            Ok(()) => panic!("a publicly omitted child's pre-event actual read must be rejected"),
+        }
+        // Fresh native data may be projected using the retained exact edge,
+        // even while the PUBLIC child row is omitted. This grants no rights:
+        // the parent's snapshot is still stale and Journal must refuse a ticket.
+        let fresh = bounded(driver.snapshot(&transport, &child)).await.unwrap();
+        assert_eq!(fresh.value["modelId"], "child-after-change");
+        driver.apply_snapshot(&child, &fresh).unwrap();
+        {
+            let state = driver.lock().unwrap();
+            assert_eq!(state.revision(&child), 1);
+            assert_eq!(state.children(), children);
+            assert!(children.iter().all(|child| state.revision(child) == 1));
+            assert!(!state.member("outside-family"));
+            assert!(!state.versions.contains_key("outside-family"));
+            let projector = state.projector.as_ref().unwrap();
+            let public = projector.observation().unwrap();
+            assert!(!public["observed_children"].as_array().unwrap().iter()
+                .any(|row| row["sessionId"] == child));
+            let retained = projector.checkpoint().unwrap();
+            let row = retained["state"]["observed_children"].as_array().unwrap().iter()
+                .find(|row| row["sessionId"] == child).unwrap();
+            assert_eq!(row["snapshot"]["modelId"], "child-after-change");
+            assert_eq!(row["snapshot_freshness"], "fresh");
+            assert_eq!(row["parentSessionId"], ROOT);
+            assert_eq!(row["itemId"], items[0]);
+            assert_eq!(row["parentTurnId"], parent_turn);
+            assert_eq!(row["revision"], 1);
+            let journal = state.journal.as_ref().unwrap();
+            assert!(journal.authorize_session(state.scope.as_ref().unwrap(), &child).is_err());
+        }
+        bounded(shutdown(&driver, &runtime)).await;
+        bounded(native).await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|call| call["method"] == "session/start").count(), 1);
+        assert_eq!(calls.iter().filter(|call| call["method"] == "session/read"
+            && call["params"]["sessionId"] == child).count(), 2);
+        assert!(!calls.iter().any(|call| call["method"] == "turn/start"
+            || call["method"] == "session/fork"
+            || call["method"].as_str().unwrap().starts_with("subagent/")));
         assert_eq!(runtime.starts.load(Ordering::SeqCst), 1);
     }
 
