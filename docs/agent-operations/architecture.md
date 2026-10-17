@@ -1,34 +1,31 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 14 · 2026-10-05 · source review `2aec51bb1e3c8122da7d496142ac8e25a21969a3`.
+Revision 15 · 2026-10-17 · Canonical Version 3 Architecture.
 
-[Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) separates source evidence from proposals. These contracts are not implementation claims.
+[Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) defines mandatory Rust crate and vendor SDK reuse.
 
-## 1. One Rust system
+## 1. One Rust control plane with effective donor and SDK reuse
 
-All owned host/Store, authorization, configuration, native transport/adapters, supervision, monitoring, GitHub, hooks, distribution/review, cron, Goal, MCP/gateway and script-runner logic is Rust. Python/PowerShell are optional external extensions. Vendor binaries and native Git remain external tools reached through typed Rust boundaries.
-
-Reuse maintained complete Rust libraries where suitable; qualify installed protocols/capabilities rather than prescribe a fixed release. Existing owned non-Rust bridges are migration inputs. Unsupported non-Rust-only integration remains an explicit gap, not invented parity or copied private vendor internals. New adapter settings do not restart existing work implicitly.
+All owned host/Store, authorization, configuration, IPC, supervision, monitoring, GitHub, hooks, distribution/review, cron, Goal, MCP/gateway and script-runner orchestration is Rust. Within Rust, subsystems use maintained donor libraries (`rmcp`, `agent-client-protocol`, `octocrab`, `croner`, `sysinfo`, `notify`, `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact`, `cccc-windows-process`) rather than handwritten reimplementations. For vendor runtimes whose official protocol is shipped as an official SDK (`@muse-code/sdk`, `@anthropic-ai/claude-agent-sdk`, `@opencode/server`, `openai-codex`), the Rust adapter owns `ModuleLink`, supervision, digests and Store receipts while delegating native session/stream protocol handling to the official Rust protocol crate or a thin stateless vendor SDK driver. Python/PowerShell remain optional external script extensions. New adapter settings do not restart existing work implicitly.
 
 ### 1.0 Build, process and observability boundaries
 
 [Modular Runtime](modularity.md) defines independently compiled packages,
 versioned worker IPC, on-demand activation and per-module restart. A Rust `mod`
 or folder is not that boundary. Kernel/frontends/supervisor must not link adapter
-implementations. The bus dispatcher is separately replaceable, while durable
-journal append and Operation/cursor transactions stay inside the sole Store.
-An adapter-only change must not rebuild/restart the kernel or unrelated adapters.
+implementations or optional worker crates (`swarm-automation`, `swarm-bus`,
+`swarm-checks`, `swarm-forge-worker`, `swarm-observer`, `swarm-script-worker`).
+The bus dispatcher is separately replaceable, while durable journal append and
+Operation/cursor transactions stay inside the sole Store. An adapter-only change
+must not rebuild/restart the kernel or unrelated adapters.
 
 [Observability](observability.md) defines configurable levels/content depth,
 correlated error/exit/recovery facts, a bounded recorder and a live read-only view.
 Business receipts are not optional logs. Unused optional workers have no polling
 loop or native connection; failed optional workers restart locally, not through
 host-wide shutdown. Store/journal failure remains a distinct critical condition.
-Current source does not yet meet these boundaries; the [source recheck](modularity-review-2026-10-05.md)
-records the precise remaining defects. Do not interpret this specification as
-runtime qualification or as permission to repeat uncertain model/remote effects.
 
-### 1.1 Universal transactional kernel and adapters
+### 1.1 Universal transactional kernel, adapters and schema evolution
 
 The system is a general transactional framework: a kernel, durable event bus,
 commands, actions and messages. Agent work is one application of that framework.
@@ -75,10 +72,11 @@ generic state or arbitrary error text is not that proof. For Forge,
 `publication_started` records historical attempt evidence: it is false for a
 queued or proven pre-effect result, and terminal status alone must not erase a
 recorded attempt. Parsing literal JSON `null` succeeds, but `null` is not a
-usable terminal domain result; SQL `NULL` is missing evidence. Preserve the
-identity representation required at each boundary: compare retained raw
-request bytes where byte-equivalence is required, and use canonical JSON
-identity only where the contract defines it.
+usable terminal domain result; SQL `NULL` is missing evidence.
+
+**Schema evolution and canonical comparison rules (anti-fragility):**
+- **External vs. internal validation:** Public mutation inputs (`TaskSpec`, `automation.config.apply` patches) validate known fields strictly. Internal IPC envelopes, persisted Store projections, build manifests, and diagnostic receipts **must be forward-compatible**—never attach `#[serde(deny_unknown_fields)]` to internal readers where an additive optional field (such as a digest or diagnostic tag) from a newer producer would brick deserialization.
+- **Canonical digest and JSON identity:** Normalize all SHA-256 digests at the ingestion boundary to 64 lowercase hexadecimal characters (stripping any optional `sha256:` prefix before comparison or storage). Never compare structured JSON payloads by raw unparsed text equality (`TEXT == TEXT`); compare parsed semantic fields or canonical RFC 8785 / JCS digests where content equivalence is required.
 
 Migration `011` captures new `cancelled` Operations and transitions into that
 state by the same transaction rule. The occurrence names the cancelled target
@@ -105,7 +103,7 @@ their exact link is checked again after paging. Event metadata does not expose
 the retained diagnostic: an authorized current manager obtains detail through
 the ordinary scoped Operation read path.
 
-### 1.2 Transaction and load boundaries
+### 1.2 Transaction, relational SQLite and WAL read-pool boundaries
 
 Admission, semantic reservation, committed event identity and the associated
 cursor/pending state share the relevant short Store transaction. Perform native
@@ -113,6 +111,11 @@ or network I/O outside it; then persist its confirmed or uncertain outcome with
 the applicable identity and authority checks. An uncertain remote effect stays
 uncertain until exact readback; restarting a host or changing managers does not
 authorize a second effect or rewrite its original actor.
+
+**SQLite architecture and storage discipline:**
+1. **Single writer, pooled WAL readers:** `swarm-store` / `swarm-kernel` maintains one serialized `IMMEDIATE` writer connection for state mutations and a **read-only WAL connection pool** (`SQLITE_OPEN_READ_ONLY`, `PRAGMA query_only = ON`) for all read-only operations (`*.get`, `*.list`, `dashboard`, `report.delta`, `automation.config.explain`, `runtime.catalog`). Read queries must execute directly against the WAL read pool and **must never block in the single writer actor queue**.
+2. **Relational tables, never `meta` key-value blobs:** The `meta` table is reserved strictly for scalar database/host identity (schema version, data-root identity, host epoch). Storing collections, queues, cursors, task projections, hex-encoded composite keys, or a serialized `CapacityLedger` JSON blob in `meta` is **forbidden**. All domain records, per-entry cursors, pending subjects, review slots, and capacity reservations (`active_slots`, `reserved_slots` following the Agent of Empires relational pattern) must live in dedicated relational tables with proper primary/foreign keys and SQL indexes.
+3. **Single-copy payload storage:** Large assistant outputs, normalized result pages, and check/script `stdout`/`stderr` captures are persisted once (in content-addressed artifact storage or the dedicated result page table) and referenced by ID and SHA-256 digest. Never duplicate full result bodies across `operations.result_json`, `observations.payload_json`, and `meta`.
 
 For committed `rejected`, `cancelled` and `outcome_unknown` state, the Store-level capture
 also commits in that transaction. A speculative exception is not an observed
@@ -142,6 +145,18 @@ readback; it does not authorize another external challenge or action. Supervisor
 failure retains the fixed supervisor identity when available, including task
 join failures, without broadcasting a panic payload.
 
+### 1.3 Direct launch pipeline and non-blocking MCP readiness
+
+The productive launch pipeline is direct and non-blocking:
+1. **Workspace preparation:** Verify or create the isolated Git worktree (`workspace.lease`).
+2. **Session binding (`agent.open`):** Start or attach to the runtime adapter and open the native session with any configured MCP server endpoints and scoped participant credentials pre-populated in the launch configuration.
+3. **Immediate dispatch eligibility (`task.dispatch`):** As soon as `agent.open` succeeds (`binding_state == ready`), the binding is immediately eligible to accept `task.dispatch` and `agent.send`.
+
+**Non-blocking MCP capability discovery:**
+- Native MCP connection and `tools/list` readback are **asynchronous capability observations**, not a pre-dispatch barrier. Many runtimes (batch CLI agents, Antigravity headless, OpenCode before its first tool turn) do not initiate an MCP handshake until the model actively invokes a tool during a turn.
+- Therefore, Store and adapters **must never hold or reject `task.dispatch` in an `awaiting_native_mcp` state**.
+- When an optional MCP readback or tool-discovery check fails asynchronously, the native-MCP failure adapter records a bounded `controller:native-mcp` / `native.mcp.failure` observation (`failed` or `unknown`) for observability and optional `script_run` triggers without wedging task execution.
+
 ### Module disconnect and unresolved-open readback
 
 When IPC closes a module link, the Store transaction changes
@@ -164,18 +179,7 @@ kind, including future kinds. Event visibility and the action's current rights
 are checked independently. A safe projection preserves occurrence/causal
 identity without passing private message bodies or credentials to scripts.
 Legacy and normalized views of one occurrence must not produce duplicate
-actions. These are requirements; current implementation and qualification
-boundaries remain in [Implementation Status](../implementation-status.md).
-
-The native-MCP failure adapter is another ordinary ScriptRun event source. C7
-readback retries and C8 tools retries/stale-launch holds commit a bounded
-`controller:native-mcp` / `native.mcp.failure` fact beside the existing retry
-marker or schedule transition. The normalized status is `failed`, or `unknown`
-for an explicitly unknown native outcome. Its occurrence identifies the launch
-Operation, failure supervisor/kind, and attempt: a later attempt is a distinct
-fact, while a repeated unchanged stale hold without an established launch
-identity is emitted once. The persisted `retry_wait` deadline remains the
-scheduler's gate; selecting the event does not cause an immediate retry.
+actions.
 
 These observations are historical facts, not continuing authority. Before an
 unstarted ScriptRun proceeds, the shared event path rechecks the exact retained
@@ -289,13 +293,22 @@ A snapshot returns its committed cut. Changes after that cut remain readable by 
 
 Bound serialized pages, rings and blocking work. Slow viewers receive lag/resync and cannot block native permission replies, completion or manual commands. Dispatch is fair across owners/routes with account-wide capacity; display that basis without claiming estimated cost is a measured quota. Waiting for an auditor retains candidate ownership, not an unnecessary active-model slot.
 
-## 4. Text, tools and reasoning
+## 4. Text, tools, reasoning and turn-correlated result collection
 
 `stream.open/read/close` observes an authorized work/binding context without starting a model. Expose only native-supplied assistant text, reasoning summary/text where supported, tool progress, lifecycle and usage. Hidden/encrypted reasoning is unavailable.
 
 Preserve native item/part ordering. Final content replaces matching deltas rather than counting both; cumulative usage replaces earlier cumulative observations. Unknown pricing/cost remains unknown. Use shared bounded rings and optional capped artifacts, not an Observation per token or a transcript copy per viewer.
 
-Redact across chunk boundaries; buffer bounded logical records or omit a sensitive class until the redaction path is qualified. Retention protects active/referenced evidence by ownership, not mtime. No stream content becomes an automation definition or permission.
+Redact across chunk boundaries using `atlas-redact`; buffer bounded logical records or omit a sensitive class until the redaction path is qualified. Retention protects active/referenced evidence by ownership, not mtime. No stream content becomes an automation definition or permission.
+
+### 4.1 Deterministic turn-scoped result correlation (`agent.result`)
+
+Every runtime adapter must return the completed assistant output for an admitted `task.dispatch` or `agent.send` Operation through `swarm.normalized_result_page@1`. Adapters use a two-level deterministic correlation hierarchy:
+
+1. **Level 1 — Explicit native parent/request pointer:** When the vendor wire protocol includes the originating request or input message ID on assistant items and turn completions (such as Codex JSON-RPC `app-server`), the adapter verifies and records that exact native parent pointer.
+2. **Level 2 — Serialized active-turn / busy-window correlation (Waku / Paseo pattern):** When the vendor wire protocol streams assistant chunks, tool calls, and turn-completion events scoped to a session or turn without repeating a parent-input ID on every assistant message (such as OpenCode HTTP/SSE, Antigravity ACP/headless, or Claude stream-json), the adapter enforces single-flight turn execution on `(binding_id, binding_generation, native_session_id)` and binds the active turn's stream accumulator directly to the admitted `task.dispatch` / `agent.send` Operation ID. All assistant text and terminal outcome facts observed between turn admission and the turn's terminal event belong deterministically to that Operation.
+
+**Anti-sabotage rule:** Adapters **must never** return `RESULT_BODY_UNAVAILABLE` or leave a completed turn in permanent `Unknown` state merely because a vendor protocol uses Level 2 session/turn scoping instead of Level 1 per-message parent pointers. `RESULT_BODY_UNAVAILABLE` is reserved exclusively for genuine transport truncation or process crash before terminal assistant output was emitted.
 
 ## 5. Hooks
 
@@ -319,9 +332,9 @@ Retain one scoped pending diagnostic for an unchanged failure. Do not launch an 
 
 ## 7. Cron and shared reminders
 
-Extend the existing Rust scheduler. Schedules/rules/Goal editors share the same manager-owned enabled entry, without duplicate switches. Use indexed per-definition/due records rather than expanding one shared blob; preserve legacy schedule/receipt identities.
+Consolidate scheduling into one unified Rust scheduler using `croner` and indexed relational SQLite tables. Schedules/rules/Goal editors share the same manager-owned enabled entry, without duplicate switches or parallel interval/cron loops. Use indexed per-definition/due rows rather than expanding one shared JSON blob; preserve legacy schedule/receipt identities.
 
-Use a maintained complete cron evaluator and supported timezone integration. Preview grammar, calendar, next occurrences, DST gaps/repetitions, overlap and misfire. No handwritten cron parser or frozen release requirement.
+Use the `croner` donor crate for complete cron expression evaluation and supported timezone integration. Preview grammar, calendar, next occurrences, DST gaps/repetitions, overlap and misfire. No handwritten cron parser or frozen release requirement.
 
 Logical calendar generation changes only when calendar semantics change; toggling enabled, changing a display name/model preference or jitter does not recreate old slots. Identity includes the schedule and intended due UTC occurrence, not actual start time. Persist considered occurrences and invocation identity. Legacy interval slot keys remain recognizable.
 

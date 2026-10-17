@@ -119,14 +119,15 @@ retention_days = 7
 
 The exact host `ObservabilityConfig` fields are `enabled`, optional `directory`
 and `live_config_file`, `queue_records`, `queue_bytes`, `max_record_bytes`,
-`file_segment_bytes`, `retention_bytes`, and `retention_days`. The Host maps
-these to the observer's `RecorderConfig` (`file_segment_bytes` becomes
-`segment_bytes`) and creates a `LineObserver`; the callback forwards the exact
-scoped Manager policy to `HostRecorder`. There is no separate `ObserverOptions`
-configuration object. `Store` installs the Atlas text redactor and observer
-text-capture policy before constructing the Producer. Raw text is never
-serialized: Atlas redaction precedes observer-line text serialization and either
-queue admission, while ordinary stderr remains metadata-only.
+`file_segment_bytes`, `retention_bytes`, and `retention_days`. `swarm-telemetry`
+and `swarm-observer` implement this configuration directly over `tracing`,
+`tracing-subscriber::reload` (for dynamic level/scope updates without restart),
+`tracing-appender::non_blocking` (bounded with both record and byte accounting),
+and `atlas-redact` (`vendor/atlas`). Do not maintain a second parallel handwritten
+logging framework alongside `tracing`. `Store` installs the `atlas-redact` text
+redactor and observer text-capture policy before constructing the Producer. Raw
+text is never serialized: `atlas-redact` scrubbing precedes observer-line text
+serialization and queue admission, while ordinary stderr remains metadata-only.
 
 ### Pinned operator live policy
 
@@ -298,7 +299,9 @@ receipts. Account and display dropped records and the affected interval.
 ## 5. Live monitoring and future charts
 
 Provide a read-only initial snapshot tied to a journal cut, followed by events
-after its cursor. Register/capture the cut so updates racing with the snapshot
+after its cursor, executing all read queries against the Store's **read-only WAL
+connection pool** so live viewers never contend with the writer thread.
+Register/capture the cut so updates racing with the snapshot
 are recoverable. On a lagged volatile channel, replay retained journal facts;
 on an expired retention cursor, return an explicit gap and fresh snapshot.
 Do not silently report continuous history or complete native family coverage.
@@ -312,7 +315,8 @@ user configurable and based on shared observations, not active model prompts.
 
 Record aggregate rates/counters/histograms for admitted/completed/failed/unknown
 operations, queue bytes/age, event lag/loss, dispatch and native durations,
-module starts/restarts, and measured active-process CPU/RSS. Use bounded metric
+module starts/restarts, and measured active-process CPU/RSS sampled via the
+`sysinfo` donor crate. Use bounded metric
 labels such as module/runtime/status. Agent/Task/Operation IDs belong in logs or
 exemplars, not unlimited time-series labels. Avoid counting final cumulative
 usage again after per-turn deltas. Shared native-process RSS must not be added

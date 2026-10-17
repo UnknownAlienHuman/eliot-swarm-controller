@@ -461,7 +461,9 @@ uses only the existing strict TaskSpec fields: required `objective`, `phase`,
 and `requirements`; optional/defaulted `acceptance`, `dependencies`, `scope`,
 `source_refs`, `owner_policy_id`, `source_index`, and
 `baseline_candidate_ref`. The canonical spec is capped at 256 KiB. Unknown
-fields are rejected by the Store's `deny_unknown_fields` TaskSpec parser.
+fields on this external `TaskSpec` input are rejected at admission, whereas
+internal IPC envelopes, persisted projections, and diagnostic receipts remain
+forward-compatible (ignoring additive optional fields).
 Only a taskless, event-triggered ScriptRun owned by the current registered
 Manager can receive this grant. The script cannot choose a Manager, project,
 Task ID, origin key, or request ID: the Store takes the project from the exact

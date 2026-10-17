@@ -55,17 +55,16 @@ Dependency direction:
 
 ```text
 contracts <- client <- CLI / MCP / gateway / bus / optional workers / adapters
-contracts <- store <- kernel domain handlers
-contracts <- process primitives <- supervisor / owned execution workers
-telemetry producer <- components that emit diagnostics
+contracts <- store (1 writer + WAL read pool) <- kernel domain handlers
+contracts <- process primitives (cccc-windows-process + sysinfo) <- supervisor / owned execution workers
+telemetry producer (tracing + atlas-redact) <- components that emit diagnostics
 observer <- client + telemetry decoding; not kernel or adapter implementations
 ```
 
-`swarm-kernel`, `swarm-supervisor` and frontends must have **no Cargo dependency
-on any `swarm-adapter-*` package**. Adapter A must not depend on adapter B.
-The kernel does not link the bus/recorder executable implementation either.
-A shared contract change legitimately rebuilds its Rust consumers; an internal
-adapter change must not relink the kernel, CLI or another adapter.
+**Strict package dependency rules (anti-monolith):**
+1. `swarm-kernel` / `swarm-kernel-host`, `swarm-supervisor` and frontends (`swarm-cli`, `swarm-mcp`, `swarm-gateway`) must have **no Cargo `[dependencies]` on any `swarm-adapter-*` package**. Adapter A must not depend on adapter B.
+2. `swarm-kernel` / `swarm-kernel-host` must have **no Cargo `[dependencies]` on optional worker packages** (`swarm-automation`, `swarm-bus`, `swarm-checks`, `swarm-forge-worker`, `swarm-observer`, `swarm-script-worker`, `swarm-supervisor`). Communication between the kernel and workers occurs strictly over IPC using `swarm-contracts` and `swarm-client`. Importing worker crates into `swarm-kernel-host` defeats separate compilation and recreates a monolithic failure domain.
+3. **No CLI duplication:** `swarm-cli` (`swarm`) is the sole owner of operator/manager CLI subcommand definitions. `swarm-host` and `swarm-kernel-host` parse only daemon bootstrap flags (`--config`, `--data-dir`, `--endpoint`); they must never duplicate `swarm-cli`'s subcommand parser.
 
 ### 2.1 Bus modularity without broken transactions
 
@@ -211,12 +210,15 @@ Missing an optional capability stops only its affected action. Every denial has
 one actionable reason and exact next action; do not return a list of invented
 approval stages or repeatedly ask the manager for unchanged information.
 
-## 5. Demand-driven lifecycle and recovery
+## 5. Demand-driven lifecycle, unified supervision and recovery
+
+**One unified supervisor, not three parallel loops:**
+The runtime uses a single `ModuleSupervisor` (`swarm-supervisor`) to manage all adapter and optional worker processes under the unified descriptor contract (`external_attach`, `owned_service`, `one_shot`). Maintaining parallel in-process supervisor loops (`ManagedWorkerSupervisor` or `legacy_optional_workers`) inside the kernel host is forbidden and must be removed.
 
 The supervisor keeps cheap installed/configured metadata. Optional workers start
 only for an admitted command, a configured due action, or an explicit live
 subscription. One single-flight start per module/service scope coalesces parallel
-demand. A worker preparing to stop and a concurrent start use one generation/
+demand (following the Paseo `initializingPromises` pattern). A worker preparing to stop and a concurrent start use one generation/
 state transition; a late startup response cannot resurrect a disabled worker.
 
 Disabled/unused modules have no task loop, periodic provider read, extra socket,
@@ -237,7 +239,7 @@ Python/PowerShell extensions remain external and are not mandatory internals.
 | Failure | Required behavior |
 |---|---|
 | Optional worker error/panic/exit | Record worker/boot/exit evidence, restart **that** worker if still needed, reconnect and read back pending Operations. Kernel/listener and other modules stay running. |
-| IPC disconnect, process still alive or identity unknown | Reconnect/read-only reconciliation. Preserve the new `2aec51bb` unknown-outcome transition; disconnect is not proof that the process died. |
+| IPC disconnect, process still alive or identity unknown | Reconnect/read-only reconciliation. Preserve the unknown-outcome transition; disconnect is not proof that the process died. |
 | Adapter worker dead, native execution survives | Restart adapter and attach only through its supported recorded-session contract. Do not recreate the native family or replay model input. |
 | Proven native interruption | Preserve exact terminal evidence; a new work attempt is a separate manager decision unless an existing enabled policy explicitly requests it. |
 | Uncertain native/remote effect | Recover by exact readback. Only the affected operation/resource remains unresolved; unrelated work continues. Never convert a timeout into success, failure or safe retry without evidence. |
@@ -253,13 +255,17 @@ starting defaults, **not measured reliability figures**. A library timeout must
 not secretly retry a non-idempotent POST underneath this policy.
 
 Restarted supervisor/kernel must adopt verified existing owners under OS locks,
-not duplicate them. Retain Windows Job/process birth and Unix process-group
+not duplicate them. Retain Windows Job/process birth (`cccc-windows-process` + `sysinfo`) and Unix process-group
 identity; PID alone is insufficient. Preserve owner-first non-killing native
 ownership. Bound worker shutdown waits, but do not kill unproven native work to
 make shutdown appear clean. A plugin process boundary contains a crash; it is
 not an OS sandbox against arbitrary same-user code or a hard memory/CPU quota.
 
-### 5.2 Independent update/build
+### 5.2 Independent update, build and production `src/` hygiene
+
+**Zero inline test bloat or mock binaries in production `src/`:**
+- Production `src/` trees across `swarm-kernel-host`, `swarm-store`, and all `swarm-adapter-*` packages must contain **production code only**.
+- Large integration test suites (`*tests*.rs`) and mock/fake runtime executables (`fake_codex_app_server`, `fake_claude`, `fake_opencode`, etc.) must reside in Cargo `tests/` directories or a dedicated `swarm-test-support` `[dev-dependencies]` crate—never inside `src/` or production `[[bin]]` targets where `cargo check --lib --bins` and `cargo build` are forced to compile 100,000+ lines of test harnesses.
 
 Place executable artifacts in versioned module directories. Validate compatibility
 and atomically change the selected version for **new** admissions. Existing
@@ -277,7 +283,7 @@ at the workspace level as needed by the actual pinned toolchain. Do not adopt a
 newer Cargo-doc feature without checking that compiler's support.
 
 Use a fast local profile; keep optimized release packaging separate. Example
-**target root-manifest settings**, not a change installed by this PR:
+**target root-manifest settings**:
 
 ```toml
 [profile.iterate]

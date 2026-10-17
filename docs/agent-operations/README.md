@@ -1,48 +1,22 @@
-# Agent Operations — Manager-Owned Automation
+# Agent Operations — Manager-Owned Automation (Architecture v3)
 
-Revision 10 · 2026-10-05 · current source baseline `f51cf1b`; runtime qualification remains pending.
+Revision 11 · 2026-10-17 · Canonical Version 3 specification.
 
-**Status: partial implementation.** Current source includes manager-owned action
-admission and transfer, durable intake and peer coordination, the reviewed
-return/repair cycle, calendar CheckRuns and manual run-now, bounded hooks,
-invocation-scoped script effects, typed review rules and shared Goal
-continuation. Each implemented slice uses the same Store and ordinary Operation
-path. Source checks, exact CI commits, native failures and remaining gaps are
-recorded in [Implementation status](../implementation-status.md); successful
-source tests do not establish productive native/model execution. The documents
-below retain the complete requirements, including work still outstanding.
+**Engineering principle:** The architecture must enable fast, reliable, productive execution of agent tasks—never paralyze work with artificial deadlocks, brittle internal hash ceremonies, or refusals to return model output. Historical CI runs and past remediation notes live in [Implementation status](../implementation-status.md); the documents in `docs/agent-operations/` define the clean, normative Version 3 contract.
 
-The current source integration includes the physical Kernel move and all five
-Rust adapter paths. The latest scoped production Clippy `--keep-going` run
-failed with compile/lint errors across the adapters, supervisor, observer,
-Forge, bus and checks; the integrated source batch addresses those defects. No tests, full
-builds or native/provider/model calls have run in this source phase. Productive
-qualification remains pending. OpenCode without exact assistant-parent proof
-remains `Unknown`, Antigravity's unavailable result body remains unavailable,
-and frozen historical qualification receipts are unchanged.
+## Core anti-sabotage guarantees
 
-## Current operability and modularization
-
-The historical [2026-10-05 recheck](modularity-review-2026-10-05.md) reproduced
-the operator-only Task create/revise defect at its recorded revision. Later
-source admits ordinary authenticated Managers to planning, retains optional
-supervisor failures, and separates CLI, MCP, gateway and module supervisor
-packages/processes. Scoped logging and monitoring are connected in source.
-OpenCode native ownership/MCP effects and physical Kernel extraction are
-delivered in source. The Kernel owns Store/IPC in `crates/swarm-kernel-host`,
-the public host is a launcher, and the standalone supervisor has no database
-access. Store retains typed native-start success against the original launch
-history after Manager/lease changes. The installer validates the complete
-sibling chain. These source changes have no current runtime qualification; see the
-exact boundaries in [Implementation status](../implementation-status.md).
-
-[Modular Runtime](modularity.md) owns the requested package/process boundaries,
-demand-driven activation, simpler ordinary manager authority and local restart.
-[Observability](observability.md) owns adjustable diagnostic depth and live views.
-These are implementation contracts, not another activation ledger or approval
-phase. Existing O1–O11 work is retained; M1–M6 specifies its extraction order and
-concrete completion conditions. Finish required source before tests and native
-qualification, using scoped Clippy to close compile defects during development.
+1. **Productive result collection without artificial parent-edge refusals:**
+   When a native runtime protocol provides an explicit request/input parent ID on assistant items (such as Codex JSON-RPC), the adapter records that exact ID. When a native stream is session- or turn-scoped without a cryptographic input-parent field on every chunk (such as OpenCode HTTP/SSE, Antigravity ACP/headless, or Claude stream-json), the adapter correlates assistant output deterministically using the **serialized active turn / busy window** `(binding_id, binding_generation, native_session_id, active_turn_id)` sealed to the admitted `task.dispatch` or `agent.send` Operation. Adapters must assemble and return the assistant result body through `swarm.normalized_result_page@1`—never refuse a valid model response with `RESULT_BODY_UNAVAILABLE` or permanent `Unknown` status merely because the vendor wire format omits a parent pointer.
+2. **Direct launch and dispatch without pre-prompt MCP deadlocks:**
+   The productive launch sequence is `workspace lease -> agent.open -> task.dispatch`. Native MCP capability discovery (`tools/list`, participant connection readback) is asynchronous readiness telemetry. A session that does not need MCP tools for its first turn—or a batch/headless runtime that connects to MCP only when invoking a tool—must never be blocked from receiving `task.dispatch` by an `awaiting_native_mcp` gate.
+3. **Donor-first implementation (no reinvented wheels):**
+   Use mature Rust crates (`rmcp`, `agent-client-protocol`, `octocrab`, `croner`, `sysinfo`, `notify`, `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact`, `cccc-windows-process`) and official vendor SDK contracts (`@muse-code/sdk`, `@anthropic-ai/claude-agent-sdk`, `@opencode/server`, `openai-codex`) directly for their intended purpose. Do not write custom HTTP/GitHub stacks, custom cron parsers, custom process-tree pollers, custom logging frameworks, or from-scratch reimplementations of vendor SDK state machines.
+4. **Relational SQLite with WAL read concurrency:**
+   The Store uses a single serialized writer for state transitions and a **read-only WAL connection pool** for all queries (`*.get`, `*.list`, `dashboard`, `explain`, `catalog`). Domain entities, cursors, pending work, and capacity reservations live in indexed relational tables—never as hex-encoded keys or multi-kilobyte JSON blobs inside the scalar `meta` table.
+5. **True modularity and clean compilation boundaries:**
+   [Modular Runtime](modularity.md) defines strict package and process boundaries: `swarm-kernel` / `swarm-kernel-host` must never link adapter crates or optional worker implementations (`swarm-automation`, `swarm-bus`, `swarm-checks`, `swarm-observer`, `swarm-script-worker`, `swarm-supervisor`), and production `src/` trees must not embed massive integration test suites or mock binaries.
+   [Observability](observability.md) defines adjustable diagnostic depth and live views built on `tracing` and `atlas-redact`.
 
 ## Product rule
 
@@ -98,9 +72,9 @@ Observation, streams, peer mail, requested reminders and late result collection 
 
 ## Boundaries retained
 
-**Rust internals:** all owned host/Store, native adapters, monitoring, GitHub, hooks, distribution, review, cron, Goal, MCP/gateway, configuration and script-runner code is Rust. Python/PowerShell are optional external extensions. Existing owned non-Rust bridges are migration inputs; vendor executables and native Git remain external tools behind typed Rust adapters.
+**Rust core and donor reuse:** all owned host/Store, IPC, supervision, monitoring, GitHub, hooks, distribution, review, cron, Goal, MCP/gateway, configuration and script-runner orchestration is Rust. Within Rust, mandatory donor crates (`rmcp`, `agent-client-protocol`, `octocrab`, `croner`, `sysinfo`, `notify`, `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact`, `cccc-windows-process`) provide protocol, GitHub, scheduling, OS observation, logging and redaction primitives. For external runtimes whose official protocol is defined by a vendor SDK (`@muse-code/sdk`, `@anthropic-ai/claude-agent-sdk`, `@opencode/server`, `openai-codex`), the Rust adapter owns `ModuleLink`, supervision, digests and Store receipts while delegating native session/stream protocol handling to the official Rust protocol crate or a thin stateless vendor SDK driver—never reimplementing vendor state machines from scratch. Python/PowerShell remain optional external user script extensions.
 
-**No prescribed software pins:** choose maintained libraries and compatible dependency requirements. Accept installed runtimes by documented protocol/capability support, not equality to an old release. Evidence SHAs, request/configuration revisions and retained run bytes do not freeze future compatible software. No callback-time installer or silent downgrade.
+**No prescribed software pins:** choose maintained libraries and compatible dependency requirements. Accept installed runtimes by documented protocol/capability support, not equality to an old release or hardcoded executable SHA-256. Evidence SHAs, request/configuration revisions and retained run bytes do not freeze future compatible software. No callback-time installer or silent downgrade.
 
 **One manager, one mutable worktree and one in-flight product candidate.** Internal writers work on non-overlapping parts of that Issue, do not run Cargo and do not independently publish their fragments. Candidate-bound review and protected acceptance remain distinct from self-report.
 
@@ -120,4 +94,4 @@ Observation, streams, peer mail, requested reminders and late result collection 
 
 ## Delivery scope
 
-The current Kernel, standalone supervisor, typed adapter handoff and event/result ownership changes are delivered as source. Compiler, core failure/recovery and native qualification remain separate acceptance work. The historical bounded recheck retains its recorded source and IPC scope; its temporary-host observation does not qualify the current implementation. See the current source block in [Implementation status](../implementation-status.md) before interpreting older receipts.
+All Version 3 architecture documents in `docs/agent-operations/` are normative for ongoing development and refactoring. Historical CI runs, qualification logs and remediation records are tracked separately in [Implementation status](../implementation-status.md).

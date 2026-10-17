@@ -2,9 +2,6 @@
 
 **Current operator status:** See [Implementation Status](../implementation-status.md) for published revisions, gate results, and native qualification. This page owns the manager-facing configuration contract.
 
-### Historical C7/C8 WorkDispatch qualification
-Historical C7/C8 CI details are in [Implementation Status](../implementation-status.md).
-
 [Architecture](architecture.md) owns execution; [Delivery](delivery.md) owns the shared work handlers.
 
 ## 1. One control model
@@ -194,21 +191,9 @@ The revision assumes no intervening edit; real calls use the current returned va
 
 ### 4.1 WorkDispatch: explicit manager-authorized launch settings
 
-The current typed `work_dispatch` object is a complete launch-settings bundle,
-not a route-only switch. Replace the illustrative route/profile/surface names
-below with values from the manager's current `runtime.catalog`. Use
-`automation.config.preview` to check the patch and revision effects; each exact
-Task still goes through the canonical launcher preview and can wait on route,
-workspace, MCP, capacity or other readiness. C8 source commit
-`a1577aee63094e6fcb3feea6fc6079d1a8454850` wires manager-authorized automatic
-WorkDispatch and passed a bounded StoreAPI regression. Hosted CI evidence is recorded in the linked Implementation Status. This does not qualify productive dispatch or a complete local cycle. All local model/inference
-execution remains deferred by owner.
+The typed `work_dispatch` object is a complete launch-settings bundle, not a route-only switch. Replace the illustrative route/profile/surface names below with values from the manager's current `runtime.catalog`. Use `automation.config.preview` to check the patch and revision effects; each exact Task goes through the canonical launcher preview and checks route, workspace, and capacity readiness (never blocking `task.dispatch` on an `awaiting_native_mcp` callback).
 
-The authenticated current Manager enables one entry for one project. The server
-derives `owner_manager_id` from that Manager; do not submit an owner, role or
-`run_as`. Admission and pending-work rechecks require that owner to remain a
-registered, enabled Manager and recheck the current entry. The technical actor
-does not fall back to GM authority.
+The authenticated current Manager enables one entry for one project. The server derives `owner_manager_id` from that Manager; do not submit an owner, role or `run_as`. Admission and pending-work rechecks require that owner to remain a registered, enabled Manager and recheck the current entry. The technical actor does not fall back to GM authority.
 
 ```json
 {
@@ -245,49 +230,13 @@ does not fall back to GM authority.
 }
 ```
 
-`expected_revision: 0` creates a new entry; existing entries use the latest
-revision returned by `automation.config.get`. `include_existing: false` is the
-future-only choice. `scope` currently accepts only `work_pool_id`; a non-null
-pool has no committed membership reader and returns a visible scope gap rather
-than widening access. Keep it `null` for the current project-wide Task reader.
-The settings object denies unknown fields and requires `route`, `agent_profile`,
-`mcp_profile`, `mcp_surface`, `workspace_policy`, nullable
-`requested_model`/`requested_effort`, all three nullable budget fields,
-`stop_conditions` (at most 16 strings), and `purpose`. No route, profile,
-workspace policy, model, effort, budget, or stop-condition default is inferred.
-`workspace_policy` currently uses `manager_owned_worktree`. `null` budget values
-mean no requested numeric cap for that field; choose bounds required by the
-manager's policy instead of treating null as a safe default.
+`expected_revision: 0` creates a new entry; existing entries use the latest revision returned by `automation.config.get`. `include_existing: false` is the future-only choice. `scope` currently accepts only `work_pool_id`; a non-null pool has no committed membership reader and returns a visible scope gap rather than widening access. Keep it `null` for the current project-wide Task reader. The settings object validates known fields and requires `route`, `agent_profile`, `mcp_profile`, `mcp_surface`, `workspace_policy`, nullable `requested_model`/`requested_effort`, all three nullable budget fields, `stop_conditions` (at most 16 strings), and `purpose`. No route, profile, workspace policy, model, effort, budget, or stop-condition default is inferred. `workspace_policy` currently uses `manager_owned_worktree`. `null` budget values mean no requested numeric cap for that field; choose bounds required by the manager's policy instead of treating null as a safe default.
 
-The C8 source path reads only committed local controller Task
-facts (`task.create`, `task.revise`, `task.claim`) and checks the exact current
-Task revision/Attempt before normal launch preview and manager-authorized
-admission. It does not consume GitHub/webhook events. At activation, Store
-records the current observation high-water as `activation_cut`. With
-`include_existing: false`, the durable per-entry cursor starts at that cut and
-processes later facts only. With `true`, it performs bounded catch-up only
-through the captured cut, then follows new facts; it does not replay arbitrary
-remote deliveries. Cursor, pending readiness state, semantic launch-slot
-reservation and admitted Operation are committed through the Store path. The
-bounded C8 StoreAPI regression passed. CI run `37157609062` failed because the test fixture omitted `002workspace`; repair `7d518ef4edb84c5e8ce677fafa778de914abed30` adds it, the focused projection filter passed 6/6, and CI run `37158328828` passed all Ubuntu and Windows steps for repair commit `7d518ef4edb84c5e8ce677fafa778de914abed30`.
+The `work_dispatch` path reads committed local controller Task facts (`task.create`, `task.revise`, `task.claim`) and checks the exact current Task revision/Attempt before normal launch preview and manager-authorized admission. It does not consume GitHub/webhook events directly. At activation, Store records the current observation high-water as `activation_cut`. With `include_existing: false`, the durable per-entry cursor starts at that cut and processes later facts only. With `true`, it performs bounded catch-up only through the captured cut, then follows new facts; it does not replay arbitrary remote deliveries. Cursor, pending readiness state, semantic launch-slot reservation and admitted Operation are committed atomically through the Store path.
 
-The `automation.config.explain` `work_dispatch` projection contains:
-`cursor`, `activation_cut`, optional `catch_up_until`, retained `pending`
-subjects with readiness reason/wake conditions, and a bounded `recent` window.
-Pending readiness is distinct from a source-integrity `gap`; gaps are surfaced
-in recent dispositions and are not silently treated as empty success. The
-cursor and source observations remain durable, while the recent diagnostic
-window is bounded. Unavailable manager authority remains a pending reason; it
-does not switch to another owner. This readback is part of the committed C8
-source; the bounded regression is not a substitute for hosted CI or end-to-end
-qualification.
+The `automation.config.explain` `work_dispatch` projection contains: `cursor`, `activation_cut`, optional `catch_up_until`, retained `pending` subjects with readiness reason/wake conditions, and a bounded `recent` window. Pending readiness is distinct from a source-integrity `gap`; gaps are surfaced in recent dispositions and are not silently treated as empty success. The cursor and source observations remain durable, while the recent diagnostic window is bounded. Unavailable manager authority remains a pending reason; it does not switch to another owner.
 
-The C8 source has manual and automatic launch admission share the
-manager-scoped immutable semantic slot for the exact Task revision/Attempt and
-launch parameters. The bounded StoreAPI regression verified exact slot reuse,
-conflict handling, idempotent receipt and one Operation for its covered case.
-The existing `swarm.launch` semantic-reuse acknowledgment is immutable and does
-not copy mutable progress or result data. Its receipt shape is:
+Manual and automatic launch admission share the manager-scoped immutable semantic slot for the exact Task revision/Attempt and launch parameters. The `swarm.launch` semantic-reuse acknowledgment is immutable and does not copy mutable progress or result data. Its receipt shape is:
 
 ```json
 {
@@ -299,12 +248,7 @@ not copy mutable progress or result data. Its receipt shape is:
 }
 ```
 
-Treat `operation_state_at_receipt` as a historical acknowledgment field. Read
-current progress/result using `operation.get` with `operation_id`; the intended
-WorkDispatch recent entry carries the admitted Operation ID and semantic slot
-ID. In the example, timestamp `0` is a numeric placeholder; the server supplies
-the actual receipt time. Current progress and result come from live
-`operation.get`, not the immutable receipt snapshot. productive dispatch and the full cycle remain unqualified.
+Treat `operation_state_at_receipt` as a historical acknowledgment field. Read current progress/result using `operation.get` with `operation_id`; the WorkDispatch recent entry carries the admitted Operation ID and semantic slot ID. In the example, timestamp `0` is a numeric placeholder; the server supplies the actual receipt time. Current progress and result come from live `operation.get`, not the immutable receipt snapshot.
 
 ### 4.2 Publication: explicit accepted-candidate target
 
@@ -552,7 +496,7 @@ taskless and do not establish Task completion.
 
 ### Native MCP failure selector
 
-C7/C8 native-MCP readback failures use the ordinary generic ScriptRun source
+Native-MCP readback failures use the ordinary generic ScriptRun source
 and kind `controller:native-mcp` / `native.mcp.failure`. Omit `status` to select
 both normalized `failed` and `unknown` facts. Set `status` to `failed` or
 `unknown` to select only that normalized state; these values describe the
@@ -636,15 +580,42 @@ Keep #22's small eager cores. Config get/preview/apply/explain/transfer and deta
 
 For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
 
-## 11. Existing native OpenCode service
+## 11. OpenCode service integration (`external_attach` and `owned_service`)
 
-OpenCode owns its provider accounts, authorization, configuration and model loop. The controller connects to the already running, already authorized native service through direct HTTP. It never reads a provider `auth.json`, copies provider keys, calls provider login/connection APIs, or asks a manager for provider credentials. Provider/model/variant selection comes from that native service's catalog.
+### 11.1 Existing native OpenCode service (`external_attach`)
 
-Set `routes.native_options.connection_file` to the native service registration used by the installed client. The official `@opencode/client/service` registration contains `url`, `pid` and optional `version`, `id` and local HTTP `password`. This local service-access record is distinct from provider authorization. The controller reads it in place and checks the loopback endpoint, live PID and declared version; it never rewrites the record or starts, replaces or repairs the service. The legacy explicit ELIOT connection-record format remains readable for existing installations.
+OpenCode owns its provider accounts, authorization, configuration, and model loop. In the primary `external_attach` mode (`eliot-opencode-v2.rust-http.1`), the controller connects to an already running, already authorized native OpenCode service through HTTP/SSE without reading provider `auth.json` files or copying provider keys.
 
-The former `opencode_provider_auth_sources` and owned-service provider `credential_ref` mapping are removed. Fresh isolated SDK service starts are retired. Existing owner/process receipts remain available for bounded historical readback and departure fencing; uncertain ownership is retained, never converted into a new launch or a force-kill. Controller IPC/MCP credentials remain a separate authorization boundary.
+Set `routes.native_options.connection_file` to the native service registration used by the installed OpenCode client (`@opencode/client/service`), which records `url`, `pid`, and optional `version`, `id`, and local HTTP `password`. This local service-access record is distinct from provider authorization. The controller reads it in place and checks the loopback endpoint and live PID without rewriting the record or replacing the service. Provider/model/variant selection comes from that native service's catalog (or native defaults when omitted).
 
-See the [OpenCode module configuration](../../modules/opencode/README.md#explicit-configuration) for the route shape and [Implementation Status](../implementation-status.md) for the actual verification boundary.
+### 11.2 Isolated owned OpenCode service (`owned_service`)
+
+When an operator explicitly configures a dedicated isolated service (`eliot-opencode-v2.http.2`), Store starts the service only after an exact Manager/Operator admission for the opening binding, Task revision, Attempt, and held workspace lease:
+
+~~~toml
+[[routes]]
+alias = "opencode-owned"
+runtime = "opencode_v2"
+module_artifact_id = "eliot-opencode-v2.http.2"
+enabled = true
+native_options = {}
+
+[routes.owned_service]
+origin = "fresh_owned_service"
+service_id = "opencode-owned"
+model = { id = "approved-model-id", providerID = "approved-provider", variant = "approved-variant" }
+model_catalog = "offline"
+bun_executable = "C:/approved/runtime/bun.exe"
+server_program = "C:/approved/repo/modules/opencode/serve.mjs"
+state_root = "C:/approved/private-state/opencode"
+port = 0
+~~~
+
+The Bun path must identify a regular file supporting a compatible Bun runtime (`>= 1.1`), and optional `bun_sha256` / `server_program_sha256` fields, when supplied, are verified as normalized 64-character lowercase hex digests before spawn; do not hardcode a single minor Bun version (such as `1.4.0`) or freeze `@opencode/server` to a single historical patch string in code. `state_root` must be a canonical, non-reparse directory restricted to the service owner. Port `0` requests an OS-selected loopback port.
+
+Each admitted owned launch receives its own retained owner nonce and private state directory under `state_root/launches/<owner_nonce>`. The controller keeps its helper child's stdin open while the service is owned; closing stdin sends EOF as the graceful-stop signal. Before spawn, Store reserves one durable start; if spawn was attempted and the outcome is uncertain, the disposition remains `outcome_unknown` and is resolved via readback rather than blind replay.
+
+For current retained-run and qualification evidence, see [Implementation Status](../implementation-status.md). The execution and no-replay rules above remain normative.
 
 ### Windows Git metadata path admission
 

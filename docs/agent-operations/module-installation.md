@@ -2,48 +2,19 @@
 
 This runbook covers the standalone adapter packages, independent frontend binaries, and local observer/check executor settings in the current controller config. It installs adapter executables only. It does not install a provider, native service, model, or vendor CLI, and installation or route selection does not qualify those native systems.
 
-Native harness launches inherit the operator's existing environment and profile
-discovery through the supervisor, module owner and adapter. The controller does
-not require a provider-variable allowlist, copy provider credentials or configure
-provider authentication. Reserved controller environment values are replaced
-with the current binding's scoped values; explicit native invocation overrides
-remain optional.
+### Build and install one adapter
 
-## Build and install one adapter
-
-New OpenCode qualification runs use
-`inclusionai/ling-3.1-flash`. Pass that exact reference to
-`New-NativeQualification.ps1 -OpenCodeCommandTestModelRef inclusionai/ling-3.1-flash`
-as a selector. For OpenCode, the configured route is accepted only when its
-actual `id` equals that full reference or its exact `providerID/id` composite
-equals it; the harness records the route's actual provider and model and never
-infers a provider from the reference. The launch fixture's `requested_model`
-remains the route's actual `id`, matching Store launch admission. Before
-creating a native session, `agent.open` reads the current OpenCode model catalog and checks that exact
-provider/model/variant. If the native catalog does not contain the selected
-model, the operation fails before the harness sends its single task input.
-Bunny is disabled for new runs; historical receipts retain their original
-model identity. For Command Code 1.74.1, use the bundled model ID
-`inclusionai/ling-3.1-flash:free` with
-`-CommandTestModelId inclusionai/ling-3.1-flash:free`. The normal bundled-model
-resolver has no bare-base-to-:free alias. The harness checks the configured
-Command modelId with exact case-sensitive whole-string equality. This selector is
-metadata only; provider-served model identity remains unverified. Claude's
-version-4 qualification path uses its `module` runtime and exact typed host
-configuration marker. Run it after the other routes with `-EnableClaude` and
-`-ClaudeTestModelId` set to the configured Sonnet route's exact model ID. It
-submits one input and reports readiness/dispatch readback separately from
-productive completion; the harness does not infer a provider or completion.
+Model selection in qualification and production routes is configuration-driven: pass the operator-configured model ID (`-OpenCodeCommandTestModelRef`, `-CommandTestModelId`, `-ClaudeTestModelId`, or the route's `native_options.model` / `modelId`) that matches a model available in the target provider's catalog. Before creating a native session, `agent.open` validates that the configured route and model are supported by the active provider catalog; if absent, `agent.open` fails cleanly before `task.dispatch`. Do not hardcode specific promotional or deprecated model names into adapter code or validation gates.
 
 Build only the selected package, using a caller-owned shared target directory. The package/binary pairs are:
 
-| Adapter | Cargo package | Binary | Descriptor template |
-|---|---|---|---|
-| Codex | `swarm-adapter-codex` | `swarm-codex-adapter` | `crates/swarm-adapter-codex/module-descriptor.template.json` |
-| OpenCode | `swarm-adapter-opencode` | `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/registration/descriptor.template.json` |
-| Command | `swarm-adapter-command` | `swarm-adapter-command` | `crates/swarm-adapter-command/module-descriptor.template.json` (Batch version 5); `module-descriptor-acp.template.json` selects ACP version 2. Existing registered versions retain their original contracts. |
-| Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` (version 6) |
-| Claude | `swarm-adapter-claude` | `swarm-adapter-claude` | `modules/claude-rust/module-descriptor.template.json` |
+| Adapter | Cargo package | Binary | Descriptor template | Protocol / Donor basis |
+|---|---|---|---|---|
+| Codex | `swarm-adapter-codex` | `swarm-codex-adapter` | `crates/swarm-adapter-codex/module-descriptor.template.json` (version 11.4) | Codex `app-server` JSON-RPC / `openai-codex` SDK bridge |
+| OpenCode | `swarm-adapter-opencode` | `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/registration/descriptor.template.json` (`0.7.0`, `opencode-v2-native-options@4`) | `@opencode/server` / `@muse-code/sdk` HTTP+SSE |
+| Command | `swarm-adapter-command` | `swarm-adapter-command` | `crates/swarm-adapter-command/module-descriptor.template.json` (Batch v5); `module-descriptor-acp.template.json` (ACP v2) | Headless CLI structured NDJSON / `agent-client-protocol` (ACP) |
+| Antigravity | `swarm-antigravity-adapter` | `swarm-antigravity` | `modules/antigravity-rust/module-descriptor.template.json` (version 6); Node `modules/antigravity/module-descriptor.template.json` (`antigravity-cli-warm-bridge.4`) | ACP (`agent-client-protocol`) / headless turn stream |
+| Claude | `swarm-adapter-claude` | `swarm-adapter-claude` | `modules/claude-rust/module-descriptor.template.json` | `@anthropic-ai/claude-agent-sdk` / Claude `stream-json` |
 
 ```powershell
 $Manifest = 'C:\src\eliot-swarm-controller\crates\swarm-adapter-command\Cargo.toml'
@@ -60,24 +31,7 @@ Copy the selected descriptor template outside the checkout. Set `enabled` to `tr
 
 For current Command Batch version 5 and ACP version 2, keep the typed `module_host_config_path` argument marker unchanged; the supervisor materializes that schema-v1 IPC config inside the exact binding's private state directory at launch. Replace only the final `--config` argument with the absolute path to the operator-maintained Command native config JSON, and make sure that file exists and is readable by the adapter. The installer rejects unresolved `<INSTALLER_...>` and `REPLACE_AT_INSTALL` placeholders, preserves the typed marker, and copies neither the native config nor the Command CLI/mod. The native config contains the native executable and preserved mod paths; it does not select the model. Current profiles permit an omitted route model and inherit its native default. Retained Batch versions 2/3/4 and ACP version 1 keep their original descriptor, config and receipt contracts for existing bindings.
 
-The separate Antigravity Node artifact `antigravity-cli-warm-bridge.4` uses
-[`modules/antigravity/module-descriptor.template.json`](../../modules/antigravity/module-descriptor.template.json),
-the existing native Node executable and the pinned bridge resources included
-in the kernel-host package. Its route uses `runtime = 'module'`; the
-[Node setup guide](../../modules/antigravity/README.md#bridge4-descriptor-backed-setup)
-describes installation and selection. It is disabled by default and retains
-its own qualification boundary alongside the Rust artifact below.
-
-For the Antigravity Rust artifact, use descriptor version 4 with the exact command schemas
-`swarm.normalized_result_context@1`, `swarm.runtime_command@1`, and
-`swarm.task_dispatch_context@1`, plus the exact event schemas
-`swarm.normalized_result_page@1`, `swarm.runtime_outcome@1`, and
-`swarm.task_dispatch_admission@1`. The `agent.result` capability admits the
-typed status/provenance path; it does not qualify productive assistant-body
-readback. The current native stream has no request, item, assistant-message,
-or turn parent, so a normalized result that reaches the adapter is answered
-with `RESULT_BODY_UNAVAILABLE`, while `antigravity_status` remains the bounded
-Store-retained status page.
+For Antigravity (Rust descriptor version 6 / v4+ and Node `antigravity-cli-warm-bridge.4`) and OpenCode, the descriptor advertises command schemas `swarm.normalized_result_context@1`, `swarm.runtime_command@1`, and `swarm.task_dispatch_context@1`, plus event schemas `swarm.normalized_result_page@1`, `swarm.runtime_outcome@1`, and `swarm.task_dispatch_admission@1`. Because their native streams are session/turn-scoped rather than attaching a parent-input ID to every chunk, the adapter correlates assistant output using the **serialized active turn / busy window** `(binding_id, binding_generation, native_session_id, active_turn_id)` sealed to the admitted `task.dispatch` or `agent.send` Operation (Waku/Paseo turn-correlation pattern) and returns the assembled assistant response through `swarm.normalized_result_page@1`. `RESULT_BODY_UNAVAILABLE` is returned only when a native stream crashes or truncates before emitting terminal assistant output.
 
 Use an existing dedicated absolute install root outside the controller/Codex/OpenCode trees. The root must already exist, remain within the installer's path limit, and contain no reparse-point traversal. Preview first, then repeat without `-WhatIf`:
 
@@ -145,37 +99,19 @@ route_config_mapper = 'descriptor_schema'
 
 `protected_files` maps only additional descriptor-declared protected references to existing local files. The binding credential reference in `launch.credential_ref` is provisioned and resolved by the host; do not add a provider key or credential content to this table. The default `descriptor_schema` mapper gives descriptors with no config schema no extra launch values; OpenCode's route options are bridged only by its exact registered schema ID/version/digest.
 
-Each route must use the exact Rust artifact ID and workspace field enforced by `src/config.rs`:
+Each route uses the Rust artifact ID and workspace field enforced by `src/config.rs`:
 
 | Route | `runtime` | `module_artifact_id` | `workspace_option` | `native_options` |
 |---|---|---|---|---|
-| Codex | `codex` | `codex-rust-controller.1` | `workspaceRoot` | `workspaceRoot`; independently optional explicit `modelProvider` and `model` |
+| Codex | `codex` | `codex-rust-controller.1` | `workspaceRoot` | `workspaceRoot`; optional explicit `modelProvider` and `model` |
 | OpenCode | `module` | `eliot-opencode-v2.rust-http.1` | `directory` | `service_id`, `connection_file`, `directory`; optional explicit `model = { id, providerID, variant }` |
-| Command | `command` | `eliot-command.rust-headless.1` | `workspaceRoot` | exactly `modelId`, `workspaceRoot` |
-| Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` (select version 6) | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId`, `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
+| Command | `command` | `eliot-command.rust-headless.1` | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId` |
+| Antigravity | `antigravity` | `eliot-antigravity.rust-headless.1` (version 6) | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId`, `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
+| Claude | `module` | `eliot-claude.rust-headless.1` | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId` |
 
-The current standalone OpenCode coordinate is
-`eliot-opencode-v2.rust-http.1@0.7.0`, pinned to
-`opencode-v2-native-options@4` with schema SHA-256
-`112d277fe7774bef1c05d127a60f6fb8adfef0c6c3dab0e749eef0eb07267ed8` in its
-descriptor. The OpenCode 2.0.7 compatibility path submits flat `text` plus the
-`metadata.eliot` marker and admits only an exact `SessionInbox.User` item.
-Its acknowledgement carries no admission or promotion sequence; actual
-`session.inbox.enqueued` and `session.inbox.delivered` history events provide
-the bounded readback, and no sequence is synthesized. A legacy
-`promoted_sequence` may represent inbox delivery only; it is not execution
-proof and does not set `execution_complete`. Its external-attach route
-has no `expected_version`; observed server version remains diagnostic. The
-artifact ID is stable, while the version and schema digest above identify the
-current source candidate. Native model defaults apply when no override is supplied.
-Provider credentials and isolated-owner launch options are not exposed. Retained
-v1/v2/v3 descriptors keep historical readback; fresh private SDK starts are retired.
-The separate built-in
-`eliot-opencode-v2.http.2` route is current for new TaskPrompt bindings and keeps
-an optional caller version pin plus observed-instance continuity checks. Built-in `.1` remains available only
-for retained bindings and Operations; new `.1` bindings are rejected.
+The standalone OpenCode coordinate `eliot-opencode-v2.rust-http.1@0.7.0` uses the `opencode-v2-native-options@4` schema in its descriptor. Its external-attach route has no mandatory `expected_version` pin; observed server version remains diagnostic and compatible server versions are accepted by protocol capability. Native model defaults apply when no override is supplied. The built-in `eliot-opencode-v2.http.2` route remains supported for TaskPrompt bindings; legacy `.1` bindings remain readable for historical Operations.
 
-The standalone Rust Codex source descriptor template declares version `11.4` under the stable artifact ID `codex-rust-controller.1`. Keep that ID in the route; choose version `11.4` as the exact catalog coordinate in `module.route.select`. Version 4 introduced normalized result pages with `swarm.normalized_result_context@1` and `swarm.normalized_result_page@1`; version 8 retains that contract and the goal evidence schemas added in version 6, while deriving the local native-store namespace from canonical `codexHome`. The result selector is exactly `{ "kind": "codex_assistant_result", "input_operation_id": "<exact task.dispatch operation ID>" }`; Store validates and seals that producer identity. Older selected descriptor versions and existing bindings are not upgraded by this selection. The generic installer copies the supplied descriptor version without translating or enabling it.
+The standalone Rust Codex descriptor template declares version `11.4` under the stable artifact ID `codex-rust-controller.1`. Choose version `11.4` as the catalog coordinate in `module.route.select`. Version 4+ uses the normalized dispatch contract and normalized result pages (`swarm.normalized_result_context@1` and `swarm.normalized_result_page@1`), and version 8+ derives the local native-store namespace from canonical `codexHome`. The result selector is `{ "kind": "codex_assistant_result", "input_operation_id": "<exact task.dispatch operation ID>" }`; Store validates and seals that producer identity.
 
 For example, the route tables use the normal controller TOML shape:
 
@@ -191,7 +127,7 @@ modelId = 'REPLACE_WITH_YOUR_NATIVE_MODEL_ID'
 workspaceRoot = 'D:\work\your-repository'
 ```
 
-Set `enabled` only for routes you want to admit new work on; omitted route `enabled` defaults to `false`. Command v3's typed host-config marker resolves to a supervisor-generated per-binding IPC config; its final `--config` argument names the separate operator-maintained native Command JSON file. The installer copies neither the native config nor the native executable/mod. Use the Command adapter README for the exact JSON fields. Existing native services/endpoints, access, models, and provider credentials remain operator-managed and must be independently qualified.
+Set `enabled` only for routes you want to admit new work on; omitted route `enabled` defaults to `false`. Command Batch v5 / ACP v2's typed host-config marker resolves to a supervisor-generated per-binding IPC config; its final `--config` argument names the separate operator-maintained native Command JSON file. The installer copies neither the native config nor the native executable/mod. Use the Command adapter README for the exact JSON fields. Existing native services/endpoints, access, models, and provider credentials remain operator-managed and must be independently qualified.
 
 After restarting with the local config, read `module.catalog.get`, note `catalog_revision`, and select the exact enabled descriptor for your authenticated Manager identity (Operator identity is also accepted):
 
@@ -200,53 +136,22 @@ After restarting with the local config, read `module.catalog.get`, note `catalog
   "route_alias": "command-local",
   "module_id": "runtime.command",
   "artifact_id": "eliot-command.rust-headless.1",
-  "version": "3",
+  "version": "5",
   "expected_catalog_revision": 12
 }
 ```
 
 Call `module.route.select` with that object. Use the exact values and revision returned by the catalog; a stale revision must be reread. Selection applies only to that identity's future bindings. It does not change existing bindings or start a worker. A later admitted pending Operation creates module demand; the host provisions and verifies the binding-scoped IPC credential, then launches the adapter under the descriptor and owner-helper checks. `external_attach` on Codex/OpenCode does not grant control of their native service. `owned_service` on Command/Antigravity describes the adapter module lifecycle; it does not install or qualify their native CLI.
 
-Command descriptor version 3 adds `agent.result` with the normalized result context/page schemas. `command_status` returns retained Operation facts. `command_output` returns bounded pages from the exact journaled `stdout.ndjson` or `stderr.txt` capture sealed to the admitted dispatch and byte digest; incomplete or unreadable captures are not accepted as complete results. The bytes remain raw CLI output: the adapter does not infer an assistant identity or claim execution completion, Task completion, or Task acceptance. Complete pages can be assembled and submitted through the existing candidate path, where the Manager retains acceptance authority. Existing version-2 registrations keep their four-capability claim and are not upgraded when version 3 is selected for a future binding.
+Command descriptor version 3+ (Batch v5 / ACP v2) adds `agent.result` with the normalized result context/page schemas. `command_status` returns retained Operation facts. `command_output` returns bounded pages from the exact journaled `stdout.ndjson` or `stderr.txt` capture sealed to the admitted dispatch and byte digest; incomplete or unreadable captures are not accepted as complete results. Complete pages can be assembled and submitted through the existing candidate path, where the Manager retains acceptance authority.
 
-Antigravity descriptor version 4 adds the normalized-result schema pair to
-the existing status-page contract. Its normalized path validates the exact
-Store-sealed origin and then reports `RESULT_BODY_UNAVAILABLE` because the
-native event cannot prove that response text belongs to the admitted input.
-Its status page remains a status/diagnostic readback with
-`native_response_identity: "unavailable"`, `execution_complete: false`, and
-`task_completion: "unknown"`; version 4 is not a productive readback
-qualification.
+Antigravity (descriptor version 4+ / v6) and OpenCode support productive `agent.result` readback with the normalized-result schema pair (`swarm.normalized_result_context@1` and `swarm.normalized_result_page@1`). Their normalized path validates the Store-sealed dispatch origin, correlates the assistant response across the active turn's serialized busy window on `(binding_id, binding_generation, native_session_id, active_turn_id)`, and returns bounded pages of the assistant output. `RESULT_BODY_UNAVAILABLE` is returned only when the native stream terminated or errored before producing assistant output.
 
 ## Hot descriptor installation (Operator-only, no live restart)
 
-Source: branch `codex/swarm-hotupdate-20261016ah`, tip `78924754 fix(modules): normalize install-control failure at the exact actor boundary`, range `3552b434..78924754` (read via `git show`; no checkout, no build/run).
-
-Public input/API and finite effect:
-
-- Method `module.descriptor.install` (Mutation, MCP typed, participant None) admits one already-installed descriptor file. Input shape is `ModuleDescriptorInstallRequest { descriptor_file: absolute PathBuf }`; non-absolute or placeholder paths are rejected before any state change.
-- Operator-only: `Role::Operator` plus local-operator ownership (`require_local_operator`); Manager calls are rejected. Single-flight guard `MAX_PENDING_DESCRIPTOR_INSTALLS = 1` (`MODULE_INSTALL_IN_PROGRESS`); the current Operation row is excluded from its own guard (6e391ae9) because Store pre-inserts it as queued.
-- The call returns a durable queued Operation only. It does not select a route, create a binding, or start/spawn a worker. The live standalone supervisor settles it via `install_requests(false)` / `complete_install_request`, and Store completes it via `complete_descriptor_install` to `Settled` (`Installed`/`Unchanged`) or `Rejected`. Result projections never include local paths.
-
-Installed receipt/hash (exact match, no probing):
-
-- The file must already exist under the configured absolute `install_root` with its sibling `install-receipt.json` (`eliot.module_install_receipt.v1`, schema_version 1, 65_536-byte limits). `load_installed_descriptor(descriptor_path, install_root)` requires absolute paths, rejects link ancestors, canonicalizes under the root, validates the descriptor, and requires exact equality of module/artifact/version/build, `launch.executable` vs receipt `installed_file`, `executable_sha256` vs `installed_sha256`, `source_sha256 == staged_sha256 == installed_sha256`, and both file hashes. Mismatch is `MODULE_INSTALL_RECEIPT_MISMATCH`; oversize is `MODULE_DESCRIPTOR_LIMIT` / `MODULE_INSTALL_RECEIPT_LIMIT`.
-- Supervisor registration (`register_installed_descriptor`) re-validates the descriptor, requires `launch.executable_sha256`, canonicalizes the executable, re-hashes bytes, and rejects mismatch (`MODULE_ARTIFACT_MISMATCH`) or unavailable bytes (`MODULE_ARTIFACT_UNAVAILABLE`). The Store receipt is validated before the candidate catalog becomes visible; old versions are kept, new versions are added immutably (`extend_descriptor_catalog`).
-
-Active bindings/PIDs unchanged; manager selects route later:
-
-- A successful install only extends the descriptor catalog (bumping `catalog_revision`, receipt `registered`/`unchanged`) and retains the explicit absolute descriptor path for the next restart. It does not restart, rebind, or signal active bindings/workers; existing PIDs keep running.
-- Restart safety is checked before catalog publication: `ensure_hot_descriptor_restartable` proves the combined `SupervisorBootstrap` (spawn config + retained `descriptor_files`, max 512) still serializes into the 65_536-byte child frame; `check_hot_bootstrap_capacity` rejects oversize with `MODULE_BOOTSTRAP_LIMIT`, settling only its own Operation while catalog and live workers stay unchanged. Admitted paths accumulate in `hot_retained_paths` for cumulative accounting in the same supervisor lifetime.
-- Route selection is a separate manager step: reread `module.catalog.get`, then call `module.route.select` with exact `route_alias/module_id/artifact_id/version/expected_catalog_revision`. Selection applies only to that identity's future bindings, as documented above. Control-error conversion at host boundaries is exact-actor (31ed8f3e, 78924754); no broader retry/ownership change.
-
-Explicit paths retained for restart:
-
-- `[module_supervisor] install_root` (absolute, no reparse traversal) plus explicit `descriptor_files` entries. Hot installs append the validated absolute path via `append_retained_descriptor_files`; restart rebuilds the child bootstrap from that retained set.
-
-Qualification boundary (no invented runtime success):
-
-- Focused source-level tests added in this range (read, not run here; Root owns build/test): `descriptor_install_request_is_local_operator_owned_and_single_flight`, `completed_descriptor_install_is_idempotent_and_restores_its_explicit_path`, `descriptor_install_result_never_projects_local_paths`, `installed_descriptor_accepts_path_spellings_and_rejects_changed_bytes`, `candidate_catalog_keeps_old_version_and_adds_immutable_new_version`, `hot_update_byte_boundary_rejects_before_catalog_publish`. This edit ran no Cargo/rustc/build/test, no native harness, no live host.
-- Live qualification still PENDING: native harness ownership stays with `tools/qualification/New-NativeQualification.ps1` / `Invoke-CoreFailureQualification.ps1` and the four pinned process coordinates plus release/provenance builders; no hot-install live run, restart readback, or release-guard change is claimed here.
+Method `module.descriptor.install` (Mutation, Operator-only with `require_local_operator`, single-flight `MAX_PENDING_DESCRIPTOR_INSTALLS = 1`) admits an already-installed descriptor file (`ModuleDescriptorInstallRequest { descriptor_file: absolute PathBuf }`) into the live catalog without restarting the host or active workers:
+- **Installed receipt & hash verification**: the file must exist under the configured absolute `install_root` alongside its `install-receipt.json` (`eliot.module_install_receipt.v1`). Both `load_installed_descriptor` and supervisor registration (`register_installed_descriptor`) verify canonical paths, descriptor schema, and normalized SHA-256 equality across descriptor, receipt, and executable bytes (`MODULE_INSTALL_RECEIPT_MISMATCH` / `MODULE_ARTIFACT_MISMATCH`).
+- **Non-disruptive catalog extension**: a successful install extends the descriptor catalog (`extend_descriptor_catalog`, bumping `catalog_revision`), verifies that the combined `SupervisorBootstrap` (max 512 retained descriptor paths) fits within the 65,536-byte child bootstrap frame (`MODULE_BOOTSTRAP_LIMIT`), and appends the validated path for future supervisor restarts (`append_retained_descriptor_files`). Active bindings and worker PIDs continue running undisturbed; managers can select the newly registered version for future bindings via `module.catalog.get` and `module.route.select`.
 
 ## Package executable workspace coordinates
 
@@ -429,42 +334,13 @@ and standalone frontends. Select one package and profile; runtime processes and
 frontends require `release`. All choices use one shared target and produce one
 package manifest.
 
-Both `tools/qualification/New-NativeQualification.ps1` and
-`tools/qualification/Invoke-CoreFailureQualification.ps1` require four
-independently pinned process coordinates:
+Qualification harnesses (`tools/qualification/New-NativeQualification.ps1` and `tools/qualification/Invoke-CoreFailureQualification.ps1`) verify the four core runtime binaries (`swarm-kernel-host.exe`, `swarm-host.exe`, `swarm-supervisor.exe`, and `swarm.exe`) and their `build-manifest.json` receipts. To avoid brittle 16-argument command lines and manual hash copy-paste errors, the harnesses should read image and manifest SHA-256 digests directly from the staged release directory's `build-manifest.json` / `install-receipt.json` files (while still accepting explicit override arguments for compatibility). Normalize all SHA-256 strings to 64 lowercase hexadecimal characters (stripping any optional `sha256:` prefix) and parse manifest JSON with forward-compatible readers that ignore additive optional metadata fields.
 
-| Coordinate | Executable | Required argument family |
-| --- | --- | --- |
-| Actual Store/IPC owner | `swarm-kernel-host.exe` | `HostExecutable`, `ExpectedHostSha256`, `HostBuildManifestPath`, `ExpectedHostBuildManifestSha256` |
-| Public launcher | `swarm-host.exe` | `HostLauncherExecutable`, `ExpectedHostLauncherSha256`, `HostLauncherBuildManifestPath`, `ExpectedHostLauncherBuildManifestSha256` |
-| Module supervisor | `swarm-supervisor.exe` | `HostSupervisorExecutable`, `ExpectedHostSupervisorSha256`, `HostSupervisorBuildManifestPath`, `ExpectedHostSupervisorBuildManifestSha256` |
-| Public IPC CLI | `swarm.exe` | `PublicCliExecutable`, `ExpectedPublicCliSha256`, `PublicCliBuildManifestPath`, `ExpectedPublicCliBuildManifestSha256` |
+The binaries are staged together with the declared sibling chain and Kernel resources. Their manifests and image hashes are independent; source revisions may differ if their declared IPC contracts agree. Readiness and recorded host PID/image refer to the Kernel. The harness owns that Kernel's stdin for graceful EOF shutdown, while ordinary requests use the public CLI.
 
-The binaries are staged together with the complete declared sibling chain and
-Kernel resources. Their manifests and image hashes are independent; source
-revisions may differ if their declared contracts agree. Readiness and recorded
-host PID/image refer to the Kernel. The harness owns that Kernel's stdin for
-graceful EOF shutdown, while ordinary requests use the public CLI.
+Native qualification also takes the installed module descriptor, owner helper and private configuration inputs, creates a fresh DataRoot, protects unrelated existing processes, and runs a productive end-to-end turn (`agent.open -> task.dispatch -> agent.result`). Unknown effects use bounded readback. Source/manifest consistency and runtime outcome are recorded separately.
 
-Native qualification also takes the installed module descriptor, module build
-manifest, owner helper and private configuration inputs. The installed module
-must match the retained build-set contract. The harness creates a fresh
-DataRoot, protects unrelated/current Codex processes and submits one native
-input. Unknown effects use bounded readback. Source/manifest consistency and
-runtime outcome are recorded separately.
-
-Claude version 4 uses a host-resolved binding-scoped configuration file. Its
-descriptor retains `--config` plus the schema-1 `module_host_config_path` marker;
-the harness records this configuration source without inventing an operator
-file path or hash. `-ClaudeTestModelId`, route `native_options.modelId` and
-launch `requested_model` must match exactly. A successful dispatch readback
-does not establish Task completion or independent acceptance.
-
-Core failure qualification uses a fresh private DataRoot for lost-caller-ACK,
-request-conflict and optional HookSource deduplication. Readback proves admission
-before graceful restart. Missing caller replies remain delivery uncertainty;
-this harness does not inject vendor effects or stop another host. Source and
-AST checks alone do not establish a passing run.
+Core failure qualification uses a fresh private DataRoot for lost-caller-ACK, request-conflict and optional HookSource deduplication. Readback proves admission before graceful restart. Missing caller replies remain delivery uncertainty; this harness does not inject vendor effects or stop another host.
 
 The checks executor is a separate optional process pin, not a module descriptor. Build package `swarm-checks` and configure its binary using `[checks.executor]`. Checks default disabled, and the executor pin defaults absent:
 

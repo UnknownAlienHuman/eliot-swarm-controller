@@ -1,32 +1,20 @@
 # Shared package boundaries
 
-The first PR25 extraction uses one workspace and lockfile. The root remains the
-default CLI/kernel entrypoint; it consumes the implementations below rather than
-having the new packages import the old controller library.
+The workspace uses one lockfile and strict downward dependency edges. The kernel and CLI entrypoints consume the shared packages below; shared packages never import the host or adapter crates.
 
-| Package | Implementation | Local dependencies |
+| Package | Implementation | Local & Donor dependencies |
 |---|---|---|
-| `swarm-contracts` | Credential, JSON-RPC Request, runtime command/outcome and receipt identity, error classification, module catalog and typed hello claim | None |
+| `swarm-contracts` | Credential, JSON-RPC Request, runtime command/outcome and receipt identity, error classification, module catalog and typed hello claim | `serde`, `serde_json` (forward-compatible internal readers) |
 | `swarm-client` | Authenticated bounded sequential local IPC client, endpoint computation and typed `ModuleLink` | `swarm-contracts` |
-| `swarm-checks` | Kernel-admitted bounded native check executor and authenticated CheckRun status readback | `swarm-client`, `swarm-contracts`, `swarm-process` |
-| `swarm-process` | OS process/group ownership, identity/departure checks, private files and scoped module-owner bootstrap | `swarm-contracts` |
-| `swarm-store` | SQLite connection opening, schema identity/digest and transaction primitives | None |
-| `swarm-kernel` | Single bounded writer actor, readiness and contiguous typed job batching | None |
-| `swarm-telemetry` | Bounded metadata producer, lazy stderr writer and local drop/failure counters | None |
+| `swarm-checks` | Kernel-admitted bounded native check executor and authenticated CheckRun status readback (Claw `CheckRunner` pattern) | `swarm-client`, `swarm-contracts`, `swarm-process` |
+| `swarm-process` | OS process/group ownership, identity/departure checks, private files and scoped module-owner bootstrap | `swarm-contracts`, `cccc-windows-process`, `sysinfo` |
+| `swarm-store` | SQLite WAL connection management (1 serialized `IMMEDIATE` writer + concurrent read-only WAL connection pool), relational schema migrations and transaction primitives | `rusqlite` |
+| `swarm-kernel` | Single bounded writer actor for mutations, WAL read-pool dispatch for queries, readiness and contiguous typed job batching | `swarm-store`, `swarm-contracts` |
+| `swarm-telemetry` | Structured `tracing` producer, dynamic `reload` filter, `tracing-appender` non-blocking writer, `atlas-redact` scrubbing, and local drop/failure counters | `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact` |
 
-The host still owns authentication policy, domain transactions,
-server IPC, dispatch and installed runtime selection. Compatibility paths in
-`config`, `model`, `runtime`, `ipc` and `platform` preserve existing host callers;
-they map the shared error to the host error once at the boundary. Shared
-contracts have no SQLite, native vendor DTO or process dependency.
+`swarm-kernel-host` owns authentication policy, domain transactions, server IPC, and dispatch routing, but **must not** link worker crates (`swarm-automation`, `swarm-bus`, `swarm-checks`, `swarm-forge-worker`, `swarm-observer`, `swarm-script-worker`, `swarm-supervisor`) or `swarm-adapter-*` crates in `[dependencies]`, and must keep integration test suites out of `src/`. Shared contracts have no SQLite, native vendor DTO or process dependency.
 
-The root Store uses `swarm-kernel` for its existing single writer thread and
-bounded FIFO queue. The DataRoot lock stays on that thread through database
-initialization and shutdown. Readiness returns the original initializer error;
-only contiguous typed message jobs are batched, with the same limit and pending
-non-message job ordering. Root supplies database initialization and domain
-callbacks, response channels and close/join handling. No second writer, database
-or scheduling policy was added. Kernel domain extraction remains unfinished.
+The Store uses `swarm-kernel` for its single writer thread (bounded FIFO mutation queue) while serving read-only queries (`*.get`, `*.list`, `dashboard`, `report.delta`, `automation.config.explain`, `runtime.catalog`) concurrently through `swarm-store`'s **read-only WAL connection pool** (`SQLITE_OPEN_READ_ONLY`, `query_only = ON`). The DataRoot lock stays on the writer thread through database initialization and shutdown. Readiness returns the original initializer error; only contiguous typed message jobs are batched, with the same limit and pending non-message job ordering.
 
 The module catalog validates data and selects an exact artifact with compatible
 protocol/capabilities. It reads no files and starts no process. Launch metadata
@@ -155,21 +143,4 @@ benchmark. No `cargo clean` or repeated full workspace/release gate is required
 for a writer fragment. Shared changes also require checking actual reverse
 dependencies. See [the modularity program](modularity.md) for M2–M6 acceptance.
 
-Current verification: workspace/lock metadata, explicit package formatting and
-source review pass. Current root source `042d8b6` passed scoped production
-Clippy on Windows and remote Ubuntu in
-[run 37318364299](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37318364299).
-Full tests, release packaging and native interoperability remain separate.
-The writer actor correction `025282a` also passed scoped format and strict
-production Clippy on Windows and remote Ubuntu in
-[run 37322606976](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37322606976).
-The scoped module-owner bootstrap `cd88746` passed formatting and strict
-production Clippy on Windows and remote Ubuntu in
-[run 37326559091](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/37326559091).
-This is compiler evidence for the helper source, not installed-process or
-native-family qualification. Its scoped gate ran no integration targets.
-Full tests, release packaging and native qualification remain pending.
-The new handshake/receipt/checks batch has source hashes, formatting and metadata
-shape checks; its combined compiler gate remains pending at this publication.
-These seven packages do not complete the Store/kernel, bus, supervisor or adapter
-split. They create the shared boundary those modules can consume independently.
+These shared packages establish the compile-time and IPC contract boundaries consumed by the kernel, frontends, standalone workers and runtime adapters. Historical CI run logs and commit receipts are tracked in [Implementation Status](../implementation-status.md).

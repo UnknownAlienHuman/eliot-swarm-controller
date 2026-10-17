@@ -52,7 +52,7 @@ For direct or automatic dispatch, recheck current Task/revision, relevant pool m
 
 One manager owns one mutable worktree and one in-flight product candidate. Writers work on non-overlapping parts of that Issue and return their changes for integration; they do not publish separate fragments. A pool may contain several authorized managers without merging their workspace ownership.
 
-Filter readiness before page limits and keep manager order unless they chose ranking. Capacity waits retain the subject and wake when capacity changes, not repeatedly start rejected jobs. Routes sharing a provider account share its budget. Ordinary local review/delivery must work without GitHub setup or optional script interpreters.
+Filter readiness before page limits and keep manager order unless they chose ranking. Capacity waits retain the subject in relational SQLite tables (`active_slots`, `reserved_slots` — Agent of Empires pattern, never a `meta` JSON blob) and wake when capacity changes, not repeatedly start rejected jobs. Routes sharing a provider account share its budget. Ordinary local review/delivery must work without GitHub setup or optional script interpreters.
 
 ## 4. Exact triggers, not a chain that must have started automatically
 
@@ -154,7 +154,7 @@ Audit, acceptance, upload, push, PR merge, Issue closure and cleanup remain sepa
 
 ### Intake and feedback loops
 
-Use one Rust client/rate boundary with private local repository/credential handles. Inventory actual read/Issue/PR/Check/Contents permissions. Raw-body HMAC, repository/installation validation, durable intake before ACK, dedupe and conditional paged reconciliation handle missing/duplicate/unordered webhooks. Permission failure is not proven deletion.
+Use the `octocrab` donor crate as the single Rust GitHub client and rate-pacing boundary with private local repository/credential handles (never a handwritten HTTP stack). Inventory actual read/Issue/PR/Check/Contents permissions. Raw-body HMAC, repository/installation validation, durable intake before ACK, dedupe and conditional paged reconciliation handle missing/duplicate/unordered webhooks. Permission failure is not proven deletion.
 
 The event does not choose its owner, credentials or executable policy. ELIOT-generated labels/Checks/comments are correlated projections; their webhook echoes must not revise Task requirements or trigger another identical action. Do not ignore every bot/user comment by username: preserve genuinely new selected normative content and uncertain-source gaps. Frozen requirements change only through the normal authorized Task revision path.
 
