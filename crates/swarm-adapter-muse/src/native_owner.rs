@@ -14,11 +14,12 @@ use std::{
     fmt,
     io,
     path::PathBuf,
-    process::{ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    time::Duration,
 };
 use tokio::{
     io::AsyncReadExt,
-    process::{Child, ChildStderr, Command},
+    process::{ChildStderr, ChildStdin, ChildStdout},
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
@@ -76,6 +77,7 @@ struct StderrDrain {
 /// never kills the process. Its result says nothing about owner-group state.
 pub struct NativeDirectChild {
     child: Child,
+    observed_exit: Option<ExitStatus>,
     stderr_drain: Option<StderrDrain>,
     stderr_result: Option<NativeStderrResult>,
 }
@@ -83,7 +85,7 @@ pub struct NativeDirectChild {
 impl fmt::Debug for NativeDirectChild {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeDirectChild")
-            .field("pid", &self.child.id())
+            .field("pid", &self.id())
             .field(
                 "stderr_drain_finished",
                 &self
@@ -97,12 +99,23 @@ impl fmt::Debug for NativeDirectChild {
 
 impl NativeDirectChild {
     pub fn id(&self) -> Option<u32> {
-        self.child.id()
+        self.observed_exit.is_none().then(|| self.child.id())
     }
 
     /// Observe only this process. No timeout or kill is applied.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
+        if let Some(status) = self.observed_exit {
+            return Ok(status);
+        }
+        loop {
+            // Never move the std Child into an abortable future or task. A
+            // failed observation or cancelled wait retains this exact handle.
+            if let Some(status) = self.child.try_wait()? {
+                self.observed_exit = Some(status);
+                return Ok(status);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// Wait for stderr EOF and return only closed, allowlisted metadata.
@@ -122,6 +135,22 @@ impl NativeDirectChild {
         self.stderr_drain = None;
         self.stderr_result = Some(result.clone());
         result
+    }
+}
+
+impl Drop for NativeDirectChild {
+    fn drop(&mut self) {
+        // Same retain-until-observed rule as the Host supervisor reapers.
+        // There is no generic public reaper in swarm-process and no detached
+        // fallback here. Call close_and_wait_direct before dropping an attached
+        // child: Drop does not bypass the MSP submission barrier by closing its
+        // externally owned stdin. It may block until the direct process exits.
+        while self.observed_exit.is_none() {
+            match self.child.wait() {
+                Ok(status) => self.observed_exit = Some(status),
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
     }
 }
 
@@ -160,6 +189,10 @@ impl NativeOwnedChild {
 pub enum NativeOwnerStartError {
     AdapterOwnerUnverified,
     Spawn(io::Error),
+    AsyncStdioUnavailable {
+        kind: io::ErrorKind,
+        direct_child: NativeDirectChild,
+    },
     PipedStdioUnavailable { direct_child: NativeDirectChild },
     TransportUnavailable {
         reason: TransportEnd,
@@ -167,11 +200,31 @@ pub enum NativeOwnerStartError {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeStartEffect {
+    NotStarted,
+    PossiblyStarted,
+}
+
+impl NativeOwnerStartError {
+    pub fn native_effect(&self) -> NativeStartEffect {
+        match self {
+            Self::AdapterOwnerUnverified | Self::Spawn(_) => NativeStartEffect::NotStarted,
+            Self::AsyncStdioUnavailable { .. }
+            | Self::PipedStdioUnavailable { .. }
+            | Self::TransportUnavailable { .. } => NativeStartEffect::PossiblyStarted,
+        }
+    }
+}
+
 impl fmt::Display for NativeOwnerStartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AdapterOwnerUnverified => f.write_str("MUSE_ADAPTER_OWNER_UNVERIFIED"),
             Self::Spawn(error) => write!(f, "MUSE_NATIVE_SPAWN_{:?}", error.kind()),
+            Self::AsyncStdioUnavailable { kind, .. } => {
+                write!(f, "MUSE_NATIVE_POST_SPAWN_STDIO_{kind:?}")
+            }
             Self::PipedStdioUnavailable { .. } => f.write_str("MUSE_NATIVE_STDIO_UNAVAILABLE"),
             Self::TransportUnavailable { reason, .. } => {
                 write!(f, "MUSE_NATIVE_TRANSPORT_{reason:?}")
@@ -185,7 +238,9 @@ impl Error for NativeOwnerStartError {
         match self {
             Self::Spawn(error) => Some(error),
             Self::TransportUnavailable { reason, .. } => Some(reason),
-            Self::AdapterOwnerUnverified | Self::PipedStdioUnavailable { .. } => None,
+            Self::AdapterOwnerUnverified
+            | Self::AsyncStdioUnavailable { .. }
+            | Self::PipedStdioUnavailable { .. } => None,
         }
     }
 }
@@ -201,21 +256,7 @@ pub async fn spawn_owned(
     swarm_process::module_owner::verify_current_adapter_from_env()
         .map_err(|_| NativeOwnerStartError::AdapterOwnerUnverified)?;
 
-    let mut child = build_command(&spec)
-        .spawn()
-        .map_err(NativeOwnerStartError::Spawn)?;
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr_drain = child.stderr.take().map(drain_stderr);
-    let direct_child = NativeDirectChild {
-        child,
-        stderr_drain,
-        stderr_result: None,
-    };
-
-    let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
-        return Err(NativeOwnerStartError::PipedStdioUnavailable { direct_child });
-    };
+    let (direct_child, stdin, stdout) = spawn_piped(build_command(&spec), attach_stdio)?;
 
     match MspTransport::attach_owned_stdio(stdout, stdin, server, Options::default()) {
         Ok((transport, notifications)) => Ok(NativeOwnedChild {
@@ -230,15 +271,63 @@ pub async fn spawn_owned(
     }
 }
 
+type AsyncStdio = (ChildStdin, ChildStdout, ChildStderr);
+
+fn attach_stdio(
+    stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+) -> io::Result<AsyncStdio> {
+    Ok((
+        ChildStdin::from_std(stdin)?,
+        ChildStdout::from_std(stdout)?,
+        ChildStderr::from_std(stderr)?,
+    ))
+}
+
+fn spawn_piped(
+    mut command: Command,
+    attach: impl FnOnce(
+        std::process::ChildStdin,
+        std::process::ChildStdout,
+        std::process::ChildStderr,
+    ) -> io::Result<AsyncStdio>,
+) -> Result<(NativeDirectChild, ChildStdin, ChildStdout), NativeOwnerStartError> {
+    // std Command::spawn is the OS-creation boundary. Unlike Tokio 1.53.1
+    // Command::spawn, it performs no subsequent reactor/pidfd registration.
+    // Install direct custody before the first fallible async pipe conversion.
+    let child = command.spawn().map_err(NativeOwnerStartError::Spawn)?;
+    let mut direct_child = NativeDirectChild {
+        child,
+        observed_exit: None,
+        stderr_drain: None,
+        stderr_result: None,
+    };
+    let (Some(stdin), Some(stdout), Some(stderr)) = (
+        direct_child.child.stdin.take(),
+        direct_child.child.stdout.take(),
+        direct_child.child.stderr.take(),
+    ) else {
+        return Err(NativeOwnerStartError::PipedStdioUnavailable { direct_child });
+    };
+    let (stdin, stdout, stderr) = match attach(stdin, stdout, stderr) {
+        Ok(pipes) => pipes,
+        Err(error) => return Err(NativeOwnerStartError::AsyncStdioUnavailable {
+            kind: error.kind(),
+            direct_child,
+        }),
+    };
+    direct_child.stderr_drain = Some(drain_stderr(stderr));
+    Ok((direct_child, stdin, stdout))
+}
+
 fn build_command(spec: &NativeClientSpec) -> Command {
     let mut command = Command::new(&spec.executable);
     command
         .args(&spec.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // The verified outer module owner retains non-killing group custody.
-        .kill_on_drop(false);
+        .stderr(Stdio::piped());
     if let Some(current_dir) = &spec.current_dir {
         command.current_dir(current_dir);
     }
@@ -246,7 +335,7 @@ fn build_command(spec: &NativeClientSpec) -> Command {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NO_WINDOW);
     }
     command
 }
@@ -333,11 +422,18 @@ mod tests {
             };
             let mut command = build_command(&spec);
             command.env(FIXTURE_ENV, case);
-            let mut child = command.spawn().expect("synthetic child starts");
-            let mut stdin = child.stdin.take().expect("piped stdin");
-            let mut stdout = child.stdout.take().expect("piped stdout");
-            let stderr = child.stderr.take().expect("piped stderr");
-            let mut stderr_drain = drain_stderr(stderr);
+            let (mut child, mut stdin, mut stdout) =
+                spawn_piped(command, attach_stdio).expect("synthetic child starts");
+
+            // The child is blocked on stdin, so this poll deterministically
+            // suspends. Cancelling this wait must leave its std Child retained.
+            let mut pending_wait = Box::pin(child.wait());
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(pending_wait.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(pending_wait);
 
             stdin
                 .write_all(b"accepted-before-eof\n")
@@ -352,13 +448,10 @@ mod tests {
                 .await
                 .expect("read synthetic stdout to EOF");
             let status = child.wait().await.expect("observe direct child exit");
-            let stderr = (&mut stderr_drain.result)
-                .await
-                .expect("stderr drain task result");
-            stderr_drain.task.await.expect("stderr drain task");
+            let stderr = child.wait_stderr_closed().await;
 
             assert!(status.success());
-            assert_eq!(output, b"stdin-eof\n");
+            assert_eq!(output.as_slice(), b"stdin-eof\n");
             match (stderr, expected_code) {
                 (NativeStderrResult::Closed { error_code: Some(actual) }, Some(expected)) => {
                     assert_eq!(actual, expected);
@@ -371,6 +464,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn injected_post_spawn_attachment_failure_retains_unknown_child_until_wait() {
+        let spec = NativeClientSpec {
+            executable: std::env::current_exe().expect("test executable path"),
+            args: vec![
+                "--exact".into(), FIXTURE_TEST.into(),
+                "--ignored".into(), "--nocapture".into(),
+            ],
+            current_dir: None,
+        };
+        let mut command = build_command(&spec);
+        command.env(FIXTURE_ENV, "attach_failure");
+        let error = match spawn_piped(command, |_stdin, _stdout, _stderr| {
+            Err(io::Error::other("injected local attachment failure"))
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("injected attachment must fail"),
+        };
+        assert_eq!(error.native_effect(), NativeStartEffect::PossiblyStarted);
+        let NativeOwnerStartError::AsyncStdioUnavailable {
+            mut direct_child, ..
+        } = error else {
+            panic!("post-spawn failure must return the exact child");
+        };
+        assert!(direct_child.id().is_some());
+        let status = direct_child.wait().await.expect("recover direct exit");
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(direct_child.id(), None);
+        // Dropping after observed exit is safe; no no-effect or family claim.
+        drop(direct_child);
+    }
+
     #[test]
     #[ignore = "spawned only by the synthetic owned-child pipe fixture"]
     fn synthetic_native_child_fixture() {
@@ -381,6 +506,9 @@ mod tests {
         std::io::stdin()
             .read_to_end(&mut input)
             .expect("read until parent closes stdin");
+        if case == "attach_failure" {
+            std::process::exit(23);
+        }
         if input != b"accepted-before-eof\n" {
             std::process::exit(91);
         }
