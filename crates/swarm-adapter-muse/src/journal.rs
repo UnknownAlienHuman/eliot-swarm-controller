@@ -19,7 +19,9 @@
 //! exact-root read; capture_projection/retain_observations for the shared fold;
 //! authorize_session before and after child reads; capture_pending_inventory
 //! and atomically pair its reduced projector using retain_observations; finally
-//! prepare_command and synchronously enqueue PreparedNative's exact invocation.
+//! native_invocation (for explicitly granted session MCP config), prepare_command
+//! and synchronously enqueue PreparedNative's exact invocation. NativeInvocation::new
+//! has no grant authority and always rejects config, including an empty map.
 //! The compatibility prepare_native seam is same-worker/root-only; it cannot
 //! supply context, child authority or an MCP grant. Driver must use prepare_command.
 //! Cross-worker agent.reconcile uses retained_command/retained_invocation and
@@ -176,11 +178,16 @@ fn instance_token(boot:&str)->Result<String,Fault> {
 /// Exact saved JSON plus SHA-256 of its canonical JSON value, matching the
 /// public SDK's value-equivalent command signature contract. Byte equality is
 /// additionally required for saved ACKs and delivery retirement; no text repair.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SavedJson {
     utf8: String,
     sha256: Sha256Digest,
+}
+impl fmt::Debug for SavedJson {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
+        f.debug_struct("SavedJson").field("bytes",&self.utf8.len()).field("sha256",&self.sha256).finish()
+    }
 }
 impl SavedJson {
     fn new(value: &Value) -> Result<Self, Fault> {
@@ -219,16 +226,14 @@ fn closed_shape(s: &Value, v: &Value, depth: usize) -> Result<(), Fault> {
             return if arms.iter().any(|arm| closed_shape(arm, v, depth + 1).is_ok()) { Ok(()) } else { Err(Fault::InvalidState) };
         }
     }
-    if let Some(value) = s.get("const") { if value != v { return Err(Fault::InvalidState); } }
-    if let Some(values) = s["enum"].as_array() { if !values.contains(v) { return Err(Fault::InvalidState); } }
+    if let Some(value) = s.get("const") && value != v { return Err(Fault::InvalidState); }
+    if let Some(values) = s["enum"].as_array() && !values.contains(v) { return Err(Fault::InvalidState); }
     if let Some(ty) = s.get("type") {
         let matches = |ty: &str| match ty { "object" => v.is_object(), "array" => v.is_array(), "string" => v.is_string(), "null" => v.is_null(), "boolean" => v.is_boolean(), "integer" => v.as_i64().is_some() || v.as_u64().is_some(), "number" => v.is_number(), _ => false };
         if !ty.as_str().is_some_and(matches) && !ty.as_array().is_some_and(|types| types.iter().any(|ty| ty.as_str().is_some_and(matches))) { return Err(Fault::InvalidState); }
     }
     if let Some(object) = v.as_object() {
-        if let Some(required) = s["required"].as_array() {
-            if required.iter().any(|key| key.as_str().is_none_or(|key| !object.contains_key(key))) { return Err(Fault::InvalidState); }
-        }
+        if let Some(required) = s["required"].as_array() && required.iter().any(|key| key.as_str().is_none_or(|key| !object.contains_key(key))) { return Err(Fault::InvalidState); }
         for (key, value) in object {
             if let Some(property) = s["properties"].get(key) { closed_shape(property, value, depth + 1)?; }
             else if let Some(additional) = s.get("additionalProperties").filter(|s| s.is_object()) { closed_shape(additional, value, depth + 1)?; }
@@ -285,6 +290,10 @@ impl NativeInvocation {
         command_id: &str,
         params: Map<String, Value>,
     ) -> Result<Self, Fault> {
+        if params.contains_key("config") {return Err(Fault::GrantRequired);}
+        Self::from_admitted_params(scope,method,command_id,params)
+    }
+    fn from_admitted_params(scope:&Scope,method:&str,command_id:&str,params:Map<String,Value>)->Result<Self,Fault> {
         let params = SavedJson::new(&Value::Object(params))?;
         let invocation = Self {
             method: method.into(),
@@ -322,6 +331,9 @@ impl NativeInvocation {
         { return Err(Fault::ScopeMismatch); }
         schema::validate_method_parameters(&self.method, &params).map_err(|_| Fault::InvalidState)?;
         closed_shape(schema::method_parameters_schema(&self.method).map_err(|_| Fault::InvalidState)?, &params, 0)?;
+        if let Some(config)=params.get("config")
+            && (self.method!="session/start" || config.as_object().is_none_or(|object|object.len()!=1 || !object.contains_key("mcpServers")))
+        {return Err(Fault::InvalidState);}
         if self.method == "session/resume" && params["excludeItems"] != true { return Err(Fault::InvalidState); }
         if matches!(self.method.as_str(), "goal/set" | "goal/edit") {
             let objective = params["objective"].as_str().ok_or(Fault::InvalidState)?;
@@ -584,7 +596,7 @@ impl RetainedCommandContext {
         if let Some(family)=&self.family {family.validate(scope,invocation.params()?["sessionId"].as_str().ok_or(Fault::InvalidState)?)?;}
         match self.encoding(scope)? {
             commands::CommandEncoding::Native{request,requested,..} if request.method==invocation.method && request.params==invocation.params()? => {
-                if let Some(requested)=requested {if requested!=self.requested.encoder(){return Err(Fault::IntentConflict);}}
+                if let Some(requested)=requested && requested!=self.requested.encoder(){return Err(Fault::IntentConflict);}
                 Ok(())
             },
             _=>Err(Fault::IntentConflict),
@@ -1027,6 +1039,15 @@ impl Journal {
     }
     pub fn retained_invocation(&self,scope:&Scope,operation_id:&str)->Result<&NativeInvocation,Fault> {
         self.healthy(scope)?;self.state.operations.get(operation_id).and_then(|op|op.native.as_ref()).map(|n|&n.invocation).ok_or(Fault::IntentConflict)
+    }
+    /// The only public construction path for session/start.config. The grant
+    /// comes from this journal's CURRENT validated initialize result, never a
+    /// caller boolean/requested capability. Closed schema validation retains
+    /// only the admitted mcpServers union; preparation/replay recheck the grant.
+    pub fn native_invocation(&self,scope:&Scope,method:&str,command_id:&str,params:Map<String,Value>)->Result<NativeInvocation,Fault> {
+        self.healthy(scope)?;
+        if params.contains_key("config") && (!self.initialized || !self.session_mcp_granted) {return Err(Fault::GrantRequired);}
+        NativeInvocation::from_admitted_params(scope,method,command_id,params)
     }
     /// Persist context AND intent in one replacement before returning a permit.
     /// Required Driver entry for durable cross-worker commands. The caller must
@@ -2063,9 +2084,8 @@ mod tests {
         let id="019a0000-0000-7000-8000-000000000002";
         let params=json!({"commandId":id,"sessionId":fixture.scope.native_root_id,"mode":"onRequest"});
         let setting=NativeInvocation::new(&fixture.scope,"session/setApprovalMode",id,params.as_object().unwrap().clone()).unwrap();
-        let setting_ack=json!({"commandId":id,"status":"accepted","applyOutcome":"noop","effectiveMode":{"mode":"onRequest","source":"session","lastCommandId":id}});
+        let mut setting_ack=json!({"commandId":id,"status":"accepted","applyOutcome":"noop","effectiveMode":{"mode":"onRequest","source":"session","lastCommandId":id}});
         // The enum is read from the complete public schema, not hand guessed.
-        let mut setting_ack=setting_ack;
         let source=schema::definition_schema("ApprovalModeSource").unwrap()["enum"][0].clone();
         setting_ack["effectiveMode"]["source"]=source;
         validate_ack(&fixture.scope,&setting,&setting_ack).unwrap();
@@ -2090,11 +2110,17 @@ mod tests {
         let servers=json!({"explicit":{"transport":"stdio","command":"explicit-binary","args":["--explicit"],"mode":"required"}});
         let mut command=fixture.command("open","agent.open",json!({}));command.route["native_options"]["mcpServers"]=servers.clone();
         let base=fixture.invocation(4,"session/start");let mut params=base.params().unwrap();params.insert("config".into(),json!({"mcpServers":servers}));
-        let invocation=NativeInvocation::new(&fixture.scope,"session/start",base.command_id(),params.clone()).unwrap();
-        assert!(matches!(journal.prepare_command(&fixture.scope,fixture.receipt("open"),command.clone(),invocation.clone(),RetainedSelectors::default()),Err(Fault::GrantRequired)));
-        let mut invalid=Value::Object(params);invalid["config"]["mcpServers"]["explicit"]["transport"]=json!("futureTransport");
-        assert!(NativeInvocation::new(&fixture.scope,"session/start",base.command_id(),invalid.as_object().unwrap().clone()).is_err());
+        assert!(matches!(NativeInvocation::new(&fixture.scope,"session/start",base.command_id(),params.clone()),Err(Fault::GrantRequired)));
+        assert!(matches!(journal.native_invocation(&fixture.scope,"session/start",base.command_id(),params.clone()),Err(Fault::GrantRequired)));
         fixture.initialize(&mut journal,true);
+        let invocation=journal.native_invocation(&fixture.scope,"session/start",base.command_id(),params.clone()).unwrap();
+        fixture.initialize(&mut journal,false);
+        assert!(matches!(journal.prepare_command(&fixture.scope,fixture.receipt("open"),command.clone(),invocation.clone(),RetainedSelectors::default()),Err(Fault::GrantRequired)));
+        fixture.initialize(&mut journal,true);
+        let mut invalid=Value::Object(params.clone());invalid["config"]["mcpServers"]["explicit"]["transport"]=json!("futureTransport");
+        assert!(matches!(journal.native_invocation(&fixture.scope,"session/start",base.command_id(),invalid.as_object().unwrap().clone()),Err(Fault::InvalidState)));
+        let mut private=Value::Object(params);private["config"]["modelProviderKey"]=json!("forbidden");
+        assert!(matches!(journal.native_invocation(&fixture.scope,"session/start",base.command_id(),private.as_object().unwrap().clone()),Err(Fault::InvalidState)));
         drop(journal.prepare_command(&fixture.scope,fixture.receipt("open"),command,invocation.clone(),RetainedSelectors::default()).unwrap());
         drop(journal);let mut journal=fixture.reopen();fixture.initialize(&mut journal,false);
         assert!(matches!(journal.explicit_reconcile(&fixture.scope,"open",invocation.payload_sha256()),Err(Fault::GrantRequired)));
