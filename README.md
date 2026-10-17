@@ -6,6 +6,8 @@ Eliot Memory OS is not yet connected on the owner machine. The standalone contro
 
 The current owner scope is contracts and integration preparation only. Runtime implementation and use await a separate owner instruction.
 
+For development, start with [AGENTS.md](AGENTS.md) and the [V3 refactoring map](docs/agent-operations/refactoring.md): current-source findings, completed audit items, migration order and exact package seams. V3 is the target; the implementation and qualification matrix below remains scoped evidence.
+
 ## Current implementation — 0.1.0
 
 The Rust core provides authenticated clients, task revisions/ownership, durable request receipts, directed mailbox, incremental reports, binding-scoped module admission, immutable artifacts, submission/review and acceptance. Windows uses user-restricted Named Pipes; Unix uses a private socket. No TCP control listener is opened.

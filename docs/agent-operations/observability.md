@@ -119,12 +119,16 @@ retention_days = 7
 
 The exact host `ObservabilityConfig` fields are `enabled`, optional `directory`
 and `live_config_file`, `queue_records`, `queue_bytes`, `max_record_bytes`,
-`file_segment_bytes`, `retention_bytes`, and `retention_days`. `swarm-telemetry`
-and `swarm-observer` implement this configuration directly over `tracing`,
-`tracing-subscriber::reload` (for dynamic level/scope updates without restart),
-`tracing-appender::non_blocking` (bounded with both record and byte accounting),
-and `atlas-redact` (`vendor/atlas`). Do not maintain a second parallel handwritten
-logging framework alongside `tracing`. `Store` installs the `atlas-redact` text
+`file_segment_bytes`, `retention_bytes`, and `retention_days`. V3 requires
+`swarm-telemetry` and `swarm-observer` to migrate this configuration to `tracing`,
+`tracing-subscriber::reload` (dynamic level/scope updates), `tracing-appender`
+and the already used `atlas-redact` (`vendor/atlas`). The current implementation
+uses its own Producer/HostRecorder; [source status](refactoring.md) does not claim
+a completed tracing migration. The reviewed [appender 0.2.5 API](https://docs.rs/tracing-appender/0.2.5/tracing_appender/non_blocking/struct.NonBlockingBuilder.html)
+bounds buffered lines, not aggregate bytes: preserve `queue_bytes` and
+`max_record_bytes` in the same sink adapter, with explicit drop accounting and
+independent stderr/file failure handling. Replace old logging plumbing as callers
+move; do not retain a second logging framework alongside tracing. `Store` installs the `atlas-redact` text
 redactor and observer text-capture policy before constructing the Producer. Raw
 text is never serialized: `atlas-redact` scrubbing precedes observer-line text
 serialization and queue admission, while ordinary stderr remains metadata-only.

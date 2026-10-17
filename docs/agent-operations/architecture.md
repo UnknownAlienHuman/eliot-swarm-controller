@@ -1,12 +1,14 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 15 · 2026-10-17 · Canonical Version 3 Architecture.
+Revision 16 · 2026-10-17 · Canonical Version 3 Architecture.
+
+This is the refactoring target. The [source map](refactoring.md) identifies its current gaps and existing owners; historical implementation/qualification claims remain revision-scoped.
 
 [Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) defines mandatory Rust crate and vendor SDK reuse.
 
 ## 1. One Rust control plane with effective donor and SDK reuse
 
-All owned host/Store, authorization, configuration, IPC, supervision, monitoring, GitHub, hooks, distribution/review, cron, Goal, MCP/gateway and script-runner orchestration is Rust. Within Rust, subsystems use maintained donor libraries (`rmcp`, `agent-client-protocol`, `octocrab`, `croner`, `sysinfo`, `notify`, `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact`, `cccc-windows-process`) rather than handwritten reimplementations. For vendor runtimes whose official protocol is shipped as an official SDK (`@muse-code/sdk`, `@anthropic-ai/claude-agent-sdk`, `@opencode/server`, `openai-codex`), the Rust adapter owns `ModuleLink`, supervision, digests and Store receipts while delegating native session/stream protocol handling to the official Rust protocol crate or a thin stateless vendor SDK driver. Python/PowerShell remain optional external script extensions. New adapter settings do not restart existing work implicitly.
+All owned host/Store, authorization, configuration, IPC, supervision, monitoring, GitHub, hooks, distribution/review, cron, Goal, MCP/gateway and script-runner orchestration is Rust. Within Rust, subsystems use maintained donor libraries (`rmcp`, `agent-client-protocol`, `octocrab`, `croner`, `sysinfo`, `notify`, `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact`, `cccc-windows-process`) rather than handwritten reimplementations. For vendor runtimes whose official protocol is shipped as an official SDK (`@muse-code/sdk`, `@anthropic-ai/claude-agent-sdk`, `@opencode/server`, `openai-codex`), the Rust adapter owns `ModuleLink`, supervision, digests and Store receipts while using the official Rust protocol crate, the documented native protocol directly (for example Codex app-server or OpenCode HTTP/SSE), or a thin official-SDK driver as specified in the [donor map](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries). A driver may retain native protocol/session handles; durable ELIOT work, ownership and retry policy stay in Rust/Store. Python/PowerShell remain optional external script extensions. New adapter settings do not restart existing work implicitly.
 
 ### 1.0 Build, process and observability boundaries
 
@@ -74,9 +76,29 @@ queued or proven pre-effect result, and terminal status alone must not erase a
 recorded attempt. Parsing literal JSON `null` succeeds, but `null` is not a
 usable terminal domain result; SQL `NULL` is missing evidence.
 
-**Schema evolution and canonical comparison rules (anti-fragility):**
-- **External vs. internal validation:** Public mutation inputs (`TaskSpec`, `automation.config.apply` patches) validate known fields strictly. Internal IPC envelopes, persisted Store projections, build manifests, and diagnostic receipts **must be forward-compatible**—never attach `#[serde(deny_unknown_fields)]` to internal readers where an additive optional field (such as a digest or diagnostic tag) from a newer producer would brick deserialization.
-- **Canonical digest and JSON identity:** Normalize all SHA-256 digests at the ingestion boundary to 64 lowercase hexadecimal characters (stripping any optional `sha256:` prefix before comparison or storage). Never compare structured JSON payloads by raw unparsed text equality (`TEXT == TEXT`); compare parsed semantic fields or canonical RFC 8785 / JCS digests where content equivalence is required.
+### Schema and identity boundaries
+
+Compatible optional projection/diagnostic metadata must not break internal readback.
+Remove `deny_unknown_fields` from a reader when it rejects such additive fields;
+validate its required identity, bounds and schema version explicitly. Mutation
+commands, grants and authoritative receipts keep their required-field and authority
+checks. Unknown fields never grant capabilities. Use the existing bounded extension
+envelope where fields must be retained; reject an incompatible command/version
+before effect. Change each producer and consumer together rather than deleting
+serde attributes repository-wide.
+
+| Identity boundary | Required comparison |
+| --- | --- |
+| User/config ingestion of SHA-256 | Normalize accepted hexadecimal case to 64 lowercase characters. Strip `sha256:` only for a field whose input grammar permits that prefix. |
+| Stored receipt/artifact identity | Validate its declared representation and compare the exact digest. Bare hex, prefixed image identity and Git object IDs remain distinct contracts. |
+| Structured JSON content equality | Compare parsed semantic fields or the canonical serializer owned by that versioned contract. Use `Sha256Digest::of_canonical_json` for protected artifacts and the existing ScriptRun v1 helper for ScriptRun inputs. |
+| Exact TaskPrompt, artifact, native payload or journal/ACK bytes | Preserve and hash the exact retained bytes. Semantic equality cannot replace an explicit byte-identity contract. |
+
+A new canonical-JCS contract must be versioned if its bytes differ from an existing
+serializer; recursively sorted serde JSON is not automatically RFC 8785. Do not
+rehash historical receipts, rewrite frozen policy editions or add one universal
+permissive digest helper. Compatible native software can be selected without
+weakening integrity checks on the selected local binary and manifest.
 
 Migration `011` captures new `cancelled` Operations and transitions into that
 state by the same transaction rule. The occurrence names the cancelled target
@@ -113,8 +135,8 @@ uncertain until exact readback; restarting a host or changing managers does not
 authorize a second effect or rewrite its original actor.
 
 **SQLite architecture and storage discipline:**
-1. **Single writer, pooled WAL readers:** `swarm-store` / `swarm-kernel` maintains one serialized `IMMEDIATE` writer connection for state mutations and a **read-only WAL connection pool** (`SQLITE_OPEN_READ_ONLY`, `PRAGMA query_only = ON`) for all read-only operations (`*.get`, `*.list`, `dashboard`, `report.delta`, `automation.config.explain`, `runtime.catalog`). Read queries must execute directly against the WAL read pool and **must never block in the single writer actor queue**.
-2. **Relational tables, never `meta` key-value blobs:** The `meta` table is reserved strictly for scalar database/host identity (schema version, data-root identity, host epoch). Storing collections, queues, cursors, task projections, hex-encoded composite keys, or a serialized `CapacityLedger` JSON blob in `meta` is **forbidden**. All domain records, per-entry cursors, pending subjects, review slots, and capacity reservations (`active_slots`, `reserved_slots` following the Agent of Empires relational pattern) must live in dedicated relational tables with proper primary/foreign keys and SQL indexes.
+1. **Single writer, pooled WAL readers:** `swarm-store` / `swarm-kernel` maintains one serialized `IMMEDIATE` writer connection for state mutations and a **read-only WAL connection pool** (`SQLITE_OPEN_READ_ONLY`, `PRAGMA query_only = ON`) for all read-only operations (`*.get`, `*.list`, `dashboard`, `report.delta`, `automation.config.explain`, `runtime.catalog`). Read queries must execute directly against the WAL read pool and **must never block in the single writer actor queue**. Route by inspected handler semantics, not a `get`/`list` suffix: stream registry operations, dequeue/admission and DB-plus-file reads have separate owners. Each SQL read uses one short snapshot for current-principal validation, authorization and projection. The [migration map](refactoring.md#wal-migration-detail) defines incremental cutover from the current reader.
+2. **Relational tables, never `meta` key-value blobs:** The `meta` table is reserved strictly for scalar database/host identity (schema version, data-root identity, host epoch). Storing collections, queues, cursors, task projections, hex-encoded composite keys, or a serialized `CapacityLedger` JSON blob in `meta` is **forbidden**. All domain records, per-entry cursors, pending subjects, review slots, and capacity reservations must live in dedicated relational tables with proper primary/foreign keys and SQL indexes. Preserve active-plus-reserved accounting from the [Agent of Empires pattern](donor-map.md#8-architectural-donor-patterns); relational durability is ELIOT's implementation requirement.
 3. **Single-copy payload storage:** Large assistant outputs, normalized result pages, and check/script `stdout`/`stderr` captures are persisted once (in content-addressed artifact storage or the dedicated result page table) and referenced by ID and SHA-256 digest. Never duplicate full result bodies across `operations.result_json`, `observations.payload_json`, and `meta`.
 
 For committed `rejected`, `cancelled` and `outcome_unknown` state, the Store-level capture
@@ -306,9 +328,22 @@ Redact across chunk boundaries using `atlas-redact`; buffer bounded logical reco
 Every runtime adapter must return the completed assistant output for an admitted `task.dispatch` or `agent.send` Operation through `swarm.normalized_result_page@1`. Adapters use a two-level deterministic correlation hierarchy:
 
 1. **Level 1 — Explicit native parent/request pointer:** When the vendor wire protocol includes the originating request or input message ID on assistant items and turn completions (such as Codex JSON-RPC `app-server`), the adapter verifies and records that exact native parent pointer.
-2. **Level 2 — Serialized active-turn / busy-window correlation (Waku / Paseo pattern):** When the vendor wire protocol streams assistant chunks, tool calls, and turn-completion events scoped to a session or turn without repeating a parent-input ID on every assistant message (such as OpenCode HTTP/SSE, Antigravity ACP/headless, or Claude stream-json), the adapter enforces single-flight turn execution on `(binding_id, binding_generation, native_session_id)` and binds the active turn's stream accumulator directly to the admitted `task.dispatch` / `agent.send` Operation ID. All assistant text and terminal outcome facts observed between turn admission and the turn's terminal event belong deterministically to that Operation.
+2. **Level 2 — Serialized active-turn correlation:** For a session/turn-scoped protocol without repeated parent-input IDs, retain the admitted Operation, binding/generation, native session, stream generation and turn baseline before sending its input. Enforce one independently attributable input in that window, collect only its scoped output, and close it on the matching terminal event. The adapter's retained mapping, not arrival time or the newest assistant message, associates the body with the Operation. Preserve explicit native lineage whenever it exists. Waku supplies a [sequential execution-worker pattern](donor-map.md#8-architectural-donor-patterns); ELIOT supplies its own Operation mapping. Paseo's separately documented initialization/close barriers inform lifecycle serialization, not result attribution.
 
-**Anti-sabotage rule:** Adapters **must never** return `RESULT_BODY_UNAVAILABLE` or leave a completed turn in permanent `Unknown` state merely because a vendor protocol uses Level 2 session/turn scoping instead of Level 1 per-message parent pointers. `RESULT_BODY_UNAVAILABLE` is reserved exclusively for genuine transport truncation or process crash before terminal assistant output was emitted.
+A complete Level 2 window has one admitted input owner, continuous scoped stream
+coverage in the recorded generation, a matching terminal disposition and retained
+body bytes. A second independent input, an unclassified stream gap or a changed
+session/generation is actual ambiguity; reconcile the recorded input without
+resending it. When a complete Level 2 window independently establishes the
+Operation association, a missing per-message parent pointer alone does not make
+that window ambiguous.
+
+**Productive result rule:** return every body whose Level 1 or Level 2 association
+is established through `swarm.normalized_result_page@1`. Do not reject it merely
+because a protocol omits parent pointers. Report actual missing/truncated bytes,
+expired permitted retention or unavailable history after restart with their precise
+availability reason; integrity/origin conflicts remain distinct. A retained digest
+cannot reconstruct a missing body. Result collection does not itself accept a Task.
 
 ## 5. Hooks
 

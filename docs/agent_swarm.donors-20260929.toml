@@ -1,4 +1,6 @@
 schema_version = 1
+# V3 reuse targets: docs/agent-operations/donor-map.md. Historical program decisions
+# and installed/qualification fields below remain revision-scoped inventory facts.
 architecture = "ELIOT Swarm Prototype v18"
 as_of = "2026-10-02"
 status = "mixed_inventory_not_an_install_lock"
@@ -351,7 +353,9 @@ reviewed_pin = "v0.10.3 (commit b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7)"
 reviewed_commit = "b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7"
 installed_pin = "none (pattern only; no code imported)"
 qualification = "none_pattern_only; no installation and no live qualification"
-source_units = ["docs/timeline-sync.md", "packages/server/src/server/agent/timeline-projection.ts"]
+source_units = ["docs/timeline-sync.md", "packages/server/src/server/agent/timeline-projection.ts", "packages/server/src/server/agent/agent-loading.ts"]
+# Rechecked 2026-10-17 at the same commit: agent-loading.ts uses
+# pendingAgentInitializations / waitForAgentClose; adoption and qualification unchanged.
 license_declaration = "Apache-2.0; root LICENSE at v0.10.3 (verified 2026-10-02 against the LICENSE file at the exact tag: Paseo itself is licensed under the Apache License, Version 2.0; third-party components incorporated into Paseo retain the licenses of their respective copyright holders)"
 execution = "Pattern transfer into existing ELIOT boundaries only; this is not permission to copy Paseo source (Documentation Program section 1A preamble)."
 retain = ["Live vs authoritative split", "Epoch/ranges/gaps projection semantics", "Canonical prompt acknowledgment separate from RPC settlement", "Declaration-first children"]

@@ -218,7 +218,7 @@ The runtime uses a single `ModuleSupervisor` (`swarm-supervisor`) to manage all 
 The supervisor keeps cheap installed/configured metadata. Optional workers start
 only for an admitted command, a configured due action, or an explicit live
 subscription. One single-flight start per module/service scope coalesces parallel
-demand (following the Paseo `initializingPromises` pattern). A worker preparing to stop and a concurrent start use one generation/
+demand (following Paseo's `pendingAgentInitializations` single-flight pattern). A worker preparing to stop and a concurrent start use one generation/
 state transition; a late startup response cannot resurrect a disabled worker.
 
 Disabled/unused modules have no task loop, periodic provider read, extra socket,
@@ -263,9 +263,10 @@ not an OS sandbox against arbitrary same-user code or a hard memory/CPU quota.
 
 ### 5.2 Independent update, build and production `src/` hygiene
 
-**Zero inline test bloat or mock binaries in production `src/`:**
-- Production `src/` trees across `swarm-kernel-host`, `swarm-store`, and all `swarm-adapter-*` packages must contain **production code only**.
-- Large integration test suites (`*tests*.rs`) and mock/fake runtime executables (`fake_codex_app_server`, `fake_claude`, `fake_opencode`, etc.) must reside in Cargo `tests/` directories or a dedicated `swarm-test-support` `[dev-dependencies]` crate—never inside `src/` or production `[[bin]]` targets where `cargo check --lib --bins` and `cargo build` are forced to compile 100,000+ lines of test harnesses.
+**Keep large integration suites and mock executables outside production `src/`:**
+
+- Place new integration suites and mock/fake runtime executables (`fake_codex_app_server`, `fake_claude`, `fake_opencode`, etc.) in Cargo `tests/` directories or dev-only support packages. Move existing suites as their implementation seam is extracted; do not expose private production APIs solely to relocate tests.
+- Mock/fake executables must not be production `[[bin]]` targets. Small `#[cfg(test)]` unit tests may remain beside the implementation: they are already excluded from ordinary production builds. Relocation improves source ownership and navigation; it does not by itself establish a runtime or build-time gain.
 
 Place executable artifacts in versioned module directories. Validate compatibility
 and atomically change the selected version for **new** admissions. Existing
