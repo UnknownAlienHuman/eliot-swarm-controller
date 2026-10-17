@@ -5,6 +5,8 @@ mod app320_connected_consumer;
 mod config;
 #[cfg(test)]
 mod control_consumer_tests;
+#[cfg(test)]
+mod input_status_delivery_tests;
 mod journal;
 mod mcp_plugin;
 mod module_link;
