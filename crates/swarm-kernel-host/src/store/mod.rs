@@ -69,6 +69,7 @@ mod module_prelaunch_observation_tests;
 mod module_supervisor_observation;
 mod monitor;
 mod native_mcp;
+mod native_streams;
 mod native_usage;
 mod normalized_result;
 #[cfg(test)]
@@ -174,6 +175,7 @@ impl DisconnectReason {
 
 #[derive(Clone)]
 pub struct Store {
+    native_streams: Arc<std::sync::Mutex<native_streams::NativeStreams>>,
     kernel: KernelHostHandle,
     status_reader: status_reader::Sender,
     config: Arc<Config>,
@@ -453,6 +455,9 @@ impl StoreOwner {
             }
         };
         let store = Store {
+            native_streams: Arc::new(std::sync::Mutex::new(
+                native_streams::NativeStreams::default(),
+            )),
             kernel: kernel_handle,
             status_reader,
             config: config.clone(),
@@ -1896,6 +1901,12 @@ impl Store {
                 "FORBIDDEN",
                 "method is outside this participant's scoped surface",
             ));
+        }
+        if matches!(
+            method.as_str(),
+            "module.stream.publish" | "stream.open" | "stream.read" | "stream.close"
+        ) {
+            return native_streams::call(self, principal, method, params).await;
         }
         if method == "host.status" {
             let mut status = self.status_reader.host_status(principal, params).await?;
@@ -5337,7 +5348,14 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                         registration["participation_basis"]["kind"].as_str(),
                         Some("attempt_owner" | "producer_ref")
                     ) {
-                        allowed.extend(["source.capture", "task.submit", "artifact.read"]);
+                        allowed.extend([
+                            "source.capture",
+                            "task.submit",
+                            "artifact.read",
+                            "stream.open",
+                            "stream.read",
+                            "stream.close",
+                        ]);
                     } else if registration["participation_basis"]["kind"] == "sponsored_reviewer" {
                         allowed.extend([
                             "review.submit",
@@ -5345,6 +5363,9 @@ fn mcp_authorization(db: &Connection, p: &Principal, value: &Value) -> Result<Va
                             "review.list",
                             "swarm.review.context",
                             "artifact.read",
+                            "stream.open",
+                            "stream.read",
+                            "stream.close",
                             "task.submission",
                             "check.get",
                         ]);
