@@ -232,6 +232,8 @@ impl ForgeGitCustody {
             status: None,
             family_departed: false,
             reported_tree_unconfirmed: false,
+            #[cfg(windows)]
+            job_query: NativeWorkerJobQuery::Pending,
         }));
         state.native_workers.push(Arc::clone(&custody));
         Ok(NativeWorkerRun {
@@ -478,6 +480,14 @@ struct NativeWorkerCustody {
     status: Option<std::process::ExitStatus>,
     family_departed: bool,
     reported_tree_unconfirmed: bool,
+    #[cfg(windows)]
+    job_query: NativeWorkerJobQuery,
+}
+
+#[cfg(windows)]
+enum NativeWorkerJobQuery {
+    Pending,
+    Retained(swarm_process::process_group::Group),
 }
 
 impl NativeWorkerCustody {
@@ -497,6 +507,45 @@ impl NativeWorkerCustody {
         self.status.is_none() || !self.family_departed || self.reported_tree_unconfirmed
     }
 
+    #[cfg(windows)]
+    fn retain_job_query(&mut self, owner: &Value) -> Result<()> {
+        if !matches!(&self.job_query, NativeWorkerJobQuery::Pending) {
+            return Ok(());
+        }
+        let group = swarm_process::process_group::Group::open_module_query(
+            &owner["process"],
+            &self.job.owner_token,
+        )?;
+        self.job_query = NativeWorkerJobQuery::Retained(group);
+        Ok(())
+    }
+
+    fn family_empty(&self) -> Result<bool> {
+        #[cfg(windows)]
+        {
+            match &self.job_query {
+                NativeWorkerJobQuery::Retained(group) => Ok(group.family_empty()?),
+                NativeWorkerJobQuery::Pending => Err(Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "Forge worker Job accounting is unavailable",
+                )),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let owner = self.owner_record.as_ref().ok_or_else(|| {
+                Error::new(
+                    "FORGE_GIT_TREE_TERMINATION",
+                    "Forge worker owner receipt is unavailable",
+                )
+            })?;
+            Ok(swarm_process::departed_empty(
+                &owner["process"],
+                &self.job.owner_token,
+            )?)
+        }
+    }
+
     fn poll(&mut self) {
         if self.owner_record.is_none() {
             // Retry the same receipt against the same retained PID and job.
@@ -507,14 +556,14 @@ impl NativeWorkerCustody {
                 self.owner_record = Some(owner);
             }
         }
+        #[cfg(windows)]
+        if let Some(owner) = self.owner_record.clone() {
+            // Retry only this already-validated owner. A failed open remains
+            // unknown and must never be treated as an empty Job.
+            let _ = self.retain_job_query(&owner);
+        }
         let _ = self.observe_exit();
-        if !self.family_departed
-            && let Some(owner) = self.owner_record.as_ref()
-            && matches!(
-                swarm_process::departed_empty(&owner["process"], &self.job.owner_token),
-                Ok(true)
-            )
-        {
+        if !self.family_departed && matches!(self.family_empty(), Ok(true)) {
             self.family_departed = true;
         }
     }
@@ -2220,7 +2269,27 @@ async fn wait_worker_owner(run: &NativeWorkerRun) -> Result<Value> {
                     "worker image identity check did not complete",
                 )
             })??;
-            return Ok(owner);
+            let ready = {
+                let mut custody = run
+                    .custody
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                custody.owner_record = Some(owner.clone());
+                #[cfg(windows)]
+                {
+                    custody.retain_job_query(&owner).is_ok()
+                }
+                #[cfg(not(windows))]
+                {
+                    true
+                }
+            };
+            // The worker is still behind its existing authorization gate.
+            // Do not let any caller authorize Git before its exact Job query
+            // handle has been retained. Keep the existing startup deadline.
+            if ready {
+                return Ok(owner);
+            }
         }
         if run
             .custody
@@ -2237,7 +2306,7 @@ async fn wait_worker_owner(run: &NativeWorkerRun) -> Result<Value> {
         if tokio::time::Instant::now() >= deadline {
             return Err(Error::new(
                 "FORGE_WORKER_START_UNCONFIRMED",
-                "Forge worker owner receipt did not arrive within its startup bound",
+                "Forge worker owner receipt and family accounting did not become ready within the startup bound",
             ));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2313,14 +2382,14 @@ async fn wait_forge_worker(run: NativeWorkerRun, expected_authorized: bool) -> R
         Duration::from_secs(job.timeout_seconds.saturating_add(60)),
     )
     .await?;
-    let owner_process = run.owner_record["process"].clone();
-    let token = job.owner_token.clone();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let process = owner_process.clone();
-        let token = token.clone();
+        let custody = Arc::clone(&run.custody);
         let departed = match tokio::task::spawn_blocking(move || {
-            swarm_process::departed_empty(&process, &token)
+            custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .family_empty()
         })
         .await
         {
@@ -3373,6 +3442,10 @@ fn intent_attempt_task(db: &Connection, intent: &PublicationIntent) -> Result<St
     let attempt = tasks::get_attempt(db, &intent.attempt_id)?;
     Ok(model::text(&attempt, "task_id")?.to_owned())
 }
+
+#[cfg(all(test, windows))]
+#[path = "forge_custody_tests.rs"]
+mod forge_custody_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4940,10 +5013,13 @@ async fn spawn_native_worker(
             return Err(pending);
         }
     };
-    run.custody
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .owner_record = Some(owner_record.clone());
+    {
+        let mut custody = run
+            .custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        custody.owner_record = Some(owner_record.clone());
+    }
     run.owner_record = owner_record;
     Ok(run)
 }

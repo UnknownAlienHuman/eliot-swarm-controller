@@ -19,6 +19,16 @@ const CHILD_STARTED: &str = "MODULE_CUSTODY_GRANDCHILD_STARTED";
 const CHILD_EXITED: &str = "MODULE_CUSTODY_GRANDCHILD_EXITED";
 const FIXTURE_LIFETIME: Duration = Duration::from_secs(50);
 const PIPE_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(windows)]
+const FORGE_QUERY_MODE: &str = "ELIOT_FORGE_QUERY_FIXTURE_MODE";
+#[cfg(windows)]
+const FORGE_QUERY_DIRECTORY: &str = "ELIOT_FORGE_QUERY_FIXTURE_DIRECTORY";
+#[cfg(windows)]
+const FORGE_QUERY_TOKEN: &str = "ELIOT_FORGE_QUERY_FIXTURE_TOKEN";
+#[cfg(windows)]
+const FORGE_QUERY_WORKER_RELEASE: &str = "ELIOT_FORGE_QUERY_FIXTURE_WORKER_RELEASE";
+#[cfg(windows)]
+const FORGE_QUERY_GRANDCHILD_RELEASE: &str = "ELIOT_FORGE_QUERY_FIXTURE_GRANDCHILD_RELEASE";
 
 #[derive(Debug)]
 struct CapturedCli {
@@ -124,6 +134,190 @@ fn custody_fixture_grandchild_process() {
     thread::sleep(FIXTURE_LIFETIME);
     fs::write(fixture_path(FIXTURE_EXIT), CHILD_EXITED).expect("record natural grandchild exit");
     println!("{CHILD_EXITED}");
+}
+
+/// Forge worker fixture: publish exact owner identity, leave a live Job member,
+/// then exit on request so the parent can query the retained Job handle.
+#[cfg(windows)]
+#[test]
+fn forge_query_fixture_worker_process() {
+    if std::env::var(FORGE_QUERY_MODE).as_deref() != Ok("worker") {
+        return;
+    }
+    let directory = fixture_path(FORGE_QUERY_DIRECTORY);
+    let token = std::env::var(FORGE_QUERY_TOKEN).expect("Forge fixture Job token");
+    let group = swarm_process::process_group::Group::enter_module(&token)
+        .expect("create Forge worker Job and attach exact owner");
+    let owner_process = group.identity.clone();
+    let owner_pid = std::process::id();
+    assert_eq!(owner_process["purpose"], "module");
+    assert_eq!(owner_process["pid"].as_u64(), Some(u64::from(owner_pid)));
+    let owner_birth = swarm_process::process_birth_identity(owner_pid)
+        .expect("query Forge worker birth identity")
+        .expect("Forge worker remains live");
+    assert!(
+        same_birth(&owner_process, &owner_birth),
+        "Forge Job owner and process readback must name the same birth identity"
+    );
+    let owner_image = swarm_process::process_image_identity(owner_pid)
+        .expect("query Forge worker image identity");
+
+    let grandchild = Command::new(std::env::current_exe().expect("fixture executable path"))
+        .args([
+            "--exact",
+            "forge_query_fixture_grandchild_process",
+            "--nocapture",
+        ])
+        .env(FORGE_QUERY_MODE, "grandchild")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn Forge worker grandchild in its Job");
+    let grandchild_pid = grandchild.id();
+    let grandchild_birth = swarm_process::process_birth_identity(grandchild_pid)
+        .expect("query Forge grandchild birth identity")
+        .expect("Forge grandchild remains live");
+    let grandchild_image = swarm_process::process_image_identity(grandchild_pid)
+        .expect("query Forge grandchild image identity");
+    let receipt = json!({
+        "owner_process": owner_process,
+        "owner_image": owner_image,
+        "grandchild": {
+            "pid": grandchild_pid,
+            "birth": grandchild_birth,
+            "image": grandchild_image
+        }
+    });
+    fs::write(
+        directory.join("forge-worker-receipt.json"),
+        serde_json::to_vec(&receipt).expect("serialize Forge fixture receipt"),
+    )
+    .expect("publish Forge fixture receipt while owner is live");
+    drop(grandchild);
+
+    let release = fixture_path(FORGE_QUERY_WORKER_RELEASE);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !release.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn forge_query_fixture_grandchild_process() {
+    if std::env::var(FORGE_QUERY_MODE).as_deref() != Ok("grandchild") {
+        return;
+    }
+    let release = fixture_path(FORGE_QUERY_GRANDCHILD_RELEASE);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !release.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Retain the Forge worker's exact Job while it is alive, then prove accounting
+/// still sees its exact live grandchild after the worker closes its owner handle.
+#[cfg(windows)]
+#[test]
+fn forge_worker_retained_query_sees_live_grandchild_after_worker_exit() {
+    let directory = new_test_directory();
+    let token = uuid::Uuid::new_v4().to_string();
+    let worker_release = directory.join("release-worker");
+    let grandchild_release = directory.join("release-grandchild");
+    let receipt_path = directory.join("forge-worker-receipt.json");
+    let mut worker = Command::new(std::env::current_exe().expect("fixture executable path"))
+        .args([
+            "--exact",
+            "forge_query_fixture_worker_process",
+            "--nocapture",
+        ])
+        .env(FORGE_QUERY_MODE, "worker")
+        .env(FORGE_QUERY_DIRECTORY, &directory)
+        .env(FORGE_QUERY_TOKEN, &token)
+        .env(FORGE_QUERY_WORKER_RELEASE, &worker_release)
+        .env(FORGE_QUERY_GRANDCHILD_RELEASE, &grandchild_release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn Forge worker fixture");
+
+    let receipt_deadline = Instant::now() + Duration::from_secs(10);
+    while !receipt_path.is_file() && Instant::now() < receipt_deadline {
+        assert!(
+            worker
+                .try_wait()
+                .expect("observe exact Forge worker")
+                .is_none(),
+            "Forge worker exited before publishing its receipt"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        receipt_path.is_file(),
+        "Forge worker receipt was not published"
+    );
+    let receipt = read_json(&receipt_path);
+    let owner_process = &receipt["owner_process"];
+    let owner_pid = owner_process["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("Forge owner has exact PID");
+    assert_eq!(owner_pid, worker.id());
+    assert_process_birth_is_live(owner_pid, owner_process);
+    let observed_owner_image =
+        swarm_process::process_image_identity(owner_pid).expect("query exact Forge owner image");
+    assert_eq!(observed_owner_image, receipt["owner_image"]);
+
+    let grandchild_pid = receipt["grandchild"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("Forge grandchild has exact PID");
+    let grandchild_birth = &receipt["grandchild"]["birth"];
+    assert_process_birth_is_live(grandchild_pid, grandchild_birth);
+    assert_eq!(
+        swarm_process::process_image_identity(grandchild_pid)
+            .expect("query exact Forge grandchild image"),
+        receipt["grandchild"]["image"]
+    );
+
+    let retained_query =
+        swarm_process::process_group::Group::open_module_query(owner_process, &token)
+            .expect("retain exact Forge worker Job query while owner lives");
+    fs::write(&worker_release, "exit").expect("release Forge worker fixture");
+    let worker_deadline = Instant::now() + Duration::from_secs(10);
+    let worker_status = loop {
+        if let Some(status) = worker.try_wait().expect("observe Forge worker exit") {
+            break status;
+        }
+        assert!(
+            Instant::now() < worker_deadline,
+            "Forge worker did not exit"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        worker_status.success(),
+        "Forge worker fixture failed: {worker_status}"
+    );
+    assert_process_birth_is_live(grandchild_pid, grandchild_birth);
+    assert!(
+        !retained_query
+            .family_empty()
+            .expect("query exact Forge Job after worker exit"),
+        "live Forge grandchild must keep the Job nonempty after owner exit"
+    );
+
+    fs::write(&grandchild_release, "exit").expect("release Forge grandchild fixture");
+    wait_for_process_departure(grandchild_pid, grandchild_birth, Duration::from_secs(5));
+    assert!(
+        retained_query
+            .family_empty()
+            .expect("confirm exact Forge Job empty after grandchild exit"),
+        "Forge Job must become empty after its exact grandchild exits"
+    );
+    fs::remove_dir_all(&directory).expect("remove Forge query fixture directory");
 }
 
 fn run_cli(
