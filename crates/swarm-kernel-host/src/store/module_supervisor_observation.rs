@@ -477,6 +477,9 @@ pub(super) struct ModuleSupervisorObservation {
     effect_certainty: ModuleEffectCertainty,
     stage: Option<ModuleFailureStage>,
     error_code: Option<String>,
+    /// Separate closed worker receipt code; absent in historical payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_diagnostic_code: Option<String>,
     unknown_operation_ids: Vec<String>,
     unknown_operation_count: usize,
     unknown_operation_ids_truncated: bool,
@@ -1135,9 +1138,10 @@ fn nonterminal_occurrence_id(
     ))
 }
 
-/// Map only exact lifecycle transitions into the existing closed diagnostic
-/// vocabulary. Status is not an event acknowledgement: it becomes visible
-/// only after the enclosing Store transaction commits.
+/// Map exact lifecycle transitions and first worker-code enrichment into the
+/// existing closed diagnostic vocabulary. Status is not an event
+/// acknowledgement: it becomes visible only after the enclosing Store
+/// transaction commits.
 fn diagnostic_for_transition(
     previous: &Value,
     observation: &ModuleSupervisorObservation,
@@ -1160,40 +1164,70 @@ fn diagnostic_for_transition(
         return None;
     }
 
-    let (severity, kind, phase, code) = match observation.phase {
-        ModuleSupervisorPhase::Ready if !same_boot || previous_phase == Some("starting") => (
-            Severity::Info,
-            Kind::ModuleStarted,
-            Phase::ModuleStart,
-            None,
-        ),
-        ModuleSupervisorPhase::Exited
-        | ModuleSupervisorPhase::RestartBackoff
-        | ModuleSupervisorPhase::Completed
-            if matches!(
-                observation.effect_certainty,
-                ModuleEffectCertainty::NotStarted
-            ) && observation
-                .stage
-                .is_some_and(ModuleFailureStage::proves_pre_spawn)
-                && previous_phase != Some("ready") =>
-        {
-            (
-                Severity::Error,
-                Kind::ModuleStopped,
-                Phase::ModuleStart,
-                Some(Code::ModuleStartFailed),
-            )
+    // The owner can publish its already-validated worker code after the first
+    // exit status. Retain that as a scoped diagnostic enrichment with the new
+    // callback event identity; it is not a new lifecycle or Operation cause.
+    let diagnostic_only_enrichment = same_boot
+        && previous["actor_instance_id"].as_str()
+            == Some(observation.actor_instance_id.as_str())
+        && matches!(
+            previous_phase,
+            Some("exited" | "exited_proven" | "restart_backoff")
+        )
+        && matches!(
+            observation.phase,
+            ModuleSupervisorPhase::Exited
+                | ModuleSupervisorPhase::ExitedProven
+                | ModuleSupervisorPhase::RestartBackoff
+        )
+        && previous["worker_diagnostic_code"].is_null()
+        && observation.worker_diagnostic_code.is_some()
+        && previous["error_code"].as_str() == observation.error_code.as_deref();
+    let (severity, kind, phase, code) = if diagnostic_only_enrichment {
+        (Severity::Warn, Kind::ModuleStopped, Phase::ModuleExit, None)
+    } else {
+        match observation.phase {
+            ModuleSupervisorPhase::Ready if !same_boot || previous_phase == Some("starting") => {
+                (
+                    Severity::Info,
+                    Kind::ModuleStarted,
+                    Phase::ModuleStart,
+                    None,
+                )
+            }
+            ModuleSupervisorPhase::Exited
+            | ModuleSupervisorPhase::RestartBackoff
+            | ModuleSupervisorPhase::Completed
+                if matches!(
+                    observation.effect_certainty,
+                    ModuleEffectCertainty::NotStarted
+                ) && observation
+                    .stage
+                    .is_some_and(ModuleFailureStage::proves_pre_spawn)
+                    && previous_phase != Some("ready") =>
+            {
+                (
+                    Severity::Error,
+                    Kind::ModuleStopped,
+                    Phase::ModuleStart,
+                    Some(Code::ModuleStartFailed),
+                )
+            }
+            ModuleSupervisorPhase::Exited | ModuleSupervisorPhase::RestartBackoff
+                if same_boot && previous_phase == Some("ready") =>
+            {
+                (Severity::Warn, Kind::ModuleStopped, Phase::ModuleExit, None)
+            }
+            ModuleSupervisorPhase::Completed if same_boot && previous_phase == Some("ready") => {
+                (Severity::Info, Kind::ModuleStopped, Phase::ModuleExit, None)
+            }
+            _ => return None,
         }
-        ModuleSupervisorPhase::Exited | ModuleSupervisorPhase::RestartBackoff
-            if same_boot && previous_phase == Some("ready") =>
-        {
-            (Severity::Warn, Kind::ModuleStopped, Phase::ModuleExit, None)
-        }
-        ModuleSupervisorPhase::Completed if same_boot && previous_phase == Some("ready") => {
-            (Severity::Info, Kind::ModuleStopped, Phase::ModuleExit, None)
-        }
-        _ => return None,
+    };
+    let operation_link = if diagnostic_only_enrichment {
+        None
+    } else {
+        operation_link
     };
     let diagnostic_text = diagnostic_text_for_transition(observation);
     let mut record = Record::new(severity, kind, phase)
@@ -1229,12 +1263,18 @@ fn diagnostic_text_for_transition(observation: &ModuleSupervisorObservation) -> 
             | ModuleSupervisorPhase::ExitedProven
             | ModuleSupervisorPhase::RestartBackoff
     ) && observation.error_code.is_none()
+        && observation.worker_diagnostic_code.is_none()
         && observation.stage.is_none()
     {
         return None;
     }
+    let worker_diagnostic_code = observation
+        .worker_diagnostic_code
+        .as_deref()
+        .map(|code| format!(" worker_diagnostic_code={code}"))
+        .unwrap_or_default();
     Some(format!(
-        "module supervisor status: phase={} effect_certainty={} stage={} error_code={} unresolved_operations={}",
+        "module supervisor status: phase={} effect_certainty={} stage={} error_code={}{} unresolved_operations={}",
         observation.phase.as_str(),
         observation.effect_certainty.as_str(),
         observation
@@ -1242,6 +1282,7 @@ fn diagnostic_text_for_transition(observation: &ModuleSupervisorObservation) -> 
             .map(ModuleFailureStage::as_str)
             .unwrap_or("none"),
         observation.error_code.as_deref().unwrap_or("none"),
+        worker_diagnostic_code,
         observation.unknown_operation_count,
     ))
 }
@@ -1976,6 +2017,14 @@ fn nonterminal_fact_matches_observation(
     }
 }
 
+fn valid_closed_code(code: &str, max_len: usize) -> bool {
+    !code.is_empty()
+        && code.len() <= max_len
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 fn validate_header(observation: &ModuleSupervisorObservation) -> Result<()> {
     if observation.schema_version != 1
         || observation.scope.generation == 0
@@ -2011,15 +2060,22 @@ fn validate_header(observation: &ModuleSupervisorObservation) -> Result<()> {
             "module supervisor event ID does not match its actor, boot, and sequence",
         ));
     }
-    if let Some(error_code) = observation.error_code.as_deref()
-        && (error_code.is_empty()
-            || error_code.len() > 128
-            || !error_code
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'))
+    if observation
+        .error_code
+        .as_deref()
+        .is_some_and(|code| !valid_closed_code(code, 128))
     {
         return Err(invalid(
             "module supervisor error code is outside its safe format",
+        ));
+    }
+    if observation
+        .worker_diagnostic_code
+        .as_deref()
+        .is_some_and(|code| !valid_closed_code(code, 64))
+    {
+        return Err(invalid(
+            "module supervisor worker diagnostic code is outside its closed safe format",
         ));
     }
     if observation.stage.is_some() && observation.error_code.is_none() {
@@ -2234,7 +2290,7 @@ fn validate_operation_ids(
 }
 
 fn payload(observation: &ModuleSupervisorObservation, generation: i64) -> Value {
-    json!({
+    let mut payload = json!({
         "schema_version": 1,
         "actor_instance_id": observation.actor_instance_id,
         "event_id": observation.event_id,
@@ -2255,7 +2311,11 @@ fn payload(observation: &ModuleSupervisorObservation, generation: i64) -> Value 
         "unknown_operation_count": observation.unknown_operation_count,
         "unknown_operation_ids_truncated": observation.unknown_operation_ids_truncated,
         "retry_authorized": false,
-    })
+    });
+    if let Some(code) = observation.worker_diagnostic_code.as_deref() {
+        payload["worker_diagnostic_code"] = json!(code);
+    }
+    payload
 }
 
 /// Narrow public projection for the existing `agent.state` binding read.
@@ -2539,9 +2599,11 @@ mod journal_regression_tests {
     use rusqlite::{Connection, TransactionBehavior, params};
     use serde_json::Value;
     use swarm_supervisor::{
+        AdmissionState as ProducerAdmission, FailureSummary as ProducerFailureSummary,
+        LifecycleState as ProducerLifecycleState,
         ModuleEffectCertainty as ProducerCertainty, ModuleFailureStage as ProducerStage,
         ModuleSupervisorObservation as ProducerObservation, ModuleSupervisorPhase as ProducerPhase,
-        ServiceScope,
+        RestartStatus as ProducerRestartStatus, ServiceScope, SupervisorStatus as ProducerStatus,
     };
 
     const BINDING_ID: &str = "binding-fixture";
@@ -2694,10 +2756,262 @@ mod journal_regression_tests {
             effect_certainty: ProducerCertainty::Unknown,
             stage: error_code.map(|_| ProducerStage::Worker),
             error_code: error_code.map(str::to_owned),
+            worker_diagnostic_code: None,
             unknown_operation_ids: Vec::new(),
             unknown_operation_count: 0,
             unknown_operation_ids_truncated: false,
         }
+    }
+
+    fn producer_status(worker_diagnostic_code: Option<&str>) -> ProducerStatus {
+        ProducerStatus {
+            module_id: MODULE_ID.to_owned(),
+            artifact_id: ARTIFACT_ID.to_owned(),
+            artifact_version: ARTIFACT_VERSION.to_owned(),
+            build_id: Some(BUILD_ID.to_owned()),
+            scope: ServiceScope {
+                binding_id: BINDING_ID.to_owned(),
+                generation: GENERATION,
+            },
+            admission: ProducerAdmission::Open,
+            lifecycle: ProducerLifecycleState::RestartBackoff { delay_ms: 300 },
+            owner: None,
+            worker: None,
+            worker_boot_id: Some(BOOT_ID.to_owned()),
+            hello_failure: None,
+            worker_diagnostic_code: worker_diagnostic_code.map(str::to_owned),
+            effect_certainty: ProducerCertainty::Unknown,
+            failure_stage: None,
+            readback_required: true,
+            unknown_operation_ids: Vec::new(),
+            unknown_operation_count: 0,
+            unknown_operation_ids_truncated: false,
+            restart: ProducerRestartStatus {
+                starts_in_window: 1,
+                last_delay_ms: Some(300),
+                exhausted: false,
+            },
+            last_failure: Some(ProducerFailureSummary {
+                code: "MODULE_EXITED".to_owned(),
+                detail: "PRIVATE_DIAGNOSTIC_DETAIL".to_owned(),
+            }),
+        }
+    }
+
+    fn seed_ready_scope(db: &mut Connection) {
+        let starting = producer_observation(1, ProducerPhase::Starting, None);
+        let ready = producer_observation(2, ProducerPhase::Ready, None);
+        assert!(
+            record_in_transaction(db, &starting, 100)
+                .unwrap()
+                .inserted
+        );
+        assert!(record_in_transaction(db, &ready, 200).unwrap().inserted);
+    }
+
+    #[test]
+    fn worker_diagnostic_status_reaches_store_text_and_exact_retry_is_idempotent() {
+        let mut db = fixture_db();
+        seed_ready_scope(&mut db);
+
+        let status = producer_status(Some("HOST_RETRY_EXHAUSTED"));
+        let observation = ProducerObservation::from_status(&status, ACTOR_INSTANCE_ID, 3)
+            .expect("validated worker status becomes an observation");
+        assert_eq!(observation.error_code.as_deref(), Some("MODULE_EXITED"));
+        assert_eq!(
+            observation.worker_diagnostic_code.as_deref(),
+            Some("HOST_RETRY_EXHAUSTED")
+        );
+        assert_eq!(observation.boot_id.as_deref(), Some(BOOT_ID));
+        assert_eq!(
+            observation.event_id,
+            format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:3")
+        );
+
+        let parsed = parse(observation.clone()).expect("parse exact producer DTO");
+        let text = diagnostic_text_for_transition(&parsed).expect("render exit diagnostic");
+        assert_eq!(
+            text,
+            "module supervisor status: phase=restart_backoff effect_certainty=unknown stage=worker error_code=MODULE_EXITED worker_diagnostic_code=HOST_RETRY_EXHAUSTED unresolved_operations=0"
+        );
+        assert!(!text.contains("PRIVATE_DIAGNOSTIC_DETAIL"));
+
+        let committed = record_in_transaction(&mut db, &observation, 300)
+            .expect("retain scoped status");
+        assert!(committed.inserted);
+        assert!(committed.diagnostic.is_some());
+        let raw: String = db
+            .query_row(
+                "SELECT payload_json FROM observations WHERE source_event_key=?1 AND kind=?2",
+                params![observation.event_id, EVENT_KIND],
+                |row| row.get(0),
+            )
+            .expect("read retained status payload");
+        let payload: Value = serde_json::from_str(&raw).expect("decode retained payload");
+        assert_eq!(payload["error_code"], "MODULE_EXITED");
+        assert_eq!(payload["worker_diagnostic_code"], "HOST_RETRY_EXHAUSTED");
+        assert!(!raw.contains("PRIVATE_DIAGNOSTIC_DETAIL"));
+        let operation_id: Option<String> = db
+            .query_row(
+                "SELECT operation_id FROM observations WHERE source_event_key=?1 AND kind=?2",
+                params![observation.event_id, EVENT_KIND],
+                |row| row.get(0),
+            )
+            .expect("read diagnostic operation link");
+        assert!(operation_id.is_none(), "status is not an Operation cause");
+
+        let retry = record_in_transaction(&mut db, &observation, 301)
+            .expect("exact callback retry is accepted");
+        assert!(!retry.inserted);
+        assert!(retry.diagnostic.is_none());
+    }
+
+    #[test]
+    fn delayed_worker_diagnostic_uses_a_new_event_id_and_reused_id_conflicts() {
+        let mut db = fixture_db();
+        seed_ready_scope(&mut db);
+
+        let generic = ProducerObservation::from_status(
+            &producer_status(None),
+            ACTOR_INSTANCE_ID,
+            3,
+        )
+        .expect("generic exit status is representable");
+        assert!(
+            record_in_transaction(&mut db, &generic, 300)
+                .unwrap()
+                .inserted
+        );
+
+        let specific = ProducerObservation::from_status(
+            &producer_status(Some("HOST_RETRY_EXHAUSTED")),
+            ACTOR_INSTANCE_ID,
+            4,
+        )
+        .expect("later validated code is representable");
+        assert_eq!(specific.error_code, generic.error_code);
+        assert_eq!(specific.boot_id, generic.boot_id);
+        assert_ne!(specific.event_id, generic.event_id);
+        let delayed = record_in_transaction(&mut db, &specific, 400).unwrap();
+        assert!(delayed.inserted);
+        assert!(delayed.diagnostic.is_some());
+
+        let mut changed_payload_same_identity = specific.clone();
+        changed_payload_same_identity.worker_diagnostic_code =
+            Some("HOST_VERSION_UNSUPPORTED".to_owned());
+        let error = expect_record_error(&mut db, &changed_payload_same_identity, 401);
+        assert_eq!(error.code, "MODULE_OBSERVATION_CONFLICT");
+    }
+
+    #[test]
+    fn worker_diagnostic_keeps_foreign_stale_and_malformed_inputs_closed() {
+        let mut foreign_db = fixture_db();
+        seed_ready_scope(&mut foreign_db);
+        let mut foreign = ProducerObservation::from_status(
+            &producer_status(Some("HOST_RETRY_EXHAUSTED")),
+            ACTOR_INSTANCE_ID,
+            3,
+        )
+        .unwrap();
+        foreign.scope.binding_id = "other-binding".to_owned();
+        assert_eq!(
+            expect_record_error(&mut foreign_db, &foreign, 300).code,
+            "NOT_FOUND"
+        );
+        let mut wrong_generation = ProducerObservation::from_status(
+            &producer_status(Some("HOST_RETRY_EXHAUSTED")),
+            ACTOR_INSTANCE_ID,
+            3,
+        )
+        .unwrap();
+        wrong_generation.scope.generation += 1;
+        assert_eq!(
+            expect_record_error(&mut foreign_db, &wrong_generation, 301).code,
+            "NOT_FOUND"
+        );
+
+        let mut stale_db = fixture_db();
+        seed_ready_scope(&mut stale_db);
+        let current = ProducerObservation::from_status(
+            &producer_status(Some("HOST_RETRY_EXHAUSTED")),
+            ACTOR_INSTANCE_ID,
+            4,
+        )
+        .unwrap();
+        assert!(
+            record_in_transaction(&mut stale_db, &current, 400)
+                .unwrap()
+                .inserted
+        );
+        let stale = ProducerObservation::from_status(
+            &producer_status(Some("HOST_RETRY_EXHAUSTED")),
+            ACTOR_INSTANCE_ID,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            expect_record_error(&mut stale_db, &stale, 401).code,
+            "MODULE_OBSERVATION_STALE"
+        );
+
+        let malformed_status = producer_status(Some("lowercase"));
+        let error = ProducerObservation::from_status(&malformed_status, ACTOR_INSTANCE_ID, 5)
+            .expect_err("worker diagnostic retains the receipt's closed code guard");
+        assert_eq!(error.code, "MODULE_OBSERVATION_INVALID");
+
+        let mut malformed_dto =
+            ProducerObservation::from_status(&producer_status(None), ACTOR_INSTANCE_ID, 5)
+                .unwrap();
+        malformed_dto.worker_diagnostic_code = Some("lowercase".to_owned());
+        let mut malformed_db = fixture_db();
+        assert_eq!(
+            expect_record_error(&mut malformed_db, &malformed_dto, 500).code,
+            "MODULE_OBSERVATION_INVALID"
+        );
+    }
+
+    #[test]
+    fn worker_diagnostic_none_preserves_old_optional_payload_bytes() {
+        let none_dto = ProducerObservation::from_status(&producer_status(None), ACTOR_INSTANCE_ID, 1)
+            .expect("status without a worker diagnostic remains valid");
+        assert!(
+            serde_json::to_value(none_dto)
+                .expect("serialize None DTO")
+                .get("worker_diagnostic_code")
+                .is_none()
+        );
+
+        let old_payload = json!({
+            "schema_version": 1,
+            "actor_instance_id": ACTOR_INSTANCE_ID,
+            "event_id": format!("{BOOT_ID}:{ACTOR_INSTANCE_ID}:1"),
+            "sequence": 1,
+            "module_id": MODULE_ID,
+            "artifact_id": ARTIFACT_ID,
+            "artifact_version": ARTIFACT_VERSION,
+            "build_id": BUILD_ID,
+            "binding_id": BINDING_ID,
+            "generation": GENERATION,
+            "boot_id": BOOT_ID,
+            "phase": "ready",
+            "effect_certainty": "unknown",
+            "certainty_scope": "latest_helper_attempt_only",
+            "stage": null,
+            "error_code": null,
+            "unknown_operation_ids": [],
+            "unknown_operation_count": 0,
+            "unknown_operation_ids_truncated": false,
+            "retry_authorized": false,
+        });
+        let old_bytes = model::canonical(&old_payload).expect("encode v1 fixture");
+        let parsed =
+            parse_retained_observation(&old_bytes).expect("read pre-field retained observation");
+        assert!(parsed.worker_diagnostic_code.is_none());
+        let restored = payload(&parsed, GENERATION as i64);
+        assert_eq!(
+            model::canonical(&restored).expect("reencode legacy payload"),
+            old_bytes
+        );
     }
 
     fn record_in_transaction(

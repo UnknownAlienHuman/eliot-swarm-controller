@@ -132,6 +132,11 @@ pub struct ModuleSupervisorObservation {
     pub effect_certainty: ModuleEffectCertainty,
     pub stage: Option<ModuleFailureStage>,
     pub error_code: Option<String>,
+    /// Closed code from the exact worker diagnostic receipt. This remains
+    /// separate from the generic lifecycle `error_code` and is omitted when
+    /// absent to preserve older payload bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_diagnostic_code: Option<String>,
     pub unknown_operation_ids: Vec<String>,
     pub unknown_operation_count: usize,
     pub unknown_operation_ids_truncated: bool,
@@ -186,16 +191,23 @@ impl ModuleSupervisorObservation {
                     .as_ref()
                     .map(|failure| failure.code.clone()),
             });
-        if let Some(code) = error_code.as_deref()
-            && (code.len() > 128
-                || code.is_empty()
-                || !code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'))
+        if error_code
+            .as_deref()
+            .is_some_and(|code| !valid_closed_code(code, 128))
         {
             return Err(Error::new(
                 "MODULE_OBSERVATION_INVALID",
                 "module observation error code is outside its closed safe format",
+            ));
+        }
+        if status
+            .worker_diagnostic_code
+            .as_deref()
+            .is_some_and(|code| !valid_closed_code(code, 64))
+        {
+            return Err(Error::new(
+                "MODULE_OBSERVATION_INVALID",
+                "worker diagnostic code is outside its closed safe format",
             ));
         }
         let stage = status.failure_stage.or_else(|| {
@@ -218,6 +230,7 @@ impl ModuleSupervisorObservation {
             effect_certainty: status.effect_certainty,
             stage,
             error_code,
+            worker_diagnostic_code: status.worker_diagnostic_code.clone(),
             unknown_operation_ids,
             unknown_operation_count: status.unknown_operation_count,
             unknown_operation_ids_truncated: status.unknown_operation_ids_truncated,
@@ -275,4 +288,12 @@ fn validate_token(value: &str, field: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn valid_closed_code(code: &str, max_len: usize) -> bool {
+    !code.is_empty()
+        && code.len() <= max_len
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
