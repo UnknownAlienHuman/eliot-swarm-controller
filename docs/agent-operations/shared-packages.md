@@ -1,20 +1,20 @@
 # Shared package boundaries
 
-The workspace uses one lockfile and strict downward dependency edges. The kernel and CLI entrypoints consume the shared packages below; shared packages never import the host or adapter crates.
+V3 requires one lockfile and strict downward dependency edges. The table describes the target responsibilities and relevant dependencies, not the current Cargo graph. The [refactoring map](refactoring.md#3-current-gaps-against-v3) records current links, reader coverage and donor use. Kernel/CLI entrypoints consume shared packages; shared packages never import the host or adapters. Add a dependency only where its API is actually consumed.
 
-| Package | Implementation | Local & Donor dependencies |
+| Package | V3 responsibility | Relevant local / donor dependencies |
 |---|---|---|
 | `swarm-contracts` | Credential, JSON-RPC Request, runtime command/outcome and receipt identity, error classification, module catalog and typed hello claim | `serde`, `serde_json` (forward-compatible internal readers) |
 | `swarm-client` | Authenticated bounded sequential local IPC client, endpoint computation and typed `ModuleLink` | `swarm-contracts` |
 | `swarm-checks` | Kernel-admitted bounded native check executor and authenticated CheckRun status readback (Claw `CheckRunner` pattern) | `swarm-client`, `swarm-contracts`, `swarm-process` |
 | `swarm-process` | OS process/group ownership, identity/departure checks, private files and scoped module-owner bootstrap | `swarm-contracts`, `cccc-windows-process`, `sysinfo` |
-| `swarm-store` | SQLite WAL connection management (1 serialized `IMMEDIATE` writer + concurrent read-only WAL connection pool), relational schema migrations and transaction primitives | `rusqlite` |
+| `swarm-store` | SQLite WAL connections (1 serialized `IMMEDIATE` writer + pooled read-only connections), schema-identity checks and transaction primitives; domain DDL/conversion stays with Store | `rusqlite` |
 | `swarm-kernel` | Single bounded writer actor for mutations, WAL read-pool dispatch for queries, readiness and contiguous typed job batching | `swarm-store`, `swarm-contracts` |
 | `swarm-telemetry` | Structured `tracing` producer, dynamic `reload` filter, `tracing-appender` non-blocking writer, `atlas-redact` scrubbing, and local drop/failure counters | `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact` |
 
-`swarm-kernel-host` owns authentication policy, domain transactions, server IPC, and dispatch routing, but **must not** link worker crates (`swarm-automation`, `swarm-bus`, `swarm-checks`, `swarm-forge-worker`, `swarm-observer`, `swarm-script-worker`, `swarm-supervisor`) or `swarm-adapter-*` crates in `[dependencies]`, and must keep integration test suites out of `src/`. Shared contracts have no SQLite, native vendor DTO or process dependency.
+`swarm-kernel-host` owns authentication policy, domain transactions, server IPC, and dispatch routing, but **must not** link worker crates (`swarm-automation`, `swarm-bus`, `swarm-checks`, `swarm-forge-worker`, `swarm-observer`, `swarm-script-worker`, `swarm-supervisor`) or `swarm-adapter-*` crates in `[dependencies]`. Keep integration suites and fixture executables outside production `src/`; small `#[cfg(test)]` unit tests may remain beside code, as specified in [modularity](modularity.md#52-independent-update-build-and-production-src-hygiene). Shared contracts have no SQLite, native vendor DTO or process dependency.
 
-The Store uses `swarm-kernel` for its single writer thread (bounded FIFO mutation queue) while serving read-only queries (`*.get`, `*.list`, `dashboard`, `report.delta`, `automation.config.explain`, `runtime.catalog`) concurrently through `swarm-store`'s **read-only WAL connection pool** (`SQLITE_OPEN_READ_ONLY`, `query_only = ON`). The DataRoot lock stays on the writer thread through database initialization and shutdown. Readiness returns the original initializer error; only contiguous typed message jobs are batched, with the same limit and pending non-message job ordering.
+The target Store uses `swarm-kernel` for its single writer thread (bounded FIFO mutation queue) while serving read-only queries (`*.get`, `*.list`, `dashboard`, `report.delta`, `automation.config.explain`, `runtime.catalog`) concurrently through `swarm-store`'s **read-only WAL connection pool** (`SQLITE_OPEN_READ_ONLY`, `query_only = ON`). The DataRoot lock stays on the writer thread through database initialization and shutdown. Readiness returns the original initializer error; only contiguous typed message jobs are batched, with the same limit and pending non-message job ordering.
 
 The module catalog validates data and selects an exact artifact with compatible
 protocol/capabilities. It reads no files and starts no process. Launch metadata
@@ -24,8 +24,9 @@ components: supervisors must encode or hash them, including Windows drive-like
 names. Exact `.` and `..` identifiers/versions are rejected. These contracts
 do not prove an installed binary's identity.
 
-The Store's trusted descriptor registry uses its existing writer and metadata
-table. A host-generated supervisor credential has a positive one-method scope
+At the reviewed baseline, the Store's trusted descriptor registry uses its existing
+writer and metadata table; migrate its domain records through the same Store schema
+owner under the V3 relational target. A host-generated supervisor credential has a positive one-method scope
 for registration; it cannot use normal writer or Manager methods. Registration
 does not inspect or launch an executable. The trusted installer/supervisor must
 first establish the installed artifact's provenance.

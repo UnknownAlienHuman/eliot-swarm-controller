@@ -4,6 +4,8 @@ Revision 21 · 2026-10-17 · Canonical Version 3 Implementation Plan.
 
 **Current implementation status:** See [Implementation Status](../implementation-status.md) for historical CI runs, commit receipts, and qualification logs. This plan owns the normative O1–O11 implementation blocks and works together with M1–M6 in [Modular Runtime](modularity.md).
 
+For the current source delta and candidate order, use the [refactoring map](refactoring.md). O1–O11 and M1–M6 remain the scope map; completed source is not reopened as an empty implementation task.
+
 Read [README](README.md), then the relevant [Configuration](configuration.md), [Architecture](architecture.md), [Delivery](delivery.md) and [Donor map](donor-map.md).
 
 ## 1. Delivery discipline
@@ -59,7 +61,7 @@ Done: one manager can enable only an audit helper in one call, use manual comman
 
 ## 4. O2 — Durable intake and shared observation
 
-Reuse Store events/deduplication, change signals, relational capacity tables (Agent of Empires pattern) and MCP lag/resync.
+Reuse Store events/deduplication, change signals and MCP lag/resync. V3 migrates capacity to relational tables while retaining active-plus-reserved accounting from the Agent of Empires pattern.
 
 - Normalize source/native identity, source cursor/epoch, controller cursor, work/binding scope and coverage. Source failure is unknown, not empty success.
 - Commit verified intake before durable ACK. Dispatcher cursor advancement and Operation/reservation or pending-subject state commit together in one short transaction.
@@ -74,8 +76,8 @@ Done: monitoring works with no enabled automation, dropped notifications recover
 
 ## 5. O3 — Runtime adapters, streams, turn-correlated results and direct control
 
-- Use official Rust protocol crates (`agent-client-protocol` for ACP/Zed, `rmcp` for MCP) and official vendor SDK contracts (`@muse-code/sdk` / `@opencode/server` for OpenCode, `@anthropic-ai/claude-agent-sdk` for Claude, Codex `app-server` / `openai-codex` for Codex). The Rust adapter (`swarm-adapter-*`) owns `ModuleLink`, supervision, request/prompt digests and Store receipts; delegate native protocol/session state to the official protocol crate or a thin stateless vendor SDK driver rather than reimplementing vendor loops from scratch.
-- Qualify installed protocol/capabilities, not exact release equality or rigid binary SHA-256 pins. Ensure internal IPC envelopes and receipt readers are forward-compatible (no `#[serde(deny_unknown_fields)]` on internal projections; normalize SHA-256 digests to 64 lowercase hex chars).
+- Use official Rust protocol crates for their actual protocols (`agent-client-protocol` for ACP-speaking adapters, `rmcp` for MCP), documented native contracts (Codex app-server, OpenCode HTTP/SSE), and official vendor SDKs where needed (`@muse-code/sdk` for Muse, `@opencode/server` for OpenCode, `@anthropic-ai/claude-agent-sdk` for Claude). Follow the [donor boundary](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries). The Rust adapter owns `ModuleLink`, supervision, request/prompt digests and Store receipts. A thin SDK driver may retain native protocol/session handles; durable ELIOT work and retry policy stay in Rust/Store.
+- Qualify installed protocol/capabilities independently of historical release equality. Preserve integrity checks on the selected local artifact. Apply the [schema and identity rules](architecture.md#schema-and-identity-boundaries): additive metadata compatibility, strict required authority fields, normalized declared SHA inputs, and unchanged retained byte contracts.
 - Keep the launch path direct and non-blocking: `workspace lease -> agent.open -> task.dispatch`. Pre-populate MCP server endpoints and scoped participant credentials in the launch config before `agent.open`, and treat native MCP connection / `tools/list` readback as asynchronous readiness telemetry—**never block `task.dispatch` in an `awaiting_native_mcp` state**.
 - Implement deterministic **turn-scoped result correlation** (`swarm.normalized_result_page@1`) across all adapters: use explicit native `parent_input_id` where provided by the protocol (Codex), and use the **serialized active turn / busy window** `(binding_id, binding_generation, native_session_id, active_turn_id)` sealed to `task.dispatch` / `agent.send` where the native stream is session/turn-scoped (OpenCode, Antigravity, Claude — following the Waku/Paseo pattern). Never refuse a completed model response with `RESULT_BODY_UNAVAILABLE` or permanent `Unknown` status due to a missing per-chunk parent pointer.
 - Maintain native binding/generation/session/turn/family and actual process ownership (`cccc-windows-process` + `sysinfo`). Never restart/adopt by heuristic merely to activate a new adapter.

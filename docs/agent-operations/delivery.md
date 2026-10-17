@@ -52,7 +52,7 @@ For direct or automatic dispatch, recheck current Task/revision, relevant pool m
 
 One manager owns one mutable worktree and one in-flight product candidate. Writers work on non-overlapping parts of that Issue and return their changes for integration; they do not publish separate fragments. A pool may contain several authorized managers without merging their workspace ownership.
 
-Filter readiness before page limits and keep manager order unless they chose ranking. Capacity waits retain the subject in relational SQLite tables (`active_slots`, `reserved_slots` — Agent of Empires pattern, never a `meta` JSON blob) and wake when capacity changes, not repeatedly start rejected jobs. Routes sharing a provider account share its budget. Ordinary local review/delivery must work without GitHub setup or optional script interpreters.
+Filter readiness before page limits and keep manager order unless they chose ranking. Under the V3 target, capacity waits retain the subject in relational SQLite tables and wake when capacity changes, not repeatedly start rejected jobs. Preserve active-plus-reserved accounting from the Agent of Empires pattern; the relational migration from current `meta` records belongs to ELIOT, as detailed in the [refactoring map](refactoring.md#relational-conversion-detail). Routes sharing a provider account share its budget. Ordinary local review/delivery must work without GitHub setup or optional script interpreters.
 
 ## 4. Exact triggers, not a chain that must have started automatically
 
