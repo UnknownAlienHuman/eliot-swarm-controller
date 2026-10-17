@@ -1,230 +1,176 @@
-use crate::{IpcConfig, ipc_endpoint};
-use futures_util::{SinkExt, StreamExt};
+use crate::{IpcConfig, ipc_endpoint, multiplex::{Session, Stream}};
 use serde_json::{Value, json};
-use std::{path::Path, time::Duration};
-use swarm_contracts::{
-    Credential,
-    error::{Error, Result},
-};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    time,
-};
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
-
-trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
-type Stream = Box<dyn IoStream>;
+use std::{path::Path, sync::Arc};
+#[cfg(any(windows,test))]
+use std::time::Duration;
+use swarm_contracts::{Credential, error::{Error, Result}};
 
 async fn open_stream(root: &Path) -> Result<Stream> {
     let endpoint = ipc_endpoint(root)?;
     #[cfg(unix)]
-    {
-        Ok(Box::new(tokio::net::UnixStream::connect(&endpoint).await?))
-    }
+    { Ok(Box::new(tokio::net::UnixStream::connect(&endpoint).await?)) }
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
-        // Retry only establishment while no application request has been sent.
-        let deadline = time::Instant::now() + Duration::from_secs(5);
+        // Only establishment is retried, before authentication/application IO.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             match ClientOptions::new().open(&endpoint) {
                 Ok(stream) => return Ok(Box::new(stream)),
-                Err(error)
-                    if error.raw_os_error() == Some(231) && time::Instant::now() < deadline =>
-                {
-                    time::sleep(Duration::from_millis(25)).await;
-                }
+                Err(error) if error.raw_os_error()==Some(231) && tokio::time::Instant::now()<deadline => tokio::time::sleep(Duration::from_millis(25)).await,
                 Err(error) => return Err(error.into()),
             }
         }
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = endpoint;
-        Err(Error::new(
-            "HOST_UNAVAILABLE",
-            "local IPC is supported only on Windows and Unix",
-        ))
+    #[cfg(not(any(unix,windows)))]
+    { let _=endpoint;Err(Error::new("HOST_UNAVAILABLE","local IPC is supported only on Windows and Unix")) }
+}
+
+#[cfg(test)]
+mod multiplex_tests {
+    use super::*;
+    use futures_util::{SinkExt,StreamExt};
+    use tokio::{io::DuplexStream,sync::oneshot};
+    use tokio_util::codec::{FramedRead,FramedWrite,LinesCodec};
+
+    fn fixture(capacity:usize,pipe:usize)->(Client,DuplexStream) {
+        let (owned,peer)=tokio::io::duplex(pipe);
+        let config=IpcConfig{max_frame_bytes:4096,max_inflight_per_connection:capacity,write_timeout_seconds:1,..IpcConfig::default()};
+        (Client{session:Session::attach(Box::new(owned),&config).unwrap()},peer)
+    }
+    fn response(request:&Value,result:Value)->String {json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string()}
+
+    #[tokio::test]
+    async fn ipc_mux_out_of_order_replies_match_exact_concurrent_ids() {
+        let (client,peer)=fixture(4,16*1024);let clone=client.clone();
+        let task=tokio::spawn(async move {
+            let (r,w)=tokio::io::split(peer);let mut r=FramedRead::new(r,LinesCodec::new());let mut w=FramedWrite::new(w,LinesCodec::new());
+            let one:Value=serde_json::from_str(&r.next().await.unwrap().unwrap()).unwrap();
+            let two:Value=serde_json::from_str(&r.next().await.unwrap().unwrap()).unwrap();
+            assert_ne!(one["id"],two["id"]);assert_eq!(one["id"].as_str().unwrap().len(),36);
+            w.send(response(&two,two["params"].clone())).await.unwrap();w.send(response(&one,one["params"].clone())).await.unwrap();
+            assert!(r.next().await.is_none());
+        });
+        let (one,two)=tokio::join!(client.request_shared("module.next",json!({"tag":"next"})),clone.request_shared("module.outcome",json!({"tag":"outcome"})));
+        assert_eq!(one.unwrap()["tag"],"next");assert_eq!(two.unwrap()["tag"],"outcome");client.close().await;task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ipc_mux_capacity_and_queued_cancel_send_no_frame_and_do_not_poison() {
+        let (client,peer)=fixture(1,16*1024);
+        let mut first=Box::pin(client.request_shared("must.not.send",json!({})));
+        assert!(futures_util::poll!(first.as_mut()).is_pending());
+        let error=client.request_shared("also.not.sent",json!({})).await.unwrap_err();assert_eq!(error.code,"IPC_CAPACITY");
+        drop(first);assert!(client.is_connected());
+        // The bounded writer still owns the cancelled queue slot until its
+        // next poll skips it; this is not an implicit RPC retry.
+        tokio::task::yield_now().await;
+        let task=tokio::spawn(async move {
+            let (r,w)=tokio::io::split(peer);let mut r=FramedRead::new(r,LinesCodec::new());let mut w=FramedWrite::new(w,LinesCodec::new());
+            let request:Value=serde_json::from_str(&r.next().await.unwrap().unwrap()).unwrap();assert_eq!(request["method"],"only.sent");
+            w.send(response(&request,json!({"ok":true}))).await.unwrap();assert!(r.next().await.is_none());
+        });
+        assert_eq!(client.request_shared("only.sent",json!({})).await.unwrap()["ok"],true);client.close().await;task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ipc_mux_application_refusal_keeps_same_transport_usable() {
+        let (client,peer)=fixture(2,16*1024);
+        let task=tokio::spawn(async move {
+            let (r,w)=tokio::io::split(peer);let mut r=FramedRead::new(r,LinesCodec::new());let mut w=FramedWrite::new(w,LinesCodec::new());
+            let request:Value=serde_json::from_str(&r.next().await.unwrap().unwrap()).unwrap();
+            w.send(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32000,"message":"scope denied","data":{"code":"FORBIDDEN"}}}).to_string()).await.unwrap();
+            let next:Value=serde_json::from_str(&r.next().await.unwrap().unwrap()).unwrap();assert_ne!(request["id"],next["id"]);
+            w.send(response(&next,json!({"ok":true}))).await.unwrap();assert!(r.next().await.is_none());
+        });
+        assert_eq!(client.request_shared("denied",json!({})).await.unwrap_err().code,"FORBIDDEN");assert!(client.is_connected());
+        assert_eq!(client.request_shared("allowed",json!({})).await.unwrap()["ok"],true);client.close().await;task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ipc_mux_cancel_after_write_poison_drains_without_resend_or_new_hello() {
+        let (client,peer)=fixture(2,16*1024);let (seen,received)=oneshot::channel();let (late,after_cancel)=oneshot::channel();
+        let peer=tokio::spawn(async move {
+            let (r,w)=tokio::io::split(peer);let mut r=FramedRead::new(r,LinesCodec::new());let mut w=FramedWrite::new(w,LinesCodec::new());
+            let request:Value=serde_json::from_str(&r.next().await.unwrap().unwrap()).unwrap();seen.send(()).unwrap();after_cancel.await.unwrap();
+            let _=w.send(response(&request,json!({"late":true}))).await;assert!(r.next().await.is_none());
+        });
+        let clone=client.clone();let call=tokio::spawn(async move{clone.request_shared("mutation",json!({"logical_id":"retain"})).await});
+        received.await.unwrap();call.abort();assert!(call.await.unwrap_err().is_cancelled());assert!(!client.is_connected());
+        assert_eq!(client.request_shared("never.replay",json!({})).await.unwrap_err().code,"DISCONNECTED");late.send(()).unwrap();client.close().await;peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ipc_mux_retired_reply_cannot_complete_another_pending_request() {
+        let (client,peer)=fixture(2,16*1024);
+        let peer=tokio::spawn(async move {
+            let (r,w)=tokio::io::split(peer);let mut r=FramedRead::new(r,LinesCodec::new());let mut w=FramedWrite::new(w,LinesCodec::new());
+            let old:Value=serde_json::from_str(&r.next().await.unwrap().unwrap()).unwrap();w.send(response(&old,json!({"old":true}))).await.unwrap();
+            let next:Value=serde_json::from_str(&r.next().await.unwrap().unwrap()).unwrap();assert_ne!(old["id"],next["id"]);
+            w.send(response(&old,json!({"forged_next":true}))).await.unwrap();assert!(r.next().await.is_none());
+        });
+        assert_eq!(client.request_shared("first",json!({})).await.unwrap()["old"],true);
+        assert_eq!(client.request_shared("second",json!({})).await.unwrap_err().code,"OUTCOME_UNKNOWN");assert!(!client.is_connected());client.close().await;peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ipc_mux_partial_eof_fails_all_unresolved_calls_unknown() {
+        use tokio::io::AsyncWriteExt;
+        let (client,peer)=fixture(2,16*1024);
+        let peer=tokio::spawn(async move {
+            let (r,mut w)=tokio::io::split(peer);let mut r=FramedRead::new(r,LinesCodec::new());
+            assert!(r.next().await.is_some());assert!(r.next().await.is_some());w.write_all(b"{\"jsonrpc\":").await.unwrap();
+        });
+        let (a,b)=tokio::join!(client.request_shared("first",json!({})),client.request_shared("second",json!({})));
+        assert_eq!(a.unwrap_err().code,"OUTCOME_UNKNOWN");assert_eq!(b.unwrap_err().code,"OUTCOME_UNKNOWN");client.close().await;peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ipc_mux_writer_backpressure_is_bounded_unknown_not_a_retry() {
+        let (client,_nonreading_peer)=fixture(2,16);
+        let (a,b)=tokio::time::timeout(Duration::from_secs(3),async {
+            tokio::join!(client.request_shared("large",json!({"body":"x".repeat(1024)})),client.request_shared("queued",json!({})))
+        }).await.unwrap();
+        assert_eq!(a.unwrap_err().code,"OUTCOME_UNKNOWN");assert_eq!(b.unwrap_err().code,"OUTCOME_UNKNOWN");assert!(!client.is_connected());client.close().await;
     }
 }
 
-fn encode(value: &Value, limit: usize) -> Result<String> {
-    let line = serde_json::to_string(value)?;
-    if line.len() > limit {
-        return Err(Error::new(
-            "FRAME_TOO_LARGE",
-            "use smaller pages or artifact ranges",
-        ));
-    }
-    Ok(line)
-}
-
-/// Sequential local client. A failed transport is never reused or auto-replayed.
-pub struct Client {
-    reader: FramedRead<tokio::io::ReadHalf<Stream>, LinesCodec>,
-    writer: FramedWrite<tokio::io::WriteHalf<Stream>, LinesCodec>,
-    limit: usize,
-    write_timeout: Duration,
-    usable: bool,
-}
-
+/// Authenticated bounded IPC. Clones share the SAME socket/pipe and reader,
+/// writer, pending map and failure state; cloning never authenticates/reconnects.
+#[derive(Clone)]
+pub struct Client { session:Arc<Session> }
 impl Client {
-    pub async fn connect(root: &Path, credential: &Credential, config: &IpcConfig) -> Result<Self> {
-        let stream = open_stream(root).await.map_err(|error| {
-            if error.code == "IO_ERROR" {
-                Error::new(
-                    "HOST_UNAVAILABLE",
-                    "controller IPC is unavailable; no application request was sent; start or reconnect the host",
-                )
-            } else {
-                error
-            }
+    pub async fn connect(root:&Path,credential:&Credential,config:&IpcConfig)->Result<Self> {
+        let stream=open_stream(root).await.map_err(|error|if error.code=="IO_ERROR" {Error::new("HOST_UNAVAILABLE","controller IPC is unavailable; no application request was sent; start or reconnect the host")}else{error})?;
+        let client=Self{session:Session::attach(stream,config)?};
+        // No public handle exists until this one physical authentication has
+        // completed. No application frame can overtake client.hello.
+        client.session.exchange("client.hello",json!(credential)).await.map_err(|error| {
+            if matches!(error.code.as_str(),"OUTCOME_UNKNOWN"|"PROTOCOL_ERROR"|"INVALID_PARAMS") {Error::new("HOST_HANDSHAKE_FAILED","controller authentication handshake did not complete; no application request was sent; reconnect before dispatch")}else{error}
         })?;
-        let (read, write) = tokio::io::split(stream);
-        let mut client = Self {
-            reader: FramedRead::new(
-                read,
-                LinesCodec::new_with_max_length(config.max_frame_bytes),
-            ),
-            writer: FramedWrite::new(
-                write,
-                LinesCodec::new_with_max_length(config.max_frame_bytes),
-            ),
-            limit: config.max_frame_bytes,
-            write_timeout: Duration::from_secs(config.write_timeout_seconds),
-            usable: true,
-        };
-        client
-            .exchange("client.hello", json!(credential))
-            .await
-            .map_err(|error| {
-                if matches!(
-                    error.code.as_str(),
-                    "OUTCOME_UNKNOWN" | "PROTOCOL_ERROR" | "INVALID_PARAMS"
-                ) {
-                    Error::new(
-                        "HOST_HANDSHAKE_FAILED",
-                        "controller authentication handshake did not complete; no application request was sent; reconnect before dispatch",
-                    )
-                } else {
-                    error
-                }
-            })?;
         Ok(client)
     }
-
-    pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        if method == "client.hello" {
-            return Err(Error::invalid("client.hello is reserved for the transport"));
-        }
-        self.exchange(method, params).await
+    /// Source-compatible sequential call surface for existing CLI/adapters.
+    pub async fn request(&mut self,method:&str,params:Value)->Result<Value> {self.request_shared(method,params).await}
+    /// Correlated concurrent exchange on this same authenticated link. Capacity
+    /// refusal is pre-submit; cancellation after possible write poisons all
+    /// unresolved calls as OUTCOME_UNKNOWN. No application request is resent.
+    pub async fn request_shared(&self,method:&str,params:Value)->Result<Value> {
+        if method=="client.hello" {return Err(Error::invalid("client.hello is reserved for the transport"));}
+        self.session.exchange(method,params).await
     }
-
-    async fn exchange(&mut self, method: &str, params: Value) -> Result<Value> {
-        if !self.usable {
-            return Err(Error::new(
-                "DISCONNECTED",
-                "client link failed; reconnect before another request",
-            ));
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        let line = encode(
-            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
-            self.limit,
-        )?;
-        self.usable = false;
-        time::timeout(self.write_timeout, self.writer.send(line))
-            .await
-            .map_err(|_| unknown_write())?
-            .map_err(|_| unknown_write())?;
-        let frame = time::timeout(Duration::from_secs(60), self.reader.next())
-            .await
-            .map_err(|_| {
-                Error::new(
-                    "OUTCOME_UNKNOWN",
-                    "reply missing; inspect the operation before retrying",
-                )
-            })?
-            .ok_or_else(|| Error::new("OUTCOME_UNKNOWN", "server closed before reply"))?
-            .map_err(|_| unknown_response())?;
-        let response: Value = serde_json::from_str(&frame).map_err(|_| unknown_response())?;
-        if response["id"] != id || response["jsonrpc"] != "2.0" {
-            return Err(unknown_response());
-        }
-        // Qualification-only seam. A complete, matched response has just been
-        // received and the request was written exactly once and unaltered, so
-        // every Store decision it produced is already durable.
-        #[cfg(feature = "qualification-faults")]
-        if crate::qualification_faults::take_single_reply_drop_if_armed(method) {
-            // Poison the connection exactly as an uncertain reply does:
-            // usable stays false, so the caller must reconnect before any
-            // further request and cannot replay this frame.
-            let reply_id = response["id"].as_str().unwrap_or_default();
-            return Err(Error::new(
-                crate::qualification_faults::QUALIFICATION_REPLY_DROPPED,
-                format!(
-                    "qualified reply withheld at the transport seam; the request was sent once and is not reusable; withheld_frame_bytes={}; jsonrpc_request_id={}; jsonrpc_reply_id={}",
-                    frame.len(),
-                    id,
-                    reply_id
-                ),
-            ));
-        }
-        if let Some(error) = response.get("error") {
-            if response.get("result").is_some()
-                || !error.is_object()
-                || error["code"].as_i64().is_none()
-                || error["message"].as_str().is_none()
-                || error["data"]["code"].as_str().is_none_or(str::is_empty)
-            {
-                return Err(unknown_response());
-            }
-            self.usable = true;
-            return Err(Error::new(
-                error["data"]["code"].as_str().unwrap_or("RPC_ERROR"),
-                error["message"].as_str().unwrap_or("RPC error"),
-            ));
-        }
-        let result = response
-            .get("result")
-            .cloned()
-            .ok_or_else(unknown_response)?;
-        self.usable = true;
-        Ok(result)
-    }
-}
-
-fn unknown_response() -> Error {
-    Error::new(
-        "OUTCOME_UNKNOWN",
-        "reply was malformed or could not be matched; preserve the logical request ID and inspect the original operation before retrying",
-    )
-}
-
-fn unknown_write() -> Error {
-    Error::new(
-        "OUTCOME_UNKNOWN",
-        "request write did not complete; delivery is uncertain; preserve the logical request ID and inspect the original operation before retrying",
-    )
+    /// Transport usability only, never native/service/authorization liveness.
+    pub fn is_connected(&self)->bool {self.session.connected()}
+    /// Close and join the fixed IO tasks while the runtime remains alive.
+    /// All clones close together; unresolved RPCs retain uncertain delivery.
+    pub async fn close(&self) {self.session.close().await;}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt,StreamExt};
+    use tokio_util::codec::{FramedRead,FramedWrite,LinesCodec};
     use tokio::io::DuplexStream;
     const TEST_FRAME_LIMIT: usize = 4096;
 
     fn client_on_duplex(stream: DuplexStream) -> Client {
-        let stream: Stream = Box::new(stream);
-        let (read, write) = tokio::io::split(stream);
-        Client {
-            reader: FramedRead::new(read, LinesCodec::new_with_max_length(TEST_FRAME_LIMIT)),
-            writer: FramedWrite::new(write, LinesCodec::new_with_max_length(TEST_FRAME_LIMIT)),
-            limit: TEST_FRAME_LIMIT,
-            write_timeout: Duration::from_secs(1),
-            usable: true,
-        }
+        let config=IpcConfig{max_frame_bytes:TEST_FRAME_LIMIT,write_timeout_seconds:1,..IpcConfig::default()};
+        Client {session:Session::attach(Box::new(stream),&config).unwrap()}
     }
 
     fn fake_peer_client(

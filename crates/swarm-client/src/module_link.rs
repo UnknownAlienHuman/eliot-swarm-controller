@@ -5,15 +5,24 @@
 
 use crate::{Client, IpcConfig};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{path::Path,sync::{Arc,atomic::{AtomicBool,Ordering}}};
 use swarm_contracts::{
     Credential,
     error::{Error, Result},
     module_contract::ModuleContractClaim,
+    module_catalog::Sha256Digest,
 };
 
+#[derive(Default)]
+struct Hello { digest:Option<Sha256Digest>, reply:Option<Result<Value>> }
+/// Clones share one authenticated Client and one hello barrier, hence the same
+/// Store Principal.link_id. Give pending next/delivery/stream tasks clones;
+/// never call connect/hello independently for those lanes.
+#[derive(Clone)]
 pub struct ModuleLink {
     client: Client,
+    hello:Arc<tokio::sync::Mutex<Hello>>,
+    ready:Arc<AtomicBool>,
 }
 
 impl ModuleLink {
@@ -23,6 +32,8 @@ impl ModuleLink {
     pub async fn connect(root: &Path, credential: &Credential, config: &IpcConfig) -> Result<Self> {
         Ok(Self {
             client: Client::connect(root, credential, config).await?,
+            hello:Arc::new(tokio::sync::Mutex::new(Hello::default())),
+            ready:Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -45,18 +56,39 @@ impl ModuleLink {
             claim.validate().map_err(Error::invalid)?;
             fields.insert("module_contract".to_owned(), serde_json::to_value(claim)?);
         }
-        self.client.request("module.hello", params).await
+        let digest=Sha256Digest::of_canonical_json(&params).map_err(|_|Error::invalid("module hello cannot be encoded"))?;
+        let mut hello=self.hello.lock().await;
+        if !self.client.is_connected(){return Err(Error::new("DISCONNECTED","the physical module link failed; cached hello is not a new handshake"));}
+        if let Some(prior)=&hello.digest {
+            if prior!=&digest{return Err(Error::new("MODULE_HELLO_CONFLICT","this physical module link already attempted another hello"));}
+            return hello.reply.clone().unwrap_or_else(||Err(Error::new("MODULE_HELLO_INCOMPLETE","prior hello was interrupted; inspect/reconnect explicitly")));
+        }
+        hello.digest=Some(digest);
+        let result=self.client.request_shared("module.hello",params).await;
+        if result.is_ok(){self.ready.store(true,Ordering::Release);}
+        hello.reply=Some(result.clone());
+        result
     }
 
+    fn established(&self)->Result<()> {
+        if !self.ready.load(Ordering::Acquire){return Err(Error::new("MODULE_HELLO_REQUIRED","await this physical link's module hello before application calls"));}
+        Ok(())
+    }
+    pub fn is_connected(&self)->bool {self.client.is_connected()}
+    pub async fn close(&self){self.client.close().await;}
+
     pub async fn next(&mut self) -> Result<Value> {
+        self.established()?;
         self.client.request("module.next", json!({})).await
     }
 
     pub async fn outcome(&mut self, params: Value) -> Result<Value> {
+        self.established()?;
         self.client.request("module.outcome", params).await
     }
 
     pub async fn observe(&mut self, params: Value) -> Result<Value> {
+        self.established()?;
         self.client.request("module.observe", params).await
     }
 
@@ -66,6 +98,7 @@ impl ModuleLink {
         &mut self,
         frame: &swarm_contracts::native_stream::StreamPublish,
     ) -> Result<Value> {
+        self.established()?;
         self.client
             .request(
                 swarm_contracts::native_stream::PUBLISH_METHOD,
@@ -75,6 +108,7 @@ impl ModuleLink {
     }
 
     pub async fn result(&mut self, params: Value) -> Result<Value> {
+        self.established()?;
         self.client.request("module.result", params).await
     }
 }
