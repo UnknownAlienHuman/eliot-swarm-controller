@@ -166,6 +166,15 @@ impl State {
     fn changed(&mut self) {
         self.dirty = self.dirty.saturating_add(1);
     }
+    fn close_usage(&mut self, at_ms: i64) {
+        if let (Some(projector), Some(fence)) = (&self.projector, &self.fence) {
+            let closed = projector.close_usage_connection(fence, at_ms);
+            if closed.status != ReductionStatus::Ignored {
+                self.projector = Some(closed.projector);
+                self.changed();
+            }
+        }
+    }
     fn revision(&self, session: &str) -> u64 {
         *self.versions.get(session).unwrap_or(&0)
     }
@@ -428,6 +437,7 @@ impl Driver {
             if let Some(driver) = weak.upgrade() {
                 if let Ok(mut s) = driver.lock() {
                     s.ready = false;
+                    s.close_usage(now());
                     s.diagnostic = Some("MUSE_NATIVE_TRANSPORT_ENDED");
                     s.changed();
                 }
@@ -1602,6 +1612,7 @@ impl Driver {
         self.request_stop();
         let transport = self.lock().ok().and_then(|mut s| {
             s.ready = false;
+            s.close_usage(now());
             s.transport.clone()
         });
         if let Some(transport) = transport {
@@ -2346,6 +2357,39 @@ mod tests {
             "MUSE_SCHEMA_VERSION_UNSUPPORTED"
         );
     }
+    #[test]
+    fn muse_driver_native_connection_end_stales_usage_once() {
+        let fence = ProjectionFence {
+            binding_id: "synthetic-binding".into(),
+            binding_generation: 1,
+            native_root_id: ROOT.into(),
+            native_scope_key: "synthetic-native-scope".into(),
+            bridge_boot_id: BOOT.into(),
+        };
+        let projector = ObservationProjector::new(fence.clone())
+            .unwrap()
+            .begin_usage_connection(&fence, "synthetic-connection", 1000)
+            .projector;
+        assert_eq!(
+            projector.observation().unwrap()["native_usage"]["freshness"],
+            "current"
+        );
+        let mut state = State::empty();
+        state.fence = Some(fence);
+        state.projector = Some(projector);
+        state.close_usage(1001);
+        assert_eq!(
+            state.projector.as_ref().unwrap().observation().unwrap()["native_usage"]["freshness"],
+            "stale"
+        );
+        let revision = state.dirty;
+        state.close_usage(1002);
+        assert_eq!(
+            state.dirty, revision,
+            "repeated close does not invent a new usage observation"
+        );
+    }
+
     #[test]
     fn muse_driver_admission_requires_actual_public_ack_shape() {
         assert!(

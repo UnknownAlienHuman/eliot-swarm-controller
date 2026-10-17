@@ -193,13 +193,6 @@ impl TurnEvent {
             _ => None,
         }
     }
-    fn method(self) -> &'static str {
-        match self {
-            Self::Started => "turn/started",
-            Self::Completed => "turn/completed",
-            Self::Unqueued => "turn/unqueued",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
