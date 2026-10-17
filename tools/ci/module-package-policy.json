@@ -3,6 +3,11 @@
   "format": "eliot.module_build_policy.v2",
   "approved_package_coordinates": [
     {
+      "package_name": "swarm-adapter-muse",
+      "manifest": "crates/swarm-adapter-muse/Cargo.toml",
+      "binary_target": "swarm-muse-adapter"
+    },
+    {
       "package_name": "swarm-adapter-codex",
       "manifest": "crates/swarm-adapter-codex/Cargo.toml",
       "binary_target": "swarm-codex-adapter",

@@ -1,4 +1,4 @@
-//! Muse Rust transport foundation, not a usable runtime adapter.
+//! Muse Rust transport and gated durable adapter source.
 //!
 //! Dependency decision (2026-10-16): adopt whole `jsonrpsee-core = 0.26.1`
 //! (MIT), async client AND public server router, with the already locked
@@ -21,19 +21,29 @@
 //! so this scoped dependency decision stays with the owned library rather than
 //! creating a new documentation convention.
 //!
-//! Production attachment verifies the existing module owner membership. The
-//! caller supplies pipes from its owned child; this crate does not spawn, kill,
-//! adopt, or discharge any process/Job custody. EOF is only a transport fact.
+//! Production transport attachment verifies existing module-owner membership.
+//! The native_owner module retains the real spawned child in an external joined
+//! custodian; transport attachment itself neither owns nor discharges that
+//! process/Job custody. No kill or adoption is implemented. EOF is a transport fact.
 //! Explicit close drains locally admitted submissions before closing stdin;
 //! neither close nor a written frame establishes native command completion.
 //! Cancellation of a submission receipt does not cancel an admitted frame.
 //!
-//! Remaining work includes the complete command/TaskPrompt/model/readback facade,
-//! private checkpoint and host delivery, children, results, recovery, streams,
-//! packaging and native qualification. Native MCP inventory remains unavailable;
-//! this library makes no dispatch-readiness claim. jsonrpsee payload trace
-//! targets must remain disabled by the eventual worker's logging configuration.
+//! The command/TaskPrompt/model facade, journal, Host delivery, child observations,
+//! results, explicit recovery and streams are integrated source components. The
+//! executable uses the joined runtime; its descriptor remains disabled pending
+//! platform/native qualification; see registration/INTEGRATION.md. MCP inventory remains
+//! unavailable. Keep jsonrpsee payload trace targets disabled in worker logging.
 //! Tests in `msp` are boundary fixtures written for Root to run, not qualification
 //! of the installed Muse executable or any account/authentication state.
 
+pub mod commands;
+pub mod driver;
+pub mod journal;
+pub mod module_runtime;
 pub mod msp;
+pub mod native_owner;
+pub(crate) mod observations;
+pub mod results;
+pub mod schema;
+pub mod streams;
