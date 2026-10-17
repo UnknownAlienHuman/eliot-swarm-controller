@@ -1,10 +1,20 @@
 # Rust Muse worker integration and qualification
 
-The new `muse-rust-controller.1@0.1.0` descriptor remains disabled pending final
+The new `muse-rust-controller.1@0.1.1` descriptor remains disabled pending final
 platform and controlled installed-native qualification. The executable's normal
 `run_owned` entry now uses the integrated shared-link loop and external native
 custodian. Explicit operator registration/route activation remains separate from
 source integration and candidate packaging.
+
+Version 0.1.1 accepts an empty native lifecycle `viewCursor` as the pinned MSP
+schema's required string, preserving its exact value across journal reopen.
+Missing or non-string cursors and foreign session IDs remain invalid. On
+2026-10-17 the installed Muse 1.4.0 returned an empty cursor for an exact
+read-only session lookup after the 0.1.0 candidate left its open outcome unknown.
+This repair does not settle that earlier operation, replay its start or qualify
+model output, recovery, process-family completion or M6. Changed executable
+bytes require a new installed artifact coordinate; existing 0.1.0 receipts and
+bindings remain historical.
 
 The current installed Node bridge.13 and its private state are separate. This
 artifact reads only its own Rust scope marker and versioned journal. It neither

@@ -107,7 +107,7 @@ impl NativeRuntime for JoinedNativeRuntime {
 
 pub const MODULE_ID: &str = "muse";
 pub const ARTIFACT_ID: &str = "muse-rust-controller.1";
-pub const ARTIFACT_VERSION: &str = "0.1.0";
+pub const ARTIFACT_VERSION: &str = "0.1.1";
 pub const CAPABILITIES: [&str; 10] = [
     "agent.configure",
     "agent.goal",

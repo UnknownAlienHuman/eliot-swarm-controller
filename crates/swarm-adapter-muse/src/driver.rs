@@ -2659,12 +2659,12 @@ mod tests {
                         .is_ok()
                     );
                     assert!(request["params"].get("modelId").is_none());
-                    json!({"session":session(&workspace),"viewCursor":"root:0"})
+                    json!({"session":session(&workspace),"viewCursor":""})
                 }
                 "session/read" => {
-                    json!({"session":session(&workspace),"viewCursor":"root:1","history":{"mode":"none","items":null,"snapshot":null},"pendingRequests":[]})
+                    json!({"session":session(&workspace),"viewCursor":"","history":{"mode":"none","items":null,"snapshot":null},"pendingRequests":[]})
                 }
-                "view/subscribe" => json!({"viewCursor":"root:1"}),
+                "view/subscribe" => json!({"viewCursor":""}),
                 "approval/listPending" => json!({"approvals":[],"userInputs":[]}),
                 "usage/read" => json!({"usage":null}),
                 "turn/start" => {

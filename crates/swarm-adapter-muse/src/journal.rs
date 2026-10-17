@@ -2711,9 +2711,9 @@ fn validate_ack(scope: &Scope, invocation: &NativeInvocation, ack: &Value) -> Re
         invocation.method.as_str(),
         "session/start" | "session/resume"
     ) {
-        if ack["session"]["sessionId"] != scope.native_root_id
-            || ack["viewCursor"].as_str().is_none_or(str::is_empty)
-        {
+        // The native opaque head may be the empty string before any view
+        // event. The pinned result schema still requires a string field.
+        if ack["session"]["sessionId"] != scope.native_root_id {
             return Err(Fault::ScopeMismatch);
         }
         if invocation.method == "session/resume"
@@ -5329,6 +5329,90 @@ mod tests {
             matches!(journal.explicit_reconcile(&fixture.scope, host_operation_v4, invocation.payload_sha256()).unwrap(), Reconciliation::AckReadback(saved) if saved == ack)
         );
         assert!(journal.outbox(&fixture.scope).unwrap().is_empty());
+    }
+
+    #[test]
+    fn muse_journal_empty_lifecycle_cursor_survives_reopen_without_native_replay() {
+        for method in ["session/start", "session/resume"] {
+            let fixture = Fixture::new();
+            let invocation = fixture.invocation(1, method);
+            let mut journal = fixture.create();
+            fixture.initialize(&mut journal, false);
+            journal
+                .record_exact_root_read(&fixture.scope, &fixture.scope.native_root_id)
+                .unwrap();
+            drop(
+                journal
+                    .prepare_native(
+                        &fixture.scope,
+                        fixture.receipt("lifecycle"),
+                        invocation.clone(),
+                    )
+                    .unwrap(),
+            );
+            let mut ack = fixture.ack(&invocation);
+            ack["viewCursor"] = json!("");
+            let checkpoint = fs::read(&journal.path).unwrap();
+            for bad_cursor in [Value::Null, json!(7)] {
+                let mut malformed = ack.clone();
+                malformed["viewCursor"] = bad_cursor;
+                assert!(
+                    journal
+                        .record_native_ack(
+                            &fixture.scope,
+                            "lifecycle",
+                            invocation.command_id(),
+                            malformed
+                        )
+                        .is_err()
+                );
+                assert_eq!(fs::read(&journal.path).unwrap(), checkpoint);
+            }
+            let mut missing = ack.clone();
+            missing.as_object_mut().unwrap().remove("viewCursor");
+            assert!(
+                journal
+                    .record_native_ack(
+                        &fixture.scope,
+                        "lifecycle",
+                        invocation.command_id(),
+                        missing
+                    )
+                    .is_err()
+            );
+            let mut foreign = ack.clone();
+            foreign["session"]["sessionId"] = json!("foreign-root");
+            assert_eq!(
+                journal.record_native_ack(
+                    &fixture.scope,
+                    "lifecycle",
+                    invocation.command_id(),
+                    foreign
+                ),
+                Err(Fault::ScopeMismatch)
+            );
+            assert_eq!(fs::read(&journal.path).unwrap(), checkpoint);
+            journal
+                .record_native_ack(
+                    &fixture.scope,
+                    "lifecycle",
+                    invocation.command_id(),
+                    ack.clone(),
+                )
+                .unwrap();
+            drop(journal);
+            let mut reopened = fixture.reopen();
+            assert!(matches!(
+                reopened.explicit_reconcile(&fixture.scope, "lifecycle", invocation.payload_sha256()).unwrap(),
+                Reconciliation::AckReadback(saved) if saved == ack
+            ));
+            assert_eq!(
+                reopened
+                    .retained_invocation(&fixture.scope, "lifecycle")
+                    .unwrap(),
+                &invocation
+            );
+        }
     }
 
     #[test]

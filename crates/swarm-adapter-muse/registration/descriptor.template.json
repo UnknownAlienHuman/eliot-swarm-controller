@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "module_id": "muse",
-  "artifact": {"artifact_id": "muse-rust-controller.1", "version": "0.1.0", "build_id": null},
+  "artifact": {"artifact_id": "muse-rust-controller.1", "version": "0.1.1", "build_id": null},
   "launch": {
     "executable": "<INSTALLER_ABSOLUTE_MUSE_RUST_ADAPTER_PATH>",
     "argv": [
