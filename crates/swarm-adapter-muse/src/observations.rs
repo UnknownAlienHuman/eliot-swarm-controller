@@ -709,6 +709,19 @@ pub(crate) struct ChildSnapshotInput<'a> {
     pub(crate) snapshot: Option<&'a Value>,
     pub(crate) failure: Option<ChildReadFailure>,
 }
+
+struct TurnContext<'a> {
+    session_id: &'a str,
+    turn_id: &'a str,
+    event_revision: u64,
+    command_id: Option<String>,
+    event: TurnEvent,
+    terminal: Option<Terminal>,
+    view_cursor: Option<String>,
+    source_range: Option<SourceRange>,
+    error_kind: Option<NativeErrorKind>,
+}
+
 impl ObservationProjector {
     pub(crate) fn new(fence: ProjectionFence) -> Result<Self, ProjectionError> {
         if !fence.valid() {
@@ -1066,17 +1079,22 @@ impl ObservationProjector {
                         stream_handoff: None,
                     };
                 };
-                next.turn(
-                    &session,
-                    &turn_id,
-                    input.event_revision,
+                next.turn(TurnContext {
+                    session_id: &session,
+                    turn_id: &turn_id,
+                    event_revision: input.event_revision,
                     command_id,
                     event,
-                    Terminal::native(params.get("terminal").and_then(Value::as_str), event),
+                    terminal: Terminal::native(
+                        params.get("terminal").and_then(Value::as_str),
+                        event,
+                    ),
                     view_cursor,
                     source_range,
-                    NativeErrorKind::parse(params.pointer("/error/kind").and_then(Value::as_str)),
-                );
+                    error_kind: NativeErrorKind::parse(
+                        params.pointer("/error/kind").and_then(Value::as_str),
+                    ),
+                });
             }
             EventKind::SessionStatusChanged if session == self.fence.native_root_id => {
                 next.state.execution =
@@ -1087,10 +1105,10 @@ impl ObservationProjector {
                 }
             }
             EventKind::ItemStarted | EventKind::ItemUpdated | EventKind::ItemCompleted => {
-                if let Some(item) = params.get("item") {
-                    if ChildKind::parse(item.get("kind").and_then(Value::as_str)).is_some() {
-                        next.child_item(&session, item, view_cursor, turn_id.clone());
-                    }
+                if let Some(item) = params.get("item")
+                    && ChildKind::parse(item.get("kind").and_then(Value::as_str)).is_some()
+                {
+                    next.child_item(&session, item, view_cursor, turn_id.clone());
                 }
             }
             EventKind::SessionReasoningEffortChanged if session == self.fence.native_root_id => {
@@ -1928,18 +1946,18 @@ impl ObservationProjector {
         )?;
         Ok(value)
     }
-    fn turn(
-        &mut self,
-        session: &str,
-        id: &str,
-        event_revision: u64,
-        command: Option<String>,
-        event: TurnEvent,
-        terminal: Option<Terminal>,
-        cursor: Option<String>,
-        range: Option<SourceRange>,
-        error: Option<NativeErrorKind>,
-    ) {
+    fn turn(&mut self, context: TurnContext<'_>) {
+        let TurnContext {
+            session_id: session,
+            turn_id: id,
+            event_revision,
+            command_id: command,
+            event,
+            terminal,
+            view_cursor: cursor,
+            source_range: range,
+            error_kind: error,
+        } = context;
         let found = self
             .state
             .turns
@@ -2152,11 +2170,10 @@ impl ObservationProjector {
             .observed_children
             .iter_mut()
             .find(|entry| entry.session_id == session)
+            && child.snapshot_freshness == Freshness::Fresh
         {
-            if child.snapshot_freshness == Freshness::Fresh {
-                child.snapshot_freshness = Freshness::Stale;
-                child.snapshot_freshness_reason = FreshnessReason::NativeEventAfterRead;
-            }
+            child.snapshot_freshness = Freshness::Stale;
+            child.snapshot_freshness_reason = FreshnessReason::NativeEventAfterRead;
         }
     }
 

@@ -92,13 +92,12 @@ impl NativeRuntime for JoinedNativeRuntime {
     fn join_custodians(&self) -> NativeFuture<'_, ()> {
         Box::pin(async move {
             let observed = self.custodian.lock().await.join().await;
-            if let Some(observed) = observed {
-                if observed.wait_failures.count > 0
+            if let Some(observed) = observed
+                && (observed.wait_failures.count > 0
                     || !observed.direct_child.success()
-                    || !matches!(observed.stderr, NativeStderrResult::Closed { .. })
-                {
-                    return Err(fault("MUSE_NATIVE_EXIT_OBSERVATION_UNRESOLVED"));
-                }
+                    || !matches!(observed.stderr, NativeStderrResult::Closed { .. }))
+            {
+                return Err(fault("MUSE_NATIVE_EXIT_OBSERVATION_UNRESOLVED"));
             }
             // Direct exit plus stderr EOF does not prove family departure.
             Ok(())

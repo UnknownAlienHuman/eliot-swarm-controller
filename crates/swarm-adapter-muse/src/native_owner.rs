@@ -194,15 +194,11 @@ impl NativeChildCustodian {
     /// remains uncertain. Descendants may hold stderr open after direct exit;
     /// this join intentionally retains its drain until EOF/task completion.
     pub async fn join(&mut self) -> Option<NativeCustodianObservation> {
-        if self
-            .state
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .child
-            .is_none()
-        {
-            return None;
-        }
+            .as_ref()?;
         let status = loop {
             let observed = self
                 .state
@@ -280,11 +276,10 @@ impl NativeDirectChild {
                     .state
                     .upgrade()
                     .ok_or_else(|| io::Error::other("MUSE_NATIVE_CUSTODIAN_LOST"))?;
-                let observed = state
+                state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .poll_exit();
-                observed
+                    .poll_exit()
             };
             if let Some(status) = observed? {
                 return Ok(status);

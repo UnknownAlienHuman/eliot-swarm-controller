@@ -282,12 +282,12 @@ impl Driver {
     pub fn hello(&self) -> Value {
         let mut hello = json!({"boot_id":self.bootstrap.worker.boot_id,"module_artifact_id":self.bootstrap.contract.artifact.artifact_id,
             "native_ready":false,"managed_owner":{"token":self.bootstrap.worker.owner_record["token"],"process":self.bootstrap.worker.owner_record["process"]}});
-        if let Ok(s) = self.lock() {
-            if let (Some(root), Some(scope)) = (&s.confirmed_root, &s.scope) {
-                hello["native_root_id"] = json!(root);
-                hello["native_scope_key"] = json!(scope.native_namespace);
-                hello["native_ready"] = json!(s.ready && !self.stopping());
-            }
+        if let Ok(s) = self.lock()
+            && let (Some(root), Some(scope)) = (&s.confirmed_root, &s.scope)
+        {
+            hello["native_root_id"] = json!(root);
+            hello["native_scope_key"] = json!(scope.native_namespace);
+            hello["native_ready"] = json!(s.ready && !self.stopping());
         }
         hello
     }
@@ -296,7 +296,7 @@ impl Driver {
             schema_version: 1,
             module_id: self.bootstrap.contract.module_id.clone(),
             artifact: self.bootstrap.contract.artifact.clone(),
-            protocol: self.bootstrap.contract.protocol.clone(),
+            protocol: self.bootstrap.contract.protocol,
             binding_id: self.bootstrap.binding_id.clone(),
             binding_generation: self.bootstrap.generation,
             operation_id: command.operation_id.clone(),
@@ -434,13 +434,13 @@ impl Driver {
                     driver.mark_gap("MUSE_NOTIFICATION_PROJECTION_UNAVAILABLE");
                 }
             }
-            if let Some(driver) = weak.upgrade() {
-                if let Ok(mut s) = driver.lock() {
-                    s.ready = false;
-                    s.close_usage(now());
-                    s.diagnostic = Some("MUSE_NATIVE_TRANSPORT_ENDED");
-                    s.changed();
-                }
+            if let Some(driver) = weak.upgrade()
+                && let Ok(mut s) = driver.lock()
+            {
+                s.ready = false;
+                s.close_usage(now());
+                s.diagnostic = Some("MUSE_NATIVE_TRANSPORT_ENDED");
+                s.changed();
             }
         }));
         let init=read_rpc(&transport,"initialize",json!({"clientInfo":{"name":"eliot_swarm_controller","version":"0.1.0"},"capabilities":{"requestedCapabilities":["sessionMcp"]}})).await?;
@@ -767,7 +767,7 @@ impl Driver {
                         command: command.clone(),
                         receipt: receipt.clone(),
                         invocation: invocation.clone(),
-                        task: task_prompt.map(Arc::new),
+                        task: task_prompt.map(Arc::from),
                         requested,
                         work: work.as_ref().map(|w| w.value.clone()),
                         ack: None,
@@ -1364,12 +1364,12 @@ impl Driver {
             fence: &fence,
             session_id: session,
             expected_session_revision: p.session_revision(session),
-            inventory: &inventory,
+            inventory,
         });
         if replaced.status != ReductionStatus::Applied {
             return Err(fault("MUSE_PENDING_INVENTORY_UNRESOLVED"));
         }
-        let replacement = inventory_controls(session, &inventory, pending_revision)?;
+        let replacement = inventory_controls(session, inventory, pending_revision)?;
         s.pending.retain(|_, p| p.params["sessionId"] != session);
         if s.pending.len().saturating_add(replacement.len()) > MAX_PENDING {
             return Err(fault("MUSE_PENDING_CAPACITY"));
@@ -1393,11 +1393,11 @@ impl Driver {
             .event_number
             .checked_add(1)
             .ok_or_else(|| fault("MUSE_EVENT_REVISION_EXHAUSTED"))?;
-        if let Some(session) = p["sessionId"].as_str() {
-            if s.member(session) {
-                let rev = s.revision(session).saturating_add(1);
-                s.versions.insert(session.into(), rev);
-            }
+        if let Some(session) = p["sessionId"].as_str()
+            && s.member(session)
+        {
+            let rev = s.revision(session).saturating_add(1);
+            s.versions.insert(session.into(), rev);
         }
         let is_delta = method == "item/delta";
         if let (Some(projector), Some(fence)) = (&s.projector, &s.fence) {
@@ -1415,37 +1415,36 @@ impl Driver {
             && s.confirmed_root.as_deref() == p["sessionId"].as_str()
         {
             let item = &p["item"];
-            if let (Some(id), Some(turn)) = (item["itemId"].as_str(), item["turnId"].as_str()) {
-                if !id.is_empty()
-                    && id.len() <= 512
-                    && item["revision"].as_u64().is_some_and(|r| r > 0)
-                    && s.task_turns.contains_key(turn)
-                    && s.items.len() < MAX_STREAM_ITEMS
-                {
-                    let kind = match item["kind"].as_str() {
-                        Some("agentMessage") => Some(crate::streams::KnownItemKind::AgentMessage),
-                        Some("reasoning") => Some(crate::streams::KnownItemKind::Reasoning),
-                        Some("toolCall") => Some(crate::streams::KnownItemKind::ToolCall),
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
-                        let order = s.items.len() as u32;
-                        if let Some(old) = s.items.get_mut(id) {
-                            if old.turn != turn || old.kind != kind {
-                                old.disabled = true;
-                                stream_gap(&mut s, "MUSE_STREAM_ITEM_IDENTITY_CONFLICT");
-                            }
-                        } else {
-                            s.items.insert(
-                                id.into(),
-                                ItemIdentity {
-                                    turn: turn.into(),
-                                    kind,
-                                    order,
-                                    disabled: false,
-                                },
-                            );
+            if let (Some(id), Some(turn)) = (item["itemId"].as_str(), item["turnId"].as_str())
+                && !id.is_empty()
+                && id.len() <= 512
+                && item["revision"].as_u64().is_some_and(|r| r > 0)
+                && s.task_turns.contains_key(turn)
+                && s.items.len() < MAX_STREAM_ITEMS
+            {
+                let kind = match item["kind"].as_str() {
+                    Some("agentMessage") => Some(crate::streams::KnownItemKind::AgentMessage),
+                    Some("reasoning") => Some(crate::streams::KnownItemKind::Reasoning),
+                    Some("toolCall") => Some(crate::streams::KnownItemKind::ToolCall),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let order = s.items.len() as u32;
+                    if let Some(old) = s.items.get_mut(id) {
+                        if old.turn != turn || old.kind != kind {
+                            old.disabled = true;
+                            stream_gap(&mut s, "MUSE_STREAM_ITEM_IDENTITY_CONFLICT");
                         }
+                    } else {
+                        s.items.insert(
+                            id.into(),
+                            ItemIdentity {
+                                turn: turn.into(),
+                                kind,
+                                order,
+                                disabled: false,
+                            },
+                        );
                     }
                 }
             }

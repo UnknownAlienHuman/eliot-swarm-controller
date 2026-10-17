@@ -5,6 +5,7 @@
 //! - modules/muse/settings.mjs (one setter, goal verbs, grant-gated MCP config);
 //! - modules/muse/results.mjs: result work is delegated to the results owner;
 //! - modules/muse/observe.mjs:38-50 (pinned absent durability classification).
+//!
 //! Public MSP 1.3 schema:
 //! <https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/schema/msp/msp.d.ts>
 //! Approval/user-input identities: lines 36-48, 120-123, 2064-2182;
@@ -204,7 +205,7 @@ pub struct ReconciliationTarget {
 pub enum CommandEncoding {
     Native {
         request: NativeRequest,
-        task_prompt: Option<ValidatedTaskPrompt>,
+        task_prompt: Option<Box<ValidatedTaskPrompt>>,
         /// Present only on open: retain these explicit route constraints.
         requested: Option<RequestedSelectors>,
     },
@@ -482,7 +483,7 @@ fn native(
     params.insert("commandId".into(), json!(id));
     Ok(CommandEncoding::Native {
         request: NativeRequest { method, params },
-        task_prompt,
+        task_prompt: task_prompt.map(Box::new),
         requested,
     })
 }
