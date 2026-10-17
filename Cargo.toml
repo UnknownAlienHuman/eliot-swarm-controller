@@ -28,6 +28,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 lto = "thin"
 strip = "debuginfo"
 
+[profile.test]
+debug = "line-tables-only"
+
 [profile.iterate]
 inherits = "dev"
 opt-level = 1
