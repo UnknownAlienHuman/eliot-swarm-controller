@@ -7,6 +7,11 @@ use serde_json::{Value, json};
 use std::{collections::{HashMap, VecDeque}, sync::Arc};
 use swarm_contracts::native_stream::*;
 
+// Revision/order facts outlive payload eviction. At this bound, refuse a new
+// part rather than forget an existing part's fence or reset its epoch. Keys
+// retain only the already-bounded item ID and part index, never content.
+const MAX_TRACKED_PARTS: usize = MAX_RING_RECORDS * 4;
+
 #[derive(Default)]
 pub(super) struct NativeStreams {
     rings: HashMap<StreamScope, Ring>,
@@ -17,12 +22,21 @@ struct Ring {
     epoch: String,
     publisher_link: String,
     records: VecDeque<Record>,
+    parts: HashMap<(String, u32), PartMetadata>,
     bytes: usize,
     cursor: u64,
     source_sequence: u64,
     source_gap: bool,
+    /// Missing producer ordinals before the first accepted frame. This is
+    /// separate from `lost_through`, which counts evicted host cursors.
+    source_lost_prefix_through: u64,
     lost_through: u64,
     updated_at_ms: i64,
+}
+
+struct PartMetadata {
+    item_order: u32,
+    final_revision: Option<u64>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -109,6 +123,8 @@ pub(super) async fn call(
                 let epoch = ring.epoch.clone();
                 let cursor = ring.cursor;
                 let lost_through = ring.lost_through;
+                let source_gap = ring.source_gap;
+                let source_lost_prefix_through = ring.source_lost_prefix_through;
                 streams.viewers.insert(stream_id.clone(), Viewer {
                     client_id: principal.client_id,
                     link_id: principal.link_id,
@@ -118,6 +134,7 @@ pub(super) async fn call(
                 });
                 Ok(json!({"stream_id":stream_id,"epoch":epoch,"scope":scope,
                     "cursor":cursor,"after":0,"lost_through":lost_through,
+                    "source_gap":source_gap,"source_lost_prefix_through":source_lost_prefix_through,
                     "ephemeral":true,"text_delivery":"complete_logical_records_only",
                     "content_grant":{"level":grant.level.as_str(),"basis":grant.basis.as_str()},
                     "hidden_reasoning":"unavailable"}))
@@ -169,6 +186,7 @@ pub(super) async fn call(
                     "records":selected,"next":next,"head":ring.cursor,
                     "cursor_loss":request.after < ring.lost_through,
                     "lost_through":ring.lost_through,"source_gap":ring.source_gap,
+                    "source_lost_prefix_through":ring.source_lost_prefix_through,
                     "has_more":next < ring.cursor,"ephemeral":true,
                     "ordering":"item_order_part_index_then_cursor",
                     "content_grant":{"level":grant.level.as_str(),"basis":grant.basis.as_str()},
@@ -317,39 +335,52 @@ impl NativeStreams {
         }
         let ring = self.rings.entry(frame.scope.clone()).or_insert_with(|| Ring {
             epoch: model::new_id(), publisher_link: link.clone(), records: VecDeque::new(),
+            parts: HashMap::new(),
             bytes: 0, cursor: 0, source_sequence: 0, source_gap: false,
+            source_lost_prefix_through: 0,
             lost_through: 0, updated_at_ms: now,
         });
         if ring.publisher_link != link || frame.source_sequence <= ring.source_sequence {
             return Err(stale());
         }
-        if ring.records.iter().any(|old| {
-            (old.frame.item_id == frame.item_id && old.frame.item_order != frame.item_order)
-                || (!old.frame.item_id.starts_with('@') && !frame.item_id.starts_with('@')
-                    && old.frame.item_id != frame.item_id && old.frame.item_order == frame.item_order)
+        if ring.parts.iter().any(|((item_id, _), old)| {
+            (item_id == &frame.item_id && old.item_order != frame.item_order)
+                || (!item_id.starts_with('@') && !frame.item_id.starts_with('@')
+                    && item_id != &frame.item_id && old.item_order == frame.item_order)
         }) {
             return Err(Error::invalid("native item ordering facts changed"));
         }
-        let replacement = matches!(&frame.payload, StreamPayload::Text { final_record: true, .. }
-            | StreamPayload::CumulativeUsage { .. });
-        for old in ring.records.iter().filter(|old| same_part(&old.frame, &frame)) {
-            if let StreamPayload::Text { final_record: true, revision: old_revision, .. } = &old.frame.payload {
-                match &frame.payload {
-                    StreamPayload::Text { revision, .. } if revision > old_revision => {}
-                    _ => return Err(stale()),
-                }
+        let part_key = (frame.item_id.clone(), frame.part_index);
+        if let Some(old_revision) = ring.parts.get(&part_key).and_then(|part| part.final_revision) {
+            match &frame.payload {
+                StreamPayload::Text { final_record: true, revision: Some(revision), .. }
+                    if *revision > old_revision => {}
+                _ => return Err(stale()),
             }
         }
+        if !ring.parts.contains_key(&part_key) && ring.parts.len() >= MAX_TRACKED_PARTS {
+            return Err(Error::new("STREAM_CAPACITY", "native stream part metadata bound reached"));
+        }
+        let final_revision = match &frame.payload {
+            StreamPayload::Text { final_record: true, revision, .. } => *revision,
+            _ => None,
+        };
+        let replacement = matches!(&frame.payload, StreamPayload::Text { final_record: true, .. }
+            | StreamPayload::CumulativeUsage { .. });
+        let cursor = ring.cursor.checked_add(1).ok_or_else(stale)?;
+        let mut record = Record { cursor, frame, bytes: 0 };
+        record.bytes = serde_json::to_vec(&record)?.len();
         if replacement {
-            ring.records.retain(|old| !same_part(&old.frame, &frame));
+            ring.records.retain(|old| !same_part(&old.frame, &record.frame));
             ring.bytes = ring.records.iter().map(|r| r.bytes).sum();
         }
-        ring.source_gap |= ring.source_sequence > 0
-            && frame.source_sequence != ring.source_sequence + 1;
-        ring.source_sequence = frame.source_sequence;
-        ring.cursor = ring.cursor.checked_add(1).ok_or_else(stale)?;
-        let mut record = Record { cursor: ring.cursor, frame, bytes: 0 };
-        record.bytes = serde_json::to_vec(&record)?.len();
+        ring.parts.insert(part_key, PartMetadata { item_order: record.frame.item_order, final_revision });
+        if ring.source_sequence == 0 {
+            ring.source_lost_prefix_through = record.frame.source_sequence - 1;
+        }
+        ring.source_gap |= ring.source_sequence.checked_add(1) != Some(record.frame.source_sequence);
+        ring.source_sequence = record.frame.source_sequence;
+        ring.cursor = cursor;
         ring.bytes += record.bytes;
         ring.records.push_back(record);
         while ring.records.len() > MAX_RING_RECORDS || ring.bytes > MAX_RING_BYTES {
@@ -440,13 +471,7 @@ mod tests {
         assert_eq!(reply["result"]["ephemeral"], true, "{reply}");
     }
 
-    #[tokio::test]
-    async fn real_store_ipc_stream_content_rights_replacement_gap_revocation_and_no_observations() {
-        swarm_contracts::mcp_catalog::validate_registry_metadata().unwrap();
-        for method in ["stream.open", "stream.read", "stream.close"] {
-            assert!(swarm_contracts::mcp_catalog::find_tool_spec(method).unwrap().0);
-        }
-        assert!(swarm_contracts::mcp_catalog::find_tool_spec(PUBLISH_METHOD).is_none());
+    async fn fixture() -> (std::path::PathBuf, StoreOwner, Store, Config) {
         let directory = std::env::temp_dir().join(format!("swarm-native-stream-{}", model::new_id()));
         std::fs::create_dir_all(&directory).unwrap();
         let root = DataRoot::acquire(&directory).unwrap();
@@ -484,6 +509,17 @@ mod tests {
             db.execute("INSERT INTO operations(operation_id,caller_id,client_request_id,method,original_request_json,effective_request_json,task_id,attempt_id,binding_id,binding_generation,state,native_refs_json,result_json,due_at_ms,settled_at_ms,created_at_ms,updated_at_ms) VALUES('stream-old-dispatch','stream-exact-caller','stream-old-request','task.dispatch','{}','{}','stream-task','stream-old-attempt','stream-binding',1,'settled','{\"session_id\":\"stream-root\",\"turn_id\":\"old-turn\"}','{\"outcome\":\"applied\",\"details\":{}}',1,1,1,1)", [])?;
             Ok(())
         }).await.unwrap();
+        (directory, owner, store, config)
+    }
+
+    #[tokio::test]
+    async fn real_store_ipc_stream_content_rights_replacement_gap_revocation_and_no_observations() {
+        swarm_contracts::mcp_catalog::validate_registry_metadata().unwrap();
+        for method in ["stream.open", "stream.read", "stream.close"] {
+            assert!(swarm_contracts::mcp_catalog::find_tool_spec(method).unwrap().0);
+        }
+        assert!(swarm_contracts::mcp_catalog::find_tool_spec(PUBLISH_METHOD).is_none());
+        let (directory, owner, store, config) = fixture().await;
         let connect = |id: &str| Credential { client_id:id.into(), token:format!("{id}-token") };
         let mut module = Peer::connect(&store, connect("stream-module"), &config).await;
         // Existing legacy synthetic handshake establishes this actual IPC
@@ -506,7 +542,14 @@ mod tests {
         assert!(registration.get("result").is_some(), "{registration}");
         let mut participant = Peer::connect(&store, connect("stream-participant"), &config).await;
         let before = counts(&store).await;
-        publish(&mut module, frame(1, "assistant-item", 0, 0, StreamPayload::Text {
+        let failed_first = module.rpc(PUBLISH_METHOD, serde_json::to_value(frame(
+            1, "assistant-item", 0, 0, StreamPayload::Text {
+                class:TextClass::Assistant, text:"invalid final".into(),
+                final_record:true, revision:None,
+            },
+        )).unwrap()).await;
+        assert!(failed_first.get("error").is_some(), "rejected ordinal 1 is not delivered");
+        publish(&mut module, frame(2, "assistant-item", 0, 0, StreamPayload::Text {
             class:TextClass::Assistant, text:"secret split-prefix".into(),
             final_record:false, revision:None,
         })).await;
@@ -535,31 +578,36 @@ mod tests {
         assert!(anchored_read.get("result").is_some());
         assert_eq!(receipt_reader.rpc("stream.close", json!({"stream_id":byte_view})).await["result"]["closed"], true);
         let forbidden_publish = reader.rpc(PUBLISH_METHOD, serde_json::to_value(frame(
-            2, "fake", 0, 0, StreamPayload::Lifecycle { state:StreamLifecycle::Started },
+            3, "fake", 0, 0, StreamPayload::Lifecycle { state:StreamLifecycle::Started },
         )).unwrap()).await;
         assert!(forbidden_publish.get("error").is_some(), "publication is module-only");
-        let mut foreign = frame(2, "fake", 0, 0,
+        let mut foreign = frame(3, "fake", 0, 0,
             StreamPayload::Lifecycle { state:StreamLifecycle::Started });
         foreign.scope.turn_id = "foreign-turn".into();
         let foreign_turn = module.rpc(PUBLISH_METHOD, serde_json::to_value(foreign).unwrap()).await;
         assert!(foreign_turn.get("error").is_some(), "native turn must match retained Operation");
         let open = reader.rpc("stream.open", selector.clone()).await;
         assert_eq!(open["result"]["content_grant"]["basis"], "current_task_manager");
+        assert_eq!(open["result"]["source_gap"], true);
+        assert_eq!(open["result"]["source_lost_prefix_through"], 1);
         let stream_id = open["result"]["stream_id"].as_str().expect("authorized Task reader").to_owned();
         let incomplete = reader.rpc("stream.read", json!({"stream_id":stream_id,"after":0})).await;
         assert_eq!(incomplete["result"]["records"][0]["frame"]["payload"]["reason"], "logical_record_pending");
         assert!(!incomplete.to_string().contains("secret split-prefix"));
-        publish(&mut module, frame(2, "assistant-item", 0, 0, StreamPayload::Text {
+        assert_eq!(incomplete["result"]["source_gap"], true);
+        assert_eq!(incomplete["result"]["source_lost_prefix_through"], 1);
+        assert_eq!(incomplete["result"]["lost_through"], 0, "source loss is distinct from host eviction");
+        publish(&mut module, frame(3, "assistant-item", 0, 0, StreamPayload::Text {
             class:TextClass::Assistant, text:"final assistant".into(),
-            final_record:true, revision:Some(2),
+            final_record:true, revision:Some(10),
         })).await;
-        for (sequence, part) in [(3,1), (4,0)] {
+        for (sequence, part) in [(4,1), (5,0)] {
             publish(&mut module, frame(sequence, "reasoning-item", 1, part, StreamPayload::Text {
                 class:TextClass::ReasoningSummary, text:format!("summary {part}"),
                 final_record:true, revision:Some(2),
             })).await;
         }
-        for (sequence, total) in [(5,50), (6,77)] {
+        for (sequence, total) in [(6,50), (7,77)] {
             publish(&mut module, frame(sequence, "@usage", 1_000_000, 0,
                 StreamPayload::CumulativeUsage { prompt_tokens:40, output_tokens:10, total_tokens:total })).await;
         }
@@ -590,7 +638,7 @@ mod tests {
         let closed = reader.rpc("stream.close", json!({"stream_id":extra_id})).await;
         assert_eq!(closed["result"]["closed"], true);
         for offset in 0..MAX_RING_RECORDS + 4 {
-            publish(&mut module, frame(7 + offset as u64, &format!("item-{offset}"),
+            publish(&mut module, frame(8 + offset as u64, &format!("item-{offset}"),
                 10 + offset as u32, 0, StreamPayload::Lifecycle { state:StreamLifecycle::InProgress })).await;
         }
         let lost = reader.rpc("stream.read", json!({"stream_id":stream_id,"after":0,"limit":64})).await;
@@ -601,8 +649,48 @@ mod tests {
             let ring = shared.rings.get(&scope()).unwrap();
             assert!(ring.records.len() <= MAX_RING_RECORDS);
             assert!(ring.bytes <= MAX_RING_BYTES);
+            assert!(!ring.records.iter().any(|record| record.frame.item_id == "assistant-item"));
+            assert_eq!(ring.parts[&("assistant-item".to_owned(), 0)].final_revision, Some(10));
             assert_eq!(shared.rings.len(), 1, "viewers do not copy transcript/ring");
         }
+        let next_source = 8 + (MAX_RING_RECORDS + 4) as u64;
+        let late = frame(next_source, "assistant-item", 0, 0, StreamPayload::Text {
+            class:TextClass::Assistant, text:"late stale final".into(),
+            final_record:true, revision:Some(9),
+        });
+        let stale_revision = module.rpc(PUBLISH_METHOD, serde_json::to_value(late).unwrap()).await;
+        assert_eq!(stale_revision["error"]["data"]["code"], "STREAM_STALE",
+            "evicting payload must not retire its revision fence");
+        let changed_order = module.rpc(PUBLISH_METHOD, serde_json::to_value(frame(
+            next_source, "assistant-item", 999, 0, StreamPayload::Text {
+                class:TextClass::Assistant, text:"changed order".into(),
+                final_record:true, revision:Some(11),
+            },
+        )).unwrap()).await;
+        assert!(changed_order.get("error").is_some(), "evicted item keeps its native order");
+        let reused_order = module.rpc(PUBLISH_METHOD, serde_json::to_value(frame(
+            next_source, "alias-item", 0, 0,
+            StreamPayload::Lifecycle { state:StreamLifecycle::Started },
+        )).unwrap()).await;
+        assert!(reused_order.get("error").is_some(), "evicted item keeps its order reservation");
+        publish(&mut module, frame(next_source, "assistant-item", 0, 0, StreamPayload::Text {
+            class:TextClass::Assistant, text:"newer final assistant".into(),
+            final_record:true, revision:Some(11),
+        })).await;
+        let stale_ordinal = module.rpc(PUBLISH_METHOD, serde_json::to_value(frame(
+            next_source, "late-source", 999, 0,
+            StreamPayload::Lifecycle { state:StreamLifecycle::Started },
+        )).unwrap()).await;
+        assert_eq!(stale_ordinal["error"]["data"]["code"], "STREAM_STALE");
+        let replacement = reader.rpc("stream.read", json!({
+            "stream_id":stream_id,"after":lost["result"]["head"],
+        })).await;
+        assert_eq!(replacement["result"]["records"].as_array().unwrap().len(), 1);
+        assert_eq!(replacement["result"]["records"][0]["frame"]["payload"]["revision"], 11);
+        assert_eq!(replacement["result"]["records"][0]["frame"]["payload"]["text"], "newer final assistant");
+        assert_eq!(replacement["result"]["epoch"], open["result"]["epoch"]);
+        assert_eq!(replacement["result"]["source_gap"], true);
+        assert_eq!(replacement["result"]["source_lost_prefix_through"], 1);
         store.run_fixture(|db| {
             let mut registration = meta(db, "client:stream-reader")?.unwrap();
             registration["disabled"] = json!(true);
@@ -641,6 +729,81 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[tokio::test]
+    async fn task_revise_revokes_stream_publish_open_and_existing_views_without_releasing_attempt() {
+        let (directory, owner, store, config) = fixture().await;
+        let connect = |id: &str| Credential { client_id:id.into(), token:format!("{id}-token") };
+        let mut module = Peer::connect(&store, connect("stream-module"), &config).await;
+        let hello = module.rpc("module.hello", json!({"boot_id":"stream-boot",
+            "module_artifact_id":"stream-artifact","native_ready":true})).await;
+        assert!(hello.get("result").is_some(), "{hello}");
+        let mut reader = Peer::connect(&store, connect("stream-reader"), &config).await;
+        let mut caller = Peer::connect(&store, connect("stream-exact-caller"), &config).await;
+        publish(&mut module, frame(1, "assistant-item", 0, 0, StreamPayload::Text {
+            class:TextClass::Assistant, text:"current revision content".into(),
+            final_record:true, revision:Some(10),
+        })).await;
+        let selector = json!({"operation_id":"stream-dispatch"});
+        let reader_view = reader.rpc("stream.open", selector.clone()).await;
+        let caller_view = caller.rpc("stream.open", selector.clone()).await;
+        let reader_id = reader_view["result"]["stream_id"].as_str().unwrap().to_owned();
+        let caller_id = caller_view["result"]["stream_id"].as_str().unwrap().to_owned();
+        assert_eq!(reader_view["result"]["content_grant"]["basis"], "current_task_manager");
+        assert_eq!(caller_view["result"]["content_grant"]["basis"], "exact_result_operation_caller");
+        for (peer, stream_id) in [(&mut reader, &reader_id), (&mut caller, &caller_id)] {
+            let page = peer.rpc("stream.read", json!({"stream_id":stream_id,"after":0})).await;
+            assert_eq!(page["result"]["records"][0]["frame"]["payload"]["text"], "current revision content");
+            assert_eq!(page["result"]["source_gap"], false);
+            assert_eq!(page["result"]["source_lost_prefix_through"], 0);
+        }
+
+        let spec: Value = serde_json::from_str(include_str!("../../config/task.example.json")).unwrap();
+        let revised = reader.rpc("task.revise", json!({
+            "client_request_id":model::new_id(),"task_id":"stream-task",
+            "expected_revision":1,"spec":spec,
+        })).await;
+        assert_eq!(revised["result"]["revision"], 2, "{revised}");
+        assert_eq!(revised["result"]["existing_attempt_preserved"], true);
+        let retained = store.run_fixture(|db| Ok(db.query_row(
+            "SELECT t.revision,a.task_revision,a.released_at_ms,a.owner_id \
+             FROM tasks t JOIN attempts a ON a.task_id=t.task_id WHERE a.attempt_id='stream-attempt'",
+            [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?, row.get::<_, String>(3)?)),
+        )?)).await.unwrap();
+        assert_eq!(retained, (2, 1, None, "stream-reader".to_owned()),
+            "Task revision advances while the exact old Attempt stays unreleased");
+        let before = counts(&store).await;
+        for (peer, stream_id) in [(&mut reader, &reader_id), (&mut caller, &caller_id)] {
+            let page = peer.rpc("stream.read", json!({"stream_id":stream_id,"after":0})).await;
+            assert_eq!(page["error"]["data"]["code"], "NOT_FOUND", "{page}");
+            let reopened = peer.rpc("stream.open", selector.clone()).await;
+            assert_eq!(reopened["error"]["data"]["code"], "NOT_FOUND", "{reopened}");
+        }
+        let late = module.rpc(PUBLISH_METHOD, serde_json::to_value(frame(
+            2, "assistant-item", 0, 0, StreamPayload::Text {
+                class:TextClass::Assistant, text:"old revision late content".into(),
+                final_record:true, revision:Some(11),
+            },
+        )).unwrap()).await;
+        assert_eq!(late["error"]["data"]["code"], "NOT_FOUND", "{late}");
+        let receipt = caller.rpc("operation.get", selector).await;
+        assert!(receipt.get("result").is_some(), "historical Receipt remains readable: {receipt}");
+        {
+            let streams = store.native_streams.lock().unwrap();
+            let ring = &streams.rings[&scope()];
+            assert_eq!(ring.source_sequence, 1);
+            assert_eq!(ring.cursor, 1);
+            assert_eq!(ring.parts[&("assistant-item".to_owned(), 0)].final_revision, Some(10));
+        }
+        assert_eq!(counts(&store).await, before, "denied stream calls create no Observations or Operations");
+        reader.close().await;
+        caller.close().await;
+        module.close().await;
+        drop(store);
+        owner.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn rings_bound_bytes_count_sources_and_reconnect_incarnations() {
         let mut streams = NativeStreams::default();
@@ -653,7 +816,18 @@ mod tests {
         assert!(ring.bytes <= MAX_RING_BYTES);
         assert!(ring.records.len() < MAX_RING_RECORDS, "byte bound must evict before count");
         assert!(ring.lost_through > 0);
+        assert!(!ring.source_gap);
+        assert_eq!(ring.source_lost_prefix_through, 0);
+        assert!(!ring.records.iter().any(|record| record.frame.item_id == "large-1"));
+        assert_eq!(ring.parts[&("large-1".to_owned(), 0)].final_revision, Some(1));
         let old_epoch = ring.epoch.clone();
+        let late = streams.publish(frame(101, "large-1", 1, 0, StreamPayload::Text {
+            class:TextClass::Assistant, text:"stale after byte eviction".into(),
+            final_record:true, revision:Some(1),
+        }), "link".into(), 101).unwrap_err();
+        assert_eq!(late.code, "STREAM_STALE");
+        assert_eq!(streams.rings[&scope()].source_sequence, 100);
+        assert_eq!(streams.rings[&scope()].epoch, old_epoch);
         streams.publish(frame(1, "replacement", 0, 0,
             StreamPayload::Lifecycle { state:StreamLifecycle::Started }), "new-link".into(), 200).unwrap();
         assert_ne!(streams.rings[&scope()].epoch, old_epoch);
@@ -667,5 +841,39 @@ mod tests {
             streams.publish(next, "link".into(), 300 + index as i64).unwrap();
         }
         assert_eq!(streams.rings.len(), MAX_RINGS);
+    }
+
+    #[test]
+    fn revision_metadata_capacity_refuses_new_parts_without_forgetting_evicted_parts() {
+        let mut streams = NativeStreams::default();
+        for part in 0..MAX_TRACKED_PARTS {
+            streams.publish(frame(1 + part as u64, "bounded-item", 0, part as u32,
+                StreamPayload::Lifecycle { state:StreamLifecycle::InProgress }),
+                "link".into(), 1 + part as i64).unwrap();
+        }
+        let ring = &streams.rings[&scope()];
+        let epoch = ring.epoch.clone();
+        assert_eq!(ring.parts.len(), MAX_TRACKED_PARTS);
+        assert!(ring.records.len() <= MAX_RING_RECORDS);
+        assert!(ring.bytes <= MAX_RING_BYTES);
+        assert!(!ring.records.iter().any(|record| record.frame.part_index == 0));
+        let sequence = MAX_TRACKED_PARTS as u64 + 1;
+        let full = streams.publish(frame(sequence, "new-item", 1, 0,
+            StreamPayload::Lifecycle { state:StreamLifecycle::Started }),
+            "link".into(), 2000).unwrap_err();
+        assert_eq!(full.code, "STREAM_CAPACITY");
+        assert_eq!(streams.rings[&scope()].source_sequence, sequence - 1);
+        assert_eq!(streams.rings[&scope()].epoch, epoch);
+        streams.publish(frame(sequence, "bounded-item", 0, 0, StreamPayload::Text {
+            class:TextClass::Assistant, text:"authoritative final".into(),
+            final_record:true, revision:Some(10),
+        }), "link".into(), 2001).unwrap();
+        let stale_revision = streams.publish(frame(sequence + 1, "bounded-item", 0, 0,
+            StreamPayload::Text { class:TextClass::Assistant, text:"late final".into(),
+                final_record:true, revision:Some(9) }), "link".into(), 2002).unwrap_err();
+        assert_eq!(stale_revision.code, "STREAM_STALE");
+        assert_eq!(streams.rings[&scope()].source_sequence, sequence);
+        assert_eq!(streams.rings[&scope()].parts.len(), MAX_TRACKED_PARTS);
+        assert_eq!(streams.rings[&scope()].epoch, epoch);
     }
 }

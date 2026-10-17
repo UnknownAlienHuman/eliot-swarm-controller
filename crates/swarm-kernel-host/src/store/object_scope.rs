@@ -2729,15 +2729,19 @@ pub(super) fn native_stream_content_source(
     }
     let Some(identity) = operation_task_identity(db, &target)? else { return Ok(None) };
     let Some(attempt_id) = identity.attempt_id.as_deref() else { return Ok(None) };
-    if identity.task_revision.is_none() || identity.binding_id.is_none()
-        || identity.binding_generation.is_none()
+    let Some(task_revision) = identity.task_revision else { return Ok(None) };
+    if identity.binding_id.is_none() || identity.binding_generation.is_none()
     {
         return Ok(None);
     }
-    // Eligibility fence only. This is deliberately not an owner/role grant.
+    // Live streams require the Task's current revision as well as its frozen,
+    // unreleased Attempt. Historical result/Receipt rights remain separate.
+    // This shared eligibility fence is deliberately not an owner/role grant.
     let current: bool = db.query_row(
-        "SELECT released_at_ms IS NULL FROM attempts WHERE attempt_id=?1",
-        [attempt_id], |row| row.get(0),
+        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t ON t.task_id=a.task_id \
+         WHERE a.attempt_id=?1 AND a.task_id=?2 AND a.task_revision=?3 \
+           AND a.released_at_ms IS NULL AND t.revision=?3)",
+        params![attempt_id, identity.task_id, task_revision], |row| row.get(0),
     )?;
     Ok(current.then_some(NativeStreamContentSource { target, identity }))
 }
