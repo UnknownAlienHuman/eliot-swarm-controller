@@ -352,6 +352,20 @@ jobs:
             --target-dir $sharedTargetDir `
             --packages-json $env:PACKAGE_SPECS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run selected Muse transport boundary fixtures
+        if: needs.scope.outputs.packages != '[]'
+        shell: pwsh
+        env:
+          PACKAGE_SPECS: ${{ needs.scope.outputs.packages }}
+        run: |
+          $musePackages = @($env:PACKAGE_SPECS | ConvertFrom-Json | Where-Object {
+            ([string]$_).Split('@')[0] -ceq 'swarm-adapter-muse'
+          })
+          if ($musePackages.Count -eq 0) { exit 0 }
+          if ($musePackages.Count -ne 1) { throw 'Muse transport package selector must be unambiguous.' }
+          $sharedTargetDir = Join-Path $env:RUNNER_TEMP 'eliot-scoped-rust-shared-target'
+          & cargo test --locked --package $musePackages[0] --lib msp_transport_ --target-dir $sharedTargetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run changed integration targets only
         if: needs.scope.outputs.tests_changed == 'true'
         shell: pwsh
