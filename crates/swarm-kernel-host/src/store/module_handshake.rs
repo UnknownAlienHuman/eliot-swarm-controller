@@ -1399,15 +1399,20 @@ pub(super) fn selected_native_command_supported(
         }));
     let is_opencode_artifact = retained.module_id.as_str() == "eliot.opencode.v2"
         && retained.artifact.artifact_id.as_str() == "eliot-opencode-v2.rust-http.1";
-    let opencode_reply_schema_supported = !is_opencode_artifact
-        || (matches!(
-            retained.artifact.version.as_str(),
-            "0.5.0" | "0.6.0" | "0.7.0"
-        ) && retained.command_schemas.iter().any(|schema| {
+    let opencode_reply = is_opencode_artifact
+        && matches!(
+            command,
+            swarm_contracts::module_command::RuntimeCommandKind::AgentReply
+        );
+    // Installed artifact versions are identities, not a Core compatibility
+    // allowlist. Only OpenCode replies require this exact typed reply schema;
+    // other common commands retain their own capability/schema checks.
+    let opencode_reply_schema_supported = !opencode_reply
+        || retained.command_schemas.iter().any(|schema| {
             schema.schema_id == "swarm.opencode_reply_command"
                 && schema.version == "1"
                 && schema.sha256.is_none()
-        }));
+        });
     Ok(Some(
         capability_supported
             && schema_supported
@@ -1691,6 +1696,219 @@ mod tests {
         assert_eq!(schema.version, "2");
         assert_eq!(native_mcp_schema_admission("1"), Some(false));
         assert_eq!(native_mcp_schema_admission("2"), Some(true));
+    }
+
+    fn opencode_compat_descriptor(version: &str) -> ModuleDescriptor {
+        let mut trusted = descriptor();
+        trusted.module_id = ModuleId::new("eliot.opencode.v2").unwrap();
+        trusted.artifact = ArtifactIdentity {
+            artifact_id: ArtifactId::new("eliot-opencode-v2.rust-http.1").unwrap(),
+            version: ArtifactVersion::new(version).unwrap(),
+            build_id: None,
+        };
+        trusted.capabilities = [
+            "agent.open",
+            "agent.reply",
+            "agent.send/next_turn",
+            "task.dispatch",
+        ]
+        .into_iter()
+        .map(|capability| CapabilityId::new(capability).unwrap())
+        .collect();
+        trusted.command_schemas = [
+            SchemaDescriptor {
+                schema_id: "swarm.runtime_command".into(),
+                version: "1".into(),
+                sha256: None,
+            },
+            SchemaDescriptor {
+                schema_id: "swarm.opencode_reply_command".into(),
+                version: "1".into(),
+                sha256: None,
+            },
+        ]
+        .into_iter()
+        .collect();
+        trusted
+    }
+
+    fn opencode_compat_reply_input() -> Value {
+        json!({
+            "client_request_id":"compat-reply",
+            "binding_id":"compat-binding",
+            "generation":1,
+            "reply":{
+                "kind":"permission","session_id":"ses_compat","request_id":"per_compat",
+                "fingerprint":"a".repeat(64),"body":{"reply":"once"}
+            }
+        })
+    }
+
+    fn opencode_compat_admission(
+        trusted: ModuleDescriptor,
+        method: &str,
+        input: &Value,
+    ) -> Result<()> {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);")
+            .unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        register_trusted_descriptor(&tx, trusted.clone()).unwrap();
+        let registry = load_registry(&tx).unwrap();
+        let revision = registry.descriptors[0].registered_revision;
+        let selector = serde_json::to_value(RouteSelection {
+            schema_version: 1,
+            module_id: trusted.module_id.clone(),
+            artifact: trusted.artifact.clone(),
+            registered_revision: revision,
+            selected_revision: revision,
+        })
+        .unwrap();
+        require_selected_native_command(
+            &tx,
+            "compat-binding",
+            ("module", trusted.artifact.artifact_id.as_str()),
+            Some(&selector),
+            method,
+            input,
+        )
+    }
+
+    #[test]
+    fn opencode_descriptor_compat_common_commands_follow_contract_not_artifact_version() {
+        for version in ["0.7.0", "0.7.1", "99.0.0"] {
+            for (method, input) in [
+                ("agent.open", json!({})),
+                ("agent.reply", opencode_compat_reply_input()),
+                ("agent.send", json!({"delivery":"next_turn"})),
+                ("task.dispatch", json!({})),
+            ] {
+                opencode_compat_admission(opencode_compat_descriptor(version), method, &input)
+                    .unwrap_or_else(|error| panic!("{version} {method}: {error:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_descriptor_compat_reply_requires_its_exact_typed_schema() {
+        for replacement in [
+            None,
+            Some(SchemaDescriptor {
+                schema_id: "swarm.other_reply_command".into(),
+                version: "1".into(),
+                sha256: None,
+            }),
+            Some(SchemaDescriptor {
+                schema_id: "swarm.opencode_reply_command".into(),
+                version: "2".into(),
+                sha256: None,
+            }),
+            Some(SchemaDescriptor {
+                schema_id: "swarm.opencode_reply_command".into(),
+                version: "1".into(),
+                sha256: Some(Sha256Digest::new("a".repeat(64)).unwrap()),
+            }),
+        ] {
+            let mut trusted = opencode_compat_descriptor("0.7.1");
+            trusted
+                .command_schemas
+                .retain(|schema| schema.schema_id != "swarm.opencode_reply_command");
+            if let Some(schema) = replacement {
+                trusted.command_schemas.insert(schema);
+            }
+            // A reply schema cannot be a prerequisite for opening a root.
+            opencode_compat_admission(trusted.clone(), "agent.open", &json!({})).unwrap();
+            assert_eq!(
+                opencode_compat_admission(trusted, "agent.reply", &opencode_compat_reply_input())
+                    .unwrap_err()
+                    .code,
+                "MODULE_COMMAND_UNSUPPORTED"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_descriptor_compat_requires_the_actual_command_capability() {
+        for (method, input, capability) in [
+            ("agent.open", json!({}), "agent.open"),
+            ("agent.reply", opencode_compat_reply_input(), "agent.reply"),
+            (
+                "agent.send",
+                json!({"delivery":"next_turn"}),
+                "agent.send/next_turn",
+            ),
+            ("task.dispatch", json!({}), "task.dispatch"),
+        ] {
+            let mut trusted = opencode_compat_descriptor("0.7.1");
+            assert!(
+                trusted
+                    .capabilities
+                    .remove(&CapabilityId::new(capability).unwrap())
+            );
+            assert_eq!(
+                opencode_compat_admission(trusted, method, &input)
+                    .unwrap_err()
+                    .code,
+                "MODULE_COMMAND_UNSUPPORTED",
+                "other capabilities and the reply schema cannot grant {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_descriptor_compat_preserves_legacy_loop_step_and_closed_methods() {
+        let loop_capability = CapabilityId::new("native.opencode.loop_step").unwrap();
+        let loop_schema = SchemaDescriptor {
+            schema_id: "swarm.opencode_loop_step_command".into(),
+            version: "1".into(),
+            sha256: None,
+        };
+        for version in ["0.5.0", "0.7.1", "99.0.0"] {
+            let mut trusted = opencode_compat_descriptor(version);
+            trusted.capabilities.insert(loop_capability.clone());
+            trusted.command_schemas.insert(loop_schema.clone());
+            let result =
+                opencode_compat_admission(trusted, "native.opencode.loop_step", &json!({}));
+            if version == "0.5.0" {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code, "MODULE_COMMAND_UNSUPPORTED");
+            }
+        }
+        for missing_schema in [false, true] {
+            let mut trusted = opencode_compat_descriptor("0.5.0");
+            if missing_schema {
+                trusted.capabilities.insert(loop_capability.clone());
+            } else {
+                trusted.command_schemas.insert(loop_schema.clone());
+            }
+            assert_eq!(
+                opencode_compat_admission(trusted, "native.opencode.loop_step", &json!({}))
+                    .unwrap_err()
+                    .code,
+                "MODULE_COMMAND_UNSUPPORTED"
+            );
+        }
+        for (method, input, code) in [
+            (
+                "native.opencode.future",
+                json!({}),
+                "MODULE_COMMAND_UNSUPPORTED",
+            ),
+            ("agent.future", json!({}), "MODULE_COMMAND_UNMAPPED"),
+            ("agent.send", json!({}), "MODULE_COMMAND_INVALID"),
+        ] {
+            let mut trusted = opencode_compat_descriptor("0.7.1");
+            trusted
+                .capabilities
+                .insert(CapabilityId::new(method).unwrap());
+            assert_eq!(
+                opencode_compat_admission(trusted, method, &input)
+                    .unwrap_err()
+                    .code,
+                code
+            );
+        }
     }
 
     #[test]

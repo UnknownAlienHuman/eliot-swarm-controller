@@ -215,13 +215,8 @@ async fn retained_attempt(store: &Store, attempt_id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn opencode_open_supports_reviewed_artifact_versions_without_widening_unknown_versions() {
-    for (version, supported) in [
-        ("0.5.0", true),
-        ("0.6.0", true),
-        ("0.7.0", true),
-        ("0.8.0", false),
-    ] {
+async fn opencode_open_uses_trusted_descriptor_contract_across_artifact_versions() {
+    for version in ["0.5.0", "0.6.0", "0.7.0", "0.7.1", "0.8.0"] {
         let f = Fixture::new().await;
         let mut descriptor = registered_opencode_descriptor();
         descriptor["artifact"]["version"] = json!(version);
@@ -240,7 +235,7 @@ async fn opencode_open_supports_reviewed_artifact_versions_without_widening_unkn
             })
             .await
             .unwrap();
-        assert_eq!(observed, Some(supported), "artifact {version}");
+        assert_eq!(observed, Some(true), "trusted artifact {version}");
         owner.close().await.unwrap();
     }
 }
