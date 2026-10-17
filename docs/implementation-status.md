@@ -2,7 +2,17 @@
 
 ## Current state
 
-### Current-status overlay (2026-10-16; main `de116965db81718aeb880ae3a0902f9d24e9019c`)
+### Delivery through PR #162 (2026-10-16; main `a5e70bd39c148a2ed218f4ae06fb779113c6fb86`)
+
+[PR #162](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/162) delivers standalone OpenCode artifact `eliot-opencode-v2.rust-http.1@0.7.1`. A complete empty synchronized log permits only exact session/location root readback; ordinary input history still requires numeric cursor coverage. Host common-command admission and the supervisor schema-v4 mapper now use the retained capability/schema contract across compatible artifact releases. Legacy schema and vendor loop-step restrictions remain closed. Native harnesses retain provider authorization, model configuration and handshake ownership.
+
+The recorded local gates passed: 21 inbox/root HTTP cases (two ignored), 17 descriptor/authority cases, the actual Store compatibility boundary, 11 supervisor projection cases, the public APP299 Tasks-to-launcher/native-root dedup composition, and strict all-target Clippy for Host, supervisor and adapter. Linux/Windows scoped CI passed. Root's development observation records an applied `agent.open` and ready 0.7.1 root on the existing OpenCode 2.0.31 service with zero controller model inputs. Native Codex/OpenCode PID and birth identities were preserved. This is root-resource evidence; inference, family, in-flight native restart, release and whole-product qualification remain open.
+
+[PR #163](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/163) retains a validated Windows Forge Job query before Git authorization and through worker/family retirement. Two production worker cases, the real grandchild lifetime regression, strict Host Clippy and Linux/Windows scoped CI passed. This prospective repair does not clear or replay the earlier publication with unconfirmed process-tree custody.
+
+The full Windows/Linux qualification was dispatched once at this source as [run 38988720266](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/38988720266); no result is promoted by this entry. Its receipt must be checked separately. Remaining #153 work includes attributable prelaunch validation diagnostics and retained-scope identity uncertainty. Issues #1/#3/#4/#5/#11/#140/#153/#159 remain open. The project remains **PARTIAL_PROGRESS**.
+
+### Retained delivery overlay (2026-10-16; main `de116965db81718aeb880ae3a0902f9d24e9019c`)
 
 The merged delivery record now includes [PR #157](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/157), [PR #158](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/158), and [PR #161](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/161). Earlier sections retain their exact source and run scope; this overlay does not reinterpret historical receipts as current installed qualification.
 
@@ -28,7 +38,7 @@ The standalone schema-4 adapter now permits native model defaults and omits the 
 
 ### Current source and completion map
 
-**Current-status checkpoint:** [de116965db81718aeb880ae3a0902f9d24e9019c](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/de116965db81718aeb880ae3a0902f9d24e9019c). **Retained source-gate checkpoint:** [adaf3469fa92cc45a8e7fe00012c15acdd83a101](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/adaf3469fa92cc45a8e7fe00012c15acdd83a101). **Broader completion-map baseline:** [ec4642910bbe0911337e3985e50a828d6a7d626b](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/ec4642910bbe0911337e3985e50a828d6a7d626b), with documentation-only PR #24 merged at 6cd5b1b. Existing entries retain their recorded source/run scope. The [README capability matrix](../README.md#capability-and-qualification-matrix) is the per-component artifact and evidence view; states stay scoped to the recorded artifact and run.
+**Current-status checkpoint:** [a5e70bd39c148a2ed218f4ae06fb779113c6fb86](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/a5e70bd39c148a2ed218f4ae06fb779113c6fb86). **Retained source-gate checkpoint:** [adaf3469fa92cc45a8e7fe00012c15acdd83a101](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/adaf3469fa92cc45a8e7fe00012c15acdd83a101). **Broader completion-map baseline:** [ec4642910bbe0911337e3985e50a828d6a7d626b](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/ec4642910bbe0911337e3985e50a828d6a7d626b), with documentation-only PR #24 merged at 6cd5b1b. Existing entries retain their recorded source/run scope. The [README capability matrix](../README.md#capability-and-qualification-matrix) is the per-component artifact and evidence view; states stay scoped to the recorded artifact and run.
 
 #### Issue #153 source reconciliation
 
