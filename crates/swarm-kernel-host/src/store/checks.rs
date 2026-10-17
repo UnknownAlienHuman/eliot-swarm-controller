@@ -5482,6 +5482,69 @@ mod tests {
 
     #[cfg(any(windows, target_os = "linux"))]
     #[tokio::test]
+    async fn completed_probe_owner_handoff_retains_bounded_diagnostic() {
+        let fixture = fixture().await;
+        let store = &fixture.owner.store;
+        let (mut owner, process_fixture) =
+            inputs::tests::pending_probe_custody_fixture_with_explicit_release(probe_scope(
+                "checks-handoff",
+                "workspace-handoff",
+            ));
+        process_fixture.release_all();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                owner.poll();
+                if !owner.is_pending() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observe actual helper-family departure before Store handoff");
+        let before_handoff = process_fixture
+            .handoff_diagnostic()
+            .expect("completed owner retains its final poll diagnostic");
+
+        // Exercise the early return in retain_probe_cleanup: the completed
+        // incoming owner is dropped instead of being inserted into Store.
+        assert!(!install_probe_owner(store, owner).await);
+        assert_eq!(store.check_child_custody_count().await, 0);
+        let after_handoff = process_fixture
+            .handoff_diagnostic()
+            .expect("diagnostic survives removal of the incoming owner");
+        assert_eq!(after_handoff, before_handoff);
+        assert!(after_handoff.len() <= 4096);
+        for field in [
+            "helper_exit_code=Some(0)",
+            "helper_exit_success=Some(true)",
+            "owner_pending=false",
+            "status_observation_failed=false",
+            "capture_setup_failed=false",
+            "capture_started=true",
+            "capture_finished=true",
+            "capture_reader_failed=false",
+            "capture_truncated=false",
+            "explicit_release=true",
+            "target_exit=true",
+            "descendant_exit=true",
+            // The fixture's libtest preamble remains an invalid full protocol
+            // frame; diagnostic retention must not reinterpret it as proof.
+            "response=invalid_full_frame_diagnostic_tail(",
+            "response_group_empty=None",
+        ] {
+            assert!(
+                after_handoff.contains(field),
+                "missing {field}; {after_handoff}"
+            );
+        }
+        assert!(!after_handoff.contains("probe-nested-direct-output"));
+        assert!(!after_handoff.contains("probe-nested-descendant-output"));
+        fixture.owner.close().await.unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
     async fn real_probe_owner_blocks_only_conflicting_preflight_until_exact_family_departure() {
         const OWNER_PROFILE_REVISION: &str = "pr61-real-owner";
         const PROBE_PROFILE_REVISION: &str = "pr61-real-probe-error";
@@ -5559,7 +5622,8 @@ mod tests {
         assert_eq!(
             store.check_child_custody_count().await,
             1,
-            "initial pending={initial_pending_message}; before_count={before_count:?}; helper_departure_proven={}; target_departure_proven={}; descendant_departure_proven={}",
+            "initial pending={initial_pending_message}; before_count={before_count:?}; handoff_snapshot={:?}; helper_departure_proven={}; target_departure_proven={}; descendant_departure_proven={}",
+            process_fixture.handoff_diagnostic(),
             process_fixture.process_departed(&helper_identity),
             process_fixture.process_departed(&target_identity),
             process_fixture.process_departed(&descendant_identity),
