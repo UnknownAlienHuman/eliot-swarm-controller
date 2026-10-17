@@ -137,11 +137,14 @@ struct WireTrace {
 impl WireTrace {
     fn delivery_diagnostic(&self, binding: &str) -> Value {
         let matching = || {
-            self.deliveries.iter()
+            self.deliveries
+                .iter()
                 .filter(|item| item.observation["scope"]["binding_id"] == binding)
         };
         let total = matching().count();
-        let rows: Vec<_> = matching().rev().take(8)
+        let rows: Vec<_> = matching()
+            .rev()
+            .take(8)
             .map(|item| {
                 let disposition = match item.reply["disposition"].as_str() {
                     Some("committed") => "committed",
@@ -744,7 +747,8 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
             gate_diagnostic.polls = gate_diagnostic.polls.saturating_add(1);
             gate_diagnostic.runner_finished = runner.is_finished();
             gate_diagnostic.admission_open = matches!(
-                supervisor.registry().admission_state(), AdmissionState::Open
+                supervisor.registry().admission_state(),
+                AdmissionState::Open
             );
             // Only marker metadata is sampled here. No receipt/config reads
             // or new status awaits are added before the original AND gate.
@@ -814,8 +818,8 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
                     .registry()
                     .status(compatible_descriptor.module_id.as_str(), &compatible_scope)
                     .await;
-                gate_diagnostic.lookup_completed = gate_diagnostic.lookup_completed
-                    .saturating_add(1);
+                gate_diagnostic.lookup_completed =
+                    gate_diagnostic.lookup_completed.saturating_add(1);
                 gate_diagnostic.lookup_completed_at_ms = Some(case_started.elapsed().as_millis());
                 gate_diagnostic.lookup_elapsed_ms = Some(lookup_started.elapsed().as_millis());
                 gate_diagnostic.compatible =
@@ -833,7 +837,8 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
     })
     .await;
     let progress_finished_ms = case_started.elapsed().as_millis();
-    let lookup_pending_elapsed_ms = gate_diagnostic.lookup_started_at_ms
+    let lookup_pending_elapsed_ms = gate_diagnostic
+        .lookup_started_at_ms
         .filter(|_| gate_diagnostic.lookup_started > gate_diagnostic.lookup_completed)
         .map(|started| progress_finished_ms.saturating_sub(started));
     // Freeze the last in-bound sample BEFORE stop/release changes any markers.
@@ -861,13 +866,13 @@ async fn connected_prelaunch_observation_is_scoped_idempotent_and_status_only() 
     });
     // Logging cannot delay the child's release: only the frozen pre-cleanup
     // sample is printed, even when cleanup itself times out or fails.
-    eprintln!("prelaunch startup diagnostic: {}", json!({
-        "before_cleanup":before_cleanup,"phase_times":phase_times,
-    }));
-    cleanup
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    eprintln!(
+        "prelaunch startup diagnostic: {}",
+        json!({
+            "before_cleanup":before_cleanup,"phase_times":phase_times,
+        })
+    );
+    cleanup.unwrap().unwrap().unwrap();
     progress.unwrap_or_else(|error| panic!(
         "no connected duplicate ACK, scoped rejection, stable passes or receipt-validated compatible adapter start within the bound: {error:?}; compatible={}; gate={before_cleanup}; phases={phase_times}",
         compatible_status_diagnostic(compatible_start_status.as_ref()),
