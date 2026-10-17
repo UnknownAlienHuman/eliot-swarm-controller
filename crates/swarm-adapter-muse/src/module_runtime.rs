@@ -1045,6 +1045,7 @@ mod runtime_tests {
         outcomes: usize,
         rejected_stream: usize,
         stalled_stream: usize,
+        stop_requested: bool,
     }
     async fn host(mut stream: Box<dyn FixtureIo>, facts: Arc<Mutex<HostFacts>>, done: Arc<Notify>) {
         let (read, mut write) = tokio::io::split(&mut stream);
@@ -1077,7 +1078,26 @@ mod runtime_tests {
             }};
         }
         macro_rules! respond {($id:expr,$value:expr)=>{output!(json!({"jsonrpc":"2.0","id":$id,"result":$value}))};}
-        while let Some(line) = lines.next_line().await.unwrap() {
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error)
+                    if facts.lock().unwrap().stop_requested
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::NotConnected
+                        ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!(
+                    "fixture Host read failed before controlled peer shutdown: {:?}",
+                    error.kind()
+                ),
+            };
             let call: Value = serde_json::from_str(&line).unwrap();
             let id = call["id"].clone();
             match call["method"].as_str().unwrap() {
@@ -1201,6 +1221,7 @@ mod runtime_tests {
             assert_eq!(f.rejected_stream, 1);
             assert_eq!(f.next, 3);
         }
+        facts.lock().unwrap().stop_requested = true;
         owner.control().request_stop();
         tokio::time::timeout(DEADLINE, owner.join())
             .await
