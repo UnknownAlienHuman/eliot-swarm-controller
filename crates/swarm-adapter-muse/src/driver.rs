@@ -2484,7 +2484,17 @@ mod tests {
         let driver = Driver::with_state(bootstrap, runtime.clone(), state).unwrap();
         (driver, runtime, peer)
     }
-    fn command(driver: &Driver, operation: &str, method: &str, input: Value) -> RuntimeCommand {
+    fn command(driver: &Driver, operation: &str, method: &str, mut input: Value) -> RuntimeCommand {
+        // Preserve the public Host envelope metadata as well as its module
+        // route projection. This remains a synthetic Host/MSP fixture.
+        input["client_request_id"] = json!(format!("request-{operation}"));
+        if method == "agent.open" {
+            input["lane_id"] = json!("fixture-lane");
+            input["route"] = json!("fixture-route");
+        } else if method != "task.dispatch" {
+            input["binding_id"] = json!(driver.bootstrap.binding_id);
+            input["generation"] = json!(driver.bootstrap.generation);
+        }
         RuntimeCommand {
             operation_id: operation.into(),
             method: method.into(),
@@ -2496,7 +2506,7 @@ mod tests {
             } else {
                 Some(ROOT.into())
             },
-            route: json!({"module_artifact_id":driver.bootstrap.contract.artifact.artifact_id,"native_options":{"workspaceRoot":driver.bootstrap.state_dir}}),
+            route: json!({"alias":"fixture-route","runtime":"module","enabled":true,"module_artifact_id":driver.bootstrap.contract.artifact.artifact_id,"native_options":{"workspaceRoot":driver.bootstrap.state_dir}}),
             input_sha256: Some(digest(operation.as_bytes())),
             input,
             target_input_sha256: None,
@@ -2509,6 +2519,7 @@ mod tests {
             "task.dispatch",
             json!({"text":"abc"}),
         );
+        c.input["attempt_id"] = json!("attempt");
         c.input["task_prompt"] = json!({"schema_id":"swarm.task_prompt","schema_version":1,"task_id":"task","task_revision":2,"attempt_id":"attempt","task_snapshot_sha256":"b".repeat(64),"prompt_sha256":digest(b"abc"),"prompt_bytes":3,"prompt":"abc"});
         c.input["task_dispatch_context"] = json!({"schema_version":1,"operation_id":c.operation_id,"binding_id":c.binding_id,"binding_generation":1,"worker_boot_id":BOOT,"task_id":"task","task_revision":2,"attempt_id":"attempt","task_snapshot_sha256":"b".repeat(64),"source_text_sha256":digest(b"abc"),"source_text_bytes":3});
         c

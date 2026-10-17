@@ -772,18 +772,29 @@ fn validate_host_envelope(scope: &Scope, command: &RuntimeCommand) -> Result<(),
     let route = command.route.as_object().ok_or(Fault::InvalidState)?;
     if route.keys().any(|key| {
         ![
-            "module_artifact_id", "native_options", "alias", "runtime", "enabled",
-            "workspace_option", "admission_policy", "owned_service",
+            "module_artifact_id",
+            "native_options",
+            "alias",
+            "runtime",
+            "enabled",
+            "workspace_option",
+            "admission_policy",
+            "owned_service",
         ]
         .contains(&key.as_str())
     }) || command.route["module_artifact_id"] != scope.artifact.artifact_id.as_str()
     {
         return Err(Fault::InvalidState);
     }
-    let host_route = ["alias", "runtime", "enabled"].iter().any(|key| route.contains_key(*key));
+    let host_route = ["alias", "runtime", "enabled"]
+        .iter()
+        .any(|key| route.contains_key(*key));
     if host_route
         && (!route.get("alias").and_then(Value::as_str).is_some_and(atom)
-            || !matches!(route.get("runtime").and_then(Value::as_str), Some("muse" | "module"))
+            || !matches!(
+                route.get("runtime").and_then(Value::as_str),
+                Some("muse" | "module")
+            )
             || !route.get("enabled").is_some_and(Value::is_boolean))
     {
         return Err(Fault::InvalidState);
@@ -792,7 +803,9 @@ fn validate_host_envelope(scope: &Scope, command: &RuntimeCommand) -> Result<(),
         let field = field.as_str().ok_or(Fault::InvalidState)?;
         let mut bytes = field.bytes();
         if field.len() > 128
-            || !bytes.next().is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+            || !bytes
+                .next()
+                .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
             || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
         {
             return Err(Fault::InvalidState);
@@ -801,7 +814,9 @@ fn validate_host_envelope(scope: &Scope, command: &RuntimeCommand) -> Result<(),
     if let Some(policy) = route.get("admission_policy") {
         let policy = policy.as_object().ok_or(Fault::InvalidState)?;
         if policy.len() != 1
-            || !policy.get("max_concurrent_roots").and_then(Value::as_u64)
+            || !policy
+                .get("max_concurrent_roots")
+                .and_then(Value::as_u64)
                 .is_some_and(|value| (1..=u16::MAX as u64).contains(&value))
         {
             return Err(Fault::InvalidState);
@@ -809,15 +824,23 @@ fn validate_host_envelope(scope: &Scope, command: &RuntimeCommand) -> Result<(),
     }
     // A non-null owned_service is an OpenCode-only launch definition, not a
     // Muse option or permission to retain provider/service configuration.
-    if route.get("owned_service").is_some_and(|value| !value.is_null()) {
+    if route
+        .get("owned_service")
+        .is_some_and(|value| !value.is_null())
+    {
         return Err(Fault::InvalidState);
     }
     if let Some(options) = route.get("native_options") {
         let options = options.as_object().ok_or(Fault::InvalidState)?;
         if options.keys().any(|key| {
             ![
-                "workspaceRoot", "nativeExecutable", "modelId", "providerId",
-                "reasoningEffort", "approvalMode", "mcpServers",
+                "workspaceRoot",
+                "nativeExecutable",
+                "modelId",
+                "providerId",
+                "reasoningEffort",
+                "approvalMode",
+                "mcpServers",
             ]
             .contains(&key.as_str())
         }) {
@@ -828,7 +851,8 @@ fn validate_host_envelope(scope: &Scope, command: &RuntimeCommand) -> Result<(),
                 continue;
             }
             let nullable = matches!(
-                key.as_str(), "modelId" | "providerId" | "reasoningEffort" | "approvalMode"
+                key.as_str(),
+                "modelId" | "providerId" | "reasoningEffort" | "approvalMode"
             );
             if !(nullable && value.is_null()) && !value.as_str().is_some_and(atom) {
                 return Err(Fault::InvalidState);
@@ -841,27 +865,57 @@ fn validate_host_envelope(scope: &Scope, command: &RuntimeCommand) -> Result<(),
     let allowed: &[&str] = match command.method.as_str() {
         "agent.open" => &["client_request_id", "lane_id", "route"],
         "agent.send" => &[
-            "client_request_id", "binding_id", "generation", "text", "delivery",
-            "expected_turn_id", "prerequisite_operation_id",
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "text",
+            "delivery",
+            "expected_turn_id",
+            "prerequisite_operation_id",
         ],
         "task.dispatch" => &[
-            "client_request_id", "attempt_id", "text", "delivery", "expected_turn_id",
-            "prerequisite_operation_id", "launch_operation_id", "task_prompt", "task_dispatch_context",
+            "client_request_id",
+            "attempt_id",
+            "text",
+            "delivery",
+            "expected_turn_id",
+            "prerequisite_operation_id",
+            "launch_operation_id",
+            "task_prompt",
+            "task_dispatch_context",
         ],
         "agent.reply" => &["client_request_id", "binding_id", "generation", "reply"],
         "agent.configure" => &[
-            "client_request_id", "binding_id", "generation", "settings", "prerequisite_operation_id",
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "settings",
+            "prerequisite_operation_id",
         ],
         // Store's mutation validator/prerequisite producer also accepts the
         // prerequisite on agent.goal; it is not an arbitrary extension map.
         "agent.goal" => &[
-            "client_request_id", "binding_id", "generation", "action", "objective",
-            "expected_revision", "prerequisite_operation_id",
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "action",
+            "objective",
+            "expected_revision",
+            "prerequisite_operation_id",
         ],
         "agent.recover" => &[
-            "client_request_id", "binding_id", "generation", "expected_boot_id", "reason",
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "expected_boot_id",
+            "reason",
         ],
-        "agent.reconcile" => &["client_request_id", "binding_id", "generation", "operation_id"],
+        "agent.reconcile" => &[
+            "client_request_id",
+            "binding_id",
+            "generation",
+            "operation_id",
+        ],
         _ => return Err(Fault::InvalidState),
     };
     let input = command.input.as_object().ok_or(Fault::InvalidState)?;
@@ -869,30 +923,51 @@ fn validate_host_envelope(scope: &Scope, command: &RuntimeCommand) -> Result<(),
         return Err(Fault::InvalidState);
     }
     for key in [
-        "client_request_id", "lane_id", "route", "binding_id", "attempt_id",
-        "prerequisite_operation_id", "launch_operation_id", "operation_id", "expected_boot_id",
+        "client_request_id",
+        "lane_id",
+        "route",
+        "binding_id",
+        "attempt_id",
+        "prerequisite_operation_id",
+        "launch_operation_id",
+        "operation_id",
+        "expected_boot_id",
     ] {
-        if input.get(key).is_some_and(|value| !value.as_str().is_some_and(atom)) {
+        if input
+            .get(key)
+            .is_some_and(|value| !value.as_str().is_some_and(atom))
+        {
             return Err(Fault::InvalidState);
         }
     }
-    if input.get("binding_id").is_some_and(|id| id.as_str() != Some(command.binding_id.as_str()))
-        || input.get("generation").is_some_and(|value| value.as_i64() != Some(command.generation))
-        || input.get("expected_revision").is_some_and(|value| value.as_i64().is_none_or(|n| n < 0))
-        || input.get("reason").is_some_and(|value| value.as_str().is_none_or(|s| s.trim().is_empty()))
+    if input
+        .get("binding_id")
+        .is_some_and(|id| id.as_str() != Some(command.binding_id.as_str()))
+        || input
+            .get("generation")
+            .is_some_and(|value| value.as_i64() != Some(command.generation))
+        || input
+            .get("expected_revision")
+            .is_some_and(|value| value.as_i64().is_none_or(|n| n < 0))
+        || input
+            .get("reason")
+            .is_some_and(|value| value.as_str().is_none_or(|s| s.trim().is_empty()))
     {
         return Err(Fault::ScopeMismatch);
     }
     if command.method == "agent.open"
         && (input.contains_key("lane_id") != input.contains_key("route")
-            || input.get("route").is_some_and(|alias| host_route && alias != &route["alias"]))
+            || input
+                .get("route")
+                .is_some_and(|alias| host_route && alias != &route["alias"]))
     {
         return Err(Fault::ScopeMismatch);
     }
     if host_route && !input.contains_key("client_request_id") {
         return Err(Fault::InvalidState);
     }
-    if host_route && !matches!(command.method.as_str(), "agent.open" | "task.dispatch")
+    if host_route
+        && !matches!(command.method.as_str(), "agent.open" | "task.dispatch")
         && (!input.contains_key("binding_id") || !input.contains_key("generation"))
     {
         return Err(Fault::InvalidState);
@@ -3170,7 +3245,13 @@ mod tests {
         let (read_only, spec) = swarm_contracts::mcp_catalog::find_tool_spec(method).unwrap();
         let shape = swarm_contracts::mcp_catalog::input_schema(spec, *read_only, true);
         let shape = Value::Object(shape.as_ref().clone());
-        assert!(jsonschema::options().offline().build(&shape).unwrap().is_valid(&request));
+        assert!(
+            jsonschema::options()
+                .offline()
+                .build(&shape)
+                .unwrap()
+                .is_valid(&request)
+        );
         let hash = digest(&request).unwrap();
         let mut command = fixture.command(operation, method, request);
         command.route = json!({
@@ -3195,9 +3276,14 @@ mod tests {
         let fixture = Fixture::new();
         let mut journal = fixture.create();
         fixture.initialize(&mut journal, true);
-        let mut command = host_command(&fixture, "host-open", "agent.open", json!({
-            "client_request_id":"request-open", "lane_id":"writer-lane", "route":"muse-host-fixture"
-        }));
+        let mut command = host_command(
+            &fixture,
+            "host-open",
+            "agent.open",
+            json!({
+                "client_request_id":"request-open", "lane_id":"writer-lane", "route":"muse-host-fixture"
+            }),
+        );
         let servers = json!({
             "stdio":{"transport":"stdio","command":"explicit-binary","args":[],"mode":"required","env":{}},
             "http":{"transport":"streamableHttp","url":"https://example.invalid/mcp","mode":"optional","headers":{}}
@@ -3206,40 +3292,79 @@ mod tests {
         let base = fixture.invocation(50, "session/start");
         let mut params = base.params().unwrap();
         params.insert("config".into(), json!({"mcpServers":servers}));
-        let invocation = journal.native_invocation(
-            &fixture.scope, "session/start", base.command_id(), params.clone(),
-        ).unwrap();
+        let invocation = journal
+            .native_invocation(
+                &fixture.scope,
+                "session/start",
+                base.command_id(),
+                params.clone(),
+            )
+            .unwrap();
         let receipt = host_receipt(&fixture, &command);
-        drop(journal.prepare_command(
-            &fixture.scope, receipt.clone(), command.clone(), invocation.clone(),
-            RetainedSelectors::default(),
-        ).unwrap());
+        drop(
+            journal
+                .prepare_command(
+                    &fixture.scope,
+                    receipt.clone(),
+                    command.clone(),
+                    invocation.clone(),
+                    RetainedSelectors::default(),
+                )
+                .unwrap(),
+        );
         drop(journal);
 
         let mut journal = fixture.reopen();
-        let retained = journal.retained_command(&fixture.scope, "host-open").unwrap().unwrap();
-        assert_eq!(serde_json::to_value(retained.command()).unwrap(), serde_json::to_value(&command).unwrap());
+        let retained = journal
+            .retained_command(&fixture.scope, "host-open")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(retained.command()).unwrap(),
+            serde_json::to_value(&command).unwrap()
+        );
         assert_eq!(retained.original_receipt(), &receipt);
         assert_eq!(retained.original_boot(), BOOT_A);
         assert_eq!(retained.native_command_id(), invocation.command_id());
         assert_eq!(retained.payload_sha256(), invocation.payload_sha256());
-        assert_eq!(journal.retained_invocation(&fixture.scope, "host-open").unwrap().params().unwrap(), params);
+        assert_eq!(
+            journal
+                .retained_invocation(&fixture.scope, "host-open")
+                .unwrap()
+                .params()
+                .unwrap(),
+            params
+        );
 
         fixture.initialize(&mut journal, true);
-        let mut reconcile = host_command(&fixture, "host-reconcile", "agent.reconcile", json!({
-            "client_request_id":"request-reconcile", "binding_id":fixture.scope.binding_id,
-            "generation":fixture.scope.generation, "operation_id":"host-open"
-        }));
+        let mut reconcile = host_command(
+            &fixture,
+            "host-reconcile",
+            "agent.reconcile",
+            json!({
+                "client_request_id":"request-reconcile", "binding_id":fixture.scope.binding_id,
+                "generation":fixture.scope.generation, "operation_id":"host-open"
+            }),
+        );
         reconcile.route = command.route.clone();
         reconcile.native_root_id = None;
         reconcile.target_input_sha256 = Some(receipt.input_sha256.clone());
         let reconcile_receipt = host_receipt(&fixture, &reconcile);
-        match journal.reconcile_command(&fixture.scope, &reconcile, &reconcile_receipt).unwrap() {
+        match journal
+            .reconcile_command(&fixture.scope, &reconcile, &reconcile_receipt)
+            .unwrap()
+        {
             Reconciliation::Write(prepared) => assert_eq!(prepared.invocation(), &invocation),
             _ => panic!("rootless reconciliation must retain the same native intent"),
         }
-        let retained = journal.retained_command(&fixture.scope, "host-open").unwrap().unwrap();
-        assert_eq!(serde_json::to_value(retained.command()).unwrap(), serde_json::to_value(command).unwrap());
+        let retained = journal
+            .retained_command(&fixture.scope, "host-open")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(retained.command()).unwrap(),
+            serde_json::to_value(command).unwrap()
+        );
         assert_eq!(retained.original_receipt(), &receipt);
     }
 
@@ -3250,10 +3375,15 @@ mod tests {
         let mut journal = fixture.create();
         fixture.initialize(&mut journal, false);
         fixture.work_read(&mut journal, 7);
-        let mut command = host_command(&fixture, "host-dispatch", "task.dispatch", json!({
-            "client_request_id":"request-dispatch", "attempt_id":"attempt", "text":"abc",
-            "prerequisite_operation_id":"configured-operation"
-        }));
+        let mut command = host_command(
+            &fixture,
+            "host-dispatch",
+            "task.dispatch",
+            json!({
+                "client_request_id":"request-dispatch", "attempt_id":"attempt", "text":"abc",
+                "prerequisite_operation_id":"configured-operation"
+            }),
+        );
         let original_hash = command.input_sha256.clone();
         let prompt = "exact fixture input";
         command.input["task_prompt"] = json!({
@@ -3276,22 +3406,45 @@ mod tests {
         for field in ["task_prompt", "task_dispatch_context"] {
             let mut bad = command.clone();
             bad.input[field]["transcript"] = json!([{"text":"undeclared nested content"}]);
-            assert!(journal.prepare_command(
-                &fixture.scope, receipt.clone(), bad, invocation.clone(),
-                RetainedSelectors::default(),
-            ).is_err());
+            assert!(
+                journal
+                    .prepare_command(
+                        &fixture.scope,
+                        receipt.clone(),
+                        bad,
+                        invocation.clone(),
+                        RetainedSelectors::default(),
+                    )
+                    .is_err()
+            );
             assert_eq!(fs::read(&journal.path).unwrap(), checkpoint);
         }
-        drop(journal.prepare_command(
-            &fixture.scope, receipt.clone(), command.clone(), invocation.clone(),
-            RetainedSelectors::default(),
-        ).unwrap());
+        drop(
+            journal
+                .prepare_command(
+                    &fixture.scope,
+                    receipt.clone(),
+                    command.clone(),
+                    invocation.clone(),
+                    RetainedSelectors::default(),
+                )
+                .unwrap(),
+        );
         drop(journal);
         let mut journal = fixture.reopen();
-        let retained = journal.retained_command(&fixture.scope, "host-dispatch").unwrap().unwrap();
-        assert_eq!(serde_json::to_value(retained.command()).unwrap(), serde_json::to_value(&command).unwrap());
+        let retained = journal
+            .retained_command(&fixture.scope, "host-dispatch")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(retained.command()).unwrap(),
+            serde_json::to_value(&command).unwrap()
+        );
         assert_eq!(retained.command().input_sha256, original_hash);
-        assert_ne!(digest(&retained.command().input).unwrap().as_str(), receipt.input_sha256);
+        assert_ne!(
+            digest(&retained.command().input).unwrap().as_str(),
+            receipt.input_sha256
+        );
         assert_eq!(retained.original_receipt(), &receipt);
         let task = retained.task_prompt(&fixture.scope).unwrap().unwrap();
         assert_eq!(task.context.worker_boot_id, BOOT_A);
@@ -3299,10 +3452,15 @@ mod tests {
 
         fixture.initialize(&mut journal, false);
         fixture.work_read(&mut journal, 99);
-        let mut reconcile = host_command(&fixture, "host-dispatch-reconcile", "agent.reconcile", json!({
-            "client_request_id":"request-dispatch-reconcile", "binding_id":fixture.scope.binding_id,
-            "generation":fixture.scope.generation, "operation_id":"host-dispatch"
-        }));
+        let mut reconcile = host_command(
+            &fixture,
+            "host-dispatch-reconcile",
+            "agent.reconcile",
+            json!({
+                "client_request_id":"request-dispatch-reconcile", "binding_id":fixture.scope.binding_id,
+                "generation":fixture.scope.generation, "operation_id":"host-dispatch"
+            }),
+        );
         reconcile.target_input_sha256 = Some(receipt.input_sha256.clone());
         let reconcile_receipt = host_receipt(&fixture, &reconcile);
         let checkpoint = fs::read(&journal.path).unwrap();
@@ -3314,58 +3472,119 @@ mod tests {
             let mut bad = reconcile.clone();
             bad.input[field] = value;
             bad.input_sha256 = Some(digest(&bad.input).unwrap().as_str().into());
-            assert!(journal.reconcile_command(&fixture.scope, &bad, &host_receipt(&fixture, &bad)).is_err());
+            assert!(
+                journal
+                    .reconcile_command(&fixture.scope, &bad, &host_receipt(&fixture, &bad))
+                    .is_err()
+            );
             assert_eq!(fs::read(&journal.path).unwrap(), checkpoint);
         }
-        match journal.reconcile_command(&fixture.scope, &reconcile, &reconcile_receipt).unwrap() {
+        match journal
+            .reconcile_command(&fixture.scope, &reconcile, &reconcile_receipt)
+            .unwrap()
+        {
             Reconciliation::Write(prepared) => assert_eq!(prepared.invocation(), &invocation),
             _ => panic!("reconciliation must preserve the original enriched Task command"),
         }
     }
 
     #[test]
-    fn muse_journal_host_envelope_rejects_unknown_private_and_malformed_fields_without_checkpoint_change() {
+    fn muse_journal_host_envelope_rejects_unknown_private_and_malformed_fields_without_checkpoint_change()
+     {
         let fixture = Fixture::new();
         let mut journal = fixture.create();
         fixture.initialize(&mut journal, true);
-        let original = host_command(&fixture, "host-open", "agent.open", json!({
-            "client_request_id":"request-open", "lane_id":"writer-lane", "route":"muse-host-fixture"
-        }));
+        let original = host_command(
+            &fixture,
+            "host-open",
+            "agent.open",
+            json!({
+                "client_request_id":"request-open", "lane_id":"writer-lane", "route":"muse-host-fixture"
+            }),
+        );
         let cases = [
             ("/route/transcript", json!({"text":"private history"})),
             ("/route/alias", json!({"transcript":"private history"})),
             ("/route/runtime", json!("opencode_v2")),
             ("/route/enabled", json!("true")),
             ("/route/workspace_option", json!({"text":"private history"})),
-            ("/route/admission_policy", json!({"max_concurrent_roots":2,"transcript":[]})),
+            (
+                "/route/admission_policy",
+                json!({"max_concurrent_roots":2,"transcript":[]}),
+            ),
             ("/route/admission_policy", json!({"max_concurrent_roots":0})),
-            ("/route/owned_service", json!({"origin":"http://example.invalid"})),
-            ("/route/native_options/providerApiKey", json!("synthetic-not-a-secret")),
-            ("/route/native_options/auth", json!({"token":"synthetic-not-a-secret"})),
+            (
+                "/route/owned_service",
+                json!({"origin":"http://example.invalid"}),
+            ),
+            (
+                "/route/native_options/providerApiKey",
+                json!("synthetic-not-a-secret"),
+            ),
+            (
+                "/route/native_options/auth",
+                json!({"token":"synthetic-not-a-secret"}),
+            ),
             ("/route/native_options/modelId", json!({"transcript":[]})),
-            ("/route/native_options/workspaceRoot", json!({"text":"private history"})),
-            ("/route/native_options/mcpServers", json!({"http":{"transport":"streamableHttp","url":"https://example.invalid/mcp","mode":"optional","headers":{"X-Custom":"synthetic-not-a-secret"}}})),
-            ("/route/native_options/mcpServers", json!({"stdio":{"transport":"stdio","command":"explicit-binary","args":[],"mode":"required","env":{"CUSTOM_TOKEN":"synthetic-not-a-secret"}}})),
+            (
+                "/route/native_options/workspaceRoot",
+                json!({"text":"private history"}),
+            ),
+            (
+                "/route/native_options/mcpServers",
+                json!({"http":{"transport":"streamableHttp","url":"https://example.invalid/mcp","mode":"optional","headers":{"X-Custom":"synthetic-not-a-secret"}}}),
+            ),
+            (
+                "/route/native_options/mcpServers",
+                json!({"stdio":{"transport":"stdio","command":"explicit-binary","args":[],"mode":"required","env":{"CUSTOM_TOKEN":"synthetic-not-a-secret"}}}),
+            ),
             ("/input/transcript", json!([{"text":"private history"}])),
-            ("/input/client_request_id", json!({"text":"private history"})),
+            (
+                "/input/client_request_id",
+                json!({"text":"private history"}),
+            ),
             ("/input/lane_id", json!([])),
             ("/input/route", json!("another-route")),
-            ("/input/task_prompt", json!({"prompt":"must not be accepted on open"})),
+            (
+                "/input/task_prompt",
+                json!({"prompt":"must not be accepted on open"}),
+            ),
         ];
         let checkpoint = fs::read(&journal.path).unwrap();
         let invocation = fixture.invocation(52, "session/start");
         for (path, value) in cases {
             let mut bad = serde_json::to_value(&original).unwrap();
             let (parent, key) = path.rsplit_once('/').unwrap();
-            bad.pointer_mut(parent).unwrap().as_object_mut().unwrap().insert(key.into(), value);
+            bad.pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), value);
             let mut bad: RuntimeCommand = serde_json::from_value(bad).unwrap();
             bad.input_sha256 = Some(digest(&bad.input).unwrap().as_str().into());
-            assert!(journal.prepare_command(
-                &fixture.scope, host_receipt(&fixture, &bad), bad, invocation.clone(),
-                RetainedSelectors::default(),
-            ).is_err(), "unexpectedly retained {path}");
-            assert_eq!(fs::read(&journal.path).unwrap(), checkpoint, "changed checkpoint for {path}");
-            assert!(journal.retained_command(&fixture.scope, "host-open").unwrap().is_none());
+            assert!(
+                journal
+                    .prepare_command(
+                        &fixture.scope,
+                        host_receipt(&fixture, &bad),
+                        bad,
+                        invocation.clone(),
+                        RetainedSelectors::default(),
+                    )
+                    .is_err(),
+                "unexpectedly retained {path}"
+            );
+            assert_eq!(
+                fs::read(&journal.path).unwrap(),
+                checkpoint,
+                "changed checkpoint for {path}"
+            );
+            assert!(
+                journal
+                    .retained_command(&fixture.scope, "host-open")
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -3373,14 +3592,32 @@ mod tests {
     fn muse_journal_host_metadata_is_closed_for_each_native_command_method() {
         let fixture = Fixture::new();
         for (method, fields) in [
-            ("agent.send", json!({"text":"input","delivery":"next_turn","prerequisite_operation_id":"configured-operation"})),
-            ("agent.reply", json!({"reply":{"method":"userInput/cancel","params":{"sessionId":fixture.scope.native_root_id,"userInputId":"question"}}})),
-            ("agent.configure", json!({"settings":{"reasoningEffort":"high"},"prerequisite_operation_id":"configured-operation"})),
-            ("agent.goal", json!({"action":"pause","expected_revision":1})),
-            ("agent.recover", json!({"expected_boot_id":BOOT_A,"reason":"explicit recovery"})),
+            (
+                "agent.send",
+                json!({"text":"input","delivery":"next_turn","prerequisite_operation_id":"configured-operation"}),
+            ),
+            (
+                "agent.reply",
+                json!({"reply":{"method":"userInput/cancel","params":{"sessionId":fixture.scope.native_root_id,"userInputId":"question"}}}),
+            ),
+            (
+                "agent.configure",
+                json!({"settings":{"reasoningEffort":"high"},"prerequisite_operation_id":"configured-operation"}),
+            ),
+            (
+                "agent.goal",
+                json!({"action":"pause","expected_revision":1}),
+            ),
+            (
+                "agent.recover",
+                json!({"expected_boot_id":BOOT_A,"reason":"explicit recovery"}),
+            ),
         ] {
             let mut request = json!({"client_request_id":"request-method","binding_id":fixture.scope.binding_id,"generation":fixture.scope.generation});
-            request.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
             let mut command = host_command(&fixture, "host-method", method, request);
             // The Host mutation validator and prerequisites::validate_request
             // permit this field on agent.goal, beyond the catalog's field list.
