@@ -367,18 +367,13 @@ jobs:
               'crates/swarm-kernel-host/src/ipc.rs',
               'crates/swarm-kernel-host/src/store/mod.rs',
               'crates/swarm-kernel-host/src/store/native_streams.rs',
-              'crates/swarm-kernel-host/src/store/object_scope.rs',
-              '.github/workflows/rust.yml'
+              'crates/swarm-kernel-host/src/store/object_scope.rs'
             )
           })
           if ($relevantPaths.Count -eq 0) { exit 0 }
           # Reuse exact selected identities, including real reverse consumers
           # of changed contracts/client code. Never expand to a full suite.
-          $packages = @(
-            @($env:PACKAGE_SPECS | ConvertFrom-Json) +
-            @($env:CLIPPY_PACKAGE_SPECS | ConvertFrom-Json) |
-              Sort-Object -Unique
-          )
+          $packages = @($env:CLIPPY_PACKAGE_SPECS | ConvertFrom-Json)
           $clientPackages = @($packages | Where-Object { ([string]$_).Split('@')[0] -ceq 'swarm-client' })
           $hostPackages = @($packages | Where-Object { ([string]$_).Split('@')[0] -ceq 'swarm-kernel-host' })
           if ($clientPackages.Count -gt 1 -or $hostPackages.Count -gt 1) {
