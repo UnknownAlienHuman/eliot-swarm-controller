@@ -14,6 +14,7 @@ pub mod module_command;
 pub mod module_contract;
 /// Store-admitted native MCP command DTO and method declarations.
 pub mod native_mcp;
+pub mod native_stream;
 pub mod native_usage;
 pub mod provider_condition;
 pub mod rpc;

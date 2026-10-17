@@ -60,6 +60,20 @@ impl ModuleLink {
         self.client.request("module.observe", params).await
     }
 
+    /// Ephemeral content ingress only. No Observation/event or native request
+    /// is produced; Store validates current link, boot and exact Operation.
+    pub async fn publish_stream(
+        &mut self,
+        frame: &swarm_contracts::native_stream::StreamPublish,
+    ) -> Result<Value> {
+        self.client
+            .request(
+                swarm_contracts::native_stream::PUBLISH_METHOD,
+                serde_json::to_value(frame)?,
+            )
+            .await
+    }
+
     pub async fn result(&mut self, params: Value) -> Result<Value> {
         self.client.request("module.result", params).await
     }

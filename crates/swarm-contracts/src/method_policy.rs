@@ -37,6 +37,22 @@ pub struct MethodPolicy {
 /// service calls. Unknown names do not acquire a default writer path.
 pub const METHOD_REGISTRY: &[MethodPolicy] = &[
     MethodPolicy {
+        method: "stream.open", class: MethodClass::ReadOnly, mcp: true,
+        participant: ParticipantAccess::Read,
+    },
+    MethodPolicy {
+        method: "stream.read", class: MethodClass::ReadOnly, mcp: true,
+        participant: ParticipantAccess::Read,
+    },
+    MethodPolicy {
+        method: "stream.close", class: MethodClass::ReadOnly, mcp: true,
+        participant: ParticipantAccess::Read,
+    },
+    MethodPolicy {
+        method: "module.stream.publish", class: MethodClass::Internal, mcp: false,
+        participant: ParticipantAccess::None,
+    },
+    MethodPolicy {
         method: "code.scope.propose",
         class: MethodClass::Mutation,
         mcp: true,
