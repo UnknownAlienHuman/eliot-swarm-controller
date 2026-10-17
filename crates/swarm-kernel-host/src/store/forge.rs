@@ -3720,13 +3720,15 @@ mod tests {
         let group = swarm_process::Group::enter_module(&token).unwrap();
         witness.phase("group_ready");
         let pid = std::process::id();
+        #[cfg(target_os = "linux")]
+        witness.observe_self_exe_metadata();
         witness.phase("image_observation");
         let image = swarm_process::process_image_identity(pid);
         witness.image_returned(
             image
                 .as_ref()
                 .map(|_| ())
-                .map_err(|error| error.code.as_str()),
+                .map_err(|error| (error.code.as_str(), error.message.as_str())),
         );
         let image = image.unwrap();
         witness.phase("image_observed");

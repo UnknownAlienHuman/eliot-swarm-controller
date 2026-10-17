@@ -21,6 +21,53 @@ const OWNER_PHASES: &[&str] = &[
     "roundtrip_checked",
     "assertions_complete",
 ];
+const IMAGE_REASONS: &[&str] = &[
+    "not_applicable",
+    "unclassified",
+    "image_path_not_unicode",
+    "image_path_boundary",
+    "image_file_boundary",
+    "image_size_overflow",
+    "image_hash_boundary",
+    "image_hash_changed",
+    "proc_stat_invalid",
+    "proc_stat_incomplete",
+    "proc_group_invalid",
+    "pidfd_unobservable",
+    "boot_id_unavailable",
+    "exe_path_not_absolute",
+    "post_hash_identity_changed",
+    "process_gone",
+    "process_executable_gone",
+    "process_birth_changed_on_open",
+    "process_gone_during_inventory",
+];
+
+fn classify_image_error(code: &str, message: &str) -> &'static str {
+    // Exact literals from process_group.rs, never substrings or raw diagnostics.
+    match (code, message) {
+        ("PROCESS_IDENTITY", "process executable path is not valid Unicode") => "image_path_not_unicode",
+        ("PROCESS_IDENTITY", "process executable path is outside the supported boundary") => "image_path_boundary",
+        ("PROCESS_IDENTITY", "process executable is outside the supported file boundary") => "image_file_boundary",
+        ("PROCESS_IDENTITY", "process image size overflow") => "image_size_overflow",
+        ("PROCESS_IDENTITY", "process executable exceeds the supported hash boundary") => "image_hash_boundary",
+        ("PROCESS_IDENTITY", "process executable changed during bounded hashing") => "image_hash_changed",
+        ("PROCESS_IDENTITY", "invalid proc stat") => "proc_stat_invalid",
+        ("PROCESS_IDENTITY", "incomplete proc stat") => "proc_stat_incomplete",
+        ("PROCESS_IDENTITY", "invalid process group") => "proc_group_invalid",
+        ("PROCESS_IDENTITY", "cannot observe process pidfd") => "pidfd_unobservable",
+        ("PROCESS_IDENTITY", "kernel boot identity is unavailable") => "boot_id_unavailable",
+        ("PROCESS_IDENTITY", "kernel executable path is not absolute") => "exe_path_not_absolute",
+        // This source branch combines birth/liveness/path/device/inode checks;
+        // its reason does not identify which individual condition failed.
+        ("PROCESS_IDENTITY", "process birth or executable image changed during bounded hashing") => "post_hash_identity_changed",
+        ("PROCESS_GONE", "process is no longer live") => "process_gone",
+        ("PROCESS_GONE", "process executable disappeared") => "process_executable_gone",
+        ("PROCESS_GONE", "process birth changed while opening its executable") => "process_birth_changed_on_open",
+        ("PROCESS_GONE", "process exited during inventory") => "process_gone_during_inventory",
+        _ => "unclassified",
+    }
+}
 
 fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -187,16 +234,61 @@ impl OwnerImageWitness {
         }));
     }
 
-    pub(super) fn image_returned(&self, result: Result<(), &str>) {
+    #[cfg(target_os = "linux")]
+    pub(super) fn observe_self_exe_metadata(&self) {
+        // Observe the running executable through the opened kernel reference,
+        // not a configured path. This is a separate pre-call metadata sample.
+        let metadata = match File::open("/proc/self/exe").and_then(|file| file.metadata()) {
+            Ok(metadata) => json!({
+                "read_status":"ok", "is_file":metadata.is_file(), "len_bytes":metadata.len(),
+            }),
+            Err(_) => json!({"read_status":"read_error", "is_file":null, "len_bytes":null}),
+        };
+        self.write_once("self_exe_metadata", metadata.to_string().as_bytes())
+            .expect("persist self executable metadata");
+    }
+
+    pub(super) fn image_returned(&self, result: Result<(), (&str, &str)>) {
         let classification = match result {
             Ok(()) => "returned_ok",
-            Err("PROCESS_GONE") => "returned_error_PROCESS_GONE",
-            Err("PROCESS_IDENTITY") => "returned_error_PROCESS_IDENTITY",
-            Err("IO_ERROR") => "returned_error_IO_ERROR",
+            Err(("PROCESS_GONE", _)) => "returned_error_PROCESS_GONE",
+            Err(("PROCESS_IDENTITY", _)) => "returned_error_PROCESS_IDENTITY",
+            Err(("IO_ERROR", _)) => "returned_error_IO_ERROR",
             Err(_) => "returned_error_other",
         };
         self.write_once("image_result", classification.as_bytes())
             .expect("persist image observation return");
+        let reason = match result {
+            Ok(()) => "not_applicable",
+            Err((code, message)) => classify_image_error(code, message),
+        };
+        self.write_once("image_reason", reason.as_bytes())
+            .expect("persist closed image observation reason");
+    }
+
+    fn self_exe_metadata_summary(&self) -> Value {
+        let unavailable = |status| json!({"read_status":status, "is_file":null, "len_bytes":null});
+        let bytes = match read_bounded(&self.0.join("self_exe_metadata"), 256) {
+            Ok(bytes) => bytes,
+            Err(error) => return unavailable(read_class(&error)),
+        };
+        if bytes.len() > 256 {
+            return unavailable("invalid");
+        }
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value)
+                if value["read_status"] == "ok"
+                    && value["is_file"].is_boolean()
+                    && value["len_bytes"].as_u64().is_some() =>
+            {
+                json!({
+                    "read_status":"ok", "is_file":value["is_file"],
+                    "len_bytes":value["len_bytes"],
+                })
+            }
+            Ok(value) if value["read_status"] == "read_error" => unavailable("read_error"),
+            _ => unavailable("invalid"),
+        }
     }
 
     pub(super) fn summary(&self) -> Value {
@@ -225,9 +317,18 @@ impl OwnerImageWitness {
             Ok(_) => "invalid",
             Err(ref error) => read_class(error),
         };
+        let image_reason = match read_bounded(&self.0.join("image_reason"), 64) {
+            Ok(bytes) => IMAGE_REASONS
+                .iter()
+                .find(|reason| bytes == reason.as_bytes())
+                .copied()
+                .unwrap_or("invalid"),
+            Err(ref error) => read_class(error),
+        };
         json!({
             "phase":phase, "invalid_phase":invalid_phase,
             "image_return":image_return, "panic":panic,
+            "image_reason":image_reason, "self_exe_metadata":self.self_exe_metadata_summary(),
         })
     }
 }
@@ -283,14 +384,54 @@ fn forge_failure_witness_owner_return_is_distinct_from_missing_and_invalid_evide
     assert_eq!(absent["phase"], "image_observation");
     assert_eq!(absent["image_return"], "not_recorded");
     assert_eq!(absent["panic"], "not_recorded");
-    witness.image_returned(Err("IO_ERROR"));
+    assert_eq!(absent["image_reason"], "not_recorded");
+    assert_eq!(
+        absent["self_exe_metadata"],
+        json!({"read_status":"not_recorded", "is_file":null, "len_bytes":null}),
+    );
+    witness.image_returned(Err(("IO_ERROR", "SECRET_ERROR /private/path")));
     witness.write_once("panic", b"recorded\n").unwrap();
     let returned = witness.summary();
     assert_eq!(returned["image_return"], "returned_error_IO_ERROR");
+    assert_eq!(returned["image_reason"], "unclassified");
     assert_eq!(returned["panic"], "recorded");
+    assert!(!returned.to_string().contains("SECRET"));
+    let identity_directory = directory.join("identity");
+    fs::create_dir(&identity_directory).unwrap();
+    let identity_witness = OwnerImageWitness(identity_directory);
+    identity_witness.image_returned(Err(("PROCESS_IDENTITY", "SECRET_IDENTITY_ERROR")));
+    let identity = identity_witness.summary();
+    assert_eq!(identity["image_return"], "returned_error_PROCESS_IDENTITY");
+    assert_eq!(identity["image_reason"], "unclassified");
+    assert!(!identity.to_string().contains("SECRET"));
+    let boundary = "process executable is outside the supported file boundary";
+    assert_eq!(classify_image_error("PROCESS_IDENTITY", boundary), "image_file_boundary");
+    assert_eq!(classify_image_error("IO_ERROR", boundary), "unclassified");
+    assert_eq!(
+        classify_image_error("PROCESS_IDENTITY", &format!("{boundary} SECRET_SUFFIX")),
+        "unclassified",
+    );
+    assert_eq!(
+        classify_image_error(
+            "PROCESS_IDENTITY",
+            "process birth or executable image changed during bounded hashing",
+        ),
+        "post_hash_identity_changed",
+    );
     fs::write(directory.join("image_result"), b"SECRET_ERROR".repeat(100)).unwrap();
+    fs::write(directory.join("image_reason"), b"SECRET_REASON").unwrap();
+    fs::write(
+        directory.join("self_exe_metadata"),
+        br#"{"read_status":"ok","is_file":true,"len_bytes":"SECRET_SIZE"}"#,
+    )
+    .unwrap();
     let invalid = witness.summary();
     assert_eq!(invalid["image_return"], "invalid");
+    assert_eq!(invalid["image_reason"], "invalid");
+    assert_eq!(
+        invalid["self_exe_metadata"],
+        json!({"read_status":"invalid", "is_file":null, "len_bytes":null}),
+    );
     assert!(!invalid.to_string().contains("SECRET"));
     fs::remove_dir_all(directory).unwrap();
 }
