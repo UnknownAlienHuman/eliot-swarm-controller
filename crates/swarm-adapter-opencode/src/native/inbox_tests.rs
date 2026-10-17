@@ -1045,24 +1045,26 @@ async fn native_072_input_status_rejects_foreign_root_scope_and_pinned_model() {
         let intent = fixture.saved_intent("agent.send");
         let mut session = fixture.session.clone();
         *session.pointer_mut(pointer).unwrap() = replacement;
-        let (client, server) = http_fixture(
-            vec![
-                fixture.session_response(&session),
-                fixture.location_response(),
-            ],
-            "GET",
-        )
-        .await;
+        let mut responses = vec![fixture.session_response(&session)];
+        if pointer != "/id" {
+            responses.push(fixture.location_response());
+        }
+        let requests = responses.len();
+        let (client, server) = http_fixture(responses, "GET").await;
         assert_eq!(
             client
                 .read_input_status(&intent, &fixture.options)
                 .await
                 .unwrap_err()
                 .code,
-            "NATIVE_EVIDENCE_UNAVAILABLE",
+            if pointer == "/id" {
+                "NATIVE_SCHEMA_ERROR"
+            } else {
+                "NATIVE_EVIDENCE_UNAVAILABLE"
+            },
             "root field {pointer}"
         );
-        assert_eq!(server.await.unwrap(), vec![Value::Null; 2]);
+        assert_eq!(server.await.unwrap(), vec![Value::Null; requests]);
     }
 }
 
