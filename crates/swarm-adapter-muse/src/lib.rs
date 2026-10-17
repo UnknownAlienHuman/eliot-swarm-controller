@@ -36,7 +36,9 @@
 //! Tests in `msp` are boundary fixtures written for Root to run, not qualification
 //! of the installed Muse executable or any account/authentication state.
 
+pub mod commands;
 pub mod journal;
 pub mod msp;
+pub(crate) mod observations;
 pub mod results;
 pub mod schema;
