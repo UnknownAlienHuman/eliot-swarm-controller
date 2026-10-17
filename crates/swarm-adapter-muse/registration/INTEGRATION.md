@@ -1,10 +1,33 @@
 # Rust Muse worker integration and qualification
 
-The new `muse-rust-controller.1@0.1.1` descriptor remains disabled pending final
+The new `muse-rust-controller.1@0.1.2` descriptor remains disabled pending final
 platform and controlled installed-native qualification. The executable's normal
 `run_owned` entry now uses the integrated shared-link loop and external native
 custodian. Explicit operator registration/route activation remains separate from
 source integration and candidate packaging.
+
+Version 0.1.2 declares and consumes `swarm.normalized_result_context@1` and
+produces `swarm.normalized_result_page@1`. Result requests retain the exact
+Host envelope and selector, including `input_operation_id`. The reader binds
+the Store-sealed origin to its original retained TaskPrompt, dispatch receipt,
+native command ACK and root turn before reading the exact item/revision. An
+unrelated session or turn is rejected; child-family membership alone does not
+attribute every child turn to this Task. Native paths and URIs are never read.
+Pages retain the full payload digest, exact bytes, range and both receipts;
+they remain readback evidence with Task completion unknown and no native replay.
+Opaque session authority is checked around native reads and before journal
+publication. The original result command and typed page survive journal reopen.
+
+This source change does not migrate or overwrite installed 0.1.1 state, replay
+its Task input, or claim its existing dispatch is readable through 0.1.2. Core's
+normalized result validator requires equal full artifact identities for the
+dispatch and result receipts, including version. Any live cross-version handoff
+therefore remains a separate unresolved boundary, not an adapter exception.
+
+The Host observation facade always emits an `observed_children` array. If the
+compact projection omitted it, the facade marks that inventory unavailable and
+family completeness partial; it creates no child and proves no family absence.
+Completed reminder-child metadata is not a fresh child snapshot.
 
 Version 0.1.1 accepts an empty native lifecycle `viewCursor` as the pinned MSP
 schema's required string, preserving its exact value across journal reopen.

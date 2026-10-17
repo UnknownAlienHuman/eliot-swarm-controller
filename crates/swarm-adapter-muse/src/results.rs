@@ -12,9 +12,14 @@
 
 use crate::msp::{MspTransport, RequestError};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fmt, future::Future};
+use swarm_contracts::{
+    ModuleReceiptIdentity, NormalizedResultOriginContext, NormalizedResultPageSource,
+    RuntimeCommand, module_catalog::Sha256Digest,
+};
 
 pub const MAX_PAGE_BYTES: u64 = 65_536;
 pub const MAX_HISTORY_PAGES: usize = 64;
@@ -43,6 +48,7 @@ impl ResultKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResultSelector {
     kind: ResultKind,
+    input_operation_id: Option<String>,
     session_id: String,
     item_id: String,
     item_revision: u64,
@@ -52,6 +58,9 @@ pub struct ResultSelector {
 }
 
 impl ResultSelector {
+    pub fn input_operation_id(&self) -> Option<&str> {
+        self.input_operation_id.as_deref()
+    }
     pub fn kind(&self) -> ResultKind {
         self.kind
     }
@@ -91,6 +100,7 @@ impl ResultRequest {
         if selector.keys().any(|key| {
             ![
                 "kind",
+                "input_operation_id",
                 "session_id",
                 "item_id",
                 "item_revision",
@@ -112,6 +122,7 @@ impl ResultRequest {
         };
         let selected = ResultSelector {
             kind,
+            input_operation_id: optional_text(value, "input_operation_id")?,
             session_id: text(value, "session_id")?.to_owned(),
             item_id: text(value, "item_id")?.to_owned(),
             item_revision: integer(value.get("item_revision"), None, 1)?,
@@ -156,6 +167,7 @@ impl ResultRequest {
             "item_id":s.item_id, "item_revision":s.item_revision,
         });
         for (key, value) in [
+            ("input_operation_id", &s.input_operation_id),
             ("output_ref", &s.output_ref),
             ("expected_digest", &s.expected_digest),
             ("before_cursor", &s.before_cursor),
@@ -166,6 +178,200 @@ impl ResultRequest {
         }
         json!({"selector":selector,"offset_bytes":self.offset_bytes,"length_bytes":self.length_bytes})
     }
+}
+
+/// Store's sealed origin is provenance, never a replacement for the retained
+/// dispatch or the reader's current opaque SessionAuthority.
+pub(crate) struct NormalizedResultContext {
+    command: RuntimeCommand,
+    receipt: ModuleReceiptIdentity,
+    origin: NormalizedResultOriginContext,
+    request: ResultRequest,
+    native_turn_id: String,
+}
+
+pub(crate) fn validate_normalized_request(
+    command: &RuntimeCommand,
+    receipt: &ModuleReceiptIdentity,
+) -> Result<(ResultRequest, NormalizedResultOriginContext), ResultReadError> {
+    let input = command.input.as_object().ok_or_else(|| error("RESULT_CONTEXT_INVALID"))?;
+    if input.keys().any(|key| ![
+        "client_request_id", "binding_id", "generation", "selector", "offset_bytes",
+        "length_bytes", "normalized_result_origin", "normalized_result_payload_identity",
+    ].contains(&key.as_str())) {
+        return Err(error("RESULT_CONTEXT_INVALID"));
+    }
+    if let Some(expected) = input.get("normalized_result_payload_identity") {
+        let expected = expected.as_object().ok_or_else(|| error("RESULT_PAYLOAD_MISMATCH"))?;
+        if expected.len() != 3
+            || !expected.get("sha256").and_then(Value::as_str).is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            || expected.get("byte_length").and_then(Value::as_u64).is_none_or(|bytes| bytes > MAX_SAFE_INTEGER)
+            || expected.get("complete").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(error("RESULT_PAYLOAD_MISMATCH"));
+        }
+    }
+    let request = ResultRequest::parse(&command.input)?;
+    let origin: NormalizedResultOriginContext = serde_json::from_value(
+        command.input["normalized_result_origin"].clone(),
+    ).map_err(|_| error("RESULT_ORIGIN_INVALID"))?;
+    origin.validate().map_err(|_| error("RESULT_ORIGIN_INVALID"))?;
+    receipt.validate().map_err(|_| error("RESULT_CONTEXT_INVALID"))?;
+    let selector_sha256 = Sha256Digest::of_canonical_json(&command.input["selector"])
+        .map_err(|_| error("RESULT_CONTEXT_INVALID"))?;
+    if command.method != "agent.result"
+        || command.operation_id != receipt.operation_id
+        || command.binding_id != receipt.binding_id
+        || command.generation != receipt.binding_generation
+        || command.input_sha256.as_deref() != Some(receipt.input_sha256.as_str())
+        || origin.binding_id != command.binding_id
+        || origin.binding_generation != command.generation
+        || command.target_input_sha256.as_deref() != Some(origin.target_input_sha256.as_str())
+        || request.selector.input_operation_id() != Some(origin.target_operation_id.as_str())
+        || origin.target_operation_id == command.operation_id
+        || origin.selector_sha256 != selector_sha256.as_str()
+        || origin.producer.module_receipt.module_id != receipt.module_id
+        || origin.producer.module_receipt.artifact != receipt.artifact
+        || origin.producer.module_receipt.protocol != receipt.protocol
+        || input.get("binding_id").is_some_and(|id| id.as_str() != Some(command.binding_id.as_str()))
+        || input.get("generation").is_some_and(|generation| generation.as_i64() != Some(command.generation))
+        || command.native_root_id.as_deref() != Some(request.selector.session_id())
+    {
+        return Err(error("RESULT_ORIGIN_MISMATCH"));
+    }
+    Ok((request, origin))
+}
+
+impl NormalizedResultContext {
+    pub(crate) fn for_dispatch(
+        command: &RuntimeCommand,
+        receipt: &ModuleReceiptIdentity,
+        dispatch_receipt: &ModuleReceiptIdentity,
+        task: &crate::commands::ValidatedTaskPrompt,
+        native_input_id: &str,
+        native_turn_id: &str,
+    ) -> Result<Self, ResultReadError> {
+        let (request, origin) = validate_normalized_request(command, receipt)?;
+        let c = &task.context;
+        let producer = &origin.producer;
+        if origin.producer.module_receipt != *dispatch_receipt
+            || origin.target_operation_id != c.operation_id
+            || origin.target_input_sha256 != dispatch_receipt.input_sha256
+            || origin.task_id != c.task_id
+            || origin.task_revision != c.task_revision
+            || origin.task_snapshot_sha256 != c.task_snapshot_sha256
+            || origin.attempt_id != c.attempt_id
+            || producer.source_text_sha256 != c.source_text_sha256
+            || producer.source_text_bytes != c.source_text_bytes
+            || producer.native_payload_sha256 != task.envelope.prompt_sha256
+            || producer.native_payload_bytes != task.envelope.prompt_bytes
+            || producer.native_input_id.as_deref() != Some(native_input_id)
+            || producer.completion_condition != "native_input_admitted"
+            || producer.execution_complete
+            || producer.disposition != "admitted"
+            || native_turn_id.is_empty()
+        {
+            return Err(error("RESULT_DISPATCH_MISMATCH"));
+        }
+        Ok(Self {
+            command: command.clone(), receipt: receipt.clone(), origin, request,
+            native_turn_id: native_turn_id.to_owned(),
+        })
+    }
+
+    pub(crate) fn request(&self) -> &ResultRequest { &self.request }
+
+    fn native_identity(&self) -> Result<String, ResultReadError> {
+        let digest = Sha256Digest::of_canonical_json(&json!({
+            "selector":self.command.input["selector"], "native_turn_id":self.native_turn_id,
+        })).map_err(|_| error("RESULT_CONTEXT_INVALID"))?;
+        Ok(format!("muse:result:{}", digest.as_str()))
+    }
+
+    pub(crate) fn normalize_page(&self, mut page: Value) -> Result<Value, ResultReadError> {
+        let selected = self.request.selector();
+        let native = &page["source"];
+        if native["native_session_id"] != selected.session_id()
+            || native["item_id"] != selected.item_id()
+            || native["item_revision"].as_u64() != Some(selected.item_revision())
+            || native["turn_id"] != self.native_turn_id
+            || native["kind"] != selected.kind().as_str()
+            || native.get("output_ref").and_then(Value::as_str) != selected.output_ref()
+        {
+            return Err(error("RESULT_NATIVE_SCOPE_MISMATCH"));
+        }
+        let payload_sha256 = native["content_digest"].as_str()
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+            .ok_or_else(|| error("RESULT_PAYLOAD_IDENTITY_UNAVAILABLE"))?.to_owned();
+        let source = NormalizedResultPageSource {
+            schema_id: "swarm.normalized_result_page".into(), schema_version: 1,
+            origin: self.origin.clone(), result_operation_id: self.receipt.operation_id.clone(),
+            result_input_sha256: self.receipt.input_sha256.clone(),
+            result_module_receipt: self.receipt.clone(), payload_sha256,
+            payload_bytes: page["total_bytes"].as_u64().ok_or_else(|| error("RESULT_PAGE_INVALID"))?,
+            native_response_identity: Some(self.native_identity()?), execution_complete: false,
+            task_completion: "unknown".into(), native_replay: false,
+        };
+        page["source"] = serde_json::to_value(source).map_err(|_| error("RESULT_PAGE_INVALID"))?;
+        self.validate_page(&page)?;
+        Ok(page)
+    }
+
+    pub(crate) fn validate_page(&self, page: &Value) -> Result<(), ResultReadError> {
+        let page: NormalizedPage = serde_json::from_value(page.clone())
+            .map_err(|_| error("RESULT_PAGE_INVALID"))?;
+        page.source.validate().map_err(|_| error("RESULT_PAGE_INVALID"))?;
+        let bytes = STANDARD.decode(&page.content_base64).map_err(|_| error("RESULT_PAGE_INVALID"))?;
+        let end = page.offset_bytes.checked_add(page.byte_length)
+            .ok_or_else(|| error("RESULT_PAGE_INVALID"))?;
+        if page.source.origin != self.origin
+            || page.source.result_module_receipt != self.receipt
+            || page.source.result_operation_id != self.command.operation_id
+            || page.source.native_response_identity.as_deref() != Some(self.native_identity()?.as_str())
+            || page.source.payload_bytes != page.total_bytes
+            || page.total_bytes > MAX_SAFE_INTEGER
+            || page.offset_bytes != self.request.offset_bytes()
+            || page.byte_length != bytes.len() as u64
+            || page.byte_length > self.request.length_bytes()
+            || page.byte_length > MAX_PAGE_BYTES
+            || end > page.total_bytes
+            || page.eof != (end == page.total_bytes)
+            || page.byte_length == 0 && !page.eof
+            || STANDARD.encode(&bytes) != page.content_base64
+            || hash(&bytes) != page.page_sha256
+            || page.media_type.is_empty() || page.media_type.len() > 256
+            || page.media_type.chars().any(char::is_control)
+            || page.offset_bytes == 0 && page.eof && hash(&bytes) != page.source.payload_sha256
+        {
+            return Err(error("RESULT_PAGE_MISMATCH"));
+        }
+        if let Some(expected) = self.command.input.get("normalized_result_payload_identity") {
+            let expected = expected.as_object().ok_or_else(|| error("RESULT_PAYLOAD_MISMATCH"))?;
+            if expected.len() != 3
+                || expected.get("sha256").and_then(Value::as_str) != Some(page.source.payload_sha256.as_str())
+                || expected.get("byte_length").and_then(Value::as_u64) != Some(page.total_bytes)
+                || expected.get("complete").and_then(Value::as_bool) != Some(true)
+            {
+                return Err(error("RESULT_PAYLOAD_MISMATCH"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NormalizedPage {
+    source: NormalizedResultPageSource,
+    offset_bytes: u64,
+    byte_length: u64,
+    total_bytes: u64,
+    eof: bool,
+    media_type: String,
+    content_base64: String,
+    page_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -558,6 +764,35 @@ where
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_origin(
+    receipt: &ModuleReceiptIdentity,
+    task: &crate::commands::ValidatedTaskPrompt,
+    native_input_id: &str,
+    selector: &Value,
+) -> Value {
+    let c = &task.context;
+    json!({
+        "schema_version":1, "binding_id":receipt.binding_id,
+        "binding_generation":receipt.binding_generation,
+        "task_id":c.task_id, "task_revision":c.task_revision,
+        "task_snapshot_sha256":c.task_snapshot_sha256, "attempt_id":c.attempt_id,
+        "target_operation_id":receipt.operation_id, "target_input_sha256":receipt.input_sha256,
+        "selector_sha256":Sha256Digest::of_canonical_json(selector).unwrap().as_str(),
+        "producer":{
+            "assignment_id":receipt.operation_id, "dispatch_operation_id":receipt.operation_id,
+            "attempt_id":c.attempt_id, "task_id":c.task_id, "task_revision":c.task_revision,
+            "task_snapshot_sha256":c.task_snapshot_sha256,
+            "source_text_sha256":c.source_text_sha256,"source_text_bytes":c.source_text_bytes,
+            "native_payload_sha256":task.envelope.prompt_sha256,
+            "native_payload_bytes":task.envelope.prompt_bytes,
+            "completion_condition":"native_input_admitted", "execution_complete":false,
+            "task_completion":"unknown", "disposition":"admitted",
+            "native_input_id":native_input_id, "module_receipt":receipt,
+        }
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{
@@ -618,6 +853,142 @@ mod tests {
         )
         .await;
         (result, calls)
+    }
+
+    fn normalized_fixture() -> (
+        RuntimeCommand, ModuleReceiptIdentity, ModuleReceiptIdentity,
+        crate::commands::ValidatedTaskPrompt,
+    ) {
+        let target: ModuleReceiptIdentity = serde_json::from_value(json!({
+            "schema_version":1,"module_id":"muse",
+            "artifact":{"artifact_id":"muse-rust-controller.1","version":"0.1.2","build_id":null},
+            "protocol":{"major":1,"minor":0},"binding_id":"binding","binding_generation":1,
+            "operation_id":"dispatch","input_sha256":"a".repeat(64),
+        })).unwrap();
+        let task = crate::commands::ValidatedTaskPrompt {
+            envelope: serde_json::from_value(json!({
+                "schema_id":"swarm.task_prompt","schema_version":1,"task_id":"task",
+                "task_revision":2,"attempt_id":"attempt","task_snapshot_sha256":"b".repeat(64),
+                "prompt":"rendered abc","prompt_sha256":hash(b"rendered abc"),"prompt_bytes":12,
+            })).unwrap(),
+            context: serde_json::from_value(json!({
+                "schema_version":1,"operation_id":"dispatch","binding_id":"binding",
+                "binding_generation":1,"worker_boot_id":"boot","task_id":"task",
+                "task_revision":2,"attempt_id":"attempt","task_snapshot_sha256":"b".repeat(64),
+                "source_text_sha256":hash(b"abc"),"source_text_bytes":3,
+            })).unwrap(),
+        };
+        let mut receipt = target.clone();
+        receipt.operation_id = "result".into();
+        receipt.input_sha256 = "c".repeat(64);
+        let mut request = input("message");
+        request["selector"]["input_operation_id"] = json!("dispatch");
+        request["selector"]["before_cursor"] = json!("");
+        request["client_request_id"] = json!("request-result");
+        request["binding_id"] = json!("binding");
+        request["generation"] = json!(1);
+        request["offset_bytes"] = json!(0);
+        request["length_bytes"] = json!(65_536);
+        request["normalized_result_origin"] = fixture_origin(&target, &task, "native-input", &request["selector"]);
+        let command = RuntimeCommand {
+            operation_id:"result".into(), method:"agent.result".into(), created_at_ms:1,
+            binding_id:"binding".into(), generation:1, native_root_id:Some("root".into()),
+            route:json!({"alias":"muse","runtime":"module","enabled":true,"module_artifact_id":"muse-rust-controller.1"}),
+            input:request, input_sha256:Some(receipt.input_sha256.clone()),
+            target_input_sha256:Some(target.input_sha256.clone()),
+        };
+        (command, receipt, target, task)
+    }
+
+    #[tokio::test]
+    async fn muse_normalized_result_host_envelope_to_typed_page_preserves_selector_and_bytes() {
+        let (command, receipt, target, task) = normalized_fixture();
+        let context = NormalizedResultContext::for_dispatch(&command, &receipt, &target, &task, "native-input", "turn").unwrap();
+        assert_eq!(context.request().to_input()["selector"], command.input["selector"]);
+        let body = "hello π";
+        let calls = Calls::default();
+        let raw = read_result_with(context.request().clone(), fake(vec![view(vec![event(message(body))], Value::Null)], calls.clone()), |_| true).await.unwrap();
+        let page = context.normalize_page(raw).unwrap();
+        let source: NormalizedResultPageSource = serde_json::from_value(page["source"].clone()).unwrap();
+        source.validate().unwrap();
+        assert_eq!(source.origin, serde_json::from_value::<NormalizedResultOriginContext>(command.input["normalized_result_origin"].clone()).unwrap());
+        assert_eq!(source.result_module_receipt, receipt);
+        assert_eq!(source.payload_sha256, hash(body.as_bytes()));
+        assert_eq!(STANDARD.decode(page["content_base64"].as_str().unwrap()).unwrap(), body.as_bytes());
+        assert!(!source.execution_complete && !source.native_replay);
+        assert_eq!(source.task_completion, "unknown");
+        assert_eq!(calls.lock().unwrap()[0].0, "view/page");
+        assert_eq!(calls.lock().unwrap()[0].1["cursor"], "");
+        for (pointer, value) in [
+            ("/source/origin/task_revision", json!(3)),
+            ("/source/result_module_receipt/input_sha256", json!("d".repeat(64))),
+            ("/source/native_response_identity", json!("another-item")),
+            ("/source/payload_sha256", json!("d".repeat(64))),
+            ("/source/execution_complete", json!(true)),
+            ("/source/native_replay", json!(true)),
+            ("/offset_bytes", json!(1)), ("/byte_length", json!(0)),
+            ("/total_bytes", json!(99)), ("/eof", json!(false)),
+            ("/content_base64", json!("c3Vic3RpdHV0ZWQ=")),
+        ] {
+            let mut bad = page.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(context.validate_page(&bad).is_err(), "{pointer}");
+        }
+    }
+
+    #[test]
+    fn muse_normalized_result_rejects_unsealed_foreign_and_mismatched_dispatch_contexts() {
+        let (command, receipt, target, task) = normalized_fixture();
+        for (pointer, value) in [
+            ("/normalized_result_origin/task_revision", json!(3)),
+            ("/normalized_result_origin/attempt_id", json!("other-attempt")),
+            ("/normalized_result_origin/producer/native_payload_sha256", json!("d".repeat(64))),
+            ("/normalized_result_origin/producer/native_input_id", json!("another-input")),
+            ("/normalized_result_origin/producer/module_receipt/artifact/version", json!("0.1.1")),
+            ("/selector/session_id", json!("foreign-root")),
+            ("/selector/input_operation_id", json!("other-dispatch")),
+            ("/selector/item_revision", json!(8)),
+        ] {
+            let mut bad = command.clone();
+            *bad.input.pointer_mut(pointer).unwrap() = value;
+            assert!(NormalizedResultContext::for_dispatch(&bad, &receipt, &target, &task, "native-input", "turn").is_err(), "{pointer}");
+        }
+        let mut bad = command.clone();
+        bad.input["normalized_result_origin"]["private_auth"] = json!("must-not-be-retained");
+        assert!(validate_normalized_request(&bad, &receipt).is_err());
+        bad.input = command.input.clone();
+        bad.input.as_object_mut().unwrap().remove("normalized_result_origin");
+        assert!(validate_normalized_request(&bad, &receipt).is_err());
+    }
+
+    #[tokio::test]
+    async fn muse_normalized_result_rejects_foreign_native_turn_before_page_publication() {
+        let (command, receipt, target, task) = normalized_fixture();
+        let context = NormalizedResultContext::for_dispatch(&command, &receipt, &target, &task, "native-input", "turn").unwrap();
+        let mut item = message("other turn");
+        item["turnId"] = json!("foreign-turn");
+        let (page, _) = run(command.input.clone(), vec![view(vec![event(item)], Value::Null)]).await;
+        assert_eq!(context.normalize_page(page.unwrap()).unwrap_err().code, "RESULT_NATIVE_SCOPE_MISMATCH");
+    }
+
+    #[tokio::test]
+    async fn muse_normalized_result_partial_page_keeps_whole_digest_and_sealed_range() {
+        let (mut command, receipt, target, task) = normalized_fixture();
+        command.input["offset_bytes"] = json!(1);
+        command.input["length_bytes"] = json!(2);
+        command.input["normalized_result_payload_identity"] = json!({
+            "sha256":hash(b"abcdef"),"byte_length":6,"complete":true,
+        });
+        let context = NormalizedResultContext::for_dispatch(&command, &receipt, &target, &task, "native-input", "turn").unwrap();
+        let (page, _) = run(command.input.clone(), vec![view(vec![event(message("abcdef"))], Value::Null)]).await;
+        let page = context.normalize_page(page.unwrap()).unwrap();
+        assert_eq!(STANDARD.decode(page["content_base64"].as_str().unwrap()).unwrap(), b"bc");
+        assert_eq!(page["source"]["payload_sha256"], hash(b"abcdef"));
+        assert_eq!(page["total_bytes"], 6);
+        assert_eq!(page["eof"], false);
+        command.input["normalized_result_payload_identity"]["sha256"] = json!("d".repeat(64));
+        let changed = NormalizedResultContext::for_dispatch(&command, &receipt, &target, &task, "native-input", "turn").unwrap();
+        assert_eq!(changed.validate_page(&page).unwrap_err().code, "RESULT_PAYLOAD_MISMATCH");
     }
 
     #[test]

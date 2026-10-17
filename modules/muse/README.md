@@ -7,15 +7,17 @@ selecting it for a new binding. Existing bindings keep their original artifact
 identity and code; an artifact ID must never be relabelled or cross-served.
 
 This package remains an existing compatibility bridge around the official Node
-SDK. Its stateful checkpoint, recovery and native-control code is still Node;
-the Rust adapter migration required by the [modular architecture](../../docs/agent-operations/modularity.md#6-implementation-sequence-and-completion-criteria)
-remains incomplete. The bridge's fixture results apply to this implementation.
+SDK and remains the current default Muse route. Its Node checkpoint, recovery
+and native-control code and fixture evidence belong to this implementation.
 
-The prospective [Rust transport library](../../crates/swarm-adapter-muse/README.md)
-uses complete generic Rust RPC/codec crates and passes 20 local synthetic-pipe
-fixtures. It has no executable/descriptor and does not replace this bridge's
-commands, checkpoint, recovery or results. Those Rust migration steps and native
-qualification remain open.
+The [Rust adapter candidate](../../crates/swarm-adapter-muse/registration/INTEGRATION.md)
+has a runnable `swarm-muse-adapter` executable and a disabled
+`muse-rust-controller.1@0.1.2` descriptor. On 2026-10-17 the installed 0.1.1
+candidate applied a native open and observed one Task's native turn complete.
+Public normalized-result contract and family-read qualification remain pending;
+this is not whole-product or M6 qualification. The candidate does not overwrite
+existing 0.1.1 records or replace the default Node route. The native MCP
+inventory boundary below remains in force.
 
 ## Ownership and setup
 

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "module_id": "muse",
-  "artifact": {"artifact_id": "muse-rust-controller.1", "version": "0.1.1", "build_id": null},
+  "artifact": {"artifact_id": "muse-rust-controller.1", "version": "0.1.2", "build_id": null},
   "launch": {
     "executable": "<INSTALLER_ABSOLUTE_MUSE_RUST_ADAPTER_PATH>",
     "argv": [
@@ -19,11 +19,13 @@
   "command_schemas": [
     {"schema_id": "swarm.runtime_command", "version": "1", "sha256": null},
     {"schema_id": "swarm.task_dispatch_context", "version": "1", "sha256": null},
-    {"schema_id": "swarm.task_prompt", "version": "1", "sha256": null}
+    {"schema_id": "swarm.task_prompt", "version": "1", "sha256": null},
+    {"schema_id": "swarm.normalized_result_context", "version": "1", "sha256": null}
   ],
   "event_schemas": [
     {"schema_id": "swarm.runtime_outcome", "version": "1", "sha256": null},
-    {"schema_id": "swarm.task_dispatch_admission", "version": "1", "sha256": null}
+    {"schema_id": "swarm.task_dispatch_admission", "version": "1", "sha256": null},
+    {"schema_id": "swarm.normalized_result_page", "version": "1", "sha256": null}
   ],
   "protocol": {"minimum": {"major": 1, "minor": 0}, "maximum": {"major": 1, "minor": 0}},
   "capabilities": ["agent.configure", "agent.goal", "agent.open", "agent.reconcile", "agent.recover", "agent.refresh", "agent.reply", "agent.result", "agent.send", "task.dispatch"],

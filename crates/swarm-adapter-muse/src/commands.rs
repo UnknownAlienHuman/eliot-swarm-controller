@@ -213,7 +213,7 @@ pub enum CommandEncoding {
         request: NativeRequest,
         session_id: String,
     },
-    /// No result codec or native request is owned by this module.
+    /// Exact Store-sealed result context; the reader owns only native reads.
     ResultReadRequired { validated_input: Value },
     /// No native request is safe from this target alone.
     ReconciliationRequired(ReconciliationTarget),
@@ -634,6 +634,8 @@ pub fn encode(
             if validated != p {
                 return Err(EncodeError::ResultRequestUnvalidated);
             }
+            crate::results::validate_normalized_request(command, cx.expected_receipt)
+                .map_err(|_| EncodeError::ResultRequestUnvalidated)?;
             Ok(CommandEncoding::ResultReadRequired {
                 validated_input: validated.clone(),
             })
@@ -1903,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn muse_commands_result_delegates_exact_validated_input_without_a_parallel_codec() {
+    fn muse_commands_result_rejects_unsealed_input_even_with_a_facade_handoff() {
         let fixture = Fixture::new(
             "agent.result",
             json!({"selector":{"kind":"message","session_id":"ses_child",
@@ -1914,15 +1916,12 @@ mod tests {
             encode(&fixture.command, &cx).unwrap_err(),
             EncodeError::ResultRequestUnvalidated
         );
-        // Only the handoff contract is tested here. Result schema and paging
-        // vectors belong to results.rs and its ResultRequest::parse verifier.
+        // A facade boolean/reference cannot replace the typed Store origin.
         cx.validated_result_input = Some(&fixture.command.input);
-        let encoded = encode(&fixture.command, &cx).unwrap();
-        assert!(encoded.first_request().is_none());
-        let CommandEncoding::ResultReadRequired { validated_input } = encoded else {
-            panic!("results owner handoff")
-        };
-        assert_eq!(validated_input, fixture.command.input);
+        assert_eq!(
+            encode(&fixture.command, &cx).unwrap_err(),
+            EncodeError::ResultRequestUnvalidated
+        );
         let other_input = json!({"different":"input"});
         cx.validated_result_input = Some(&other_input);
         assert_eq!(

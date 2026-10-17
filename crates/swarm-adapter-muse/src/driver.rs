@@ -17,7 +17,7 @@ use crate::{
         ChildSnapshotInput, NativeEventInput, ObservationProjector, PendingInventoryInput,
         ProjectionFence, ReadMethod, ReductionStatus, RootSnapshotInput,
     },
-    results::{self, ResultRequest},
+    results,
     schema,
 };
 use jsonrpsee_core::server::RpcModule;
@@ -795,7 +795,10 @@ impl Driver {
             self.refresh_one(&transport, session).await?;
         }
         let result_input = if command.method == "agent.result" {
-            ResultRequest::parse(&command.input).map_err(|e| fault(e.code))?;
+            let s = self.lock()?;
+            s.journal.as_ref().ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                .result_context(s.scope.as_ref().ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?, receipt, command)
+                .map_err(jf)?;
             Some(command.input.clone())
         } else {
             None
@@ -945,9 +948,13 @@ impl Driver {
                 self.queue(receipt,EffectOutcome::Applied,json!({"completion_condition":"native_read_completed","execution_complete":false}),None,None)
             }
             CommandEncoding::ResultReadRequired { validated_input } => {
-                let requested =
-                    ResultRequest::parse(&validated_input).map_err(|error| fault(error.code))?;
-                let session = requested.selector().session_id();
+                let context = {
+                    let s = self.lock()?;
+                    s.journal.as_ref().ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
+                        .result_context(s.scope.as_ref().ok_or_else(|| fault("MUSE_SCOPE_UNAVAILABLE"))?, receipt, command)
+                        .map_err(jf)?
+                };
+                let session = context.request().selector().session_id();
                 self.refresh(&transport, &root).await?;
                 if session != root {
                     self.refresh_one(&transport, session).await?;
@@ -979,6 +986,7 @@ impl Driver {
                 })
                 .await
                 .map_err(|e| fault(e.code))?;
+                let page = context.normalize_page(page).map_err(|error| fault(error.code))?;
                 let mut s = self.lock()?;
                 let scope = s
                     .scope
@@ -987,7 +995,7 @@ impl Driver {
                 s.journal
                     .as_mut()
                     .ok_or_else(|| fault("MUSE_JOURNAL_UNAVAILABLE"))?
-                    .queue_result_for(&scope, receipt.clone(), page, &authority)
+                    .queue_normalized_result_for(&scope, receipt.clone(), command, page, &authority)
                     .map_err(jf)
             }
             CommandEncoding::ReconciliationRequired(_) => {
@@ -2009,6 +2017,7 @@ impl Driver {
                 } else {
                     json!({"execution":"unknown","family_completeness":"partial","boot_id":self.bootstrap.worker.boot_id})
                 };
+                view = family_wire_observation(view);
                 view["native_ready"] = json!(s.ready);
                 view["fingerprint_warning"] = json!(s.fingerprint_warning);
                 view["diagnostic_code"] = json!(s.diagnostic);
@@ -2211,6 +2220,17 @@ fn outcome(
         details,
     }
 }
+fn family_wire_observation(mut view: Value) -> Value {
+    // The shared family pager requires an inventory array even when the compact
+    // projection retained none. Unavailable is not proof of native child absence.
+    if view.get("observed_children").is_none() {
+        view["observed_children"] = json!([]);
+        view["observed_children_state"] = json!("unavailable");
+        view["family_completeness"] = json!("partial");
+    }
+    view
+}
+
 fn task_admission(
     task: &ValidatedTaskPrompt,
     receipt: &ModuleReceiptIdentity,
@@ -2623,6 +2643,21 @@ mod tests {
         c.input["task_dispatch_context"] = json!({"schema_version":1,"operation_id":c.operation_id,"binding_id":c.binding_id,"binding_generation":1,"worker_boot_id":BOOT,"task_id":"task","task_revision":2,"attempt_id":"attempt","task_snapshot_sha256":"b".repeat(64),"source_text_sha256":digest(b"abc"),"source_text_bytes":3});
         c
     }
+    fn normalized_result_command(driver: &Driver) -> RuntimeCommand {
+        let mut command = command(driver, "03-result", "agent.result", json!({
+            "selector":{"kind":"message","input_operation_id":"02-dispatch",
+                "session_id":ROOT,"item_id":"answer","item_revision":7,"before_cursor":""},
+            "offset_bytes":0,"length_bytes":65_536,
+        }));
+        let state = driver.lock().unwrap();
+        let saved = &state.contexts["02-dispatch"];
+        command.target_input_sha256 = Some(saved.receipt.input_sha256.clone());
+        command.input["normalized_result_origin"] = results::fixture_origin(
+            &saved.receipt, saved.task.as_ref().unwrap(), saved.invocation.command_id(),
+            &command.input["selector"],
+        );
+        command
+    }
     async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) {
         writer
             .write_all(format!("{}\n", serde_json::to_string(&value).unwrap()).as_bytes())
@@ -2831,6 +2866,23 @@ mod tests {
             "MUSE_SCHEMA_VERSION_UNSUPPORTED"
         );
     }
+
+    #[test]
+    fn muse_driver_family_wire_keeps_unknown_inventory_and_child_freshness_distinct() {
+        let missing = family_wire_observation(json!({"execution":"unknown","family_completeness":"partial"}));
+        assert_eq!(missing["observed_children"], json!([]));
+        assert_eq!(missing["observed_children_state"], "unavailable");
+        assert_eq!(missing["family_completeness"], "partial");
+        let observed = json!({
+            "execution":"idle","family_completeness":"partial","native_root_id":ROOT,
+            "observed_children":[{"sessionId":"child","parentSessionId":ROOT,
+                "parentTurnId":"native-turn","kind":"reminderChild","status":"completed",
+                "snapshot_freshness":"unknown","observed_now":false}],
+        });
+        assert_eq!(family_wire_observation(observed.clone()), observed);
+        let malformed = json!({"observed_children":null,"family_completeness":"partial"});
+        assert_eq!(family_wire_observation(malformed.clone()), malformed);
+    }
     #[test]
     fn muse_driver_native_connection_end_stales_usage_once() {
         let fence = ProjectionFence {
@@ -2926,7 +2978,7 @@ mod tests {
             assert_eq!(restored.inventories[0].session_id(), ROOT);
         }
         driver.clone().execute(dispatch(&driver)).await.unwrap();
-        driver.clone().execute(command(&driver,"03-result","agent.result",json!({"selector":{"kind":"message","session_id":ROOT,"item_id":"answer","item_revision":7}}))).await.unwrap();
+        driver.clone().execute(normalized_result_command(&driver)).await.unwrap();
         let records = Arc::new(Mutex::new(Vec::new()));
         let host = host_pair(&dir.0, records.clone());
         let mut first = driver.bootstrap.link(&driver).await.unwrap();
@@ -2962,6 +3014,12 @@ mod tests {
                 .filter(|r| r["method"] == "module.result")
                 .collect();
             assert_eq!(pages.len(), 2);
+            let source: swarm_contracts::NormalizedResultPageSource =
+                serde_json::from_value(pages[0]["params"]["page"]["source"].clone()).unwrap();
+            source.validate().unwrap();
+            assert_eq!(source.origin.target_operation_id, "02-dispatch");
+            assert_eq!(source.origin.task_revision, 2);
+            assert!(!source.execution_complete && !source.native_replay);
             assert_eq!(pages[0]["params"], pages[1]["params"]);
             assert_eq!(
                 serde_json::from_str::<Value>(&exact).unwrap(),
@@ -2981,6 +3039,12 @@ mod tests {
                 dispatch["params"]["details"]["dispatch_admission"]["task_revision"],
                 2
             );
+        }
+        {
+            let observed = records.lock().unwrap();
+            for frame in observed.iter().filter(|frame| frame["method"] == "module.observe") {
+                assert!(frame["params"]["state"]["observed_children"].is_array());
+            }
         }
         shutdown(&driver, &runtime).await;
         native.await.unwrap();
