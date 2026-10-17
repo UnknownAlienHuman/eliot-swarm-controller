@@ -691,6 +691,17 @@ impl SchedulerFixtureChild {
         }
         owner
     }
+
+    #[cfg(windows)]
+    fn retained_job_accounting_witness(&self) -> &'static str {
+        // One failure-only snapshot from the already retained exact Job.
+        match self.1.as_ref().map(swarm_process::Group::family_empty) {
+            Some(Ok(true)) => "zero_active_processes",
+            Some(Ok(false)) => "nonzero_active_processes",
+            Some(Err(_)) => "query_error",
+            None => "not_retained",
+        }
+    }
 }
 
 impl Drop for SchedulerFixtureChild {
@@ -1301,11 +1312,25 @@ async fn r48_owner_lost_store_results_hold_intent_and_process_capacity() {
     assert_eq!(child_launch_calls, 1);
     assert!(child.0.try_wait().unwrap().is_none());
     child.0.kill().unwrap();
-    child.0.wait().unwrap();
+    let direct_child_exit = child.0.wait().unwrap();
     store
         .finish_automation_scheduler_worker(scope, launch_id, identity)
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            #[cfg(windows)]
+            let retained_job_accounting_after_finish = child.retained_job_accounting_witness();
+            #[cfg(not(windows))]
+            let retained_job_accounting_after_finish = "not_applicable";
+            let finish_reason = match error.code.as_str() {
+                "AUTOMATION_SERVICE_OWNER_RETAINED" => "owner_retained",
+                "AUTOMATION_SERVICE_OWNER_PROOF_UNAVAILABLE" => "proof_unavailable",
+                "AUTOMATION_SERVICE_OWNER_STALE" => "owner_stale",
+                _ => "unclassified",
+            };
+            panic!(
+                "scheduler fixture finish rejected: finish_reason={finish_reason}; direct_child_exit={direct_child_exit:?}; retained_job_accounting_after_finish={retained_job_accounting_after_finish}"
+            );
+        });
     let (next_scope, next_launch_id) = store.begin_automation_scheduler_worker().await.unwrap();
     assert_eq!(next_scope, active.scope);
     assert_ne!(next_launch_id, active.launch_id);
