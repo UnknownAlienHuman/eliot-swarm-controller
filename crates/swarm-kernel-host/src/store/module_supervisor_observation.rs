@@ -61,7 +61,7 @@ impl super::Store {
         observation: T,
     ) -> Result<ObservationDisposition> {
         let observation = parse(observation)?;
-        let (disposition, diagnostic) = self
+        let (disposition, diagnostic, committed_change) = self
             .run(move |db| {
                 let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // A lost denial ACK must replay its retained disposition before
@@ -71,6 +71,7 @@ impl super::Store {
                     return Ok((
                         ObservationDisposition::ScopedPermanentRejection { error_code },
                         None,
+                        false,
                     ));
                 }
                 let now_ms = model::now_ms()?;
@@ -87,6 +88,7 @@ impl super::Store {
                                 ObservationDisposition::ExactDuplicate
                             },
                             committed.diagnostic,
+                            committed.inserted,
                         ))
                     }
                     Err(error) if is_permanent_observation_error(&error.code) => {
@@ -106,6 +108,7 @@ impl super::Store {
                                 error_code: error.code,
                             },
                             None,
+                            true,
                         ))
                     }
                     Err(error) => {
@@ -115,7 +118,7 @@ impl super::Store {
                 }
             })
             .await?;
-        if !matches!(&disposition, ObservationDisposition::ExactDuplicate) {
+        if committed_change {
             self.changed
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
@@ -811,8 +814,16 @@ pub(super) fn record(
     }
     validate_phase_transition(tx, current, observation)?;
     let transition = lifecycle_transition(current, observation);
-    let nonterminal = nonterminal_transition(observation);
-    let operation_link = validate_operation_ids(tx, observation, generation)?;
+    let validated = validate_operation_ids(tx, observation, generation)?;
+    let operation_link = validated.active_link;
+    // A raced prelaunch callback is a retained status sample, not a new
+    // Operation cause. The nonterminal writer otherwise links a sole sampled
+    // ID without consulting the validated active link.
+    let nonterminal = if validated.terminal_prelaunch_sample {
+        None
+    } else {
+        nonterminal_transition(observation)
+    };
     let diagnostic = diagnostic_for_transition(current, observation, operation_link.as_ref());
 
     tx.execute(
@@ -2108,11 +2119,16 @@ struct ValidatedOperationLink {
     owner_id: Option<String>,
 }
 
+struct ValidatedOperationSnapshot {
+    active_link: Option<ValidatedOperationLink>,
+    terminal_prelaunch_sample: bool,
+}
+
 fn validate_operation_ids(
     tx: &Transaction<'_>,
     observation: &ModuleSupervisorObservation,
     generation: i64,
-) -> Result<Option<ValidatedOperationLink>> {
+) -> Result<ValidatedOperationSnapshot> {
     type OperationValidationRow = (
         String,
         Option<String>,
@@ -2125,6 +2141,14 @@ fn validate_operation_ids(
         && observation.unknown_operation_ids.len() == 1
         && !observation.unknown_operation_ids_truncated;
     let mut exact_link = None;
+    // The caller has already fenced the current actor and exact immutable
+    // binding/descriptor identity. Only this bootless diagnostic shape may
+    // retain IDs that settled after the supervisor's sampled readback.
+    let prelaunch_sample = observation.boot_id.is_none()
+        && matches!(observation.phase, ModuleSupervisorPhase::Isolated)
+        && matches!(observation.effect_certainty, ModuleEffectCertainty::Unknown)
+        && matches!(observation.stage, Some(ModuleFailureStage::ValidateLaunch));
+    let mut terminal_prelaunch_sample = false;
     for operation_id in &observation.unknown_operation_ids {
         let row: Option<OperationValidationRow> = tx
             .query_row(
@@ -2163,12 +2187,13 @@ fn validate_operation_ids(
             state.as_str(),
             "sending" | "native_accepted" | "outcome_unknown"
         ) {
-            if matches!(observation.phase, ModuleSupervisorPhase::Ready)
+            if (matches!(observation.phase, ModuleSupervisorPhase::Ready) || prelaunch_sample)
                 && matches!(state.as_str(), "settled" | "rejected" | "cancelled")
             {
-                // The immutable hello snapshot may wait behind delivery while
-                // an exact scoped Operation settles. Keep the sampled ID but
-                // do not attach terminal work as an active lifecycle cause.
+                // Preserve the immutable sampled ID, count and event. Continue
+                // checking every listed ID; queued, missing and foreign work
+                // never becomes a tolerated terminal sample.
+                terminal_prelaunch_sample |= prelaunch_sample;
                 continue;
             }
             return Err(Error::new(
@@ -2204,7 +2229,10 @@ fn validate_operation_ids(
             });
         }
     }
-    Ok(exact_link)
+    Ok(ValidatedOperationSnapshot {
+        active_link: exact_link,
+        terminal_prelaunch_sample,
+    })
 }
 
 fn payload(observation: &ModuleSupervisorObservation, generation: i64) -> Value {
