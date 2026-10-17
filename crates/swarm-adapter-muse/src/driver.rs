@@ -1508,7 +1508,7 @@ impl Driver {
                 {
                     continue;
                 }
-                schema::validate_method_parameters(
+                validate_native_notification_parameters(
                     event["method"]
                         .as_str()
                         .ok_or_else(|| fault("MUSE_DISCOVERY_PAGE_INVALID"))?,
@@ -1546,7 +1546,7 @@ impl Driver {
             }
             let next = page["nextCursor"]
                 .as_str()
-                .filter(|s| !s.is_empty() && s.len() <= 8192)
+                .filter(|s| s.len() <= 8192 && !s.chars().any(char::is_control))
                 .ok_or_else(|| fault("MUSE_DISCOVERY_PAGE_INVALID"))?;
             if cursor.as_deref() == Some(next) || !seen.insert(next.to_owned()) {
                 return Err(fault("MUSE_DISCOVERY_CURSOR_STALLED"));
@@ -2636,6 +2636,15 @@ mod tests {
         calls: Arc<Mutex<Vec<Value>>>,
         drop_turn_ack: bool,
     ) {
+        native_peer_with_discovery(peer, workspace, calls, drop_turn_ack, None).await;
+    }
+    async fn native_peer_with_discovery(
+        peer: DuplexStream,
+        workspace: PathBuf,
+        calls: Arc<Mutex<Vec<Value>>>,
+        drop_turn_ack: bool,
+        discovered_child: Option<&'static str>,
+    ) {
         let (read, mut write) = tokio::io::split(peer);
         let mut lines = BufReader::new(read).lines();
         let mut initialized = false;
@@ -2662,7 +2671,13 @@ mod tests {
                     json!({"session":session(&workspace),"viewCursor":""})
                 }
                 "session/read" => {
-                    json!({"session":session(&workspace),"viewCursor":"","history":{"mode":"none","items":null,"snapshot":null},"pendingRequests":[]})
+                    let mut value = session(&workspace);
+                    if let Some(child) = discovered_child
+                        && request["params"]["sessionId"] == child
+                    {
+                        value["sessionId"] = json!(child);
+                    }
+                    json!({"session":value,"viewCursor":"","history":{"mode":"none","items":null,"snapshot":null},"pendingRequests":[]})
                 }
                 "view/subscribe" => json!({"viewCursor":""}),
                 "approval/listPending" => json!({"approvals":[],"userInputs":[]}),
@@ -2677,6 +2692,30 @@ mod tests {
                         return;
                     }
                     json!({"commandId":request["params"]["commandId"],"status":"accepted","disposition":"started","startedNewTurn":true,"turnId":"native-turn"})
+                }
+                "view/page" if request["params"]["direction"] == "forward" => {
+                    let events = if request["params"].get("cursor").is_none() {
+                        discovered_child.map_or_else(Vec::new, |child| vec![json!({
+                            "method":"item/completed",
+                            "params":{"sessionId":ROOT,"viewCursor":"",
+                                "sourceRange":{"stream":{"kind":"session","id":ROOT},
+                                    "first":{"id":"child-record","sequence":1},
+                                    "last":{"id":"child-record","sequence":1}},
+                                "item":{"itemId":"child-item","kind":"subagent",
+                                    "status":"completed","revision":1,"turnId":"parent-turn",
+                                    "childSessionId":child,"subagentId":child,
+                                    "result":{"artifactRefs":[],"evidenceRefs":[],"summary":"synthetic"}}}
+                        })])
+                    } else {
+                        Vec::new()
+                    };
+                    let next = if let Some(cursor) = request["params"].get("cursor") {
+                        assert_eq!(cursor, "", "empty continuation must be sent verbatim");
+                        Value::Null
+                    } else {
+                        json!("")
+                    };
+                    json!({"events":events,"nextCursor":next})
                 }
                 "view/page" => {
                     json!({"events":[{"method":"item/completed","params":{"sessionId":ROOT,"viewCursor":"result:7","sourceRange":{"stream":{"kind":"run","id":"synthetic-run"},"first":{"id":"synthetic-first","sequence":1},"last":{"id":"synthetic-last","sequence":2}},"item":{"itemId":"answer","revision":7,"kind":"agentMessage","status":"completed","turnId":"native-turn","text":"synthetic result"}}}],"nextCursor":null})
@@ -2856,6 +2895,18 @@ mod tests {
             .unwrap();
         assert!(driver.lock().unwrap().ready);
         {
+            let calls = calls.lock().unwrap();
+            let pages: Vec<_> = calls
+                .iter()
+                .filter(|call| {
+                    call["method"] == "view/page" && call["params"]["direction"] == "forward"
+                })
+                .collect();
+            assert_eq!(pages.len(), 2);
+            assert!(pages[0]["params"].get("cursor").is_none());
+            assert_eq!(pages[1]["params"]["cursor"], "");
+        }
+        {
             let s = driver.lock().unwrap();
             let scope = s.scope.as_ref().unwrap();
             let journal = s.journal.as_ref().unwrap();
@@ -2947,6 +2998,59 @@ mod tests {
             1
         );
     }
+    #[tokio::test]
+    async fn muse_driver_paged_child_discovery_preserves_empty_cursor_and_notification_schema() {
+        const CHILD: &str = "019b0000-0000-7000-8000-000000000001";
+        let dir = Directory::new();
+        let (driver, runtime, peer) = fixture(&dir.0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let native = tokio::spawn(native_peer_with_discovery(
+            peer,
+            dir.0.clone(),
+            calls.clone(),
+            false,
+            Some(CHILD),
+        ));
+        driver
+            .clone()
+            .execute(command(&driver, "01-open", "agent.open", json!({})))
+            .await
+            .unwrap();
+        {
+            let state = driver.lock().unwrap();
+            assert!(state.ready);
+            assert_eq!(state.children(), vec![CHILD.to_owned()]);
+            let scope = state.scope.as_ref().unwrap();
+            let journal = state.journal.as_ref().unwrap();
+            assert!(journal.authorize_session(scope, CHILD).is_ok());
+            let restored = journal.restored_observations(scope).unwrap().unwrap();
+            // Each refreshed session atomically replaces the capture stamp;
+            // the last exact child inventory is the current retained ticket.
+            assert_eq!(restored.inventories.len(), 1);
+            assert_eq!(restored.inventories[0].session_id(), CHILD);
+            let discovery = restored.discovery.last().unwrap();
+            assert_eq!(discovery.after.as_deref(), Some(""));
+            assert!(discovery.next.is_none());
+            assert!(discovery.complete);
+        }
+        shutdown(&driver, &runtime).await;
+        native.await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.iter().any(
+                |call| call["method"] == "session/read" && call["params"]["sessionId"] == CHILD
+            )
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "session/start")
+                .count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| call["method"] == "turn/start"));
+    }
+
     #[tokio::test]
     async fn muse_driver_lost_native_ack_stop_never_freshens_root_or_replays_input() {
         let dir = Directory::new();

@@ -1194,7 +1194,11 @@ pub struct ChildDiscovery {
 impl ChildDiscovery {
     fn validate(&self) -> Result<(), Fault> {
         if !atom(&self.parent_session_id)
-            || self.after.iter().chain(self.next.iter()).any(|s| !atom(s))
+            || self
+                .after
+                .iter()
+                .chain(self.next.iter())
+                .any(|s| s.len() > 8192 || s.chars().any(char::is_control))
             || self.complete != self.next.is_none()
             || self.next.is_some() && self.after == self.next
         {

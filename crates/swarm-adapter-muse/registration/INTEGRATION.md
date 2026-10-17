@@ -16,6 +16,13 @@ model output, recovery, process-family completion or M6. Changed executable
 bytes require a new installed artifact coordinate; existing 0.1.0 receipts and
 bindings remain historical.
 
+Opaque empty continuations also remain distinct from an absent cursor and the
+native `null` end marker in discovery, result paging and stream metadata.
+Paired discovery boundaries retain them atomically. Paged child-item events use
+the same pinned notification definitions as live events, rather than the RPC
+method table. Connected synthetic discovery verifies the parent edge, a real
+child read and current child authority; it is not an installed child run.
+
 The current installed Node bridge.13 and its private state are separate. This
 artifact reads only its own Rust scope marker and versioned journal. It neither
 adopts nor rewrites a Node checkpoint.
