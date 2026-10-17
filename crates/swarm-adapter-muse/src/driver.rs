@@ -181,6 +181,19 @@ impl State {
             }
         }
     }
+    fn end_transport(&mut self, at_ms: i64) {
+        self.ready = false;
+        if !self.transport_ended {
+            self.transport_ended = true;
+            if let (Some(journal), Some(scope)) = (&mut self.journal, &self.scope) {
+                // Revoke read/reply tickets before the final publication check.
+                // Cleanup preserves an existing failure; unhealthy journals
+                // already refuse authority and every later preparation.
+                let _ = journal.end_connection(scope);
+            }
+        }
+        self.close_usage(at_ms);
+    }
     fn revision(&self, session: &str) -> u64 {
         *self.versions.get(session).unwrap_or(&0)
     }
@@ -472,9 +485,7 @@ impl Driver {
             if let Some(driver) = weak.upgrade()
                 && let Ok(mut s) = driver.lock()
             {
-                s.ready = false;
-                s.transport_ended = true;
-                s.close_usage(now());
+                s.end_transport(now());
                 s.diagnostic = Some("MUSE_NATIVE_TRANSPORT_ENDED");
                 s.changed();
             }
@@ -1281,6 +1292,9 @@ impl Driver {
         }
         {
             let mut s = self.lock()?;
+            if s.transport_ended {
+                return Err(fault("MUSE_NATIVE_CONNECTION_ENDED"));
+            }
             if s.scope
                 .as_ref()
                 .is_some_and(|scope| scope.native_root_id == session)
@@ -1935,9 +1949,7 @@ impl Driver {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.ready = false;
-            s.transport_ended = true;
-            s.close_usage(now());
+            s.end_transport(now());
             s.transport.clone()
         };
         if let Some(transport) = transport {
@@ -2963,6 +2975,14 @@ mod tests {
             .unwrap();
         let saved = driver.lock().unwrap().contexts["01-open"].clone();
         let ack = saved.ack.clone().unwrap();
+        let authority = {
+            let s = driver.lock().unwrap();
+            s.journal
+                .as_ref()
+                .unwrap()
+                .authorize_session(s.scope.as_ref().unwrap(), ROOT)
+                .unwrap()
+        };
         native.abort();
         assert!(native.await.unwrap_err().is_cancelled());
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2975,14 +2995,50 @@ mod tests {
         })
         .await
         .expect("real peer EOF must reach the notification consumer");
+        let late_read = json!({"session":ack["session"],"viewCursor":"late:read","history":{"mode":"none","items":null,"snapshot":null},"pendingRequests":[]});
         driver.finish_ack(&saved, ack).unwrap();
         assert_eq!(driver.hello()["native_ready"], false);
         {
             let state = driver.lock().unwrap();
             assert!(!state.ready);
+            assert!(
+                !state
+                    .journal
+                    .as_ref()
+                    .unwrap()
+                    .authority_is_current(state.scope.as_ref().unwrap(), &authority)
+            );
+            assert!(
+                state
+                    .journal
+                    .as_ref()
+                    .unwrap()
+                    .authorize_session(state.scope.as_ref().unwrap(), ROOT)
+                    .is_err()
+            );
             assert_eq!(
                 state.projector.as_ref().unwrap().observation().unwrap()["native_usage"]["freshness"],
                 "stale"
+            );
+        }
+        {
+            let mut state = driver.lock().unwrap();
+            let scope = state.scope.clone().unwrap();
+            assert!(
+                state
+                    .journal
+                    .as_mut()
+                    .unwrap()
+                    .record_work_read(
+                        &scope,
+                        0,
+                        0,
+                        &late_read,
+                        journal::RetainedModelState::Settled,
+                        None
+                    )
+                    .is_err(),
+                "a completed old-connection read must not reopen authority after EOF"
             );
         }
         shutdown(&driver, &runtime).await;

@@ -1621,6 +1621,15 @@ impl Journal {
         self.healthy(scope)?;
         self.invalidate_freshness()
     }
+    /// End the actual initialized connection without rewriting historical ACKs
+    /// or durability facts. A late read cannot restore current capabilities.
+    pub fn end_connection(&mut self, scope: &Scope) -> Result<(), Fault> {
+        self.healthy(scope)?;
+        self.initialized = false;
+        self.durability_observed = false;
+        self.session_mcp_granted = false;
+        self.invalidate_freshness()
+    }
     /// Call only after the correlated initialize result and initialized flush
     /// on the same connection. Validate the full result, persist only durability;
     /// museHome/userAgent/provider settings are never copied into the journal.
