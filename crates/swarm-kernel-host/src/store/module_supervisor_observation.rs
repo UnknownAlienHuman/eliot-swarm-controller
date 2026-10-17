@@ -245,10 +245,7 @@ fn is_permanent_observation_error(code: &str) -> bool {
     )
 }
 
-fn rejection_facts(
-    observation: &ModuleSupervisorObservation,
-    error_code: &str,
-) -> Result<Value> {
+fn rejection_facts(observation: &ModuleSupervisorObservation, error_code: &str) -> Result<Value> {
     let generation = i64::try_from(observation.scope.generation)
         .map_err(|_| invalid("module supervisor generation exceeds the Store range"))?;
     // Hash every parsed observation field, not only the rejection's address.
