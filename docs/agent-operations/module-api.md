@@ -4,7 +4,7 @@ This page explains the retained Store boundaries. The [shared method catalog](..
 and owning parsers define request fields and bounds; do not maintain another schema
 here. [Implementation](implementation.md) owns changes, [delivery](delivery.md)
 owns the work cycle, and [configuration](configuration.md) owns enabled automation.
-Source observations below apply to `f7e1b63`; target changes are named explicitly.
+Source observations below apply to `311b770`; target changes are named explicitly.
 
 ## Common harness commands
 
@@ -36,16 +36,21 @@ and expose their disposition through that Operation, without copying the native 
 Extend the existing projections rather than adding `agent.status` or a quota service.
 Current `agent.state` returns a [binding projection](../../crates/swarm-kernel-host/src/store/operations.rs);
 supervisor phases describe worker lifecycle, not native agent activity.
+In the target, `agent.state` / `agent.family` also accept the source/native identity
+returned by inventory, so an observed unbound session can be read locally.
 
 | Readable fact | Target meaning |
 | --- | --- |
+| Inventory in `agent.list` / family in `agent.family` | Include observed sessions and native children in the authorized source scope even without an Eliot binding, Task or registered producer. The Governor's operational read uses current GM authority; Task/transcript grants retain their own scope. Discovery does not attach, launch or assign work. |
 | Activity in `agent.state` | `idle`, `running`, `waiting` or `unknown`, with current Operation/turn, pending request/reason and last native work activity. Connection health and freshness stay separate. A heartbeat or quota refresh is not work activity. |
-| Identity and location in `agent.state` | Task/Attempt and binding, native session and observed child relationship, process identity/liveness, repository/worktree, assigned and observed branch/HEAD, and local provider JSON reference. Keep each source's time and gaps. A module PID is not automatically an agent PID. |
+| Identity and location in `agent.state` | Known Task/Attempt/binding links, native session/child relationships, process identity/liveness, worktree and local provider source. Separate assigned branch, actual checkout, upstream, push target and last remote repository/ref/head. Keep source times/gaps; ownership can be unknown while a process remains observable. |
 | Run usage | Native run/session tokens, cost and context occupancy. Attribute to an individual input only when the source supplies that scope. Cumulative snapshots are not additive deltas. |
 | Account limits in `agent.usage` | Reuse [NativeUsageSnapshot](../../crates/swarm-contracts/src/native_usage.rs): scoped buckets/windows, reset time, available credit/limit fields, source and freshness. Preserve unavailable values; context size and Goal budget do not establish account quota. |
 
 The [usage reader](../../crates/swarm-kernel-host/src/store/native_usage.rs) already
 retains the latest snapshot and makes it stale after connection/boot/release changes.
+The startup connection reset currently misses `opening/reconciling` bindings;
+fix it so an old `connected` flag cannot keep their quota fresh after host restart.
 It currently admits Codex and enumerated Muse Node bridges; the Rust Muse producer
 is [incorrectly rejected](refactoring.md#current-source-gaps). Fix this same path;
 one connection ID is not an account ID, and several agents do not multiply a shared
@@ -60,6 +65,12 @@ erase the agent. Provider-local history is useful observation even when the cont
 connection is down. It does not by itself prove that an uncertain input was accepted
 or authorize a resend. [Observability](observability.md#5-live-monitoring-and-future-charts)
 defines the Governor's combined read.
+
+`monitor.follow` retains addressed journal history and wakes a live view. Preserve
+binding/generation or source identity in its envelope. A later journal cursor may
+contain an older native sequence; coalesce local projection reads after notification
+instead of treating raw payloads as authoritative state deltas. No provider call is
+needed. These inventory/read changes remain [implementation work](implementation.md#passive-agent-observation).
 
 ## Task planning
 

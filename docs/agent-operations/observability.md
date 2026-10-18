@@ -3,7 +3,7 @@
 Observation is required product behavior. The Governor reads local facts at any
 time without making a request to the provider harness or starting a model.
 [Implementation](implementation.md) owns the remaining source changes.
-At `f7e1b63`, [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) and
+At `311b770`, [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) and
 [swarm-observer](../../crates/swarm-observer/src/host.rs) use a bounded
 Producer/HostRecorder chain. Tracing replacement and broader read-pool routing are
 targets, not implemented guarantees.
@@ -184,18 +184,24 @@ answer who owns the work, where it runs, what it is doing and which fact is miss
 
 | Group | Required observation |
 | --- | --- |
-| Assignment | Manager/agent, Task/Attempt, current Operation and binding/generation. Retain historical work through replacement. |
+| Assignment | Known manager/agent, Task/Attempt, Operation and binding/generation links. Unassigned sessions remain visible; retain historical work through replacement. |
 | Native work | Provider session/root and turn/input IDs; observed child relationships; active tool, pending question/approval/child wait, terminal/error and last content activity. A containing session and a spawning parent are different relations. |
-| Process | Known module/native process, PID and OS birth identity, liveness/exit and observation time. A shared server is one process associated with several sessions. Its exit is a process fact, not completion of every assigned Task. |
-| Workspace and GitHub | Repository, worktree/path, assigned branch and baseline; separately observed checkout branch/HEAD/dirty state; last known remote branch/head and publication Operation. Local commits and worktree changes remain visible before a push. |
+| Process | Known module/native process, PID and OS birth identity, liveness/exit and observation time. A shared server is counted once. Losing its Eliot owner does not hide a surviving process or authorize controlling it. |
+| Workspace and GitHub | Repository/worktree, assigned branch/baseline; observed checkout branch/HEAD/dirty state; upstream, push target and last remote repository/ref/head. Publication Operation is optional. Detached/unborn branches and local changes before push remain visible. |
 | Provider data | Local JSON/JSONL/database reference, native IDs, last consumed cursor/offset, source time and collection error/gap. The authorized Governor can inspect the relevant bounded native data. |
 | Coverage | Connection health, collector health and freshness of each source, independently of work status. Include visible unmatched processes/sessions; absence of a known assignment does not hide them. |
 
-Retain the launch/attach relationship and native IDs once, then update observations.
-Do not rediscover an owner from the newest file, title, branch name or prompt text.
-Native Git metadata may describe session creation; it is not a current checkout
-read. GitHub head is last observed remote state, with its own time; viewing it does
-not trigger a network request. The existing integration can update it independently.
+Retain launch/attach relationships and source/native IDs; discovery can precede
+both launch and assignment. The Governor's operational inventory/family read needs
+no Task Attempt or fabricated producer. Task and transcript access still follows
+actual grants. Do not infer ownership from the newest file, title or branch name.
+
+Native Git metadata may describe session creation. Read the actual worktree
+separately and show deviations from its assignment. A SHA alone names neither a
+branch nor a repository. GitHub state comes from a small independent remote-ref
+read/cache, not necessarily a publication; current Issue polling lacks that view.
+Keep the remote source time/error. Local tracking refs and repeated status reads
+do not establish a fresh remote observation.
 
 ### Collection and reading
 
@@ -206,22 +212,30 @@ stays with the selected adapter. A lost control connection does not stop its loc
 file/database reader or the adapter's separate Eliot ModuleLink. The planned core
 host task collects process/worktree facts independently of the optional recorder.
 If the adapter, its Eliot link or another collector fails, preserve its last facts
-and report lost coverage; retained native data is not presented as fresh. Restart
-loads the retained view and reconciles its known sources before claiming freshness.
+and report lost coverage. Host restart invalidates old connections across all live
+binding states; native processes may survive. Reconcile known sources before
+claiming freshness.
 
-Collect once per native store/service and once per shared worktree/process, using
-bounded incremental reads and coalesced change notifications with a periodic local
-recheck. The number of viewers does not multiply collection. `agent.state`, reports
-and subscriptions read the same projection. An explicit safe `agent.refresh` may
-ask the native service for additional facts; ordinary observation never depends
-on it. Automation and diagnostic log settings do not switch these collectors off.
+Collect once per native store/service and shared worktree/process. Bound actual
+bytes, entries and elapsed work, not just returned page length; retain scan progress
+and coverage between passes. Per-pass limits must not hide excess subjects. Failed
+or filtered discovery does not prove a session disappeared. Coalesce changes with
+a periodic local recheck; viewer count does not multiply collection. `agent.state`,
+reports and subscriptions read the same projection. Explicit `agent.refresh` may
+request additional native facts. Ordinary observation never depends on it;
+disabling automation or diagnostic logging does not disable these collectors.
 
 The initial snapshot uses a short authorized read transaction with its journal
-cut, followed by retained events after that cursor. Apply the existing
+cut, followed by retained events after that cursor. Include the source and known
+binding/generation in the event envelope. Journal order is arrival history; Store
+can retain a late native sequence without applying it to current state. A live
+subscriber treats the record as an addressed invalidation, coalesces local reads
+and uses the projection's observation identity to avoid regressing. Historical
+event display stays separate from current state; no frontend native reducer.
+An expired cursor reports a gap and obtains a fresh snapshot. Apply the existing
 [Store read conversion](implementation.md#store-and-current-data); ordinary reads
-are not all on a read pool today. A lagged subscriber replays retained facts; an
-expired cursor reports a gap and obtains a fresh snapshot. Store source references
-and compact current facts, not a second copy of every transcript.
+are not all on a read pool today. Retain compact facts/source references, not another
+transcript store.
 
 An alive process with a pending child/tool, an alive process with no recent
 progress, a lost connection, a confirmed process exit and an unreadable provider

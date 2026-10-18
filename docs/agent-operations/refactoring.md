@@ -1,6 +1,6 @@
 # Refactoring — Source Findings
 
-Source rechecked at `f7e1b634b619dc2c1a723fe357307f7daab12541` on 2026-10-18.
+Source rechecked at `311b770f0f1efdd63d62a7a65764c33cfcf6fa72` on 2026-10-18.
 Owner baseline: `f1b854b6fd058dc2440d3848fc95acc279657d3f`, parent
 `27fcae1ed2d9fc0aa778680d5e39a08834248023`. The runtime is unchanged since
 `25a8e3b`; subsequent preparation commits change documentation.
@@ -31,6 +31,10 @@ surfaces, not promised deletions; overlapping surfaces cannot be added.
 | --- | --- | --- |
 | Harness commands and Goals | [Goal progression](../../crates/swarm-kernel-host/src/store/automation_goal_progression.rs) is terminal-event-only and branches between Codex `agent.send` and OpenCode `agent.goal`, then repeats that choice at validation. Its [settings](../../crates/swarm-kernel-host/src/automation/config.rs) contain only `goal_id`; recurring-message policy is missing. Codex native Goal exists upstream but the [Rust adapter](../../crates/swarm-adapter-codex/src/lib.rs) declares it unsupported. These are separate plugin-delivery and native-control gaps. | [Two Goal mechanisms](implementation.md#harness-goals-and-the-eliot-goal-plugin) |
 | Passive agent view | [runtime::observe](../../crates/swarm-kernel-host/src/store/runtime.rs) retains native JSON and sequence in binding state. [Public projection](../../crates/swarm-kernel-host/src/store/operations.rs) exposes selected session fields but no combined process/workspace/provider-local view; `public_native_failure` still validates session IDs through OpenCode `valid_id(..., "ses")`. Process identity and [workspace leases](../../crates/swarm-kernel-host/src/store/launcher.rs) already exist separately. Update these producers and the public reader together; a new collector alone will not expose the needed facts. | [Passive agent observation](implementation.md#passive-agent-observation) |
+| Unbound inventory and native children | `agent.list` reads only bindings; `runtime::observe` requires one. [ServiceScope](../../crates/swarm-supervisor/src/descriptor.rs) is also binding-only, although [observations](../../crates/swarm-kernel-host/migrations/001_core.sql) permits a null binding. The [supervisor demand loop](../../crates/swarm-kernel-host/src/host_module_supervisor.rs) has no configured-source demand. [object_reads::family](../../crates/swarm-kernel-host/src/store/object_reads.rs) requires an Attempt from Managers/GM and filters children through registered producers; only Operator bypasses that filter. Local discovery alone cannot make unmatched work visible. | [Passive agent observation](implementation.md#passive-agent-observation) |
+| Restart and live event reads | [initialize_database](../../crates/swarm-kernel-host/src/store/mod.rs) clears connection only for `ready`; `opening/reconciling` can retain old `connected`, also misleading quota freshness. [object_reads::timeline](../../crates/swarm-kernel-host/src/store/object_reads.rs) omits stored binding/generation from its envelope. `runtime::observe` journals late sequences without updating state, so journal payload order is not a current-state reducer. These are source-proven paths, not reproduced live failures. | [Passive agent observation](implementation.md#passive-agent-observation) |
+| Process observation through owner failure | [process_metrics](../../crates/swarm-observer/src/process_metrics.rs) requires live module membership; [module_membership](../../crates/swarm-process/src/module_membership.rs) loses it when the owner dies although native children can survive. [ModuleSupervisorObservation::from_status](../../crates/swarm-supervisor/src/observation.rs) drops the owner/worker identities already present in `SupervisorStatus`. Current sampling is Windows-only and limited to eight selections; it is not the fleet inventory. | [Passive agent observation](implementation.md#passive-agent-observation) |
+| Working branch and remote source | [workspace::verify_worktree](../../crates/swarm-kernel-host/src/workspace.rs) enforces clean/baseline/branch conditions for launch, unsuitable as a live observer. [GitHub polling](../../crates/swarm-kernel-host/src/github/observer.rs) reads Issues. [pulls::read_pull_request](../../crates/swarm-kernel-host/src/github/pulls.rs) has no discovered caller and drops parsed head/base repository IDs and ref names. Remote-ref readback currently belongs to publication. The proposed independent read/cache remains work. | [Passive agent observation](implementation.md#passive-agent-observation) |
 | Muse quota ingress | Rust [projector](../../crates/swarm-adapter-muse/src/observations.rs) emits `NativeUsageSnapshot`; [Store parser](../../crates/swarm-kernel-host/src/store/native_usage.rs) allows Muse only from Node bridge `.9`–`.13`. A `muse-rust-controller.1` snapshot fails `NATIVE_USAGE_SOURCE_MISMATCH`. The `?` in [runtime::observe](../../crates/swarm-kernel-host/src/store/runtime.rs) aborts the entire containing observation before insertion. This is a source integration defect, not a reproduced live failure. | [Shared observation and quotas](implementation.md#shared-observation-and-quotas) |
 | First dispatch | [launcher_dispatch](../../crates/swarm-kernel-host/src/store/launcher_dispatch.rs) calls `require_current_dispatch_capability` at admission/coalesced dispatch; OpenCode/Muse branches require MCP connection evidence. | [Launch and results](implementation.md#launch-and-results) |
 | Result collection | OpenCode [native reader](../../crates/swarm-adapter-opencode/src/native.rs) rejects missing assistant `parentID`; the standalone path has no implemented admitted-turn-window alternative yet. An actual circular MCP/model deadlock was not established. | [Launch and results](implementation.md#launch-and-results) |
@@ -63,6 +67,16 @@ Converting all of it to relational storage would retain its product complexity.
 Implementation removes unwanted actions before rebuilding storage for the remainder.
 
 ## Identity machinery
+
+[Process sampling](../../crates/swarm-observer/src/process_metrics.rs) calls
+`verify_subject` before and after CPU/RSS collection. Each reaches
+[process_image_identity/hash_process_image](../../crates/swarm-process/src/process_group.rs),
+directly or through module membership: at least two complete executable SHA-256
+reads per successful sample, beyond selection-time validation. This is source
+evidence, not a measured runtime cost. OS handles/birth identity already distinguish
+the sampled process. Keep launch/attachment byte checks at that boundary; remove
+this repeated hashing and ownership prerequisite from observation, without adding
+a hash cache or another identity registry.
 
 [LaunchRequest::parse](../../crates/swarm-kernel-host/src/launcher.rs) requires
 `plan_digest`; Store [launch_for_actor](../../crates/swarm-kernel-host/src/store/launcher.rs)

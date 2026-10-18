@@ -9,7 +9,7 @@ currently installed machines or claim a complete product acceptance run.
 The owner-supplied baseline is
 [`f1b854b6`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/f1b854b6fd058dc2440d3848fc95acc279657d3f),
 on `27fcae1e`. Prepared work through
-[`f7e1b63`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/f7e1b634b619dc2c1a723fe357307f7daab12541)
+[`311b770`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/311b770f0f1efdd63d62a7a65764c33cfcf6fa72)
 is in `main` as of 18 October; [PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183)
 is closed. Runtime source is unchanged since `25a8e3bc`. Older installed artifacts
 and receipts retain their own source and run identities.
@@ -29,9 +29,13 @@ GitHub/provider-JSON view, readable without a harness request and independently
 of automation or diagnostic logging. The [original script review](remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md)
 now covers the actual ZIP runners and monitors, checked against the old specification,
 audits and current vendor sources. [Donor mappings](agent-operations/donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries)
-separate vendor APIs/local readers from missing adapter mappings. Source study also covers
-preview/schema/credential coupling, the manual acceptance gate, result-file/receipt
-ordering and unbounded Muse stop waits.
+separate vendor APIs/local readers from missing adapter mappings. The next source
+pass found binding-only inventory/GM family filtering, per-sample executable hashes,
+lost process references, stale connections after restart and unaddressed history
+events. Implementation now names their replacements, real reader work limits and
+an independent remote-ref cache. Git, SQLite, sysinfo, Claude session readers/store
+and Codex compressed rollouts were checked as donors. Earlier findings retain
+preview/schema/credential coupling, acceptance/result ordering and Muse stop scope.
 Communication has [one compact contract](agent-communication-program.md). These are
 documentation changes and deletion targets, not completed runtime removals or new
 native qualification. The earlier CLI implementation is scoped below.
@@ -54,7 +58,7 @@ source observations, not measured speedups or completed deletions.
 | Area | Current source and remaining gap |
 | --- | --- |
 | Shared harness control | Store's Eliot progression is terminal-event-only, branches by vendor and lacks recurring-message policy. Codex native Goal and Claude SDK live controls/usage exist upstream but are not mapped by the current selected adapters. Native and Eliot Goals must remain independently controlled; their corrected mapping is documented, not implemented. |
-| Passive agent observation | Binding native JSON, process identity and workspace leases exist separately. A complete local joined view and provider-local collectors are pending; the public reader still contains OpenCode-specific session-ID validation. Muse Rust quota snapshots also fail Store's Node-only artifact list, rejecting accompanying activity. The documentation now names both ingress and public-reader changes. |
+| Passive agent observation | A complete local joined view and provider-local collectors remain pending. Source findings now cover unbound inventory/GM family access, process visibility after owner loss and expensive sampling, startup connection invalidation, follow identity/order and publication-independent remote-ref observation. The OpenCode-specific ID filter and Muse quota rejection remain unfixed. These are source findings, not measured runtime failures or completed code changes. |
 | Manager → agent → result → review | Store owns durable work and complete-result validation. Direct `task.accept` still accepts caller-authored requirement reviews; only its automatic producer requires an assigned pass. Moving that prerequisite into the shared handler and retaining review references is pending. The named historical accepted Task below does not prove this prerequisite is enforced on every call. |
 | Store reads | Most reads still use the single writer queue. Status/monitor have a separate FIFO reader. Existing reader primitives can support bounded snapshots, but the broader read-path reduction is not implemented. |
 | Capacity and automation state | Capacity v2 separates a scope header and JSON rows in `meta`; the v1 whole-ledger reader remains. Automation still stores sealed configuration/state and owner-dependent entry keys with transfer journals. Relational simplification and stable entry identity remain candidates. |

@@ -1,6 +1,6 @@
 # Donor Map — Rust Operations and Manager-Owned Automation
 
-Revision 10 · Reduction review 2026-10-18. Waku, Paseo loading and Muse Connection/Session were rechecked at the recorded commits; Cargo metadata documentation was checked. Other observations retain their dates.
+Reduction review 2026-10-18: native local readers, SQLite, Git machine formats and sysinfo were checked against primary documentation/source. Earlier Waku, Paseo, Muse SDK and Cargo findings retain their recorded scope; none is a live-runtime claim.
 
 `CODE` means an inspected source behavior; `DOC` means official/library documentation; `OWNER_AUDIT` means supplied operating evidence; `DESIGN` means an ELIOT proposal. Earlier inspections are not new live qualification. Commit/blob identities locate evidence, not required installed versions.
 
@@ -14,7 +14,7 @@ The operations program now also includes [Modular Runtime](modularity.md) and [O
 
 Earlier ELIOT inspection used `504199d14135c030ad3951a3c5023a098a3d03f0`.
 Use [source findings](refactoring.md) for current call sites and corrected audit
-claims at `906f797`. [Architecture](architecture.md) owns the product manifesto;
+claims at `311b770`. [Architecture](architecture.md) owns the product manifesto;
 [implementation](implementation.md) owns source changes and donor choices;
 [delivery](delivery.md) owns work transitions. Earlier owner-policy editions are
 historical decisions, not runtime rights.
@@ -29,14 +29,36 @@ Use a library when its API replaces a needed owned mechanism. Keep current rmcp/
 | `agent-client-protocol` | [API](https://docs.rs/agent-client-protocol/latest/agent_client_protocol/); actual caller: `crates/swarm-adapter-command/src/adapter/acp.rs` | Native ACP types, session/turn envelopes and content blocks for the ACP adapter. | Binding generation, digest verification and Store receipt mapping. Zed eval-cli stays a sessionless CLI adapter unless its selected native protocol changes. | Ad-hoc parsing of ACP wire messages beside the crate. |
 | `octocrab` | [API](https://docs.rs/octocrab/latest/octocrab/), [builder](https://docs.rs/octocrab/latest/octocrab/struct.OctocrabBuilder.html); **not an Eliot dependency** | Potential Rust GitHub API client, if replacing a retained transport is worthwhile. | Existing ownership still covers credentials/account selection, action rights, durable intent, bounded safe reads and uncertain-write readback. | If adopted, remove the replaced `gh` API path; do not add a parallel client or treat octocrab as required core work. |
 | `croner` | [API](https://docs.rs/croner/latest/croner/); actual caller: `crates/swarm-kernel-host/src/scheduler/calendar.rs` | Cron expression parsing and occurrence evaluation with timezone support. | Manager enabled choice, due identity, overlap/catch-up and persistence. | Handwritten cron parsers or per-rule sleep loops. |
-| `sysinfo` | [API](https://docs.rs/sysinfo/latest/sysinfo/) | Selective cross-platform process/resource observation, parent-child tree refresh and CPU/RSS sampling (`swarm-process`, `swarm-observer`). | Verified birth/Job ownership and safe lifecycle decisions; metrics do not authorize kill. | Spawning `tasklist`/`ps` subprocesses or writing raw Win32/procfs metric pollers. |
-| `notify` | [API](https://docs.rs/notify/latest/notify/) | Event-driven filesystem and parent-directory atomic-save observation (`config`, workspace hints). | Exact readback, revision validation and source-health gaps. | Busy-waiting `sleep` loops polling file `mtime`. |
+| `sysinfo` | [API](https://docs.rs/sysinfo/latest/sysinfo/); not currently a dependency | Target for selective fleet process inventory and CPU/RSS reads in the existing process owner. See [refresh limits](#selective-process-observation). | Precise OS birth identity, source coverage and explicit lifecycle ownership remain Eliot's. Read access requires no ownership of the native process. | Replace the diagnostic sampler's repeated executable hashing/metric queries; do not layer another sampler over it or spawn `tasklist`/`ps` per agent. |
+| `notify` | [API](https://docs.rs/notify/latest/notify/) | Optional filesystem change hints and parent-directory atomic-save observation. | Bounded readback and periodic reconciliation recover missing hints; events are not current state. | Per-viewer/file polling loops. A shared technical recheck remains necessary. |
 | `tracing`, `tracing-subscriber`, `tracing-appender` | [`reload`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/reload/), [`non_blocking`](https://docs.rs/tracing-appender/latest/tracing_appender/non_blocking/) | Structured spans/events, dynamic `reload` filter swaps without restart, and bounded `non_blocking` writer (`swarm-telemetry`, `swarm-observer`). | Byte-budget accounting, `atlas-redact` scrubbing prior to sink write, and scope expiry. | Custom logging frameworks or duplicate handmade ring queues. |
 | `atlas-redact` | `vendor/atlas/crates/atlas-redact`; actual callers: `crates/swarm-kernel-host/src/redaction.rs` and `crates/swarm-adapter-claude/src/interactions.rs` | Stateless redaction of each supplied string/JSON value; it does not retain cross-chunk state or detect a secret assembled across chunk boundaries. | Apply it at each retained diagnostic/stream boundary where coverage is required; current call sites do not establish that all stream chunks and logs pass through it. | Regex-per-call ad-hoc secret stripping. Do not claim complete diagnostic coverage from the dependency alone. |
 | `cccc-windows-process` | [Inspected complete crate](https://github.com/ChesterRa/cccc/tree/c270e276591879c6edb7d08af67bec7035585c7e/crates/cccc-windows-process) | Suspended-child creation, owned primary-thread handle, resume and cleanup-on-failed-bootstrap, integrated through `swarm-process`. | Job creation/assignment and family policy are outside this small crate. Preserve owner-first non-killing observation for active agent families and separate bounded-check termination. | Copying its suspended-launch mechanism; assuming the donor supplies the full Job/family subsystem. |
 | `tokio` / `rusqlite` / `serde` | Project manifest and library documentation. | Async runtime, WAL relational storage (1 writer + pooled read-only connections), and typed serialization. | Current domain schema, authorized snapshots and single Store authority. | Storing collections as JSON blobs in `meta` or serializing all reads through the single writer thread. |
 
 No old release, fixed CLI/model equality or callback-time package installation is prescribed. Ordinary compatible requirements and recorded build resolution are not a policy freezing future software. [Cargo's dependency documentation](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html) distinguishes dependency requirements from a particular resolved build.
+
+### Selective process observation
+
+**DOC/CODE, 2026-10-18:** [System](https://docs.rs/sysinfo/latest/sysinfo/struct.System.html)
+can refresh selected PIDs with `refresh_processes_specifics`. Keep one instance
+across ticks, select CPU/memory fields, and enumerate for discovery separately;
+do not use `new_all`/`refresh_all` for every viewer. The inspected
+[manifest](https://github.com/GuillaumeGomez/sysinfo/blob/main/Cargo.toml) separates
+`system` from disk/network/GPU/user features: disable default features and enable
+only `system` for this use.
+[ProcessRefreshKind::nothing](https://docs.rs/sysinfo/latest/sysinfo/struct.ProcessRefreshKind.html)
+still includes Linux tasks; use `without_tasks` for process-level inventory. OS
+threads are not native agent children. This API selection is not proof of constant
+OS-query cost or of successful access to every selected process.
+
+[Process](https://docs.rs/sysinfo/latest/sysinfo/struct.Process.html) reports start
+time in seconds; retain Eliot's finer OS birth identity for PID reuse and controls.
+CPU needs two samples and can exceed 100% across cores; label/normalize its unit
+once rather than silently mixing it with the current host-normalized percentage.
+Reset the baseline on identity change and leave an unestablished sample unknown.
+Library cache removal does not delete retained Eliot history or prove process exit.
+This replacement does not introduce another process owner or authorize kill.
 
 ### Retry ownership
 
@@ -139,6 +161,49 @@ cursors suffice; no per-observation hash, signature or provenance registry is ne
 The [implementation](implementation.md#passive-agent-observation) joins these sources
 with existing process ownership and workspace leases.
 
+### Local reader cost and coverage
+
+**CODE, 2026-10-18:** Codex [compression](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/compression.rs)
+selects plain JSONL before its `.jsonl.zst` sibling; resume can materialize plain
+JSONL again. Keep one logical session across those representations. Its
+[prefix/seek reader](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/seekable_reader.rs)
+has a bounded decoded-prefix operation, but seekable compressed history decodes the
+whole file to temporary storage. Live monitoring tails plain files; compressed
+metadata/history reads have separate work limits. Offsets refer to decoded JSONL,
+not compressed bytes. Reuse the small selection/prefix mechanism, not Codex's whole
+rollout maintenance subsystem. [session_index.jsonl](https://github.com/openai/codex/blob/main/codex-rs/rollout/src/session_index.rs)
+records name updates; its time is not work activity.
+
+Claude's official [Python disk readers](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/sessions.py)
+read each candidate's head/tail before list pagination; message pagination follows
+whole-file parsing and conversation-chain construction. This is Python source
+evidence, not an assertion about TypeScript internals. The published TypeScript
+types specify filtering and whole-session reads: retain programmatic sessions,
+scope worktree expansion, and enumerate subagents separately. A missing/filtered
+summary or swallowed read error does not establish an empty fleet. Use the selected
+runtime's actual data root; do not switch process-global home/config environment
+between concurrent readers. Frequent observation follows known changed files;
+SDK inventory/transcript calls remain scoped, with honest coverage and I/O limits.
+
+Claude [SessionStore](https://code.claude.com/docs/en/agent-sdk/session-storage)
+offers append-time `foldSessionSummary` and `listSessionSummaries`, avoiding repeated
+metadata reconstruction when that store is already used. It mirrors selected SDK
+queries into an application backend; `load` returns a whole session and mirror
+delivery can have gaps. It does not discover unrelated local sessions. Reuse those
+summaries if present; do not add a transcript store merely to monitor agents.
+
+OpenCode's SQL already indexes messages by session/sequence and primary ID, not
+`time_updated`. Query new sequences and known open IDs instead of rescanning/sorting
+the entire table by update time. SQLite [data_version](https://sqlite.org/pragma.html#pragma_data_version)
+can suppress unchanged passes only when compared on the same read connection;
+reset its baseline on reopen. It describes database commits, not agent progress or
+a durable cursor. Use real [read-only mode](https://sqlite.org/uri.html): neither
+`immutable=1` nor `nolock=1` is valid for a live changing store. Preserve
+[WAL visibility](https://sqlite.org/wal.html); copying just `.db` can miss committed
+data. Keep transactions short so they do not hold back native checkpoints, and
+end them before folding or delivering observations. An unreadable source stays a
+gap; no provider migration, checkpoint or repair.
+
 ### Quota sources
 
 | Source | What the adapter can report |
@@ -180,6 +245,24 @@ and [PR endpoints](https://docs.github.com/en/rest/pulls/pulls) describe remote 
 evidence and effects, not local Task acceptance. Trigger disable and run cancellation
 are distinct [Actions operations](https://docs.github.com/en/rest/actions/workflow-runs).
 No merge queue or publication engine is required for local delivery.
+
+### Git worktree and remote observation
+
+**DOC/CODE, 2026-10-18:** use the existing bounded
+[Git runner](../../crates/swarm-kernel-host/src/forge.rs) and `gh` owner. Current
+workspace validation and publication readback are not a general live view.
+
+| Native mechanism | Small Eliot use |
+| --- | --- |
+| [worktree list --porcelain -z](https://git-scm.com/docs/git-worktree) | Read known worktrees once per repository, preserving NUL-delimited paths, detached/bare/locked/prunable facts. Do not parse quoted human output or prune/repair during observation. |
+| [status --porcelain=v2 --branch -z](https://git-scm.com/docs/git-status) | Observe actual HEAD/branch and changes with `--no-optional-locks`, as the runner already uses. Avoid rename detection and ahead/behind counts when unused. Bound untracked/submodule scans and report omitted coverage rather than declaring a partly scanned tree clean. |
+| [for-each-ref upstream/push fields](https://git-scm.com/docs/git-for-each-ref) | Resolve configured tracking and push destinations separately. Preserve remote name, repository/endpoint and full remote ref; neither `origin` nor equal local/remote branch names is guaranteed. Tracking refs are local cached facts. |
+| Existing [remote_ref_at](../../crates/swarm-kernel-host/src/store/forge.rs) / GitHub client | Extract the bounded read of one selected repository/ref from its publication-only caller. Keep last head/time/error as ordinary source observation; no accepted candidate, PR creation or live network call per status read. If using PR readback, retain its existing head/base repository IDs and ref names. |
+
+Git may refresh/write the index during ordinary status; `--no-optional-locks`
+avoids that background contention. Observation does not change checkout, index,
+remote configuration or fetch refs. External changes and a known local upstream
+do not prove a fresh GitHub head; only the independently recorded remote read does.
 
 ## 10. Owner operating evidence
 

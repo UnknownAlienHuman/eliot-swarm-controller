@@ -1,7 +1,7 @@
 # Eliot Swarm Controller — Implementation
 
 This is the single implementation order for the [architecture](architecture.md).
-Source rechecked at `f7e1b634b619dc2c1a723fe357307f7daab12541` on 2026-10-18.
+Source rechecked at `311b770f0f1efdd63d62a7a65764c33cfcf6fa72` on 2026-10-18.
 Source descriptions name existing code; implementation instructions are target
 changes unless explicitly marked completed.
 [Findings](refactoring.md) retain source evidence and counts;
@@ -33,7 +33,7 @@ below points to existing source; the detailed findings are not another checklist
 | Retire unused installation/executor paths | [Frontend installer](../../tools/modules/Install-SwarmFrontend.ps1), legacy fixture, duplicate Forge installer and retired Python Codex identified in [findings](refactoring.md#code-reduction-candidates). Remove their CI/Justfile/config consumers together. | A current installation does not inspect retired siblings; current Codex needs no Python executor or vendored bridge SDK. |
 | Remove policy/provenance bureaucracy | [policy.rs](../../crates/swarm-kernel-host/src/policy.rs), `LegacyV1` acceptance branches, [qualification](../../tools/qualification/New-NativeQualification.ps1) and [package helpers](../../tools/ci/SwarmBuildProvenanceHelpers.ps1). Follow [identity rules](#identity-and-hashes). | Caller/object rights and the selected module contract replace document editions and checkout/compiler/cache-path equality. |
 | Converge native execution and finish the productive path | Apply [shared harness control](#shared-harness-control), [passive observation](#passive-agent-observation) and [launch/results](#launch-and-results). Move needed built-in OpenCode consumers to the [standalone adapter](../../crates/swarm-adapter-opencode/src/lib.rs); remove host native execution/routing. Compare Muse Node/Rust behavior and total owned code, select one and retire the other. | Common commands, independent native/Eliot Goals and a local process/workspace/session view. Remove vendor branches in plugin delivery, artifact-version usage allowlists and duplicate Muse normalization. No third bridge or pre-prompt MCP gate. |
-| Remove optional product engines | [Concilium](../../crates/swarm-kernel-host/src/store/concilium.rs), [integration](../../crates/swarm-kernel-host/src/store/integration.rs), automatic [publication](../../crates/swarm-kernel-host/src/store/automation_publication.rs)/[GitHub projection](../../crates/swarm-kernel-host/src/store/automation_github_projection.rs), their methods, config and schedulers. | Ordinary assignments, messages and independent review serve collaboration. Explicit accepted-candidate publication remains an optional command. Retain participant registration and review/submission grants colocated in coordination code. |
+| Remove optional product engines | [Concilium](../../crates/swarm-kernel-host/src/store/concilium.rs), [integration](../../crates/swarm-kernel-host/src/store/integration.rs), automatic [publication](../../crates/swarm-kernel-host/src/store/automation_publication.rs)/[GitHub projection](../../crates/swarm-kernel-host/src/store/automation_github_projection.rs), their methods, config and schedulers. | Ordinary assignments, messages and independent review serve collaboration. Retain explicit accepted-candidate publication, the small remote-ref read/cache, and participant/review/submission grants. Observation requires no publication workflow. |
 | Unify automation and indexed state | [automation_transfer](../../crates/swarm-kernel-host/src/store/automation_transfer.rs), Store automation families, [scheduler](../../crates/swarm-kernel-host/src/scheduler.rs) and [automation_scheduler](../../crates/swarm-kernel-host/src/store/automation_scheduler.rs). Apply [stable identity](#automation-and-delivery) and [Store conversion](#store-and-current-data). | One entry identity, scheduler and durable due model; delete journal relocators, successor ancestry, old loop/config registry and replaced `meta` key codecs. |
 | Finish read and package boundaries | `Store::call`, [legacy_optional_workers](../../crates/swarm-kernel-host/src/host/legacy_optional_workers.rs) and affected manifests. Use [Store reads](#store-and-current-data) and [process boundaries](#processes-and-frontends). | Bounded independent reads; host stops linking retained worker implementations. Existing public CLI deletion stays completed. |
 
@@ -129,66 +129,114 @@ request both explicitly. Neither action implicitly cancels turns or queued input
 ### Passive agent observation
 
 Implement the [local view](observability.md#5-live-monitoring-and-future-charts)
-through existing owners. Observation collection is independent of automation,
-diagnostic logging and viewer count; a status read makes no harness request.
-The current `swarm-observer::host::HostRecorder` is only an optional diagnostic
-sink. Add one bounded local collection task to [host::run_until](../../crates/swarm-kernel-host/src/host.rs),
-with host startup/shutdown, outside `observability.enabled` and automation entries.
-Reuse process sampling primitives and the host-only status-delivery pattern in
-[module_supervisor_observation](../../crates/swarm-kernel-host/src/store/module_supervisor_observation.rs);
-keep its needed types/helpers in existing shared owners as worker dependencies
-are removed. This core collection lifecycle is not implemented today.
+through one bounded collection task in [host::run_until](../../crates/swarm-kernel-host/src/host.rs),
+with host startup/shutdown, outside automation and `observability.enabled`.
+`swarm-observer::host::HostRecorder` is an optional diagnostic sink, not this
+lifecycle. Coalesce notifications with a periodic local recheck; viewers do not
+create collectors. The [source findings](refactoring.md#current-source-gaps) name
+the missing paths; the core collection lifecycle is not implemented today.
 
-1. At launch/resume/attach, retain the native session and available local source
-   reference beside the binding. Join the existing Task/Attempt/Operation to the
-   [launch workspace lease](../../crates/swarm-kernel-host/src/store/launcher.rs):
-   repository/worktree, path, assigned branch and baseline. Reuse
-   [process ownership](../../crates/swarm-process/src/module_owner.rs) and supervisor
-   observations for PID plus OS birth identity. A shared server can host many
-   sessions; native children need no invented process of their own.
-2. In the selected adapter, fold native events and read available local provider
-   JSON/JSONL/SQLite independently of its connection to the provider harness.
-   Keep the separate Eliot ModuleLink alive while native control reconnects. Use the
-   [vendor readers](donor-map.md#local-observation-sources), one bounded collector
-   per store/service scope. Tail from a retained file identity/offset; keep an
-   incomplete final record for the next read. Rotation/truncation produces a visible
-   gap. For OpenCode, revisit known open messages as well as new sequences: their
-   JSON can change in place. Use short read-only SQLite transactions with WAL
-   visibility; never run vendor migrations, checkpoints or repair.
-3. Fold compact native facts in [runtime::observe](../../crates/swarm-kernel-host/src/store/runtime.rs)
-   and expose them through [operations::get_binding_public/public_observation](../../crates/swarm-kernel-host/src/store/operations.rs).
-   Adapter facts arrive through authenticated `module.observe`; host OS/worktree
-   facts use the host-only status callback, without needing a live adapter boot.
-   Keep source time/cursor and coverage per source; an OS or quota update cannot
-   refresh old work activity. Move native interpretation, including the current
-   OpenCode-only `ses` failure-ID validation, out of this shared projection.
-   Expose relevant process/workspace/session references to authorized readers
-   without exposing credentials or private launch configuration.
-4. The core host task collects process and local Git facts independently. Read
-   branch/HEAD/dirty state once per active worktree; retain the
-   last known GitHub head from the existing integration separately. Keep bounded
-   change/event collection with a coalesced technical tick in that task, independent
-   of optional automation, so lost notifications do not freeze the view. No full transcript scan per tick,
-   per-viewer poller, new observer database or signed observation envelope.
+**Identity and inventory.** At launch/resume/attach, join Task/Attempt/Operation,
+binding/generation and native session to the [workspace lease](../../crates/swarm-kernel-host/src/store/launcher.rs).
+Retain host, selected runtime/data root, native ID and local source reference.
+Discovery uses those configured roots, including native children; titles/cwd are
+hints, not ownership. It must also work before any Task or execution binding exists.
+Extend the existing [ServiceScope](../../crates/swarm-supervisor/src/descriptor.rs)
+and module setup with one read-only configured-source case. Include configured
+source registration in the existing [demand/watch](../../crates/swarm-kernel-host/src/host_module_supervisor.rs)
+so its reader can start without a durable Operation. Reuse the adapter and supervisor
+lifecycle; this activation neither opens a native session nor grants execution
+rights. No fabricated Task, producer or binding is needed for visibility.
 
-Retain the source's host/runtime/session and known local data location for bounded
-Governor inspection; resolve source references within that scope, without exposing
-launch credentials or creating a general filesystem RPC. Discovery by name/cwd is a hint until correlated;
-unmatched processes or native sessions remain visible with an unknown assignment.
-Native connection loss does not stop local parsing. If the adapter or its Eliot
-link fails, Store retains the last native snapshot with a gap while core OS/Git
-collection continues; reconnection resumes local-source reconciliation. No claim
-of fresh native data follows from that retained snapshot. New code must not
-interpret an old provider `running` field as current OS
-liveness, or turn observation into automatic ownership, cancellation or restart.
+Keep source-scoped inventory in the existing Store observation journal/projection;
+[observations](../../crates/swarm-kernel-host/migrations/001_core.sql) already permits
+an absent binding. Add this status path beside binding-scoped
+[runtime::observe](../../crates/swarm-kernel-host/src/store/runtime.rs). Authenticate
+adapter reports against the host-selected source; join known bindings without
+letting reported data assign Tasks. Host OS/Git facts use the host-only callback
+pattern in [module_supervisor_observation](../../crates/swarm-kernel-host/src/store/module_supervisor_observation.rs).
+Move needed types/helpers to existing shared owners as worker dependencies are removed.
+
+**Native sources.** The selected adapter folds native events and reads local
+JSON/JSONL/SQLite independently of its provider control connection; its separate
+Eliot ModuleLink remains usable during native reconnect. Use the
+[vendor readers](donor-map.md#local-observation-sources), once per store/service.
+Bound discovery entries, bytes, elapsed work and incomplete-record buffers, with
+cancellation and continuation between passes. A page limit alone does not bound
+SDK I/O. Keep known facts when a scan is incomplete; a filtered/failed SDK listing
+does not prove absence. An oversized record reports a gap and advances boundedly
+to the next record boundary so it cannot freeze other sessions.
+
+Tail known files from their identity/offset. Retain the cursor at complete record
+boundaries and keep a bounded unfinished suffix for the next pass. Re-resolve native
+representation changes; report an actual unverified interval instead of inventing continuity.
+For OpenCode, page new messages by the existing session/sequence index and revisit
+known open message IDs updated in place. Reuse a read-only connection, end each
+short transaction before parsing/delivery, and preserve WAL visibility. The
+[SQLite change hint](donor-map.md#local-reader-cost-and-coverage) can skip unchanged
+passes; it is not a durable cursor. Do not modify or repair the provider store.
+
+**Processes.** Use [selective sysinfo refresh](donor-map.md#selective-process-observation)
+for fleet inventory/CPU/RSS in the existing process owner; retain precise
+[process_birth_identity](../../crates/swarm-process/src/process_group.rs).
+Replace the diagnostic metric-query path as these callers move. Its [sampler](../../crates/swarm-observer/src/process_metrics.rs)
+is Windows-only, selects at most eight processes and repeatedly hashes the executable
+through membership checks. Do not transfer those constraints into fleet observation.
+Use the held OS handle/birth identity for a sample; byte verification belongs to
+launch/attachment. No executable hash or live-owner requirement on each sample.
+Carry compact owner/worker PID+birth refs through
+[ModuleSupervisorObservation::from_status](../../crates/swarm-supervisor/src/observation.rs),
+which currently drops them. Distinguish an adapter PID from the external native
+service. A shared service is counted once; a native child may have no separate PID.
+After owner loss, continue observing a known surviving process and mark ownership
+uncertain. Destructive controls still require actual ownership. Batch work across
+the whole known inventory; a per-pass bound must not hide the ninth process.
+
+**Git and GitHub.** Use the existing bounded Git runner for one read per active
+worktree and the [native machine formats](donor-map.md#git-worktree-and-remote-observation).
+Do not call `workspace::verify_worktree` as a monitor: its clean/baseline/branch
+requirements are launch checks, while changed files and branches are observations.
+Keep assigned branch, actual checkout/HEAD, upstream and selected push target distinct.
+Remote identity is repository/endpoint plus full ref, not a SHA or short branch name.
+Retain one last-observed remote-ref snapshot under the existing Git/`gh` owner,
+separate from publication admission. Current Issue polling does not supply it.
+Read a selected remote outside Store transactions, coalesce by repository/ref and
+cache its source time/error; status reads neither fetch Git nor query GitHub.
+Unconfigured/unreadable remote state remains unknown. No publication engine or PR
+is required to correlate a working branch.
+
+**Reading and recovery.** Update [get_binding_public/public_observation](../../crates/swarm-kernel-host/src/store/operations.rs),
+`agent.list` and [object_reads::family](../../crates/swarm-kernel-host/src/store/object_reads.rs)
+with the producers. Let `agent.state` / `agent.family` address an unbound session
+by the source/native identity returned in inventory. Add the Governor's bounded operational read
+under existing [GM authority](../../crates/swarm-kernel-host/src/store/gm.rs), without
+requiring a Task Attempt or registered producer for every native child. Keep
+Task/transcript reads scoped to their actual grants. Remove OpenCode-only `ses`
+validation from the shared projection. Expose scoped native source references for
+bounded inspection, not credentials, private launch data or a general filesystem RPC.
+
+At [Store startup](../../crates/swarm-kernel-host/src/store/mod.rs), invalidate the
+old connection of every unreleased binding, not just `ready`; change work state
+separately as in `runtime::disconnected`. Retain native facts with their own times.
+Adapter/Eliot-link failure leaves a native snapshot and coverage gap while core
+OS/Git collection continues; reconciliation must precede fresh coverage claims.
+An OS/quota update cannot refresh old work activity.
+
+Preserve binding/generation and source identity in
+[timeline/monitor.follow](../../crates/swarm-kernel-host/src/store/object_reads.rs)
+envelopes. A journal cursor orders stored history, not native execution: an old
+native sequence may be journaled without updating current state. Live readers use
+these records as addressed invalidations and coalesce reads of the local projection;
+they do not duplicate the adapter/Store reducer or request the harness. Keep the
+snapshot cut and cursor-gap behavior in [observability](observability.md#collection-and-reading).
 
 ### Shared observation and quotas
 
 Fold activity into the existing `agent.state` projection and quota data into
 `NativeUsageSnapshot`; use [their distinct meanings](module-api.md#activity-and-usage-reads).
 Keep native payload parsing/units and sparse-patch folding in the adapter. Shared
-contracts validate normalized bounds; Store validates the authenticated binding,
-boot, selected capability and observation order. Replace
+contracts validate normalized bounds; Store validates the authenticated source/boot,
+any claimed binding, selected capability and observation order. Replace
 [native_usage::parse](../../crates/swarm-kernel-host/src/store/native_usage.rs)'s
 hardcoded artifact list: it currently rejects `muse-rust-controller.1` although
 that adapter emits this DTO, aborting the containing state observation.
@@ -350,7 +398,7 @@ verifier. The [source findings](refactoring.md#identity-machinery) distinguish t
 | Boundary | Implementation decision |
 | --- | --- |
 | Local configuration/launch preview | Keep effect-free preview optional. `automation::apply` already checks expected revisions and validates the patch; remove its extra `preview_digest` comparison. Launch uses the retained Operation plan described above, with no caller-carried approval hash. |
-| Documents, build provenance and local diagnostics | Remove policy-document SHA/path/edition admission and checkout/compiler/cache equality. Diagnostic rows use existing source/row IDs and revisions; do not add attestations or agreement hashes. |
+| Documents, build provenance and local diagnostics | Remove policy-document SHA/path/edition admission, checkout/compiler/cache equality and per-sample executable hashing. Diagnostic rows use source/row IDs; process samples use OS birth/handles. |
 | Requests, credentials and immutable bytes | Keep same-request/same-input checks, private credentials, selected executable verification and necessary artifact/native-payload digests. Use existing canonical/byte helpers according to the actual contract; no new hash registry. |
 | Participant issuance | `participant_credentials::issue_for_launch` must reuse the same private token after a lost registration reply. Consolidate duplicate manifest/reference-index fields and the two identical indexes into one authoritative record with resolving refs; preserve request/registration binding and exact credential/profile readback. |
 | Results across executor replacement | `normalized_result::same_module` currently compares full artifact identity. Keep original dispatch provenance and implement a supported authorized handover/result mapping for required work; do not forge receipts or retain an old executable indefinitely. |
@@ -446,7 +494,7 @@ Choose relevant cases rather than turning this table into a new release program.
 | --- | --- |
 | Shared harness control | The same controller request reaches different native mappings; unsupported native actions are explicit. Cancellation distinguishes turn, queued input and surviving work. Current Muse Rust usage reaches Store; unavailable/malformed quota does not erase valid activity or become zero. |
 | Two Goals | Native Goal works alone by default where supported; the Eliot plugin works alone or alongside it. Two scheduled occurrences may send the same text, while replay of one occurrence reuses one Operation. Plugin disable and native pause affect only their own mechanism; neither cancels active work implicitly. |
-| Passive observation | Disconnect the native control connection and read process/worktree/provider-local facts without a harness request. A collector failure preserves last facts with a gap. Cover a shared server with two managers, PID reuse, branch change, mutable open message, partial/rotated JSONL and an unmatched session; none creates a false owner or terminal result. |
+| Passive observation | Read without harness calls: an unbound session/native child, two managers on one server, a surviving process after owner loss and a changed worktree. Cover PID reuse, bounded partial/oversized/rotated/compressed JSONL and mutable open messages. Restart from `opening/reconciling` clears old connection health; a late native event cannot roll back the live view. No per-sample executable hash or publication prerequisite. |
 | Launch/result | Direct launch needs no preview token; stale revisions/changed workspace are rejected; ready session dispatches without MCP discovery; explicit-parent and complete serialized-turn output are attributable; an actual gap stays unresolved without replay. |
 | Delivery/automation | Manual/helper share the evidence gate: a required missing/changes-requested review fails; B needs B's pass, while checks-only policies remain possible. Disable/start ordering, late results and A→B→A ownership preserve the right work. |
 | Store | Restart/lost notification retains an action; reader snapshot is authorized and bounded; migration preserves identity and held capacity; cosmetic SQL text does not define database compatibility. |
