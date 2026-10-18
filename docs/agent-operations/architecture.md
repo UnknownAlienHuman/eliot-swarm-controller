@@ -35,17 +35,19 @@ that boundary.
 The common language covers opening or resuming a session, assigning work, sending
 or steering input, replying to a pending request, configuring supported options,
 controlling a native Goal, moving eligible work to background, cancelling an exact
-turn or queued input, refreshing safe native facts, retrieving output, reconciling
-an uncertain action and releasing owned resources.
+turn or queued input, recovering a known session after owner loss, refreshing safe
+native facts, retrieving output, reconciling an uncertain action and releasing owned
+resources.
 
 Capabilities describe which semantic actions and scopes an adapter implements.
 They route commands; they never grant rights. Store authorization remains the only
 permission boundary. Package versions, build IDs and schema inventories are not a
 behavioral API and must not become a permanent compatibility matrix in the core.
 
-Each adapter owns one native connection and one ordered native command/event loop.
+Each native session/scope has one adapter state owner that orders its commands and
+events. A shared native service connection is not duplicated per hosted session.
 Shared adapter plumbing may own authenticated Eliot IPC, hello, command pulling and
-re-delivery of already-retained Eliot records. It must not own vendor state,
+re-delivery of already-retained Eliot records. It must not own vendor state, native
 recovery policy, Task state or another scheduler.
 
 ## Goals

@@ -22,6 +22,7 @@ change owners, submit review or accept work.
 | `agent.goal` | `Goal` | Control the vendor's native Harness Goal: set/edit/pause/resume/clear as declared by the adapter. |
 | `agent.background` | `Background` | Move a specifically eligible native foreground tool/run to background. Optional; not a generic process detach. |
 | `agent.cancel` | `Cancel` | Cancel one exact native turn or queued input. Unsent controller work uses `operation.cancel`. |
+| `agent.recover` | `Recover` | Re-establish one known native session/binding after confirmed owner or control-connection loss, without replaying admitted input. |
 | `agent.refresh` | `Refresh` | Explicitly request supported safe native readback. Ordinary state reads never require this call. |
 | `agent.result` | `Result` | Retrieve output attributable to one admitted input/turn through the normalized page contract. |
 | `agent.reconcile` | `Reconcile` | Read back one uncertain admitted action. It never repeats the action. |
@@ -35,9 +36,13 @@ protocol-2 conversion:
 - `native.command.cancel_turn` → `agent.cancel` with `turn` scope;
 - `native.command.close_session` → `agent.shutdown`;
 - `native.command.release_evidence` → adapter-internal cleanup;
-- `native.mcp.*` → OpenCode adapter-internal setup/observation;
-- `agent.recover` → adapter reconnect/`agent.open` resume; uncertain effects use
-  `agent.reconcile`.
+- `native.mcp.*` → OpenCode adapter-internal setup/observation.
+
+`agent.recover` remains a common semantic action because current Muse recovery and
+other retained session-resume paths must not be hidden inside an automatic reconnect.
+It names the existing binding/session, requires confirmed recovery preconditions and
+must not replay the Task input. `agent.reconcile` remains the separate readback for
+an uncertain effect.
 
 ## Capabilities
 
@@ -102,7 +107,9 @@ reconnected.
 
 The common adapter shell reconnects Eliot IPC and redelivers retained Eliot records.
 The vendor adapter owns native reconnect, session resume and uncertain native-effect
-readback. There is no universal recovery command or hidden retry layer below Store.
+readback. `Recover` is the explicit Store-admitted request to execute a supported
+session recovery after the required loss/readback checks; it is not a hidden retry
+layer and does not resend input.
 
 ## Harness Goal and Eliot Goal
 

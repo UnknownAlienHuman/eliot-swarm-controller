@@ -35,7 +35,7 @@ and proof system rather than a small semantic port.
 
 | Area | Current source condition | Target |
 | --- | --- | --- |
-| Common commands | `RuntimeCommandKind` mixes semantic actions with OpenCode, Command ACP and native MCP internal methods. | One typed `AdapterCommand`; vendor/internal operations map to semantic `Send`, `Cancel`, `Shutdown` or stay inside the adapter. |
+| Common commands | `RuntimeCommandKind` mixes semantic actions with OpenCode, Command ACP and native MCP internal methods. | One typed `AdapterCommand`; vendor/internal operations map to semantic `Send`, `Cancel`, `Shutdown` or stay inside the adapter. Preserve explicit `Recover` for known-session restoration without replay. |
 | Module contract | Store and adapters exact-compare artifact versions, capability lists, config schemas and command/event schema sets. Codex and Command retain version/profile ladders. | One current protocol major and compact capability subset negotiation. Package identity remains inventory/installation data. |
 | Adapter bootstrap | Codex, Claude, OpenCode, Muse, Command and Antigravity repeat owner/env/credential parsing, hello equality checks and delivery loops. | Common bootstrap in `swarm-process` and small IPC/re-delivery shell in `swarm-client`, adopted by at least two current Rust adapters before extraction is considered complete. |
 | Receipts | Module/package/protocol/request hashes and Task/source identities are repeated across outcomes, dispatch receipts and result origins. Shared contracts also contain vendor readiness and Goal-continuation proof structs. | Authenticated link + Operation/binding identity; keep hashes only on credentials/executable/package bytes and retained result/artifact content. Vendor state becomes observation. |

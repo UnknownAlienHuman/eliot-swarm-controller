@@ -55,6 +55,7 @@ Background    move an eligible foreground tool/run to native background
 Cancel        cancel one exact turn or queued input
 Refresh       explicit safe native refresh/readback
 Result        retrieve output attributable to one admitted input
+Recover       re-establish one known native session after confirmed owner/connection loss
 Reconcile     read back one uncertain admitted action
 Shutdown      release or stop an explicitly owned native resource
 ```
@@ -69,9 +70,12 @@ Remove from the common command set and Store public routing:
 - `native.command.cancel_turn`: it is `Cancel { target: turn }`;
 - `native.command.close_session`: it is `Shutdown`/release;
 - `native.command.release_evidence`: internal cleanup, not manager control;
-- `native.mcp.install|observe|arm|read`: adapter-internal setup/observation;
-- `agent.recover`: reconnect/resume belongs to adapter lifecycle and `Open`; uncertain
-  effects use `Reconcile`.
+- `native.mcp.install|observe|arm|read`: adapter-internal setup/observation.
+
+Keep `Recover` as a semantic action. It re-establishes a known session/binding after
+confirmed owner or control-connection loss and never replays the Task input. It is
+distinct from `Open` (select/open/attach) and `Reconcile` (read back an uncertain
+effect). Adapters that can recover declare it; unsupported adapters fail explicitly.
 
 Keep `Background` as an optional semantic action because a real OpenCode operation
 uses it. Unsupported actions fail before native I/O.
@@ -157,7 +161,7 @@ The shell accepts callbacks/trait methods only for:
 - execute one typed native action;
 - return pending retained Eliot deliveries;
 - acknowledge a retained delivery;
-- stop the adapter-owned native connection.
+- release or stop the selected native scope according to actual ownership.
 
 It does **not** own the vendor session, native command queue, result association,
 uncertain-effect readback, Task state, timers or scheduling. Those stay in the
@@ -213,6 +217,7 @@ Use the standalone Rust adapter as the only new-work executor. Map:
 - `Reply` to the exact pending permission/form request;
 - `Background` to the native background operation;
 - `Cancel` to exact turn/queued-input control where exposed;
+- `Recover` to resume the known session after confirmed owner loss without replay;
 - `Refresh`, `Result` and `Reconcile` to read-only native state/history.
 
 Remove built-in host execution, `legacy_worker_demand`, `native.opencode.loop_step`
@@ -227,16 +232,18 @@ generation requires readback; never select the newest assistant message by guess
 #### Codex
 
 Use the current Rust app-server adapter only. Map native Goal, live configure, reply,
-turn interrupt and account usage from the current app-server protocol. Delete the
-retired Python executor/SDK and all Codex artifact-version templates. The adapter's
-local rollout reader remains available independently of the control socket.
+turn interrupt, supported session recovery and account usage from the current
+app-server protocol. Delete the retired Python executor/SDK and all Codex
+artifact-version templates. The adapter's local rollout reader remains available
+independently of the control socket.
 
 #### Muse
 
 Choose Node or Rust by complete behavior and total maintained Rust + JS + IPC code.
-Retain one. Native Goal, turns, usage and local session-log observation stay in that
-adapter. Do not import the SDK's high-level recovery coordinator beside Eliot's
-Operation readback. Delete the rejected executor and duplicate normalizer.
+Retain one. Native Goal, turns, explicit recovery, usage and local session-log
+observation stay in that adapter. Do not import the SDK's high-level recovery
+coordinator beside Eliot's Operation readback. Delete the rejected executor and
+duplicate normalizer.
 
 #### Claude
 

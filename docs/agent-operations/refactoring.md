@@ -182,22 +182,26 @@ The target Store branches on semantic action and retained object state only. Ven
 interpretation moves to the selected adapter. Remove a branch when its producer and
 consumer move; do not hide it behind another artifact allowlist.
 
-## 8. Public recovery/control surface accumulated internal operations
+## 8. Recovery is real; internal lifecycle operations are not public actions
 
-`agent.recover` exists as a common method although native recovery differs by
-harness and uncertain external effects already have `agent.reconcile`. Several
-adapters reject recovery; Muse implements a particular bridge-restart flow.
+`agent.recover` has a real current consumer: Muse uses it after confirmed bridge
+family departure to restore the known session without replaying the Task. Preserve
+that functionality as typed `Recover`. Define common preconditions and outcome;
+let each adapter implement or reject it. Keep it distinct from `Open` and from
+`Reconcile`, which only reads back an uncertain effect.
 
-Likewise native MCP phase methods and release-evidence commands are internal
-lifecycle details exposed through Store policy/capacity/operations. This multiplies
-public schemas, reservations, receipts and tests without adding manager semantics.
+By contrast, native MCP phases and release-evidence commands are internal lifecycle
+details exposed through Store policy/capacity/operations. They multiply public
+schemas, reservations, receipts and tests without adding manager semantics.
 
 Target:
 
-- adapter lifecycle reconnects/resumes its native session;
-- `agent.open` explicitly attaches/resumes where the manager requests it;
-- `agent.reconcile` reads back one uncertain effect;
-- `agent.cancel` and `agent.shutdown` use explicit subjects;
+- ordinary link reconnect is automatic but cannot replay native input;
+- `Recover` explicitly re-establishes a known supported native session after the
+  adapter's required owner-loss/readback checks;
+- `Open` selects or attaches a session;
+- `Reconcile` reads back one uncertain effect;
+- `Cancel` and `Shutdown` use explicit subjects;
 - internal setup/cleanup remains internal and appears only as observation/diagnostic
   facts.
 
