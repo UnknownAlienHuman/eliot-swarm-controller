@@ -3,7 +3,8 @@
 
 **Revision:** 1 — 2026-10-03  
 **Source baseline:** `main` at `35e499ae73b622d873c44873f6993ee3fcbea87b`  
-**Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Tool Catalog and Deferred Loading](mcp-tool-catalog-and-loading.md), [Legacy Swarm Transition](legacy-swarm-transition.md), [Task Policy](task-policy.md)  
+**Applies to:** [Communication Program](agent-communication-program.md), [MCP Tool Catalog and Deferred Loading](mcp-tool-catalog-and-loading.md), [Legacy Swarm Transition](legacy-swarm-transition.md), [Task Policy](task-policy.md)
+
 **Status:** normative implementation amendment. The named high-level methods are design targets until implemented and qualified.  
 **Precedence:** this file governs launch preview, assignment packets, manager/participant launcher UX, queue/overlap projection and reminder/watch semantics.
 

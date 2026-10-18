@@ -1,10 +1,10 @@
 # Implementation Plan — Rust Operations on Behalf of the Manager
 
-Revision 22 · 2026-10-17 · Canonical Version 3 scope and acceptance index.
+Revision 23 · 2026-10-18 · Capability and completion reference.
 
-O1–O11 name product requirements; [M1–M6](modularity.md#6-implementation-sequence-and-completion-criteria)
-name package/process changes. The [refactoring map](refactoring.md) owns the current
-source queue and deletions. [Implementation status](../implementation-status.md)
+O1–O11 name capabilities; [M1–M6](modularity.md#6-implementation-sequence-and-completion-criteria)
+name package/process boundaries. They are references, not cumulative work orders.
+The [refactoring map](refactoring.md) selects the compact core, optional scope and deletions. [Implementation status](../implementation-status.md)
 records what exists and what was actually checked. A completion criterion below
 is a target, not a report that a block passed.
 
@@ -19,9 +19,10 @@ ledger or framework-only milestone is needed.
 ## 2. Dependencies
 
 Prioritize the productive local path: workspace, launch, dispatch, attributable
-result, submission, review, repair and acceptance. Required V3 GitHub, hook, script,
-cron/rule and Goal scopes remain below; completing all of them is not a prerequisite
-for reducing the current code or fixing local delivery.
+result, submission, review, repair and acceptance, with observation and selected
+Goal continuation. GitHub, hooks and scripts are optional extensions. Council,
+interface-ratification/ACK and automatic publication/Issue-label engines are outside
+required core completion; do not finish them as a prerequisite to removing them.
 
 O1/O2 provide shared admission, storage and intake. O3/O4/O5 can use those boundaries
 independently with non-overlapping file ownership. O7 local review does not depend
@@ -121,8 +122,8 @@ Owners: [typed rules](architecture.md#6-typed-rules-and-legitimate-progression),
 
 Completion criterion: one `croner` scheduler over indexed Store rows supports
 manager enable/disable, manual run-now and restart without duplicated occurrences.
-Retain calendar/DST/overlap/misfire semantics, old interval slots and latest-only
-ordinary catch-up. Cursor and action/pending disposition commit together. Generic
+Retain calendar/DST/overlap/misfire semantics and consumed occurrence identity
+while converting used interval definitions once; remove the old scheduler. Cursor and action/pending disposition commit together. Generic
 event selection does not create a second scheduler or bypass typed action validation.
 
 ## 11. O9 — Goal and reminders
@@ -152,13 +153,14 @@ manager/GM rights. No generic execute-method tool or new public aliases.
 
 ## 13. O11 — Qualification
 
-These are final product scenarios, not prerequisites for unrelated source slices.
-Retain exact source/platform/artifact and distinguish fixtures from native evidence.
+Use the relevant scenarios for the selected product behavior. Optional integrations
+do not make the whole table a release gate for core work. Record what actually ran
+and distinguish fixtures from native evidence; document changes need neither.
 
 | Cases | Required outcome |
 | --- | --- |
 | Default, one-call enable, manual coexistence | New/untrusted-imported entries are off; only selected helpers run. Full manual delivery remains available without a new mode/grant ceremony. |
-| Launch and result | Codex, OpenCode, Antigravity, Command and Claude complete `agent.open -> task.dispatch -> agent.result` with full attributable output and asynchronous MCP discovery. |
+| Launch and result | Each selected supported adapter completes `agent.open -> task.dispatch -> agent.result` with attributable output and asynchronous MCP discovery. Retired experimental adapters are not a compatibility matrix to keep green. |
 | Current rights and on-behalf visibility | No forged Principal/Scheduler shortcut; authorized manager reads, explains and cancels through concurrent WAL snapshots without cross-manager disclosure. |
 | Commit/signalling crash and capacity wait | Lost notification/reconnect loses no committed fact or duplicates an action; waiting subjects resume on prerequisite/capacity changes. |
 | Activation cut and config edit | Enablement races safely with new events; omitted inclusion drains no old backlog. New admissions use new preferences; retained jobs keep inputs. |
@@ -179,10 +181,10 @@ live repository writes, service installation or owner-machine cleanup.
 ## 14. Migration and completion
 
 Use [existing Store migration owners](refactoring.md#relational-conversion-detail)
-for domain tables/indexes. Operations remain execution authority; preserve frozen
-policies, legacy receipts and uncertain effects. The never-deployed PR #23 global
-mode/control API needs no aliases. Adopt deliberate new policy through its common
-handler, not by weakening current rights from a future tool description.
+for domain tables/indexes. Operations retain admitted actor/input identity. Required
+old data follows a [finite transition](refactoring.md#retire-executors-without-losing-history);
+remove historical readers and policy branches after conversion. The never-deployed
+PR #23 API needs no aliases. Current authorization comes from the common handler.
 
 Setup records trusted local runtime/source/credential choices and enables no sample
 work. Ordinary crash recovery preserves owned saved choices; unattributable imports

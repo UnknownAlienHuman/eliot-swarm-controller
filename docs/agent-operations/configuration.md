@@ -2,7 +2,7 @@
 
 **Current operator status:** See [Implementation Status](../implementation-status.md) for published revisions, gate results, and native qualification. This page owns the manager-facing configuration contract.
 
-[Architecture](architecture.md) owns execution; [Delivery](delivery.md) owns the shared work handlers.
+[Architecture](architecture.md) owns execution; [Delivery](delivery.md) owns the shared work handlers. The [compact scope](refactoring.md#1-authority-and-audit-scope) selects which helpers remain: automatic publication and Issue-label projection are outside required core completion.
 
 ## 1. One control model
 
@@ -82,11 +82,8 @@ explicit transfer below; `automation.config.preview` and
 
 ### 3.1 Explicit transfer to the current GM
 
-`gm.handover` changes the designated GM but does not transfer automation
-entries. After handover, the current GM or a local Operator may call
-`automation.config.transfer` for one entry. The destination is always the
-current GM; the request identifies only the project, former owner, automation
-and expected source revision:
+Changing the designated GM does not silently change automation ownership. The
+current explicit call identifies one entry and its expected revision:
 
 ```json
 {
@@ -98,39 +95,23 @@ and expected source revision:
 }
 ```
 
-The call atomically retires the former-owner source and transfers that entry to
-the current GM. A stale `expected_revision` or an existing conflicting target
-entry is refused; transfer does not overwrite or merge the target. Cursors,
-pending slots and linked history are preserved. Transfer does not grant
-unrelated action rights, rewrite prior actors or replay pending work. While the
-successor remains the current GM and the transferred entry and exact Task and
-Attempt scope remain current, its explicitly selected `review_dispatch`,
-`review_disposition` and `acceptance` steps may continue that Attempt. The
-Attempt owner and submission author remain unchanged; new review assignments
-use the successor as sponsor, while the assigned reviewer supplies the review
-evidence. A resulting correction is attributed to the successor and addressed
-to the original Attempt owner. A later transfer does not rewrite an existing
-assignment sponsor; its result remains usable only when that sponsor is in the
-validated transfer lineage.
+The CLI is `swarm automation config transfer --file <json>`; the current GM or
+local Operator selects the current GM as destination. Ordinary configuration
+preview/apply remains under the Manager profile. Resolve an unknown response by
+reading the existing Operation rather than creating another transfer.
 
-`repair_dispatch` is a separate opt-in step. It can queue one bounded next-turn
-correction only after the exact assigned finding has an applied return-for-
-correction decision, and only while the exact current Task, Attempt,
-submission, candidate, ready binding generation and transfer chain remain
-valid. The original Attempt owner remains the delivery recipient and binding
-owner; the review sponsor and correction decision manager remain their
-recorded actors; a later successor owns only the new semantic repair slot.
-`agent.send` staying queued does not establish that a native delivery occurred,
-and this step does not grant general `agent.send` authority. Use the current
-source revision from `automation.config.get` and a stable `client_request_id`
-for the explicit mutation.
+**Refactoring target:** one immutable internal entry ID, with mutable owner and
+revision. Transfer updates that row atomically after current authorization/CAS.
+All state and occurrence rows retain the entry ID; no disabled former-owner copy,
+relocated journals, successor pointers or ancestry walk is required. Prior
+Operations keep their admitting actor/input. Pending new effects check current
+rights; late review/results remain tied to their original assignment/candidate.
 
-The CLI form is `swarm automation config transfer --file <json>`, with
-`--request-id <stable-id>` supplying `client_request_id`. A GM may inspect the
-former owner's entry and transfer it, but the preview/apply configuration
-mutations remain available only through the Manager profile. If the transfer
-outcome is unknown, resolve it through readback only; do not issue another
-transfer mutation.
+**Current source gap:** `automation_transfer::apply` still clones the entry and
+moves six state families plus cron. The retained target check prevents returning
+A→B→A for the same entry. Replace that mechanism during the
+[relational conversion](refactoring.md#relational-conversion-detail), without
+changing the identity of already consumed occurrences or replaying native input.
 
 Effective automatic authority is:
 
@@ -366,7 +347,7 @@ Saved enabled/disabled choices survive ordinary host restart and manager-client 
 
 Disable stops new starts and separate follow-ups, not running agents, native Goals or remote writes. Manual tools keep working and share the same reservations. Results/readback from already started work remain recordable; revocation never justifies forging new output or losing observed effect evidence.
 
-Revoked/deleted ownership blocks only new affected actions. Restored rights can make a still-enabled entry eligible; explicitly disabled entries stay disabled. `automation.config.transfer` is the explicit, atomic compare-and-swap path for moving one entry from `former_owner_manager_id` to the current GM. It retires the source entry, preserves cursors, pending slots and linked history, refuses a conflicting target, and leaves authority and historical actors unchanged. It is never a side effect of editing, last-editor identity, session silence, queue balancing or `gm.handover`; a GM handover does not automatically transfer automations or old epoch-fenced publication. Resolve an unknown transfer outcome through readback only.
+Revoked/deleted ownership blocks new affected actions. Restored rights can make a still-enabled entry eligible; explicitly disabled entries stay disabled. [Explicit ownership transfer](#31-explicit-transfer-to-the-current-gm) updates the same logical entry and preserves admitted actors/occurrences. Editing, session silence, queue balancing and `gm.handover` do not transfer entries implicitly. Resolve unknown outcomes through the existing Operation.
 
 ### Module disconnect behavior
 
@@ -578,7 +559,7 @@ Goal tracking starts no work. Its selected progression uses one enabled manager 
 
 Keep #22's small eager cores. Config get/preview/apply/explain/transfer and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Goal editors update the same entry and enabled flag, not parallel records. Before exposing a new method, wire its real application handler and result reader.
 
-For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. Scoped Manager feedback is available only when a TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md) for a new Attempt. Existing v1 Attempts and their feedback rights/evidence remain frozen and unchanged. Existing legacy MCP schemas do not silently acquire new rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
+For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. The target permits scoped Manager feedback through current caller/assignment/action checks. The current document-edition gate is a [removal candidate](refactoring.md#code-reduction-candidates); convert actually needed unfinished work explicitly instead of keeping v1/v2 business rules forever. Tool schemas do not grant rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
 
 ## 11. OpenCode external attach and retained service ownership
 
@@ -597,10 +578,10 @@ also returns the native-harness-required error. Do not configure a fresh private
 Bun/OpenCode server or rebuild that launch path from an old example. New service
 connections use the native registration described above.
 
-Retained service-owner records, nonce/process identity, departure checks and
-uncertain-outcome readback remain compatibility obligations. Their presence does
-not make the old producer a supported new-launch mode. Retire dormant producer
-code separately from this readback under the [runtime reduction boundary](refactoring.md#retire-executors-without-losing-history).
+Current readback still consumes service-owner and process-identity records. Resolve
+actually retained in-flight work through the [finite transition](refactoring.md#retire-executors-without-losing-history),
+then remove the old reader and producer. Their source presence does not establish
+a user-data obligation or justify indefinite compatibility.
 Current source/native evidence remains in [Implementation status](../implementation-status.md).
 
 ### Windows Git metadata path admission

@@ -1,10 +1,10 @@
 # Agent Operations — Rust Architecture and Execution Contracts
 
-Revision 17 · 2026-10-17 · Canonical Version 3 Architecture.
+Revision 18 · 2026-10-18 · Compact V3 architecture target.
 
 This is the refactoring target. The [source map](refactoring.md) identifies its current gaps and existing owners; historical implementation/qualification claims remain revision-scoped.
 
-[Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) defines mandatory Rust crate and vendor SDK reuse.
+[Configuration](configuration.md) owns editable settings; [Delivery](delivery.md) owns work transitions; [Donor map](donor-map.md) identifies libraries and patterns that replace required mechanisms. The [refactoring map](refactoring.md) defines the compact core and removed/deferred scope; the optional capabilities below are not cumulative completion obligations.
 
 ## 1. One Rust control plane with effective donor and SDK reuse
 
@@ -32,12 +32,12 @@ Business receipts are not optional logs. Unused optional workers have no polling
 loop or native connection; failed optional workers restart locally, not through
 host-wide shutdown. Store/journal failure remains a distinct critical condition.
 
-### 1.1 Universal transactional kernel, adapters and schema evolution
+### 1.1 Controller operations, adapters and schema evolution
 
-The system is a general transactional framework: a kernel, durable event bus,
-commands, actions and messages. Agent work is one application of that framework.
-The kernel must not depend on a particular provider, harness, model, session or
-Task workflow to persist and route an occurrence or report an action outcome.
+The controller serves agent work. Reuse its existing Operation, event and message
+primitives for the concrete Task, review, observation and selected Goal consumers.
+Keep provider-specific transport in adapters; do not turn these shared primitives
+into a general workflow platform or implement hypothetical consumers.
 
 An event records an occurrence with stable source and occurrence identity,
 kind, version, time, applicable scope and causal links. A command requests an
@@ -99,11 +99,14 @@ serde attributes repository-wide.
 | Structured JSON content equality | Compare parsed semantic fields or the canonical serializer owned by that versioned contract. Use `Sha256Digest::of_canonical_json` for protected artifacts and the existing ScriptRun v1 helper for ScriptRun inputs. |
 | Exact TaskPrompt, artifact, native payload or journal/ACK bytes | Preserve and hash the exact retained bytes. Semantic equality cannot replace an explicit byte-identity contract. |
 
-A new canonical-JCS contract must be versioned if its bytes differ from an existing
-serializer; recursively sorted serde JSON is not automatically RFC 8785. Do not
-rehash historical receipts, rewrite frozen policy editions or add one universal
-permissive digest helper. Compatible native software can be selected without
-weakening integrity checks on the selected local binary and manifest.
+Version an incompatible byte contract deliberately; recursively sorted serde JSON
+is not automatically RFC 8785. Preserve original evidence bytes without requiring
+old executable readers forever: use the [finite transition](refactoring.md#retire-executors-without-losing-history).
+Build provenance, protocol compatibility and current authorization are separate.
+The selected image must match the selected module; checkout/compiler/build-cache
+equality is not an execution prerequisite. Remove document path/section/SHA and
+legacy policy editions as a second rights system. Current caller, assignment,
+candidate and action checks own authorization; archive text records past decisions.
 
 Migration `011` captures new `cancelled` Operations and transitions into that
 state by the same transaction rule. The occurrence names the cancelled target
@@ -121,7 +124,7 @@ as an uncertain transport effect, settles each pending send once and blocks
 further writes to that stream. Raw native errors are not selector metadata.
 Current authorized managers obtain retained details through ordinary readback.
 
-These normalized observations are the framework event bus. Addressed mailbox
+These normalized observations use the controller's existing event path. Addressed mailbox
 messages remain durable delivery to their recipient, with one raw mailbox
 delivery on the public timeline; message lifecycle observations do not repeat
 that delivery through `report.delta` or `message.read`. Operation-linked
@@ -270,7 +273,7 @@ Keep technical requester/executor, effective manager, automation/revision, seman
 
 Construct the internal execution context from authenticated admission or retained Store records. It is not deserializable from public `run_as`, role or manager-ID fields. The context resolves the manager's current action/object rights and intersects them with the entry's configured actions/targets and ordinary host/project/resource/candidate policy. Do not mutate a Principal or rewrite an Operation's caller to impersonate the manager.
 
-The existing internal Scheduler ownership exception in `Principal::owns` is specific to the original scheduled-check path. It must not become a blanket bypass for manager-owned launch, feedback, acceptance or forge actions. Use the shared authorization evaluator, preserving historical scheduler receipts without widening their rights.
+The existing internal Scheduler ownership exception in `Principal::owns` is specific to the original scheduled-check path. It must not become a blanket bypass for manager-owned launch, feedback, acceptance or forge actions. Use the shared authorization evaluator; archive former scheduler attribution without retaining its legacy authorization branch.
 
 Current GM/epoch, accepted-candidate and repository checks remain real guards. Where new scoped manager rights are intended, add them for manual and on-behalf requests together and update the accepted policy explicitly. Reaching an internal function is not permission. Historical policy/Attempt evidence remains readable.
 
@@ -386,7 +389,7 @@ Retain one scoped pending diagnostic for an unchanged failure. Do not launch an 
 
 ## 7. Cron and shared reminders
 
-Consolidate scheduling into one unified Rust scheduler using `croner` and indexed relational SQLite tables. Schedules/rules/Goal editors share the same manager-owned enabled entry, without duplicate switches or parallel interval/cron loops. Use indexed per-definition/due rows rather than expanding one shared JSON blob; preserve legacy schedule/receipt identities.
+Consolidate scheduling into one Rust scheduler using `croner` and indexed SQLite rows. Schedules/rules/Goal editors share the same entry and enabled state. Convert actually used interval definitions once and remove the old loop/config registry. Entry identity is stable across owner changes; consumed occurrences and admitted Operations retain their original identities. Do not retain parallel schedulers for historical records.
 
 Use the `croner` donor crate for complete cron expression evaluation and supported timezone integration. Preview grammar, calendar, next occurrences, DST gaps/repetitions, overlap and misfire. No handwritten cron parser or frozen release requirement.
 
@@ -418,7 +421,7 @@ Run-scoped API credentials permit declared invocation effects only. They carry m
 
 Use one registry and #22's profile/surface/catalog separation. Keep normal cores small; detailed config, runtime profiles, streams, reviews, hooks, scripts, schedules, Goal and forge are deferred. No arbitrary execute-method tool or new mode-management group.
 
-The assigned auditor submits only its exact result through `review.submit`; `review.get` and linked `operation.get` may finish/read that same retained assignment after Task revision or Attempt release while authentication remains valid and unrevoked. No historical context/list, artifact or evidence reads are implied. A null preregistered review assignment remains unusable until atomic binding. `task.request_changes` applies manager disposition and is not an ordinary auditor tool. Preserve any explicitly named legacy `Reviewer` compatibility profile separately; neither tool visibility nor a role label grants new rights.
+The assigned auditor submits only its exact result through `review.submit`; `review.get` and linked `operation.get` may finish/read that same retained assignment after Task revision or Attempt release while authentication remains valid and unrevoked. No historical context/list, artifact or evidence reads are implied. A null preregistered review assignment remains unusable until atomic binding. `task.request_changes` applies manager disposition and is not an ordinary auditor tool. Retire obsolete `Reviewer` profiles with their actual consumers; neither tool visibility nor a role label grants new rights.
 
 For capability receipts distinguish configured, listed by the transport, acknowledged by the harness, and successfully used. `tools/list` or `list_changed` alone cannot prove a model loaded a schema. Do not start extra model turns to fill a readiness checkbox. Use native inventory or a real harmless call in already requested work where supported; otherwise show the gap. Required missing reporting capability affects that launch, not unrelated tools/agents.
 

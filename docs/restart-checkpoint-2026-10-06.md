@@ -68,7 +68,7 @@ profile does not expose `report.delta`.
 - Source-gap/error retention, fair cursors, exact ScriptRun holds and transfer
   rules; generic adapter descriptors and bounded Manager attention projections.
 
-See [implementation status](implementation-status.md) for the exact historical
+See the [recorded implementation status](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs/implementation-status.md) for the exact historical
 source and verification scopes.
 
 ## Code not implemented or still partial

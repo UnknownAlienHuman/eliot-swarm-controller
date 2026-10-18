@@ -1,291 +1,208 @@
 # V3 refactoring map
 
-Source baseline: `f1b854b6fd058dc2440d3848fc95acc279657d3f`, 2026-10-17.
-Its parent is `27fcae1ed2d9fc0aa778680d5e39a08834248023`. The V3 commit changes
-11 documentation files and no runtime source. This map turns the existing O1–O11
-and M1–M6 requirements into connected source slices; it adds no approval stage,
-activation ledger or separate backlog.
+2026-10-18 · Source recheck at `25a8e3bceaadeefb700defa164a4e401885f7e1c`.
+Owner baseline: `f1b854b6fd058dc2440d3848fc95acc279657d3f`, parent
+`27fcae1ed2d9fc0aa778680d5e39a08834248023`. This revision changes the reduction
+program and documentation; the source mechanisms identified below still exist.
 
 ## 1. Authority and audit scope
 
-[V3](README.md) is the target for ongoing development, including donor reuse,
-productive result collection, direct launch, relational state and concurrent reads.
-[V18](../agent_swarm.md), the [module contract](../agent_swarm.module-contract-v2.md)
-and accepted policy editions retain the unaffected transactional and ownership
-contracts. Changing an implementation does not rewrite frozen Attempts, request
-receipts or historical artifact bytes. Current source determines what exists;
-[implementation status](../implementation-status.md) records the scope of its evidence.
+The compact product is **manager → Task/Attempt → agent execution → attributable
+result → independent review → acceptance**, with observation and selected Goal
+continuation. Addressed peer messages support that work. Separate council,
+interface-ratification and automatic GitHub-label engines are outside its required
+completion scope. They are removal candidates, not prerequisites to finish first.
 
-The relevant implementation audit is [Issue #153](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/153),
-including Wave 2 and subsequent corrections. Its `ed1df44` findings are dated;
-the [closeout map](../remediation/2026-10-15/ISSUE-153-CLOSEOUT.md) records later work.
-The older [CURRENT-AUDIT](../remediation/2026-10-09/CURRENT-AUDIT.md) and
-[modularity review](modularity-review-2026-10-05.md) are evidence at their own revisions.
-This preparation inspected manifests and the critical Store, launch, result,
-worker and journal paths. It is not an exhaustive line-by-line audit or a new
-runtime/qualification pass.
+This map owns the active reduction order. V3 documents describe the target; older
+O/M/C/I programs, V18, policy editions and module histories supply context, not
+cumulative obligations to preserve every experiment. Existing runtime behavior
+is evidence to inspect, not a reason to keep it. [Status](../implementation-status.md)
+records actual implementation and checks. The [Issue #153 closeout](../remediation/2026-10-15/ISSUE-153-CLOSEOUT.md)
+retains the dated audit and corrections; this is a source study, not full qualification.
 
-Size at that source baseline (`git ls-files '*.rs'`, excluding `vendor/`):
-
-| Scope | Physical lines | Explicit test-only estimate | Remaining text, upper bound |
+| Owned Rust scope | Baseline physical lines | Current physical lines | Explicit test-only estimate |
 | --- | ---: | ---: | ---: |
-| All 479 owned Rust files | 534,926 | 172,511 | 362,415 |
-| `crates/swarm-kernel-host` | 366,932 | 128,996 | 237,936 |
+| All 479 files, excluding `vendor/` | 534,926 | 533,720 | 172,511 |
+| `crates/swarm-kernel-host` | 366,932 | 365,726 | 128,996 |
 
-The test estimate follows `tests/` paths, test-required `cfg` items and their
-resolvable out-of-line module descendants, with comments/literals masked for
-delimiter matching. It does not compile features or establish production reachability;
-macro-generated/atypical modules can be missed. Physical lines include comments
-and blanks; the remainder is not production SLOC. The older filename-only 85,087
-test/fixture count understated embedded suites. None of these figures measures
-performance or establishes that every remaining line is needed.
+Counts include comments and blanks. The test estimate follows `tests/`, test-required
+`cfg` items and resolvable module descendants, masking comments/literals; it does
+not establish Cargo reachability. The current remainder, 361,209 lines, is not
+production SLOC. Subsystem sizes below include tests unless stated otherwise and
+are inspected surfaces, not promised deletions; overlapping surfaces cannot be added.
 
 ## 2. Audit findings already addressed
 
-Verify these current symbols before assigning new work; historical failing receipts
-remain historical. Source presence does not imply a current full-suite pass.
+Do not reopen fixed or disproved hypotheses merely because an old audit names them.
+The qualification-only automation fixtures are gated; [acceptance](../../crates/swarm-kernel-host/src/store/acceptance.rs)
+loads the source Operation rather than treating a CheckRun ID as an Operation ID;
+launcher cursor, result-cache and OpenCode retention-uncertainty corrections exist.
+The dead WorkQueue/DemandGate was removed. Shared canonical-JSON/digest helpers
+already have owners in `swarm-contracts` and `swarm-scripts`.
 
-| Audit item | Current source evidence | Disposition |
-| --- | --- | --- |
-| D1: qualification helpers broke normal test compilation | [`swarm-automation`](../../crates/swarm-automation/src/lib.rs): both qualification-admit test modules require `qualification-faults`. | Source correction present. |
-| D3 / #150: CheckRun ID used as Operation ID | [`acceptance.rs`](../../crates/swarm-kernel-host/src/store/acceptance.rs): selects `s.operation_id`, then loads that Operation while retaining `cached_from` as CheckRun ID. | Source correction present. |
-| D5: #146 / #148 / #149 | [`launcher.rs`](../../crates/swarm-kernel-host/src/store/launcher.rs): immutable reconcile cursor; [`results.rs`](../../crates/swarm-kernel-host/src/store/results.rs) / [`object_scope.rs`](../../crates/swarm-kernel-host/src/store/object_scope.rs): assembly cache; [`retention.rs`](../../crates/swarm-adapter-opencode/src/journal/retention.rs): durable removal-uncertainty marker. | Preserve the corrections and their stated limits. |
-| Dead WorkQueue / DemandGate | [PR #154](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/154) merged; [`swarm-bus`](../../crates/swarm-bus/src/lib.rs) retains the used event/router contract. | Deleted; no replacement queue needed. |
-| Repeated Command / Claude SHA predicates | [`Command lib.rs`](../../crates/swarm-adapter-command/src/lib.rs): `is_lower_sha256_hex`; [`Claude receipt.rs`](../../crates/swarm-adapter-claude/src/receipt.rs): shared `is_sha256`. | The named package-local cleanup is present. |
-| Duplicate protected-artifact and ScriptRun JSON digests | [`Sha256Digest::of_canonical_json`](../../crates/swarm-contracts/src/module_catalog.rs), [`script_run_canonical_json_*_v1`](../../crates/swarm-scripts/src/lib.rs) and their producer/consumer call sites. | Shared contract owners exist; use them. |
-
-D4's isolation/readback remainder stays domain-specific. A missing SAVEPOINT in an
-arbitrary file does not prove a fleet stall; trace selection, isolation and the
-caller before assigning a defect. Existing fixes do not prove universal recovery.
+Antigravity already associates a serialized turn with its Operation and retains
+normalized body pages. Codex/Claude native input identities work differently and
+remain useful. Source presence is not a claim that every native scenario passed.
+See the MCP and ScriptRun corrections below before assigning another cleanup.
 
 ## 3. Current gaps against V3
 
-| Area | Verified baseline | Required change |
+| Core boundary | Source reality | Required smaller path |
 | --- | --- | --- |
-| Read dispatch | [`Store::call`](../../crates/swarm-kernel-host/src/store/mod.rs) sends only `host.status`, `monitor.snapshot` and `monitor.follow` to [`status_reader`](../../crates/swarm-kernel-host/src/store/status_reader.rs): one connection, one FIFO. Most other SQL reads use `RunJob`. | Bounded WAL reader concurrency and explicit query-family routing. |
-| Capacity | [`capacity.rs`](../../crates/swarm-kernel-host/src/store/capacity.rs): v2 stores a scope header plus individual JSON entry rows in `meta`; v1 whole-ledger compatibility remains. | Indexed relational capacity records. The audit's single-blob description is no longer the whole current path. |
-| Other domain state | [`automation/config.rs`](../../crates/swarm-kernel-host/src/automation/config.rs) and [`store/automation.rs`](../../crates/swarm-kernel-host/src/store/automation.rs) encode entry and dispatch records in `meta`. | Migrate one record family with its indexes and consumers at a time. |
-| Package boundaries | [`host Cargo.toml`](../../crates/swarm-kernel-host/Cargo.toml) directly links six worker implementations: bus, automation, script-worker, supervisor, checks, observer. `swarm-scripts` also reaches bus. | Remove implementation edges, including transitive edges, through existing contract/client/process owners. |
-| OpenCode result | [`native.rs::read_assistant_result`](../../crates/swarm-adapter-opencode/src/native.rs) and [`lib.rs::normalized_assistant_result_page`](../../crates/swarm-adapter-opencode/src/lib.rs) still require an explicit assistant parent. | Implement V3 serialized-turn association for parentless streams. |
-| Launcher readiness | [`launcher_dispatch.rs`](../../crates/swarm-kernel-host/src/store/launcher_dispatch.rs) requires current C8 tool proof for launcher-owned OpenCode work. Direct dispatch without a launch parent is already independent. | Make native MCP observation asynchronous in the V3 launch path. |
-| Donor integration | `rmcp`, ACP, `croner` and Atlas have production consumers. `tracing` is only transitive; octocrab, notify, sysinfo, tracing-subscriber/appender and CCCC are absent from direct dependencies. | Integrate at the named boundary, replacing its current mechanism. See [donor map](donor-map.md). |
+| Result collection | OpenCode [native reader](../../crates/swarm-adapter-opencode/src/native.rs) and [result page](../../crates/swarm-adapter-opencode/src/lib.rs) require an explicit assistant parent. | Capture the admitted serialized-turn window and return its body; retain explicit native lineage when available. |
+| First dispatch | [Launcher dispatch](../../crates/swarm-kernel-host/src/store/launcher_dispatch.rs) requires current C8 MCP proof for launcher-owned work. | Valid Task/workspace/binding admits the first prompt; native MCP observations arrive asynchronously. Remove the actual admission dependency, not just an evidence-field comparison. |
+| Reads | [Store::call](../../crates/swarm-kernel-host/src/store/mod.rs) sends only status/monitor to one FIFO reader; most other reads use the writer queue. | Bounded WAL snapshots, one writer, explicit routing by query family. |
+| Capacity | [capacity.rs](../../crates/swarm-kernel-host/src/store/capacity.rs), 5,630 lines: v2 scope headers and separate JSON entry rows in `meta`; v1 whole-ledger reads remain. | Indexed domain rows through the existing schema installer; remove key/codec/orphan plumbing after conversion. The entire reservation subsystem is not expendable. |
+| Automation state | [config](../../crates/swarm-kernel-host/src/automation/config.rs) and [Store automation](../../crates/swarm-kernel-host/src/store/automation.rs) store sealed JSON/key families. | Stable entry identity and indexed state; changing owner must not relocate every journal. |
 
-**Two result/readiness corrections:** Antigravity already records a single-flight
-Operation → receipt/conversation/ordinal/boot/generation mapping and returns its
-retained body ([controller](../../modules/antigravity-rust/src/controller.rs),
-[result page](../../modules/antigravity-rust/src/result_page.rs)); its old guide
-was stale. Preserve this implementation. Codex uses explicit native input/turn
-identity; Claude uses its native user-message UUID evidence. Do not weaken those
-working paths to a generic latest-message selector.
-
-The current OpenCode C8 prerequisite is an availability restriction, not a proven
-circular model-request deadlock: the plugin's `arm` path calls `McpService.tools()`
-before a prompt, and the consumer accepts unknown provider-request evidence
-([plugin](../../modules/opencode/native-mcp-proof.mjs),
-[validator](../../crates/swarm-kernel-host/src/runtime/opencode_v2/mcp_tools.rs)).
-V3 still requires removing that prerequisite from initial prompt admission.
-The literal `dispatch_permitted: false` is an evidence-field invariant; deleting
-that comparison alone does not remove the actual prerequisite.
+The OpenCode prerequisite is an availability restriction; a circular model/MCP
+request deadlock was not established. Its plugin can list tools before a prompt.
+Removing that prerequisite still follows the V3 direct-launch target.
 
 ## 4. Connected work order
 
-Start with the productive path. Store, worker and donor slices can proceed in
-parallel on non-overlapping assignments after their manager fixes shared-file
-ownership. Native qualification is a later phase, not a prerequisite for source
-work. Existing O/M identifiers remain the scope map; the rows below are small
-candidate boundaries, not new permanent Issues.
-
-| First candidate | Scope / starting files | Completion and deletion |
-| --- | --- | --- |
-| O3: OpenCode result association | Adapter `native.rs`, `lib.rs`, journal/result context; shared origin DTO only if required. | Capture one admitted turn, return its bounded normalized body, retain its exact Operation association. Remove the parent-only rejection for this supported path; retain explicit native lineage when supplied. |
-| O3/O10: direct launcher dispatch | `store/launcher_dispatch.rs`, `launcher.rs`, native-MCP reconciliation and public progress projection. | Ready binding accepts the first dispatch with valid Task/workspace/caller scope; MCP observations arrive asynchronously. Remove the `require_current_dispatch_capability` admission dependency and its duplicate pre-effect readiness gate, retaining ancestry/receipt checks. |
-| M2/O2: WAL readers | `swarm-store`, `status_reader.rs`, `Store::call` and selected read handlers. | Existing status/monitor plus a first bounded query family use concurrent read-only snapshots; delete their writer-queue branches. Expand method families separately as below. |
-| M2/O1: relational capacity | Existing schema installer and `store/capacity.rs`. | Convert scopes with held reservations intact, switch all scope reads/writes to indexed rows, then retire migrated `capacity:*` / `capacity-entry:*` representations. |
-| M2/O1–O2: relational automation | `automation/config.rs::{entry_key,load_entry}`, `store/automation.rs::scoped_entries`, existing schema installer. | First migrate the owner/project entry family and its get/preview/apply consumers; replace prefix/key scans with indexed scoped queries. Cursor, pending, review and due families are later separate candidates. Preserve sealed payload validation, identity and scope/page bounds. |
-| M2–M4: worker boundaries | The edge-removal table below. | Each worker-only edit leaves the host outside its actual Cargo reverse-dependency closure; one production owner remains. |
-| O4: GitHub donor | Existing `github/client.rs` traits plus issue/label/PR consumers. | One shared octocrab backend replaces `run_gh_api`; current account/host, bounded responses and Store-owned write/readback survive. Native Git publication keeps its own process boundary. |
-| M5/O2: observation donors | `swarm-telemetry`, `swarm-observer`, config/watch and `swarm-process`. | tracing replaces duplicate logging plumbing; notify replaces matching file polling; sysinfo supplies metrics; CCCC supplies suspended-child bootstrap where that launch path exists. Complete one donor/consumer replacement per candidate. |
+Reduce obsolete mechanisms and optional scope before splitting the remaining
+code into more packages. The table is the work order; it does not create a new
+Issue series or approval protocol. Independent rows may proceed together.
 
 ### Code reduction candidates
 
-These refine the same O/M queue alongside the productive-path fixes.
-Keep broader O4–O9 feature completion off this reduction
-pass's critical path; existing requirements remain in [O1–O11](implementation.md).
-Estimate the old surface before work, then report actual deleted/added owned lines
-and the resulting owner after integration. Count Rust, JS/Python drivers and IPC
-glue together, with tests separately; vendoring or moving code is not deletion.
+| Candidate and source evidence | Decision and replacement |
+| --- | --- |
+| **Retired installation baggage.** [Frontend installer](../../tools/modules/Install-SwarmFrontend.ps1) enumerates all installed siblings and can rehash retired OpenCode `node_modules` before allowing a new frontend. Its tree/closure helpers alone occupy 174 lines; the [legacy fixture harness](../../tools/qualification/Test-InstallFrontendLegacyCompat.ps1) adds 316. [Forge installer](../../tools/modules/Install-ForgeWorker.ps1) adds 129 lines with no discovered code/CI caller; `Install-StandaloneWorker.ps1` already handles Forge. | **Remove** the retired tree checks, fixture and duplicate Forge installer. An old release directory can remain on disk without its dependencies becoming an admission condition for an unrelated new binary. No alias wrapper. |
+| **Build provenance as product compatibility.** [Native qualification](../../tools/qualification/New-NativeQualification.ps1) rejects host/module differences in commit, manifests, compiler strings and even hashed build-cache path (`HOST_MODULE_BUILD_PROVENANCE_DIVERGED`). [Provenance helpers](../../tools/ci/SwarmBuildProvenanceHelpers.ps1) rebuild dependency inventories; builders match private Rust source text with regex. | **Remove** checkout/compiler/cache-path equality and source-spelling checks. Package the selected Cargo target; record optional build facts without making them runtime rights. Installation needs selected files and one descriptor/image contract. Use the shared Rust validator; remove the PowerShell schema copy and redundant permanent copy hashes in [Install-ModuleArtifact](../../tools/modules/Install-ModuleArtifact.ps1). |
+| **Retired Python Codex.** Four owned Python files under [modules/codex](../../modules/codex/README.md) total 4,277 lines, plus a vendored SDK tree. [require_new_binding](../../crates/swarm-kernel-host/src/store/task_prompt.rs) rejects its old artifact. Discovered execution callers are fixture/CI/Justfile paths, not the Rust adapter. | **Remove** Python executor, SDK package, old build/test job and launch instructions. The 165-line [receipt decoder](../../crates/swarm-kernel-host/src/runtime/codex.rs) has real Store callers but does not need that Python system. Convert/export actual required records and then retire the decoder too. |
+| **Two OpenCode implementations.** Host [runtime/opencode_v2](../../crates/swarm-kernel-host/src/runtime/opencode_v2.rs) subtree: 19,948 lines, plus facade/Store integration; [standalone adapter](../../crates/swarm-adapter-opencode/src/lib.rs): 24,984 across `src/`. [Legacy demand](../../crates/swarm-kernel-host/src/store/legacy_worker_demand.rs) and host workers still execute the built-in route independently of module supervision. | **Converge on the standalone owner.** Move required session/result/recovery consumers, then remove built-in routing, executor and its fixture machinery. Do not keep a second general runtime for archive reads. Fresh-owned start already rejects; code after its unconditional guards is a separate immediate deletion, not a reason to delete still-used readback blindly. |
+| **Two Muse implementations.** Node `modules/muse/*.mjs`: 4,298 lines; Rust adapter `src/`: 21,774. Node remains the default route; the Rust template is disabled, with one recorded native exact-result success. | **Choose one owner** after comparing the required consumers and total owned code. Inspect reuse of SDK `Connection`/fold instead of rebuilding native machinery; no third bridge or automatic preference for a larger Rust implementation. Complete the selected path and retire the other executor/journal format through a finite transition. |
+| **Two schedulers and legacy worker lifecycle.** [scheduler.rs](../../crates/swarm-kernel-host/src/scheduler.rs) and [automation_scheduler](../../crates/swarm-kernel-host/src/store/automation_scheduler.rs) handle interval, cron and Goal due work. Enabling standalone does not disable built-in demand. [legacy_optional_workers](../../crates/swarm-kernel-host/src/host/legacy_optional_workers.rs) has 11 worker kinds and 2,337 lines. | **One scheduler and lifecycle owner.** Convert used interval definitions into the common entry/due model and remove the old loop/config registry. Store may already suppress duplicate effects; the demonstrated duplication is orchestration. Remove retired worker variants, not just the word `legacy`. |
+| **Document editions as permissions and historical acceptance branches.** [policy.rs](../../crates/swarm-kernel-host/src/policy.rs) requires document path/section/SHA equality before scoped feedback. [acceptance](../../crates/swarm-kernel-host/src/store/acceptance.rs), [automation acceptance](../../crates/swarm-kernel-host/src/store/automation_acceptance.rs), reviews and Task code branch on `LegacyV1`. | **One current scoped-manager policy and acceptance contract.** Check caller, assignment, candidate and action directly. Remove document SHA/path/edition as a capability and V1 business-workflow branches after explicit conversion of needed unfinished work. Historical text is evidence, not an executable rights system. |
+| **Owner embedded in automation identity.** [automation_transfer::apply](../../crates/swarm-kernel-host/src/store/automation_transfer.rs) clones an entry, retains a disabled former-owner copy, calls six journal relocators plus cron and writes transfer pointers. Its target-conflict check makes A→B→A collide with A's retained entry, by source inspection. | **Stable internal entry ID; mutable owner/revision.** Journal rows reference the entry ID; running Operations retain their original admitting actor. One transaction changes ownership. Delete relocation, successor traversal, cycle detection and historical copies used as identity. See relational conversion below. |
+| **Council and interface-negotiation engines.** Concilium: 3,589 lines in three core files, 11 states and 8 methods. Integration DTO/Store: 3,747 lines for offer/requirement, 14 compatibility dimensions and ACKs. They are advisory; [integration](../../crates/swarm-kernel-host/src/coordination/integration.rs) explicitly does not accept Tasks or change assignments. | **Remove from compact core.** Use ordinary independent assignments/reviews and addressed messages. Delete council rounds/digests and generic agreement/ratification machinery with their methods/consumers. Keep participant registration, scoped messaging and review/submission grants currently colocated in [coordination](../../crates/swarm-kernel-host/src/store/coordination.rs). The 12,697-line wider coordination surface is not all removable. |
+| **Automatic publication/Issue labels.** [Publication](../../crates/swarm-kernel-host/src/store/automation_publication.rs), [projection](../../crates/swarm-kernel-host/src/store/automation_github_projection.rs) and its automation publication model total 5,371 lines, with separate cursors/watermarks and special on-behalf contexts. | **Defer/remove this automation from required core.** Preserve explicit publication of an accepted candidate through existing Forge/GitHub commands. Project CI can label published work when needed. Remove the automation settings, schedulers and special contexts together; do not count manual Forge as deleted. |
 
-| Candidate / source owner | Replacement and deletion | Limits of the estimate |
-| --- | --- | --- |
-| M2/O1: capacity persistence — [`capacity.rs`](../../crates/swarm-kernel-host/src/store/capacity.rs) | Indexed scope/entry rows replace hex-key codecs, header/entry serializers, `meta` scans and orphan stitching as each scope cuts over. Reuse the existing installer and reservation domain code. | A 5,630-line file is not a deletion estimate. Reservation correctness, held/unknown capacity and damaged-source isolation are real behavior; only the replaced persistence machinery is removed. |
-| M3/M4: parallel runtime implementations | Select one owner for new admissions; keep narrow historical decoding/readback, then remove the retired executor as described below. | Potentially larger than helper cleanup, but active routes and saved formats differ. No whole-runtime saving is claimed before the caller/cutover diff. |
-| O4: GitHub API subprocess — [`github/client.rs`](../../crates/swarm-kernel-host/src/github/client.rs) | One `octocrab` backend behind existing API traits replaces `run_gh_api` and its `gh api` argument glue. Keep native Git publication separate. | `run_gh_api` is about 104 lines; with caller glue the old surface is roughly 150–250 lines. It is not a large handwritten HTTP stack, and octocrab is not yet a direct dependency. |
+The full automation subtree plus Store automation files is 54,612 physical lines.
+Moving all of it from JSON to tables would retain its product complexity. Select
+needed actions first; do not rebuild the removed ones in a cleaner generic engine.
 
 ### CLI reduction implemented in the preparation branch
 
-[PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183)
-removes duplicate application commands, IPC mapping/retry and MCP launching from
-[`host main`](../../crates/swarm-kernel-host/src/main.rs): 1,949 → 743 physical
-lines, net −1,206; the 87-line parser-test section is unchanged. The existing
-[`swarm-cli`](../../crates/swarm-cli/src/main.rs) remains the public owner with no
-new wrapper, schema or dependency. Direct general host commands now use `swarm`;
-MCP uses `swarm mcp`/`swarm-mcp`. No in-repository caller required a rewrite.
-
-Keep all `command_uses_host` delegates and the internal module-owner/Zed workers.
-Client creation still validates the operator credential before writing the client
-credential, then registers its hash with the same request-ID/retry behavior.
-Daemon flags, Gateway, hook installation, observer reads and artifact export remain.
-This closes the duplicate-CLI slice, not broader O10 parity or O11 qualification.
+[PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183) already
+contains the earlier CLI implementation: [host main](../../crates/swarm-kernel-host/src/main.rs)
+1,949 → 743 physical lines, net −1,206; the 87-line parser-test section is unchanged.
+`swarm-cli` owns public commands; host delegates/internal workers remain. This is
+separate from the present documentation-only source study, not the scale target.
 
 ### MCP hypotheses rechecked
 
-The catalog's size is not evidence of another implementation. Exact exposure already
-has one owner, `swarm-contracts::mcp_catalog::exposes_method`; the MCP frontend only
-forwards to it. Its approximately 230 lines are not a duplicate-policy deletion.
-For example, `task.get` lists Participant/AssignedReviewer as intended audiences
-but is not exposed to either profile. Keep descriptive audiences, exact profile
-exposure, Store authorization and eager defaults distinct. Two redundant Concilium
-literals are incidental cleanup, not a new policy-matrix project.
+`swarm-contracts::mcp_catalog::exposes_method` already owns exact exposure; the
+frontend forwards to it. Descriptive audiences, discovery and actual Store rights
+are different facts. Its roughly 230 lines are not duplicate-policy savings.
+[Schemars](donor-map.md#12-schema-generation-candidate) has no surveyed shared input
+DTO ready to replace the existing manual tool inputs: do not invent 164 DTOs or a
+new schema DSL for a cosmetic deletion.
 
-[Schemars](donor-map.md#12-schema-generation-candidate) remains a researched option,
-not the next source assignment: the surveyed tool inputs use `Value`/manual parsing
-or host-owned types, not an existing shared input DTO ready for derivation. Do not
-add 164 DTOs or another schema DSL just to replace `TOOL_ITEMS` with generated code.
-Revisit only with a concrete existing-type extraction and a measured net deletion.
+ScriptRun is also not another active default root executor: current reconciliation
+rejects queued `executor=None`, and the runner requires a selected standalone.
+Its old fallback comment/wire and compatibility entrypoint need cleanup; they do
+not prove that new work still runs through the retired backend.
 
 ### Retire executors without losing history
 
-| Runtime | Current distinction | Source reduction boundary |
-| --- | --- | --- |
-| Codex | [`config.rs`](../../crates/swarm-kernel-host/src/config.rs) rejects the old Python artifact for new bindings; Rust is the selected new-admission path. [`runtime/codex.rs`](../../crates/swarm-kernel-host/src/runtime/codex.rs) still validates historical native/thread/turn/input identity. | Inventory retained bindings and unresolved executable consumers. Remove retired Python orchestration/package paths when those consumers are handled, retaining the versioned decoder and historical bytes. It is unnecessary to erase every old Operation to retire its producer. |
-| OpenCode | Built-in `http.2` and standalone `rust-http.1` both have real routes and different integration coverage. Fresh-owned service start is already rejected; substantial helper code is test-only. | Migrate required new-admission/session/result consumers to one runtime owner. Retire the replaced executor and dormant producer helpers, preserving exact old-artifact readback and owner/family disposition. Do not delete all `owned_service.rs` or recreate an SDK service merely because that file remains. |
-| Muse | Node bridge.13 remains a current path; Rust 0.1.2 is a disabled candidate with a different durable journal. | Select one owner for new admissions. Retain each format's compatible readback/reconcile path for saved work before retiring its executor; Rust does not adopt/rewrite Node checkpoints ([integration boundary](../../crates/swarm-adapter-muse/registration/INTEGRATION.md)). A thin SDK driver must shrink total owned transport/fold/glue; full SDK `Session` adds automatic replay ([inspected boundary](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries)). |
+Support one current executor and active-work format. A source enum, old fixture,
+versioned directory or historical audit is not evidence of an installed consumer.
+Do not promise indefinite readers for every prior artifact/SDK/model-default variant.
 
-Native route cutover has its own later operational validation. It is not a gate
-on source extraction or removal of independently unreachable code. Retained
-unknown work requires its actual reconciliation path, not a second general runtime.
+For concrete data that must survive, use the smallest finite transition: finish or
+reconcile identified in-flight work with its current owner, use a supported session
+handover, or export required results and convert unfinished Tasks to the current
+contract. A semantic change may require a new Task revision/Attempt; keep the old
+record as history instead of silently assigning it new rights. Uncertain native
+effects are resolved or left explicitly for manual disposition, never resent.
+After the transition, remove old producers, readers, schema branches and packaging.
+No general migration framework, permanent dual writes or fallback executor is needed.
+
+Keep original dispatch provenance distinct from protocol compatibility and the
+currently authorized result reader. [normalized_result::same_module](../../crates/swarm-kernel-host/src/store/normalized_result.rs)
+currently compares full artifact identity; [Muse integration](../../crates/swarm-adapter-muse/registration/INTEGRATION.md)
+shows the resulting cross-build read restriction. Change that contract deliberately
+with an explicit authorized handover/result mapping; do not forge old receipt bytes
+or require the old binary forever merely because a build version changed.
 
 ### WAL migration detail
 
-Generalize the existing reader path; `swarm-store::open_reader` already opens
-read-only/query-only connections. Keep a bounded worker-owned pool, one connection
-per executing request and no unbounded thread/task creation. Resolve the current
-principal and read its authorized projection in the same short `DEFERRED` read
-transaction. Preserve each handler's candidate scan, per-row authorization and
-visible-page ordering in that snapshot. For observation-position pages,
-unauthorized or missing rows advance raw coverage without consuming a visible
-slot; preserve `next_after`, gap and coverage semantics. Pool saturation uses
-bounded backpressure rather than a hidden return to the writer queue.
-
-Begin with existing status/monitor, `runtime.catalog`, `module.catalog.get`,
-`check.profiles` and `route.list`; then Task/Attempt/review reads, Operation
-projections, reports and automation explain. Audit actual handlers, not method
-suffixes. `module.next` changes durable dispatch state; `stream.open/read/close`
-manages an in-memory stream registry. `artifact.read` performs DB authorization
-and cache-epoch validation before file I/O; `artifact.parts` is a bounded DB-only
-projection with per-page authorization and assembly-cache snapshot validation.
-Move those artifact paths only after making their immutable read snapshots
-explicit. Keep schema changes and durable cursor advancement on the writer.
-
-A single RPC snapshot includes authorization and data; where a handler exposes a
-journal cut, capture it in that same snapshot. Separate page RPCs retain their
-existing cursor/gap semantics; do not keep a read transaction
-open across clients or stream lifetime. WAL allows read/write concurrency but
-long readers can delay checkpoints ([SQLite WAL](https://sqlite.org/wal.html)).
-No throughput improvement is claimed until it is measured.
+Reuse `swarm-store::open_reader` and a bounded connection pool. Authorize and read
+one response in the same short read snapshot; retain page ordering/cuts. Start with
+status/monitor and bounded catalog/profile/route reads. `module.next` writes dispatch
+state; stream methods manage registries; artifact bodies need authorization and
+cache-epoch validation before file I/O. Do not route by method suffix alone or keep
+a DB transaction open across client pages. Pool saturation uses bounded backpressure.
+[SQLite WAL](https://sqlite.org/wal.html) permits concurrent reads/writes; long readers
+can delay checkpoints. Measure actual performance after the change.
 
 ### Relational conversion detail
 
-Use `Store::initialize_database` / `install_schema_extension` and the existing
-`crates/swarm-kernel-host/migrations/` directory. `swarm-store` owns connection
-mechanics, while Store owns domain DDL and conversions; no second migration runner.
-Capacity rows need explicit scope/entry keys, identity, state and indexes used by
-reservation and reporting queries. Keep Operation/Attempt records authoritative.
-Store bounded versioned payloads in their domain row when needed; relationalization
-does not require changing their digest/byte contract or making a table per JSON leaf.
-Use existing SQLite/`rusqlite` facilities rather than adding a migration runner or ORM.
+Use `Store::initialize_database`, `install_schema_extension` and the existing host
+migrations. Store owns domain DDL; `swarm-store` owns connection mechanics. Convert
+one bounded family on the writer, validate the saved identities/reservation totals,
+switch its consumers and remove the replaced keys/code. Bounded JSON belongs in its
+owning row where useful; no table per leaf, second migration runner or ORM is needed.
+Held or unknown capacity cannot become free during conversion.
 
-Create tables once, then convert bounded scopes on the writer with a resumable
-cutover marker and a single authoritative representation per scope. Validate
-entry counts, identities and reservation totals before cutover; preserve damaged
-source for the existing scoped isolation/readback path. Never treat unknown
-capacity as free. Keep v1/v2 reads until the relevant saved scopes are migrated;
-remove old key writes/rows when their cutover is committed. Do not introduce
-permanent dual-write ledgers or migrate data from a read request.
-
-For the first automation-entry conversion, `scoped_entries` currently scans keys
-and calls `load_entry` again for every row. Replace that path with one bounded
-owner/project query through the existing config Store owner. Keep authorization,
-automation-ID ordering, the over-limit error and sealed-record validation; update
-get/preview/apply together. This removes redundant lookup/key plumbing, not the
-entry's on-behalf policy or every automation record family.
-
-Cron due-row shape belongs with `automation_cron::DueIndex`. Its candidate validator
-and `automation_scheduler::valid_cron_due_index` overlap but are not equivalent:
-the scheduler also checks closed fields/nonempty/SHA identity and records damaged
-source evidence, while cron checks live DB state and classifies the candidate.
-Share only identical shape/key rules during that family's migration; keep each
-consumer's error/quarantine behavior. Do not introduce a generic validator framework
-or treat the scheduler's entire 37-line check as free deletion.
+For automation, introduce an immutable internal `entry_id` distinct from its editable
+name and `owner_manager_id`. Existing state/occurrences reference that ID. Resolve
+actual source/successor entries to one logical entry during conversion; unrelated
+same-name entries remain distinct. Ownership changes update owner/revision without
+moving state or minting new consumed-occurrence identities. Pending starts check
+current authority; already admitted Operations retain original actor and input.
+This removes the need for six `relocate_state` paths and transfer-pointer ancestry.
+Replace `scoped_entries` key scans/N+1 loads with one indexed owner/project query.
 
 ### Remove worker implementation edges
 
-| Current host edge | Existing destination for the shared seam | Worker-only remainder |
-| --- | --- | --- |
-| `swarm-supervisor` | `swarm-contracts`: bootstrap/health/control DTOs; `swarm-client`: bounded control client; `swarm-process`: owner primitives. | Standalone supervisor registry, spawn/restart loop and child lifecycle. Host keeps Store demand/receipt coordination. |
-| `swarm-bus`, including through `swarm-scripts` | `swarm-contracts`: event/selector contract and pure matching used by Store/script planning. | Dispatcher process and wake loop. Retain `route_event`/`same_slot` behavior; the dead queue is already gone. |
-| `swarm-script-worker` | `swarm-scripts`: ScriptRun wire/plan/start-decision contract; `swarm-process`: file/process primitives. | Executor loop, child execution and captures. Remove the host-linked compatibility entrypoint and dependency after the standalone consumer is connected. |
-| `swarm-checks` | `swarm-contracts`: check plan/result DTOs; `swarm-process`: bounded process/capture mechanics. | Check execution. Preserve the current standalone-host admission and custody path. |
-| `swarm-automation` | `swarm-contracts`: worker config/ready facts; `swarm-process`: exact family ownership/readback. | Scheduler worker loop. Store keeps atomic slot/admission decisions and `croner` supplies calendar parsing. |
-| `swarm-observer` | `swarm-telemetry`: small in-process producer/config contract; shared process facts in `swarm-process`. | Recorder, follow/metrics CLI and observer worker. Preserve recording when another sink fails. |
+These edges concern retained external executors. Pure functions, planning and
+small projections stay in existing libraries. One owner does not imply a new
+process, descriptor or IPC protocol for every helper. Consolidate existing
+process lifecycles; do not build a new worker framework.
 
-Move one seam with both callers, then remove its Cargo edge. Do not publish empty
-wrapper crates or copy worker implementations into the host under another name.
-Use Cargo metadata to check the full local normal-dependency graph, including
-`swarm-scripts → swarm-bus`. Small `cfg(test)` units are already excluded from
-production builds; moving tests alone does not establish this boundary or a
-runtime-performance gain. Relocate large integration fixtures as their seam moves.
+| Host implementation edge | Existing shared owner | Independent remainder |
+| --- | --- | --- |
+| `swarm-supervisor` | `swarm-contracts` DTOs, `swarm-client` control, `swarm-process` ownership | Registry, spawn/restart and child lifecycle |
+| `swarm-bus`, including through `swarm-scripts` | `swarm-contracts` event/selector contract | Dispatcher/wake loop; Store retains durable event/Operation transaction |
+| `swarm-script-worker` | `swarm-scripts` plan/wire/start decisions, `swarm-process` primitives | Child execution/capture; remove the host compatibility entrypoint |
+| `swarm-checks` | `swarm-contracts` plan/result, `swarm-process` capture | Check execution |
+| `swarm-automation` | Shared config/ready facts and process ownership | The single selected scheduler loop |
+| `swarm-observer` | `swarm-telemetry` producer/config and shared process facts | Recorder, metrics and observer worker |
+
+Move a used seam with both callers and remove its dependency edge. Do not add empty
+wrapper crates, copy workers into the host or claim test relocation as code reduction.
 
 ## 5. Compatibility, journals and donor completion
 
-Apply the [schema and identity rules](architecture.md#schema-and-identity-boundaries)
-at the owning DTO. Optional projection metadata must not break readback; fields
-that change authority, required capabilities or an existing digest format need
-the corresponding versioned contract. Preserve raw TaskPrompt/artifact bytes and
-use current canonical helpers for the contracts they own. No global SHA/serde/JCS
-rewrite is needed to deliver V3.
+[Donor reuse](donor-map.md) replaces a needed mechanism; it is not a checklist to
+add every library/product. Current rmcp/ACP/croner/Atlas integrations remain useful.
+Cargo already exposes targets and dependency metadata; an installer need not parse
+Cargo.lock or certify the text of a private function. Waku's sequential OpenCode
+worker and Paseo's initialization/close barrier are narrow patterns, not extra
+workflow engines to import.
 
-A common journal state engine is not justified by the current formats: Claude and
-OpenCode have different JSONL reducers; Command uses immutable per-Operation files;
-Muse uses a checkpoint; Codex uses sequenced snapshots and checksum files.
-[`swarm-process::scan_jsonl`](../../crates/swarm-process/src/jsonl.rs) and
-[private durable-file helpers](../../crates/swarm-process/src/permissions.rs)
-already own shared mechanics. A bounded append helper with Claude and OpenCode
-as real consumers is a possible later deletion; keep each adapter's record,
-ACK, torn-tail and retention semantics. It is not a prerequisite for results.
+Keep the selected adapter's actual command/result persistence with that adapter.
+`swarm-process` already supplies JSONL and private durable-file mechanics. Different
+journal formats do not justify a universal event-sourcing framework, nor indefinite
+maintenance of obsolete formats. Muse SDK `Connection` accepts caller-supplied IDs;
+the current Node bridge already passes `maxAttempts:1`. Compare that reuse against
+Rust-owned transport before adding a new bridge; the SDK's higher-level `Session`
+has its own recovery/replay coordinator. See the inspected [SDK boundary](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries).
 
-For octocrab, preserve the existing host/account/credential selection and the
-4 MiB pre-materialization response limit. Disable implicit write retries in the
-selected SDK and lower transport; uncertain effects reconcile through existing
-Store paths. Keep ELIOT authorization, selected-source, watermark and publication
-semantics outside the SDK ([audited migration boundary](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/153#issuecomment-6169520482)).
-For tracing, preserve record/byte limits, cross-chunk redaction and independent
-sink failure handling; the appender's line limit is not an aggregate-byte budget.
-For CCCC, integrate its complete suspended-child primitive; its reviewed crate
-does not implement ELIOT's full Job/family policy. Preserve owner-first non-killing
-observation and separate bounded-check termination semantics.
+GitHub API replacement remains a small optional candidate: existing `run_gh_api`
+is about 104 lines, not a large HTTP stack. Any octocrab backend keeps current
+account/host selection, response bounds and one uncertain-write readback owner.
 
 ## 6. Completion and verification
 
-A source candidate delivers its producer, handler, registration/projection and
-consumer together, removes the replaced path, and updates the existing contract
-and status entry. Each manager integrates before one scoped format/minimal strict
-Clippy pass with actual reverse dependencies and an external shared Cargo target.
-Documentation-only candidates run the documentation gate. Subagents run no Cargo.
-
-Tests, process/native exercises, load measurements and full product qualification
-follow completed source. Retain their exact source/platform/scope when that phase
-runs. Source work does not wait for paid inference, optional services, all-adapter
-parity or a new audit campaign. Do not repeat unchanged failing qualification or
-add a large verification document per attempt. Current productive/native gaps
-remain visible without being prerequisites for unrelated implementation.
+An implementation removes a named mechanism with its obsolete callers/config/tests
+and updates its owning contract. Report actual net changes across all owned languages;
+compare behavior, not line-count targets alone. Verify the affected behavior and
+actual dependency boundary using existing scoped checks. A runtime change needs
+appropriate source/runtime evidence; a documentation study needs content/link checks
+and no Rust build, toolchain work or native/model campaign. Keep one integrated diff
+and one work queue; do not turn every historical failure into another release gate.

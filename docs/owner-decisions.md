@@ -3,11 +3,11 @@
 
 **Edition:** 1 — 2026-10-02  
 **Repository baseline:** `0ff7129d11a15a71a94e1ed2c265f7a3eeb0e1db`  
-**Status:** accepted owner policy and implementation decisions. A decision does not claim that its product code or live qualification already exists.
+**Status:** historical decisions for the recorded baseline. Current refactoring uses [Task policy](task-policy.md) and [AGENTS.md](../AGENTS.md); the edition text below remains evidence consumed by existing code, not cumulative instructions for new development.
 
 ## 0. Authority
 
-This document resolves the explicit owner-decision issues opened by the Documentation Program. It is subordinate to the product architecture and module contract on runtime invariants, and preserves the frozen v1 owner-policy section below. The accepted edition identifiers for new Attempts are listed in [Task policy](task-policy.md); v2 is separately frozen in [owner-policy-v2.md](owner-policy-v2.md).
+This document records the former Documentation Program decisions. The v1 section below is still referenced by current source. The [current target](agent-operations/refactoring.md) removes document identity as a permission mechanism and uses a finite transition for needed old work; it does not require maintaining this historical workflow.
 
 Older field briefs and incident logs remain evidence. They do not override this edition by date, file mtime, branch name or generated TASK text.
 

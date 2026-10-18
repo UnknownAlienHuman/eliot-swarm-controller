@@ -1,7 +1,7 @@
 # Owner policy v2 — scoped manager review disposition
 
 **Edition:** 2 — 2026-10-03
-**Status:** accepted owner policy for explicitly selected new Attempts.
+**Status:** historical edition still recognized by current source. The [current Task policy target](task-policy.md) removes document-edition permission gates after a finite transition; the recorded section below does not prescribe a permanent workflow.
 
 ## Owner policy v2 — scoped manager review disposition
 

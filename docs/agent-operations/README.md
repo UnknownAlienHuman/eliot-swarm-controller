@@ -1,11 +1,12 @@
 # Agent Operations — Manager-Owned Automation (Architecture v3)
 
-Revision 13 · 2026-10-17 · Canonical Version 3 specification.
+Revision 14 · 2026-10-18 · Compact V3 refactoring target.
 
 V3 is the required target for ongoing development. [Current source and evidence](../implementation-status.md)
 remain separately scoped. Start source work with [AGENTS.md](../../AGENTS.md) and the
 [refactoring map](refactoring.md), then read the contract for the assigned boundary.
-The map contains the near-term queue; this index does not create another backlog.
+The map owns the reduction order and supersedes cumulative O/M/C/I work lists.
+Historical specifications do not require completing or retaining every old subsystem.
 
 ## Product rule
 
@@ -14,6 +15,11 @@ own behalf. Manual and automatic callers use the same authorization, reservation
 Operation and result path. Enabling one helper does not enable other delivery steps.
 There is no global operating mode, second activation registry or additional Root
 approval for actions already permitted to that manager.
+
+The required core is assignment, agent execution, attributable result, independent
+review, acceptance, observation and selected Goal continuation. [Addressed messages](../agent-communication-program.md)
+support that work. Separate Concilium, interface-ratification/ACK and automatic
+publication/Issue-label engines are removal candidates outside core completion.
 
 ## Required outcomes
 
@@ -44,7 +50,7 @@ approval for actions already permitted to that manager.
 | [Donor map](donor-map.md) | Inspected donor behavior, actual integrations and replacement limits. |
 | [Module installation](module-installation.md) | Build, package, register and select current artifacts. |
 | [Observability](observability.md) | Diagnostic depth, redaction, storage bounds and live projections. |
-| [Implementation](implementation.md) | O1–O11 scope and final acceptance scenarios. |
+| [Implementation](implementation.md) | Core and optional capabilities, with relevant completion scenarios. |
 | [Implementation status](../implementation-status.md) | Revision-specific implementation and qualification evidence. |
 
 ## Boundaries retained
@@ -55,8 +61,10 @@ it must not introduce another Eliot lifecycle or replay owner. Choose compatible
 maintained software; exact local artifact verification and retained identity bytes
 remain separate from future protocol compatibility.
 
-V18, the module contract and accepted policy editions retain unaffected invariants.
-Do not infer new caller rights from a tool schema or rewrite frozen Attempts.
+Preserve actual caller/assignment/result identity; document editions do not grant
+rights. Support one current executor/format. Required old data follows the
+[finite transition](refactoring.md#retire-executors-without-losing-history), then the
+old path is removed. Do not silently rewrite a recorded Attempt or its evidence.
 Private endpoints, credentials and paths stay local; public projections expose
 only authorized, redacted data. Historical audits and run logs are evidence at their
 recorded revisions, not additional agent instructions.

@@ -5,7 +5,7 @@
 ### Historical C7/C8 status snapshot
 **Revision:** 12 — 2026-10-05
 **Integration review:** published C5 snapshot `a0a931e` and [Agent Operations PR #23](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/23).
-**Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
+**Historical C7/C8 CI:** Exact runs and source commits are recorded in the [historical status](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs/implementation-status.md).
 
 All local model/inference execution remains deferred by owner. C10 provider authentication uses an explicit credential reference; `stored_unverified` is metadata only, not proof of key validity or consumption. Current native evidence is maintained in [Implementation Status](implementation-status.md).
 

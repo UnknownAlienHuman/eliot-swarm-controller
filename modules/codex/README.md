@@ -1,177 +1,60 @@
-# Codex app-server bridge
+# Codex app-server integration
 
-This module directory documents the passive observer and two separately
-versioned controller artifacts over an operator-owned Codex app-server. The
-legacy Python controller is artifact `codex-sdk-18194bf-bridge.3`; the
-standalone Rust controller is artifact `codex-rust-controller.1`, current
-descriptor version `11.4`, sourced from `crates/swarm-adapter-codex`. Both attach
-to the existing app-server and never start or stop it. Their result contracts
-are documented separately below.
+The current executor is the [Rust Codex adapter](../../crates/swarm-adapter-codex/src/lib.rs),
+identified by [its descriptor](../../crates/swarm-adapter-codex/module-descriptor.template.json)
+as `codex-rust-controller.1`, version `11.4`. It attaches to an existing native
+app-server. Provider authentication, configuration and the native model loop
+remain with Codex; the adapter owns its connection and controller Operations.
 
-## Setup
+Use the [module installation guide](../../docs/agent-operations/module-installation.md)
+for configuration and registration. This directory's Python bridge and vendored
+SDK are retired implementation material; they are not dependencies of the Rust
+adapter. New bindings to `codex-sdk-18194bf-bridge.3` are rejected by
+[`require_new_binding`](../../crates/swarm-kernel-host/src/store/task_prompt.rs).
 
-The Python setup below is historical donor tooling, not required by the current Rust controller. The Rust route attaches to an already configured native app-server; each omitted model/provider selector uses that harness's default. The current candidate retains v11's native defaults and the acknowledged opening proof. Older bindings and receipts retain their original identity and installed bytes.
+## Current behavior
 
-Create a module-local Python environment and install only the pinned
-requirements:
+| Boundary | Rust owner behavior |
+| --- | --- |
+| Connection | Attach to the configured app-server; do not start or stop that shared service. Reconnection does not replay input or resume a thread implicitly. |
+| Native defaults | `workspaceRoot` is the admitted absolute workspace. Omitted `modelProvider` and `model` use native defaults; supplied values must match native readback. Observed values do not become requested route settings. |
+| Input | `task.dispatch` consumes the Store-produced TaskPrompt. Dispatch/send record intent before native input, correlate `clientUserMessageId` with the Operation and read back the native user item and turn. Steering addresses the active turn. |
+| Result | Read the final assistant response from the exact completed root turn. Preserve its input/turn/item association and explicit missing-result diagnostics. Child-history/tool projection from the old Python bridge is outside this Rust result path. |
+| Shutdown | `agent.shutdown` releases the adapter connection and drains saved outcomes. It does not terminate the external app-server or declare Task acceptance. |
 
-```powershell
-cd modules/codex
-py -3 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe verify_vendor.py
-```
-
-Copy `module.example.json` outside the repository and set `endpoint`,
-`hostEndpoint`, and `credentialFile`. The referenced app-server is already
-running and remains operator-owned. `tokenEnv`, when set, names an environment
-variable containing its WebSocket bearer token; the token is never stored in
-the config file or logged. The host injects `ELIOT_SWARM_MODULE_STATE` and
-`ELIOT_SWARM_MODULE_OWNER` for the controller's private operation checkpoint.
-
-The setup and observer commands in this section belong to the legacy Python
-bridge artifact `.3`. The standalone Rust artifact `.1`, current descriptor
-version `11.4`, uses its own package and descriptor under
-`crates/swarm-adapter-codex`; it does not use
-this module-local Python environment or `vendor_bridge`.
-
-## Observer CLI
-
-```powershell
-.venv\Scripts\python.exe bridge.py --config C:\SwarmState\codex-module.json describe
-.venv\Scripts\python.exe bridge.py --config C:\SwarmState\codex-module.json open --thread <native-thread-id>
-.venv\Scripts\python.exe bridge.py --config C:\SwarmState\codex-module.json snapshot --limit 20
-```
-
-The observer attaches passively. Its client allowlist permits only
-`initialize`, `initialized`, `thread/read`, and `thread/list`.
-
-## Legacy Python registered controller (`codex-sdk-18194bf-bridge.3`)
-
-The operator launches the bridge through the managed module owner. Use the
-absolute paths of the pinned module-local Python interpreter and bridge:
-
-```powershell
-swarm module-run --state-dir C:\SwarmState\codex-owner --command ABSOLUTE_PYTHON_PATH -- ABSOLUTE_BRIDGE_PATH --config C:\SwarmState\codex-module.json module
-```
-
-The route must select `runtime = "codex"`, artifact
-`codex-sdk-18194bf-bridge.3`, and explicit `native_options.modelProvider`,
-`native_options.model`, and absolute `native_options.workspaceRoot`. Model
-configuration and effort changes are unavailable; the controller never
-silently chooses a model. `agent.open` records the requested route separately
-from the model/provider returned by native `thread/start`. Served model and
-billing remain `unknown` unless native evidence says otherwise.
-
-`task.dispatch` and `agent.send` record the operation identity before issuing
-`turn/start` or `turn/steer`. They use the operation ID as
-`clientUserMessageId` and confirm the unique native user item, its content
-digest, its actual item ID, and associated turn ID from history. A lost
-turn-input acknowledgment is reconciled by reading history; the input is never replayed.
-Steering requires the exact active turn ID. Resume is explicit through
-`agent.recover`; reconnecting the WebSocket alone does not resume a thread.
-
-The legacy `.3` controller enumerates native child threads through explicit
-`parentThreadId` links from
-paginated `thread/list` responses. Pagination does not provide an atomic
-family snapshot, so observations always report family completeness as
-`partial`; auxiliary-provider affinity is unavailable. A bounded lifecycle
-event window records native thread, turn, and item IDs/statuses observed on
-the current connection, without treating notifications as complete history.
-
-The legacy `.3` `agent.result` can publish bounded pages of native history for
-one exact prior input operation. It revalidates the acknowledged user item and
-completed native turn. For direct-child results, it requires both the child
-parent link and its activity item in the exact parent turn. The result
-projection keeps native item IDs and allowlisted tool call names, arguments,
-and results while omitting reasoning. Root and child thread-configured
-provider/model fields are reported separately; per-turn served inference and
-billing remain `unknown`.
-Pages in the legacy `.3` controller are capped at 64 KiB. This reports an
-allowlisted projection of observed native history only; it does not claim
-complete family coverage or execute tools.
-
-## Standalone Rust controller (`codex-rust-controller.1`, current descriptor version `11.4`)
-
-The standalone Rust adapter is a separate registered artifact from the legacy
-Python bridge. Its route uses `runtime = "codex"` and the exact artifact
-`codex-rust-controller.1`; its descriptor is
-`crates/swarm-adapter-codex/module-descriptor.template.json`. The current
-v11.4 descriptor retains v11's normalized dispatch/result schema pair,
-TaskPrompt v1 and Goal continuation admission/terminal evidence schemas.
-The route contract requires
-`workspace_option = "workspaceRoot"` and absolute `workspaceRoot`.
-For current v11.4 bindings, `modelProvider` and `model` are independently optional
-`thread/start` overrides. Omit either field to use its installed harness default;
-each supplied field must match native readback. The pinned native
-`ThreadStartParams` permits independent omission
-(`model: str | None = None`, `modelProvider: str | None = None`);
-per-turn `model` is likewise omitted when no override was requested. The
-adapter never infers a provider from a model string, never reconfigures the
-provider, and never substitutes a proxy/delegation model ID. `agent.open`
-records each requested selector (null when omitted) separately from the
-effective pair from native `thread/read` readback; served model and billing
-remain `unknown` unless native evidence says otherwise. The result selector remains:
+The result selector is:
 
 ```json
-{"kind":"codex_assistant_result","input_operation_id":"<exact task.dispatch operation ID>"}
+{"kind":"codex_assistant_result","input_operation_id":"<task.dispatch operation ID>"}
 ```
 
-The v8 result path retains the v4 boundary: one root-thread final assistant
-response. It checks the Store-sealed target dispatch and producer, finds the
-unique native user item for that exact dispatch, reads the exact root turn,
-requires completed status without an error, and selects the final assistant
-response from that turn. It reports `execution_complete = false`,
-`task_completion = "unknown"`, and `native_replay = false`; it does not claim
-Task completion or acceptance.
+Current source caps one result page at 24 KiB and the complete response at 4 MiB.
+The Store's larger artifact envelope does not increase those adapter limits.
+`thread/start` has no caller-selected correlation ID: a lost creation ACK leaves
+the opening outcome unknown, so the controller must not create another thread
+to guess the result. Native approvals are refused according to their request
+schema; unsupported commands remain unavailable.
 
-The verified native turn ID is retained on the exact parent `task.dispatch`
-Operation and is used for readback validation. The normalized page source
-retains the response item identity and the sealed parent Operation identity;
-it does not fabricate a separate self-contained turn ID. The v8 adapter accepts
-at most 24 KiB per page and 4 MiB for the complete response. The shared Store
-artifact envelope is 64 KiB, but that larger envelope is not the v8 adapter's
-accepted page limit.
+## Retired Python path
 
-The current v8 adapter does not enumerate child threads, verify `parentThreadId` or
-`subAgentActivity`, or project child history and allowlisted tool items. The
-legacy `.3` child/history/tool projection above remains available only through
-that legacy artifact. No v8 selector or descriptor row requires child ancestry;
-v8 must return an unsupported or unavailable result rather than infer child
-causality from session, cwd, turn order, or family enumeration.
+The Python controller, passive observer, fixture suite and SDK vendor tree remain
+in source, and the existing Justfile/CI still exercise them. Their presence does
+not establish a supported second executor or a requirement to install Python for
+Codex integration. Historical source details are recorded in [UPDATE.md](UPDATE.md)
+and Git history.
 
-The current descriptor also declares `agent.shutdown` with only
-`owned_scope = "external_attach"`. It releases the adapter-owned connection,
-retains intent and uncertain effects, and drains saved outcomes through Store
-ACKs without native input replay. Selected intent recovery checks the retained
-native scope before any journal mutation. It never stops the shared app-server
-or claims Task/family completion. See the [scope contract](../../docs/agent_swarm.module-contract-v2.md).
+The [executor retirement plan](../../docs/agent-operations/refactoring.md#retire-executors-without-losing-history)
+removes this old execution/package/CI path. If concrete saved work needs it,
+finish or reconcile that work once and export the required results; archive
+completed records without keeping the old controller in the normal runtime.
+The small [host receipt decoder](../../crates/swarm-kernel-host/src/runtime/codex.rs)
+is a separate current source dependency, not a reason to retain the whole Python
+SDK. Remove its special cases with the relevant data transition.
 
-`thread/start` has no caller-selected correlation ID. A lost creation
-acknowledgment therefore leaves `agent.open` unknown and reserves that opening;
-the bridge cannot safely find a replacement thread or repeat creation. Native
-readiness is the last recorded observation until a subsequent successful read
-re-establishes it after a socket disconnect.
+## Verification
 
-Neither controller artifact implements dynamic tools, file/command execution,
-goal controls, artifacts, or background work. App-server approval requests are
-answered with their schema's explicit deny/refuse form; a request the bridge
-does not recognize fails closed and does not receive an empty success object.
-Unsupported features are reported unavailable, not simulated.
-
-## Fixture verification
-
-The scripted peer fixtures validate the legacy `.3` bridge's pinned SDK
-JSON-RPC request and response models; they are synthetic and do not establish
-live provider availability or model service identity. A focused controller check
-is:
-
-```powershell
-.venv\Scripts\python.exe -m unittest test_bridge.BridgeFixtureTests.test_controller_exact_model_and_dual_native_identity_readback test_bridge.BridgeFixtureTests.test_server_requests_get_schema_shaped_non_granting_replies -v
-```
-
-The vendored `openai/codex/sdk/python` source and generated models retain the
-pinned upstream bytes. The dev/test generator pin and lockfile carry the
-[documented security update](VENDOR-SECURITY-PATCHES.md) to `0.81.0`.
-`SHA256SUMS` verifies the complete unit with that delta. All transport and
-controller adaptation is ELIOT-owned code outside `vendor_bridge/`.
+Follow the [project's scoped checks](../../docs/ci-scoped-builds.md) for the
+changed Rust boundary. Existing adapter fixtures exercise protocol and result
+behavior; native service coverage belongs to the recorded scope in
+[implementation status](../../docs/implementation-status.md). Documentation
+changes do not require a Python environment, adapter build or model run.

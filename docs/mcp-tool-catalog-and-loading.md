@@ -6,8 +6,8 @@
 ### Historical C7/C8 catalog qualification snapshot
 **Revision:** 12 — 2026-10-05
 **Source baseline:** C10 `cea63dde1d923f821c436c61f2561bcfb6a4bb0d`; prior C9 CI baseline `2e609ecf7d826da7019fe5e5f2ed397a992bc45a`.
-**Applies to:** [Communication Program](agent-communication-program.md), [Fleet-Scale Freedom](agent-communication-fleet-scale-freedom.md), [MCP Profiles](mcp-profiles.md)
-**Historical C7/C8 CI:** Exact runs and source commits are recorded in [Implementation Status](implementation-status.md).
+**Applies to:** [Communication Program](agent-communication-program.md), [MCP Profiles](mcp-profiles.md)
+**Historical C7/C8 CI:** Exact runs and source commits are recorded in the [historical status](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs/implementation-status.md).
 All local model/inference remains deferred by owner. C10 credential state `stored_unverified` is metadata only, not proof of key validity or consumption. Current native and gate evidence is tracked in [Implementation Status](implementation-status.md).
 
 **Precedence:** this file governs MCP grouping, eager/deferred loading, catalog metadata and launcher-facing tool UX. Existing application authorization and Task/Attempt authority remain unchanged.

@@ -132,7 +132,7 @@ Local audit aggregation works without enabled automation. Labels, acceptance and
 
 ## 7. Return and repair
 
-Current `task.request_changes` uses GM/operator authority and stores mail, not native input. Add scoped Manager feedback in that existing guarded path only for new Attempts whose TaskSpec explicitly selects [owner-policy-v2](../owner-policy-v2.md); v1 Attempts, existing rights and retained evidence stay frozen. Do not give auditors GM credentials or treat an MCP tool annotation as permission.
+`task.request_changes` records manager disposition and mail; it does not itself deliver native input. The target authorizes the current scoped Manager/GM/Operator through ordinary assignment and candidate checks. Remove the document-edition gate in `policy.rs` and historical acceptance branches through the [finite transition](refactoring.md#retire-executors-without-losing-history). Do not give auditors manager credentials or rewrite old evidence to grant new rights.
 
 The auditor calls `review.submit`. The manager or selected `review_disposition` applies relevant findings. Only explicit owner input or selected `repair_dispatch` starts correction. Feedback admission alone is not proof the correction reached the model; retain exact delivery/readback and retry semantics.
 
@@ -142,7 +142,7 @@ A configured fallback/reassignment requires prior native family and workspace di
 
 ## 8. Acceptance, upload and publication
 
-Selecting/omitting acceptance and publication steps expresses the manager's choices; no extra manager-gate mode. Publication can be automatic after manual acceptance, or accepted work can wait for a manual push. Both use the same exact-candidate, current rights, GM/epoch and repository policy checks.
+The compact core ends at accepted local work. Publication is an explicit optional command through the existing Forge/GitHub path, with exact-candidate and current rights checks. Automatic publication and Issue-label projection are outside required core completion; their separate automation engines are [removal candidates](refactoring.md#code-reduction-candidates).
 
 A local audit requires no first push. When remote CI is selected, `forge.upload_candidate` performs an explicitly permitted pre-review upload into its configured review namespace. It is not accepted publication and cannot write protected output refs, close Issues or bypass checks. Later CI output is evidence, not auto-merge authority by itself.
 
@@ -162,7 +162,7 @@ External GitHub author is the authenticated App/user. Internal on-behalf attribu
 
 ### Projection writes
 
-Only configured manager commands/automation write managed labels, commit-specific Checks, summaries and annotations. Preserve unrelated labels/comments. Use exact head SHA, retained remote IDs and batch/readback identity. `external_id` is correlation, not an exactly-once guarantee; annotation updates can append.
+When this optional integration is selected, explicit manager commands or project CI write managed labels, commit-specific Checks, summaries and annotations. Preserve unrelated labels/comments. Use exact head SHA, retained remote IDs and batch/readback identity. `external_id` is correlation, not an exactly-once guarantee; annotation updates can append.
 
 Map only complete positive evidence to success. Neutral/skipped GitHub conclusions are not a passed ELIOT audit. Stale labels cannot authorize a new candidate. Code audit alone cannot close an Issue; closure needs its explicit completion policy/action.
 
@@ -190,4 +190,4 @@ Record already-issued outcomes regardless of enabled state. Further bookkeeping,
 
 Only after its candidate and conflicting native family/continuation are settled may the manager prepare the next Task in the same worktree. No age-based cleanup or branch disappearance removes pending submissions. Writers' useful output must be integrated into the candidate or explicitly retained/dispositioned, not silently abandoned.
 
-A correct first product path is one local manager -> writer -> applied submission -> assigned auditor -> actionable return -> repaired submission -> pass -> authorized acceptance/publication. Every arrow has an actual producer, handler and result reader. Remote GitHub, scripts, cron and larger fleets are additional adapters/triggers, not prerequisites for this path.
+A correct first product path is one local manager -> writer -> applied submission -> assigned auditor -> actionable return -> repaired submission -> pass -> authorized acceptance. Publication is a separate explicit action. Every arrow has an actual producer, handler and result reader. Remote GitHub, scripts, cron and larger fleets are additional adapters/triggers, not prerequisites for this path.

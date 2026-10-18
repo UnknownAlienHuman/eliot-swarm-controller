@@ -1,6 +1,8 @@
 # Module API contracts
 
-This page documents bounded, existing Store contracts. A manual effect call,
+This page documents bounded Store contracts. The [reduction program](refactoring.md)
+selects core scope; optional historical API sections below do not require retaining
+their separate automation engines. Current calls may remain until their source cutover. A manual effect call,
 script grant, hook source or Goal record does not itself enable a background
 action. Automation remains manager-owned and must select an enabled entry and
 its typed step; see [automation configuration](configuration.md).
@@ -8,7 +10,7 @@ its typed step; see [automation configuration](configuration.md).
 ## M1: ordinary Manager Task planning
 
 `task.create` and `task.revise` are local planning methods for an authenticated
-Manager or the pinned local Operator. A current GM already has the ordinary
+Manager or the configured local Operator. A current GM already has the ordinary
 Manager role for creation and owner-scoped revision, so those calls do not
 require the Operator credential or a separate GM gate. The narrow foreign-live
 Attempt case below still requires current GM authority. The existing Manager

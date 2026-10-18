@@ -1,6 +1,6 @@
 # Donor Map — Rust Operations and Manager-Owned Automation
 
-Revision 9 · V3 source/target reconciliation 2026-10-17. Waku, Paseo loading, CCCC suspended-child and Muse SDK source were rechecked at recorded commits; Schemars documentation was inspected at 1.2.2. Other observations retain their dates.
+Revision 10 · Reduction review 2026-10-18. Waku, Paseo loading and Muse Connection/Session were rechecked at the recorded commits; Cargo metadata documentation was checked. Other observations retain their dates.
 
 `CODE` means an inspected source behavior; `DOC` means official/library documentation; `OWNER_AUDIT` means supplied operating evidence; `DESIGN` means an ELIOT proposal. Earlier inspections are not new live qualification. Commit/blob identities locate evidence, not required installed versions.
 
@@ -15,15 +15,15 @@ The operations program now also includes [Modular Runtime](modularity.md) and [O
 Earlier ELIOT inspection used `504199d14135c030ad3951a3c5023a098a3d03f0`.
 Use the [current refactoring map](refactoring.md) for the recheck at `f1b854b6`,
 including completed audit fixes, actual dependency use and current call sites.
-The [architecture](architecture.md), [delivery contract](delivery.md) and frozen
-[owner policies](../owner-decisions.md) own the product rules; source observations
-here neither grant rights nor transfer historical qualification to new artifacts.
+The [architecture](architecture.md), [delivery contract](delivery.md) and
+[reduction program](refactoring.md) own the current target. Earlier owner-policy
+editions record decisions; their document hashes are not future runtime rights.
 
-## 3. Mandatory Rust Crate Donors (No Handwritten Reinvention)
+## 3. Library reuse at a required boundary
 
-V3 requires direct donor use at the matching subsystem boundary. This table is a migration target: several named crates are not yet in Cargo dependencies, and `vendor/cccc-windows-process` does not yet exist. See the [current integration snapshot](refactoring.md#3-current-gaps-against-v3). Use each library for its actual API; ELIOT still owns the listed application semantics.
+Use a library when its actual API replaces a needed owned mechanism. This table is a boundary map, not an obligation to implement every listed subsystem. Several crates are not direct dependencies, and `vendor/cccc-windows-process` does not exist. Keep current rmcp/ACP/croner/Atlas integrations; select further replacements by the concrete caller and net code removed. A library name in a document or lockfile is not integration, and adding a wrapper to satisfy the table is not progress.
 
-| Component | Maintained source | Mandatory use in ELIOT | ELIOT remains responsible for | Forbidden anti-pattern |
+| Component | Maintained source | Mechanism supplied | ELIOT responsibility | Reinvention to remove |
 |---|---|---|---|---|
 | `rmcp` | [API](https://docs.rs/rmcp/latest/rmcp/) | Actual MCP server/client transport and tool/resource routing. | Role/profile filtering, scoped credentials, Store admission and bounded I/O. The existing non-MCP `ModuleLink` protocol remains its own contract. | Reimplementing MCP framing or routing beside rmcp. |
 | `agent-client-protocol` | [API](https://docs.rs/agent-client-protocol/latest/agent_client_protocol/) | Native ACP wire protocol, session/turn envelopes and content blocks for ACP adapters. | Binding generation, digest verification and Store receipt mapping. Zed eval-cli stays a sessionless CLI adapter unless its selected native protocol changes. | Ad-hoc parsing of an actual ACP protocol beside the crate. |
@@ -33,8 +33,8 @@ V3 requires direct donor use at the matching subsystem boundary. This table is a
 | `notify` | [API](https://docs.rs/notify/latest/notify/) | Event-driven filesystem and parent-directory atomic-save observation (`config`, workspace hints). | Exact readback, revision validation and source-health gaps. | Busy-waiting `sleep` loops polling file `mtime`. |
 | `tracing`, `tracing-subscriber`, `tracing-appender` | [`reload`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/reload/), [`non_blocking`](https://docs.rs/tracing-appender/latest/tracing_appender/non_blocking/) | Structured spans/events, dynamic `reload` filter swaps without restart, and bounded `non_blocking` writer (`swarm-telemetry`, `swarm-observer`). | Byte-budget accounting, `atlas-redact` scrubbing prior to sink write, and scope expiry. | Custom logging frameworks or duplicate handmade ring queues. |
 | `atlas-redact` | `vendor/atlas` (`crates/atlas-redact`) | Deterministic secret/token/credential redaction across streaming chunks and diagnostic records before disk or IPC fanout. | Calling the redactor on every stream chunk and log line before persistence. | Regex-per-call ad-hoc secret stripping or unredacted diagnostic capture. |
-| `cccc-windows-process` | [Pinned complete crate](https://github.com/ChesterRa/cccc/tree/c270e276591879c6edb7d08af67bec7035585c7e/crates/cccc-windows-process) | Suspended-child creation, owned primary-thread handle, resume and cleanup-on-failed-bootstrap, integrated through `swarm-process`. | Job creation/assignment and family policy are outside this small crate. Preserve owner-first non-killing observation for active agent families and separate bounded-check termination. | Copying its suspended-launch mechanism; assuming the donor supplies the full Job/family subsystem. |
-| `tokio` / `rusqlite` / `serde` | Project manifest and library documentation. | Async runtime, WAL relational storage (1 writer + pooled read-only connections), and typed serialization. | Relational schema design, forward-compatible internal readers, and single Store authority. | Storing collections as JSON blobs in `meta` or serializing all reads through the single writer thread. |
+| `cccc-windows-process` | [Inspected complete crate](https://github.com/ChesterRa/cccc/tree/c270e276591879c6edb7d08af67bec7035585c7e/crates/cccc-windows-process) | Suspended-child creation, owned primary-thread handle, resume and cleanup-on-failed-bootstrap, integrated through `swarm-process`. | Job creation/assignment and family policy are outside this small crate. Preserve owner-first non-killing observation for active agent families and separate bounded-check termination. | Copying its suspended-launch mechanism; assuming the donor supplies the full Job/family subsystem. |
+| `tokio` / `rusqlite` / `serde` | Project manifest and library documentation. | Async runtime, WAL relational storage (1 writer + pooled read-only connections), and typed serialization. | Current domain schema, authorized snapshots and single Store authority. | Storing collections as JSON blobs in `meta` or serializing all reads through the single writer thread. |
 
 No old release, fixed CLI/model equality or callback-time package installation is prescribed. Ordinary compatible requirements and recorded build resolution are not a policy freezing future software. [Cargo's dependency documentation](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html) distinguishes dependency requirements from a particular resolved build.
 
@@ -78,9 +78,9 @@ Keep hard server/application authorization and small role surfaces with deferred
 
 ## 8. Architectural donor patterns
 
-The [donor inventory](../agent_swarm.donors-20260929.toml) distinguishes complete libraries from pattern-only sources and records exact revisions, licenses and exclusions. V3 requires the mechanisms below, while an upstream pattern does not by itself implement ELIOT Operation correlation, durability or authorization. Keep pattern-only sources as patterns and integrate complete libraries where the table above names a library boundary:
+The [donor inventory](../agent_swarm.donors-20260929.toml) records inspected libraries, patterns and source revisions. Select a pattern only for a retained responsibility; it does not implement ELIOT correlation, durability or authorization. Do not import another product to reproduce its architecture:
 
-| Donor | Inspected unit | Mechanism to adopt in ELIOT | Anti-sabotage rule |
+| Donor | Inspected unit | Useful mechanism | Boundary |
 |---|---|---|---|
 | **Waku** | [`crates/waku-core/src/driver/opencode.rs` at 10bcd728](https://github.com/egoist/waku/blob/10bcd728c9b2f07d664cfece3c8c870d3418ddd2/crates/waku-core/src/driver/opencode.rs) | One sequential command/event worker; `session.execution.*` settles an open turn once. ELIOT adds the [admitted-Operation window](architecture.md#41-deterministic-turn-scoped-result-correlation-agentresult) and retains its body. | Missing parent pointers alone do not reject an attributable result. Keep the inventory exclusions; upstream settlement is not ELIOT input-correlation proof. |
 | **Paseo** | [`agent-loading.ts` at b4af508e](https://github.com/getpaseo/paseo/blob/b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7/packages/server/src/server/agent/agent-loading.ts); earlier timeline units remain in the inventory. | `pendingAgentInitializations` coalesces initialization, and `waitForAgentClose` separates closing from new initialization. | Reuse the single-flight/lifecycle pattern; it is not evidence of ELIOT result attribution or durable completion. |
@@ -125,7 +125,8 @@ build a new wrapper solely to move Rust lines elsewhere.
 Accept installed runtimes by documented protocol/capability compatibility.
 Selected local artifact digests and historical request/checkpoint bytes remain
 exact. Source refactoring does not wait for all-runtime native qualification;
-retire old executors separately from their historical decoders.
+use a [finite transition](refactoring.md#retire-executors-without-losing-history)
+for actual required data, then remove the old executor and readers.
 
 GitHub references:
 
@@ -144,6 +145,28 @@ and cleanup commands are not current defaults. The active [configuration](config
 contracts own the resulting rules; do not copy incident tables into agent tasks.
 
 ## 11. Donor integration discipline
+
+**Source recheck, 2026-10-18:** [Cargo metadata](https://doc.rust-lang.org/cargo/commands/cargo-metadata.html)
+already exposes package targets and the resolved graph as machine-readable data.
+Use it when package tooling needs those facts; remove the duplicate coordinate
+allowlist and private-source regex machinery. Keep files required by a selected
+adapter as ordinary package contents: the current policy file also lists the
+Antigravity Node bridge resources. Removing a policy must not omit that used bridge.
+Cargo lock resolution is a build input, not a requirement that two communicating
+processes have identical checkouts, compilers or cache directories.
+
+The inspected Waku driver has one sequential command/event worker and one turn
+settlement function. Paseo's 153-line loading unit coalesces initialization and
+waits for close. These narrow patterns support one owner with fewer competing
+paths; copying either entire orchestrator would add unrelated behavior.
+
+Muse `Connection.command` defaults to up to three attempts, only for its explicit
+`overloaded`/`backpressured` no-admission errors. The existing
+[Node bridge](../../modules/muse/bridge.mjs) already supplies `commandId` and
+`maxAttempts:1`; do not invent a missing retry-control wrapper. Its high-level
+`Session` additionally owns recovery/replay. Compare the existing lower-level
+reuse and required result/ownership consumers before choosing between the two
+Muse implementations. Source commit observations do not certify an npm artifact.
 
 A dependency is integrated when a real caller uses it and its replaced mechanism
 is removed. Pattern-only donors do not justify importing another workflow engine.

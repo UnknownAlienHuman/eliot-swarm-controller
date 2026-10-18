@@ -1,28 +1,20 @@
-# ELIOT Agent Communication — Peer Autonomy Source Map
+# Agent communication — recorded peer-autonomy sources
 
-**Revision:** 1 — 2026-10-03  
-**Repository baseline:** `3ecdf52707731e3f85e85827a88fbdb28d784f3e`  
-**Normative consumers:** [Peer Autonomy](agent-communication-peer-autonomy.md), [Peer Autonomy Implementation](agent-communication-peer-autonomy-implementation.md)  
-**Status:** research evidence. Source behavior and reports do not become ELIOT capability until implemented and qualified.
+**Research date:** 2026-10-03. This file retains the original source/document/report
+observations; the sources were not revalidated during this documentation edit.
+Only the [communication contract](agent-communication-program.md) defines current
+scope. Donor mechanisms and reported defects are research inputs, not required
+features, compatibility promises or a mandatory test list.
 
-## 0. Evidence rule
-
-```text
-CODE        exact source behavior
-DOC         official product/protocol documentation
-RELEASE     exact tagged/released behavior
-ISSUE       concrete user/developer report
-USER        experience without full independent reproduction
-PAPER       research result under its stated setup
-INFERENCE   ELIOT design conclusion
-UNVERIFIED  plausible but not end-to-end established
-```
-
-A current-main implementation is not silently attributed to a stable release. A reported defect is an acceptance case, not proof that every version still has it.
+The historical design consumers were
+[Peer Autonomy](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs/agent-communication-peer-autonomy.md) and
+[Peer Autonomy Implementation](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs/agent-communication-peer-autonomy-implementation.md).
+Their adoption instructions, agreement requirements and implementation queues
+are superseded. A public report describes its recorded case, not every release.
 
 ## 1. Claude Code Agent Teams and cross-session messaging
 
-### Official behavior worth taking
+### Official behavior recorded
 
 Official documentation establishes:
 
@@ -42,7 +34,7 @@ Official sources:
 - <https://code.claude.com/docs/en/agent-teams>
 - <https://code.claude.com/docs/en/cross-session-messaging>
 
-### Field failures to test
+### Reported field failures
 
 Public issue reports describe:
 
@@ -62,36 +54,11 @@ Selected issue anchors:
 - <https://github.com/anthropics/claude-code/issues/88741>
 - <https://github.com/anthropics/claude-code/issues/71723>
 
-### ELIOT adoption
-
-Take:
-
-```text
-direct peer messaging
-independent context
-one-line preview
-recipient accept/hold/refuse policy
-peer message never equals human approval
-safe-boundary notification
-one-shot readiness notification
-```
-
-Reject:
-
-```text
-second shared Task authority
-recipient string that creates a mailbox/identity
-poll-driven model wake
-auto-starting an idle recipient for ordinary mail
-full task transcript injected into every participant
-implicit fallback that changes communication semantics
-```
-
 ## 2. OpenAI Responses Multi-agent
 
 ### Official distinction
 
-OpenAI's current multi-agent guide distinguishes:
+The reviewed OpenAI multi-agent guide distinguished:
 
 ```text
 send_message
@@ -109,43 +76,16 @@ Official source:
 
 - <https://developers.openai.com/api/docs/guides/responses-multi-agent>
 
-### ELIOT adoption
-
-This distinction is normative:
-
-```text
-peer coordination tool == send_message semantic
-manager Task/runtime operation == followup_task semantic
-```
-
-No peer API may smuggle the second semantic into the first.
-
 ## 3. Agency Swarm
 
 ### Useful mechanism
 
-Agency Swarm defines explicit directional `communication_flows` and allows a message tool to require structured fields such as key decisions and context. This is better than letting any actor contact any other actor through an untyped global chat.
+Agency Swarm defines explicit directional `communication_flows` and allows a message tool to require structured fields such as key decisions and context.
 
 Source:
 
 - <https://github.com/VRSEN/agency-swarm>
 - `examples/custom_send_message.py`
-
-### ELIOT adoption
-
-Take:
-
-```text
-explicit communication edges
-typed required message fields
-separate message and handoff semantics
-```
-
-Improve:
-
-- derive current sparse edges from Task dependency, ProducerRef, contract key, accepted scope overlap and reviewer sponsorship;
-- do not make one static all-project communication graph the sole authority;
-- do not make handoff the default response to an ordinary question.
 
 ## 4. Gas Town / Beads
 
@@ -173,26 +113,6 @@ Public reports and project discussions show why durable work state and live runt
 - issue-graph state can diverge from current process/session state;
 - stale escalation can become repeated control traffic if it automatically creates more model work.
 
-### ELIOT adoption
-
-Take:
-
-```text
-one-shot predecessor/owner query
-information query before escalation
-typed escalation classes
-current facts outside model context
-```
-
-Reject:
-
-```text
-another work graph/task authority
-Mayor as mandatory relay for every query
-automatic stale re-escalation that starts models
-live ownership inferred solely from issue state
-```
-
 ## 5. Overstory
 
 ### Useful mechanisms
@@ -212,28 +132,9 @@ Sources:
 - `STEELMAN.md`
 - `src/mail/agentic_instructions.md`
 
-### Risky mechanisms for ELIOT
+### Other exposed mechanisms
 
 Its mail vocabulary includes task-adjacent `dispatch` and `assign`, group broadcasts and urgent/high auto-nudges.
-
-### ELIOT adoption
-
-Take:
-
-```text
-capability/current-state discovery
-typed mail
-explicit integration-risk accounting
-```
-
-Reject:
-
-```text
-broadcast groups
-peer-visible assign/dispatch as ordinary mail
-auto-nudge urgency that can trigger model work
-second SQLite mail authority
-```
 
 ## 6. MCP Agent Mail
 
@@ -251,7 +152,7 @@ Source:
 
 ### Boundaries
 
-The existing Field Evidence document records:
+The [recorded field evidence](agent-communication-field-evidence.md) includes:
 
 - restrictive license rider;
 - separate Git/SQLite authority;
@@ -260,10 +161,6 @@ The existing Field Evidence document records:
 - placeholder identity creation;
 - false release;
 - direct-storage polling and storage/FD failures.
-
-### ELIOT adoption
-
-Take the UX and advisory-reservation concepts. Do not reuse code or storage.
 
 ## 7. CCCC
 
@@ -276,26 +173,10 @@ crates/cccc-core/src/connect_delivery.rs
 crates/cccc-core/src/inbox.rs
 ```
 
-Take:
-
-```text
-delivery identity
-actor generation
-deadlines
-digest-bound reply/cancel
-participant membership checks
-stored/claimed/accepted/failed/ambiguous vocabulary
-cursor and pending-read recovery
-```
-
-Do not take:
-
-```text
-scheduler/group/task authority
-append-only ledger as a second store
-PTY/TUI process topology
-whole bridge/runtime process model
-```
+The recorded units cover delivery identity, actor generations, deadlines,
+reply/cancel checks, delivery dispositions and cursor/pending-read recovery.
+The donor also owns group/task scheduling, its own ledger and a bridge/runtime
+process model; these are separate from the message primitive.
 
 Source:
 
@@ -317,10 +198,6 @@ At reviewed commit `ffa595abfb6f6671ac995041f9c44f5e1a67f50f`, Council provides:
 Source:
 
 - <https://github.com/Enderfga/claw-orchestrator/blob/ffa595abfb6f6671ac995041f9c44f5e1a67f50f/src/kernel/nodes/council.ts>
-
-### ELIOT adoption
-
-Take bounded advisory deliberation. Do not take the workflow store, node replay or consensus as authority.
 
 ## 9. Multica and AutoGen field evidence
 
@@ -357,10 +234,6 @@ Selected anchors:
 - <https://github.com/microsoft/autogen/issues/7409>
 - <https://github.com/microsoft/autogen/issues/7487>
 
-### ELIOT adoption
-
-Convert reports into negative tests. Do not implement free-running GroupChat, LLM speaker selection or shared full history.
-
 ## 10. Sparse-communication research
 
 Research lines such as AgentPrune, adaptive graph pruning, CONCAT and hierarchical/progressive debate support the design direction of sparse, progressively escalated communication. Debate research also warns that homogeneous agents can converge socially without becoming more correct and that answer agreement can hide incompatible reasoning.
@@ -375,33 +248,3 @@ Selected sources:
 - <https://arxiv.org/abs/2604.09679>
 - <https://arxiv.org/abs/2605.00914>
 - <https://arxiv.org/abs/2606.08457>
-
-## 11. Fleet behavior → ELIOT requirement map
-
-| Observed behavior | ELIOT requirement |
-|---|---|
-| General manager becomes a relay bottleneck | relevant-peer directory, cards, quick ask, peer-local handshake |
-| Agents do not know who owns a seam | exact indexed owner resolution with ambiguity/no-send |
-| Long questions repeat known facts | structured card-field lookup before delivery |
-| Peer mail accidentally creates work | hard message vs follow-up-task separation |
-| Busy recipients process mail late | durable pull/one-line safe-boundary header; no false immediate-delivery claim |
-| Idle recipient starts a costly turn | ELIOT default forbids peer-triggered turn start |
-| Recipient name typo creates orphan inbox | exact registered participant/generation, fail closed |
-| Completion notifications flood context | replaceable current state and coalesced freshness, no durable liveness mail |
-| Assignment replay/duplicate work | peer has no assignment method; manager operation remains idempotent authority |
-| Central issue graph disagrees with live process | card/participant validity rechecked against current Attempt/ProducerRef/binding |
-| Shared chat grows geometrically | sparse edges, one recipient, headers/cards, paged history |
-| Peers socially agree on wrong contract | deterministic comparator, named dimensions, unknown prevents compatible |
-| Every local detail waits for GM | peer-local autonomy envelope |
-| Local agreement silently changes global policy | manager-required classifier and canonical-source pinning |
-| Auditor reads all chatter | compact review packet with exact agreement/comparison/evidence |
-| Hundreds of idle agents poll | no per-agent task/process; pull current state on demand |
-
-## 12. Final source-derived rule
-
-```text
-Direct peer communication is useful when it carries one bounded fact or reconciles one explicit interface.
-It becomes harmful when it also assigns work, wakes models, broadcasts history, changes authority or substitutes social agreement for verification.
-```
-
-ELIOT therefore makes direct coordination easy while keeping work assignment, global policy and acceptance explicit and separate.

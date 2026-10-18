@@ -1,7 +1,7 @@
 # Modular Runtime — Build, Process and Authority Boundaries
 
 Owner direction: 2026-10-05. **Implementation specification, not an implementation claim.**
-Current source boundaries: [refactoring map](refactoring.md) at `f1b854b6`.
+Current source boundaries and reduction order: [refactoring map](refactoring.md).
 [Review and defects](modularity-review-2026-10-05.md) retains the earlier `2aec51bb` inspection;
 [Observability](observability.md) defines logging/live monitoring;
 [Donor map](donor-map.md) records inspected mechanisms and rejected assumptions.
@@ -16,9 +16,9 @@ network connection or loaded native model. One failed optional worker does not
 stop the host or unrelated agents. Recovery restarts software, not the original
 model input or an uncertain external write.
 
-Preserve the existing durable Operations, Task/Attempt snapshots, mailbox,
-independent review/acceptance and exact-candidate publication. Do not replace
-these with a new scheduler, broker product, model loop or general workflow DSL.
+Keep durable Operations, Task/Attempt association, mailbox and independent
+review/acceptance for the compact core. Publication is an explicit optional action.
+Do not replace these with a new scheduler, broker product, model loop or workflow DSL.
 
 Three boundaries are different: a Rust source module is not a compilation unit;
 a Cargo package is not a fault-isolated process; a restarted adapter process is
@@ -113,15 +113,15 @@ requires the outer identity and native input ID to match, and records an existin
 Attempt producer for `Accepted` or `Applied`. `Unknown` remains unresolved and
 cannot mark the Task complete. The original dispatch context is retained before
 the command leaves Store, so recovery validates the original admitted worker
-boot rather than a replacement boot. Descriptors without both schemas retain
-the legacy codec and runtime-specific producer path.
+boot. Current descriptors lacking these schemas still use runtime-specific
+codecs; convert needed consumers and remove that path under the finite transition.
 
 Current TaskPrompt artifacts also advertise `swarm.task_prompt@1`. Store builds
 one exact prompt envelope from the retained Task snapshot and source text; it
 contains Task/Attempt/revision identity, the snapshot digest, prompt bytes and
 their digest. The adapter validates the envelope against the dispatch context
-and submits its prompt unchanged. Legacy snapshot renderers remain only behind
-historical artifact contracts, never as a fallback for a current artifact.
+and submits its prompt unchanged. Retire legacy snapshot renderers after the
+actual old consumers/data are converted; do not add a fallback to current dispatch.
 
 The adapter owns native schemas, workspace-field mapping, connection identity,
 capability interpretation, command translation and normalization of observations.
@@ -173,10 +173,10 @@ on-behalf automation. Generate discovery/schema classifications from that
 registry; a profile can narrow it, not grant new rights. Keep deferred tool
 loading as UX, not another authorization/activation bureaucracy.
 
-Required first correction: replace the operator-only gates in
-`src/store/tasks.rs::{create,revise}` with the ordinary **Operator or Manager**
-policy, including the designated GM. Do not substitute the broader
-`require_writer()` predicate: it is not an explicit Manager allowlist.
+Current [Task handlers](../../crates/swarm-kernel-host/src/store/tasks.rs) already
+call `require_task_planner`, which admits Operator/Manager. The separate
+`authorize_foreign_live_attempt_revision` handles another manager's live Attempt.
+Keep these existing checks; do not assign the old operator-only defect again.
 Planning a Task must not depend on an installed runtime, workspace launch,
 provider quota, MCP proof or observer readiness. Native prerequisites apply to
 that native action when it is actually requested.
@@ -205,8 +205,11 @@ approval stages or repeatedly ask the manager for unchanged information.
 
 ## 5. Demand-driven lifecycle, unified supervision and recovery
 
-**One unified supervisor, not three parallel loops:**
-The runtime uses a single `ModuleSupervisor` (`swarm-supervisor`) to manage all adapter and optional worker processes under the unified descriptor contract (`external_attach`, `owned_service`, `one_shot`). Maintaining parallel in-process supervisor loops (`ManagedWorkerSupervisor` or `legacy_optional_workers`) inside the kernel host is forbidden and must be removed.
+The target has one lifecycle owner for each selected process, reusing
+`ModuleSupervisor` (`swarm-supervisor`). Remove parallel `ManagedWorkerSupervisor`/
+`legacy_optional_workers` paths as their used responsibilities move. Do not create
+an executable, descriptor or supervisor registration for every small helper;
+pure mechanics belong in the existing shared packages.
 
 The supervisor keeps cheap installed/configured metadata. Optional workers start
 only for an admitted command, a configured due action, or an explicit live
@@ -264,7 +267,9 @@ not an OS sandbox against arbitrary same-user code or a hard memory/CPU quota.
 Place executable artifacts in versioned module directories. Validate compatibility
 and atomically change the selected version for **new** admissions. Existing
 bindings retain their old artifact until drain or a supported attachment handover.
-Keep the prior version for rollback; do not overwrite a running Windows binary.
+Keep a prior release only for an actual rollback/drain window; remove obsolete
+versions after the [finite transition](refactoring.md#retire-executors-without-losing-history).
+Do not overwrite a running Windows binary.
 Compatible recorder/adapter updates never require restarting kernel or unrelated
 native sessions. Kernel/schema upgrades still require their own controlled
 handover and supported database backup/migration, not a claim of universal hot
@@ -273,8 +278,9 @@ file and call it a verified backup.
 
 Cargo workspace `default-members` must be the small CLI/kernel entrypoints,
 not every adapter. Shared root dependency declarations disable unwanted features
-at the workspace level as needed by the actual pinned toolchain. Do not adopt a
-newer Cargo-doc feature without checking that compiler's support.
+at the workspace level as needed by the supported compiler. Build provenance
+may be diagnostic; host/adapter equality of checkout, compiler or build-cache
+path is not a protocol requirement.
 
 Use a fast local profile; keep optimized release packaging separate. Example
 **target root-manifest settings**:
@@ -311,25 +317,27 @@ Acceptance is absence of unrelated rebuilds/restarts, not an invented speedup.
 
 ## 6. Implementation sequence and completion criteria
 
-This is the implementation order for the existing O1–O11 program, not a second
-Task planner. Reuse landed code and keep one owner/candidate per delivery unit.
-Instrumentation starts immediately so the refactor's own failures are visible.
+These labels describe boundaries used by the [single reduction queue](refactoring.md#code-reduction-candidates).
+They do not require completing obsolete or optional subsystems before removing
+them. Basic failure reporting belongs with a working path; no dashboard milestone
+is required before source reduction.
 
 | Step | Concrete change and initial owners | Completion condition |
 |---|---|---|
 | M1 — usable manager and visible failures | `src/store/tasks.rs`, `src/model.rs`, shared method authorization; `Store::disconnected`, host error handling and small telemetry producer | Manager and current GM create/revise without operator token; observers/modules cannot. An ordinary Manager cannot revise another Manager's unreleased Attempt; the explicit current-GM/Operator path validates the same exact scope and revision. A disconnect persistence error is visible, not coerced into `false`. No unrelated native prerequisites on planning. |
-| M2 — real build boundaries | Root manifest/Justfile/CI and existing shared packages; finish the [verified dependency removals](refactoring.md#remove-worker-implementation-edges), preserving public CLI/serialized data | Explicit package graph with no adapter-to-kernel reverse dependency; existing database/receipts still readable. Independent build recipe works on Windows and Linux. |
+| M2 — real build boundaries | Root manifest/Justfile/CI and existing shared packages; finish the [verified dependency removals](refactoring.md#remove-worker-implementation-edges), preserving public CLI/serialized data | Explicit package graph with no adapter-to-kernel reverse dependency; needed data converted/exported with one current format. Independent build recipe works on Windows and Linux. |
 | M3 — bus and one complete adapter | Generic module descriptor/handshake in supervisor; extract OpenCode translation plus vendor Store paths; independent bus dispatcher and atomic cursor admission | Adapter replacement leaves kernel hash/PID unchanged; bus restart resumes cursor without duplicate command; a second minimal executor needs registration, not a new Store runtime-name switch. |
-| M4 — remaining executors and lazy workers | Extract each real adapter, then checks/Forge/scripts/automation and optional frontends | Each has a named owner, demand predicate, bounded queues and local restart. No empty supervisor loops for disabled modules; no Rust orchestration claim while durable Eliot control remains in JS/Python; native SDK handles follow the donor boundary. |
+| M4 — selected executors and workers | Keep one needed provider/worker implementation and remove its replaced path | Each has a named owner, demand predicate, bounded queues and local restart. No empty supervisor loops for disabled modules; no Rust orchestration claim while durable Eliot control remains in JS/Python; native SDK handles follow the donor boundary. |
 | M5 — recorder and live view | Complete `swarm-observer`, log configuration/reload and projections in [Observability](observability.md) | Show manager/agent/module/operation timeline, exact crash/restart facts, lag/loss and selected active resource metrics; changing depth does not restart work. |
-| M6 — integrated product qualification | Existing productive O7/O11 delivery path using real manager identity, two distinct adapters and the same common contracts | Task → dispatch → result → independent audit → correction → re-audit → acceptance → exact publication; optional failure and restart do not repeat effects or stop unrelated agents. Record exact evidence and unresolved native gaps. |
+| M6 — integrated product qualification | The compact O7 path using real manager identity and the selected adapters | Task → dispatch → result → independent audit → correction → re-audit → acceptance; optional publication is separate; optional failure and restart do not repeat effects or stop unrelated agents. Record exact evidence and unresolved native gaps. |
 
 M4 workers may be extracted independently after M2/M3 contracts stabilize; do not
 make every optional provider a blocker for the first complete productive path.
 M1/M2 include basic logging, not a requirement to finish a dashboard first.
 Broad fault/load/native testing comes after the relevant product path is complete;
 minimal formatting/Clippy and source review are the development gate. No repeated
-large fixture campaign for every writer fragment. Preserve existing test assets.
+large fixture campaign for every writer fragment. Keep tests for retained behavior;
+remove fixtures and build jobs whose sole subject is the retired mechanism.
 
 Final negative cases must cover old-worker replies, two simultaneous starts,
 revoke/disable versus launch, crash after external send but before outcome commit,

@@ -62,7 +62,7 @@ manifest's sibling `native_mcp_latest_failure` record. It exposes only the safe
 error code, closed stage, timestamp and category; current-GM
 `operation.get` includes `native_mcp_readback.latest_failure` after handover.
 The producer and current-manager readback have passed the focused source gate,
-as recorded in `implementation-status.md`; fresh native qualification is pending.
+as recorded in the [historical status](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs/implementation-status.md); fresh native qualification was pending in that record.
 The receipt is failure history, not native MCP
 proof, dispatch authority or retry permission. Reading it does not authorize
 replaying a `task.dispatch` or repeating an uncertain input.
@@ -95,7 +95,7 @@ projection, precise closed source-guard codes, and a readback-only action for
 admitted launches whose unknown start predates a validated interruption and the
 current host start. Formatting, strict production Clippy, seven distinct Manager
 regressions, build, full Windows/Ubuntu CI and independent review passed as
-recorded in `implementation-status.md`. The action preserves exact binding
+recorded in the [historical status](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs/implementation-status.md). The action preserves exact binding
 references and current-GM authority independently of the previous chat. It
 reports an unresolved reservation and does not establish which process started,
 create a terminal observation or authorize retry. C8 diagnostics include
@@ -130,7 +130,7 @@ same canonical directory loads the expected plugin. The correction changes
 only the serialized configuration path and its exact comparison consumers;
 canonical file, digest and scope validation remain intact. Offline loading does
 not establish service activation or native MCP proof; the fresh source gate
-and native run are recorded in `implementation-status.md`.
+and native run are recorded in the [historical status](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs/implementation-status.md).
 Preserve the consumed C27 claim without replay. C24 hosted Bunny remains private
 preparation until full native MCP proof exists.
 

@@ -25,7 +25,8 @@ Runtime source, fixtures and native observations have different coverage.
 
 Use the [current source and completion map](docs/implementation-status.md#current-source-and-completion-map)
 for artifact versions, implemented behavior and remaining qualification. Runtime
-guides below own their commands and compatibility details. Historical evidence
+guides below describe current commands and transition gaps. The [reduction map](docs/agent-operations/refactoring.md)
+owns the compact target and deletion order. Historical evidence
 applies to its recorded revision; a fixture pass is not native qualification.
 V3 is the required refactoring target, not a description of a completed rewrite.
 
@@ -45,7 +46,9 @@ Use an initially empty dedicated local directory. The Kernel owns its marker/loc
 database, artifacts and credentials there and refuses unrelated nonempty directories.
 Ordinary CLI requests do not initialize a database or start the host. CLI, launcher,
 Kernel and supervisor are separate artifacts; installation verifies their declared
-sibling/protocol contracts and individual provenance. See [module installation](docs/agent-operations/module-installation.md).
+sibling/protocol contracts and provenance under the current scripts. Their
+redundant provenance/legacy checks are [removal targets](docs/agent-operations/refactoring.md#code-reduction-candidates);
+see [module installation](docs/agent-operations/module-installation.md) for current commands.
 
 Use `swarm` for application commands and `swarm mcp` (or `swarm-mcp`) for MCP.
 `swarm-host` and `swarm-kernel-host` retain the designated daemon, worker and local

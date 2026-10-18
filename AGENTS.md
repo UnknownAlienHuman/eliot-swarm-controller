@@ -1,73 +1,41 @@
 # Working on Eliot Swarm Controller
 
-## Read the active contract
+Start with the owner's current task and the [refactoring map](docs/agent-operations/refactoring.md),
+then read the source and contract for that responsibility. An audit/preparation
+request stays an audit: update findings and the reduction plan; do not silently
+start runtime implementation or a build campaign. Historical specifications and
+qualification logs describe their revisions, not cumulative instructions.
 
-Start with the owner's current task, [V3 architecture](docs/agent-operations/README.md),
-and the [current refactoring map](docs/agent-operations/refactoring.md). Read only
-the relevant architecture/module sections and source for the assigned slice.
-[V18](docs/agent_swarm.md) and the [module contract](docs/agent_swarm.module-contract-v2.md)
-retain the shared Task/Attempt/Operation, ownership and recovery invariants.
-V3 controls the specified refactoring changes. Historical audits and qualification
-receipts describe their recorded revisions; check current call sites before
-reopening a finding. Frozen policy editions and retained Attempts keep their identities.
+## Reduce responsibilities before extracting code
 
-## One manager, one worktree
+- Keep the compact product: manager assignments, agent execution, attributable
+  results, independent review, acceptance, observation and selected Goal continuation.
+  The [communication contract](docs/agent-communication-program.md) owns peer messaging.
+- Give each responsibility one implementation. Reuse existing contracts, Store,
+  clients and process primitives; keep worker/adapter implementations out of the host's
+  dependency graph. A new abstraction or donor integration needs a real caller and
+  a replaced mechanism. Do not implement an unrelated feature to complete a donor list.
+- Support one current executor and format. Old experiments do not create permanent
+  compatibility obligations. For actual data that must survive, use the
+  [finite transition](docs/agent-operations/refactoring.md#retire-executors-without-losing-history),
+  then remove the old path. Do not add fallback runtimes, aliases or dual writes by default.
+- Keep Store admission and changes atomic; native/network I/O stays outside short
+  writer transactions. Authorized reads use bounded snapshots. Results remain tied
+  to their admitted Operation/turn; an uncertain input is not replayed to obtain an answer.
+- Check the actual caller, candidate, binding and process being acted on. Document
+  hashes, checkout/compiler equality and archive formats are not another rights system.
+  Keep credentials private and authenticate late results against their original work.
+- Count net owned code across Rust, SDK drivers and glue, with tests separately.
+  File moves, minification, vendoring and a new DSL do not remove a responsibility.
 
-One manager owns the branch, mutable worktree and integrated candidate. Delegate
-small, non-overlapping implementation or review assignments in that worktree.
-Each assignment names the behavior, source owner, affected files, replacement/deletion
-and completion condition. Writers do not run Cargo or publish fragments. The manager
-reviews each returned diff and integrates the complete producer-to-consumer path.
+## Integrate and verify the requested change
 
-## Keep one implementation of each responsibility
+One manager integrates a branch; delegate non-overlapping file assignments and
+review the combined caller-to-result path. Coordinate shared files and builds.
+For source changes, use the existing [scoped checks](docs/ci-scoped-builds.md) for
+the affected behavior and dependencies; avoid repeated full builds and blanket
+formatting of vendor trees. Documentation changes need link/content checks, not Cargo.
 
-- Store owns durable admission, rights, reservations, Operations and committed events.
-  Native/network I/O runs outside its short writer transactions.
-- Use the existing contracts, clients, process primitives and schema installer.
-  Extract shared DTOs into their existing contract owner; workers and adapters stay
-  independently compiled. Do not add host-to-worker or host-to-adapter dependencies.
-- Use the required donor at its actual protocol boundary. A library reference in
-  documentation or a transitive lockfile entry is not integration. Connect the real
-  caller and remove the replaced mechanism in the same slice.
-- Return captured results through native input identity or the V3 serialized-turn
-  contract. A missing optional parent pointer alone is not a result rejection.
-  Keep actual ambiguity, stream gaps and missing bytes explicit; never replay an
-  uncertain prompt to manufacture a result.
-- Implement the V3 direct launch path with asynchronous native MCP observations;
-  retain ordinary workspace, Task, binding and caller checks.
-- Keep one database writer and use pooled read-only snapshots for migrated query
-  families. Domain collections migrate to indexed tables through the existing
-  Store schema/data owners; reads never perform migration or advance durable cursors.
-- Preserve protocol-specific identity bytes and historical decoders. Use the
-  [schema/digest rules](docs/agent-operations/architecture.md#schema-and-identity-boundaries)
-  rather than global replacements of serde attributes or hash validators.
-- New abstractions need concrete consumers and a deletion. Extend an existing
-  package for a small primitive. Keep adapter-specific journal/recovery semantics
-  with the adapter; share mechanics already owned by `swarm-process`.
-- Report net owned-source change across Rust, SDK drivers and new glue; count
-  tests separately. Moving files/tests or replacing a match with another DSL is
-  not a code reduction. Keep unrelated feature expansion out of an extraction.
-- Route new requests to one executor. Preserve versioned historical readers and
-  unresolved-work reconciliation separately; old records alone do not require
-  retaining the old executable implementation forever.
-- Keep new integration suites/fixture executables outside production `src/`.
-  Move existing suites alongside the relevant extraction without exposing private
-  production APIs solely for test access. Small unit tests may remain next to code.
-
-## Source first, scoped verification
-
-Complete the connected source slice before qualification. The manager runs scoped
-formatting and minimal warnings-denied Clippy once after integration, using an
-external shared target and actual reverse dependencies from Cargo metadata.
-Follow [scoped checks](docs/ci-scoped-builds.md) and the existing `just` recipes.
-Never use root `cargo fmt --all`: it includes preserved donor sources. Writers run
-no Cargo; avoid repeated full builds, `cargo clean`, test campaigns or native/model
-qualification during source preparation. Product tests and live qualification are
-the later completion phase. Documentation-only work uses the existing documentation
-gate and needs no Rust build.
-
-Update the current contract/status entry when behavior changes. Keep receipts in
-the existing evidence location and link their source/scope. Do not append each
-attempt log to normative specifications or create parallel documentation-only
-handoff PRs for the same work. Link the owning document instead of copying its
-rules, status matrix or work queue into another index.
+Update the owning document. Keep one work queue in the refactoring map and
+revision-specific results in the existing status/evidence location. Do not create
+another approval stage, compatibility registry or parallel implementation program.

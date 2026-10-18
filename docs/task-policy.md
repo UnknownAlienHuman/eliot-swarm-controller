@@ -1,62 +1,38 @@
 # Task owner policy and source-indexed brief
 
-New Attempts must be claimed under an explicit accepted owner-policy edition. A
-TaskSpec selects it with `owner_policy_id`; the accepted values are
-`owner-policy-v1` and `owner-policy-v2`. The selection is an identifier, not a
-date or a file-mtime lookup. Creating and revising Tasks without a policy
-remains readable for legacy compatibility, but such a Task cannot start a new
-Attempt.
+## Refactoring target
 
-The accepted edition is Owner policy v1 in
-[`owner-decisions.md`](owner-decisions.md). Its frozen identity is
-`policy_id=owner-policy-v1`, `edition=1`, document path
-`docs/owner-decisions.md`, section `1. Owner policy v1 — resolves issue #14`,
-and SHA-256
-`786df3cddc329ceac270442e1e825e2af37122b4902ecf07410d3a85a4d470dc`. The digest
-covers the UTF-8 bytes of that complete section, with LF line endings and
-without the following section heading. Updating the accepted policy requires
-a new explicit edition identity and digest in code; editing the document does
-not silently change what an existing Attempt means.
+One current policy checks the authenticated caller, Task/Attempt ownership,
+assignment, candidate and requested action. A manager uses its ordinary scoped
+rights; a document path, section, SHA or edition is not an additional capability.
+Reviewers report their assigned findings without acquiring manager authority.
 
-Owner policy v2 is frozen in
-[`owner-policy-v2.md`](owner-policy-v2.md). Its identity is
-`policy_id=owner-policy-v2`, `edition=2`, document path
-`docs/owner-policy-v2.md`, section
-`Owner policy v2 — scoped manager review disposition`, and SHA-256
-`a3490caa5ee7afa435dd0a4a317917a88b99c746f477a304de9458d45553b5db`. Its
-scoped manager right applies only to an Attempt whose complete frozen policy
-record matches this accepted edition. An authenticated Manager may apply an
-actionable finding from the exact current assigned review result only to the
-current open Task revision and the unreleased Attempt they own, with exact
-submission and candidate anchors. The existing Operator/current-GM path stays
-available under both editions. Owner policy v1 and Attempts with legacy or
-unrecognized snapshots do not gain manager feedback rights. No existing
-Attempt is migrated when v2 is added.
+Remove document-edition permission gates and historical acceptance branches under
+the [reduction program](agent-operations/refactoring.md#code-reduction-candidates).
+For actual old work, use the [finite transition](agent-operations/refactoring.md#retire-executors-without-losing-history):
+convert/revise unfinished work explicitly and preserve required old evidence as
+history. Do not silently give a recorded Attempt new meaning or keep an old
+executable workflow forever to read that history.
 
-Each new Attempt freezes the selected policy identity, the Task revision, the
-dependency acceptance receipts, and a deterministic brief in its existing
-`task_snapshot`. The brief is a projection of the revision's objective, phase,
-requirements, dependencies, scope, acceptance fields and ordered source index.
-It does not create workflow rules or replace the source specification. The
-attempt read projection exposes the frozen `owner_policy` and `task_brief`;
-policy projection recognizes both frozen editions and continues to report
-legacy-unknown and unrecognized records without assigning them a new edition.
+## Current source constraints
 
-`task.get` and `task.list` expose the same normalized `task_brief` while keeping
-the raw stored `spec`. A historical spec that cannot be decoded remains
-readable with `task_brief.status=unavailable` and
-`reason=stored_task_spec_unreadable`. This does not relax validation for a new
-Attempt or invent missing source or objective fields.
+[`policy.rs`](../crates/swarm-kernel-host/src/policy.rs) still requires an explicit
+`owner_policy_id` for a new Attempt and recognizes `owner-policy-v1` and
+`owner-policy-v2`. Its complete edition record includes document identity; v2
+allows scoped feedback through the existing Store checks. This is an implementation
+gap against the target above. The exact historical definitions remain in
+[owner decisions](owner-decisions.md) and [v2](owner-policy-v2.md); copying their
+hashes into another guide does not add authority. Acceptance-policy V1/V2 is a
+separate old workflow branch, also covered by the reduction program.
 
-`source_index` entries preserve source order and have a `source_ref`, status,
-and optional revision, exact text and SHA-256 digest. A `selected` entry must
-carry a nonempty revision, exact text and a matching lowercase SHA-256 digest.
-A `gap` entry retains any known text and records why selection or parsing is
-incomplete. Unknown or malformed source comments remain gaps; the projection
-does not interpret them or invent instructions. Legacy `source_refs` remain
-accepted and are projected as explicit gaps because they have no pinned
-revision or content. Digests are computed over the exact UTF-8 text bytes.
+## Task brief and source evidence
 
-Historical Attempt snapshots are not rewritten. A snapshot with no recorded
-policy projects as `legacy_unknown`; an unrecognized recorded policy remains
-unrecognized. Neither case is assigned the current edition retroactively.
+The existing Attempt snapshot records its Task revision, admitted inputs and
+source-indexed brief. The brief projects objective, requirements, dependencies,
+scope and acceptance inputs; it does not create a second specification. Task reads
+keep the stored spec and expose an unavailable brief when it cannot be decoded.
+
+Selected source entries retain the actual revision/text and its digest. Unknown
+or malformed source references remain explicit gaps rather than invented
+instructions. Current legacy projections may lack a recognized policy or source
+selection; they describe the stored record without assigning it new rights.
