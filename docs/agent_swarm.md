@@ -172,6 +172,8 @@ Terminal может прийти до admission-response. Он сохраняе�
 
 Независимые оси: connection, execution, family, goal и проверенный результат. Не создаём enum всех сочетаний. PID жив — только process fact; parent idle с живыми детьми — не свободная линия.
 
+Уточнение владельца 18.10.2026: Governor в любой момент читает локальную связь назначения, процесса, worktree/ветки GitHub и JSON провайдера без запроса к harness. Native events и локальные JSON/JSONL/DB дополняют наблюдение ОС и Git; потеря control connection не выключает локальное чтение. Текущий компактный контракт и владельцы реализации — [наблюдение](agent-operations/observability.md#5-live-monitoring-and-future-charts) и [implementation](agent-operations/implementation.md#passive-agent-observation).
+
 Snapshot имеет scope/generation/completeness и cursor либо окно чтения. Partial/unavailable не удаляет прежние сущности. Complete active list не доказывает terminal отсутствующего child. Поздний snapshot не перетирает новые live-изменения; без native atomic snapshot остаются явно неоднозначные сущности.
 
 Host epoch, bridge boot, link epoch и native generation меняются по разным причинам. IPC reconnect не новая сессия. Старый link не допускает новых команд; уже принятая работа не отменяется задним числом. Startup сверяет и прежние незакрытые семьи, не только последний лог.
@@ -223,7 +225,7 @@ route → module artifact + native entrypoint + account/billing
 
 ## 10. Goal, общение и General Manager
 
-Continuation имеет одного владельца: native goal либо явно разрешённый controller fallback. Установка goal может начать модельную работу; это не healthcheck. Новое содержательное событие не равно дополнительному циклу «продолжай».
+Уточнение владельца 18.10.2026: Harness Goal — нативная цель, используемая по умолчанию при наличии поддержки. Eliot Goal — отдельный плагин Eliot, отправляющий агенту обычные новые или повторяющиеся сообщения. Governor выбирает любой механизм или сочетает оба; их цели и управление независимы. Прежнее требование взаимоисключения отменено. Установка native Goal может начать модельную работу; это не healthcheck. Текущий контракт — [Goal](agent-operations/module-api.md#goal-continuation).
 
 Manager получает цель, requirements IDs, phase, sources, открытые findings и способ сдачи. Не всю историю аварий, не каталог всех tools и не несколько конфликтующих briefs. Native инструкции и небольшой skill содержат только реально нужные особенности интерфейса.
 
@@ -231,7 +233,7 @@ Scope: initial paths — старт, forbidden paths — запреты, prerequ
 
 Сообщения адресуются Task/Attempt и сохраняются до ответа. Caller не ждёт peer response. Task-level вопрос может перейти новому владельцу после проверки актуальности; старый turn command молча не переносится. У каждого reader свой cursor; read не удаляет общий inbox. Delivery, ack, применение и полезность — разные факты [S11].
 
-Когда нет полезной параллельной работы, ожидание child/CI/quota нормально. Проснувшийся manager получает готовый diff, вопрос или новый finding, не периодическую просьбу имитировать занятость. Native goal/schedule и controller timer не должны дублировать продолжение.
+Ожидание child/CI/quota может быть нормальным состоянием. Governor выбирает содержимое и периодичность сообщений Eliot Goal; намеренное повторение текста допустимо и не требует новой смысловой причины. Повтор доставки одной отправки и следующая запланированная отправка — разные случаи. Наличие native Goal не запрещает эти сообщения; наблюдение состояния само по себе их не создаёт.
 
 GM wake квалифицируется: native input либо поддержанный Channels-путь; ordinary MCP notification не гарантирует запуск хода. Иначе режим явно checkpoint-poll. Смена GM не теряет задачи/решения и лишает старый binding новых управляющих команд через наш API. Full-access shell не превращается в security tenant.
 

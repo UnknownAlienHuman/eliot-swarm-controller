@@ -15,9 +15,9 @@ evidence machinery are not measures of completion.
 ## Product boundary
 
 The core covers assignments, agent execution, attributable results, independent
-review, correction, acceptance and observation. Addressed messages support this
-work. A Goal continues an existing assignment toward an explicit completion
-criterion; it does not introduce another task system.
+review, correction, acceptance and observation. The Governor coordinates this work
+through the same commands available to other authorized managers. It must know
+who is working where, what is waiting and which execution has failed.
 
 Management is manual by default. A manager can enable selected helpers within
 their existing authority. Helpers use the same actions as direct commands.
@@ -34,8 +34,12 @@ Vendor method names, payload quirks and protocol versions stay at that boundary.
 One durable controller owns work state and decisions. Each adapter owns its native
 connection; each process has one lifecycle owner. Frontends expose shared actions.
 These owners do not duplicate execution, scheduling, authorization or recovery.
-A Goal has one continuation owner: the native harness where suitable, otherwise
-Eliot's common continuation mechanism. Native progress never accepts a Task.
+
+Harness Goal is the vendor's native mechanism and the default when available.
+Eliot Goal is an optional Eliot-side plugin that sends ordinary new or repeated
+messages. The Governor can use either or combine both, with different objectives
+if needed. Each retains its own controls; neither accepts a Task on the strength
+of a native completion claim.
 
 Rust owns the control plane. Use maintained native APIs and SDKs for capabilities
 that already exist. Keep a thin SDK driver when it reduces total maintained code.
@@ -50,10 +54,14 @@ discovery cannot hold it up. Return complete output associated with that input,
 including protocols that omit repeated parent IDs. Unsupported actions and missing
 output have explicit reasons.
 
-Activity, results and usage are readable without starting a model. Execution state,
-connection health, task completion and account limits have different meanings.
-Missing quota data is unknown, never zero. Observation and manual control remain
-available when automation is disabled.
+Agent observation is core functionality. The Governor can read local state at any
+time without querying the provider harness. Eliot correlates assignments, native
+sessions and provider JSON with their processes, worktrees and GitHub branches.
+Local collection continues through loss of the native control connection; retained
+facts remain readable through collector failures, with their freshness and gaps.
+Execution, process health, connection, Task completion and account limits remain
+distinct. Unknown quota is never zero. Disabling automation or diagnostic logging
+does not disable observation or manual control.
 
 Stopping future continuation preserves running work and its results. Interrupting
 a turn, removing queued input and closing a process each have an explicit subject

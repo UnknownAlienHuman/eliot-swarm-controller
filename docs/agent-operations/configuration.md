@@ -293,7 +293,7 @@ claim.
 
 Missing steps are manual. Manual completion of a prerequisite can make an enabled later step eligible; it does not need an earlier step to have been automated. Selecting publication alone cannot manufacture acceptance. Remote-review upload, Issue closure and cleanup remain explicitly configured action choices, not implied publication side effects.
 
-A preset may contain several steps in one enabled entry. Cron, event rules and Goal use the same owner/enabled model with registered typed actions. There is no second `script_run` or `goal_continue` switch to maintain.
+A preset may contain several steps in one enabled entry. Cron and event rules use the same owner/enabled model with registered typed actions; the planned Eliot Goal message plugin uses that model too. Native Harness Goal is controlled separately through `agent.goal`; it needs no automation entry.
 
 Multiple entries may observe the same scope. Equivalent requests share a semantic slot; incompatible auditor/profile/target choices return a specific conflict and the existing reservation. They do not create duplicate work or block unrelated Tasks. The first committed valid reservation is retained; a settings edit is not permission to displace it.
 
@@ -556,9 +556,9 @@ healthy entries continue. The same revision remains held across reconciliation
 and restart; a valid newly active revision permits ordinary revalidation.
 Underlying Store and I/O failures are still reported as supervisor errors.
 
-Goal tracking starts no work. Its selected progression uses one enabled manager entry and one actual continuation owner. Requested one-shot watches are available without recurring automation; a notice is not a task or approval-prompt answer.
+Goal tracking does not directly submit model input. The target Eliot Goal plugin uses one enabled manager entry for selected event/cadence messages. It may coexist with native Harness Goal, which the Governor uses by default where supported. Disabling the entry stops future plugin messages and leaves the native Goal alone. The current progression is terminal-event-only; recurring message settings remain [implementation work](implementation.md#harness-goals-and-the-eliot-goal-plugin). Requested one-shot watches remain available independently; their notices are not model inputs.
 
-Keep #22's small eager cores. Config get/preview/apply/explain/transfer and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Goal editors update the same entry and enabled flag, not parallel records. Before exposing a new method, wire its real application handler and result reader.
+Keep #22's small eager cores. Config get/preview/apply/explain/transfer and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Eliot-plugin editors update the same entry and enabled flag; native Goal controls retain their session scope. Before exposing a new method, wire its real application handler and result reader.
 
 For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. The target permits scoped Manager feedback through current caller/assignment/action checks. The current document-edition gate is a [removal candidate](refactoring.md#code-reduction-candidates); convert actually needed unfinished work explicitly instead of keeping v1/v2 business rules forever. Tool schemas do not grant rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
 

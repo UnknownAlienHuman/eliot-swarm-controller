@@ -59,7 +59,7 @@ remains indexed under the existing Store owner.
 | Review disposition | Actionable assigned findings for the current candidate. |
 | Repair delivery | Applied feedback and the actual current owner/continuation. |
 | Acceptance | Required passing reviews and checks for that candidate. |
-| Goal continuation | The existing assignment's attributable completed input and selected Goal. |
+| Eliot Goal message | The existing assignment, selected plugin and event or due occurrence; ordinary message admission. Native Harness Goal has its own lifecycle and can coexist. |
 
 Manual work can supply any prerequisite. A corrected submission is eligible for
 fresh review even when its predecessor used the same automation. Persist the

@@ -1,8 +1,9 @@
 # Eliot Swarm Controller — Implementation
 
 This is the single implementation order for the [architecture](architecture.md).
-Source rechecked at `906f7977273e2282205d6d06e419820af5e4ca97` on 2026-10-18;
-the mechanisms below are present unless explicitly marked completed.
+Source rechecked at `f7e1b634b619dc2c1a723fe357307f7daab12541` on 2026-10-18.
+Source descriptions name existing code; implementation instructions are target
+changes unless explicitly marked completed.
 [Findings](refactoring.md) retain source evidence and counts;
 [status](../implementation-status.md) records execution evidence. O/M/C/I labels
 in older documents are historical references, not additional work queues.
@@ -19,7 +20,7 @@ callers; do not create a crate or service for every row.
 | Task delivery | Store [tasks](../../crates/swarm-kernel-host/src/store/tasks.rs), [submissions](../../crates/swarm-kernel-host/src/store/submissions.rs), [reviews](../../crates/swarm-kernel-host/src/store/reviews.rs) and [acceptance](../../crates/swarm-kernel-host/src/store/acceptance.rs) own the existing transitions; [delivery](delivery.md) owns their behavior. |
 | Native execution and results | The selected `swarm-adapter-*` owns vendor transport, session/turn mapping and native recovery. Store [normalized_result](../../crates/swarm-kernel-host/src/store/normalized_result.rs) and [results](../../crates/swarm-kernel-host/src/store/results.rs) validate and expose attributable results. No second Task store in an adapter. |
 | Scheduling and processes | [swarm-automation](../../crates/swarm-automation/src/lib.rs) is the target scheduler service; Store owns due state and admission. [swarm-supervisor](../../crates/swarm-supervisor/src/lib.rs) owns retained worker lifecycles through [swarm-process](../../crates/swarm-process/src/lib.rs). Consolidation is still required. |
-| User surfaces and observation | [swarm-cli](../../crates/swarm-cli/src/lib.rs) owns application CLI mapping; [swarm-mcp](../../crates/swarm-mcp/src/mcp/mod.rs) uses the shared catalog. [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) owns common diagnostic primitives; observers project existing state without starting models. |
+| User surfaces and observation | [swarm-cli](../../crates/swarm-cli/src/lib.rs) owns application CLI mapping; [swarm-mcp](../../crates/swarm-mcp/src/mcp/mod.rs) uses the shared catalog. Adapters collect native data; [host lifecycle](../../crates/swarm-kernel-host/src/host.rs) will own core OS/worktree collection; Store joins the facts. The existing observer recorder and [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) own optional diagnostics. |
 
 ## Implementation order
 
@@ -31,7 +32,7 @@ below points to existing source; the detailed findings are not another checklist
 | --- | --- | --- |
 | Retire unused installation/executor paths | [Frontend installer](../../tools/modules/Install-SwarmFrontend.ps1), legacy fixture, duplicate Forge installer and retired Python Codex identified in [findings](refactoring.md#code-reduction-candidates). Remove their CI/Justfile/config consumers together. | A current installation does not inspect retired siblings; current Codex needs no Python executor or vendored bridge SDK. |
 | Remove policy/provenance bureaucracy | [policy.rs](../../crates/swarm-kernel-host/src/policy.rs), `LegacyV1` acceptance branches, [qualification](../../tools/qualification/New-NativeQualification.ps1) and [package helpers](../../tools/ci/SwarmBuildProvenanceHelpers.ps1). Follow [identity rules](#identity-and-hashes). | Caller/object rights and the selected module contract replace document editions and checkout/compiler/cache-path equality. |
-| Converge native execution and finish the productive path | Apply [shared harness control](#shared-harness-control) and [launch/results](#launch-and-results). Move needed built-in OpenCode consumers to the [standalone adapter](../../crates/swarm-adapter-opencode/src/lib.rs); remove host native execution/routing. Compare Muse Node/Rust behavior and total owned code, select one and retire the other. | Common commands and observations; one executor per runtime. Remove host vendor Goal branches, artifact-version usage allowlists and duplicate Muse normalization. No third bridge or pre-prompt MCP gate. |
+| Converge native execution and finish the productive path | Apply [shared harness control](#shared-harness-control), [passive observation](#passive-agent-observation) and [launch/results](#launch-and-results). Move needed built-in OpenCode consumers to the [standalone adapter](../../crates/swarm-adapter-opencode/src/lib.rs); remove host native execution/routing. Compare Muse Node/Rust behavior and total owned code, select one and retire the other. | Common commands, independent native/Eliot Goals and a local process/workspace/session view. Remove vendor branches in plugin delivery, artifact-version usage allowlists and duplicate Muse normalization. No third bridge or pre-prompt MCP gate. |
 | Remove optional product engines | [Concilium](../../crates/swarm-kernel-host/src/store/concilium.rs), [integration](../../crates/swarm-kernel-host/src/store/integration.rs), automatic [publication](../../crates/swarm-kernel-host/src/store/automation_publication.rs)/[GitHub projection](../../crates/swarm-kernel-host/src/store/automation_github_projection.rs), their methods, config and schedulers. | Ordinary assignments, messages and independent review serve collaboration. Explicit accepted-candidate publication remains an optional command. Retain participant registration and review/submission grants colocated in coordination code. |
 | Unify automation and indexed state | [automation_transfer](../../crates/swarm-kernel-host/src/store/automation_transfer.rs), Store automation families, [scheduler](../../crates/swarm-kernel-host/src/scheduler.rs) and [automation_scheduler](../../crates/swarm-kernel-host/src/store/automation_scheduler.rs). Apply [stable identity](#automation-and-delivery) and [Store conversion](#store-and-current-data). | One entry identity, scheduler and durable due model; delete journal relocators, successor ancestry, old loop/config registry and replaced `meta` key codecs. |
 | Finish read and package boundaries | `Store::call`, [legacy_optional_workers](../../crates/swarm-kernel-host/src/host/legacy_optional_workers.rs) and affected manifests. Use [Store reads](#store-and-current-data) and [process boundaries](#processes-and-frontends). | Bounded independent reads; host stops linking retained worker implementations. Existing public CLI deletion stays completed. |
@@ -84,41 +85,102 @@ terminal/readback evidence, including no-run terminals; an unknown cancellation
 preserves the original work. [Donor mappings](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries)
 identify the native calls and their scope.
 
-### One Goal driver
+### Harness Goals and the Eliot Goal plugin
 
-Implement the [Goal semantics](module-api.md#goal-continuation) in Store
-[goals](../../crates/swarm-kernel-host/src/store/goals.rs). Persist the selected driver
-on the existing Goal's Task revision/Attempt assignment; resolve its binding there.
-Factor cause-to-action admission from
-[automation_goal_progression](../../crates/swarm-kernel-host/src/store/automation_goal_progression.rs)
-into this common owner. An activated Goal uses that path without requiring an
-automation entry; optional helpers invoke the same execution controls. Tracking
-and reminder toggles still start no work. This factoring is pending implementation.
+Keep the [two mechanisms](module-api.md#goal-continuation) independent. The Governor
+uses native Harness Goal by default where supported, and may enable Eliot Goal
+messages alongside it. There is no exclusive driver field or driver-switch protocol.
 
-Pass the existing TaskPrompt context with Goal activation, so the adapter receives
-the assignment's instructions, constraints and completion criterion, not just a
-reminder string. Map that context into native session/Goal inputs without two
-initial turns. Set/resume may start execution: retain
-each resulting session/input/turn handle against its initiating Operation and exact
-Goal assignment before exposing its result. Extend the existing
-[result-source selectors](../../crates/swarm-kernel-host/src/store/results.rs), which
-currently favor dispatch/send, to consume that mapping. Reuse result pages and
-terminal events; add no per-turn dispatch receipt and never select the latest message
-as the result. Preserve native revisions where supplied; otherwise use the adapter's
-serialized command/event association. Ambiguous native changes require readback.
+**Harness Goal:** keep `agent.goal` as binding-scoped native control. The adapter
+maps set/edit/pause/resume/clear and reports native state through `agent.state`.
+It accepts the Governor's objective without requiring an Eliot Goal record. For
+assigned work, retain Task/Attempt context with the initiating Operation. Set/resume
+may start a native turn: use the existing TaskPrompt context where needed, map the
+resulting turns to that Operation, and extend [result selectors](../../crates/swarm-kernel-host/src/store/results.rs).
+Do not accidentally dispatch the initial assignment twice. Later intentional
+messages remain ordinary inputs. A native completion claim does not accept the Task.
 
-For controller-driven execution, one retained cause admits one ordinary next-turn
-input through the same action handler. Task state determines whether work can
-continue or must wait for external evidence. There is no additional native Goal
-loop. Reuse the source Operation/EventRef and Task/Attempt/Goal revision linkage;
-move native predecessor/revision handling into the adapter. Remove host Codex/OpenCode
-method selection and duplicated provider-specific contexts/receipts when these
-callers move. The retained Goal revision supplies the objective, without another
-objective approval hash.
+**Eliot Goal:** retain the Task-scoped records in Store
+[goals](../../crates/swarm-kernel-host/src/store/goals.rs). Implement its message plugin
+as a small action in the existing automation owner: selected event or due occurrence
+→ current Goal/assignment → message → `agent.send`. Reuse the scheduler's due state
+and the existing command bus; no interpreter, separate process or timer per Goal.
+The Governor selects message content, trigger/cadence and delivery mode. New and
+repeated text use the same next-turn/steer handler as a manual message.
 
-Only an authorized change after confirmed native inactivity can change drivers
-or rebind the assignment. Retain unknown stops as pending. Use the existing
-journal/pending-work owner and scheduler, with no Goal timer or replay service.
+Refactor [automation_goal_progression](../../crates/swarm-kernel-host/src/store/automation_goal_progression.rs)
+through its callers. Today it is terminal-event-only, selects Codex `agent.send`
+versus OpenCode `agent.goal continue`, and repeats that choice in validation.
+[GoalProgressionSettings](../../crates/swarm-kernel-host/src/automation/config.rs)
+contains only `goal_id`; recurring message policy is not implemented. Extend that
+small plugin configuration using existing event/interval scheduling, and change
+[action admission](../../crates/swarm-kernel-host/src/automation/actions.rs) to require
+message delivery. Remove the OpenCode pseudo-Goal path, provider-specific continuation
+contexts and objective approval hash when these callers move. Keep native Goal
+revision handling solely in its adapter.
+
+Commit each scheduled/event occurrence with its message Operation. Replaying that
+occurrence returns its original Operation; a later scheduled occurrence may carry
+the same text. After downtime, coalesce missed ticks instead of flooding the native
+inbox. Preserve uncertain sends for readback. Disabling Eliot Goal stops its future
+messages; pausing/clearing Harness Goal affects that native goal. The Governor can
+request both explicitly. Neither action implicitly cancels turns or queued input.
+
+### Passive agent observation
+
+Implement the [local view](observability.md#5-live-monitoring-and-future-charts)
+through existing owners. Observation collection is independent of automation,
+diagnostic logging and viewer count; a status read makes no harness request.
+The current `swarm-observer::host::HostRecorder` is only an optional diagnostic
+sink. Add one bounded local collection task to [host::run_until](../../crates/swarm-kernel-host/src/host.rs),
+with host startup/shutdown, outside `observability.enabled` and automation entries.
+Reuse process sampling primitives and the host-only status-delivery pattern in
+[module_supervisor_observation](../../crates/swarm-kernel-host/src/store/module_supervisor_observation.rs);
+keep its needed types/helpers in existing shared owners as worker dependencies
+are removed. This core collection lifecycle is not implemented today.
+
+1. At launch/resume/attach, retain the native session and available local source
+   reference beside the binding. Join the existing Task/Attempt/Operation to the
+   [launch workspace lease](../../crates/swarm-kernel-host/src/store/launcher.rs):
+   repository/worktree, path, assigned branch and baseline. Reuse
+   [process ownership](../../crates/swarm-process/src/module_owner.rs) and supervisor
+   observations for PID plus OS birth identity. A shared server can host many
+   sessions; native children need no invented process of their own.
+2. In the selected adapter, fold native events and read available local provider
+   JSON/JSONL/SQLite independently of its connection to the provider harness.
+   Keep the separate Eliot ModuleLink alive while native control reconnects. Use the
+   [vendor readers](donor-map.md#local-observation-sources), one bounded collector
+   per store/service scope. Tail from a retained file identity/offset; keep an
+   incomplete final record for the next read. Rotation/truncation produces a visible
+   gap. For OpenCode, revisit known open messages as well as new sequences: their
+   JSON can change in place. Use short read-only SQLite transactions with WAL
+   visibility; never run vendor migrations, checkpoints or repair.
+3. Fold compact native facts in [runtime::observe](../../crates/swarm-kernel-host/src/store/runtime.rs)
+   and expose them through [operations::get_binding_public/public_observation](../../crates/swarm-kernel-host/src/store/operations.rs).
+   Adapter facts arrive through authenticated `module.observe`; host OS/worktree
+   facts use the host-only status callback, without needing a live adapter boot.
+   Keep source time/cursor and coverage per source; an OS or quota update cannot
+   refresh old work activity. Move native interpretation, including the current
+   OpenCode-only `ses` failure-ID validation, out of this shared projection.
+   Expose relevant process/workspace/session references to authorized readers
+   without exposing credentials or private launch configuration.
+4. The core host task collects process and local Git facts independently. Read
+   branch/HEAD/dirty state once per active worktree; retain the
+   last known GitHub head from the existing integration separately. Keep bounded
+   change/event collection with a coalesced technical tick in that task, independent
+   of optional automation, so lost notifications do not freeze the view. No full transcript scan per tick,
+   per-viewer poller, new observer database or signed observation envelope.
+
+Retain the source's host/runtime/session and known local data location for bounded
+Governor inspection; resolve source references within that scope, without exposing
+launch credentials or creating a general filesystem RPC. Discovery by name/cwd is a hint until correlated;
+unmatched processes or native sessions remain visible with an unknown assignment.
+Native connection loss does not stop local parsing. If the adapter or its Eliot
+link fails, Store retains the last native snapshot with a gap while core OS/Git
+collection continues; reconnection resumes local-source reconciliation. No claim
+of fresh native data follows from that retained snapshot. New code must not
+interpret an old provider `running` field as current OS
+liveness, or turn observation into automatic ownership, cancellation or restart.
 
 ### Shared observation and quotas
 
@@ -139,12 +201,13 @@ activity/result delivery. An event reporting a limit can reuse
 pretending it supplied utilization counters. OpenCode account quota remains
 unavailable where its selected native surface provides none.
 
-Collect on connection and native changes; coalesce requested safe refreshes.
+Collect quotas on connection and native changes; coalesce requested safe refreshes.
 Share account reads only when their actual auth/quota scope is known, and never
 sum copies of one account snapshot across agents. Remove duplicate Muse Node/Rust
 normalizers with the discarded executor. Cached reads, partial data and a visible
-collection issue suffice; do not scrape service dashboards, scan transcripts or
-start a model to fill a missing percentage. Optional experimental vendor reads
+collection issue suffice; do not scrape dashboards or scan transcripts to invent
+a missing quota percentage. Local transcript observation remains a separate required
+path. Optional experimental vendor reads
 stay inside the adapter and cannot become a launch prerequisite.
 
 ## Launch and results
@@ -251,8 +314,9 @@ automatic callers. A new request ID or config revision does not create new work.
 Settings affect future admissions; an admitted action retains its inputs. Start
 checks serialize with disable. Disable-first holds unstarted work; start-first can
 finish and report its result. Separate follow-ups check current eligibility again.
-The [Goal driver](#one-goal-driver) serves the existing assignment and completion
-evidence; it does not own another task graph or timer system.
+The [Eliot Goal plugin](#harness-goals-and-the-eliot-goal-plugin) serves the existing
+assignment through ordinary messages and this scheduler. Harness Goal keeps its
+independent native lifecycle.
 
 Local delivery follows [delivery.md](delivery.md): submission A, independent
 review, manager return, correction B and fresh review before acceptance. Preserve
@@ -380,7 +444,9 @@ Choose relevant cases rather than turning this table into a new release program.
 
 | Changed boundary | Meaningful check |
 | --- | --- |
-| Shared harness control | The same controller request reaches different native mappings. Native Goal produces no Eliot continuation; managed Goal admits one per cause and waits during review. Pause with unknown outcome cannot start a second driver. Cancellation distinguishes turn, queued input and surviving work. Current Muse Rust usage reaches Store; partial/unknown quota does not erase valid activity or become zero. |
+| Shared harness control | The same controller request reaches different native mappings; unsupported native actions are explicit. Cancellation distinguishes turn, queued input and surviving work. Current Muse Rust usage reaches Store; unavailable/malformed quota does not erase valid activity or become zero. |
+| Two Goals | Native Goal works alone by default where supported; the Eliot plugin works alone or alongside it. Two scheduled occurrences may send the same text, while replay of one occurrence reuses one Operation. Plugin disable and native pause affect only their own mechanism; neither cancels active work implicitly. |
+| Passive observation | Disconnect the native control connection and read process/worktree/provider-local facts without a harness request. A collector failure preserves last facts with a gap. Cover a shared server with two managers, PID reuse, branch change, mutable open message, partial/rotated JSONL and an unmatched session; none creates a false owner or terminal result. |
 | Launch/result | Direct launch needs no preview token; stale revisions/changed workspace are rejected; ready session dispatches without MCP discovery; explicit-parent and complete serialized-turn output are attributable; an actual gap stays unresolved without replay. |
 | Delivery/automation | Manual/helper share the evidence gate: a required missing/changes-requested review fails; B needs B's pass, while checks-only policies remain possible. Disable/start ordering, late results and A→B→A ownership preserve the right work. |
 | Store | Restart/lost notification retains an action; reader snapshot is authorized and bounded; migration preserves identity and held capacity; cosmetic SQL text does not define database compatibility. |

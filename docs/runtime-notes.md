@@ -75,7 +75,7 @@
 
 **Настройки:** system-prompt snapshot при resume не равен немедленной замене через новый CLI argument. `--bare` убирает не только шум; `--bg` не синоним `-p`. Ни самовольной compaction, ни общего копирования CLI flags всем линиям.
 
-**CL-HOOKS/GOAL:** поддержанные транспорты зависят от конкретного hook; рассмотренные SessionStart/Setup не HTTP. Сначала native stream, hook — только для недостающего факта. Goal Stop-check расходует модель; один continuation owner, а Task acceptance отдельно.
+**CL-HOOKS/GOAL:** поддержанные транспорты зависят от конкретного hook; рассмотренные SessionStart/Setup не HTTP. Сначала native stream, hook — только для недостающего факта. Goal Stop-check расходует модель. Harness Goal и Eliot Goal-плагин независимы и могут сочетаться по выбору Governor; нативный механизм используется по умолчанию при поддержке. Task acceptance остаётся отдельным решением; [текущий контракт](agent-operations/module-api.md#goal-continuation).
 
 **CL-CHANNELS/SUPERVISOR:** Channels — opt-in MCP push, возможный wake для GM, не гарантия обычной MCP notification. Background supervisor roots не включают детей; respawn без истории может повторить исходный prompt. Это другой qualified route, не стандартный healer. **CL-BILLING/AUTH:** прежняя help-страница содержала UPDATE, меняющий нижний исторический billing-текст; API credential мог менять способ оплаты. Не переносить исторический тариф/фразу в финансовый fallback.
 

@@ -1,8 +1,9 @@
 # Observability — Adjustable Logs and Live Agent Monitoring
 
-Observation explains current work and failures without starting model calls.
+Observation is required product behavior. The Governor reads local facts at any
+time without making a request to the provider harness or starting a model.
 [Implementation](implementation.md) owns the remaining source changes.
-At `906f797`, [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) and
+At `f7e1b63`, [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) and
 [swarm-observer](../../crates/swarm-observer/src/host.rs) use a bounded
 Producer/HostRecorder chain. Tracing replacement and broader read-pool routing are
 targets, not implemented guarantees.
@@ -51,7 +52,8 @@ do not maintain version tables or add old-format readers to every producer.
 
 ### Host recorder configuration
 
-The optional recorder is disabled by default. Current TOML fields are:
+The optional diagnostic recorder is disabled by default. This setting does not
+disable the required agent observation projection. Current TOML fields are:
 
 ```toml
 [observability]
@@ -175,23 +177,64 @@ the recorder.
 
 ## 5. Live monitoring and future charts
 
-The target initial snapshot uses a short authorized read transaction with its
-journal cut, followed by events after that cursor. Apply the existing
+### What the Governor must see
+
+The target `agent.state` joins existing records into a bounded local view. It must
+answer who owns the work, where it runs, what it is doing and which fact is missing.
+
+| Group | Required observation |
+| --- | --- |
+| Assignment | Manager/agent, Task/Attempt, current Operation and binding/generation. Retain historical work through replacement. |
+| Native work | Provider session/root and turn/input IDs; observed child relationships; active tool, pending question/approval/child wait, terminal/error and last content activity. A containing session and a spawning parent are different relations. |
+| Process | Known module/native process, PID and OS birth identity, liveness/exit and observation time. A shared server is one process associated with several sessions. Its exit is a process fact, not completion of every assigned Task. |
+| Workspace and GitHub | Repository, worktree/path, assigned branch and baseline; separately observed checkout branch/HEAD/dirty state; last known remote branch/head and publication Operation. Local commits and worktree changes remain visible before a push. |
+| Provider data | Local JSON/JSONL/database reference, native IDs, last consumed cursor/offset, source time and collection error/gap. The authorized Governor can inspect the relevant bounded native data. |
+| Coverage | Connection health, collector health and freshness of each source, independently of work status. Include visible unmatched processes/sessions; absence of a known assignment does not hide them. |
+
+Retain the launch/attach relationship and native IDs once, then update observations.
+Do not rediscover an owner from the newest file, title, branch name or prompt text.
+Native Git metadata may describe session creation; it is not a current checkout
+read. GitHub head is last observed remote state, with its own time; viewing it does
+not trigger a network request. The existing integration can update it independently.
+
+### Collection and reading
+
+Use [the selected owners](implementation.md#passive-agent-observation) and
+[vendor-local sources](donor-map.md#local-observation-sources): native event streams,
+local provider JSON/JSONL/SQLite, OS process state and local Git. Native parsing
+stays with the selected adapter. A lost control connection does not stop its local
+file/database reader or the adapter's separate Eliot ModuleLink. The planned core
+host task collects process/worktree facts independently of the optional recorder.
+If the adapter, its Eliot link or another collector fails, preserve its last facts
+and report lost coverage; retained native data is not presented as fresh. Restart
+loads the retained view and reconciles its known sources before claiming freshness.
+
+Collect once per native store/service and once per shared worktree/process, using
+bounded incremental reads and coalesced change notifications with a periodic local
+recheck. The number of viewers does not multiply collection. `agent.state`, reports
+and subscriptions read the same projection. An explicit safe `agent.refresh` may
+ask the native service for additional facts; ordinary observation never depends
+on it. Automation and diagnostic log settings do not switch these collectors off.
+
+The initial snapshot uses a short authorized read transaction with its journal
+cut, followed by retained events after that cursor. Apply the existing
 [Store read conversion](implementation.md#store-and-current-data); ordinary reads
-are not all on a read pool today. A lagged subscriber replays retained facts;
-an expired cursor reports a gap and obtains a fresh snapshot.
+are not all on a read pool today. A lagged subscriber replays retained facts; an
+expired cursor reports a gap and obtains a fresh snapshot. Store source references
+and compact current facts, not a second copy of every transcript.
 
-Show current manager/agent work, module state, last activity, pending reason,
-queue pressure, outcome and recovery action. A viewer disconnect cannot stop the
-agent. Share process/resource observations; do not spawn a poller or model call
-for each viewer. Do not count one shared process's RSS once per hosted session.
+An alive process with a pending child/tool, an alive process with no recent
+progress, a lost connection, a confirmed process exit and an unreadable provider
+file must remain distinguishable. Show possible stalls to the Governor with the
+supporting facts. Age, low CPU, unchanged Git or an old native `running` flag alone
+proves neither death nor useless work. Observation does not silently kill, restart
+or reassign. Provider-local history is not sufficient by itself to settle an
+uncertain command or declare a Task accepted.
 
-Use the [existing state/usage projections](module-api.md#activity-and-usage-reads).
-Supervisor readiness is not native work activity, and a usage refresh is not a
-working-agent heartbeat. Display observation time and gaps. Task completion, context
-occupancy, run cost and account limits remain distinct. Coalesce safe native refresh
-requests; never sum the same account quota once per attached agent or infer zero
-remaining allowance from an unavailable read.
+Task completion, context occupancy, run cost and account limits remain distinct.
+Quota updates do not advance work activity. Share resource observations and scoped
+account snapshots; never count one shared process's RSS or one account allowance
+once per hosted session. Missing quota remains unknown.
 
 Metrics use bounded dimensions such as runtime/status. Task and Operation IDs
 belong in logs, not unlimited metric labels. Add a bounded export or chart only
@@ -202,5 +245,6 @@ for an actual consumer; OTLP, Prometheus and dashboards are optional integration
 Check principal/object scope before reads, subscription and artifact pagination.
 Validate only the observation boundary changed: relevant filter reload/expiry,
 disabled-recorder behavior, bounded loss/slow-reader gaps, split-secret redaction
-or recorder failure. Ordinary agent work must proceed with observation absent.
+or recorder failure. A failed optional recorder or one unavailable observation
+source cannot block assigned work; it must leave a visible coverage gap.
 These checks do not start a separate fleet/native qualification program.

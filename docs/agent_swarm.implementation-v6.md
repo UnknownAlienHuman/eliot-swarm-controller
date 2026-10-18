@@ -349,8 +349,8 @@ DB очередь обслуживает короткие транзакции. 
 
 Read-only `report.delta(after)` и `message.read(after)` не продвигают общий cursor. Ответ возвращает next_cursor; каждый consumer хранит свой. Delivery/ack/use/полезность — разные факты. Expired cursor обозначается явно, без молчаливого пропуска истории. GM change сохраняет pending decisions; старый GM теряет право новых команд через штатный API, но не отменяет уже допущенную работу.
 
-Automatic nudge отправляется только при новой полезной причине, actual target и разрешённой native boundary. Incident cooldown устраняет повторы; возраст alone не запускает kill/reassign. Native goal исключает параллельный таймер «продолжай». Unknown квота не превращается в ноль и не останавливает независимые accounts. Условие исключительной
-остановки ребёнка по политике владельца проверяет и отсутствие ответа, и продвижения; mtime недостаточно.
+Уточнение владельца 18.10.2026: Eliot Goal обрабатывается плагином Eliot и отправляет обычные новые/повторяющиеся сообщения по выбранной Governor политике. Он может работать одновременно с native Harness Goal; по умолчанию используется нативный механизм. Одна запланированная отправка получает одну Operation, а следующее срабатывание может повторить тот же текст. Общий scheduler и `agent.send` заменяют отдельные vendor-specific loops; [текущий implementation](agent-operations/implementation.md#harness-goals-and-the-eliot-goal-plugin) определяет владельцев. Возраст alone не запускает kill/reassign; unknown квота не превращается в ноль и не останавливает независимые accounts.
+Пассивное наблюдение независимо читает локальные native JSON/JSONL/DB, процессы и Git в общую projection. Governor читает её без запроса к harness, со временем и пробелами каждого источника; [текущий контракт](agent-operations/observability.md#5-live-monitoring-and-future-charts) сохраняет эту функциональность при упрощении.
 Drain сохраняет запрет новых assignments до сообщений, учитывает native goal и прежние root families.
 Own check Job и общий native server имеют разные правила отмены.
 

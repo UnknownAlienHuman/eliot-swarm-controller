@@ -4,7 +4,7 @@ This page explains the retained Store boundaries. The [shared method catalog](..
 and owning parsers define request fields and bounds; do not maintain another schema
 here. [Implementation](implementation.md) owns changes, [delivery](delivery.md)
 owns the work cycle, and [configuration](configuration.md) owns enabled automation.
-Source observations below apply to `906f797`; target changes are named explicitly.
+Source observations below apply to `f7e1b63`; target changes are named explicitly.
 
 ## Common harness commands
 
@@ -19,8 +19,9 @@ neither the manager nor frontends construct vendor RPC payloads.
 | Give input | `agent.send` with `next_turn` delivers another input; `steer` addresses active execution. Unsupported steering must not silently become queued input. |
 | Answer | `agent.reply` answers the exact observed pending question or approval. It neither changes the general permission mode nor starts unrelated work. |
 | Configure | `agent.configure` selects supported model/mode/options from the runtime catalog. Return requested and effective values; vendor configuration stays in the adapter/profile. |
-| Control a Goal | `agent.goal` gains the Task-scoped execution semantics [below](#goal-continuation). The manager does not select native Goal versus prompt-loop commands. |
-| Read | `agent.state` and `agent.usage` project retained observations. `agent.refresh` requests supported native reads outside Store transactions; reads never submit a model prompt. |
+| Harness Goal | `agent.goal` controls the native goal through common actions mapped by the adapter. Native Goal is the default where supported. Its objective and controls are independent of Eliot Goal. |
+| Eliot Goal | `goal.*` retains the Eliot objective; its selected plugin sends ordinary `agent.send` messages. The Governor may use it alone or alongside Harness Goal; see [Goal continuation](#goal-continuation). |
+| Read | `agent.state` and `agent.usage` read local projections, with no request to the harness. `agent.refresh` is an explicit collection command that may use supported native reads outside Store transactions; it is never an automatic prerequisite for viewing state. |
 | Get output or resolve uncertainty | `agent.result` retrieves attributable output; `agent.reconcile` reads back the original uncertain action. Neither repeats its effect. |
 | Cancel work | **New target method:** `agent.cancel` names an existing turn/input through its retained Operation, with explicit `turn` or `queued_input` scope. Reuse `operation.cancel` for unsent controller input; replace native-specific turn controls with adapter mappings. Background jobs and process shutdown are outside these two scopes. |
 | Release a connection/process | Existing `agent.shutdown` retains its explicit owned-resource scope. A turn-cancel request is not process shutdown. |
@@ -39,6 +40,7 @@ supervisor phases describe worker lifecycle, not native agent activity.
 | Readable fact | Target meaning |
 | --- | --- |
 | Activity in `agent.state` | `idle`, `running`, `waiting` or `unknown`, with current Operation/turn, pending request/reason and last native work activity. Connection health and freshness stay separate. A heartbeat or quota refresh is not work activity. |
+| Identity and location in `agent.state` | Task/Attempt and binding, native session and observed child relationship, process identity/liveness, repository/worktree, assigned and observed branch/HEAD, and local provider JSON reference. Keep each source's time and gaps. A module PID is not automatically an agent PID. |
 | Run usage | Native run/session tokens, cost and context occupancy. Attribute to an individual input only when the source supplies that scope. Cumulative snapshots are not additive deltas. |
 | Account limits in `agent.usage` | Reuse [NativeUsageSnapshot](../../crates/swarm-contracts/src/native_usage.rs): scoped buckets/windows, reset time, available credit/limit fields, source and freshness. Preserve unavailable values; context size and Goal budget do not establish account quota. |
 
@@ -50,6 +52,14 @@ one connection ID is not an account ID, and several agents do not multiply a sha
 account's allowance. Report `unsupported`, `not_observed` and stale evidence honestly.
 Fold sparse updates once in the adapter, retain the age of omitted fields, and never
 infer renewed permission from a reset clock or lower percentage alone.
+
+The target [passive collectors](implementation.md#passive-agent-observation) update
+this view from native events, local files/databases, OS process facts and local Git.
+An unavailable source leaves its last observation and an explicit gap; it does not
+erase the agent. Provider-local history is useful observation even when the control
+connection is down. It does not by itself prove that an uncertain input was accepted
+or authorize a resend. [Observability](observability.md#5-live-monitoring-and-future-charts)
+defines the Governor's combined read.
 
 ## Task planning
 
@@ -208,33 +218,37 @@ these paths; keep format validation there without adding generic compatibility r
 
 ## Goal continuation
 
-**Current:** `goal.*` manages a Task/Attempt-scoped objective and completion evidence;
-`goal.enable/disable` controls its optional reminder and starts no model work.
-Binding-scoped `agent.goal` is a different native control with
-`set/edit/pause/resume/clear/continue`. Production
+**Current:** `goal.*` manages a Task/Attempt-scoped objective, completion evidence
+and optional reminder. Its CRUD/enable calls do not directly submit model input;
+separately enabled progression can act on that record. Binding-scoped `agent.goal`
+has `set/edit/pause/resume/clear/continue`. Production
 [Goal progression](../../crates/swarm-kernel-host/src/store/automation_goal_progression.rs)
 chooses OpenCode `agent.goal continue` or Codex `agent.send next_turn`; both retain
-the original terminal EventRef and Task/Attempt/Goal linkage.
+the original terminal EventRef and Task/Attempt/Goal linkage. This is not yet the
+general Eliot message plugin; its settings have no recurring-message policy.
 
-**Target:** keep the shared Goal record authoritative. Make `agent.goal` execute
-that record by Goal ID/revision: `set` activates, `edit` updates without resuming a
-paused Goal, and `pause/resume/clear` control its execution attachment. Store derives
-the binding, objective and Task/Attempt from the retained Goal assignment. Native
-Goal state is an adapter projection, not another manager-owned
-objective. Preserve tracking/reminder methods as effect-free operations.
+**Target:** Harness Goal and Eliot Goal are independent and can coexist.
 
-Select one continuation driver for that assignment: native Goal, or the existing
-common Eliot progression using ordinary next-turn input. A native set/resume may
-start execution itself; do not also send an initial prompt or run an Eliot loop.
-The common driver continues only from attributable terminal work and current Task
-state. Waiting for a reply, review/check, known limit or uncertain outcome produces
-a pending reason, not repeated prompts. A native completion claim yields a candidate;
-Store's review/acceptance rules still decide completion.
+| Mechanism | Meaning and control |
+| --- | --- |
+| Harness Goal | The native session objective, set and controlled through `agent.goal`. The adapter maps common actions and exposes native state. The Governor uses it by default where supported; no Eliot Goal ID is required. Unsupported native control is reported, not silently emulated. |
+| Eliot Goal | The Eliot-side plugin uses its retained objective and selected event/cadence to send new or repeated messages through `agent.send`. To the harness these are ordinary inputs; they do not create or replace a native Goal. |
 
-Pause stops future continuation; cancelling active/queued work is explicit. Confirm
-native Goal inactivity before changing drivers or reusing its binding for another
-assignment. Late turns/results keep the original scope. Unknown pause/readback cannot
-start the fallback driver. Remove public `continue` and the host's vendor branches
-when their callers move to this common mechanism. [Implementation](implementation.md#shared-harness-control)
-owns the source change; [entry transfer](configuration.md#31-explicit-transfer-to-the-current-gm)
-retains historical actors and rechecks future authority.
+The Governor may give the native Goal the main implementation objective and have
+the Eliot plugin send a periodic checkpoint request, or choose either mechanism
+alone. Enabling the plugin requires no native pause or driver handover. Native set
+or resume can start work; record the resulting turns against the initiating
+Operation and avoid accidentally duplicating the initial dispatch. Deliberate
+later messages remain permitted.
+
+Each plugin occurrence gets an ordinary message Operation. Transport replay must
+reuse it; a later scheduled occurrence may intentionally repeat the same text.
+Disabling the plugin stops its future messages. Native pause/clear affects the
+native Goal only. Cancelling an active turn or queued input remains a separate
+addressed command. Neither Goal's completion claim replaces review and acceptance;
+late results retain their original Task/Attempt where assigned.
+
+Remove the host's vendor message branches and OpenCode pseudo-Goal `continue`
+when those callers move to the plugin. Keep native revision handling in adapters.
+[Implementation](implementation.md#harness-goals-and-the-eliot-goal-plugin) owns
+the source change; [configuration](configuration.md) owns plugin enablement.

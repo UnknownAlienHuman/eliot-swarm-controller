@@ -105,13 +105,39 @@ or exposing vendor RPCs to the manager.
 | --- | --- | --- |
 | Codex | App-server `thread/start`/`resume`, `turn/start`/`steer`/`interrupt`; [Goal types](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread.rs) provide `thread/goal/set`, `get`, `clear` and updates. [Goals](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex) can continue an idle thread themselves. | [Rust adapter](../../crates/swarm-adapter-codex/src/lib.rs) handles input/readback/usage but declares `agent.goal`, reply and configure unsupported. Implement mappings; do not infer vendor limitations from that declaration. |
 | Muse | MSP session/turn commands; [goal/set](https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/goal-set/) can start an idle unfinished Goal. [Sessions and turns](https://meta-models.github.io/muse-code-sdk/next/guides/msp-concepts/sessions-and-turns/) separates interrupt/cancel, unqueue and background-task controls. | Both current adapters map queued input and `turn/unqueued`, but do not expose those turn-stop commands. Preserve the existing no-run terminal handling when adding shared cancellation; select one executor. |
-| Claude | [Published SDK types](https://app.unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.301/files/sdk.d.ts): Query input/resume, permission callbacks, model/mode setters and interrupt. Its receipt can identify inputs that remain queued. No Goal control was found in the reviewed Query interface. | The current [SDK driver](../../crates/swarm-adapter-claude/sdk-harness/bridge.mjs) handles callbacks but omits these live controls and quota mapping. Use the common Eliot Goal driver; preserve cancellation scope. |
-| OpenCode | [v2 session API](https://dev.opencode.ai/v2/docs/api): prompt admission with `steer`/`queue`, durable inbox and interruption. `resume=true` after interruption can run steering/control items while queued prompts remain parked. No Goal route was found in the reviewed session API. | Map the selected HTTP/SSE surface directly in Rust. Keep native inbox ordering; replace host-owned Goal continuation with the common driver. Do not add an SDK bridge just to call HTTP. |
+| Claude | [Published SDK types](https://app.unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.301/files/sdk.d.ts): Query input/resume, permission callbacks, model/mode setters and interrupt. Its receipt can identify inputs that remain queued. No Goal control was found in the reviewed Query interface. | The current [SDK driver](../../crates/swarm-adapter-claude/sdk-harness/bridge.mjs) handles callbacks but omits these live controls and quota mapping. Declare native Goal unsupported on this surface; the Governor may select Eliot Goal messages. Preserve cancellation scope. |
+| OpenCode | [v2 session API](https://dev.opencode.ai/v2/docs/api): prompt admission with `steer`/`queue`, durable inbox and interruption. `resume=true` after interruption can run steering/control items while queued prompts remain parked. No Goal route was found in the reviewed session API. | Map the selected HTTP/SSE surface directly in Rust. Keep native inbox ordering. Move controller-generated continuation into the Eliot message plugin; do not label it a native Goal or add an SDK bridge just to call HTTP. |
 | Command ACP | [ACP prompt lifecycle](https://agentclientprotocol.com/protocol/v1/prompt-turn), session updates, advertised configuration and cancellation through the existing `agent-client-protocol` crate. | Reuse protocol types at this adapter boundary. ACP is not Eliot's bus and need not wrap native APIs of every other harness. |
 
 Muse can end a reclaimed queued turn with `turn/unqueued`, or fail launch before
 a started event. Preserve those cases; local adapters already recognize unqueued
 turns. Shared Goal/cancellation behavior belongs to [module API](module-api.md).
+
+Native Goal is the default where available. The Eliot plugin remains independently
+selectable on every runtime with suitable message delivery, including runtimes
+already running a native Goal. The [original Swarm runner](../remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md#two-goal-mechanisms)
+demonstrates native Codex Goal and ordinary steers in the same session.
+
+### Local observation sources
+
+Source recheck: 2026-10-18. Collect these beside the existing event stream and
+retain the result locally. The Governor reads the shared projection; it does not
+invoke these readers or a provider API on every status request. These are observed
+source contracts, not evidence that Eliot already implements their readers.
+
+| Harness | Local source and correlation | Implementation limit |
+| --- | --- | --- |
+| Codex | [SessionMeta/SessionMetaLine](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/protocol.rs) records thread/session/parent IDs, cwd and optional Git metadata in rollout JSONL. [Thread](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs) exposes an optional disk path. Retain that path during normal session setup; the old scripts demonstrate local rollout reading. | The path is marked unstable; ephemeral threads have no durable log. Parse the selected format in the Codex adapter. Captured Git metadata and recent rollout activity do not establish current branch or process liveness. |
+| Claude | Official [session docs](https://code.claude.com/docs/en/agent-sdk/sessions) provide local disk enumeration/read through SDK `listSessions` and `getSessionMessages`. The published types above also expose `getSessionInfo`, `listSubagents` and `getSubagentMessages`; session info can contain cwd/branch. | Use a known project/session and bounded requests; returned pagination does not guarantee bounded underlying file I/O. Message history is not a live process status. Preserve native parent-tool/agent relationships where available; do not infer missing parents. |
+| OpenCode | Current [session SQL](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/sql.ts) defines `session_v2` with parent/project/workspace/directory fields and `session_message` with session ID, sequence and JSON data. The original `Agent-Watch.py` reads these locally in read-only mode. | Keep a small adapter-owned read-only query for the selected schema, including open records updated in place. No vendor migration, private DB writes or parallel historical schema families. An unreadable schema is a coverage gap, not an empty fleet. |
+| Muse | [Session](https://meta-models.github.io/muse-code-sdk/next/generated/msp/types/session/) exposes the durable log path, workspace and optional content-activity/parent/branch/worktree facts. The original `muse_owner_activity.py` reads `session.jsonl` streams. | Empty path means no durable log. `parentSessionId` names the containing top-level session and need not identify the spawning parent. `notLoaded` is this host's view, not global death. Retain available facts without inventing a tree or live state. |
+
+Use SDK local readers where they reduce maintained code; keep small file/SQL readers
+inside the selected adapter where needed. Known paths/native IDs, incremental reads
+and source gaps replace title/mtime guesses. Ordinary filesystem identifiers and
+cursors suffice; no per-observation hash, signature or provenance registry is needed.
+The [implementation](implementation.md#passive-agent-observation) joins these sources
+with existing process ownership and workspace leases.
 
 ### Quota sources
 

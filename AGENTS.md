@@ -6,7 +6,9 @@ Use [implementation](docs/agent-operations/implementation.md) for the single wor
 order, source owners and donor choices; read the relevant source before editing.
 [Findings](docs/agent-operations/refactoring.md) explain current excess and
 [status](docs/implementation-status.md) records revision-specific evidence.
-Historical specifications are not additional requirements.
+Read historical specifications and operating scripts for required behavior.
+The owner's current decisions resolve conflicts; simplify the mechanism while
+preserving the needed functionality.
 
 ## Implement the requested responsibility
 
