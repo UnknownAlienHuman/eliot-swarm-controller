@@ -2,7 +2,7 @@
 
 Observation explains current work and failures without starting model calls.
 [Implementation](implementation.md) owns the remaining source changes.
-At `3b910fa`, [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) and
+At `906f797`, [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) and
 [swarm-observer](../../crates/swarm-observer/src/host.rs) use a bounded
 Producer/HostRecorder chain. Tracing replacement and broader read-pool routing are
 targets, not implemented guarantees.
@@ -185,6 +185,13 @@ Show current manager/agent work, module state, last activity, pending reason,
 queue pressure, outcome and recovery action. A viewer disconnect cannot stop the
 agent. Share process/resource observations; do not spawn a poller or model call
 for each viewer. Do not count one shared process's RSS once per hosted session.
+
+Use the [existing state/usage projections](module-api.md#activity-and-usage-reads).
+Supervisor readiness is not native work activity, and a usage refresh is not a
+working-agent heartbeat. Display observation time and gaps. Task completion, context
+occupancy, run cost and account limits remain distinct. Coalesce safe native refresh
+requests; never sum the same account quota once per attached agent or infer zero
+remaining allowance from an unavailable read.
 
 Metrics use bounded dimensions such as runtime/status. Task and Operation IDs
 belong in logs, not unlimited metric labels. Add a bounded export or chart only

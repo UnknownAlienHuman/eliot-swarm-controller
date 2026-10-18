@@ -1,6 +1,6 @@
 # Refactoring — Source Findings
 
-Source rechecked at `3b910fa0346a95f6132a66d01c329d2e7f67e96c` on 2026-10-18.
+Source rechecked at `906f7977273e2282205d6d06e419820af5e4ca97` on 2026-10-18.
 Owner baseline: `f1b854b6fd058dc2440d3848fc95acc279657d3f`, parent
 `27fcae1ed2d9fc0aa778680d5e39a08834248023`. The runtime is unchanged since
 `25a8e3b`; subsequent preparation commits change documentation.
@@ -29,6 +29,8 @@ surfaces, not promised deletions; overlapping surfaces cannot be added.
 
 | Boundary | Source observation | Implementation owner |
 | --- | --- | --- |
+| Harness commands and Goals | [Goal progression](../../crates/swarm-kernel-host/src/store/automation_goal_progression.rs) branches in production between Codex `agent.send` and OpenCode `agent.goal`, then repeats that choice at dispatch validation. Codex's native Goal API exists, but the [Rust adapter](../../crates/swarm-adapter-codex/src/lib.rs) declares it unsupported. Common intent, native mapping and actual adapter coverage are different responsibilities. | [Shared harness control](implementation.md#shared-harness-control) |
+| Muse quota ingress | Rust [projector](../../crates/swarm-adapter-muse/src/observations.rs) emits `NativeUsageSnapshot`; [Store parser](../../crates/swarm-kernel-host/src/store/native_usage.rs) allows Muse only from Node bridge `.9`–`.13`. A `muse-rust-controller.1` snapshot fails `NATIVE_USAGE_SOURCE_MISMATCH`. The `?` in [runtime::observe](../../crates/swarm-kernel-host/src/store/runtime.rs) aborts the entire containing observation before insertion. This is a source integration defect, not a reproduced live failure. | [Shared observation and quotas](implementation.md#shared-observation-and-quotas) |
 | First dispatch | [launcher_dispatch](../../crates/swarm-kernel-host/src/store/launcher_dispatch.rs) calls `require_current_dispatch_capability` at admission/coalesced dispatch; OpenCode/Muse branches require MCP connection evidence. | [Launch and results](implementation.md#launch-and-results) |
 | Result collection | OpenCode [native reader](../../crates/swarm-adapter-opencode/src/native.rs) rejects missing assistant `parentID`; the standalone path has no implemented admitted-turn-window alternative yet. An actual circular MCP/model deadlock was not established. | [Launch and results](implementation.md#launch-and-results) |
 | Required review | Direct [acceptance::evidence](../../crates/swarm-kernel-host/src/store/acceptance.rs) checks caller-authored review coverage, not assigned review results. Only [automation acceptance](../../crates/swarm-kernel-host/src/store/automation_acceptance.rs) requires the retained assigned pass. An authorized acceptor distinct from the author can therefore accept a review-required candidate without that candidate's independent review. This is a process prerequisite gap, not extra caller authority. | [Automation and delivery](implementation.md#automation-and-delivery) |
@@ -109,12 +111,18 @@ verification have real consumers; do not label every digest unused. The
   the former documentation's universal field list and fleet-wide config ACKs
   were not implemented interfaces. Remove those prescriptions, not working scope
   checks. Tracing remains a replacement target.
+- `NativeUsageSnapshot` and its Store latest-snapshot reader already exist; neither
+  needs a second quota service. Native activity still lacks a common projection.
+  Muse Node and Rust already recognize `turn/unqueued`; a hypothetical waiter that
+  only accepts `turn/completed` is not evidence of a current dispatch hang.
 
-## CLI reduction implemented in the preparation branch
+## CLI reduction implemented in main
 
-[PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183), commit
-`25a8e3b`, removed duplicate application CLI/MCP launch mapping from
+Commit `25a8e3b`, included in `main` through `906f797`, removed duplicate application
+CLI/MCP launch mapping from
 [host main](../../crates/swarm-kernel-host/src/main.rs): 1,949 → 743 physical lines,
 net −1,206. Its 87-line parser-test section is unchanged. Public commands remain
 in `swarm-cli`; host delegates/internal workers remain. Subsequent documentation
 reduction is not additional Rust deletion or completed runtime qualification.
+The preparation [PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183)
+is closed; its prepared commits are in `main`.

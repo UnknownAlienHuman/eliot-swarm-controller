@@ -4,7 +4,52 @@ This page explains the retained Store boundaries. The [shared method catalog](..
 and owning parsers define request fields and bounds; do not maintain another schema
 here. [Implementation](implementation.md) owns changes, [delivery](delivery.md)
 owns the work cycle, and [configuration](configuration.md) owns enabled automation.
-Source observations below apply to `3b910fa`; target changes are named explicitly.
+Source observations below apply to `906f797`; target changes are named explicitly.
+
+## Common harness commands
+
+The target controller uses one semantic vocabulary. Reuse
+[RuntimeCommandKind](../../crates/swarm-contracts/src/module_command.rs), the method
+catalog and existing Store admission. Adapter declarations describe actual support;
+neither the manager nor frontends construct vendor RPC payloads.
+
+| Action | Shared boundary and target meaning |
+| --- | --- |
+| Open or resume | `agent.open` resolves the selected session; `task.dispatch` starts the assigned Task/Attempt with Store's task prompt. |
+| Give input | `agent.send` with `next_turn` delivers another input; `steer` addresses active execution. Unsupported steering must not silently become queued input. |
+| Answer | `agent.reply` answers the exact observed pending question or approval. It neither changes the general permission mode nor starts unrelated work. |
+| Configure | `agent.configure` selects supported model/mode/options from the runtime catalog. Return requested and effective values; vendor configuration stays in the adapter/profile. |
+| Control a Goal | `agent.goal` gains the Task-scoped execution semantics [below](#goal-continuation). The manager does not select native Goal versus prompt-loop commands. |
+| Read | `agent.state` and `agent.usage` project retained observations. `agent.refresh` requests supported native reads outside Store transactions; reads never submit a model prompt. |
+| Get output or resolve uncertainty | `agent.result` retrieves attributable output; `agent.reconcile` reads back the original uncertain action. Neither repeats its effect. |
+| Cancel work | **New target method:** `agent.cancel` names an existing turn/input through its retained Operation, with explicit `turn` or `queued_input` scope. Reuse `operation.cancel` for unsent controller input; replace native-specific turn controls with adapter mappings. Background jobs and process shutdown are outside these two scopes. |
+| Release a connection/process | Existing `agent.shutdown` retains its explicit owned-resource scope. A turn-cancel request is not process shutdown. |
+
+Admission, native input acceptance, turn termination and Task acceptance are separate
+facts. An applied input Operation can mean the native queue accepted it; it does
+not promise a finished turn. Preserve native queue item/turn handles in the adapter
+and expose their disposition through that Operation, without copying the native queue.
+
+## Activity and usage reads
+
+Extend the existing projections rather than adding `agent.status` or a quota service.
+Current `agent.state` returns a [binding projection](../../crates/swarm-kernel-host/src/store/operations.rs);
+supervisor phases describe worker lifecycle, not native agent activity.
+
+| Readable fact | Target meaning |
+| --- | --- |
+| Activity in `agent.state` | `idle`, `running`, `waiting` or `unknown`, with current Operation/turn, pending request/reason and last native work activity. Connection health and freshness stay separate. A heartbeat or quota refresh is not work activity. |
+| Run usage | Native run/session tokens, cost and context occupancy. Attribute to an individual input only when the source supplies that scope. Cumulative snapshots are not additive deltas. |
+| Account limits in `agent.usage` | Reuse [NativeUsageSnapshot](../../crates/swarm-contracts/src/native_usage.rs): scoped buckets/windows, reset time, available credit/limit fields, source and freshness. Preserve unavailable values; context size and Goal budget do not establish account quota. |
+
+The [usage reader](../../crates/swarm-kernel-host/src/store/native_usage.rs) already
+retains the latest snapshot and makes it stale after connection/boot/release changes.
+It currently admits Codex and enumerated Muse Node bridges; the Rust Muse producer
+is [incorrectly rejected](refactoring.md#current-source-gaps). Fix this same path;
+one connection ID is not an account ID, and several agents do not multiply a shared
+account's allowance. Report `unsupported`, `not_observed` and stale evidence honestly.
+Fold sparse updates once in the adapter, retain the age of omitted fields, and never
+infer renewed permission from a reset clock or lower percentage alone.
 
 ## Task planning
 
@@ -163,14 +208,33 @@ these paths; keep format validation there without adding generic compatibility r
 
 ## Goal continuation
 
-An enabled `goal_progression` entry selects an existing shared Goal and the same
-active Task/Attempt. A synchronized completed terminal event from the admitted
-input can occupy one continuation slot; native input admission alone cannot.
+**Current:** `goal.*` manages a Task/Attempt-scoped objective and completion evidence;
+`goal.enable/disable` controls its optional reminder and starts no model work.
+Binding-scoped `agent.goal` is a different native control with
+`set/edit/pause/resume/clear/continue`. Production
+[Goal progression](../../crates/swarm-kernel-host/src/store/automation_goal_progression.rs)
+chooses OpenCode `agent.goal continue` or Codex `agent.send next_turn`; both retain
+the original terminal EventRef and Task/Attempt/Goal linkage.
 
-The current source uses the OpenCode path and a retained terminal EventRef tied to
-Operation, native input/session, binding generation and Goal revision. Reconciliation
-admits or reuses one `agent.goal` continuation for that cause. It creates no new
-Task graph or independent timer. Disabling future progression preserves readback
-of the prior input. GM handover alone does not transfer the automation entry;
-[explicit transfer](configuration.md#31-explicit-transfer-to-the-current-gm)
-revalidates future admissions while retaining historical actors.
+**Target:** keep the shared Goal record authoritative. Make `agent.goal` execute
+that record by Goal ID/revision: `set` activates, `edit` updates without resuming a
+paused Goal, and `pause/resume/clear` control its execution attachment. Store derives
+the binding, objective and Task/Attempt from the retained Goal assignment. Native
+Goal state is an adapter projection, not another manager-owned
+objective. Preserve tracking/reminder methods as effect-free operations.
+
+Select one continuation driver for that assignment: native Goal, or the existing
+common Eliot progression using ordinary next-turn input. A native set/resume may
+start execution itself; do not also send an initial prompt or run an Eliot loop.
+The common driver continues only from attributable terminal work and current Task
+state. Waiting for a reply, review/check, known limit or uncertain outcome produces
+a pending reason, not repeated prompts. A native completion claim yields a candidate;
+Store's review/acceptance rules still decide completion.
+
+Pause stops future continuation; cancelling active/queued work is explicit. Confirm
+native Goal inactivity before changing drivers or reusing its binding for another
+assignment. Late turns/results keep the original scope. Unknown pause/readback cannot
+start the fallback driver. Remove public `continue` and the host's vendor branches
+when their callers move to this common mechanism. [Implementation](implementation.md#shared-harness-control)
+owns the source change; [entry transfer](configuration.md#31-explicit-transfer-to-the-current-gm)
+retains historical actors and rechecks future authority.

@@ -14,7 +14,7 @@ The operations program now also includes [Modular Runtime](modularity.md) and [O
 
 Earlier ELIOT inspection used `504199d14135c030ad3951a3c5023a098a3d03f0`.
 Use [source findings](refactoring.md) for current call sites and corrected audit
-claims at `3b910fa`. [Architecture](architecture.md) owns the product manifesto;
+claims at `906f797`. [Architecture](architecture.md) owns the product manifesto;
 [implementation](implementation.md) owns source changes and donor choices;
 [delivery](delivery.md) owns work transitions. Earlier owner-policy editions are
 historical decisions, not runtime rights.
@@ -83,7 +83,7 @@ The [donor inventory](../agent_swarm.donors-20260929.toml) records inspected lib
 | Donor | Inspected unit | Useful mechanism | Boundary |
 |---|---|---|---|
 | **Waku** | [`crates/waku-core/src/driver/opencode.rs` at 10bcd728](https://github.com/egoist/waku/blob/10bcd728c9b2f07d664cfece3c8c870d3418ddd2/crates/waku-core/src/driver/opencode.rs) | One sequential command/event worker; `session.execution.*` settles an open turn once. ELIOT adds the [admitted-Operation window](implementation.md#launch-and-results) and retains its body. | This is inspected donor evidence, not a local dependency. Missing parent pointers alone do not reject an attributable result; settlement is not ELIOT input-correlation proof. |
-| **Paseo** | [`agent-loading.ts` at b4af508e](https://github.com/getpaseo/paseo/blob/b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7/packages/server/src/server/agent/agent-loading.ts); earlier timeline units remain in the inventory. | `pendingAgentInitializations` coalesces initialization, and `waitForAgentClose` separates closing from new initialization. | Reuse the single-flight/lifecycle pattern; it is not evidence of ELIOT result attribution or durable completion. |
+| **Paseo** | [`AgentClient`/`AgentSession`](https://github.com/getpaseo/paseo/blob/main/packages/server/src/server/agent/agent-sdk-types.ts), rechecked 2026-10-18; [`agent-loading.ts` at b4af508e](https://github.com/getpaseo/paseo/blob/b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7/packages/server/src/server/agent/agent-loading.ts). | One session-facing vocabulary, declared capabilities and optional native controls; initialization is coalesced and waits for close. | Borrow this narrow shape into existing Eliot contracts. Do not copy its timeline/UI/persistence model, broad feature flags or large provider implementations. Eliot retains Operation/result attribution. |
 | **CCCC** | Recorded delivery unit `crates/cccc-core/src/connect_delivery.rs`; separate Windows crate linked above. | Delivery identity, actor generation and recipient-scoped reply/cancel patterns; complete suspended-child primitive where needed. ELIOT owns its SQLite commit-before-notify rule. | Keep delivery and process units distinct; neither imports a CCCC scheduler, ledger or observer-loss stop policy. |
 | **Agent of Empires (AoE)** | Recorded `src/plugin/automation_policy.rs` at a8e8b3b1. | Active + reserved accounting and unknown-mode handling. The donor's pending reservations are in memory; indexed relational durability is the ELIOT V3 requirement. | Migrate current per-entry `meta` records and retained legacy ledgers into Store tables while preserving held reservations. |
 | **Claw** | Recorded verifier/guard pattern at ffa595ab; see inventory. | Guarded writer, caller-owned checks and evidence-based verdicts. ELIOT implements bounded check execution through its existing process/capture owners. | Keep CheckRunner execution outside Store transactions; do not import another journal or workflow authority. |
@@ -92,61 +92,68 @@ The [donor inventory](../agent_swarm.donors-20260929.toml) records inspected lib
 
 ## 9. Official Vendor SDKs and Native Protocol Boundaries
 
-Use official protocol crates at actual protocol boundaries: ACP through
-`agent-client-protocol`, MCP through `rmcp`. Documented native APIs such as
-[Codex app-server](https://developers.openai.com/codex/app-server/) and
-[OpenCode HTTP/SSE](https://opencode.ai/docs/) may be called directly from Rust.
-A vendor SDK may supply native transport/session handles through a thin driver;
-Rust owns `ModuleLink`, supervision, admitted identity and durable Store receipts.
-No SDK introduces a second Eliot job ledger or independent uncertain-input replay.
+Use the [common Eliot commands](module-api.md#common-harness-commands), translated
+inside the selected adapter. The native APIs below were inspected on 2026-10-18;
+their existence does not mean the current Eliot adapter maps them. Muse `next`
+documents experimental MSP; OpenCode v2 is a different surface from older server
+guides. Use the actual selected protocol, without retaining every historical dialect
+or exposing vendor RPCs to the manager.
 
-**CODE, Muse SDK rechecked at recorded source commit `a7c10c5`:**
-[`Connection`](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/connection/connection.ts)
-accepts a transport and a caller-supplied `CommandOptions.commandId`.
-The high-level [`Session`](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/facade/session.ts)
-creates pending-command/turn/gap helpers and drives command replay during recovery.
-[`SessionFold`](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/fold/session-fold.ts)
-provides a separate in-memory event projection. This source observation does not
-prove equality with the installed npm tarball; the [donor inventory](../agent_swarm.donors-20260929.toml)
-records `published_artifact_version_verified = false` for this SDK source pin.
+### Command mappings
 
-**DESIGN, bounded replacement candidate:** compare lower-level `Connection` and
-direct event-fold reuse with the existing Rust transport and Node bridge, without
-the `Session` recovery coordinator. Rust must
-persist `NativePending` before I/O and validate/retain the exact command/boot/ACK
-identity. Direct adoption of `Session` would add another replay owner and is not
-accepted as that replacement. The [Rust transport](../../crates/swarm-adapter-muse/src/msp.rs)
-is 1,597 physical lines, with 927 preceding its explicit test module; these are not
-927 removable lines. It already uses `jsonrpsee` and `tokio-util`. A new Rust–Node
-bridge could exceed the saving. Count all
-owned languages, IPC glue and retained compatibility before adopting it; do not
-build a new wrapper solely to move Rust lines elsewhere.
+| Harness | Native mechanism to reuse | Current Eliot work |
+| --- | --- | --- |
+| Codex | App-server `thread/start`/`resume`, `turn/start`/`steer`/`interrupt`; [Goal types](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread.rs) provide `thread/goal/set`, `get`, `clear` and updates. [Goals](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex) can continue an idle thread themselves. | [Rust adapter](../../crates/swarm-adapter-codex/src/lib.rs) handles input/readback/usage but declares `agent.goal`, reply and configure unsupported. Implement mappings; do not infer vendor limitations from that declaration. |
+| Muse | MSP session/turn commands; [goal/set](https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/goal-set/) can start an idle unfinished Goal. [Sessions and turns](https://meta-models.github.io/muse-code-sdk/next/guides/msp-concepts/sessions-and-turns/) separates interrupt/cancel, unqueue and background-task controls. | Both current adapters map queued input and `turn/unqueued`, but do not expose those turn-stop commands. Preserve the existing no-run terminal handling when adding shared cancellation; select one executor. |
+| Claude | [Published SDK types](https://app.unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.301/files/sdk.d.ts): Query input/resume, permission callbacks, model/mode setters and interrupt. Its receipt can identify inputs that remain queued. No Goal control was found in the reviewed Query interface. | The current [SDK driver](../../crates/swarm-adapter-claude/sdk-harness/bridge.mjs) handles callbacks but omits these live controls and quota mapping. Use the common Eliot Goal driver; preserve cancellation scope. |
+| OpenCode | [v2 session API](https://dev.opencode.ai/v2/docs/api): prompt admission with `steer`/`queue`, durable inbox and interruption. `resume=true` after interruption can run steering/control items while queued prompts remain parked. No Goal route was found in the reviewed session API. | Map the selected HTTP/SSE surface directly in Rust. Keep native inbox ordering; replace host-owned Goal continuation with the common driver. Do not add an SDK bridge just to call HTTP. |
+| Command ACP | [ACP prompt lifecycle](https://agentclientprotocol.com/protocol/v1/prompt-turn), session updates, advertised configuration and cancellation through the existing `agent-client-protocol` crate. | Reuse protocol types at this adapter boundary. ACP is not Eliot's bus and need not wrap native APIs of every other harness. |
 
-**CODE, close semantics rechecked 2026-10-18:** for a process-owning transport with
-`close(flushed)`, `Connection.close` passes its submission tail. The transport
-contract requires waiting for frames to be handed to `write` within its own
-shutdown budget; the connection owns neither that budget nor process signals.
-Submission is not native admission or completed execution. Eliot's
-Rust `msp.rs` already separates submitted/response receipts and fences ingress on
-close; adding another close wrapper would duplicate that work. Its current
-`RunOwner::join` can nevertheless wait indefinitely before custody join. Apply
-the [owner-level stop decision](implementation.md#recovery-and-progress), preserving
-custody and uncertain effects rather than treating a dropped future as cancellation.
-Muse's addressed `userInput/cancel` is not a turn-cancel API. This donor comparison
-does not qualify the installed SDK package or justify a third Muse implementation.
+Muse can end a reclaimed queued turn with `turn/unqueued`, or fail launch before
+a started event. Preserve those cases; local adapters already recognize unqueued
+turns. Shared Goal/cancellation behavior belongs to [module API](module-api.md).
 
-Accept installed runtimes by documented protocol/capability compatibility.
-Selected local artifact digests and historical request/checkpoint bytes remain
-exact. Source refactoring does not wait for all-runtime native qualification;
-use a [finite transition](implementation.md#current-format-and-existing-data)
-for actual required data, then remove the old executor and readers.
+### Quota sources
 
-GitHub references:
+| Source | What the adapter can report |
+| --- | --- |
+| Codex [account protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs) | `account/rateLimits/read` supplies account buckets/windows and optional credit/spend/permission facts. Updated notifications are sparse: merge or refetch. Thread token usage is separate. Preserve field age; a rolling update does not prove ordinary usage recovered. |
+| Muse [SubscriptionUsage](https://meta-models.github.io/muse-code-sdk/next/generated/msp/types/subscriptionusage/) | `usage/read` and `usage/changed` supply current/weekly usage and reset times. `observedAtMs` is arrival time, not a live provider clock. No absolute remaining allowance is supplied. Credential/account state is a separate read. |
+| Claude SDK types above | `rate_limit_event` carries status/reset hints; its `utilization` unit is not documented in that type. The experimental structured usage read supplies explicit percentage windows, sometimes unavailable. If used, `skipBehaviors:true` avoids transcript scanning. Keep this unstable read optional and inside the adapter; do not guess event units. |
+| OpenCode [Console Budgets API](https://dev.opencode.ai/v2/docs/console/api/budgets/) | Workspace-member monthly budgets have their own account/auth scope. They are not remaining Go subscription quota or a session token counter. Absent native account evidence stays unavailable. |
 
-- [Webhook practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks), [signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [REST practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api): authenticated intake, paging, dedupe and reconciliation at the retained integration boundary.
-- [Check runs](https://docs.github.com/en/rest/checks/runs), [protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches): exact candidate evidence, remote IDs and truthful conclusions; labels are not acceptance.
-- [PR endpoints](https://docs.github.com/en/rest/pulls/pulls), [merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue): head/base/actual merged result differ; queue capability is optional, not a local distributor dependency.
-- [Disable workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows), [cancel a run](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/cancel-a-workflow-run), [trigger workflows](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow): trigger settings, live execution and credential behavior differ. A local disable does not alter remote settings or prove cancellation.
+Preserve native units and unavailable fields, including genuine over-100 usage.
+The [existing projection](module-api.md#activity-and-usage-reads) owns the shared meaning.
+
+### Muse SDK ownership and code reduction
+
+The inspected SDK [Connection](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/connection/connection.ts)
+takes a transport and caller command ID. The existing [Node bridge](../../modules/muse/bridge.mjs)
+already supplies that ID and `maxAttempts:1`; add no retry wrapper.
+[Session](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/facade/session.ts)
+also coordinates recovery/replay, while [SessionFold](https://github.com/meta-models/muse-code-sdk/blob/a7c10c5dd3f66be412077d29f9d11111af70317b/clients/sdk-ts/src/fold/session-fold.ts)
+is an independent event projection. Compare lower-level reuse against the two
+existing executors; do not import another replay owner or create a third bridge.
+
+Rust [msp.rs](../../crates/swarm-adapter-muse/src/msp.rs) has 1,597 physical lines,
+927 before its explicit test module, and already uses jsonrpsee/tokio-util. Those
+are not automatically removable lines: count Rust, JS and IPC glue together.
+Connection close hands the submission tail to its process-owning transport, whose
+budget covers handoff to writes, not native completion. Eliot already distinguishes
+submission and response; its unbounded owner stop wait needs the
+[existing-owner fix](implementation.md#recovery-and-progress), not another close
+coordinator. Source inspection does not establish the installed npm artifact.
+
+### Optional GitHub service boundaries
+
+Keep the existing `gh` effect owner unless a retained requirement justifies replacing
+it. [REST practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
+supply paging and bounded readback; [webhook signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
+belongs at authenticated intake. [Check runs](https://docs.github.com/en/rest/checks/runs)
+and [PR endpoints](https://docs.github.com/en/rest/pulls/pulls) describe remote candidate
+evidence and effects, not local Task acceptance. Trigger disable and run cancellation
+are distinct [Actions operations](https://docs.github.com/en/rest/actions/workflow-runs).
+No merge queue or publication engine is required for local delivery.
 
 ## 10. Owner operating evidence
 
@@ -167,19 +174,6 @@ adapter as ordinary package contents: the current policy file also lists the
 Antigravity Node bridge resources. Removing a policy must not omit that used bridge.
 Cargo lock resolution is a build input, not a requirement that two communicating
 processes have identical checkouts, compilers or cache directories.
-
-The inspected Waku driver has one sequential command/event worker and one turn
-settlement function. Paseo's 153-line loading unit coalesces initialization and
-waits for close. These narrow patterns support one owner with fewer competing
-paths; copying either entire orchestrator would add unrelated behavior.
-
-Muse `Connection.command` defaults to up to three attempts, only for its explicit
-`overloaded`/`backpressured` no-admission errors. The existing
-[Node bridge](../../modules/muse/bridge.mjs) already supplies `commandId` and
-`maxAttempts:1`; do not invent a missing retry-control wrapper. Its high-level
-`Session` additionally owns recovery/replay. Compare the existing lower-level
-reuse and required result/ownership consumers before choosing between the two
-Muse implementations. Source commit observations do not certify an npm artifact.
 
 A dependency is integrated when a real caller uses it and its replaced mechanism
 is removed. Pattern-only donors do not justify importing another workflow engine.

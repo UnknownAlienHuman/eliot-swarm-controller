@@ -23,8 +23,9 @@ Historical specifications are not additional requirements.
 
 ## Integrate and verify
 
-One manager owns one worktree and integrates the branch. Delegate narrow,
-non-overlapping assignments and review the combined caller-to-result path.
+One manager owns one worktree. Publish this preparation directly to `main`, as
+the owner requested; do not create another PR. Delegate narrow, non-overlapping
+assignments and review the combined caller-to-result path.
 Coordinate shared files and builds. Follow the owner's chosen agent models.
 
 Use the existing [scoped checks](docs/ci-scoped-builds.md) for changed behavior and

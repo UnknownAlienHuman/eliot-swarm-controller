@@ -8,33 +8,35 @@ currently installed machines or claim a complete product acceptance run.
 
 The owner-supplied baseline is
 [`f1b854b6`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/f1b854b6fd058dc2440d3848fc95acc279657d3f),
-on `27fcae1e`. The preparation checkout studied on 18 October is
-[`3b910fa`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/3b910fa0346a95f6132a66d01c329d2e7f67e96c),
-with runtime source unchanged since `25a8e3bc`. Older installed artifacts and receipts retain their own source and run identities.
+on `27fcae1e`. Prepared work through
+[`906f797`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/906f7977273e2282205d6d06e419820af5e4ca97)
+is in `main` as of 18 October; [PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183)
+is closed. Runtime source is unchanged since `25a8e3bc`. Older installed artifacts
+and receipts retain their own source and run identities.
 [Implementation](agent-operations/implementation.md) owns the current work order;
 [source findings](agent-operations/refactoring.md) explain reductions. This page
 records implementation and evidence.
 
-### Reduction program and documentation — 2026-10-18
+### Architecture and refactoring preparation — 2026-10-18
 
 [Architecture](agent-operations/architecture.md) is now a short product manifesto;
 [implementation](agent-operations/implementation.md) owns concrete source owners,
-replacements and checks. Source study covers preview/schema/credential coupling,
-the manual acceptance path's missing assigned-review gate, result-file/receipt
-ordering and unbounded Muse stop waits. Delivery, module API and observability
-now describe their existing owners without parallel work programs, duplicate
-review proofs or a universal diagnostic DTO.
+replacements and checks. The current pass defines one harness command vocabulary,
+native versus common Eliot Goal continuation, cancellation scope and shared
+activity/quota reads. [Donor mappings](agent-operations/donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries)
+separate vendor APIs from missing adapter mappings. Source study also covers
+preview/schema/credential coupling, the manual acceptance gate, result-file/receipt
+ordering and unbounded Muse stop waits.
 Communication has [one compact contract](agent-communication-program.md). These are
 documentation changes and deletion targets, not completed runtime removals or new
 native qualification. The earlier CLI implementation is scoped below.
 
-### CLI ownership reduction — PR #183 candidate
+### CLI ownership reduction — in main
 
-[PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183)
-removes the host's duplicate general application CLI and MCP launcher. Public
+Commit `25a8e3b` removes the host's duplicate general application CLI and MCP launcher. Public
 `swarm` commands remain in `swarm-cli`; the host retains delegated local admin,
 daemon and worker entrypoints. The
-[refactoring map](agent-operations/refactoring.md#cli-reduction-implemented-in-the-preparation-branch)
+[refactoring map](agent-operations/refactoring.md#cli-reduction-implemented-in-main)
 records the net 1,206-line Rust deletion. This is the earlier source change;
 method parity and the integrated native workflow remain broader unresolved work.
 
@@ -46,6 +48,7 @@ source observations, not measured speedups or completed deletions.
 
 | Area | Current source and remaining gap |
 | --- | --- |
+| Shared harness control | Vendor-specific Goal branches still live in Store. Codex native Goal and Claude SDK live controls/usage exist upstream but are not mapped by the current selected adapters. Muse Rust produces quota snapshots that Store's Node-only artifact list rejects, also rejecting accompanying activity. The common command/projection replacement is documented, not implemented. |
 | Manager → agent → result → review | Store owns durable work and complete-result validation. Direct `task.accept` still accepts caller-authored requirement reviews; only its automatic producer requires an assigned pass. Moving that prerequisite into the shared handler and retaining review references is pending. The named historical accepted Task below does not prove this prerequisite is enforced on every call. |
 | Store reads | Most reads still use the single writer queue. Status/monitor have a separate FIFO reader. Existing reader primitives can support bounded snapshots, but the broader read-path reduction is not implemented. |
 | Capacity and automation state | Capacity v2 separates a scope header and JSON rows in `meta`; the v1 whole-ledger reader remains. Automation still stores sealed configuration/state and owner-dependent entry keys with transfer journals. Relational simplification and stable entry identity remain candidates. |
