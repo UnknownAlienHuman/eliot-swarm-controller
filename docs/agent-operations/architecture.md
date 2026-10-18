@@ -1,99 +1,121 @@
 # Eliot Swarm Controller — Architecture
 
 This manifesto defines the product and constrains its code. Keep it in the lead
-developer's context. [Implementation](implementation.md) owns source owners,
+developer's context. [Implementation](implementation.md) owns source changes,
 algorithms and donor choices; [status](../implementation-status.md) records what
-exists. This is the target, not a claim that the rewrite is complete.
+exists. This is the target, not a claim that the refactor is complete.
 
 ## Purpose
 
-Eliot carries work from assignment to a reviewed, accepted result using native
-coding agents. It makes execution, output, ownership and remaining work visible,
-reducing repeated effort and manager attention. Activity, code volume and elaborate
-evidence machinery are not measures of completion.
+Eliot carries assigned work through native coding agents to an attributable result,
+independent review, correction and acceptance. It tells the Governor who is working,
+where, on what, with which native session, process, worktree and GitHub branch, and
+what is waiting or broken. Activity, code volume and elaborate evidence machinery
+are not measures of completion.
 
 ## Product boundary
 
-The core covers assignments, agent execution, attributable results, independent
-review, correction, acceptance and observation. The Governor coordinates this work
-through the same commands available to other authorized managers. It must know
-who is working where, what is waiting and which execution has failed.
+The compact core owns assignments, Operations, agent control, results, review,
+acceptance, scheduling selected helpers and local observation. Management is manual
+by default. A manager may enable helpers that invoke the same authorized actions as
+direct commands.
 
-Management is manual by default. A manager can enable selected helpers within
-their existing authority. Helpers use the same actions as direct commands.
-GitHub publication, hooks, scripts and remote access are optional integrations.
-Council rounds, generic agreement/ACK engines and automatic Issue-label
-publication are outside the compact core.
+GitHub publication, hooks, scripts, remote access and diagnostics are optional
+integrations. Council rounds, generic agreement/ratification engines, automatic
+Issue-label publication and compatibility with abandoned internal experiments are
+not core requirements.
 
-## One command language, one owner
+## One semantic language, thin adapters
 
-The manager gives every harness the same kinds of tasks and commands. The adapter
-translates their meaning into native calls and translates observations back.
-Vendor method names, payload quirks and protocol versions stay at that boundary.
+The controller gives every harness the same semantic actions. An adapter translates
+those actions into native calls and translates native facts back. Vendor method
+names, payloads, protocol versions, storage formats and recovery details stop at
+that boundary.
 
-One durable controller owns work state and decisions. Each adapter owns its native
-connection; each process has one lifecycle owner. Frontends expose shared actions.
-These owners do not duplicate execution, scheduling, authorization or recovery.
+The common language covers opening or resuming a session, assigning work, sending
+or steering input, replying to a pending request, configuring supported options,
+controlling a native Goal, moving eligible work to background, cancelling an exact
+turn or queued input, refreshing safe native facts, retrieving output, reconciling
+an uncertain action and releasing owned resources.
+
+Capabilities describe which semantic actions and scopes an adapter implements.
+They route commands; they never grant rights. Store authorization remains the only
+permission boundary. Package versions, build IDs and schema inventories are not a
+behavioral API and must not become a permanent compatibility matrix in the core.
+
+Each adapter owns one native connection and one ordered native command/event loop.
+Shared adapter plumbing may own authenticated Eliot IPC, hello, command pulling and
+re-delivery of already-retained Eliot records. It must not own vendor state,
+recovery policy, Task state or another scheduler.
+
+## Goals
 
 Harness Goal is the vendor's native mechanism and the default when available.
 Eliot Goal is an optional Eliot-side plugin that sends ordinary new or repeated
-messages. The Governor can use either or combine both, with different objectives
-if needed. Each retains its own controls; neither accepts a Task on the strength
-of a native completion claim.
+messages. The Governor may use either or combine both, with different objectives.
+Their controls are independent. Neither a native Goal completion nor a repeated
+Eliot message accepts a Task.
 
-Rust owns the control plane. Use maintained native APIs and SDKs for capabilities
-that already exist. Keep a thin SDK driver when it reduces total maintained code.
-Adapters can change without rebuilding the controller. Small internal helpers
-remain ordinary code rather than separate services.
+## Progress and results
 
-## Work must progress
+An authorized request can start assigned work directly. Preview is optional.
+A prepared workspace and usable native session permit the first input; optional
+MCP discovery, telemetry or diagnostic probes cannot block it.
 
-An authorized request can start assigned work directly; preview is optional.
-A ready workspace and session permit the first input. Optional telemetry or tool
-discovery cannot hold it up. Return complete output associated with that input,
-including protocols that omit repeated parent IDs. Unsupported actions and missing
-output have explicit reasons.
+Every input has one admitted Operation. The adapter associates native turns and
+output with that Operation even when the harness omits repeated parent IDs. Unknown
+delivery or output stays unknown and is read back; it is never resent by guess.
+Complete result bytes are retained once and remain attached to the original Task,
+Attempt and candidate. Late results do not change ownership or acceptance.
 
-Agent observation is core functionality. The Governor can read local state at any
-time without querying the provider harness. Eliot correlates assignments, native
-sessions and provider JSON with their processes, worktrees and GitHub branches.
-Local collection continues through loss of the native control connection; retained
-facts remain readable through collector failures, with their freshness and gaps.
-Execution, process health, connection, Task completion and account limits remain
-distinct. Unknown quota is never zero. Disabling automation or diagnostic logging
-does not disable observation or manual control.
+Stopping future continuation, cancelling a turn, removing queued input and closing
+a process are different actions with explicit subjects and observable outcomes.
 
-Stopping future continuation preserves running work and its results. Interrupting
-a turn, removing queued input and closing a process each have an explicit subject
-and observable outcome. A failed connection, optional worker or slow viewer affects
-its own scope. Bound queues, buffers and concurrency.
+## Observation
 
-## State and trust
+Observation is core functionality, not optional telemetry. The Governor can read
+local state at any time without querying the provider harness or starting a model.
+Eliot correlates assignments, bindings, native sessions and provider-local
+JSON/JSONL/SQLite with OS processes, worktrees and GitHub refs. Unassigned and
+unmatched native sessions remain visible.
 
-Keep one authoritative record of an admitted action, its inputs and its outcome.
-Commit related state atomically. Reconnect and retry cannot duplicate an uncertain
-external effect; use native readback where available. Late results belong to their
-original assignment and candidate.
+Local collection continues through loss of the native control connection. Each
+source has its own observation time, coverage and errors. Process liveness, native
+activity, connection health, Task completion, Git state and account quota remain
+separate facts. Unknown is not converted to idle, dead, complete or zero.
+
+## State, trust and recovery
+
+Store is the single durable authority for admitted work, rights and outcomes. Each
+external effect has one retry/readback owner. Commit related local state atomically;
+perform native, file, Git and network I/O outside Store transactions.
 
 Authenticate participants and protect credentials at access boundaries. Use stable
-IDs and revisions for local state. Hashes serve necessary byte verification,
-not another permission, approval or compatibility system. Documents, compiler
-versions and checkout paths do not authorize execution.
+IDs, revisions and native identities for relationships. Hashes are reserved for
+credentials, selected executable/package bytes and retained artifact content. They
+are not permissions, approvals, runtime health checks or compatibility systems.
+
+A restart reconstructs state from retained Operations and current local sources.
+An uncertain external action blocks conflicting work until readback or explicit
+disposition. It does not justify retaining every historical executor forever.
 
 ## Simplicity is a design constraint
 
-Support one current implementation and format per retained runtime. Preserve
-concrete required work through a finite transition, then delete the obsolete path.
-Old experiments create no permanent compatibility obligation.
+Support one current protocol, implementation and storage format per retained
+runtime. Preserve only concrete required work through a finite transition, then
+delete obsolete producers, readers, fixtures, configuration and compatibility
+branches.
 
-Delete unnecessary responsibilities before extracting packages. Prefer an existing
-handler, table or library to another framework, workflow language or registry.
-Reuse a donor's needed mechanism without importing its whole product. Complexity
-must serve current work and replace or simplify a named mechanism.
+Delete unnecessary responsibilities before extracting packages. Reuse an existing
+owner or maintained library instead of adding another framework, workflow language,
+registry, broker or database. A shared abstraction is justified only when at least
+two current callers use the same behavior and the replaced code is removed in the
+same change.
 
-## What completion means
+## Completion
 
-A manager can assign work, obtain output, request independent review, return
-corrections and accept the resulting candidate. Selected continuation works.
-Restart preserves known outcomes and exposes unresolved work. Replaced paths are
-removed, and verification demonstrates behavior at the changed boundary.
+A manager can assign work, control the chosen harness, observe it locally, obtain
+complete output, request independent review, return corrections and accept the
+resulting candidate. Native and Eliot Goals work independently. Restart exposes
+known outcomes and unresolved work. Replaced paths are absent, and verification
+covers the changed boundary rather than recreating a second product around it.
