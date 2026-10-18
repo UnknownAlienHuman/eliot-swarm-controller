@@ -2,123 +2,141 @@
 
 ## Current state
 
-**Overall: PARTIAL_PROGRESS.** `main` contains the completed CLI ownership reduction
-and the current architecture/implementation preparation. Runtime source has not
-changed since commit `25a8e3b`; later commits through the source revision studied
-here changed documentation.
+**Overall: PARTIAL_PROGRESS.** `main` contains one completed runtime reduction and the
+current architecture/refactoring preparation. Runtime source has not changed since
+commit `25a8e3b`; subsequent work through
+`513f9698c268753dc6f2a6c0cf4d9a53f7f5e472` changed documentation or created and
+removed a no-op edit workflow.
 
-[Architecture](agent-operations/architecture.md) is the compact product manifesto.
+[Architecture](agent-operations/architecture.md) is the product manifesto.
 [Implementation](agent-operations/implementation.md) is the only work order.
-[Source findings](agent-operations/refactoring.md) explain current excess, and the
-[donor map](agent-operations/donor-map.md) records approved mechanisms and exclusions.
+[Source findings](agent-operations/refactoring.md) explain current excess.
+[Donor map](agent-operations/donor-map.md) records approved mechanisms and exclusions.
 
-## Completed source change
-
-### CLI ownership reduction
+## Completed source reduction
 
 Commit `25a8e3b` removed the host's duplicate general application CLI and MCP
-launcher. Public `swarm` commands remain in `swarm-cli`; host retains daemon, local
-administration and internal-worker entrypoints.
+launcher.
 
 - host `main.rs`: 1,949 → 743 physical lines;
 - net owned Rust reduction: 1,206 lines;
-- existing 87-line parser-test section retained.
+- public commands remain in `swarm-cli`;
+- host daemon, local administration and internal-worker entrypoints remain.
 
-This is the only runtime-code reduction in the current preparation series.
+This is the only completed runtime-code reduction in the preparation series.
 
-## Latest source and donor study
+## Next executable slices
 
-The current adapter boundary is burdened by compatibility/proof machinery and
-repeated transport journals rather than a small semantic port.
+### A0 — active Antigravity v6 coordinate
 
-### Confirmed structural gaps
+**Not implemented.** Source/descriptor use v6; route example, package policy, native
+qualification and narrow installer validation still name v5. Synchronize active
+new-work selectors to v6 without editing historical v5 receipts. Remove active dual
+version behavior after concrete v5 bindings are disposed.
 
-| Area | Current source condition | Target |
+### A1 — durable Antigravity Store delivery
+
+**Not implemented.** Terminal outcomes/observations/results are retained only in the
+worker process. Existing remediation receipts show Store can remain
+`outcome_unknown` after worker exit because reconcile depends on dead in-memory
+`pending_receipts`.
+
+Target: route-local same-boot durable outbox using existing `swarm-process` private
+file primitives. It retries exact Store-bound envelopes only and never repeats native
+input.
+
+### A2 — remove Antigravity dispatch proof
+
+**Not implemented.** Dispatch currently depends on a fresh
+`AntigravityDispatchSessionProof`, scope/model/stream checks and multiple digests.
+Target dispatch uses current assignment/binding/session/revisions; model and stream
+state remain ordinary observations. Delete proof DTO, producer, Store validator,
+qualification gate and proof-only hashes.
+
+### A3 — semantic Antigravity route
+
+**Not implemented.** Keep only real actions: `Open`, `Dispatch`,
+`Send(next_turn)`, `Refresh`, `Result`, `Reconcile` and explicit owned-resource
+shutdown/release. Remove placeholder handlers for unsupported controls and collapse
+receipt identity to Operation/binding boot/native result facts.
+
+## Confirmed structural gaps
+
+| Area | Current source | Target |
 | --- | --- | --- |
-| Agent work packets | Workers have historically received full Issues, audits and addenda; policy corrections became more files/scripts. | Manager reads history and gives one compact slice packet with objective, symbols, failure cases, deletion list and minimal check. |
-| Common commands | `RuntimeCommandKind` mixes semantic actions with OpenCode, Command ACP and native MCP internal methods. | One typed `AdapterCommand`; preserve explicit `Recover`; internal methods map to `Send`, `Cancel`, `Shutdown` or stay private. |
-| Module contract | Store/adapters exact-compare artifact versions, capability lists, config schemas and command/event schema sets. Codex/Command retain version ladders. | One current protocol major and capability subset negotiation. Package identity remains inventory/installation data. |
-| Bootstrap/hello | Codex, Claude, OpenCode, Muse, Command and Antigravity repeat owner/env/credential parsing and hello equality. | Common bootstrap in `swarm-process`; common authenticated link in `swarm-client`, adopted by two smaller adapters before broad migration. |
-| Store delivery | Every adapter has its own outcome/observation/result outbox and reconnect drain. | One exact `DeliveryOutbox` for Store-bound envelopes only. It never replays native input. |
-| Native effect recovery | Large local journals duplicate native identities/logs or generalize the weakest harness semantics. | Native idempotency/readback first; one small adapter-specific prepared-effect record only where the harness cannot classify the outcome. |
-| Receipts | Package/protocol/request hashes and Task/source identities repeat across outcomes, dispatch receipts and result origins. Shared contracts contain vendor readiness/Goal proofs. | Authenticated link + Operation/binding/boot identity; hashes only on real immutable bytes; vendor state becomes observation. |
-| Vendor knowledge in Core | Store contains OpenCode/Command artifact checks, OpenCode session validation, Muse family logic, Goal branches and Antigravity/MCP gates. | Store branches on semantic action and retained object state; adapters own vendor interpretation. |
-| Runtime duplication | Built-in/standalone OpenCode, Node/Rust Muse, retired Python Codex, multiple Claude/Antigravity bridges and Command profiles coexist. | One current executor/format per retained runtime after finite disposition of concrete unsettled work. |
-| Goals | Harness Goal and Eliot Goal are documented as independent, but current progression still branches by vendor and lacks general recurrence. | Native Goal through adapter capability; Eliot Goal as ordinary scheduled/event `Send` Operations. |
-| Passive observation | Binding-only inventory, lost process references, repeated executable hashing, stale restart connections and publication-dependent remote refs remain. | Unbound inventory plus local provider, OS, Git and GitHub observations readable without harness calls. |
-| Results/review | Complete-result validation exists. OpenCode missing-parent association remains incomplete. Direct acceptance lacks the same assigned-review prerequisite as automation. | One admitted-turn result window and one candidate-specific review/check gate. |
-| Store/automation | Most reads use the writer; base SQL SHA gates open; automation has owner-dependent identity, relocators and overlapping schedulers. | Bounded WAL readers, explicit migrations, stable automation `entry_id` and one scheduler. |
-| Product breadth | Concilium, integration ratification/ACK and automatic publication remain. | Outside compact-core completion; retain ordinary messages, independent review and explicit accepted-candidate publication. |
+| Store delivery | Antigravity and other adapters retain outcomes in route-specific in-memory/file journals; Antigravity loses them on process exit. | exact bounded durable Store-delivery outbox; route-local first, shared only after a second current consumer deletes its old loop |
+| Native effects | generic/local journals repeat native state or generalize the weakest harness | native durable ID/readback first; smallest prepared-effect record only when the harness cannot classify outcome |
+| Dispatch readiness | Antigravity refresh proof and OpenCode/Muse MCP/readiness gates block first input | ready current binding/session plus assignment/workspace revisions; readiness becomes observation |
+| Common commands | semantic actions mixed with OpenCode, ACP and MCP internal methods | one typed semantic command port; internal vendor methods disappear from public Store routing |
+| Module contract | artifact/profile/version and exact schema/capability matrices are compared by Store and adapters | one current protocol major and required capability subset; package identity is install/inventory data |
+| Bootstrap/link | adapters repeat env/owner/credential/protocol/claim and Eliot IPC loops | Antigravity + Claude prove one `module_owner` reader; `ModuleLink` owns only authenticated Eliot transport |
+| Receipts | package/protocol/request/Task/source hashes repeat across outcomes/results | authenticated Operation/binding/boot plus native IDs; hashes only for credentials/package bytes and retained artifact content |
+| Runtime duplication | parallel OpenCode, Muse, Codex, Claude, Antigravity and Command implementations/profiles remain | one current executor/format per retained runtime after finite disposition |
+| Goals | current Eliot progression branches by provider and has Goal-specific proof families | native Goal through adapter capability; Eliot Goal is ordinary scheduled/event `Send` |
+| Observation | binding-only inventory, lost process refs, repeated executable hashing, stale connection facts and weak remote refs remain | joined local provider/OS/Git/GitHub projection readable without harness calls |
+| Results/review | OpenCode missing-parent association incomplete; manual/automatic acceptance differ | one admitted-turn result window and one candidate-specific review/check gate |
+| Store/automation | most reads use writer; SQL text SHA; owner-dependent automation identity; overlapping schedulers | WAL readers, explicit migrations, stable `entry_id`, one scheduler |
+| Product breadth | Concilium, integration ratification/ACK and automatic publication remain | outside compact core; retain normal messages, independent review and explicit accepted-candidate publication |
+| Installation/tooling | per-artifact validators, repeated receipts/hashes and build-environment equality | one generic package path, one install byte check and behavior-based qualification |
+| CI | 92 KB workflow, custom package classifier and many incident-specific qualification modes | docs + fmt + affected check/Clippy + changed JS + connected slice tests; full qualification manual/release |
 
-### Donor conclusions
+These are source findings and deletion targets, not completed repairs.
 
-- Paseo provides a useful semantic session shape but its daemon/UI/provider product is
-  not adopted.
-- Waku demonstrates one ordered provider worker and one settle point, but is GPL-3.0
-  and its current provider drivers are large; pattern only, no code copy/link.
-- ACPX confirms exact shared owner, queue-vs-native-admission separation and no blind
-  retry after uncertain submission. Its request IDs are not idempotent replay keys.
-- Muse and OpenCode expose real durable native command/inbox identities. Codex exposes
-  client message identity, exact turn IDs and steer guards; JSON-RPC request ID is not
-  durable dedupe.
-- Existing `swarm-process` private durable file primitives are sufficient for the
-  proposed Store-delivery outbox and small adapter records; no new database/crate is
-  justified.
+## Donor conclusions
 
-These are source findings and design constraints, not runtime repairs.
-
-## Historical operating experience retained
-
-The old Claude-script swarm showed:
-
-- compact exact microtasks completed reliably; whole Issues caused meta work and
-  oversized diffs;
-- one manager/issue owner should integrate its own work; a separate integrator is
-  needed only across owners;
-- file flags and branch heads lose deliveries without a durable consumer ACK;
-- two equivalent full audits wasted throughput;
-- policy addenda and copied daemons multiplied faster than the product;
-- activity, connection, process liveness, assignment and quota must remain separate;
-- build parallelism must follow host resources, not agent count;
-- compatibility shims and fallback aliases should not preserve abandoned paths.
-
-These lessons are now reflected in `AGENTS.md`, implementation slice packets,
-DeliveryOutbox/native-idempotency rules and the finite protocol transition.
-
-## Runtime evidence retained
-
-Existing receipts remain scoped to their named artifacts/revisions:
-
-- Muse exact normalized result receipt:
-  [2026-10-17 verification](remediation/2026-10-17/MUSE-NORMALIZED-RESULT-NATIVE-VERIFICATION.json);
-- connected Store cases:
-  [batch verification](remediation/2026-10-13/CONNECTED-STORE-BATCH-VERIFICATION.json);
-- Antigravity EOF settlement:
-  [verification](remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
-
-They do not qualify protocol 2, the shared outbox/bootstrap, passive observation,
-all recovery paths or the installed fleet. Historical accepted work proves only its
-named Task flow.
+- Paseo provides a useful semantic session-port pattern; its daemon/UI/provider
+  product is not adopted.
+- Waku demonstrates one ordered provider-state owner and settle point; it is GPL-3.0
+  and used as a pattern only.
+- ACPX confirms one shared queue owner, queue acceptance vs prompt start, targeted
+  cancel and explicit uncertainty. It is either a replacing optional backend or a
+  pattern, never an additional layer beside Eliot's ACP owner.
+- Muse, OpenCode and Codex expose stronger native IDs/readback than a universal Eliot
+  mutation journal.
+- Claude's contained `OwnedBootstrap` and Antigravity can prove one small shared
+  bootstrap reader.
+- Existing `swarm-process::permissions` is sufficient for a route-local delivery
+  outbox; no adapter database/crate is justified.
+- Cargo metadata is sufficient for workspace/dependency ownership; build-cache path,
+  compiler and checkout equality are not runtime compatibility.
 
 ## Runtime overview
 
 | Runtime | Current state relevant to refactoring |
 | --- | --- |
-| Codex | Current Rust app-server executor exists; retired Python executor/SDK remains in repository/fixtures. Native Goal/live controls/account usage exist upstream but are not fully mapped through the compact contract. |
-| OpenCode | Built-in and standalone Rust paths coexist. Standalone adapter has session/result/readback work, but assistant association/consolidation remain open. Public native MCP and loop-step inflate the contract. |
-| Muse | Node bridge remains example route; Rust adapter has one exact-result receipt. One complete executor is not selected. Rust quota snapshots are rejected by current artifact allowlist. |
-| Claude | Rust/SDK path and retained Node generations coexist. Live controls, local readers and quotas need one current boundary. |
-| Command | Batch and ACP implementations retain historical profile/version branches. ACP already demonstrates semantic prompt/reply/cancel mapping. |
-| Antigravity | Node and Rust warm-stream implementations coexist. Shared contracts contain Antigravity-specific readiness proof types that should become observations. |
+| Antigravity | Rust descriptor/source v6; active tooling partly v5. Rust outcome outbox is process-local. Node and Rust implementations coexist. Shared contracts contain Antigravity-specific proof DTOs. |
+| OpenCode | built-in and standalone Rust execution coexist. Standalone result/readback work exists; missing-parent association and consolidation remain open. Public native MCP/loop-step expand the contract. |
+| Codex | current Rust app-server path exists; retired Python executor/SDK/fixtures remain. Native Goal/live controls/account usage are not fully mapped to the common semantic port. |
+| Muse | Node remains example route; Rust has exact-result evidence. One complete executor is not selected. Rust quota snapshots are rejected by the Store artifact allowlist. |
+| Claude | Rust adapter plus JS SDK harness/generations coexist. `OwnedBootstrap` duplicates common owner/claim parsing and is a candidate for extraction with Antigravity. |
+| Command | Batch v3/v4/v5 and ACP v1/v2 profiles coexist with exact capability/schema alternatives and native method aliases. It is not a suitable first common-shell proof. |
+
+## Historical evidence retained
+
+Existing receipts remain scoped to their named artifact/revision:
+
+- Muse exact normalized result:
+  [2026-10-17 verification](remediation/2026-10-17/MUSE-NORMALIZED-RESULT-NATIVE-VERIFICATION.json);
+- connected Store cases:
+  [batch verification](remediation/2026-10-13/CONNECTED-STORE-BATCH-VERIFICATION.json);
+- Antigravity EOF settlement:
+  [verification](remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json);
+- Antigravity S2 retained-readback evidence under `docs/remediation/2026-10-10`.
+
+They do not qualify the target protocol, outbox, proof removal, passive observation or
+installed fleet. Historical accepted work proves only its named path.
 
 ## Verification status
 
-No runtime code changed in the latest architecture/donor/script study. Checks are
-document content, links and consistency. Runtime construction uses formatting and
-minimal affected warnings-denied Clippy/build checks first. Connected cases are listed
-in [implementation verification](agent-operations/implementation.md#5-verification);
-full product/native/release tests follow when the product path is ready.
+The latest audit/documentation pass changes no runtime source. Runtime implementation
+starts with formatting and minimal affected warnings-denied Clippy/build checks, then
+the connected behavioral cases in
+[implementation verification](agent-operations/implementation.md#verification).
 
-Do not interpret old broad CI or fixture runs as qualification of the planned
-protocol, Store-delivery outbox, native-idempotency strategy, passive observation or
-executor deletion. Record each completed source slice and net owned-code change here.
+For every completed source slice, update this file with:
+
+- actual behavior delivered;
+- old path deleted;
+- exact verification evidence;
+- net owned Rust + JS + glue, tests reported separately;
+- unresolved facts left honest.

@@ -1,208 +1,241 @@
-# Install and select a local module
+# Build, install and qualify Eliot components
 
-The commands below describe the **current scripts**, including their packaging restrictions. The target is one package with its selected descriptor/image and shared validation. Equal checkout revisions, compilers, dependency graphs or build-cache paths are not runtime compatibility requirements. Remove repeated provenance validators, retired OpenCode `node_modules` inventory and the duplicate Forge installer; these changes are **not yet implemented**. Concrete old data uses the [finite transition](implementation.md#current-format-and-existing-data), not an obligation to preserve every installer or executable version.
+This runbook separates the **current scripts** from the target package path. Current
+scripts remain usable during migration, but their provenance matrices and
+artifact-specific validators are not architecture. The target is implemented
+route-by-route under [implementation](implementation.md#11-build-install-ci-and-qualification-reduction).
 
-This runbook installs controller components. Native services, vendor CLIs, models and provider credentials are configured separately. Installation does not launch them or establish a successful model turn.
+Installation does not prove a successful model turn. Provider CLI/service, account,
+model and credentials are configured separately.
 
-## Build and install one adapter
+## 1. Target package contract
 
-Select models through route configuration and the provider catalog; use native defaults where an omitted model is supported. Do not hardcode promotional model names into code or checks.
+One current package contains:
 
-| Adapter  |  Cargo package  |  Binary  |  Descriptor template |
-| --- | --- | --- | --- |
-| Codex  |  `swarm-adapter-codex`  |  `swarm-codex-adapter`  |  `crates/swarm-adapter-codex/module-descriptor.template.json` |
-| OpenCode  |  `swarm-adapter-opencode`  |  `swarm-adapter-opencode`  |  `crates/swarm-adapter-opencode/registration/descriptor.template.json` |
-| Command  |  `swarm-adapter-command`  |  `swarm-adapter-command`  |  `crates/swarm-adapter-command/module-descriptor.template.json` (Batch v5); `module-descriptor-acp.template.json` (ACP v2) |
-| Antigravity  |  `swarm-antigravity-adapter`  |  `swarm-antigravity`  |  `modules/antigravity-rust/module-descriptor.template.json`; Node `modules/antigravity/module-descriptor.template.json` (`antigravity-cli-warm-bridge.4`) |
-| Claude  |  `swarm-adapter-claude`  |  `swarm-adapter-claude`  |  `modules/claude-rust/module-descriptor.template.json` |
+```text
+package-manifest.json
+bin/<executable>
+module-descriptor.json
+resources/<required files only>
+```
+
+The manifest names:
+
+- package/module coordinate for inventory;
+- current protocol major;
+- required semantic actions;
+- executable and required resource relative paths;
+- selected byte digests used once during installation/launch;
+- optional build commit/toolchain as diagnostics only.
+
+The descriptor contains launch/lifecycle/configuration and semantic actions. It does
+not duplicate command/event schema inventories or create behavior branches from
+artifact version.
+
+The generic installer:
+
+1. requires an absolute explicit install root;
+2. rejects traversal through reparse/symlink targets where the platform check exists;
+3. validates bounded regular package files and protected credential references;
+4. verifies selected package bytes once;
+5. atomically publishes one package directory;
+6. returns the installed descriptor and executable identity;
+7. does not launch, register a route or contact a provider.
+
+Supervisor registration validates the installed package and current protocol/actions.
+Runtime hello validates authenticated binding, protocol major and required action
+subset. It does not compare source checkout, compiler, Cargo.lock, target-cache path
+or a full echoed descriptor.
+
+## 2. Current build command
+
+Until the generic package path replaces the current scripts, build one selected Cargo
+binary into one external shared target:
 
 ```powershell
-$Manifest = 'C:\src\eliot-swarm-controller\crates\swarm-adapter-command\Cargo.toml'
-$Package = 'swarm-adapter-command'
 $Target = 'D:\build-cache\eliot-shared-target'
-cargo build --manifest-path $Manifest --package $Package --release --locked --target-dir $Target
+cargo build --locked --release --target-dir $Target `
+  --package swarm-antigravity-adapter --bin swarm-antigravity
 ```
 
-Use `$Target/release/<binary>.exe` as the installer source. Build the owner helper from `crates/swarm-process/Cargo.toml` with `--package swarm-process --bin swarm-module-owner`. Its installed path and SHA-256 are current host configuration inputs. The host creates the helper's two private launch-plan/resolver-map arguments itself.
+Use the corresponding package/target for another retained component. Build
+parallelism follows machine/Cargo capacity, not the number of agents. Do not allocate
+a separate target directory per worker.
 
-Copy the selected descriptor template outside the checkout. Replace credential placeholders with a protected-reference name, never credential bytes. Keep its protocol, capabilities and launch arguments aligned with the adapter. The installer fills `launch.executable` and `launch.executable_sha256` from the built file.
+The current owner helper is built from `swarm-process` as
+`swarm-module-owner`. It remains a separate selected executable until process
+ownership is simplified.
 
-For Command Batch 5 / ACP 2, preserve the typed `module_host_config_path` marker. Replace only the final `--config` argument with the absolute native Command JSON path described in the [adapter README](../../crates/swarm-adapter-command/README.md). That file selects the native executable/mod; route options select a model override. The host supplies binding credentials through its generated private config.
+## 3. Current adapter inventory
 
-Use an existing absolute install root outside the controller and vendor trees, without reparse-point traversal. `-WhatIf` previews the current installer:
+| Runtime | Current primary Rust package | Current descriptor source | Direction |
+| --- | --- | --- | --- |
+| Antigravity | `swarm-antigravity-adapter` | `modules/antigravity-rust/module-descriptor.template.json` | active coordinate is v6; converge route/tooling selectors and retire Node after consumers switch |
+| OpenCode | `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/registration/descriptor.template.json` | standalone Rust only |
+| Codex | `swarm-adapter-codex` | package descriptor | Rust app-server only |
+| Muse | `swarm-adapter-muse` plus Node bridge | current candidates | select one complete executor before installation is normalized |
+| Claude | `swarm-adapter-claude` | `modules/claude-rust/module-descriptor.template.json` | one Rust adapter with thin SDK driver |
+| Command | `swarm-adapter-command` | batch and ACP templates | first delete historical profiles; keep only retained current products |
+
+Do not hardcode promotional model names into package or qualification policy. Models
+belong to route configuration and provider-native discovery.
+
+### Antigravity coordinate warning
+
+The shipped Rust constant and descriptor are version `6`. Current route example,
+package policy, native qualification and narrow installer validator still name `5`.
+Do not create another version. Synchronize active selectors to v6 in one source slice;
+leave historical v5 remediation receipts unchanged. After concrete v5 bindings are
+disposed, remove active `5 | 6` branches.
+
+## 4. Current transitional installer
+
+The current command remains:
 
 ```powershell
-$Source = 'D:\build-cache\eliot-shared-target\release\swarm-adapter-command.exe'
-$Descriptor = 'D:\release-input\command-descriptor.json'
+$Source = 'D:\build-cache\eliot-shared-target\release\swarm-antigravity.exe'
+$Descriptor = 'D:\release-input\antigravity-descriptor.json'
 $InstallRoot = 'D:\eliot\installed-modules'
-$Installer = 'C:\src\eliot-swarm-controller\tools\modules\Install-ModuleArtifact.ps1'
-pwsh -NoProfile -File $Installer -SourceExecutable $Source -DescriptorTemplate $Descriptor -InstallRoot $InstallRoot -WhatIf
-# After reviewing the preview, run the same command without -WhatIf.
+pwsh -NoProfile -File tools/modules/Install-ModuleArtifact.ps1 `
+  -SourceExecutable $Source `
+  -DescriptorTemplate $Descriptor `
+  -InstallRoot $InstallRoot `
+  -WhatIf
 ```
 
-**Current limitation:** the installer creates a coordinate-hashed directory with `module.exe`, `module-descriptor.json`, `install-receipt.json` and `install-coordinate.json`; changed bytes under that identity are rejected. This is existing behavior to simplify, not a requirement to mint a new identity for every edit. Installation does not register or launch the module. Keep the native Command config separately available at its configured path.
+Review the preview, then repeat without `-WhatIf`.
 
-## Package independent frontends
+Current behavior creates a coordinate-hashed directory and several receipt/coordinate
+files. It also contains artifact-specific Antigravity and Node validators. This is a
+migration constraint, not the target. Do not add another per-artifact validator.
 
-The packages are `swarm-mcp`, `swarm-gateway` and `swarm-cli`; the latter emits `swarm.exe`. Gateway is optional. The host chain is `swarm-host` (launcher), `swarm-kernel-host` (Store/IPC) and `swarm-supervisor`.
+Keep during migration:
 
-The current frontend builder requires a clean committed checkout, an existing external target and a fresh output directory. It emits the executable and `build-manifest.json`; the installer requires that manifest and rejects differing bytes already installed at the destination.
+- absolute install root outside checkout/vendor data;
+- regular-file and path-containment checks;
+- protected credentials rather than secret literals;
+- atomic publication and exact installed byte verification.
 
-```powershell
-$TargetDir = 'D:\build-cache\eliot-shared-target'
-$PackageDirectory = 'D:\eliot\packages\swarm-mcp-new-version'
-pwsh -NoProfile -File tools/ci/Build-SwarmFrontendProvenance.ps1 `
-  -Package swarm-mcp -TargetDir $TargetDir -OutputDir $PackageDirectory
-pwsh -NoProfile -File tools/modules/Install-SwarmFrontend.ps1 `
-  -PackageDirectory $PackageDirectory -InstallDirectory 'D:\eliot\frontend-version' -WhatIf
-```
+Delete when the generic package installer is connected:
 
-The install directory must already exist. Repeat without `-WhatIf` to install. Current sibling checks compare protocol, target and launcher arguments. The same installer also inventories historical resource receipts, including the retired OpenCode dependency tree; removing that unrelated prerequisite is part of the target above.
+- per-artifact capability/schema validators;
+- multiple hashes of the same local metadata used only for self-comparison;
+- coordinate identity based on behavior version;
+- duplicate Forge/worker installers;
+- checks of retired sibling frontend resource trees.
 
-## Configure the host and route
+## 5. Host configuration and route selection
 
-`module_supervisor` defaults disabled. Configure installed descriptor paths and the owner helper:
+The module supervisor receives installed descriptor paths and the owner helper:
 
 ```toml
 [module_supervisor]
 enabled = true
 install_root = 'D:\eliot\installed-modules'
 descriptor_files = [
-  'D:\eliot\installed-modules\artifact-<coordinate-sha256>\module-descriptor.json',
+  'D:\eliot\installed-modules\<package>\module-descriptor.json',
 ]
 owner_helper = 'D:\eliot\bin\swarm-module-owner.exe'
-owner_helper_sha256 = '<64-lowercase-hex-sha256>'
+owner_helper_sha256 = '<selected-file-digest>'
 protected_files = {}
-route_config_mapper = 'descriptor_schema'
 ```
 
-`protected_files` maps additional descriptor references to local files. The host provisions `launch.credential_ref`; provider tokens do not belong in this table. The default mapper uses the descriptor's registered configuration schema.
+Provider tokens do not belong in descriptor literals. Route configuration selects
+workspace and optional native model/options. The descriptor/catalog is the source of
+module and active package identity; do not maintain another version table in this
+runbook.
 
-Set `module_artifact_id` from the selected descriptor's `artifact.artifact_id`;
-read its version from the installed catalog when selecting a route. The descriptor
-is the source for those values, not another release matrix in this runbook.
-
-| Route | `runtime` | `workspace_option` | `native_options` |
-| --- | --- | --- | --- |
-| Codex | `codex` | `workspaceRoot` | `workspaceRoot`; optional explicit `modelProvider` and `model` |
-| OpenCode | `module` | `directory` | `service_id`, `connection_file`, `directory`; optional explicit `model = { id, providerID, variant }` |
-| Command | `command` | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId` |
-| Antigravity | `antigravity` | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId`, `reasoningEffort`, `agent`, `dangerouslySkipPermissions` |
-| Claude | `module` | `workspaceRoot` | `workspaceRoot`; optional explicit `modelId` |
-
-The current OpenCode descriptor uses `opencode-v2-native-options@4`. Its external attach route has no mandatory server `expected_version`; compatibility is determined by protocol capability. See [configuration](configuration.md) for connection fields and [donor boundaries](donor-map.md) for native SDK ownership.
+Example:
 
 ```toml
 [[routes]]
-alias = 'command-local'
-runtime = 'command'
-module_artifact_id = 'eliot-command.rust-headless.1'
+alias = 'antigravity-local'
+runtime = 'antigravity'
+module_artifact_id = 'eliot-antigravity.rust-headless.1'
 enabled = true
-workspace_option = 'workspaceRoot'
 [routes.native_options]
-workspaceRoot = 'D:\work\your-repository'
+workspaceRoot = 'D:\work\repository'
+reasoningEffort = 'high'
 ```
 
-Route `enabled` defaults false. After starting with this configuration, read `module.catalog.get` and call `module.route.select` using its actual values:
+After startup, read `module.catalog.get` and select the exact current catalog entry.
+Selection affects future bindings only. A route descriptor or capability does not
+grant Store rights and does not prove a successful native turn.
 
-```json
-{
-  "route_alias": "command-local",
-  "module_id": "runtime.command",
-  "artifact_id": "eliot-command.rust-headless.1",
-  "version": "5",
-  "expected_catalog_revision": 12
-}
+## 6. Frontends and host chain
+
+Public components are `swarm` (`swarm-cli`), `swarm-mcp` and optional
+`swarm-gateway`. Host chain is `swarm-host`, `swarm-kernel-host` and
+`swarm-supervisor`.
+
+The current frontend provenance builder requires clean checkout/build manifests and
+the installer inventories historical sibling resources. Target packaging uses the
+same generic package rules as adapters:
+
+- selected binaries/resources;
+- current host IPC protocol requirement;
+- atomic install;
+- no requirement that CLI, launcher, runtime and supervisor share source commit,
+  compiler or cache directory.
+
+A release may record build provenance for diagnosis. Runtime compatibility depends on
+the current protocol and behavior, not identical build environment.
+
+## 7. Qualification
+
+Qualification must exercise the installed product through public interfaces:
+
+```text
+start isolated host
+create authorized manager
+select installed route
+create/claim Task
+open session
+submit one input
+observe admitted/native/terminal state
+retrieve exact result or honest unknown
+shutdown without replay
 ```
 
-The example revision is a placeholder; reread a stale catalog. Selection belongs to the authenticated Manager (Operator is also accepted) and affects future bindings. Admitted work creates module demand and supplies binding credentials. An adapter's `owned_service` lifecycle does not confer ownership of the vendor CLI. Result association and unavailable historical bodies follow the [result contract](implementation.md#launch-and-results); descriptor capability names alone do not prove implementation.
+The receipt records selected image/package identity and observable outcomes. It does
+not claim account/model consumption unless the provider source supplies it.
 
-## Hot descriptor installation (Operator-only, no live restart)
+Remove from qualification as their migrated route permits:
 
-`module.descriptor.install` takes `{ "descriptor_file": "<absolute path>" }`. The current local Operator path checks the installed receipt, descriptor and executable, extends the catalog and retains the path for supervisor restart. Active bindings continue unchanged; Managers can then select the new entry. Source owners are `load_installed_descriptor`, `register_installed_descriptor` and `extend_descriptor_catalog` in `swarm-supervisor`. Shared schema validation belongs to `swarm-contracts::module_catalog`; the duplicate PowerShell validator is part of the simplification.
+- host/module source commit/tree equality;
+- Cargo.toml/Cargo.lock/toolchain/rustc/cargo equality;
+- target-directory hash equality;
+- exact artifact capability/schema arrays duplicated from Rust;
+- mandatory preview plan digest;
+- Antigravity refresh/proof prerequisite;
+- provider catalog response-body hashes as dispatch authority;
+- legacy frontend compatibility inventory.
 
-## Package executable workspace coordinates
+A provider or transport timeout leaves the operation unknown and forbids replay. A
+failed qualification does not kill or reconfigure an externally owned harness.
 
-Current `tools/ci/build-module-package.ps1` uses `tools/ci/module-package-policy.json` and Cargo metadata to select a declared binary. It rejects additional binary targets and records the workspace-resolved dependency graph. Those restrictions remain in the script; they are not the target design for independent components. The manual `module-package.yml` workflow calls the same builders and selects one package per run.
+## 8. CI
 
-```powershell
-just package-module swarm-bus release `
-  'D:\build-cache\eliot-shared-target' 'D:\artifacts\swarm-bus-release'
-```
+Normal CI should remain small:
 
-For worker packages below, use `-Profile release`, an external shared `-TargetDir` and a fresh `-OutputDir` with that builder. Output is `bin/<binary>.exe` plus `build-manifest.json`. Current installers require that manifest, verify the executable and return its installed path/digest. Identical bytes are a no-op; differing bytes are rejected. Installation does not configure or launch work.
+1. changed Markdown/link/whitespace validation;
+2. rustfmt for changed Rust;
+3. `cargo check` and warnings-denied Clippy for affected packages and local reverse
+   dependencies derived from `cargo metadata`;
+4. `node --check` for changed JavaScript;
+5. connected focused tests when a product slice closes.
 
-## Build and install the standalone automation worker
+Full native/product qualification is a manual/release gate. Do not add another
+workflow-dispatch mode for each incident. Convert a lasting regression into a normal
+behavioral test, then delete the focused mode and its script branch.
 
-```powershell
-$TargetDir = 'D:\build-cache\eliot-shared-target'
-$HostOutput = 'D:\release\swarm-host'
-$WorkerOutput = 'D:\release\swarm-automation-worker'
-pwsh -NoProfile -File .\tools\ci\build-module-package.ps1 `
-  -Package eliot-swarm-controller -Profile release `
-  -TargetDir $TargetDir -OutputDir $HostOutput
-pwsh -NoProfile -File .\tools\ci\build-module-package.ps1 `
-  -Package swarm-automation -Profile release `
-  -TargetDir $TargetDir -OutputDir $WorkerOutput
+## 9. Current standalone workers
 
-$PackageExecutable = Join-Path $WorkerOutput 'bin\swarm-automation-worker.exe'
-$Installer = '.\tools\modules\Install-StandaloneWorker.ps1'
-$installed = & $Installer `
-  -WorkerCoordinate swarm-automation-worker `
-  -HostExecutable 'C:\Program Files\Eliot Swarm\swarm-host.exe' `
-  -PackageExecutable $PackageExecutable -WhatIf
-$installed
-```
+Use the existing generic `Install-StandaloneWorker.ps1` for retained standalone
+workers. The separate Forge installer is a duplicate to remove. Script, bus, checks
+and automation executables remain optional selected components; installing an image
+does not create Store admission or execution rights.
 
-The selected host must already exist. This places the worker beside it; the returned `image_sha256` identifies the worker independently of the host image.
-
-## Package and install the Forge worker
-
-Build `swarm-forge-worker`; pass `bin/swarm-forge-worker.exe` to `Install-StandaloneWorker.ps1` with `-WorkerCoordinate swarm-forge-worker`, `-HostExecutable <absolute-host.exe>` and `-PackageExecutable <absolute-worker.exe>`. The separate `Install-ForgeWorker.ps1` is a duplicate to remove, not an interface that future refactoring must preserve.
-
-## Build and install the standalone ScriptRun worker
-
-Build `swarm-script-worker`. Pass `bin/swarm-script-worker.exe` to `tools/modules/Install-ScriptWorker.ps1 -PackageExecutable <absolute-worker.exe> -InstallDirectory <existing-absolute-directory>`; add `-WhatIf` to preview. Configure its returned values:
-
-```toml
-[scripts.executor]
-executable = 'C:\ELIOT\artifacts\swarm-script-worker.exe'
-sha256 = '<64-lowercase-hex-digest-returned-by-installer>'
-artifact_id = 'swarm-script-worker.1'
-version = '0.1.0'
-```
-
-The executor defaults absent. It waits for Store admission/readiness/Go before starting the interpreter. A failed selected image does not choose another backend.
-
-## Build and install the managed bus dispatcher
-
-Build `swarm-bus`. Pass `bin/swarm-bus-dispatcher.exe` to `tools/modules/Install-BusDispatcher.ps1 -PackageExecutable <absolute-dispatcher.exe> -InstallDirectory <existing-absolute-directory>`; add `-WhatIf` to preview.
-
-```toml
-[bus_supervisor]
-enabled = true
-dispatcher_executable = 'C:\ELIOT\artifacts\swarm-bus-dispatcher.exe'
-dispatcher_sha256 = '<64-lowercase-hex-digest-returned-by-installer>'
-```
-
-The supervisor starts it only for a managed, ready Store registration. Installing the image and setting configuration do not create that registration.
-
-## Package runtime processes with source provenance
-
-Current wrappers are `Build-SwarmHostProvenance.ps1` for `swarm-host`, `Build-SwarmKernelHostProvenance.ps1` for `swarm-kernel-host`, and `Build-SwarmSupervisorProvenance.ps1` for `swarm-supervisor`. They take `-TargetDir` and a fresh `-OutputDir` and call the shared builder. Normal source pushes do not invoke these manual release builders.
-
-The current Native/Core qualification scripts separately require image and build-manifest digests. Native qualification additionally rejects host/module differences in source, toolchain and even the build-cache path (`New-NativeQualification.ps1`, `HOST_MODULE_BUILD_PROVENANCE_DIVERGED`). Remove that prerequisite: a functional turn checks selected images, protocol and result, not identical build environments. No harness run is needed to prepare this source change.
-
-## Optional checks and local observer
-
-Build `swarm-checks` and configure its executable. Checks default disabled; the executor defaults absent:
-
-```toml
-[checks.executor]
-executable = 'D:\eliot\bin\swarm-checks.exe'
-sha256 = '<64-lowercase-hex-sha256-of-that-file>'
-artifact_id = 'swarm-checks'
-version = '0.1.0'
-```
-
-The host verifies the selected image before Store Go. `artifact_id` and `version` are configuration labels, not executable metadata. Recorder settings belong in [observability](observability.md). The standalone `swarm-observer` reads diagnostic NDJSON from stdin and takes an absolute private directory plus optional queue, record-size, segment-size and retention bounds.
+Each retained component needs one current package path and one current configuration
+owner. Historical build manifests and executable versions do not justify keeping
+parallel installers or runtime branches.

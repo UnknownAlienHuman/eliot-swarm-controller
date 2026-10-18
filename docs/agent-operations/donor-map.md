@@ -1,235 +1,284 @@
 # Donor Map
 
-Use a donor only for a retained responsibility and remove the replaced Eliot code.
-A source pattern is not a dependency, qualification result or reason to import the
-donor's product. [Implementation](implementation.md) owns the concrete adoption
-boundary.
+Use a donor only for a retained responsibility and delete the Eliot mechanism it
+replaces. A useful pattern is not a reason to import another product. The concrete
+adoption boundary belongs in [implementation](implementation.md).
 
 ## 1. Adoption classes
 
-Every donor use is one of three things:
-
-| Class | Meaning |
+| Class | Rule |
 | --- | --- |
-| Maintained API/package | Call the donor's current supported interface directly. Pin only where reproducibility requires it. Do not wrap it with another private protocol. |
-| Pattern | Reimplement the small mechanism independently from documented behavior. Copy no code. |
-| Source reuse | Copy/link a named unit only after license/notices review, exact version selection and a deletion plan for the Eliot code it replaces. |
+| Maintained API/package | Call the current supported interface directly. Do not wrap it in another private protocol. |
+| Pattern | Reimplement the small behavior independently; copy no source. |
+| Source reuse | Copy/link a named unit only after license/notices review and with an exact deletion plan. |
 
-A donor is rejected when it introduces another Task store, scheduler, session owner,
-acceptance authority, transcript mirror or compatibility matrix.
+Reject a donor when it introduces another Task store, scheduler, session owner,
+acceptance authority, transcript mirror, workflow language or compatibility matrix.
 
-## 2. Shared adapter boundary
+## 2. Small semantic adapter port
 
-### Paseo — semantic session port, pattern only
+### Paseo — pattern only
 
-Reviewed current source:
+Reviewed:
 [`AgentClient` / `AgentSession`](https://github.com/getpaseo/paseo/blob/f7a0e2cbea875d44d36ac4801bfe5467fa17cdac/packages/server/src/server/agent/agent-sdk-types.ts).
-Paseo is Apache-2.0 apart from separately licensed third-party components.
 
-Useful mechanism:
+Useful:
 
-- one semantic client/session interface;
+- one semantic session interface;
 - start turn, exact active-turn steer, reply, interrupt, close and configuration;
-- optional capabilities declared separately from provider implementation;
-- provider events converted at the driver boundary;
-- out-of-band controls do not have to cancel the foreground turn.
+- optional capabilities separate from provider implementation;
+- provider events converted at the driver boundary.
 
-Use the shape, not the product. Do not copy Paseo's daemon, UI timeline, provider
-registry, plugin lifecycle, persistence, catalog or broad feature surface. Eliot
-retains Store Operations, binding/generation and result attribution.
+Use this shape for Eliot actions/capabilities. Do not import Paseo's daemon, UI,
+provider registry, persistence, plugin lifecycle or catalog.
 
-### Waku — one ordered command/event owner, pattern only
+### Waku — ordered owner pattern only
 
-Reviewed source:
+Reviewed:
 [`driver/mod.rs`](https://github.com/egoist/waku/blob/10bcd728c9b2f07d664cfece3c8c870d3418ddd2/crates/waku-core/src/driver/mod.rs)
 and
 [`driver/opencode.rs`](https://github.com/egoist/waku/blob/10bcd728c9b2f07d664cfece3c8c870d3418ddd2/crates/waku-core/src/driver/opencode.rs).
-Waku is GPL-3.0; do not copy or link its implementation into Eliot without a separate
-license decision. It is a behavior-pattern donor only.
 
-Useful mechanism:
+Useful:
 
-- one worker owns mutable native session state;
-- a closed command enum (`Prompt`, `Steer`, `Cancel`, `Respond`, options,
-  `Shutdown`);
-- commands and provider events are serialized;
-- one idempotent turn settle point;
-- a stream break is not automatically process/session death;
-- event payload and wake notification are separate, so wakes may coalesce without
-  dropping events.
+- one owner of mutable native session state;
+- closed command enum;
+- serialized command/event handling;
+- one turn settle point;
+- stream break does not imply session/process death.
 
-Waku's current provider drivers are themselves large. Do not import them or infer
-that a driver file per provider is automatically compact architecture.
+Waku is GPL-3.0 and its provider drivers are themselves substantial. Use the behavior
+pattern; do not copy/link the implementation without a separate license decision.
 
-### ACPX — exact shared owner semantics, optional backend or pattern
+## 3. ACP and ACPX
 
-Reviewed:
-[`shared-sessions.md`](https://github.com/openclaw/acpx/blob/8e396609238086dee6a407fdb3b3ac46dbdedd70/docs/shared-sessions.md).
+### Official ACP semantics
 
-Useful mechanism:
+ACP cancellation targets the active prompt turn. Cancellation request and terminal
+resolution are separate; updates may still arrive before the prompt resolves with a
+cancelled stop reason. Eliot therefore distinguishes:
 
-- exact `(agent command, cwd, name)` scope selects one session record and queue owner;
-- missing owner does not create a competing connection for shared controls;
-- queue acceptance differs from native `promptStarted` admission;
-- targeted cancellation distinguishes a queued request from the active session turn;
-- detaching a viewer/client does not cancel admitted work;
-- a lost response remains uncertain and is inspected, not automatically retried.
+- queued controller input;
+- queue-owner acceptance;
+- native prompt start;
+- active-turn cancel request;
+- terminal cancellation.
 
-Important exclusion: ACPX request IDs are queue/status identity, explicitly not an
-idempotent replay API. Adopt ACPX only as a whole optional ACP backend that replaces
-our equivalent ACP owner/queue code. Otherwise use these semantics as a pattern; do
-not layer ACPX beside the current ACP adapter.
+Do not report a turn cancelled when only the notification was sent.
 
-### Existing Eliot owners
+### ACPX — optional backend or pattern, not another layer
 
-The smallest reusable implementation already has owners:
+Reviewed current shared runtime:
+[`src/runtime/shared.ts`](https://github.com/openclaw/acpx/blob/0d874f9a98de2a82ed8c5a4746053bd0a46052c3/src/runtime/shared.ts)
+and
+[`shared-sessions.md`](https://github.com/openclaw/acpx/blob/0d874f9a98de2a82ed8c5a4746053bd0a46052c3/docs/shared-sessions.md).
 
-| Existing code | Reuse |
+Useful:
+
+- one running queue owner for a named session;
+- shared controls refuse a direct fallback that could create a competing provider
+  connection/session;
+- queue acceptance and native prompt start are separate signals;
+- cancellation targets one accepted request ID;
+- client detach/shutdown does not cancel admitted work;
+- passive watch uses retained cursor/result state;
+- missing owner is explicit `backend unavailable`, not silent reconnection through a
+  second owner.
+
+Limits:
+
+- `requestId` identifies queue/control status; it is not documented as a universal
+  idempotent native replay key;
+- shared turns deliberately exclude steering and callback-driven permission handling;
+- ACPX flows, checkpoints and TypeScript workflow language are not Eliot
+  requirements.
+
+Adopt ACPX only as a complete optional ACP backend that replaces Eliot's equivalent
+ACP owner/queue. Otherwise use the ownership/admission/cancel semantics as a pattern.
+Do not run ACPX beside a competing Eliot ACP session owner.
+
+## 4. Existing Eliot owners
+
+| Existing code | Reuse boundary |
 | --- | --- |
-| [swarm-process module owner](../../crates/swarm-process/src/module_owner.rs) | Verify supervisor-owned adapter process, scope and private state; add one common bootstrap reader. |
-| [swarm-process private files](../../crates/swarm-process/src/permissions.rs) | Atomic private create/replace/read/remove and durability barriers. Use for a small Store-delivery outbox and bounded adapter effect records; do not add an adapter database. |
-| [swarm-client ModuleLink](../../crates/swarm-client/src/module_link.rs) | Authenticated hello, `module.next`, outcome/observation/result delivery; add one exact `DeliveryOutbox`. |
-| [swarm-contracts](../../crates/swarm-contracts/src/lib.rs) | Replace string/JSON commands and vendor proof/profile matrices with current typed semantic actions. |
+| `swarm-process::module_owner` | Verify supervisor-owned adapter process, binding scope and private state. Extend with one small bootstrap reader only after Antigravity and Claude use it. |
+| `swarm-process::permissions` | Atomic private create/replace/read/remove and durability boundaries. Use for Antigravity's route-local Store-delivery outbox; no adapter database. |
+| `swarm-client::ModuleLink` | Authenticated hello and module RPC calls. Replace private IPC wrappers after hello is simplified. Do not move native policy into it. |
+| `swarm-contracts` | Current shared semantic action/record types. Remove vendor proof structs and historical profile matrices. |
 
-No new adapter-framework crate is needed.
+### Extraction thresholds
 
-## 3. Native identity and replay donors
+- **Bootstrap:** Antigravity plus Claude `module_runtime::OwnedBootstrap` can prove one
+  common owner/config reader. Delete their duplicate env/path/protocol/claim parsers
+  in the same change.
+- **Store-delivery outbox:** keep it Antigravity-local first. Move mechanics into
+  `swarm-client` only when a second migrated route uses identical boot/lane/ACK
+  semantics and both old loops are removed.
+- **Command is not a proof route:** its Batch/ACP profile ladder, journal and session
+  state would distort the abstraction.
+- **Codex and Muse are not first:** their native recovery/Goal/session state machines
+  are too large to define a delivery-only shell.
 
-Prefer the native harness's durable identity and readback over Eliot-side replay
-machinery.
+No new adapter-framework crate is justified.
 
-| Harness | Reviewed mechanism | Eliot rule |
+## 5. Native identity and replay
+
+Prefer the harness's durable identity/readback over an Eliot-side generic journal.
+
+| Harness | Native mechanism | Eliot rule |
 | --- | --- | --- |
-| Muse | MSP sessions/turns, UUIDv7 command identity, durable cursor-bearing event log and native Goal | Persist the exact command ID before send. Replay only the same ID and identical params when the MSP contract allows it. ACK is admission, not terminal. |
-| OpenCode | [v2 session contract](https://github.com/anomalyco/opencode/blob/da9d436c36e0145110531ffcd7b15e50016fdd82/specs/v2/session.md): durable inbox row precedes execution; matching inbox item ID is idempotent | Derive/retain one stable native item ID per Operation. Reconcile through inbox/projected message/session log before retry. The global event stream is live observation, not durable recovery. |
-| Codex | Current app-server [turn protocol](https://github.com/openai/codex/blob/8c076942cb70fba8e5c4732c23f1faabc4aed484/codex-rs/app-server-protocol/src/protocol/v2/turn.rs) and [Goal processor](https://github.com/openai/codex/blob/8c076942cb70fba8e5c4732c23f1faabc4aed484/codex-rs/app-server/src/request_processors/thread_goal_processor.rs) | Use `clientUserMessageId`, exact thread/turn IDs, `expectedTurnId` steer and thread/turn history where documented. A JSON-RPC request ID is connection-scoped, not durable dedupe. |
-| Claude | Current Agent SDK session/resume and permission interfaces | Reuse SDK session identity and official local history. No reviewed universal durable mutation key: serialize per session and retain only the smallest prepared effect when readback cannot classify it. |
-| ACP / ACPX | Queue request identity, prompt-start admission, retained watch/result | Never equate request ID with idempotent retry. Unknown submission remains unknown. |
-| Command batch / Antigravity | Process/run identity and captured output | Admit one effect window, retain exact local intent/output, and do not restart the process to guess whether input ran. |
+| Muse | MSP session/turn, UUIDv7 `commandId`, durable event log/cursor, native Goal | Persist exact command ID before send. Replay only when MSP permits the same ID with identical params. ACK is admission, not terminal. |
+| OpenCode | durable inbox/message identity and session SQLite/log | Retain one native item ID per Operation. Reconcile through inbox/message/session state before retry. Live event stream is observation, not recovery. |
+| Codex | `clientUserMessageId`, thread/turn IDs, `expectedTurnId`, turn history | Use exact thread/turn readback and steer guard. JSON-RPC request ID is connection-scoped, not durable dedupe. |
+| Claude | SDK session/resume identity and official local history | Serialize per session. Retain only the smallest prepared effect when the SDK cannot classify an uncertain mutation. |
+| ACP/ACPX | queue request, prompt-start and retained result/watch | Do not equate queue request ID with native idempotent replay. Unknown submission remains unknown. |
+| Antigravity/Command batch | one process/run and captured output | Admit one serialized effect window; never restart/resend to guess whether input ran. |
 
-A donor's retry rule is not generalized to other harnesses. The common layer delivers
-already-produced Eliot records only.
+Native effect state and Store delivery are separate:
 
-## 4. Vendor harness mappings
+- native identity/readback decides whether a provider action happened;
+- delivery outbox only resends already-produced Eliot envelopes until Store ACK.
 
-These capabilities do not require every adapter to expose the same feature.
+## 6. Vendor mappings
 
-| Harness | Eliot mapping |
+| Harness | Semantic actions retained |
 | --- | --- |
-| Codex | `Open`, `Dispatch`, `Send`, `Reply`, `Configure`, native `Goal`, `Cancel`, `Recover`, `Refresh`, `Result`, `Reconcile`; account-rate-limit snapshots remain separate from turn usage. |
-| OpenCode | Durable prompt/inbox delivery, steering, permission/form reply, interrupt, background and local state/result reads. Public `native.opencode.loop_step` and `native.mcp.*` are unnecessary. |
-| Muse | Native `Goal`, queued/steered input, explicit recovery and turn/queued-input controls, local session log and account usage. Select one Node/Rust executor. |
-| Claude | Open/resume, send, reply/permission, configure, interrupt, result and local session/subagent readers. Reviewed interface has no native Goal, so Eliot Goal remains available. |
-| Command ACP | Open, dispatch/send, permission reply, turn cancel and session close through the existing `agent-client-protocol` crate. ACP is an adapter protocol, not Eliot's universal bus. |
-| Antigravity | One sequential input/result window. Unsupported reply/configure/Goal remains explicit. Readiness/model facts are observations, not shared proof packets. |
+| Codex | `Open`, `Dispatch`, `Send`, `Reply`, `Configure`, native `Goal`, `Cancel`, `Recover`, `Refresh`, `Result`, `Reconcile` |
+| OpenCode | `Open`, durable `Dispatch/Send`, steer, reply, cancel, background, refresh/result/reconcile; MCP setup remains internal |
+| Muse | native `Goal`, queued/steered input, explicit recover/cancel, result and usage; select one Node/Rust executor |
+| Claude | open/resume, send, reply/permission, configure, interrupt, result and local session/subagent readers; no reviewed native Goal |
+| Command ACP | prompt/send, permission reply, active-turn cancel and session close through the existing ACP crate |
+| Antigravity | one serialized `Open`, `Dispatch`, `Send(next_turn)`, `Refresh`, `Result`, `Reconcile`; unsupported controls are absent, not placeholder handlers |
 
 Harness Goal is the default where supported. Eliot Goal remains an independent
-ordinary-message plugin on every adapter with suitable `Send` support.
+ordinary-message plugin.
 
-## 5. Claude-script experience as a donor
-
-The old scripts are field evidence, not code to port. Preserve these mechanisms:
-
-| Script behavior | Product mechanism |
-| --- | --- |
-| `make_task.py` produced compact current `TASK.md` instead of a 95-KB Issue thread | One manager-created slice packet with objective, symbols, constraints, deletion list and check command. |
-| `Agent-Watch.py`, `oc_busy.py` and vendor logs joined several local facts | One passive projection that keeps activity, connection, process, assignment and source freshness separate. |
-| `issue_settled.py` omitted delivered/parked/review-waiting work until inputs changed | Do not keep waking agents whose work has no new actionable input. |
-| `state.py` retained refuted claims | Preserve verified/refuted findings so another agent does not repeat the same investigation. |
-| `pr_evidence.py` and delivery queues bound work to exact candidates | Store Operation + candidate-specific evidence + durable acknowledgment, not flag files. |
-| manager branches and microtasks | One worktree per manager; managers integrate; weak workers receive narrow leaf work. |
-| resource and rotation scripts | Capacity and source facts, not agent count or age alone, drive scheduling/recovery. |
-
-Do not port the scripts as wrappers, compatibility daemons, marker files or a generic
-workflow language. Their knowledge becomes current adapter fixtures, Store rules and
-slice instructions. Policy changes are versioned current work, not broadcast
-addenda.
+## 7. Local observation donors
 
 <a id="local-observation-sources"></a>
-
-## 6. Local observation donors
 
 ### Codex
 
 Use native thread identity, `Thread/GitInfo`, bounded rollout JSONL reads and the
 append-only session index. Plain and `.jsonl.zst` are two representations of one
-logical rollout. A compressed historical read may decode the whole file; do not run
-it as a high-frequency poll. Session-index mtime is not work activity. Ephemeral
-threads may have no durable log.
+logical rollout. Compressed historical reads may decode the whole file and are not a
+high-frequency live poll. Index mtime is not work activity; ephemeral threads may
+have no durable log.
 
 ### Claude
 
-The official SDK's session listing can use bounded head/tail metadata reads, while
-transcript reconstruction parses full JSONL and parent links. Page size therefore
-does not bound underlying I/O. Observe known changed files frequently and run scoped
-inventory less often. Reuse existing SDK summaries when maintained; do not add a
-transcript mirror solely for monitoring.
+Official SDK session listing can use bounded head/tail metadata reads; transcript
+reconstruction can parse full JSONL and parent links. Page size therefore does not
+bound underlying I/O. Observe known changed files frequently and run inventory less
+often. Reuse maintained SDK summaries; do not create a transcript mirror.
 
 ### OpenCode
 
 Use one adapter-owned read-only SQLite connection, query indexed new sequences and
-revisit known open messages that may update in place. `PRAGMA data_version` is an
-unchanged-pass hint on the same connection, not a durable cursor or activity fact.
-Use read-only URI mode; never `immutable=1` for a live WAL database or copy only the
-`.db` file while committed WAL data exists.
+revisit known open messages that update in place. `PRAGMA data_version` is only an
+unchanged-pass hint on the same connection, not a durable cursor/activity fact. Use
+read-only URI mode; never `immutable=1` for a live WAL database or copy only the main
+`.db` file.
 
 ### Muse
 
-Use the native durable session log, workspace/worktree/branch facts and content
-activity events. `parentSessionId` may be a containing top-level session rather than
-the spawning parent. `notLoaded` is one host's view, not proof of global death.
+Use the durable session log, workspace/worktree/branch and content-activity events.
+`parentSessionId` may be a containing top-level session rather than the spawning
+parent. `notLoaded` is one host's view, not proof of global death.
 
 ### Processes, Git and GitHub
 
 Use selective `sysinfo` refresh but preserve Eliot's stronger OS birth/handle
-identity for controls. CPU needs two samples and may exceed 100% across cores. Do not
+identity for controls. CPU needs two samples and can exceed 100% across cores. Do not
 hash executable bytes on every sample.
 
 Use machine Git formats: `git worktree list --porcelain -z`,
 `git status --porcelain=v2 --branch -z` and `git for-each-ref`. Observation never
-changes checkout, index or remote config. Assigned branch, actual checkout, upstream,
-push destination and independently observed remote GitHub ref are separate facts.
-Coalesce one bounded remote-ref read per repository/ref through the existing `gh`
-owner; do not require publication or a PR.
+changes checkout/index/remotes. Assigned branch, actual checkout, upstream, push
+destination and remote GitHub ref are separate facts. Coalesce one bounded remote-ref
+read per repository/ref through the existing `gh` owner; do not require a PR.
 
-## 7. Current library integrations
+## 8. Old Claude scripts as field evidence
+
+The scripts are not code donors. Preserve only verified mechanisms:
+
+| Old behavior | Product rule |
+| --- | --- |
+| compact `TASK.md` microtasks | one manager-created slice packet with objective, symbols, deletion list and minimal check |
+| `Agent-Watch.py` / `oc_busy.py` cross-source join | one passive projection keeping activity, connection, process, assignment and freshness separate |
+| settled/review-waiting work omitted from reminders | do not keep waking agents without new actionable input |
+| refuted findings retained | preserve verified/refuted investigation results |
+| branch/candidate-specific evidence | Store Operation and candidate-specific evidence with consumer ACK |
+| one manager per lane/worktree | manager integrates its candidate; cross-owner integration is separate |
+| quota/model error tables | distinguish rate limit, exhausted quota, unavailable model and transport failure |
+
+Reject:
+
+- PID-only or newest-file ownership;
+- age/low-CPU/mtime kill decisions;
+- automatic destructive restart without confirmation;
+- first-answer permission/form automation;
+- marker files as authority;
+- copied reminder/recovery daemons;
+- addendum chains as policy;
+- forced rotation unrelated to native state.
+
+The old migration principle remains sound: compare the controller and script on the
+same facts, then delete the script. Do not preserve scripts as compatibility wrappers.
+
+## 9. Build and tooling donors
+
+### Cargo metadata
+
+Use Cargo's maintained `cargo metadata --locked --no-deps` for workspace package and
+local dependency ownership. Do not maintain a second parser for Cargo.lock or infer
+runtime compatibility from build-cache paths.
+
+A small changed-package selector may consume metadata and Git diff. It must remain
+smaller than the custom classifier it replaces and include real local reverse
+dependencies. Do not introduce another build orchestrator solely to replace a script.
+
+### Filesystem primitives
+
+The existing `swarm-process::permissions` implementation already provides bounded
+private regular-file checks, atomic same-directory publication, durability barriers
+and exact-byte convergence. Reuse it for the Antigravity delivery outbox and small
+adapter records. Do not add SQLite, RocksDB or a generic persistence crate.
+
+### Package installation
+
+Use one package manifest and generic installer behavior. Per-artifact PowerShell
+functions, exact schema arrays and build-environment equality are not donor-worthy
+safety. Keep path containment, reparse protection, private credential references,
+atomic publication and selected byte verification.
+
+## 10. Current library integrations
 
 | Library | Keep for | Do not add |
 | --- | --- | --- |
-| `rmcp` | MCP protocol/transport and tool routing | another MCP framing layer or readiness gate before dispatch |
-| `agent-client-protocol` | Command ACP wire types | ACP wrappers around every other harness |
+| `rmcp` | MCP protocol/transport and tool routing | another framing layer or dispatch readiness gate |
+| `agent-client-protocol` | Command ACP wire types | ACP wrappers around all harnesses |
 | `croner` | calendar parsing/evaluation | per-rule timers or another scheduler database |
-| `atlas-redact` | redaction of complete supplied logical records | claims of cross-chunk protection without a buffer |
-| `tokio` / `rusqlite` / `serde` | async runtime, WAL Store and typed current protocol | another broker, ORM, EAV store or generated compatibility layer |
-| `tracing` family | targeted diagnostics and dynamic filtering | second logging framework or universal business-event schema |
-| `notify` | optional filesystem change hints | event-as-state assumptions; periodic reconciliation remains required |
+| `atlas-redact` | redaction of complete supplied logical records | cross-chunk claims without buffering |
+| `tokio` / `rusqlite` / `serde` | runtime, WAL Store, current typed records | broker, ORM, EAV store or generated compatibility family |
+| `tracing` | targeted diagnostics and filtering | second logging framework or universal business-event schema |
+| `notify` | optional filesystem change hints | event-as-state assumptions; reconciliation remains required |
 
 Current GitHub effects use `gh`. `octocrab` is optional only if a retained requirement
-and measured code deletion justify replacement. Never add both clients.
+and measured deletion justify replacement. Never add both clients.
 
-## 8. Store and scheduling patterns
-
-- `tokio::sync::watch` is a latest-value wakeup, not an event log. Store observations
-  and cursors remain durable; notify after commit.
-- Temporal/Windmill provide only a pattern for schedule vs admitted run,
-  overlap/catch-up and execution identity. Do not import either service, database or
-  workflow language.
-- Disabling a schedule stops future admissions; it does not cancel started work.
-- Helper execution identity is the current manager on whose behalf Store admitted
-  the action; editing config does not silently transfer ownership.
-
-## 9. Integration discipline
+## 11. Integration discipline
 
 A donor is integrated only when:
 
-1. the exact source/version and license class are recorded;
-2. a current caller uses it;
+1. exact source/version and license class are recorded;
+2. one current product caller needs the behavior;
 3. the replaced Eliot mechanism is removed in the same connected slice;
 4. total owned Rust + JS + glue falls or a named missing behavior is delivered;
 5. retry, lifecycle and durable-state ownership remain singular;
 6. unsupported cases and source limits are explicit;
-7. the worker receives only the named mechanism, not the donor's whole architecture.
+7. the worker receives the named mechanism, not the donor's entire architecture.
 
-Do not vendor or wrap an entire donor to claim progress. Do not add a shared
-abstraction for one implementation caller. Do not preserve an old adapter because a
-historical record names it.
+Do not vendor or wrap a donor to claim progress. Do not create a shared implementation
+abstraction for one caller. Do not preserve an old adapter because a historical
+record names it.
