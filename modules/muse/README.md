@@ -10,7 +10,7 @@ it does not qualify the default Node route or complete native family recovery.
 
 Refactoring chooses one executor by required behavior and total owned code
 across Rust, SDK drivers and glue. The
-[transition plan](../../docs/agent-operations/refactoring.md#retire-executors-without-losing-history)
+[transition plan](../../docs/agent-operations/implementation.md#current-format-and-existing-data)
 removes the replaced implementation; these source versions do not promise
 permanent support for older bridges. [UPDATE.md](UPDATE.md) separates dependency
 updates, protocol changes and concrete saved-work transitions.
@@ -71,7 +71,7 @@ The bridge requests the native `sessionMcp` grant and can forward a configured
 the server or its tools are usable. The inspected native reads exposed no tool
 inventory, and the existing Store launch gate still refuses dispatch in that
 case. This is a [known source gap](../../docs/agent-operations/refactoring.md):
-[V3 requires asynchronous MCP observations](../../docs/agent-operations/architecture.md#13-direct-launch-pipeline-and-non-blocking-mcp-readiness),
+[V3 requires asynchronous MCP observations](../../docs/agent-operations/implementation.md#launch-and-results),
 so unavailable inventory must not become a new permanent launch prerequisite.
 
 ## Commands and observation

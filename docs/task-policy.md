@@ -9,7 +9,7 @@ Reviewers report their assigned findings without acquiring manager authority.
 
 Remove document-edition permission gates and historical acceptance branches under
 the [reduction program](agent-operations/refactoring.md#code-reduction-candidates).
-For actual old work, use the [finite transition](agent-operations/refactoring.md#retire-executors-without-losing-history):
+For actual old work, use the [finite transition](agent-operations/implementation.md#current-format-and-existing-data):
 convert/revise unfinished work explicitly and preserve required old evidence as
 history. Do not silently give a recorded Attempt new meaning or keep an old
 executable workflow forever to read that history.

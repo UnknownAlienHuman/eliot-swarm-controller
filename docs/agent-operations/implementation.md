@@ -1,192 +1,244 @@
-# Implementation Plan — Rust Operations on Behalf of the Manager
+# Eliot Swarm Controller — Implementation
 
-Revision 23 · 2026-10-18 · Capability and completion reference.
+This is the single implementation order for the [architecture](architecture.md).
+Source rechecked at `4e75fb1fdfc6b9cd4aee77f21c9b68dcc61761c5` on 2026-10-18;
+the mechanisms below are present unless explicitly marked completed.
+[Findings](refactoring.md) retain source evidence and counts;
+[status](../implementation-status.md) records execution evidence. O/M/C/I labels
+in older documents are historical references, not additional work queues.
 
-O1–O11 name capabilities; [M1–M6](modularity.md#6-implementation-sequence-and-completion-criteria)
-name package/process boundaries. They are references, not cumulative work orders.
-The [refactoring map](refactoring.md) selects the compact core, optional scope and deletions. [Implementation status](../implementation-status.md)
-records what exists and what was actually checked. A completion criterion below
-is a target, not a report that a block passed.
+## Code ownership
 
-## 1. Delivery discipline
+Use the existing owners. Move a needed contract to its shared owner with its
+callers; do not create a crate or service for every row.
 
-Follow [AGENTS.md](../../AGENTS.md) for one manager/worktree, integration and scoped
-verification. Complete the producer, admission/handler and result consumer together.
-Manual and enabled automatic callers share the same Store/action owners.
-Implementation slices remove replaced mechanisms; no extra workflow DSL, activation
-ledger or framework-only milestone is needed.
-
-## 2. Dependencies
-
-Prioritize the productive local path: workspace, launch, dispatch, attributable
-result, submission, review, repair and acceptance, with observation and selected
-Goal continuation. GitHub, hooks and scripts are optional extensions. Council,
-interface-ratification/ACK and automatic publication/Issue-label engines are outside
-required core completion; do not finish them as a prerequisite to removing them.
-
-O1/O2 provide shared admission, storage and intake. O3/O4/O5 can use those boundaries
-independently with non-overlapping file ownership. O7 local review does not depend
-on GitHub or script interpreters. O8/O9 reuse common entries, cursors and scheduler.
-O10 is integrated with each exposed slice; O11 follows completed source.
-
-## 3. O1 — Ownership, configuration and shared actions
-
-Owners: [Configuration](configuration.md), [on-behalf execution](architecture.md#2-same-action-handler-for-both-callers)
-and [relational migration](refactoring.md#relational-conversion-detail).
-
-Completion criterion: a manager can configure and enable only the named helper in
-one call, retain manual access, read/explain/cancel its on-behalf Operations, and
-stop future starts without losing observed results. Preserve revision CAS,
-activation cuts, shared semantic slots, retained inputs and disable/start ordering.
-New automation must not inherit the internal Scheduler's legacy cross-owner exception.
-
-## 4. O2 — Durable intake and shared observation
-
-Owners: [durable dispatch](architecture.md#23-durable-dispatch-not-notification-delivery),
-[monitoring](architecture.md#3-monitoring-without-model-interrogation) and
-[WAL reader migration](refactoring.md#wal-migration-detail).
-
-Completion criterion: monitoring works with all automation off; committed work
-survives lost/coalesced notifications and reconnects. Cursor advancement commits
-with its Operation/reservation or pending subject. Indexed capacity changes wake
-waiting work without failed-job storms; damaged sources and slow viewers do not
-block unrelated owners. Keep authorization, pagination and journal cuts in the
-same bounded read snapshot; watches are hints, not durable delivery.
-
-## 5. O3 — Runtime adapters, streams, turn-correlated results and direct control
-
-Owners: [launch](architecture.md#13-direct-launch-pipeline-and-non-blocking-mcp-readiness),
-[result correlation](architecture.md#41-deterministic-turn-scoped-result-correlation-agentresult),
-[SDK boundary](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries)
-and [module lifecycle](modularity.md#5-demand-driven-lifecycle-unified-supervision-and-recovery).
-
-Completion criterion: supported runtimes accept manual/automatic dispatch and
-return the complete attributable assistant result without a pre-prompt MCP gate.
-Keep explicit native input/turn identity where supplied; use the specified
-serialized-turn association where needed. Exact steer/reply/cancellation and
-bounded native streams keep their actual capability limits. Requested, effective
-and observed model/usage remain distinct. A donor replaces native mechanics while
-Eliot retains one durable effect/recovery authority and historical identity bytes.
-
-## 6. O4 — Optional GitHub/Git and distribution
-
-Owners: [GitHub APIs](module-api.md#o4-one-source-mapped-github-issue-label),
-[queue ownership](delivery.md#3-queue-and-ownership), [remote effects](delivery.md#9-github-boundary)
-and [donor retry policy](donor-map.md#retry-ownership).
-
-Completion criterion: one `octocrab` backend replaces GitHub API transport while
-preserving account/host selection, permissions, bounded reads, durable intake and
-uncertain-write readback. Import/read never dispatches; local work remains usable
-without GitHub. Source revision, projection echo, accepted push, PR update and
-actual merge are separate identities/effects. Native Git stays outside Store
-transactions with existing ownership and per-target serialization.
-
-## 7. O5 — Hooks
-
-Owners: [hook execution](architecture.md#5-hooks) and [verified post-commit facts](module-api.md#o5-verified-post-commit-facts).
-
-Completion criterion: authenticated bounded observation reaches the shared event
-path; only a selected enabled helper acts on it. Preserve installed hook settings,
-phase/veto semantics and source readback. Async after-hooks cannot veto past work;
-models, installation and long-running actions stay off callback paths. A missing
-optional hook integration does not disable unrelated manual work.
-
-## 8. O6 — Optional script bundles
-
-Owners: [script contract](architecture.md#9-external-scripts), [generic event ScriptRun](configuration.md#generic-system-event-scriptrun)
-and [invocation API](module-api.md#o6-one-granted-message-to-the-exact-attempt-owner).
-
-Completion criterion: direct runs and selected event triggers share one runner and
-committed intake. Capture immutable bundle/environment/schema inputs, bounded output,
-real descendant ownership and scoped invocation rights. Taskless events use their
-versioned context without invented Attempt rights; normalized/legacy occurrences
-share deduplication. Disable blocks new independent effects, not fictional recall
-of started OS work. Native delivery does not depend on optional interpreters.
-
-## 9. O7 — Local reviewed delivery and selected automation
-
-Owner: [Delivery](delivery.md), especially [review](delivery.md#6-review-assignment-verdict-and-audited-state),
-[return/repair](delivery.md#7-return-and-repair) and [acceptance/publication](delivery.md#8-acceptance-upload-and-publication).
-
-Completion criterion: manual submission A, review findings, applied return,
-correction B and fresh review complete through existing candidate-bound handlers.
-Enabled handoffs use the same slots. Applied submission creates eligibility;
-assigned auditor authorship, manager disposition and owner repair stay distinct.
-Preserve legitimate corrected descendants, unresolved findings, late historical
-results and the explicit correction phase. Local review has no first-push dependency.
-
-## 10. O8 — Cron and typed event rules
-
-Owners: [typed rules](architecture.md#6-typed-rules-and-legitimate-progression),
-[cron](architecture.md#7-cron-and-shared-reminders) and [event rules API](module-api.md#o8-event-rules-and-hook-assisted-joins).
-
-Completion criterion: one `croner` scheduler over indexed Store rows supports
-manager enable/disable, manual run-now and restart without duplicated occurrences.
-Retain calendar/DST/overlap/misfire semantics and consumed occurrence identity
-while converting used interval definitions once; remove the old scheduler. Cursor and action/pending disposition commit together. Generic
-event selection does not create a second scheduler or bypass typed action validation.
-
-## 11. O9 — Goal and reminders
-
-Owners: [server Goal](architecture.md#8-server-goal), [shared reminders](architecture.md#7-cron-and-shared-reminders)
-and [Goal continuation](module-api.md#o9-one-goal-continuation-for-one-completed-terminal-eventref).
-
-Completion criterion: tracking existing Tasks, one-shot notices and selected
-progression coexist with one actual continuation owner. Achievement uses declared
-evidence/evaluation; unknown native continuation requires readback before competing
-input. Reuse shared subject/timer indexes. No new Task graph or hidden model loop.
-
-## 12. O10 — Shared MCP/CLI and cross-PR consistency
-
-Owners: [MCP contracts](architecture.md#10-mcp-and-cross-program-contracts),
-[canonical surfaces](../mcp-canonical-surfaces-and-topologies.md),
-[catalog/loading](../mcp-tool-catalog-and-loading.md) and [code reduction](refactoring.md#code-reduction-candidates).
-
-Completion criterion: each implemented method has its actual caller, policy,
-validation, handler and result projection. `swarm-cli` owns application CLI mapping;
-remove its duplicate in `swarm-kernel-host`. Keep the small eager cores and deferred
-schemas through `rmcp`; catalog presentation never replaces Store authorization.
-Assigned review reads/submission remain exact-assignment scoped after release
-while authenticated and unrevoked. Ordinary Participant submission still requires
-its authorized current revision/Attempt or retained producer basis. Neither acquires
-manager/GM rights. No generic execute-method tool or new public aliases.
-
-## 13. O11 — Qualification
-
-Use the relevant scenarios for the selected product behavior. Optional integrations
-do not make the whole table a release gate for core work. Record what actually ran
-and distinguish fixtures from native evidence; document changes need neither.
-
-| Cases | Required outcome |
+| Responsibility | Source owner and implementation boundary |
 | --- | --- |
-| Default, one-call enable, manual coexistence | New/untrusted-imported entries are off; only selected helpers run. Full manual delivery remains available without a new mode/grant ceremony. |
-| Launch and result | Each selected supported adapter completes `agent.open -> task.dispatch -> agent.result` with attributable output and asynchronous MCP discovery. Retired experimental adapters are not a compatibility matrix to keep green. |
-| Current rights and on-behalf visibility | No forged Principal/Scheduler shortcut; authorized manager reads, explains and cancels through concurrent WAL snapshots without cross-manager disclosure. |
-| Commit/signalling crash and capacity wait | Lost notification/reconnect loses no committed fact or duplicates an action; waiting subjects resume on prerequisite/capacity changes. |
-| Activation cut and config edit | Enablement races safely with new events; omitted inclusion drains no old backlog. New admissions use new preferences; retained jobs keep inputs. |
-| Disable/start and manual/automatic race | Disable-first prevents start; start-first remains in-flight/readback. Equivalent work shares one slot, incompatible choices conflict, uncertain effects are not replayed. |
-| Review/repair, loops and source freeze | A remains immutable during review, applied return permits correction B, and B can receive fresh audit. Echoes/new IDs on unchanged defects do not consume new model work. |
-| Review replacement and late/revoked result | Reassignment follows observed prior disposition; late evidence remains historical and cannot author the replacement. Revocation bars new effects; unauthenticated verdicts are rejected. |
-| Native/capability truth | Family coverage and process ownership remain scoped; listed schemas do not imply model consumption. No extra model launch solely for a checkbox. |
-| GitHub transport/projections | Projection echoes do not revise Tasks; `octocrab`/transport middleware does not repeat ambiguous writes or publication. |
-| Cron/restart | Old slots, DST, calendar edits and toggles cannot duplicate consumed work; ordinary recovery does not become unbounded replay. |
-| Scale and isolation | Slow streams and busy owners do not starve completion/control; no per-participant polling or full-history scans. |
+| Durable work and rights | [Host Store](../../crates/swarm-kernel-host/src/store/mod.rs): admission, Tasks, Operations, reservations, events and domain DDL. [swarm-kernel](../../crates/swarm-kernel/src/lib.rs): existing actor and pure policy. [swarm-store](../../crates/swarm-store/src/lib.rs): connection/transaction mechanics. These are libraries inside the host. |
+| Shared wire and IPC | [swarm-contracts](../../crates/swarm-contracts/src/lib.rs): DTOs, method policy, module catalog. [swarm-client](../../crates/swarm-client/src/lib.rs): bounded authenticated IPC and ModuleLink. Shared libraries do not import the host or adapters. |
+| Task delivery | Store [tasks](../../crates/swarm-kernel-host/src/store/tasks.rs), [submissions](../../crates/swarm-kernel-host/src/store/submissions.rs), [reviews](../../crates/swarm-kernel-host/src/store/reviews.rs) and [acceptance](../../crates/swarm-kernel-host/src/store/acceptance.rs) own the existing transitions; [delivery](delivery.md) owns their behavior. |
+| Native execution and results | The selected `swarm-adapter-*` owns vendor transport, session/turn mapping and native recovery. Store [normalized_result](../../crates/swarm-kernel-host/src/store/normalized_result.rs) and [results](../../crates/swarm-kernel-host/src/store/results.rs) validate and expose attributable results. No second Task store in an adapter. |
+| Scheduling and processes | [swarm-automation](../../crates/swarm-automation/src/lib.rs) is the target scheduler service; Store owns due state and admission. [swarm-supervisor](../../crates/swarm-supervisor/src/lib.rs) owns retained worker lifecycles through [swarm-process](../../crates/swarm-process/src/lib.rs). Consolidation is still required. |
+| User surfaces and observation | [swarm-cli](../../crates/swarm-cli/src/lib.rs) owns application CLI mapping; [swarm-mcp](../../crates/swarm-mcp/src/mcp/mod.rs) uses the shared catalog. [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) owns common diagnostic primitives; observers project existing state without starting models. |
 
-Run synthetic registered populations separately from paid active models. Measure
-bounded Store latency/read concurrency, gaps/fairness, RSS/handles, context volume,
-repeated work and manager attention. Stage small native teams before larger fleets;
-registration count is not active-turn capacity. CI performs no paid model runs,
-live repository writes, service installation or owner-machine cleanup.
+## Implementation order
 
-## 14. Migration and completion
+Complete one connected change: producer, handler/admission, consumer and obsolete
+path removal. Independent rows can proceed with separate file ownership. Each row
+below points to existing source; the detailed findings are not another checklist.
 
-Use [existing Store migration owners](refactoring.md#relational-conversion-detail)
-for domain tables/indexes. Operations retain admitted actor/input identity. Required
-old data follows a [finite transition](refactoring.md#retire-executors-without-losing-history);
-remove historical readers and policy branches after conversion. The never-deployed
-PR #23 API needs no aliases. Current authorization comes from the common handler.
+| Work | Edit and remove | Result |
+| --- | --- | --- |
+| Retire unused installation/executor paths | [Frontend installer](../../tools/modules/Install-SwarmFrontend.ps1), legacy fixture, duplicate Forge installer and retired Python Codex identified in [findings](refactoring.md#code-reduction-candidates). Remove their CI/Justfile/config consumers together. | A current installation does not inspect retired siblings; current Codex needs no Python executor or vendored bridge SDK. |
+| Remove policy/provenance bureaucracy | [policy.rs](../../crates/swarm-kernel-host/src/policy.rs), `LegacyV1` acceptance branches, [qualification](../../tools/qualification/New-NativeQualification.ps1) and [package helpers](../../tools/ci/SwarmBuildProvenanceHelpers.ps1). Follow [identity rules](#identity-and-hashes). | Caller/object rights and the selected module contract replace document editions and checkout/compiler/cache-path equality. |
+| Converge native execution and finish the productive path | Move needed built-in OpenCode consumers to the [standalone adapter](../../crates/swarm-adapter-opencode/src/lib.rs); remove host `runtime/opencode_v2` execution and legacy routing. Compare Muse Node/Rust required behavior and total owned code, select one and retire the other. Apply [launch/result changes](#launch-and-results) to the selected implementation. | One executor per retained runtime returns attributable output without a pre-prompt MCP gate. No third bridge. |
+| Remove optional product engines | [Concilium](../../crates/swarm-kernel-host/src/store/concilium.rs), [integration](../../crates/swarm-kernel-host/src/store/integration.rs), automatic [publication](../../crates/swarm-kernel-host/src/store/automation_publication.rs)/[GitHub projection](../../crates/swarm-kernel-host/src/store/automation_github_projection.rs), their methods, config and schedulers. | Ordinary assignments, messages and independent review serve collaboration. Explicit accepted-candidate publication remains an optional command. Retain participant registration and review/submission grants colocated in coordination code. |
+| Unify automation and indexed state | [automation_transfer](../../crates/swarm-kernel-host/src/store/automation_transfer.rs), Store automation families, [scheduler](../../crates/swarm-kernel-host/src/scheduler.rs) and [automation_scheduler](../../crates/swarm-kernel-host/src/store/automation_scheduler.rs). Apply [stable identity](#automation-and-delivery) and [Store conversion](#store-and-current-data). | One entry identity, scheduler and durable due model; delete journal relocators, successor ancestry, old loop/config registry and replaced `meta` key codecs. |
+| Finish read and package boundaries | `Store::call`, [legacy_optional_workers](../../crates/swarm-kernel-host/src/host/legacy_optional_workers.rs) and affected manifests. Use [Store reads](#store-and-current-data) and [process boundaries](#processes-and-frontends). | Bounded independent reads; host stops linking retained worker implementations. Existing public CLI deletion stays completed. |
 
-Setup records trusted local runtime/source/credential choices and enables no sample
-work. Ordinary crash recovery preserves owned saved choices; unattributable imports
-are not enabling consent. Completion is a usable integrated delivery cycle with
-selected helpers, one authority per responsibility and no duplicated execution path.
+### Current format and existing data
+
+Backward compatibility is not a product requirement. A historical enum, fixture or
+release directory does not justify a converter. Identify concrete required saved
+work before writing transition code. Finish/reconcile it with its current owner,
+use a supported handover, or export required results and convert unfinished Tasks.
+A changed meaning needs a new Task revision/Attempt; preserve the old record as history.
+Then delete old producers, readers, schema branches and packages. Disposable
+experimental state needs no supported migration path; live state is not silently reset.
+
+## Launch and results
+
+Make launch preview an optional read-only view. [LaunchRequest::parse](../../crates/swarm-kernel-host/src/launcher.rs)
+currently requires `plan_digest`; Store [launch_for_actor](../../crates/swarm-kernel-host/src/store/launcher.rs)
+recomputes it, and workspace/lease/dispatch consumers repeat the comparison.
+Admit explicit settings and expected revisions directly, resolve and retain one
+plan under its launch Operation, and reference that record from workspace and
+dispatch. Remove the caller-supplied preview hash and redundant plan copies, while
+preserving the link between admitted inputs, prepared workspace and dispatched
+input. Revision/authority checks remain at admission and the relevant start boundary.
+
+In [launcher_dispatch.rs](../../crates/swarm-kernel-host/src/store/launcher_dispatch.rs),
+`require_current_dispatch_capability` still gates dispatch/coalesced dispatch on
+OpenCode/Muse MCP connection evidence. Change those admission callers: prepared
+workspace + authorized current Task/binding + ready native session admits the input.
+Keep actual session/turn validation, including Antigravity's binding evidence.
+Tool discovery reports asynchronously. Remove the MCP prerequisite itself rather
+than hiding an `awaiting_native_mcp` field.
+
+The OpenCode [native reader](../../crates/swarm-adapter-opencode/src/native.rs)
+currently rejects a missing assistant `parentID` in `validate_assistant_parent`.
+Implement result association in the selected adapter before deleting the old reader:
+
+1. When the native protocol supplies an input/parent ID, verify and retain it.
+2. Otherwise retain Operation, binding/generation, native session, stream generation
+   and turn baseline before input; serialize independently attributable inputs in
+   that window and retain its scoped body until the matching terminal event.
+3. Return the body through the existing normalized-result page contract. A complete
+   window establishes association without repeated parent IDs. A second independent
+   input, unclassified stream gap or changed generation requires readback of that
+   input, never a resend or a guess from the newest assistant message.
+
+Preserve native order and final-body replacement of deltas. Report missing/truncated
+bytes or unavailable retained history precisely; a digest cannot reconstruct output.
+Result retrieval does not accept a Task. The [Waku/Paseo patterns](donor-map.md#8-architectural-donor-patterns)
+simplify execution/lifecycle ownership; Eliot supplies this Operation mapping.
+
+## Store and current data
+
+Keep one serialized writer. Admission, current-rights checks, reservation, state
+change and durable event/cursor disposition commit together. Native, Git, file and
+network I/O run outside short database transactions.
+
+`Store::call` currently separates status/monitor reads but sends most ordinary
+reads through the writer. Reuse `swarm-store::open_reader` with a bounded WAL pool.
+Route pure SQL query families explicitly: authorization, page data and journal cut
+share one short read snapshot. Do not classify by a `get`/`list` suffix: `module.next`
+mutates dispatch, streams own registries, and artifact bodies cross DB/cache/file
+boundaries. Do not hold a snapshot across client pages; bound pool backpressure.
+
+Use existing `initialize_database` / `install_schema_extension` in Host Store for
+bounded transactional conversion. Index queried identity, owner, state, due and
+relationship fields in ordinary tables. Bounded payload/config JSON stays in its
+owning row where useful. Convert a used family, validate retained identities and
+capacity totals, switch consumers and remove old keys/code. No ORM, EAV schema,
+table per JSON leaf or second migration runner. Held/unknown capacity stays held.
+Persist a finalized body once per actual owner and reference it; required raw native
+ACK/recovery bytes and normalized/redacted output can have distinct lifetimes.
+
+[swarm-store](../../crates/swarm-store/src/lib.rs) currently verifies the base SQL's
+SHA before calling the host initializer, and again when opening a reader. Remove
+that source-text equality gate. Keep application identity, explicit schema version
+and the existing transactional extension installer. Today `user_version` is fixed
+at 1, not a migration sequence. Implement each actual schema change there and
+validate the affected tables/columns in that conversion. No general base-schema
+validator already exists; neither the current stored digest nor a version number
+proves every table is intact. SQL whitespace is not a new file format, and this
+change does not require a new schema-validation framework.
+
+## Automation and delivery
+
+Give each retained automation an immutable internal `entry_id`, separate from name
+and `owner_manager_id`. Journal/occurrence rows reference it. Convert actual
+source/successor records to the same logical entry; unrelated same-name entries
+remain distinct. `automation_transfer::apply` then updates owner/revision in one
+transaction. Delete its six `relocate_state` paths, cron relocation, historical
+identity copies and transfer-pointer/cycle machinery. A→B→A must preserve state and
+consumed occurrences. Admitted Operations retain original actor/input; pending
+starts check current authority.
+
+Keep one scheduler service. Reuse [scheduler/calendar.rs](../../crates/swarm-kernel-host/src/scheduler/calendar.rs)
+(`croner` plus `chrono_tz`) for calendar evaluation. Store owns enabled state,
+due identity, overlap/catch-up and action disposition. Convert used interval
+entries once, then remove the built-in loop and its configuration/demand registry.
+Enabling standalone currently does not remove built-in orchestration.
+
+A manual action needs no automation object. Enabled helpers call the same handlers
+with a Store-derived manager context. A cursor advances atomically with its action
+or retained pending reason; notifications only wake readers of committed work.
+Use domain uniqueness for the same candidate/action/occurrence across manual and
+automatic callers. A new request ID or config revision does not create new work.
+
+Settings affect future admissions; an admitted action retains its inputs. Start
+checks serialize with disable. Disable-first holds unstarted work; start-first can
+finish and report its result. Separate follow-ups check current eligibility again.
+One continuation owner serves an assignment. Goal references existing Tasks and
+completion evidence; it does not own a second task graph or timer system.
+
+Local delivery follows [delivery.md](delivery.md): submission A, independent
+review, manager return, correction B and fresh review before acceptance. Preserve
+candidate-specific authorship and late results. Remove document-edition rights and
+historical acceptance workflows through the finite transition, not by treating old
+verdicts as permission for new candidates.
+
+## Identity and hashes
+
+Use ordinary IDs/revisions and field comparisons for local relationships and edits.
+Retain a digest only where a consumer actually needs exact-byte identity or a secret
+verifier. The [source findings](refactoring.md#identity-machinery) distinguish the cases.
+
+| Boundary | Implementation decision |
+| --- | --- |
+| Local configuration/launch preview | Keep effect-free preview optional. `automation::apply` already checks expected revisions and validates the patch; remove its extra `preview_digest` comparison. Launch uses the retained Operation plan described above, with no caller-carried approval hash. |
+| Documents, build provenance and local diagnostics | Remove policy-document SHA/path/edition admission and checkout/compiler/cache equality. Diagnostic rows use existing source/row IDs and revisions; do not add attestations or agreement hashes. |
+| Requests, credentials and immutable bytes | Keep same-request/same-input checks, private credentials, selected executable verification and necessary artifact/native-payload digests. Use existing canonical/byte helpers according to the actual contract; no new hash registry. |
+| Participant issuance | `participant_credentials::issue_for_launch` must reuse the same private token after a lost registration reply. Consolidate duplicate manifest/reference-index fields and the two identical indexes into one authoritative record with resolving refs; preserve request/registration binding and exact credential/profile readback. |
+| Results across executor replacement | `normalized_result::same_module` currently compares full artifact identity. Keep original dispatch provenance and implement a supported authorized handover/result mapping for required work; do not forge receipts or retain an old executable indefinitely. |
+
+Selected package files and one shared descriptor/image validator are sufficient
+for installation. Remove PowerShell's duplicate schema validator, private Rust-source
+regex checks and repeated copy-provenance records. Keep actual adapter resources,
+including required Antigravity Node files. Cargo metadata supplies target/dependency
+facts when needed; it is not another package approval registry.
+
+## Recovery and progress
+
+One owner records an effect's start and confirmed/uncertain outcome. On reconnect,
+reconcile that Operation/native input before further input on the ambiguous scope.
+Do not give middleware, adapter and scheduler independent uncertain-write retries.
+Supported safe reads can use bounded retry; an unknown external write stays unknown
+until readback or explicit disposition. Observation and authenticated late-result
+ingestion continue after disable or supersession, without authorizing a new action.
+
+Use committed cursors and indexed pending work for restart and wakeup. A lost signal
+must not lose an admitted action. A malformed optional record or slow viewer is
+isolated to its source/subject; Store failure is reported as Store failure. Keep
+streams bounded, redact complete logical records before persistence/fanout, and
+show a gap when content is unavailable. No per-token durable event or per-agent
+model/status poller is needed.
+
+## Processes and frontends
+
+Remove host implementation dependencies on `swarm-supervisor`, `swarm-bus`,
+`swarm-script-worker`, `swarm-checks`, `swarm-automation` and `swarm-observer` after
+moving their used contracts/pure functions to the existing shared owners. Keep
+Store admission/event transactions in the host. `swarm-process` already supplies
+process ownership, private durable files and JSONL mechanics. One lifecycle owner
+does not require a new worker framework or process per helper.
+
+`swarm-cli` already owns the public application mapping after commit `25a8e3b`;
+the host retains daemon/local delegates and internal workers. Do not assign that
+deletion again. MCP uses `swarm-contracts::mcp_catalog::exposes_method` and the same
+Store handlers. Small eager surfaces and deferred schemas remain; inventing new
+input DTOs solely to adopt Schemars or a generic execute-method tool adds work.
+
+## Donor choices
+
+[donor-map.md](donor-map.md) owns inspected sources and limits. Reuse current rmcp
+for MCP transport, `agent-client-protocol` for Command ACP wire types, croner for
+calendar evaluation and Atlas for stateless redaction of supplied logical records.
+They are actual integrations. Waku's sequential worker and Paseo's initialization/
+close barrier are source patterns, not installed Eliot runtimes.
+
+For Muse compare the existing Node bridge and Rust MSP implementation against
+low-level SDK `Connection`/event-fold reuse. The current Node bridge already supplies
+command IDs and `maxAttempts: 1`; high-level SDK `Session` introduces another recovery
+coordinator. Select the path that removes total Rust + JS + glue; add no third bridge.
+GitHub currently uses `gh`. Keep it unless a retained requirement and net reduction
+justify replacing that transport with octocrab. Adding octocrab is not completion.
+
+## Optional integrations
+
+Hooks record authenticated bounded facts and return; enabled actions run outside
+the callback. Scripts use the existing selected runner, immutable invocation inputs,
+bounded output and owned descendants. Process groups are lifecycle control, not an
+OS sandbox. GitHub publication uses the existing accepted-candidate path and one
+remote-effect owner. Local delivery remains usable without any of these integrations.
+Use [configuration](configuration.md), [module API](module-api.md) and runtime guides
+for their concrete contracts; do not expand them to complete an old capability list.
+
+## Verification
+
+Use existing scoped checks for the changed behavior and dependency closure.
+Choose relevant cases rather than turning this table into a new release program.
+
+| Changed boundary | Meaningful check |
+| --- | --- |
+| Launch/result | Direct launch needs no preview token; stale revisions/changed workspace are rejected; ready session dispatches without MCP discovery; explicit-parent and complete serialized-turn output are attributable; an actual gap stays unresolved without replay. |
+| Delivery/automation | Manual work and selected helper share one action; disable/start ordering, correction A→B, late result and A→B→A ownership preserve the right work. |
+| Store | Restart/lost notification retains an action; reader snapshot is authorized and bounded; migration preserves identity and held capacity; cosmetic SQL text does not define database compatibility. |
+| Installation/process | Selected files suffice without retired siblings or identical build directories; adapter changes leave unrelated host execution intact; actual process ownership controls replacement/cancellation. |
+| Frontends and deletion | CLI/MCP reach the same handler; obsolete callers/config/tests/dependencies are removed, with no fallback wrapper. |
+
+Record what ran and the actual net owned-code change, separating tests. Source,
+fixtures and native execution are different evidence. Update existing status;
+a documentation change requires content/link checks, not runtime qualification.

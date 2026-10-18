@@ -1,7 +1,7 @@
 # Shared package boundaries
 
 This is the V3 ownership map, not a claim that the target Cargo graph is complete.
-Use the [refactoring map](refactoring.md#remove-worker-implementation-edges) for current
+Use [implementation](implementation.md#processes-and-frontends) for current
 edges and their removal. One workspace lockfile records resolved dependencies.
 Add a library where its API has a real consumer and replaces an existing mechanism.
 
@@ -20,7 +20,8 @@ routing. It must not link `swarm-adapter-*` or worker implementations: automatio
 bus, checks, forge, observer, script-worker or supervisor. Shared packages never
 import the host or adapters. Move shared DTOs to their existing owner; do not add a
 new general-purpose crate for each extraction. Package movement reduces coupling;
-the [deletion queue](refactoring.md#code-reduction-candidates) separately reduces code.
+the [implementation order](implementation.md#implementation-order) removes the
+unnecessary responsibilities identified in [source findings](refactoring.md).
 
 ## Contract boundaries
 
@@ -31,7 +32,7 @@ the [deletion queue](refactoring.md#code-reduction-candidates) separately reduce
 | Process owner | Nonkilling module groups on owner loss; check/script cancellation remains separately scoped. Exact process birth is not native-session identity; unknown reads are not departure. | [Lifecycle](modularity.md#5-demand-driven-lifecycle-unified-supervision-and-recovery), [`swarm-process`](../../crates/swarm-process/src/lib.rs) |
 | Check execution | Durable Store Go precedes source resolution/launch, bounded capture keeps pipes drained, and uncertain family disposition retains custody. Diagnostics do not change check/cache input identity. | [CheckRunner](../check-runner.md) |
 | Module bootstrap | Absolute private plan, explicit resolver, cleared child environment and exact owner/artifact receipts. Pre-spawn `not_started` still requires exact owner/family readback before replacement. | [Module installation](module-installation.md), [ModuleLink contract](../agent_swarm.module-contract-v2.md) |
-| Database | DataRoot lock remains on the writer through initialization/shutdown. Domain schema and reconciliation share existing transactional initialization; callback errors pass through unchanged. Preserve parsed-JSON digest comparison and both existing empty-database identity cases. Reads authorize and project in one short read-only snapshot. | [Store boundary](architecture.md#12-transaction-relational-sqlite-and-wal-read-pool-boundaries), [migration detail](refactoring.md#relational-conversion-detail) |
+| Database | DataRoot lock remains on the writer through initialization/shutdown. Domain schema and reconciliation share existing transactional initialization; callback errors pass through unchanged. Keep the new/existing database distinction and explicit application/schema identity; remove the base-SQL text-digest gate through the existing schema owner. Reads authorize and project in one short read-only snapshot. | [Store and conversion](implementation.md#store-and-current-data) |
 | Diagnostics | Redact before persistence/fanout; bound records and bytes, count sink loss independently. Diagnostic acceptance/sequence is neither a business ACK nor a durable event cursor. | [Observability](observability.md) |
 
 The process child-membership helper checks an exact distinct native child against

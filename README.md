@@ -25,8 +25,9 @@ Runtime source, fixtures and native observations have different coverage.
 
 Use the [current source and completion map](docs/implementation-status.md#current-source-and-completion-map)
 for artifact versions, implemented behavior and remaining qualification. Runtime
-guides below describe current commands and transition gaps. The [reduction map](docs/agent-operations/refactoring.md)
-owns the compact target and deletion order. Historical evidence
+guides below describe current commands and transition gaps. [Architecture](docs/agent-operations/architecture.md)
+owns the product manifesto; [implementation](docs/agent-operations/implementation.md)
+owns source changes and deletion order. Historical evidence
 applies to its recorded revision; a fixture pass is not native qualification.
 V3 is the required refactoring target, not a description of a completed rewrite.
 
@@ -129,10 +130,12 @@ Original pages remain retained; provenance is paginated. Export streams over one
 
 ## Evidence and development
 
-Start with [AGENTS.md](AGENTS.md), the [V3 documentation index](docs/agent-operations/README.md)
-and the [refactoring map](docs/agent-operations/refactoring.md). The map owns current
-source gaps and deletion candidates; [implementation status](docs/implementation-status.md)
-owns evidence. Read the relevant contract and source for the assigned slice.
+Keep the short [architecture](docs/agent-operations/architecture.md) in the lead
+developer's context. Use [implementation](docs/agent-operations/implementation.md)
+for the single work order, source owners and donor choices, then read the assigned
+source and contract. [AGENTS.md](AGENTS.md) owns collaboration practice;
+[source findings](docs/agent-operations/refactoring.md) explain excess and
+[implementation status](docs/implementation-status.md) records evidence.
 
 One manager integrates one worktree. Complete the connected source path, then run
 scoped formatting and minimal strict Clippy with actual reverse dependencies.

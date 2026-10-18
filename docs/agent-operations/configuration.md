@@ -2,7 +2,7 @@
 
 **Current operator status:** See [Implementation Status](../implementation-status.md) for published revisions, gate results, and native qualification. This page owns the manager-facing configuration contract.
 
-[Architecture](architecture.md) owns execution; [Delivery](delivery.md) owns the shared work handlers. The [compact scope](refactoring.md#1-authority-and-audit-scope) selects which helpers remain: automatic publication and Issue-label projection are outside required core completion.
+[Architecture](architecture.md) owns purpose and principles; [Implementation](implementation.md) owns the source changes; [Delivery](delivery.md) owns work transitions. The [compact scope](architecture.md#product-boundary) selects which helpers remain: automatic publication and Issue-label projection are outside required core completion.
 
 ## 1. One control model
 
@@ -44,15 +44,16 @@ The discarded `automation.control.*` proposal has no compatibility aliases. `run
 
 ### 2.1 Patch rules
 
-Use `expected_revision=0` only to create an absent entry. For an existing entry match the returned revision. A manager-local `automation_id` is stable within project/owner; edits do not create a new identity.
+Use `expected_revision=0` only to create an absent entry. For an existing entry match the returned revision. The target has one immutable internal `entry_id`; `automation_id` is a manager-facing name and ownership is editable. Current owner-dependent keys are the [transfer replacement](implementation.md#automation-and-delivery), not a permanent identity rule.
 
-Automation IDs are case-sensitive. Operation-impact reads use an exact binary
-key-prefix range: `audit_one`, `auditXone` and `Audit_one` remain separate
-identities. An underscore in an ID is literal, not a search wildcard.
+Automation IDs are case-sensitive. Names such as `audit_one`, `auditXone` and
+`Audit_one` remain distinct; an underscore is literal, not a search wildcard.
+The refactoring replaces current key-prefix lookup with an indexed entry query
+without changing that behavior.
 
 Known object fields are patched recursively; explicitly supplied arrays replace the whole array. Missing fields remain unchanged. `steps=[]` therefore removes all selected steps, while omitting `steps` does not. Missing `enabled` is false on creation and unchanged on update. Reject unknown fields, duplicates and null values except where the field schema explicitly permits null. Do not infer a toggle from a preset name.
 
-Only named entries are changed. Omitted entries are not removed or disabled. Bulk updates are bounded and all-or-nothing. Stale revisions return the current scoped values and a useful conflict; identical request retry returns its original receipt even after later changes. A supplied optional preview digest must still match; apply always validates for itself.
+Only named entries are changed. Omitted entries are not removed or disabled. Bulk updates are bounded and all-or-nothing. Stale revisions return the current scoped values and a useful conflict; identical request retry returns its original receipt even after later changes. Apply validates the patch against those revisions. The target removes preview hashes as additional confirmation tokens. Current `store/automation.rs` still compares an optional supplied `preview_digest`; remove that field/comparison with its catalog consumers as described in [implementation](implementation.md#identity-and-hashes).
 
 A disable-only patch is a local operation. It must not depend on GitHub, model discovery, script validation or a healthy proposed replacement configuration. It returns the new revision and references to unstarted, in-flight and uncertain work. No external I/O occurs in its Store transaction.
 
@@ -110,7 +111,7 @@ rights; late review/results remain tied to their original assignment/candidate.
 **Current source gap:** `automation_transfer::apply` still clones the entry and
 moves six state families plus cron. The retained target check prevents returning
 A→B→A for the same entry. Replace that mechanism during the
-[relational conversion](refactoring.md#relational-conversion-detail), without
+[relational conversion](implementation.md#store-and-current-data), without
 changing the identity of already consumed occurrences or replaying native input.
 
 Effective automatic authority is:
@@ -579,7 +580,7 @@ Bun/OpenCode server or rebuild that launch path from an old example. New service
 connections use the native registration described above.
 
 Current readback still consumes service-owner and process-identity records. Resolve
-actually retained in-flight work through the [finite transition](refactoring.md#retire-executors-without-losing-history),
+actually retained in-flight work through the [finite transition](implementation.md#current-format-and-existing-data),
 then remove the old reader and producer. Their source presence does not establish
 a user-data obligation or justify indefinite compatibility.
 Current source/native evidence remains in [Implementation status](../implementation-status.md).

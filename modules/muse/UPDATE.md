@@ -4,7 +4,7 @@ The current default Muse route uses this Node bridge. The
 [Rust adapter](../../crates/swarm-adapter-muse/registration/INTEGRATION.md) is an
 integrated candidate with a disabled descriptor. Refactoring selects one
 executor and removes the replaced implementation under the
-[central retirement plan](../../docs/agent-operations/refactoring.md#retire-executors-without-losing-history).
+[central retirement plan](../../docs/agent-operations/implementation.md#current-format-and-existing-data).
 
 ## Current source facts
 

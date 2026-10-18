@@ -9,20 +9,21 @@ currently installed machines or claim a complete product acceptance run.
 The owner-supplied baseline is
 [`f1b854b6`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/f1b854b6fd058dc2440d3848fc95acc279657d3f),
 on `27fcae1e`. The preparation checkout studied on 18 October is
-[`25a8e3bc`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/25a8e3bceaadeefb700defa164a4e401885f7e1c).
-Older installed artifacts and receipts retain their own source and run identities.
-The [refactoring map](agent-operations/refactoring.md) owns the current reduction
-work; this page records implementation and evidence, not another work queue.
+[`4e75fb1`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/4e75fb1fdfc6b9cd4aee77f21c9b68dcc61761c5),
+with runtime source unchanged since `25a8e3bc`. Older installed artifacts and receipts retain their own source and run identities.
+[Implementation](agent-operations/implementation.md) owns the current work order;
+[source findings](agent-operations/refactoring.md) explain reductions. This page
+records implementation and evidence.
 
 ### Reduction program and documentation — 2026-10-18
 
-The [refactoring map](agent-operations/refactoring.md) now prioritizes obsolete
-install/provenance checks, parallel runtimes/schedulers, document-based permission
-editions, automation identity/transfer and optional council/publication engines.
-The communication guides are distilled into [one compact contract](agent-communication-program.md).
-These are source-backed deletion targets and documentation changes, not completed
-runtime removals. This pass runs no Rust build, toolchain or native qualification.
-The previous CLI implementation remains separately scoped below.
+[Architecture](agent-operations/architecture.md) is now a short product manifesto;
+[implementation](agent-operations/implementation.md) owns concrete source owners,
+replacements and checks. The source study adds launcher preview-token, base-SQL
+digest and duplicated credential-index coupling to the existing reduction findings.
+Communication has [one compact contract](agent-communication-program.md). These are
+documentation changes and deletion targets, not completed runtime removals or new
+native qualification. The earlier CLI implementation is scoped below.
 
 ### CLI ownership reduction — PR #183 candidate
 
@@ -36,7 +37,7 @@ method parity and the integrated native workflow remain broader unresolved work.
 
 ## Current source and completion map
 
-The source study and [architecture](agent-operations/architecture.md) identify the
+The [source study](agent-operations/refactoring.md) identifies the
 following implemented responsibilities and remaining structural gaps. These are
 source observations, not measured speedups or completed deletions.
 
@@ -46,7 +47,7 @@ source observations, not measured speedups or completed deletions.
 | Store reads | Most reads still use the single writer queue. Status/monitor have a separate FIFO reader. Existing reader primitives can support bounded snapshots, but the broader read-path reduction is not implemented. |
 | Capacity and automation state | Capacity v2 separates a scope header and JSON rows in `meta`; the v1 whole-ledger reader remains. Automation still stores sealed configuration/state and owner-dependent entry keys with transfer journals. Relational simplification and stable entry identity remain candidates. |
 | Runtime ownership | Host still depends on six worker implementation crates. OpenCode has built-in and standalone paths; Muse has Node and Rust paths. Their convergence remains source work. Codex has already moved its current executor to Rust; old Python evidence is historical. |
-| Rights and result identity | Assignment and Store authorization remain necessary. Document editions, install/provenance checks and full artifact-identity comparisons add separate coupling. The refactoring map identifies their callers and finite transitions; this documentation pass changes no admission or result-reader code. |
+| Rights and result identity | Assignment and Store authorization remain necessary. Document editions, install/provenance checks and full artifact-identity comparisons add separate coupling. Source findings identify their callers; implementation owns their finite transitions; this documentation pass changes no admission or result-reader code. |
 | MCP and ScriptRun | Exact MCP exposure already has a shared owner in `swarm-contracts`; it is not duplicate policy to rebuild. New ScriptRun work already requires a selected standalone executor and rejects queued `executor=None`; its old fallback wording does not establish an active default backend. |
 | Product breadth | Concilium, generic negotiation/ratification, integration ACKs, watches and publication automation exist in source. The compact target excludes separate council/agreement engines and automatic publication from required completion; ordinary messages, independent review, Goals and explicit publication of accepted work remain. |
 

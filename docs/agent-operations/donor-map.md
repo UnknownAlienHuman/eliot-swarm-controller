@@ -13,26 +13,26 @@ The operations program now also includes [Modular Runtime](modularity.md) and [O
 ## 2. Earlier ELIOT evidence
 
 Earlier ELIOT inspection used `504199d14135c030ad3951a3c5023a098a3d03f0`.
-Use the [current refactoring map](refactoring.md) for the recheck at `f1b854b6`,
-including completed audit fixes, actual dependency use and current call sites.
-The [architecture](architecture.md), [delivery contract](delivery.md) and
-[reduction program](refactoring.md) own the current target. Earlier owner-policy
-editions record decisions; their document hashes are not future runtime rights.
+Use [source findings](refactoring.md) for current call sites and corrected audit
+claims at `4e75fb1`. [Architecture](architecture.md) owns the product manifesto;
+[implementation](implementation.md) owns source changes and donor choices;
+[delivery](delivery.md) owns work transitions. Earlier owner-policy editions are
+historical decisions, not runtime rights.
 
 ## 3. Library reuse at a required boundary
 
-Use a library when its actual API replaces a needed owned mechanism. This table is a boundary map, not an obligation to implement every listed subsystem. Several crates are not direct dependencies, and `vendor/cccc-windows-process` does not exist. Keep current rmcp/ACP/croner/Atlas integrations; select further replacements by the concrete caller and net code removed. A library name in a document or lockfile is not integration, and adding a wrapper to satisfy the table is not progress.
+Use a library when its API replaces a needed owned mechanism. Keep current rmcp/ACP/croner/Atlas integrations; select further replacements by the caller and total owned code removed. Several listed crates are not direct dependencies, and `vendor/cccc-windows-process` does not exist. Current GitHub code calls `gh`; octocrab is optional. The table records reuse boundaries, not required integrations.
 
 | Component | Maintained source | Mechanism supplied | ELIOT responsibility | Reinvention to remove |
 |---|---|---|---|---|
-| `rmcp` | [API](https://docs.rs/rmcp/latest/rmcp/) | Actual MCP server/client transport and tool/resource routing. | Role/profile filtering, scoped credentials, Store admission and bounded I/O. The existing non-MCP `ModuleLink` protocol remains its own contract. | Reimplementing MCP framing or routing beside rmcp. |
-| `agent-client-protocol` | [API](https://docs.rs/agent-client-protocol/latest/agent_client_protocol/) | Native ACP wire protocol, session/turn envelopes and content blocks for ACP adapters. | Binding generation, digest verification and Store receipt mapping. Zed eval-cli stays a sessionless CLI adapter unless its selected native protocol changes. | Ad-hoc parsing of an actual ACP protocol beside the crate. |
-| `octocrab` | [API](https://docs.rs/octocrab/latest/octocrab/), [builder](https://docs.rs/octocrab/latest/octocrab/struct.OctocrabBuilder.html) | Complete Rust GitHub REST/GraphQL client, pagination, auth and bounded read retry (`swarm-forge-worker`, GitHub intake). | Credentials, action rights, durable intent, shared rate pacing, non-idempotent write readback. | Custom handwritten HTTP/GitHub REST stacks over raw `reqwest` or `curl`. |
-| `croner` | [API](https://docs.rs/croner/latest/croner/) | Complete cron expression evaluator and timezone-aware occurrence calculation (`swarm-automation` / scheduler). | Manager enabled choice, due identity, overlap/catch-up and persistence. | Handwritten cron parsers or per-rule sleep loops. |
+| `rmcp` | [API](https://docs.rs/rmcp/latest/rmcp/); actual callers: `crates/swarm-mcp/src/mcp/mod.rs`, `crates/swarm-mcp/src/mcp/catalog.rs`, `crates/swarm-gateway/src/gateway.rs` | MCP protocol types, server transport and tool routing. | Role/profile filtering, scoped credentials, Store admission and bounded I/O. The existing non-MCP `ModuleLink` protocol remains its own contract. | Reimplementing MCP framing or routing beside rmcp. |
+| `agent-client-protocol` | [API](https://docs.rs/agent-client-protocol/latest/agent_client_protocol/); actual caller: `crates/swarm-adapter-command/src/adapter/acp.rs` | Native ACP types, session/turn envelopes and content blocks for the ACP adapter. | Binding generation, digest verification and Store receipt mapping. Zed eval-cli stays a sessionless CLI adapter unless its selected native protocol changes. | Ad-hoc parsing of ACP wire messages beside the crate. |
+| `octocrab` | [API](https://docs.rs/octocrab/latest/octocrab/), [builder](https://docs.rs/octocrab/latest/octocrab/struct.OctocrabBuilder.html); **not an Eliot dependency** | Potential Rust GitHub API client, if replacing a retained transport is worthwhile. | Existing ownership still covers credentials/account selection, action rights, durable intent, bounded safe reads and uncertain-write readback. | If adopted, remove the replaced `gh` API path; do not add a parallel client or treat octocrab as required core work. |
+| `croner` | [API](https://docs.rs/croner/latest/croner/); actual caller: `crates/swarm-kernel-host/src/scheduler/calendar.rs` | Cron expression parsing and occurrence evaluation with timezone support. | Manager enabled choice, due identity, overlap/catch-up and persistence. | Handwritten cron parsers or per-rule sleep loops. |
 | `sysinfo` | [API](https://docs.rs/sysinfo/latest/sysinfo/) | Selective cross-platform process/resource observation, parent-child tree refresh and CPU/RSS sampling (`swarm-process`, `swarm-observer`). | Verified birth/Job ownership and safe lifecycle decisions; metrics do not authorize kill. | Spawning `tasklist`/`ps` subprocesses or writing raw Win32/procfs metric pollers. |
 | `notify` | [API](https://docs.rs/notify/latest/notify/) | Event-driven filesystem and parent-directory atomic-save observation (`config`, workspace hints). | Exact readback, revision validation and source-health gaps. | Busy-waiting `sleep` loops polling file `mtime`. |
 | `tracing`, `tracing-subscriber`, `tracing-appender` | [`reload`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/reload/), [`non_blocking`](https://docs.rs/tracing-appender/latest/tracing_appender/non_blocking/) | Structured spans/events, dynamic `reload` filter swaps without restart, and bounded `non_blocking` writer (`swarm-telemetry`, `swarm-observer`). | Byte-budget accounting, `atlas-redact` scrubbing prior to sink write, and scope expiry. | Custom logging frameworks or duplicate handmade ring queues. |
-| `atlas-redact` | `vendor/atlas` (`crates/atlas-redact`) | Deterministic secret/token/credential redaction across streaming chunks and diagnostic records before disk or IPC fanout. | Calling the redactor on every stream chunk and log line before persistence. | Regex-per-call ad-hoc secret stripping or unredacted diagnostic capture. |
+| `atlas-redact` | `vendor/atlas/crates/atlas-redact`; actual callers: `crates/swarm-kernel-host/src/redaction.rs` and `crates/swarm-adapter-claude/src/interactions.rs` | Stateless redaction of each supplied string/JSON value; it does not retain cross-chunk state or detect a secret assembled across chunk boundaries. | Apply it at each retained diagnostic/stream boundary where coverage is required; current call sites do not establish that all stream chunks and logs pass through it. | Regex-per-call ad-hoc secret stripping. Do not claim complete diagnostic coverage from the dependency alone. |
 | `cccc-windows-process` | [Inspected complete crate](https://github.com/ChesterRa/cccc/tree/c270e276591879c6edb7d08af67bec7035585c7e/crates/cccc-windows-process) | Suspended-child creation, owned primary-thread handle, resume and cleanup-on-failed-bootstrap, integrated through `swarm-process`. | Job creation/assignment and family policy are outside this small crate. Preserve owner-first non-killing observation for active agent families and separate bounded-check termination. | Copying its suspended-launch mechanism; assuming the donor supplies the full Job/family subsystem. |
 | `tokio` / `rusqlite` / `serde` | Project manifest and library documentation. | Async runtime, WAL relational storage (1 writer + pooled read-only connections), and typed serialization. | Current domain schema, authorized snapshots and single Store authority. | Storing collections as JSON blobs in `meta` or serializing all reads through the single writer thread. |
 
@@ -42,7 +42,7 @@ No old release, fixed CLI/model equality or callback-time package installation i
 
 **DOC, rechecked 2026-10-03:** Octocrab's builder documents retry-capable middleware and selectable transport behavior. This does not prove every endpoint/request is safe to resend.
 
-**DESIGN:** inspect the chosen library configuration and actual method before use. Safe reads may retry under a shared bounded policy; ambiguous non-idempotent writes must not be invisibly replayed by middleware underneath Store. One effect has one retry/readback owner. Do not replace the whole client with a second handwritten GitHub stack merely to control this boundary.
+**DESIGN:** safe reads may retry under a shared bounded policy; ambiguous writes must not be invisibly replayed by middleware underneath Store. One effect has one retry/readback owner. Current calls use `gh` in `crates/swarm-kernel-host/src/github/client.rs`; keep account/host selection and that effect boundary if replacing the transport.
 
 ## 4. Tokio change notification is not an event log
 
@@ -82,7 +82,7 @@ The [donor inventory](../agent_swarm.donors-20260929.toml) records inspected lib
 
 | Donor | Inspected unit | Useful mechanism | Boundary |
 |---|---|---|---|
-| **Waku** | [`crates/waku-core/src/driver/opencode.rs` at 10bcd728](https://github.com/egoist/waku/blob/10bcd728c9b2f07d664cfece3c8c870d3418ddd2/crates/waku-core/src/driver/opencode.rs) | One sequential command/event worker; `session.execution.*` settles an open turn once. ELIOT adds the [admitted-Operation window](architecture.md#41-deterministic-turn-scoped-result-correlation-agentresult) and retains its body. | Missing parent pointers alone do not reject an attributable result. Keep the inventory exclusions; upstream settlement is not ELIOT input-correlation proof. |
+| **Waku** | [`crates/waku-core/src/driver/opencode.rs` at 10bcd728](https://github.com/egoist/waku/blob/10bcd728c9b2f07d664cfece3c8c870d3418ddd2/crates/waku-core/src/driver/opencode.rs) | One sequential command/event worker; `session.execution.*` settles an open turn once. ELIOT adds the [admitted-Operation window](implementation.md#launch-and-results) and retains its body. | This is inspected donor evidence, not a local dependency. Missing parent pointers alone do not reject an attributable result; settlement is not ELIOT input-correlation proof. |
 | **Paseo** | [`agent-loading.ts` at b4af508e](https://github.com/getpaseo/paseo/blob/b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7/packages/server/src/server/agent/agent-loading.ts); earlier timeline units remain in the inventory. | `pendingAgentInitializations` coalesces initialization, and `waitForAgentClose` separates closing from new initialization. | Reuse the single-flight/lifecycle pattern; it is not evidence of ELIOT result attribution or durable completion. |
 | **CCCC** | Recorded delivery unit `crates/cccc-core/src/connect_delivery.rs`; separate Windows crate linked above. | Delivery identity, actor generation and recipient-scoped reply/cancel patterns; complete suspended-child primitive where needed. ELIOT owns its SQLite commit-before-notify rule. | Keep delivery and process units distinct; neither imports a CCCC scheduler, ledger or observer-loss stop policy. |
 | **Agent of Empires (AoE)** | Recorded `src/plugin/automation_policy.rs` at a8e8b3b1. | Active + reserved accounting and unknown-mode handling. The donor's pending reservations are in memory; indexed relational durability is the ELIOT V3 requirement. | Migrate current per-entry `meta` records and retained legacy ledgers into Store tables while preserving held reservations. |
@@ -125,12 +125,12 @@ build a new wrapper solely to move Rust lines elsewhere.
 Accept installed runtimes by documented protocol/capability compatibility.
 Selected local artifact digests and historical request/checkpoint bytes remain
 exact. Source refactoring does not wait for all-runtime native qualification;
-use a [finite transition](refactoring.md#retire-executors-without-losing-history)
+use a [finite transition](implementation.md#current-format-and-existing-data)
 for actual required data, then remove the old executor and readers.
 
 GitHub references:
 
-- [Webhook practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks), [signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [REST practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api): durable authenticated intake, paging, dedupe and reconciliation via `octocrab`.
+- [Webhook practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks), [signature validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [REST practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api): authenticated intake, paging, dedupe and reconciliation at the retained integration boundary.
 - [Check runs](https://docs.github.com/en/rest/checks/runs), [protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches): exact candidate evidence, remote IDs and truthful conclusions; labels are not acceptance.
 - [PR endpoints](https://docs.github.com/en/rest/pulls/pulls), [merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue): head/base/actual merged result differ; queue capability is optional, not a local distributor dependency.
 - [Disable workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/disable-and-enable-workflows), [cancel a run](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/cancel-a-workflow-run), [trigger workflows](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow): trigger settings, live execution and credential behavior differ. A local disable does not alter remote settings or prove cancellation.
@@ -141,7 +141,7 @@ Historical MANAGER-BRIEF and control-plane audits motivated current ownership,
 retained candidate/review identity, durable routing, immutable invocation inputs
 and scoped recovery. Their old versions, mandatory counts/timers, stage policies
 and cleanup commands are not current defaults. The active [configuration](configuration.md),
-[delivery](delivery.md) and [recovery](architecture.md#11-recovery-and-failure-isolation)
+[delivery](delivery.md) and [recovery](implementation.md#recovery-and-progress)
 contracts own the resulting rules; do not copy incident tables into agent tasks.
 
 ## 11. Donor integration discipline
@@ -170,7 +170,7 @@ Muse implementations. Source commit observations do not certify an npm artifact.
 
 A dependency is integrated when a real caller uses it and its replaced mechanism
 is removed. Pattern-only donors do not justify importing another workflow engine.
-Use the [package ownership map](shared-packages.md) and [deletion candidates](refactoring.md#code-reduction-candidates)
+Use the [package ownership map](shared-packages.md) and [implementation choices](implementation.md#donor-choices)
 for the concrete boundary, preserving one durable effect and retry owner.
 
 ## 12. Schema generation candidate

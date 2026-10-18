@@ -52,7 +52,7 @@ For direct or automatic dispatch, recheck current Task/revision, relevant pool m
 
 One manager owns one mutable worktree and one in-flight product candidate. Writers work on non-overlapping parts of that Issue and return their changes for integration; they do not publish separate fragments. A pool may contain several authorized managers without merging their workspace ownership.
 
-Filter readiness before page limits and keep manager order unless they chose ranking. Under the V3 target, capacity waits retain the subject in relational SQLite tables and wake when capacity changes, not repeatedly start rejected jobs. Preserve active-plus-reserved accounting from the Agent of Empires pattern; the relational migration from current `meta` records belongs to ELIOT, as detailed in the [refactoring map](refactoring.md#relational-conversion-detail). Routes sharing a provider account share its budget. Ordinary local review/delivery must work without GitHub setup or optional script interpreters.
+Filter readiness before page limits and keep manager order unless they chose ranking. Under the V3 target, capacity waits retain the subject in relational SQLite tables and wake when capacity changes, not repeatedly start rejected jobs. Preserve active-plus-reserved accounting from the Agent of Empires pattern; the relational migration from current `meta` records belongs to ELIOT, as detailed in the [refactoring map](implementation.md#store-and-current-data). Routes sharing a provider account share its budget. Ordinary local review/delivery must work without GitHub setup or optional script interpreters.
 
 ## 4. Exact triggers, not a chain that must have started automatically
 
@@ -132,7 +132,7 @@ Local audit aggregation works without enabled automation. Labels, acceptance and
 
 ## 7. Return and repair
 
-`task.request_changes` records manager disposition and mail; it does not itself deliver native input. The target authorizes the current scoped Manager/GM/Operator through ordinary assignment and candidate checks. Remove the document-edition gate in `policy.rs` and historical acceptance branches through the [finite transition](refactoring.md#retire-executors-without-losing-history). Do not give auditors manager credentials or rewrite old evidence to grant new rights.
+`task.request_changes` records manager disposition and mail; it does not itself deliver native input. The target authorizes the current scoped Manager/GM/Operator through ordinary assignment and candidate checks. Remove the document-edition gate in `policy.rs` and historical acceptance branches through the [finite transition](implementation.md#current-format-and-existing-data). Do not give auditors manager credentials or rewrite old evidence to grant new rights.
 
 The auditor calls `review.submit`. The manager or selected `review_disposition` applies relevant findings. Only explicit owner input or selected `repair_dispatch` starts correction. Feedback admission alone is not proof the correction reached the model; retain exact delivery/readback and retry semantics.
 

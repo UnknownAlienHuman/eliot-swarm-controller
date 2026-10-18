@@ -1,6 +1,9 @@
 # Reference-комплект v18
 
-**Уточнено 30.09.2026. Проектные артефакты для C01–C06. Приложения и рабочей БД ещё нет.**
+Исторические проектные артефакты C01–C06 от 30.09.2026, созданные до приложения
+и рабочей БД. Текущие [архитектура](../agent-operations/architecture.md) и
+[implementation](../agent-operations/implementation.md) определяют дальнейшую
+разработку; этот комплект не добавляет требований к ней.
 
 [Initial DDL](migrations/001_core.sql) сохраняет девять таблиц. Ранее добавлены
 `tasks.origin_key`, `attempts.start_operation_id`, `check_runs.resource_claimed_at_ms/resource_released_at_ms`.

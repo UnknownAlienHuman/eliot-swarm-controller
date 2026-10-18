@@ -1,6 +1,6 @@
 # Install and select a local module
 
-The commands below describe the **current scripts**, including their packaging restrictions. The target is one package with its selected descriptor/image and shared validation. Equal checkout revisions, compilers, dependency graphs or build-cache paths are not runtime compatibility requirements. Remove repeated provenance validators, retired OpenCode `node_modules` inventory and the duplicate Forge installer; these changes are **not yet implemented**. Concrete old data uses the [finite transition](refactoring.md#retire-executors-without-losing-history), not an obligation to preserve every installer or executable version.
+The commands below describe the **current scripts**, including their packaging restrictions. The target is one package with its selected descriptor/image and shared validation. Equal checkout revisions, compilers, dependency graphs or build-cache paths are not runtime compatibility requirements. Remove repeated provenance validators, retired OpenCode `node_modules` inventory and the duplicate Forge installer; these changes are **not yet implemented**. Concrete old data uses the [finite transition](implementation.md#current-format-and-existing-data), not an obligation to preserve every installer or executable version.
 
 This runbook installs controller components. Native services, vendor CLIs, models and provider credentials are configured separately. Installation does not launch them or establish a successful model turn.
 
@@ -115,7 +115,7 @@ Route `enabled` defaults false. After starting with this configuration, read `mo
 }
 ```
 
-The example revision is a placeholder; reread a stale catalog. Selection belongs to the authenticated Manager (Operator is also accepted) and affects future bindings. Admitted work creates module demand and supplies binding credentials. An adapter's `owned_service` lifecycle does not confer ownership of the vendor CLI. Result association and unavailable historical bodies follow the [result contract](architecture.md#41-deterministic-turn-scoped-result-correlation-agentresult); descriptor capability names alone do not prove implementation.
+The example revision is a placeholder; reread a stale catalog. Selection belongs to the authenticated Manager (Operator is also accepted) and affects future bindings. Admitted work creates module demand and supplies binding credentials. An adapter's `owned_service` lifecycle does not confer ownership of the vendor CLI. Result association and unavailable historical bodies follow the [result contract](implementation.md#launch-and-results); descriptor capability names alone do not prove implementation.
 
 ## Hot descriptor installation (Operator-only, no live restart)
 

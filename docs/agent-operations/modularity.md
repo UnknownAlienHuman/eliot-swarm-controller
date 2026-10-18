@@ -55,7 +55,7 @@ worker through a new wrapper establishes an independent boundary.
    contracts/client IPC; remove transitive edges as well as direct manifest entries.
 3. `swarm-cli` owns public application command parsing and request mapping. Host
    keeps daemon/worker bootstrap and the local administrative commands explicitly
-   delegated by `command_uses_host`; remove its repeated Task/route/review mapping.
+   delegated by `command_uses_host`; its repeated application mapping is already removed.
    Migrating a remaining delegated local command is its own connected change, not
    a reason to delete bootstrap or recreate the public CLI inside another crate.
 
@@ -268,7 +268,7 @@ Place executable artifacts in versioned module directories. Validate compatibili
 and atomically change the selected version for **new** admissions. Existing
 bindings retain their old artifact until drain or a supported attachment handover.
 Keep a prior release only for an actual rollback/drain window; remove obsolete
-versions after the [finite transition](refactoring.md#retire-executors-without-losing-history).
+versions after the [finite transition](implementation.md#current-format-and-existing-data).
 Do not overwrite a running Windows binary.
 Compatible recorder/adapter updates never require restarting kernel or unrelated
 native sessions. Kernel/schema upgrades still require their own controlled
@@ -315,43 +315,17 @@ Measure cold build, warm no-op, adapter-only edit, kernel-only edit and shared
 contract edit separately, recording toolchain/profile/target and built packages.
 Acceptance is absence of unrelated rebuilds/restarts, not an invented speedup.
 
-## 6. Implementation sequence and completion criteria
+## 6. Implementation ownership
 
-These labels describe boundaries used by the [single reduction queue](refactoring.md#code-reduction-candidates).
-They do not require completing obsolete or optional subsystems before removing
-them. Basic failure reporting belongs with a working path; no dashboard milestone
-is required before source reduction.
+[Implementation](implementation.md#processes-and-frontends) owns the work order
+and current source owners. Former M1–M6 labels describe historical package-boundary
+work; they are not another program to complete. Task planner authorization and the
+host's duplicate public CLI have already been corrected; do not reassign them.
 
-| Step | Concrete change and initial owners | Completion condition |
-|---|---|---|
-| M1 — usable manager and visible failures | `src/store/tasks.rs`, `src/model.rs`, shared method authorization; `Store::disconnected`, host error handling and small telemetry producer | Manager and current GM create/revise without operator token; observers/modules cannot. An ordinary Manager cannot revise another Manager's unreleased Attempt; the explicit current-GM/Operator path validates the same exact scope and revision. A disconnect persistence error is visible, not coerced into `false`. No unrelated native prerequisites on planning. |
-| M2 — real build boundaries | Root manifest/Justfile/CI and existing shared packages; finish the [verified dependency removals](refactoring.md#remove-worker-implementation-edges), preserving public CLI/serialized data | Explicit package graph with no adapter-to-kernel reverse dependency; needed data converted/exported with one current format. Independent build recipe works on Windows and Linux. |
-| M3 — bus and one complete adapter | Generic module descriptor/handshake in supervisor; extract OpenCode translation plus vendor Store paths; independent bus dispatcher and atomic cursor admission | Adapter replacement leaves kernel hash/PID unchanged; bus restart resumes cursor without duplicate command; a second minimal executor needs registration, not a new Store runtime-name switch. |
-| M4 — selected executors and workers | Keep one needed provider/worker implementation and remove its replaced path | Each has a named owner, demand predicate, bounded queues and local restart. No empty supervisor loops for disabled modules; no Rust orchestration claim while durable Eliot control remains in JS/Python; native SDK handles follow the donor boundary. |
-| M5 — recorder and live view | Complete `swarm-observer`, log configuration/reload and projections in [Observability](observability.md) | Show manager/agent/module/operation timeline, exact crash/restart facts, lag/loss and selected active resource metrics; changing depth does not restart work. |
-| M6 — integrated product qualification | The compact O7 path using real manager identity and the selected adapters | Task → dispatch → result → independent audit → correction → re-audit → acceptance; optional publication is separate; optional failure and restart do not repeat effects or stop unrelated agents. Record exact evidence and unresolved native gaps. |
-
-M4 workers may be extracted independently after M2/M3 contracts stabilize; do not
-make every optional provider a blocker for the first complete productive path.
-M1/M2 include basic logging, not a requirement to finish a dashboard first.
-Broad fault/load/native testing comes after the relevant product path is complete;
-minimal formatting/Clippy and source review are the development gate. No repeated
-large fixture campaign for every writer fragment. Keep tests for retained behavior;
-remove fixtures and build jobs whose sole subject is the retired mechanism.
-
-Final negative cases must cover old-worker replies, two simultaneous starts,
-revoke/disable versus launch, crash after external send but before outcome commit,
-slow/failed recorder, saturated log queue, bus cursor catch-up, native child
-survival, stale GM publication and a supported kernel upgrade. Report an unknown
-outcome as unknown; fixture success is not native recovery qualification.
-
-## 7. Explicit non-goals
-
-No Kubernetes, Kafka/NATS/Redis/Temporal deployment, second Task DB, generic DAG
-language, one always-on process per agent/script, dynamic Rust ABI, mandatory
-remote telemetry, new OAuth/RBAC stack, repeated Root gates or model heartbeat.
-Do not remove receipts, candidate identity or independent acceptance in the name
-of simplicity. Do not equate same-user IPC authentication with sandboxing.
+A retained adapter/worker can change without rebuilding or restarting unrelated
+execution. Its removal includes obsolete consumers and dependency edges. Verify
+that connected behavior through existing scoped checks; source movement alone is
+not a performance result. Small shared functions remain in the existing libraries.
 
 References for package/profile behavior: [Cargo workspaces](https://doc.rust-lang.org/cargo/reference/workspaces.html)
 and [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html),

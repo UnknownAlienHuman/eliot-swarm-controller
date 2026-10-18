@@ -1,10 +1,12 @@
 # ELIOT Swarm — план реализации v6 к архитектуре v18
 
-**Уточнено 2 октября 2026. Реализовано на baseline `b0d27f4`: этот документ — карта реализации и порядок работ R0–R24, а не pre-implementation план. Исторические проектные формулировки v18 сохранены в теле как дизайн-обоснование; где тело противоречит текущему факту, действуют эта рамка, inventory §13 и раздел R0–R24 (§15).**
+Исторический план прототипа v18, уточнённый 2 октября 2026 на `b0d27f4`.
+Он сохраняет решения и задания того среза. Текущие цель и принципы — в
+[архитектуре](agent-operations/architecture.md); единственный действующий порядок
+реализации — в [implementation](agent-operations/implementation.md).
+R0–R24, main-only и границы одного crate ниже не являются текущими требованиями.
 
-Заменяет implementation-v5 как действующий план. Входная v17 доступна в [истории](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b5a437f57488f8ddcdcc3f4aaea24746a3ea1f62/docs/review-v18/source-v17/agent_swarm.md). [Контракт модулей](agent_swarm.module-contract-v2.md) — общая граница adapters; vendor mappings из v16 сохраняются. [Reference v18](agent_swarm.spec-v18/README.md) уточняет initial SQL: origin, canonical dispatch и resource release; [сводка семи native-контрактов](runtime-notes.md) уточняет mappings. Наблюдения deployment сведены в [runtime notes](runtime-notes.md) и не заменяют документацию vendor.
-
-## 1. Решения не открываем заново
+## 1. Решения прототипа
 
 Один собственный Rust crate; Tokio; одна DB-thread с rusqlite; user-host; небольшой CLI/MCP; готовые native SDK за сменяемой границей. Muse Max и прямой OpenCode V2 — первые runtime. Нет UI, отдельного broker, workflow-языка, ORM, своего model loop, PKI или обязательного полного Eliot.
 

@@ -5,7 +5,7 @@
 [Node bridge](../../../modules/muse/README.md). Refactoring selects one executor
 after comparing required consumers and total Rust/driver/glue code, then retires
 the replaced path under the
-[central transition plan](../../../docs/agent-operations/refactoring.md#retire-executors-without-losing-history).
+[central transition plan](../../../docs/agent-operations/implementation.md#current-format-and-existing-data).
 
 ## Integrated source
 

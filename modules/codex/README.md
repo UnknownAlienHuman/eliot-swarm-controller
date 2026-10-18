@@ -43,7 +43,7 @@ not establish a supported second executor or a requirement to install Python for
 Codex integration. Historical source details are recorded in [UPDATE.md](UPDATE.md)
 and Git history.
 
-The [executor retirement plan](../../docs/agent-operations/refactoring.md#retire-executors-without-losing-history)
+The [executor retirement plan](../../docs/agent-operations/implementation.md#current-format-and-existing-data)
 removes this old execution/package/CI path. If concrete saved work needs it,
 finish or reconcile that work once and export the required results; archive
 completed records without keeping the old controller in the normal runtime.
