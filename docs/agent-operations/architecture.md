@@ -44,11 +44,11 @@ They route commands; they never grant rights. Store authorization remains the on
 permission boundary. Package versions, build IDs and schema inventories are not a
 behavioral API and must not become a permanent compatibility matrix in the core.
 
-Each native session/scope has one adapter state owner that orders its commands and
-events. A shared native service connection is not duplicated per hosted session.
-Shared adapter plumbing may own authenticated Eliot IPC, hello, command pulling and
-re-delivery of already-retained Eliot records. It must not own vendor state, native
-recovery policy, Task state or another scheduler.
+Each native session or shared service scope has one state owner that orders its
+commands and events. A shared native service connection is not duplicated per hosted
+session. Shared adapter plumbing may own authenticated Eliot IPC, hello, command
+pulling and re-delivery of already-retained Eliot records. It must not own vendor
+state, native recovery policy, Task state or another scheduler.
 
 ## Goals
 
@@ -61,8 +61,8 @@ Eliot message accepts a Task.
 ## Progress and results
 
 An authorized request can start assigned work directly. Preview is optional.
-A prepared workspace and usable native session permit the first input; optional
-MCP discovery, telemetry or diagnostic probes cannot block it.
+A prepared workspace and usable native session permit the first input; optional MCP
+discovery, telemetry or diagnostic probes cannot block it.
 
 Every input has one admitted Operation. The adapter associates native turns and
 output with that Operation even when the harness omits repeated parent IDs. Unknown
@@ -72,6 +72,19 @@ Attempt and candidate. Late results do not change ownership or acceptance.
 
 Stopping future continuation, cancelling a turn, removing queued input and closing
 a process are different actions with explicit subjects and observable outcomes.
+
+## Native effects and Store delivery
+
+Use the harness's durable command, inbox, message or turn identity and native
+readback whenever it exists. A transport request ID is not automatically an
+idempotency key. When the harness lacks safe replay/readback, the adapter retains the
+smallest exact prepared effect needed to classify the outcome; it never grows a
+second Task store.
+
+Delivery back to Eliot is a different responsibility. One small durable outbox may
+retain exact outcome, observation and result envelopes until Store acknowledges
+them. It does not decide native retries, reconstruct vendor sessions or interpret
+Task completion. There is no universal journal of every provider event.
 
 ## Observation
 
@@ -97,9 +110,21 @@ IDs, revisions and native identities for relationships. Hashes are reserved for
 credentials, selected executable/package bytes and retained artifact content. They
 are not permissions, approvals, runtime health checks or compatibility systems.
 
-A restart reconstructs state from retained Operations and current local sources.
-An uncertain external action blocks conflicting work until readback or explicit
+A restart reconstructs state from retained Operations and current local sources. An
+uncertain external action blocks conflicting work until readback or explicit
 disposition. It does not justify retaining every historical executor forever.
+
+## Build the smallest complete slice
+
+Implementation proceeds vertically from one admitted command through its selected
+adapter to readback/result, while deleting the replaced path. The manager reads the
+historical evidence and gives workers a compact current slice; workers do not receive
+the entire archive. Shared contracts and state transitions have one editor.
+
+Code comes before another planning layer. A new abstraction must have current users
+and remove concrete duplication in the same slice. During construction use only the
+minimal affected format/Clippy checks; broader verification follows the connected
+product path.
 
 ## Simplicity is a design constraint
 
@@ -110,9 +135,9 @@ branches.
 
 Delete unnecessary responsibilities before extracting packages. Reuse an existing
 owner or maintained library instead of adding another framework, workflow language,
-registry, broker or database. A shared abstraction is justified only when at least
-two current callers use the same behavior and the replaced code is removed in the
-same change.
+registry, broker or database. A shared implementation abstraction is justified only
+when at least two current callers use the same behavior and the replaced code is
+removed in the same change.
 
 ## Completion
 
