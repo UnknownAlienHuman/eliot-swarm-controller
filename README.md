@@ -47,6 +47,11 @@ Ordinary CLI requests do not initialize a database or start the host. CLI, launc
 Kernel and supervisor are separate artifacts; installation verifies their declared
 sibling/protocol contracts and individual provenance. See [module installation](docs/agent-operations/module-installation.md).
 
+Use `swarm` for application commands and `swarm mcp` (or `swarm-mcp`) for MCP.
+`swarm-host` and `swarm-kernel-host` retain the designated daemon, worker and local
+admin entrypoints; direct host `task`, `call` and other general application commands
+must use `swarm` instead.
+
 In another PowerShell:
 
 ```powershell

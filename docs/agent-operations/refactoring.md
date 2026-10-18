@@ -25,7 +25,7 @@ This preparation inspected manifests and the critical Store, launch, result,
 worker and journal paths. It is not an exhaustive line-by-line audit or a new
 runtime/qualification pass.
 
-Size at this unchanged Rust baseline (`git ls-files '*.rs'`, excluding `vendor/`):
+Size at that source baseline (`git ls-files '*.rs'`, excluding `vendor/`):
 
 | Scope | Physical lines | Explicit test-only estimate | Remaining text, upper bound |
 | --- | ---: | ---: | ---: |
@@ -108,8 +108,8 @@ candidate boundaries, not new permanent Issues.
 
 ### Code reduction candidates
 
-These refine the same O/M queue. CLI cleanup can proceed alongside the
-productive-path fixes. Keep broader O4–O9 feature completion off this reduction
+These refine the same O/M queue alongside the productive-path fixes.
+Keep broader O4–O9 feature completion off this reduction
 pass's critical path; existing requirements remain in [O1–O11](implementation.md).
 Estimate the old surface before work, then report actual deleted/added owned lines
 and the resulting owner after integration. Count Rust, JS/Python drivers and IPC
@@ -117,10 +117,25 @@ glue together, with tests separately; vendoring or moving code is not deletion.
 
 | Candidate / source owner | Replacement and deletion | Limits of the estimate |
 | --- | --- | --- |
-| O10: duplicate application CLI — [`swarm-cli::command_uses_host`](../../crates/swarm-cli/src/main.rs), [`host main`](../../crates/swarm-kernel-host/src/main.rs) | Keep application parsing/request mapping in `swarm-cli`; delete host Task/route/review and other duplicate application variants/mappers. Keep daemon, Gateway, module/worker bootstrap and delegated local admin commands. The root `swarm-host` stays a thin launcher. | About 700–900 old production lines across the host enums/mapping are candidates, not a measured net diff. No direct host application callers were found in the repo; update any documented compatibility surface/caller discovered during removal. No new shared CLI crate. |
 | M2/O1: capacity persistence — [`capacity.rs`](../../crates/swarm-kernel-host/src/store/capacity.rs) | Indexed scope/entry rows replace hex-key codecs, header/entry serializers, `meta` scans and orphan stitching as each scope cuts over. Reuse the existing installer and reservation domain code. | A 5,630-line file is not a deletion estimate. Reservation correctness, held/unknown capacity and damaged-source isolation are real behavior; only the replaced persistence machinery is removed. |
 | M3/M4: parallel runtime implementations | Select one owner for new admissions; keep narrow historical decoding/readback, then remove the retired executor as described below. | Potentially larger than helper cleanup, but active routes and saved formats differ. No whole-runtime saving is claimed before the caller/cutover diff. |
 | O4: GitHub API subprocess — [`github/client.rs`](../../crates/swarm-kernel-host/src/github/client.rs) | One `octocrab` backend behind existing API traits replaces `run_gh_api` and its `gh api` argument glue. Keep native Git publication separate. | `run_gh_api` is about 104 lines; with caller glue the old surface is roughly 150–250 lines. It is not a large handwritten HTTP stack, and octocrab is not yet a direct dependency. |
+
+### CLI reduction implemented in the preparation branch
+
+[PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183)
+removes duplicate application commands, IPC mapping/retry and MCP launching from
+[`host main`](../../crates/swarm-kernel-host/src/main.rs): 1,949 → 743 physical
+lines, net −1,206; the 87-line parser-test section is unchanged. The existing
+[`swarm-cli`](../../crates/swarm-cli/src/main.rs) remains the public owner with no
+new wrapper, schema or dependency. Direct general host commands now use `swarm`;
+MCP uses `swarm mcp`/`swarm-mcp`. No in-repository caller required a rewrite.
+
+Keep all `command_uses_host` delegates and the internal module-owner/Zed workers.
+Client creation still validates the operator credential before writing the client
+credential, then registers its hash with the same request-ID/retry behavior.
+Daemon flags, Gateway, hook installation, observer reads and artifact export remain.
+This closes the duplicate-CLI slice, not broader O10 parity or O11 qualification.
 
 ### MCP hypotheses rechecked
 

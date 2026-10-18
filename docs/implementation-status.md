@@ -2,6 +2,15 @@
 
 ## Current state
 
+### CLI ownership reduction — PR #183 candidate
+
+[PR #183](https://github.com/UnknownAlienHuman/eliot-swarm-controller/pull/183)
+removes the host's duplicate general application CLI and MCP launcher. Public
+`swarm` commands remain in `swarm-cli`; the host retains delegated local admin,
+daemon and worker entrypoints. The [refactoring map](agent-operations/refactoring.md#cli-reduction-implemented-in-the-preparation-branch)
+records the net 1,206-line Rust deletion and compatibility boundary. O10's broader
+method parity and O11's integrated native workflow remain partial.
+
 ### Muse normalized exact-result native verification — 2026-10-17
 
 The existing Core `7edacae6` qualifier hot-installed `muse-rust-controller.1@0.1.2`, built from `ba2e0d8d`; its Muse source is unchanged at integrated `b835c30c`. Native Muse Code `1.4.0-R4161.1` used its existing provider/model configuration with requested `xhigh` reasoning. Provider authentication stays in the native harness. The repository's Rust descriptor template remains disabled.
