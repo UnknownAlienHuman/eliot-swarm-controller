@@ -1,0 +1,374 @@
+name: Apply operator audit fixes
+
+on:
+  push:
+    branches:
+      - audit/operator-20261018
+    paths:
+      - '.github/workflows/apply-operator-audit-fixes.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.repository == 'UnknownAlienHuman/eliot-swarm-controller'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: audit/operator-20261018
+          fetch-depth: 0
+
+      - name: Apply exact audited changes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def exact(path: str, old: str, new: str, count: int = 1) -> None:
+              file = Path(path)
+              text = file.read_text(encoding='utf-8')
+              found = text.count(old)
+              if found != count:
+                  raise SystemExit(f'{path}: expected {count} occurrences, found {found}: {old!r}')
+              file.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          def insert_before(path: str, marker: str, block: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding='utf-8')
+              if text.count(marker) != 1:
+                  raise SystemExit(f'{path}: insertion marker is not unique: {marker!r}')
+              if block in text:
+                  raise SystemExit(f'{path}: insertion block already exists')
+              file.write_text(text.replace(marker, block + marker), encoding='utf-8', newline='\n')
+
+          # Active Antigravity package coordinate is v6 everywhere. Historical
+          # receipts and Store read compatibility remain untouched.
+          exact(
+              'modules/antigravity-rust/route.example.toml',
+              "# After registration, module.route.select must name descriptor version '5'.\n# Version 5 consumes the Store-produced swarm.task_prompt@1 envelope for",
+              "# After registration, module.route.select must name descriptor version '6'.\n# Version 6 consumes the Store-produced swarm.task_prompt@1 envelope for",
+          )
+          exact(
+              'tools/ci/module-package-policy.json',
+              '          "artifact_id": "eliot-antigravity.rust-headless.1",\n          "version": "5"',
+              '          "artifact_id": "eliot-antigravity.rust-headless.1",\n          "version": "6"',
+          )
+          exact(
+              'tools/qualification/New-NativeQualification.ps1',
+              "module_id = 'antigravity'; artifact_id = 'eliot-antigravity.rust-headless.1'; version = '5'; runtime = 'antigravity';",
+              "module_id = 'antigravity'; artifact_id = 'eliot-antigravity.rust-headless.1'; version = '6'; runtime = 'antigravity';",
+          )
+          installer = 'tools/modules/Install-ModuleArtifact.ps1'
+          exact(installer, 'Assert-AntigravityV5DescriptorContract', 'Assert-AntigravityV6DescriptorContract', 2)
+          exact(installer, '.1 v5 coordinate', '.1 v6 coordinate')
+          exact(installer, "$Descriptor.artifact.version -ne '5'", "$Descriptor.artifact.version -ne '6'")
+          exact(installer, 'Antigravity artifact version 5', 'Antigravity artifact version 6', 3)
+          exact(
+              'modules/antigravity-rust/src/controller.rs',
+              'artifact v5 requires the Store-produced TaskPrompt and dispatch admission schemas',
+              'artifact v6 requires the Store-produced TaskPrompt and dispatch admission schemas',
+          )
+
+          # A rejected/failed open is terminal for this process. Close and drain
+          # the already-spawned native child before retaining the ended session.
+          exact(
+              'modules/antigravity-rust/src/main.rs',
+              '''                    Ok(OpenProgress::Ended) => {
+                        native_live = false;
+                        dispatch_closed = true;
+                        dirty = true;
+                    }
+''',
+              '''                    Ok(OpenProgress::Ended) => {
+                        session.shutdown_and_drain(&mut controller, false).await?;
+                        native_live = false;
+                        dispatch_closed = true;
+                        dirty = true;
+                    }
+''',
+          )
+
+          implementation = 'docs/agent-operations/implementation.md'
+          exact(
+              implementation,
+              '''[architecture](architecture.md). Runtime source was rechecked at
+`05b6d05828e4f3a9106c7c726034de714db845e8` on 2026-10-18; later commits in this
+series change documentation only. [Findings](refactoring.md) preserve evidence;
+''',
+              '''[architecture](architecture.md). Runtime source and active package/qualification
+tooling were rechecked at `513f9698c268753dc6f2a6c0cf4d9a53f7f5e472` on
+2026-10-18. [Findings](refactoring.md) preserve evidence;
+''',
+          )
+          exact(
+              implementation,
+              '''Use existing private durable file primitives in `swarm-process`; do not add an adapter
+database. Select the first two consumers only after measuring duplicated
+delivery-only code and confirming that their outer loops can be deleted without
+moving vendor policy into the shell. Antigravity Rust and the current Command adapter
+are initial candidates; choose the concrete Command profile after source tracing.
+Claude is an alternate. Do not begin in Codex or Muse, whose large native state
+machines would distort the common boundary.
+''',
+              '''Use existing private durable file primitives in `swarm-process`; do not add an adapter
+database. Antigravity is the first route and initially keeps its exact Store-delivery
+outbox route-local. Move outbox mechanics into `swarm-client` only after a second
+current route uses the same byte-for-byte ownership and both old loops are deleted.
+
+Bootstrap has a separate extraction threshold: Antigravity and Claude's contained
+`module_runtime::OwnedBootstrap` are the first two candidates for one common
+`module_owner` reader. Do not use Command to prove either abstraction: its batch/ACP
+profile ladder, large journal and ACP state machine would pull vendor policy into the
+shell. Do not begin shared extraction in Codex or Muse for the same reason.
+''',
+          )
+
+          first_slice = '''#### First executable slice — Antigravity protocol 2
+
+This is the first source slice, not a repository-wide contract migration. Convert one
+current Antigravity route from Store admission through exact result/readback; leave
+other routes on protocol 1 until their own finite slice.
+
+```text
+agent.open -> native initialize/readiness -> current binding + adapter boot
+task.dispatch / agent.send(next_turn)
+  -> one serialized native input window
+  -> terminal native event or honest unknown
+  -> exact Store outcome/result delivery and readback
+```
+
+Implement only `Open`, `Dispatch`, `Send { next_turn }`, `Refresh`, `Result` and
+`Reconcile`. Do not add placeholder `Reply`, `Configure`, `Goal`, `Background`,
+`Recover`, live-steer or generic effect handlers.
+
+Edit the Antigravity adapter, semantic contracts and the exact Store admission/result
+owners together. In the same slice delete:
+
+- the adapter-private `ManagerLink`/framing after it adopts `ModuleLink`;
+- full descriptor/schema equality and v5/v6 behavior selection for new bindings;
+- repeated `ModuleReceiptIdentity` package/request fields;
+- `AntigravityDispatchSessionProof`, its producer/validator and the mandatory
+  pre-dispatch `agent.refresh` proof gate;
+- replaced protocol-1 route/config/package/qualification fixtures after concrete
+  unsettled Operations receive a finite disposition.
+
+The first outbox remains Antigravity-local and is scoped by binding, generation and
+adapter boot. It stores only produced `module.outcome`, `module.observe` and
+`module.result` envelopes; it never stores native intent or replays a prompt. A
+rejected open must close and drain its spawned native process. Completion requires one
+assignment-to-result path, honest unknown after uncertain native submission, result
+survival across Eliot-link loss, no orphan native child and removal of the old path for
+new Antigravity work.
+
+'''
+          insert_before(
+              implementation,
+              '### P4 — Native identity first; local effect state only for gaps\n',
+              first_slice,
+          )
+          insert_before(
+              implementation,
+              '## 5. Verification\n',
+              '''CI is not a second architecture. Keep Cargo package/reverse-dependency discovery,
+changed-file formatting and minimal affected warnings-denied Clippy/build. Delete
+path-specific test-name branches, legacy compatibility gates and subsystem-specific
+qualification jobs with the subsystem they protect. Connected focused tests begin
+when a vertical path is complete; broad native/release suites remain the final product
+phase.
+
+''',
+          )
+          exact(
+              implementation,
+              '''- automatic publication/Issue-label projection;
+- document-edition rights and `LegacyV1` acceptance branches;
+''',
+              '''- automatic publication/Issue-label projection;
+- Concilium-triggered trusted-local script effects and generic integration cells from
+  Core; retained scripts/integrations must be optional explicit modules;
+- public native-MCP orchestration; OpenCode setup/readback stays adapter-internal;
+- document-edition rights and `LegacyV1` acceptance branches;
+''',
+          )
+
+          findings = 'docs/agent-operations/refactoring.md'
+          exact(
+              findings,
+              '''Source rechecked through `05b6d05828e4f3a9106c7c726034de714db845e8` on
+2026-10-18. This file records why current mechanisms must be replaced or removed.
+''',
+              '''Source and active package/qualification tooling rechecked through
+`513f9698c268753dc6f2a6c0cf4d9a53f7f5e472` on 2026-10-18. This file records why
+current mechanisms must be replaced or removed.
+''',
+          )
+          exact(
+              findings,
+              '[implementation P1](implementation.md#p1--replace-the-module-compatibility-matrix-with-protocol-2)',
+              '[implementation P1](implementation.md#p1--typed-semantic-adapter-port)',
+          )
+          exact(
+              findings,
+              '''Replacement: one `DeliveryOutbox` in `swarm-client` containing exact already-produced
+Store envelopes. It never records native intent or decides native replay. First
+extract it in two lower-complexity adapters and delete their outer loops; do not let
+Codex/Muse force vendor state into the common type.
+''',
+              '''Replacement: first add one exact route-local outbox to Antigravity. It contains only
+already-produced Store envelopes and never records native intent or decides native
+replay. Extract the mechanics into `swarm-client` only when a second current route has
+the identical ownership semantics and both duplicated outer loops are deleted.
+Bootstrap is a separate candidate: Antigravity plus Claude's contained
+`OwnedBootstrap` can prove one `module_owner` reader. Command, Codex and Muse are too
+large/vendor-specific to define the first common boundary.
+''',
+          )
+          latest_findings = '''## 15. Latest active-path audit
+
+### Antigravity current package was split across two versions
+
+The Rust wire constant and descriptor already name artifact version 6, while the
+example route, package policy, native qualification and narrow installer validator
+still selected version 5. A v6 install therefore bypassed the intended exact
+Antigravity validator and the qualification harness exercised the wrong coordinate.
+The active selectors are now aligned to v6; historical v5 receipts/read compatibility
+remain unchanged.
+
+`agent.open` also retained a spawned native process after initialization was observed
+but model/readback validation rejected the open. The logical binding closed while the
+child remained owned by `NativeSession`. The ended-open path now closes stdin and
+drains the child before retaining terminal state.
+
+### Automation and CI are shadow architectures
+
+`AutomationEntry` combines review, dispatch, Goal progression, scripts, publication,
+GitHub projection, cron and hooks. Each domain scans the same meta-key namespace with
+its own cursor, quarantine and copied authority context. The host still starts three
+scheduler/automation worker families. Replace these with one stable `entry_id`, one
+due index and one Operation admission; action execution follows admission.
+
+The 92-KB Rust workflow, 33-KB package classifier and 193-KB native qualification
+script encode file names, exact test names, artifact versions, model IDs and complete
+host/readback logic. Keep graph-derived package selection plus minimal format/Clippy
+checks. Delete path-specific mini-CI and adapter-specific qualification branches with
+the paths they protect; do not preserve them as the product specification.
+
+### Results optimize an unproven path
+
+Store freezes and rechecks Task/source/package receipt hashes per result page, then
+adds a custom SQLite function, pre-update hooks, row watchers, global LRU and byte
+budgeting for assembled-result caches. OpenCode still cannot attribute a productive
+assistant message when its public API omits the assistant-to-input parent edge. Keep
+one admitted-turn result window and honest unknown; remove proof/cache machinery that
+does not establish the missing association.
+
+### Secondary products multiplied through every frontend
+
+Concilium, integration cells, trusted-local script effects, automatic publication and
+public native-MCP setup each own state machines, indexes, recovery loops, authority
+proofs, MCP catalog entries, CLI commands, Doctor checks, automation consumers and CI
+fixtures. They are not compact-Core primitives. Retain ordinary messages, explicit
+accepted-candidate publication and optional modules; delete the generic engines and
+their cross-product glue from Core.
+
+'''
+          insert_before(findings, '## Implemented source reduction\n', latest_findings)
+
+          status = 'docs/implementation-status.md'
+          exact(
+              status,
+              '''**Overall: PARTIAL_PROGRESS.** `main` contains the completed CLI ownership reduction
+and the current architecture/implementation preparation. Runtime source has not
+changed since commit `25a8e3b`; later commits through the source revision studied
+here changed documentation.
+''',
+              '''**Overall: PARTIAL_PROGRESS.** `main` contains the CLI ownership reduction, the
+current architecture/implementation program and one bounded Antigravity correctness
+repair. Protocol 2 and the compact-core deletion sequence are not implemented yet.
+''',
+          )
+          exact(status, '## Completed source change\n', '## Completed source changes\n')
+          exact(
+              status,
+              '''This is the only runtime-code reduction in the current preparation series.
+
+## Latest source and donor study
+''',
+              '''This remains the only completed runtime-code reduction in the current preparation
+series.
+
+### Antigravity active-coordinate and rejected-open repair
+
+The active Rust adapter descriptor/wire was already version 6 while route/package/
+installer/qualification selectors still required version 5. Those active selectors
+now use version 6; historical v5 evidence remains historical. A rejected or failed
+`agent.open` now closes and drains the spawned native child instead of retaining an
+ended logical session with a live process.
+
+This is a correctness repair, not protocol-2 qualification and not a claim that the
+current proof/outbox architecture is retained.
+
+## Latest source and donor study
+''',
+          )
+          exact(
+              status,
+              '''| Product breadth | Concilium, integration ratification/ACK and automatic publication remain. | Outside compact-core completion; retain ordinary messages, independent review and explicit accepted-candidate publication. |
+''',
+              '''| Product breadth | Concilium, integration ratification/ACK, automatic script effects, public native MCP and automatic publication remain. | Outside compact-core completion; retain ordinary messages, independent review, explicit accepted-candidate publication and optional modules. |
+| CI/qualification | A 92-KB workflow, 33-KB classifier and 193-KB native harness mirror file names, versions, models and Store readback logic. | Package-graph selection plus minimal format/Clippy during construction; connected and broad qualification only after the product path exists. |
+''',
+          )
+          exact(
+              status,
+              '''| Antigravity | Node and Rust warm-stream implementations coexist. Shared contracts contain Antigravity-specific readiness proof types that should become observations. |
+''',
+              '''| Antigravity | Node and Rust warm-stream implementations coexist. Active Rust selectors now consistently name v6 and rejected open drains its child. Shared readiness proof types and duplicate Store-delivery logic still require the protocol-2 slice. |
+''',
+          )
+          exact(
+              status,
+              '''No runtime code changed in the latest architecture/donor/script study. Checks are
+document content, links and consistency. Runtime construction uses formatting and
+minimal affected warnings-denied Clippy/build checks first. Connected cases are listed
+in [implementation verification](agent-operations/implementation.md#5-verification);
+full product/native/release tests follow when the product path is ready.
+''',
+              '''The current source patch changes only the bounded Antigravity coordinate/open
+repair plus documentation. Existing scoped CI supplies formatting and affected
+warnings-denied Clippy/build evidence; no broad or native test qualification is
+claimed. Connected cases are listed in
+[implementation verification](agent-operations/implementation.md#5-verification);
+full product/native/release tests follow when the product path is ready.
+''',
+          )
+
+          # Final content assertions: active v6 selectors align, historical Store
+          # read compatibility is intentionally not rewritten.
+          checks = {
+              'modules/antigravity-rust/route.example.toml': "descriptor version '6'",
+              'tools/ci/module-package-policy.json': '"version": "6"',
+              'tools/qualification/New-NativeQualification.ps1': "artifact_id = 'eliot-antigravity.rust-headless.1'; version = '6'",
+              'tools/modules/Install-ModuleArtifact.ps1': 'Assert-AntigravityV6DescriptorContract',
+              'modules/antigravity-rust/src/controller.rs': 'artifact v6 requires',
+              'modules/antigravity-rust/src/main.rs': 'session.shutdown_and_drain(&mut controller, false).await?;',
+          }
+          for path, needle in checks.items():
+              if needle not in Path(path).read_text(encoding='utf-8'):
+                  raise SystemExit(f'{path}: final assertion missing {needle!r}')
+          PY
+
+      - name: Validate and commit exact diff
+        shell: bash
+        run: |
+          git diff --check
+          test -n "$(git status --short)"
+          rm .github/workflows/apply-operator-audit-fixes.yml
+          git diff --check
+          git config user.name 'Iurii Lisenkov'
+          git config user.email '71514792+UnknownAlienHuman@users.noreply.github.com'
+          git add --all
+          git commit -m 'fix: align Antigravity v6 and close rejected open'
+          git push origin HEAD:audit/operator-20261018
