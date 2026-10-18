@@ -1,12 +1,10 @@
 # Refactoring — Source Findings
 
-Source was rechecked through
-`513f9698c268753dc6f2a6c0cf4d9a53f7f5e472` on 2026-10-18.
-[Architecture](architecture.md) owns the product boundary;
-[implementation](implementation.md) owns the only work order;
-[status](../implementation-status.md) records completed changes. This file records
-why current mechanisms must be removed or replaced. Source presence is not a
-requirement to preserve a subsystem.
+Source rechecked through `7f85a00c69f3b52cc250ad7dbded91692078eb97`
+on 2026-10-18. This file records why current mechanisms must be replaced or
+removed. [Architecture](architecture.md) owns the product boundary;
+[implementation](implementation.md) owns the single work order; [status](../implementation-status.md)
+records completed work.
 
 ## Size and concentration
 
@@ -15,322 +13,278 @@ requirement to preserve a subsystem.
 | All owned Rust, excluding `vendor/` | 533,720 | 172,511 |
 | `crates/swarm-kernel-host` | 365,726 | 128,996 |
 
-Counts include blanks/comments and do not equal reachable production SLOC. Commit
-`25a8e3b` removed 1,206 net Rust lines from the duplicate host CLI. Later commits
-through this source revision changed documentation or created/removed a no-op edit
-workflow; the runtime tree remained unchanged.
+Counts include blanks/comments. They describe concentration, not reachable production
+SLOC. Commit `25a8e3b` removed 1,206 net Rust lines from the duplicate host CLI.
+Later commits through this revision changed documentation only.
 
 ## 1. Why agents could not finish the project
 
-The main failure was horizontal construction: contracts, schemas, proof packets,
-qualification modes and compatibility branches multiplied while a manager still
-could not rely on one short assignment-to-result path.
+The development loop rewarded horizontal preparation and incident patches instead of
+complete product slices.
 
-The old Claude swarm confirms the pattern. Its shadow controller contained large
-state/queue scripts, lane launchers, monitors, reminder/restart daemons and multiple
-acceptance pipelines. Compact `TASK.md` microtasks completed; whole Issue threads and
-addendum chains produced meta-work and conflicting interpretations. The useful lesson
-is one current slice packet and one manager-owned worktree, not porting the scripts.
+- Whole Issues, audits and addenda replaced a current task. Compact exact `TASK.md`
+  work completed more reliably.
+- Policy lived in copied scripts, regexes and marker files. Each incident created
+  another daemon or compatibility path.
+- Contracts, schemas and proof packets were built before one caller-to-result path
+  worked.
+- File flags and branch heads were treated as delivery despite no consumer ACK.
+- Equivalent audits and per-agent build trees duplicated work.
+- “Implemented” meant types existed, not that a manager could assign work and receive
+  a result.
 
-The development loop must reward:
+Target: manager reads history, worker receives one slice, production path changes
+first, old path disappears, one independent verifier checks the connected boundary.
 
-- one observable vertical behavior;
-- exact source symbols;
-- explicit failure cases;
-- deletion of the replaced route;
-- one independent verification after integration;
-- net owned-code reduction.
+## 2. The common command bus is not common
 
-## 2. Antigravity can lose a completed outcome
-
-`modules/antigravity-rust/src/controller.rs::pending_receipts` is a bounded in-memory
-queue. `main.rs::flush_reports` removes an entry only after Store ACK, but the bytes
-are not durable before that ACK.
-
-The repository's own Antigravity S2 receipts record the resulting gap: Store remained
-`outcome_unknown`, and after worker exit direct reconcile depended on the dead
-process's in-memory receipts and otherwise returned `NATIVE_HISTORY_UNAVAILABLE`.
-The controller comments also state that its pending receipts and completed-turn cache
-are same-process only.
-
-This is not a reason to add a universal event store. The missing responsibility is a
-small route-local Store-delivery outbox containing only already-produced outcome,
-observation and result envelopes. Native prompts remain owned by the native effect
-path and are never replayed because Store delivery failed.
-
-## 3. Active Antigravity coordinates disagree
-
-The current Rust source and shipped descriptor use artifact version `6`:
-
-- `modules/antigravity-rust/src/wire.rs::ARTIFACT_VERSION`;
-- `modules/antigravity-rust/module-descriptor.template.json`.
-
-Active tooling still selects or validates version `5`:
-
-- `modules/antigravity-rust/route.example.toml` comment;
-- `tools/ci/module-package-policy.json`;
-- `tools/qualification/New-NativeQualification.ps1::Get-AdapterContract`;
-- `tools/modules/Install-ModuleArtifact.ps1::Assert-AntigravityV5DescriptorContract`.
-
-Store accepts both `5 | 6`, which turns a packaging drift into a permanent runtime
-branch. Historical v5 receipts are valid history; new-work selectors must converge on
-v6, then the active dual-version branch must disappear after finite disposition of
-concrete v5 bindings.
-
-## 4. Antigravity readiness became a second authorization system
-
-`AntigravityDispatchSessionProof` contains:
-
-- binding/generation/worker boot;
-- native root and a SHA of the native scope;
-- requested and observed model;
-- stream phase;
-- event/result/gap counters;
-- pending state and stream errors/exits.
-
-The adapter emits it from `agent.refresh`. Store then loads the latest refresh,
-revalidates the proof against the binding and observation, compares the stream
-snapshot again, hashes the proof, hashes assignment and lease authority, and embeds
-all digests in the launch packet.
-
-This machinery does not establish a new right. Store already owns assignment,
-binding, generation, workspace lease and Operation. The adapter already owns its
-boot and native session. Model and stream facts are observations.
-
-Target dispatch preconditions are current assignment, ready unreleased binding,
-current adapter boot/session, one free serialized input window and expected revisions.
-Delete the proof DTO, producer, Store validator, packet digests and refresh gate.
-Keep the facts in `agent.state`.
-
-## 5. Antigravity carries unsupported actions and duplicate identity
-
-The descriptor advertises six capabilities, but `main.rs` and `wire.rs` still accept
-or reject placeholder branches for reply, configure, Goal, background and recover.
-Unsupported features therefore occupy method parsers, tests and adapter code despite
-never being routable.
-
-`OperationIdentity` and `ModuleReceiptIdentity` then repeat:
-
-- package/artifact/version/protocol;
-- binding/generation;
-- Operation ID;
-- request/input hash;
-- target hash for readback;
-- Task/Attempt/source identity again in dispatch admission.
-
-Store created and retained the Operation and authenticated the binding-scoped link.
-Repeating the package and request identity in every outcome adds comparison code, not
-trust. Keep only stale-report identity, native IDs/disposition and hashes of actual
-retained bytes.
-
-## 6. The shared adapter bus is still vendor-shaped
-
-`RuntimeCommandKind` contains semantic actions beside internal/vendor methods:
+`RuntimeCommandKind` mixes semantic actions with internal/vendor methods:
 
 - `native.opencode.loop_step`;
-- `native.command.cancel_turn` / `close_session` / `release_evidence`;
+- `native.command.cancel_turn`;
+- `native.command.close_session`;
+- `native.command.release_evidence`;
 - `native.mcp.install|observe|arm|read`.
 
-Store policy, capacity, descriptors, adapters and tests repeat these names. OpenCode
-loop-step is steering; ACP cancel/close are cancel/shutdown; MCP phases and release
-evidence are internal lifecycle details.
+Store parser, policy, capacity, projection, descriptors and adapters repeat them.
+OpenCode loop-step is send/steer. ACP cancel/close are cancel/shutdown. Native MCP and
+release evidence are adapter lifecycle.
 
-The target typed actions are documented in implementation. Each old method must be
-removed from contracts, Store, capacity, descriptors, adapters, fixtures and docs in
-the same route slice.
+Replace them route-by-route with the semantic port in
+[implementation](implementation.md#p1--replace-the-module-compatibility-matrix-with-protocol-2).
+Delete method, capacity entry, schema, fixture and documentation together.
 
-## 7. Package versions became behavior profiles
+## 3. Package metadata became a behavioral API
 
-`module_contract.rs` and adapter code retain Codex version ladders, Command Batch
-v3/v4/v5, ACP v1/v2 and exact schema/capability combinations. Store hello then
-compares module ID, artifact version/build, protocol, config schema, command/event
-schemas and capabilities, and adapters compare the echoed values again.
+`module_contract.rs` retains Codex and Command version/profile ladders.
+`module_handshake.rs` exact-compares module/artifact/build, protocol, capabilities,
+configuration schema and command/event schema arrays, then adapters compare the echo
+again. Store also hardcodes vendor artifact versions and schemas.
 
-Consequences:
+Every optional action therefore creates another artifact coordinate, exact schema
+set, Store branch and startup validator. Descriptor metadata is functioning as a
+second authorization system despite comments saying otherwise.
 
-- adding one optional action mints another artifact profile;
-- Core knows vendor package history;
-- old schema combinations become permanent code paths;
-- descriptor metadata acts like authorization despite Store rights being separate.
+Target: one current protocol major, required semantic capability subset and one
+selected package identity for installation/rollback. Rights remain Store policy.
 
-Use one current protocol major plus semantic action subset. Package identity remains
-installation/inventory data and may aid rollback; it does not select Core behavior.
+## 4. Bootstrap and Eliot delivery are reimplemented per adapter
 
-## 8. Every adapter repeats bootstrap and Eliot transport
+Codex, Claude, OpenCode, Muse, Command and Antigravity repeat environment parsing,
+owner membership, credentials, protocol/claim parsing, hello equality, `module.next`,
+reconnect and delivery.
 
-Codex, Claude, OpenCode, Muse, Command and Antigravity independently parse supervisor
-environment, owner membership, state/credential paths, binding identity, protocol and
-full descriptor claims. They also repeat hello validation, `module.next`, reconnect
-and Store delivery loops.
+Useful existing owners already exist:
 
-Existing owners already cover the reusable boundary:
+- `swarm-process::module_owner` for process membership/private state;
+- `swarm-client::ModuleLink` for authenticated Eliot IPC.
 
-- `swarm-process::module_owner` verifies the supervisor-owned process;
-- `swarm-client::ModuleLink` owns authenticated hello and module RPC calls;
-- `swarm-process::permissions` provides atomic private durable files.
+Extract only after two current routes use the same behavior and both old
+implementations are deleted.
 
-The first bootstrap extraction candidates are Antigravity and Claude's contained
-`OwnedBootstrap`. Command is explicitly a bad proof because its historical
-Batch/ACP matrix and ACP state machine would leak into common code.
+## 5. The journals became products
 
-The Store-delivery outbox must remain Antigravity-local until a second current route
-uses identical ownership and both old loops are deleted. A shared shell added before
-those deletions would be another wrapper, not simplification.
+Current major journal files alone are approximately:
 
-## 9. Command is a compatibility matrix, not a donor for the common shell
-
-`crates/swarm-adapter-command/src/module_host.rs` selects among Batch v3/v4/v5 and
-ACP v1/v2, accepts alternative exact capability sets, recognizes legacy/normalized
-schema combinations and repeats full negotiation equality. The adapter also has its
-own large journal and ACP queue/session lifecycle.
-
-Before using Command to prove any shared abstraction, decide whether batch and ACP are
-both retained products, select one current profile for each retained product, and
-delete historical profiles and native method aliases. Otherwise the common shell
-will simply encode Command's legacy matrix.
-
-## 10. ACPX confirms ownership semantics, not a new framework
-
-ACPX's shared runtime demonstrates useful behavior:
-
-- one running queue owner for a named session;
-- no fallback direct connection for shared controls, because that could create a
-  competing provider session;
-- queue acceptance differs from native prompt start and terminal result;
-- cancellation targets the exact request only after acceptance;
-- client detach does not cancel admitted work;
-- a lost submission remains uncertain.
-
-Its `requestId` is queue/status identity, not a general idempotent replay key. ACPX may
-be evaluated only as a whole optional backend replacing Eliot's equivalent ACP owner.
-Do not layer its flows/session product beside the existing adapter or import its
-workflow language.
-
-## 11. Tooling became another product
-
-Measured current surfaces include:
-
-| Surface | Approximate file size |
+| File | Bytes before submodules/tests |
 | --- | ---: |
-| `.github/workflows/rust.yml` | 92 KB |
-| `tools/qualification/New-NativeQualification.ps1` | 193 KB |
-| `Invoke-CoreFailureQualification.ps1` | 124 KB |
-| `Invoke-R48SchedulerQualification.ps1` | 109 KB |
-| `tools/ci/build-module-package.ps1` | 30 KB |
-| `Build-SwarmFrontendProvenance.ps1` | 20 KB |
-| `SwarmBuildProvenanceHelpers.ps1` | 14 KB |
-| `Test-InstallFrontendLegacyCompat.ps1` | 24 KB |
+| Command `journal.rs` | 199,925 |
+| Claude `journal.rs` | 183,134 |
+| OpenCode `journal.rs` | 138,914 |
 
-`New-NativeQualification.ps1` verifies not only selected images and behavior but also
-source commit/tree, Cargo manifests and lockfile, toolchain files, rustc/cargo verbose
-versions and even a SHA of the absolute target-cache path. It embeds exact artifact
-versions, capability/schema arrays, preview hashes, refresh proof gates and provider
-catalog body hashes.
+These mix several responsibilities:
 
-`Install-ModuleArtifact.ps1` duplicates generic descriptor validation and adds exact
-Antigravity artifact-specific contracts. Normal CI invokes legacy frontend inventory.
-The workflow itself contains a long list of incident-specific focused modes and
-custom attribution/classification machinery.
+- native intent and replay classification;
+- Store outcome/result/observation delivery;
+- result selectors and references;
+- append histories and outcome revisions;
+- torn-tail evidence;
+- startup inventory/cursors/counters;
+- tombstones and cleanup queues;
+- native checkpoints;
+- retention graphs and compaction.
 
-This does not improve product compatibility. A functional host and adapter may be
-built from different clean checkouts/toolchains and still speak the same current
-protocol. Build provenance is diagnostic; behavior is qualified through the public
-API.
+A common implementation extracted from these files would preserve the tumour.
 
-Keep actual installation safety:
+The only shared Store-delivery mechanism is: retain an already-produced exact
+outcome/result, send it, remove it after exact ACK. Observations are latest-value
+source checkpoints with coverage. Native intent/readback remains adapter-specific.
 
-- selected file/package byte verification once;
-- private credentials;
-- path containment and reparse protection where needed;
-- bounded regular files and atomic publication;
-- explicit protocol/action requirements.
+Antigravity currently has the opposite defect: `pending_receipts` is only memory.
+Its terminal result can exist while Store stays `outcome_unknown` after process exit.
 
-Remove build-cache/compiler/checkout equality, per-artifact validators, duplicated
-schema arrays, retired frontend inventory and behavioral proof packets from
-qualification.
+## 6. Antigravity duplicates terminal identity through observation
 
-## 12. CI duplicates Cargo and product qualification
+Current flow:
 
-`tools/ci/package-scope.ps1` implements its own path classifier, Cargo metadata graph
-resolution, target validation and documentation/tooling validation. `rust.yml` then
-contains separate jobs and a large workflow-dispatch taxonomy.
+1. terminal result creates a pending outcome with no `observation_id`;
+2. adapter publishes an observation;
+3. Store returns an observation row ID;
+4. adapter rewrites the outcome;
+5. Store validates the outcome against the same result copied into the current
+   observation.
 
-The ordinary gate needs only:
+`runtime/warm_stream.rs` requires the observation pointer, current Store observation,
+boot/root/scope, ordinal, response hash and status all to match. This prevents
+persisting an immutable outcome before the first Store call and duplicates the same
+adapter fact.
 
-- changed Markdown/link/whitespace validation;
-- rustfmt on changed Rust;
-- `cargo check` and warnings-denied Clippy for affected packages and real local
-  reverse dependencies from `cargo metadata`;
-- changed JS syntax;
-- focused connected tests for a closed product slice.
+Separately, `AntigravityDispatchSessionProof` copies binding, boot, root, scope hash,
+model, stream phase, event/gap counters and result ordinal into a refresh result;
+launcher code revalidates and hashes it again.
 
-Full native qualification belongs to explicit release/manual runs. Incident-specific
-modes should become normal permanent behavioral tests or be deleted.
+Target: self-contained terminal outcome authenticated by ModuleLink and retained
+Operation/binding/boot. Monitoring state stays an observation, not a prerequisite or
+receipt witness. Remove both the observation pointer and dispatch proof packet before
+adding the minimal durable spool.
 
-## 13. Execution duplication remains the largest runtime reduction
+## 7. Receipts repeat identity Store already knows
 
-| Runtime | Current parallel surface | Target |
+`RuntimeCommand` and `ModuleReceiptIdentity` repeat method/input hashes,
+module/artifact/version/build, protocol, binding/generation and Operation ID.
+Dispatch/result types repeat Task/Attempt/revision, source hashes, native payload
+hashes and receipts again.
+
+Store created the Operation and delivered it through an authenticated binding-scoped
+link. Repeating package/request identity creates comparison code but no new authority.
+
+Keep:
+
+- Operation ID;
+- generation/boot needed to reject stale reports;
+- native logical input/turn/result IDs;
+- disposition and bounded details;
+- hashes/ranges for actual retained result/artifact bytes.
+
+## 8. Vendor proof types leaked into shared contracts
+
+Shared runtime contracts contain Antigravity session proofs, Goal continuation proof
+families and OpenCode native-MCP envelopes. Store contains OpenCode session rules,
+Command profile logic, Muse family handling, Goal vendor branches and artifact
+allowlists.
+
+Target Store branches on semantic action and retained object state. Native readiness,
+model, MCP, physical attempts and recovery facts are adapter observations.
+
+## 9. Logical input and physical attempt are conflated
+
+OpenCode explicitly models one logical Step with several physical Attempts. Codex
+provides logical client-message identity plus exact thread/turn identity. Existing
+Eliot structures and result logic can still reason as if each terminal provider event
+is the one input execution.
+
+Target: one Eliot Operation per logical input. Adapter observations expose physical
+attempts; result and acceptance attach to the logical input. A provider retry is not
+permission for Eliot to resend.
+
+## 10. Observation has two cursor domains
+
+`monitor.snapshot`/`monitor.follow` correctly use Store `observation_id` and a
+transactional journal cut. Provider readers have different cursors: JSONL offsets,
+SQLite sequences, inbox IDs, event cursors and source epochs.
+
+Conflating them would either leak vendor storage into the public API or lose gaps.
+
+Target:
+
+- adapter owns provider cursor/epoch and gap recovery;
+- Store commits normalized facts, source cursor and coverage;
+- Governor uses Store observation cursor;
+- expired/foreign provider cursor becomes source coverage gap, not empty state;
+- follow/watch disconnect never changes native work.
+
+ACPX and OpenCode both confirm replay/follow must have an explicit synchronization
+boundary.
+
+## 11. Quota is another vendor-proof subsystem
+
+`NativeUsageSnapshot` currently hardcodes `UsageService::{Codex,Muse}` and exact
+native method names. `ProviderConditionFact` repeats binding, route, provider,
+account, model, source connection, evidence method/revision, auth SHA and sequence.
+Store `provider_conditions.rs` stores about 27 columns, reconstructs the DTO, hashes
+the retained fact and compares several ordering domains.
+
+`native_usage.rs` then admits producers through artifact allowlists. The current Muse
+Rust producer is rejected because only Node bridge versions `.9`–`.13` are accepted.
+
+This is a compatibility/provenance matrix, not a compact quota projection.
+
+Target: adapter folds native patches into one normalized source/account capacity
+snapshot. Store validates source auth, bounds and source-local monotonic sequence.
+Bindings reference one source snapshot instead of copying it. Remove vendor enums,
+native method allowlists, auth-context SHA, artifact-version gates and duplicate
+condition provenance. Unknown/missing quota is unavailable, not available or zero.
+
+## 12. Runtime duplication remains the largest deletion surface
+
+| Runtime | Parallel surface | Target |
 | --- | --- | --- |
-| Antigravity | Node and Rust warm-stream implementations | Rust only after consumers/package paths switch |
 | OpenCode | built-in host executor plus standalone Rust adapter | standalone Rust only |
-| Codex | current Rust plus retired Python executor/SDK | Rust only; retain only concrete historical readers |
-| Muse | Node bridge and Rust adapter | select one by complete behavior and total owned code |
-| Claude | Rust/SDK path plus retained Node generations | one current Rust adapter with thin SDK driver |
-| Command | Batch profile ladder and ACP profile ladder | current retained product profiles only |
+| Muse | Node bridge plus Rust adapter | select one by complete behavior and total Rust+JS+glue |
+| Codex | current Rust plus retired Python executor/SDK | Rust only |
+| Claude | Rust/SDK path plus retained Node generations | one Rust adapter |
+| Antigravity | Node bridges plus Rust warm stream | Rust only |
+| Command | Batch v3/v4/v5 and ACP v1/v2 profiles | one current batch and/or one current ACP product, no history ladder |
 
-Historical records do not justify keeping an executor. Concrete unsettled work gets a
-finite disposition before deletion.
+Historical records do not require an executable.
 
-## 14. Passive observation still needs source changes
+## 13. Tooling is a second compatibility product
 
-The required Governor view is not yet a joined local projection:
+Large workflow/qualification scripts validate checkout, compiler, lockfile,
+dependency graph, cache-path hash, artifact schema arrays, preview hashes and proof
+packets. This is mostly unrelated to whether an installed adapter can execute a
+turn.
 
-- `agent.list` remains binding-based;
-- unmatched provider sessions are not first-class inventory;
-- process owner identities are lost before Store projection;
-- process sampling repeatedly hashes executables;
-- restart can preserve stale connection health;
-- follow/timeline loses source identity;
-- GitHub polling focuses on Issues rather than independent remote refs.
+Target:
 
-Use existing adapter readers, host process/Git owners and Store observation. Do not
-add a provider call per viewer or a second transcript database. Preserve unknown and
-coverage gaps; never infer death/completion from age, low CPU, mtime or PID alone.
+- one package manifest;
+- selected executable/resources;
+- one install/launch byte check;
+- path containment, private credentials and atomic publication;
+- runtime protocol/capability check;
+- public behavioral qualification.
 
-## 15. Store, automation and product breadth remain excessive
+Remove artifact-specific PowerShell validators, build-environment equality, retired
+frontend inventory, proof qualification and incident-specific modes after their
+permanent behavior is covered.
 
-Confirmed targets remain:
+<a id="code-reduction-candidates"></a>
 
-- most reads serialized through one writer;
-- base SQL text SHA can reject a semantically compatible database before migration;
-- automation owner/name is part of identity and transfer relocates multiple journals;
-- overlapping schedulers and `legacy_optional_workers` split lifecycle ownership;
-- capacity and automation retain indexed state in encoded `meta` keys;
-- direct acceptance and automatic acceptance use different review prerequisites;
-- launch preview hashes and MCP/proof readiness block direct work;
-- Concilium, integration ratification/ACK and automatic publication are separate
-  product engines outside the compact core;
-- host links worker implementations instead of only shared contracts.
+## 14. Additional confirmed deletion candidates
 
-Implementation names the replacement and deletion order. Do not create a second issue
-program from this list.
+- frontend installation scans retired sibling dependency trees;
+- duplicate Forge installer;
+- host links worker implementation crates;
+- two schedulers and `legacy_optional_workers`;
+- owner-dependent automation identity and six relocation paths;
+- capacity/automation key codecs in `meta`;
+- Concilium and integration ratification/ACK products;
+- automatic Issue-label publication;
+- direct acceptance bypass of assigned-review evidence;
+- launch preview hashes and MCP readiness gate;
+- most Store reads through one writer;
+- base SQL text SHA gate;
+- unbounded Muse Rust shutdown;
+- per-sample executable hashing.
 
-## 16. Claims explicitly rejected
+[Implementation](implementation.md) names the order and owner. Do not create another
+issue series from this list.
 
-- Exact MCP exposure already has one owner; do not delete it as a duplicate
-  permission engine.
-- Schemars is not a proven net deletion for the inspected dynamic MCP inputs.
-- Octocrab is optional; adding it beside `gh` would increase code.
-- Result-page retention before Store ACK is necessary; the defect is that some routes
-  keep it only in memory.
-- A local transcript, alive PID or recent mtime does not settle an uncertain native
-  write or prove Task completion.
-- File moves, more crates or a Rust rewrite do not simplify retained responsibility.
-- A shared abstraction with one implementation caller is preparation debt.
+## 15. Claims rejected
+
+- Exact MCP exposure already has one owner; it is not duplicate permission policy.
+- Schemars is not a ready deletion because inspected inputs lack shared DTOs.
+- Octocrab is optional; current `gh` is not a large handwritten HTTP stack.
+- Result-page retention before ACK is necessary.
+- A transcript, alive PID or recent mtime does not settle an uncertain write or prove
+  Task completion.
+- File moves, Rust rewrites and more crates are not simplification.
+- ACP v2 is not Eliot's universal bus and does not justify permanent v1/v2 support.
+- Existing OpenCode/Claude/Command journals are not acceptable common outbox
+  implementations.
 
 ## Implemented source reduction
 
-Commit `25a8e3b` removed the host's duplicate application CLI and MCP launcher:
-`main.rs` fell from 1,949 to 743 physical lines, net −1,206 Rust lines. Public commands
-remain in `swarm-cli`; host daemon/admin/internal worker entrypoints remain. No later
-runtime deletion has landed yet.
+Commit `25a8e3b`, now in `main`, removed the host duplicate application CLI and MCP
+launcher: `main.rs` fell from 1,949 to 743 physical lines, net −1,206 Rust lines.
+Later preparation commits are documentation, not runtime deletion.
