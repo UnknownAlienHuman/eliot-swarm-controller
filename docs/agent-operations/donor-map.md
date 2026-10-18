@@ -14,7 +14,7 @@ The operations program now also includes [Modular Runtime](modularity.md) and [O
 
 Earlier ELIOT inspection used `504199d14135c030ad3951a3c5023a098a3d03f0`.
 Use [source findings](refactoring.md) for current call sites and corrected audit
-claims at `4e75fb1`. [Architecture](architecture.md) owns the product manifesto;
+claims at `3b910fa`. [Architecture](architecture.md) owns the product manifesto;
 [implementation](implementation.md) owns source changes and donor choices;
 [delivery](delivery.md) owns work transitions. Earlier owner-policy editions are
 historical decisions, not runtime rights.
@@ -121,6 +121,19 @@ is 1,597 physical lines, with 927 preceding its explicit test module; these are 
 bridge could exceed the saving. Count all
 owned languages, IPC glue and retained compatibility before adopting it; do not
 build a new wrapper solely to move Rust lines elsewhere.
+
+**CODE, close semantics rechecked 2026-10-18:** for a process-owning transport with
+`close(flushed)`, `Connection.close` passes its submission tail. The transport
+contract requires waiting for frames to be handed to `write` within its own
+shutdown budget; the connection owns neither that budget nor process signals.
+Submission is not native admission or completed execution. Eliot's
+Rust `msp.rs` already separates submitted/response receipts and fences ingress on
+close; adding another close wrapper would duplicate that work. Its current
+`RunOwner::join` can nevertheless wait indefinitely before custody join. Apply
+the [owner-level stop decision](implementation.md#recovery-and-progress), preserving
+custody and uncertain effects rather than treating a dropped future as cancellation.
+Muse's addressed `userInput/cancel` is not a turn-cancel API. This donor comparison
+does not qualify the installed SDK package or justify a third Muse implementation.
 
 Accept installed runtimes by documented protocol/capability compatibility.
 Selected local artifact digests and historical request/checkpoint bytes remain

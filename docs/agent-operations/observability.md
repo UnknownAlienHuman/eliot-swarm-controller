@@ -1,109 +1,57 @@
 # Observability — Adjustable Logs and Live Agent Monitoring
 
-Source status (2026-10-07): Section 2 describes the implemented recorder and
-Manager policy path. Sections 1 and 3–6 retain architecture, target, or
-acceptance guidance; they do not claim every listed projection or metric exists.
-The host-terminal subsection records the source correction in PR #37; its
-behavioral qualification and the remaining runtime-alias work are pending.
-Use the module/process boundaries in [Modular Runtime](modularity.md).
-Existing receipts, `report.delta`, attention/capacity, family observations and
-Doctor remain useful foundations; this document does not claim they are absent.
+Observation explains current work and failures without starting model calls.
+[Implementation](implementation.md) owns the remaining source changes.
+At `3b910fa`, [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) and
+[swarm-observer](../../crates/swarm-observer/src/host.rs) use a bounded
+Producer/HostRecorder chain. Tracing replacement and broader read-pool routing are
+targets, not implemented guarantees.
 
 ## 1. Three data classes, one explanation of reality
 
-| Class | Source/owner | Loss and authority |
-|---|---|---|
-| Durable business facts | Kernel/Store: Operations, normalized events, review/acceptance and source identities | Committed atomically; cannot be switched off by a log-level setting. Never acknowledge a lost commit. |
-| Diagnostic logs and spans | Component producer → bounded recorder | Configurable, sampled/rotated where appropriate. Loss is counted and visible; logs do not authorize a transition or replace a receipt. |
-| Live status and metrics | Shared read-only projections of the above plus real process/native observations | Include timestamp, source freshness and coverage. Silence, disconnection, idle and finished are different states. |
+| Data | Existing authority and lifetime |
+| --- | --- |
+| Business facts | Store Operations, observations and artifact references. Commit before acknowledging an action; log settings cannot disable these records. |
+| Diagnostic records | Optional bounded Producer/recorder output. Loss is counted; a log line is not an action receipt. |
+| Live view | Read-only projection of retained facts and real process/native observations, with explicit freshness and gaps. |
 
-Do not duplicate a full conversation per observer or introduce a second Task
-store in the logging module. Derived indexes/files are rebuildable or explicitly
-partial; they do not become a competing truth for who owns work or whether it
-passed. No model is queried to discover its heartbeat, health or resource usage.
+Keep large output once under its actual owner. A viewer does not maintain another
+conversation or Task store. Silence, disconnection, idle and completion differ;
+none requires asking the model for a heartbeat.
 
 ### Host terminal events and retained diagnostics
 
-`store/host_lifecycle.rs::retain_exit` retains the validated `Exit` receipt under
-`host:last-exit:v1` and, for a failure, `host:latest-failure:v1`. The receipt
-contains the primary error and up to two validated `secondary_codes`; these
-fields remain available through the existing lifecycle status readback. A later
-graceful exit does not acknowledge or erase the latest retained failure.
-
-The normalized terminal `host.exit` and `host.failed` observations are different
-views of one occurrence, not two independent failures. Both use
-`host-terminal-exit:<host_epoch>` and the same phase, timestamp and canonical safe
-payload: `schema_version`, `phase`, `status`, `occurrence_id`, `host_epoch`, and
-only the applicable `failure_category` and `failed_supervisor`. Diagnostic codes
-are not part of that payload. The reader's closed-field and paired-payload
-checks remain intact; adding detail to a receipt must not silently expand the
-ScriptRun input contract or make the two views unequal.
-
-This correction changes new terminal observations only. It neither rewrites old
-observations nor rewinds an automation cursor to replay previously skipped work.
-A historical pair containing `secondary_codes` in only one view still requires
-explicitly designed recovery; do not claim it was repaired by a producer change.
-Host interruption between epochs and epoch-less malformed-state recovery keep
-their existing separate forms. An event identifies evidence for current scoped
-admission; its ID alone never grants permission to run a script or repeat a
-native effect.
+[Host lifecycle](../../crates/swarm-kernel-host/src/store/host_lifecycle.rs) retains
+exit/failure receipts and their diagnostic codes. Normalized `host.exit` and
+`host.failed` can be views of the same host-epoch occurrence. Their shared safe
+selector payload is not an extensible copy of the diagnostic receipt. Preserve
+one occurrence when routing a selected action; changing a producer does not replay
+historical events or repair already-consumed malformed pairs.
 
 ### OpenCode catalog rejection receipt
 
-For a rejected `agent.open`, public `operation.get` can retain
-`result.failure = {"code":"NATIVE_MODEL_UNAVAILABLE","catalog_failure_category":"model_absent"}`.
-The category is exactly one of `catalog_unavailable`, `model_absent`,
-`model_disabled` or `variant_absent`. The adapter preserves the original error
-code; HTTP, schema and directory failures keep their existing codes. The Store
-projects this object only for the exact rejected open and matching diagnostic
-code. Other outcomes, methods, codes and unknown categories receive no such
-object. Private details, catalog entries, error messages and credentials remain
-outside the public receipt. This diagnostic neither grants readiness nor
-authorizes dispatch, replay or Task acceptance.
+For the exact rejected `agent.open`, `operation.get` can retain a bounded
+`NATIVE_MODEL_UNAVAILABLE` category: catalog unavailable, model absent/disabled
+or variant absent. This existing [result projection](../../crates/swarm-kernel-host/src/store/operations/execution_diagnostic.rs)
+exposes neither raw catalog/error text nor credentials. It is a diagnostic,
+not readiness or permission to retry.
 
 ## 2. Configurable depth without a restart
 
-Log **level** and captured **content** are separate settings. Levels are
-`off/error/warn/info/debug/trace`. Default is `info` with metadata only. Content
-choices are metadata and bounded Atlas-redacted text. Native frames are
-unsupported because this source has no bounded frame producer. Increasing to
-trace must not silently enable raw prompts, tool arguments, environment dumps,
-auth headers, account data or credentials. Hidden reasoning unavailable from a
-native API is not a logging feature and must not be fabricated.
+Level and content are separate choices. Current levels are
+`off/error/warn/info/debug/trace`; metadata is the default content.
+`redacted_text` is supported for selected module-supervisor diagnostics.
+Native frames are unsupported: no bounded frame producer exists. Trace cannot
+silently enable prompts, tool arguments, environment dumps or secrets.
 
-The current observer source supports metadata by default and bounded
-Atlas-redacted text for selected module-supervisor lifecycle diagnostics. Live
-config schema 3 adds `content: "metadata" | "redacted_text"` and optional
-scoped content overrides; schema 1 and 2 remain metadata-only. Redacted native
-frames are explicitly unsupported until a real bounded native-frame source exists.
-
-Managers can use `logging.get` and `logging.set` to inspect and save their own
-diagnostic scope policy without a GM session. The API accepts metadata or
-`redacted_text` for the Manager's own client, current Task/Attempt, owned
-Operation, binding generation, or retained module scope. A selected Manager
-policy applies its absolute expiry on each producer emission and after-commit
-reload; it can raise detail above the observer's default Info level for that
-exact scope. Explicit operator `off`, excluded kinds, or a scoped operator
-metadata override still fail closed. A scoped Manager `redacted_text` choice
-overrides the observer's global metadata default, but Atlas redaction occurs
-before redacted-text serialization and either queue, and the observer still applies
-its bounded file selector, retention, and TTL. Redacted native frames remain
-unsupported because there is no bounded native-frame producer.
-
-`logging.get` reports source capability separately from live availability. Its
-runtime projection shows whether the Producer is enabled, has an observer
-callback, redactor and live policy, whether the persisted scope policy matches
-the loaded Producer snapshot, and whether a non-emitting `module_stopped` scope
-probe passes the current operator policy. A passing probe means policy admission,
-not proof of a recorder file write; configured operator files remain fail-closed
-until the existing recorder worker validates and publishes their first snapshot.
+The current operator live-policy format and diagnostic wire format are different
+contracts. Their existing parsers own version handling. Use one current format
+after the [finite transition](implementation.md#current-format-and-existing-data);
+do not maintain version tables or add old-format readers to every producer.
 
 ### Host recorder configuration
 
-The host accepts only these fields under `[observability]`; level and content
-live in the separate JSON policy file, not in TOML. The recorder is disabled by
-default. Relative paths resolve against the controller config file, and an
-omitted `directory` uses `<storage.data_dir>/diagnostics`.
+The optional recorder is disabled by default. Current TOML fields are:
 
 ```toml
 [observability]
@@ -117,29 +65,16 @@ retention_bytes = 134217728
 retention_days = 7
 ```
 
-The exact host `ObservabilityConfig` fields are `enabled`, optional `directory`
-and `live_config_file`, `queue_records`, `queue_bytes`, `max_record_bytes`,
-`file_segment_bytes`, `retention_bytes`, and `retention_days`. V3 requires
-`swarm-telemetry` and `swarm-observer` to migrate this configuration to `tracing`,
-`tracing-subscriber::reload` (dynamic level/scope updates), `tracing-appender`
-and the already used `atlas-redact` (`vendor/atlas`). The current implementation
-uses its own Producer/HostRecorder; [source status](refactoring.md) does not claim
-a completed tracing migration. The reviewed [appender 0.2.5 API](https://docs.rs/tracing-appender/0.2.5/tracing_appender/non_blocking/struct.NonBlockingBuilder.html)
-bounds buffered lines, not aggregate bytes: preserve `queue_bytes` and
-`max_record_bytes` in the same sink adapter, with explicit drop accounting and
-independent stderr/file failure handling. Replace old logging plumbing as callers
-move; do not retain a second logging framework alongside tracing. `Store` installs the `atlas-redact` text
-redactor and observer text-capture policy before constructing the Producer. Raw
-text is never serialized: `atlas-redact` scrubbing precedes observer-line text
-serialization and queue admission, while ordinary stderr remains metadata-only.
+Optional `directory` defaults to `<storage.data_dir>/diagnostics`; relative paths
+resolve against the controller config. These are bounded engineering defaults,
+not measured fleet sizing. Level/content belong in the separate live-policy file.
+The existing recorder loads it lazily; disabling the recorder creates no permanent
+idle recorder thread.
 
-### Pinned operator live policy
+### Operator live policy
 
-The optional JSON file is read by the existing recorder writer after lazy
-startup. Schema 3 is the first version with content controls; schemas 1 and 2
-remain metadata-only. Replace `scope_id` with the exact canonical local data
-root path. This sample uses all supported kinds and a bounded, expiring
-operation override:
+The current schema-3 JSON file names the canonical local data root as `scope_id`.
+For example:
 
 ```json
 {
@@ -149,41 +84,27 @@ operation override:
   "level": "info",
   "content": "metadata",
   "included_kinds": [
-    "client_disconnected",
-    "store_operation_failed",
-    "module_started",
-    "module_stopped",
-    "agent_delivery_failed",
-    "recorder_failure"
+    "client_disconnected", "store_operation_failed", "module_started",
+    "module_stopped", "agent_delivery_failed", "recorder_failure"
   ],
-  "overrides": [
-    {
-      "operation_id": "op_example",
-      "level": "debug",
-      "content": "redacted_text",
-      "expires_at_unix_ms": 4102444800000
-    }
-  ],
+  "overrides": [],
   "retention_bytes": 134217728,
   "retention_days": 7
 }
 ```
 
-Only one selector (`module_id`, `client_id`, or `operation_id`) is accepted per
-override; expiry is an absolute Unix timestamp in milliseconds. The live file
-is capped at 16 KiB, 64 overrides, and 128 bytes per selector. Explicit operator
-`off`, excluded kinds, or a matching metadata-only content override remain
-fail-closed restrictions.
+An override selects one module, client or Operation and has absolute expiry.
+The existing [live-config parser](../../crates/swarm-observer/src/live_config.rs)
+caps file size, overrides and selector lengths. Explicit operator `off`,
+excluded kinds and matching metadata-only restrictions remain effective.
+Validate a whole change before swapping its filter; invalid input must not enable
+content capture. This local reload is not a fleet-wide revision/ACK protocol.
 
 ### Manager tool
 
-An ordinary registered Manager discovers the `logging_get` and `logging_set`
-tools in the typed Manager MCP profile; they dispatch the `logging.get` and
-`logging.set` application methods. Read `logging_get` for the target scope
-first; `logging_set` accepts the typed `level`, `content`, optional exact scope
-selectors, and optional `ttl_seconds` from 1 through 86,400. Omitting selectors
-targets the authenticated Manager's own client scope. For example, a temporary
-client-scope opt-in is:
+`logging.get/set` lets a registered Manager inspect and change its own scoped
+diagnostic policy. The MCP names are `logging_get` and `logging_set`; arguments
+are flat. Omitting selectors targets the authenticated Manager's client:
 
 ```json
 {
@@ -194,161 +115,85 @@ client-scope opt-in is:
 }
 ```
 
-The MCP tool arguments are flat; use the same fields when calling the Store
-method directly. Task policies require the exact `task_id`, `task_revision`,
-and `attempt_id` together; binding policies require `binding_id` and
-`binding_generation` together. A successful mutation commits durably, then
-reloads the existing Producer; its policy carries an absolute expiry checked on
-each emission. `logging.get` distinguishes source capability and runtime
-availability from proof that any record reached disk. Native frames remain
-unsupported because no bounded native-frame producer exists.
+Task scope requires its complete Task/revision/Attempt tuple; binding scope requires
+ID and generation. Current policy TTL is 1–86,400 seconds. Store commits policy and
+reloads the existing Producer; expiry is checked during emission and after restart.
+Manager scope cannot expose another principal or override operator restrictions.
 
-The queue and retention defaults are bounded engineering settings, not measured
-fleet sizing. Bounds are validated. `enabled` concerns the optional recorder,
-not the durable event journal. Merely saving a Manager policy does not start an
-agent or native session.
-The supervisor publishes the effective logging configuration revision to live
-producers; each reports applied/unsupported/error for that revision. Validate a
-whole change before atomically swapping a process's filter. A manager can narrow
-or temporarily increase detail for its existing scope without operator approval.
-It cannot expose another restricted principal's content or enable privileged raw
-capture through an ordinary log setting. Overrides expire back to baseline even
-after a producer restart; changing a filter never restarts a native session.
-
-`logging.get/set` are the ordinary Manager's durable scope-policy interface and
-live Producer projection. `monitor.snapshot/follow` and CLI `swarm logs` and
-`swarm monitor` remain separate projections of shared observations.
-Use stable query fields for module, manager, agent, Task, Attempt, Operation,
-binding/generation, time, event kind and severity. Errors name an actual supported
-next action, not a mandatory additional approval chain.
+`logging.get` distinguishes source capability, loaded policy and runtime
+availability. A passing non-emitting probe is not proof that a recorder wrote a
+file. Saving policy starts no native session. Source/status gaps stay visible.
 
 ## 3. Common record and causal relationships
 
-Use versioned structured JSON records; plain console text is only a rendering.
-Do not encode identity in the human message string. Common fields:
+Use the existing small diagnostic envelope: kind, severity, phase, observed time,
+bounded code/component and known scope IDs. The actual
+[`WireRecord`](../../crates/swarm-telemetry/src/lib.rs) already carries optional
+module, binding/boot, Task/Attempt and Operation correlation. Its sequence counts
+emission attempts, including loss; it is not a Store journal cursor or a total
+arrival order.
 
-```text
-schema_version, event_id, stream_id, sequence
-occurred_at_utc, recorded_at_utc, monotonic_elapsed_ms, clock_domain
-module_id, module_version, build_id, worker_boot_id
-process_identity (pid + verified birth/owner reference), native_runtime
-actor_id, effective_manager_id, agent_id, parent_agent_id
-project_id, task_id, attempt_id, operation_id
-binding_id, binding_generation, native_session_id, native_turn_id
-trace_id, span_id, parent_span_id, causation_id, correlation_id
-kind, level, phase, status, duration_ms
-error_code, error_class, exit_code, signal, restart_count
-payload_ref, redaction_state, coverage, source_freshness
-```
+Add fields only where a producer observes them and a consumer needs them.
+Native turn, process exit, elapsed time and review outcome belong to their source
+records; they do not justify a universal event DTO with dozens of nullable fields.
+Use existing IDs/references to join views. Trace/span context is optional correlation,
+not authority. Compare durations only within one monotonic clock domain.
 
-Fields without evidence are absent/null, not synthetic native IDs. Sequence is
-per named stream/boot; wall time does not establish a total distributed order.
-Only the same monotonic clock domain supports direct duration subtraction.
-Trace context is correlation, never authority. Keep original actor separate from
-the manager for whom automation runs; retain historical parents across handover.
-
-Capture public agent replies, native-visible tool start/end/results, addressed
-control requests, delivery outcomes, child observations and final result links
-when the selected source exposes them. Store large text once as an authorized
-bounded artifact/reference, not in event-selector metadata or every notification.
-Exact effective model/usage is recorded only when observed; requested model/effort
-is a separate field. Missing usage/cost stays unknown, never zero by default.
-
-For each failure answer: **which module/agent, what operation, when, which phase,
-which process boot, observed outcome, restart/readback action and remaining gap**.
-A supervisor's OS wait result can identify an exit or signal even if its child
-could not log. A killed process may not emit a backtrace; distinguish a suspected
-OOM from proven OS evidence. Panic/source-location diagnostics use protected
-symbol/backtrace artifacts linked to the exact build; release symbols may be
-stored separately. Do not broadcast raw panic strings as public event metadata.
+Requested model/effort differs from observed effective model and usage. Missing
+usage remains unknown, not zero. Do not reconstruct unavailable reasoning or native
+identities. Show which work failed, the observed phase/outcome, its source freshness
+and the supported recovery action; retain original actors across handover.
 
 ## 4. Implementation and failure isolation
 
-Use complete maintained Rust tracing libraries: `tracing`,
-`tracing-subscriber` filter/reload and structured formatting. Wrap the filter, not
-an entire sink unnecessarily. Apply `enabled!`/equivalent checks before expensive
-formatting or serialization; metadata-off must not construct a huge payload and
-throw it away afterward. Compile-time removal of debug/trace must not invalidate
-the advertised ability to enable them dynamically.
+Replace the existing logging plumbing through its callers using `tracing`,
+`tracing-subscriber` filtering/reload and the selected recorder sink. Remove the
+old path as callers move. No second logging framework, control service or universal
+telemetry schema is needed.
 
-The producer has a bounded queue with both byte and record limits. The recorder
-owns file I/O/rotation/indexing. `tracing-appender` offers a bounded nonblocking
-writer and loss counter, but its line-count capacity alone is not a byte budget:
-bound each record and account total queued bytes. Retain its `WorkerGuard` for
-the worker's lifetime; graceful shutdown performs a bounded flush. SIGKILL/power
-loss can still lose trailing diagnostics. Never claim exactly-once logs.
+The reviewed [tracing-appender API](https://docs.rs/tracing-appender/0.2.5/tracing_appender/non_blocking/struct.NonBlockingBuilder.html)
+bounds queued lines, not total bytes. Preserve per-record and aggregate byte limits,
+loss accounting and the worker guard in the same sink. Check enabled level/content
+before expensive formatting. Graceful flush is bounded; power loss can lose trailing
+diagnostics. Do not claim exactly-once logs.
 
-Do not put logs on protocol stdout. Use a dedicated framed diagnostic channel or
-stderr captured once by the owner. Bound and redact stderr too. Slow/disconnected
-readers cannot block control messages, cancellation or terminal evidence. Prioritize
-small control/terminal notifications over bulk text without claiming business
-facts were committed before Store says so. Share one upstream native reader per
-service scope and fan out locally; no repeated CLI launches per panel/viewer.
+Keep protocol stdout separate. Redact bounded logical records before serialization,
+persistence and fanout, including secrets split across native chunks. Existing Atlas
+calls are stateless, so a chunk buffer must establish that boundary. Suppress content
+whose safe bounds cannot be established. Escape terminal control sequences when
+rendering and keep files scoped to private controller state.
 
-When the recorder is disabled or broken, workers retain a bounded emergency path
-for critical diagnostics and report sink health/lost-record counters on reconnect.
-There is no always-running recorder thread when its sink is disabled. A failure
-while recording a failure must not recurse into the same broken sink. A kernel
-journal error is different: it cannot be swallowed as `false` or downgraded into
-an acknowledged operation. Surface it via supervisor health and fail the affected
-admission truthfully.
+One upstream reader fans out through bounded queues. A slow viewer cannot block
+control, cancellation or terminal evidence. Recorder/stderr failures have separate
+bounded error paths; recording an error must not recurse through its broken sink.
+Store journal failure remains a failed/unknown admission, never acknowledged log loss.
 
-Retention applies byte and age limits, rotates off the hot path and exposes disk
-quota/exhaustion. Never delete source evidence referenced by unresolved work or
-accepted-candidate policy under a generic log cleanup rule. A disconnected slow
-subscriber retains only its bounded cursor/lag state, not an unbounded private
-copy of every event. Sampling may reduce diagnostic traces, not durable business
-receipts. Account and display dropped records and the affected interval.
+Rotate diagnostics by byte/age limits and expose disk exhaustion and lost intervals.
+Their retention must not remove evidence referenced by unresolved work. Diagnostic
+sampling cannot drop business receipts. Keep actual process/native ownership outside
+the recorder.
 
 ## 5. Live monitoring and future charts
 
-Provide a read-only initial snapshot tied to a journal cut, followed by events
-after its cursor, executing all read queries against the Store's **read-only WAL
-connection pool** so live viewers never contend with the writer thread.
-Register/capture the cut so updates racing with the snapshot
-are recoverable. On a lagged volatile channel, replay retained journal facts;
-on an expired retention cursor, return an explicit gap and fresh snapshot.
-Do not silently report continuous history or complete native family coverage.
+The target initial snapshot uses a short authorized read transaction with its
+journal cut, followed by events after that cursor. Apply the existing
+[Store read conversion](implementation.md#store-and-current-data); ordinary reads
+are not all on a read pool today. A lagged subscriber replays retained facts;
+an expired cursor reports a gap and obtains a fresh snapshot.
 
-Minimum live view: manager/agent tree, module boot/state, current Task/Operation,
-last activity, native child coverage, queue depth, waiting reason, recent outcome,
-error and next recovery action. Process alive is not native turn running; an
-unchanging model output is not proof of a dead process. A viewer disconnect does
-not stop or restart the observed agent. Refresh rate and inspected subjects are
-user configurable and based on shared observations, not active model prompts.
+Show current manager/agent work, module state, last activity, pending reason,
+queue pressure, outcome and recovery action. A viewer disconnect cannot stop the
+agent. Share process/resource observations; do not spawn a poller or model call
+for each viewer. Do not count one shared process's RSS once per hosted session.
 
-Record aggregate rates/counters/histograms for admitted/completed/failed/unknown
-operations, queue bytes/age, event lag/loss, dispatch and native durations,
-module starts/restarts, and measured active-process CPU/RSS sampled via the
-`sysinfo` donor crate. Use bounded metric
-labels such as module/runtime/status. Agent/Task/Operation IDs belong in logs or
-exemplars, not unlimited time-series labels. Avoid counting final cumulative
-usage again after per-turn deltas. Shared native-process RSS must not be added
-once for every session hosted in it.
-
-A bounded JSONL/CSV query/export is sufficient for later time plots and dependency
-views. Optional OTLP/Prometheus/dashboard exporters can be separate modules when
-needed; none is required to launch an agent or run the local monitor. Preserve
-schema/version, units, unknowns and time ranges so a future chart is not guessing.
+Metrics use bounded dimensions such as runtime/status. Task and Operation IDs
+belong in logs, not unlimited metric labels. Add a bounded export or chart only
+for an actual consumer; OTLP, Prometheus and dashboards are optional integrations.
 
 ## 6. Privacy and acceptance
 
-Apply redaction **before** disk, fanout and export, including secrets split across
-native chunks. Escape untrusted terminal control sequences/markup when rendering.
-Truncate or suppress a frame that cannot be safely bounded/redacted; do not allow
-trace to disable secret scrubbing. Local file permissions match the controller's
-private state model. Project/participant scope is checked before query pagination,
-subscription and artifact retrieval, not only when formatting a response.
-
-After the product path is implemented, validate filter reload/expiry, correlated
-manager → child → tool → result events, one optional worker crash/recovery,
-recorder loss and disk-full behavior, slow-subscriber gap recovery, redaction of
-split synthetic secrets and disabled-module idle behavior. Verify ordinary agent
-work still proceeds with observer/recorder absent. These are acceptance scenarios,
-not a request to run a new broad test campaign before writing the implementation.
-
-Primary library documentation read 2026-10-05: [tracing-subscriber reload, 0.3.23](https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/reload/),
-[tracing-appender nonblocking, 0.2.5](https://docs.rs/tracing-appender/0.2.5/tracing_appender/non_blocking/),
-[Tokio broadcast](https://docs.rs/tokio/latest/tokio/sync/broadcast/) and
-[Tokio watch](https://docs.rs/tokio/latest/tokio/sync/watch/).
-These are reviewed source/API versions, not dependencies installed by this PR.
+Check principal/object scope before reads, subscription and artifact pagination.
+Validate only the observation boundary changed: relevant filter reload/expiry,
+disabled-recorder behavior, bounded loss/slow-reader gaps, split-secret redaction
+or recorder failure. Ordinary agent work must proceed with observation absent.
+These checks do not start a separate fleet/native qualification program.

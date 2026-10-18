@@ -1,7 +1,7 @@
 # Eliot Swarm Controller — Implementation
 
 This is the single implementation order for the [architecture](architecture.md).
-Source rechecked at `4e75fb1fdfc6b9cd4aee77f21c9b68dcc61761c5` on 2026-10-18;
+Source rechecked at `3b910fa0346a95f6132a66d01c329d2e7f67e96c` on 2026-10-18;
 the mechanisms below are present unless explicitly marked completed.
 [Findings](refactoring.md) retain source evidence and counts;
 [status](../implementation-status.md) records execution evidence. O/M/C/I labels
@@ -83,6 +83,15 @@ bytes or unavailable retained history precisely; a digest cannot reconstruct out
 Result retrieval does not accept a Task. The [Waku/Paseo patterns](donor-map.md#8-architectural-donor-patterns)
 simplify execution/lifecycle ownership; Eliot supplies this Operation mapping.
 
+Use the existing [result handoff](module-api.md#results-and-artifacts): `agent.result`
+requests a page, the adapter publishes it with `module.result`, and `artifact.read`
+reads committed bytes. Store publishes the immutable file before committing its
+receipt; these are ordered writes, not one filesystem/SQLite transaction. Keep
+the adapter's exact pending page until acknowledgment. A crash can leave an orphan
+file, not a completed result. Use `artifact.assemble` for multiple pages; submission
+already rejects incomplete coverage. Do not build another result reader/assembler
+or remove the lost-ack journal merely because both owners temporarily retain bytes.
+
 ## Store and current data
 
 Keep one serialized writer. Admission, current-rights checks, reservation, state
@@ -150,6 +159,23 @@ candidate-specific authorship and late results. Remove document-edition rights a
 historical acceptance workflows through the finite transition, not by treating old
 verdicts as permission for new candidates.
 
+Fix acceptance in the common [Store evidence gate](../../crates/swarm-kernel-host/src/store/acceptance.rs),
+already called at reserve, begin and finish. Today direct `task.accept` validates
+the requirement IDs in caller-authored `reviews`; only the
+[automatic producer](../../crates/swarm-kernel-host/src/store/automation_acceptance.rs)
+requires a retained assigned pass. Move that prerequisite to the common gate.
+Resolve required [assignments/results](../../crates/swarm-kernel-host/src/store/reviews.rs)
+for the exact current candidate and frozen requirements, validate independent
+authorship, complete coverage and passing checks, and retain their references in
+the acceptance Operation. Recheck that same evidence at finish; do not silently
+substitute a newer review. Keep the manager's decision/reason; remove the duplicate
+review-proof payload and its construction/validation in the helper. Preserve that
+helper's trigger selection and current automation authority checks. A required missing,
+inconclusive or changes-requested review blocks both manual and automatic acceptance;
+review A cannot satisfy corrected B. Derive eligibility from these records, without
+adding an `audited` ledger or a second review engine.
+Update `AcceptRequest`, kernel coverage validation, catalog and both callers together.
+
 ## Identity and hashes
 
 Use ordinary IDs/revisions and field comparisons for local relationships and edits.
@@ -186,6 +212,18 @@ streams bounded, redact complete logical records before persistence/fanout, and
 show a gap when content is unavailable. No per-token durable event or per-agent
 model/status poller is needed.
 
+For the selected Muse path, distinguish pending `userInput/cancel`, native turn
+cancellation and process shutdown. Dropping a request or flushing its frame proves
+none of the latter outcomes. The Rust `RunOwner::join` currently awaits
+`Driver::stop_native` → `MspTransport::close` before custody join, with no bound on
+pipe backpressure; the custodian can also await child/stderr indefinitely. Put one
+bounded stop wait in the existing process owner. On expiry retain custody and a
+visible pending reason; continue observation. Only an explicit authorized stop may
+use verified owned-family termination. Current Muse custody alone supplies no such
+family-stop API: do not claim a timeout or dropping the handle implements it.
+Reuse the [SDK submission-barrier distinction](donor-map.md#9-official-vendor-sdks-and-native-protocol-boundaries),
+not another shutdown/replay coordinator.
+
 ## Processes and frontends
 
 Remove host implementation dependencies on `swarm-supervisor`, `swarm-bus`,
@@ -200,6 +238,14 @@ the host retains daemon/local delegates and internal workers. Do not assign that
 deletion again. MCP uses `swarm-contracts::mcp_catalog::exposes_method` and the same
 Store handlers. Small eager surfaces and deferred schemas remain; inventing new
 input DTOs solely to adopt Schemars or a generic execute-method tool adds work.
+
+Diagnostic simplification stays in `swarm-telemetry`/`swarm-observer`. Their current
+bounded Producer/HostRecorder is not a tracing integration. Replace its plumbing
+through the existing callers when adopting tracing, preserve byte limits and scope
+expiry, and delete the old path. Keep small source-specific records and real IDs;
+the [observability contract](observability.md#3-common-record-and-causal-relationships)
+does not require a universal event DTO, another configuration service or a second
+copy of Store evidence.
 
 ## Donor choices
 
@@ -234,9 +280,9 @@ Choose relevant cases rather than turning this table into a new release program.
 | Changed boundary | Meaningful check |
 | --- | --- |
 | Launch/result | Direct launch needs no preview token; stale revisions/changed workspace are rejected; ready session dispatches without MCP discovery; explicit-parent and complete serialized-turn output are attributable; an actual gap stays unresolved without replay. |
-| Delivery/automation | Manual work and selected helper share one action; disable/start ordering, correction A→B, late result and A→B→A ownership preserve the right work. |
+| Delivery/automation | Manual/helper share the evidence gate: a required missing/changes-requested review fails; B needs B's pass, while checks-only policies remain possible. Disable/start ordering, late results and A→B→A ownership preserve the right work. |
 | Store | Restart/lost notification retains an action; reader snapshot is authorized and bounded; migration preserves identity and held capacity; cosmetic SQL text does not define database compatibility. |
-| Installation/process | Selected files suffice without retired siblings or identical build directories; adapter changes leave unrelated host execution intact; actual process ownership controls replacement/cancellation. |
+| Installation/process | Selected files suffice without retired siblings or identical build directories; adapter changes leave unrelated host execution intact. A blocked close returns a pending wait with custody retained, not false completion; actual ownership controls explicit stop/replacement. |
 | Frontends and deletion | CLI/MCP reach the same handler; obsolete callers/config/tests/dependencies are removed, with no fallback wrapper. |
 
 Record what ran and the actual net owned-code change, separating tests. Source,

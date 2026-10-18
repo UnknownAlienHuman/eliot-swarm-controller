@@ -1,6 +1,6 @@
 # Refactoring — Source Findings
 
-Source rechecked at `4e75fb1fdfc6b9cd4aee77f21c9b68dcc61761c5` on 2026-10-18.
+Source rechecked at `3b910fa0346a95f6132a66d01c329d2e7f67e96c` on 2026-10-18.
 Owner baseline: `f1b854b6fd058dc2440d3848fc95acc279657d3f`, parent
 `27fcae1ed2d9fc0aa778680d5e39a08834248023`. The runtime is unchanged since
 `25a8e3b`; subsequent preparation commits change documentation.
@@ -31,6 +31,8 @@ surfaces, not promised deletions; overlapping surfaces cannot be added.
 | --- | --- | --- |
 | First dispatch | [launcher_dispatch](../../crates/swarm-kernel-host/src/store/launcher_dispatch.rs) calls `require_current_dispatch_capability` at admission/coalesced dispatch; OpenCode/Muse branches require MCP connection evidence. | [Launch and results](implementation.md#launch-and-results) |
 | Result collection | OpenCode [native reader](../../crates/swarm-adapter-opencode/src/native.rs) rejects missing assistant `parentID`; the standalone path has no implemented admitted-turn-window alternative yet. An actual circular MCP/model deadlock was not established. | [Launch and results](implementation.md#launch-and-results) |
+| Required review | Direct [acceptance::evidence](../../crates/swarm-kernel-host/src/store/acceptance.rs) checks caller-authored review coverage, not assigned review results. Only [automation acceptance](../../crates/swarm-kernel-host/src/store/automation_acceptance.rs) requires the retained assigned pass. An authorized acceptor distinct from the author can therefore accept a review-required candidate without that candidate's independent review. This is a process prerequisite gap, not extra caller authority. | [Automation and delivery](implementation.md#automation-and-delivery) |
+| Muse stop | Rust [RunOwner::join](../../crates/swarm-adapter-muse/src/module_runtime.rs) awaits transport close before [custody join](../../crates/swarm-adapter-muse/src/native_owner.rs). Close can await pipe backpressure; custody can await child exit/stderr EOF indefinitely. No production deadline or family-stop API is supplied by this custodian. This is source evidence of unbounded waits, not an observed native hang. | [Recovery and progress](implementation.md#recovery-and-progress) |
 | Reads | [Store::call](../../crates/swarm-kernel-host/src/store/mod.rs) separates status/monitor but routes most ordinary reads through the writer. Streams, module dispatch and DB/file composites have distinct stateful paths. | [Store and current data](implementation.md#store-and-current-data) |
 | Capacity/state | [capacity.rs](../../crates/swarm-kernel-host/src/store/capacity.rs) has 5,630 lines: v2 scope/header and JSON entries in `meta`, plus v1 whole-ledger reads. Automation uses sealed JSON/key families. The required reservation behavior is not all expendable. | [Store and current data](implementation.md#store-and-current-data) |
 
@@ -48,6 +50,7 @@ another issue series, process framework or obligation to preserve old experiment
 | Parallel Muse | Node `modules/muse/*.mjs`: 4,298 lines; Rust adapter `src/`: 21,774. Node remains the example route; Rust has a disabled template and one recorded exact-result native observation. Neither source size nor that one observation decides which complete implementation to retain. |
 | Scheduler/lifecycle duplication | [scheduler.rs](../../crates/swarm-kernel-host/src/scheduler.rs) and [automation_scheduler](../../crates/swarm-kernel-host/src/store/automation_scheduler.rs) both orchestrate due work. Standalone enablement does not disable built-in demand. [legacy_optional_workers](../../crates/swarm-kernel-host/src/host/legacy_optional_workers.rs): 11 worker kinds, 2,337 lines. Duplicate effects are not proven; Store may already suppress them. |
 | Document rights and old workflows | [policy.rs](../../crates/swarm-kernel-host/src/policy.rs) requires matching document path/section/SHA before scoped feedback. Separately, [acceptance](../../crates/swarm-kernel-host/src/store/acceptance.rs), [automation acceptance](../../crates/swarm-kernel-host/src/store/automation_acceptance.rs), reviews and Tasks branch on `LegacyV1`. Owner-policy editions and acceptance-policy versions are distinct mechanisms. |
+| Duplicate review proof | [Store reviews](../../crates/swarm-kernel-host/src/store/reviews.rs) retains the assigned auditor's result. Acceptance separately accepts and copies a `reviews` array into its decision and per-requirement manifest. Resolve that evidence once in the shared acceptance gate and retain result references; remove the independent caller-authored proof and helper-only gate. |
 | Mutable automation identity | [automation_transfer::apply](../../crates/swarm-kernel-host/src/store/automation_transfer.rs) creates a successor and disabled old copy, calls six journal relocators plus cron and writes transfer pointers. Its target check makes A→B→A collide with A's retained entry, by source inspection rather than an executed test. |
 | Council/interface engines | Concilium: 3,589 lines in three core files, 11 states/eight methods. Integration DTO/Store: 3,747 lines, 14 compatibility dimensions and ACKs. [Integration](../../crates/swarm-kernel-host/src/coordination/integration.rs) is advisory; it does not accept Tasks or change assignments. Wider [coordination](../../crates/swarm-kernel-host/src/store/coordination.rs), 12,697 lines, also contains needed registration and review/submission grants. |
 | Automatic publication/labels | [Publication](../../crates/swarm-kernel-host/src/store/automation_publication.rs), [projection](../../crates/swarm-kernel-host/src/store/automation_github_projection.rs) and the automation publication model: 5,371 lines with separate cursors/watermarks and on-behalf contexts. Explicit manual Forge/GitHub publication is a separate retained capability. |
@@ -98,6 +101,14 @@ verification have real consumers; do not label every digest unused. The
   standalone runner. A stale fallback comment does not prove a live default executor.
 - GitHub `run_gh_api` is about 104 lines, not a large handwritten HTTP stack.
   octocrab is an optional replacement candidate, not a missing mandatory integration.
+- Result pages already pass complete-coverage checks before submission. Store
+  publishes files before committing receipts, leaving a possible orphan on crash;
+  its SQLite transaction does not include file I/O. An adapter's pending page has
+  a lost-ack recovery consumer, so temporary duplicate bytes are not proven waste.
+- Current telemetry has a bounded diagnostic DTO and Producer/HostRecorder;
+  the former documentation's universal field list and fleet-wide config ACKs
+  were not implemented interfaces. Remove those prescriptions, not working scope
+  checks. Tracing remains a replacement target.
 
 ## CLI reduction implemented in the preparation branch
 

@@ -9,7 +9,7 @@ currently installed machines or claim a complete product acceptance run.
 The owner-supplied baseline is
 [`f1b854b6`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/f1b854b6fd058dc2440d3848fc95acc279657d3f),
 on `27fcae1e`. The preparation checkout studied on 18 October is
-[`4e75fb1`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/4e75fb1fdfc6b9cd4aee77f21c9b68dcc61761c5),
+[`3b910fa`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/3b910fa0346a95f6132a66d01c329d2e7f67e96c),
 with runtime source unchanged since `25a8e3bc`. Older installed artifacts and receipts retain their own source and run identities.
 [Implementation](agent-operations/implementation.md) owns the current work order;
 [source findings](agent-operations/refactoring.md) explain reductions. This page
@@ -19,8 +19,11 @@ records implementation and evidence.
 
 [Architecture](agent-operations/architecture.md) is now a short product manifesto;
 [implementation](agent-operations/implementation.md) owns concrete source owners,
-replacements and checks. The source study adds launcher preview-token, base-SQL
-digest and duplicated credential-index coupling to the existing reduction findings.
+replacements and checks. Source study covers preview/schema/credential coupling,
+the manual acceptance path's missing assigned-review gate, result-file/receipt
+ordering and unbounded Muse stop waits. Delivery, module API and observability
+now describe their existing owners without parallel work programs, duplicate
+review proofs or a universal diagnostic DTO.
 Communication has [one compact contract](agent-communication-program.md). These are
 documentation changes and deletion targets, not completed runtime removals or new
 native qualification. The earlier CLI implementation is scoped below.
@@ -43,12 +46,13 @@ source observations, not measured speedups or completed deletions.
 
 | Area | Current source and remaining gap |
 | --- | --- |
-| Manager → agent → result → review | Store owns durable Tasks, Attempts, Operations, artifacts, submissions and acceptance. The compact product retains assignments, attributable results, independent review, observation and selected Goal continuation. One named native Task has recorded acceptance below; coverage across supported runtimes remains incomplete. |
+| Manager → agent → result → review | Store owns durable work and complete-result validation. Direct `task.accept` still accepts caller-authored requirement reviews; only its automatic producer requires an assigned pass. Moving that prerequisite into the shared handler and retaining review references is pending. The named historical accepted Task below does not prove this prerequisite is enforced on every call. |
 | Store reads | Most reads still use the single writer queue. Status/monitor have a separate FIFO reader. Existing reader primitives can support bounded snapshots, but the broader read-path reduction is not implemented. |
 | Capacity and automation state | Capacity v2 separates a scope header and JSON rows in `meta`; the v1 whole-ledger reader remains. Automation still stores sealed configuration/state and owner-dependent entry keys with transfer journals. Relational simplification and stable entry identity remain candidates. |
 | Runtime ownership | Host still depends on six worker implementation crates. OpenCode has built-in and standalone paths; Muse has Node and Rust paths. Their convergence remains source work. Codex has already moved its current executor to Rust; old Python evidence is historical. |
 | Rights and result identity | Assignment and Store authorization remain necessary. Document editions, install/provenance checks and full artifact-identity comparisons add separate coupling. Source findings identify their callers; implementation owns their finite transitions; this documentation pass changes no admission or result-reader code. |
 | MCP and ScriptRun | Exact MCP exposure already has a shared owner in `swarm-contracts`; it is not duplicate policy to rebuild. New ScriptRun work already requires a selected standalone executor and rejects queued `executor=None`; its old fallback wording does not establish an active default backend. |
+| Shutdown and diagnostics | Muse transport/custodian waits are unbounded in the inspected Rust path; no live hang was reproduced. Current diagnostics use Producer/HostRecorder, not the target tracing path or a fleet-wide policy-ACK interface. Bounded stop/readback and diagnostic simplification remain implementation work. |
 | Product breadth | Concilium, generic negotiation/ratification, integration ACKs, watches and publication automation exist in source. The compact target excludes separate council/agreement engines and automatic publication from required completion; ordinary messages, independent review, Goals and explicit publication of accepted work remain. |
 
 The concrete source anchors and deletion boundaries live in the single
