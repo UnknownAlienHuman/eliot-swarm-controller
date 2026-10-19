@@ -3,7 +3,7 @@
 ## Current state
 
 **Overall: PARTIAL_PROGRESS.** Runtime source was audited through
-`9c28fb75009cc4f871db591ffa85a76a6f363db4`; this commit changes documentation only.
+`8355bdf0fbe561b5163bd3ab1ba6db24c0f8ddbc`; this commit changes documentation only.
 `main` contains one completed runtime reduction and a source-backed refactoring
 program.
 
@@ -27,12 +27,13 @@ qualification.
 | Queue, WorkDispatch, provider state and capacity | deep |
 | Workspace/code scope, process custody and scheduling | deep |
 | TaskPrompt and review/correction/acceptance automation | deep connected review |
-| Public method routing/authorization ownership | deep structural review; no full privilege matrix execution |
+| Public method routing/authorization ownership | deep structural review; no full privilege-matrix execution |
 | Store schema/migration ownership | deep structural review; corruption/upgrade matrix not fully executed |
 | IPC/MCP multiplex, subscriptions, task projection and native streams | deep source review; live load not qualified |
 | Check, Script and Forge execution ownership | deep source review; one-executor deletions specified |
+| Claude adapter state machine | deep connected source review; live installed route not re-qualified |
 | Passive observation and harness executor duplication | architecture plus selected source paths |
-| Claude, Codex, Command, Muse and OpenCode internal state machines | partial targeted review |
+| Codex, Command, Muse and OpenCode internal state machines | partial targeted review |
 | GitHub effects, mailbox/coordination and gateway | partial |
 | Installed/native behavior, Windows custody and scale | unqualified except named historical receipts/open issues |
 
@@ -66,8 +67,10 @@ J0-J3  concurrent MCP IPC, one wake pump, exact pending-input read,
        native content ring off writer
 K0-K4  one Check executor, one Script wire protocol, one Forge remote-effect owner,
        no per-Operation executable hashing
-L-M    shared adapter shell after proof, one executor per harness, Goals,
-       passive observation and remaining Store/product deletion
+L       shared adapter shell only after two current routes delete duplication
+M0-M4  Claude: split native-effect state from Store delivery, persist terminal result,
+       simplify live interactions, delete retention/tombstone/reference machinery
+N       one executor per remaining harness, Goals, passive observation and deletion
 ```
 
 ## Confirmed current gaps
@@ -89,15 +92,95 @@ L-M    shared adapter shell after proof, one executor per harness, Goals,
 | MCP subscriptions | up to 16 pollers/forwarders/queues per session mirror durable facts | one coalesced wake pump; Store cursor is authority |
 | MCP task projection | `tasks/get` scans every `report.attention` page | exact Operation/binding pending-input read |
 | Native streams | ephemeral ring operations run on the single Store writer | reader authorization plus ring operation outside writer |
-| Checks | optional executor leaves standalone and hidden-host execution active | standalone `swarm-checks` for all new work; old host receipts readback only |
+| Checks | optional executor leaves standalone and hidden-host execution active | standalone `swarm-checks` for all new work; old receipts readback only |
 | Check probes | source/tool/Git-hook probes still spawn hidden host `check-worker` | bounded modes in selected check executable; no probe daemon |
 | Scripts | one standalone executor but duplicated host/worker DTOs and hidden compatibility entrypoint | shared `swarm-scripts` wire types and finite deletion of old readers |
-| Forge | valid local/remote split, but large mixed custody, custom capture and per-effect worker/Git hashes | one remote worker, bounded local Git, shared OS primitives, install-time package verification |
+| Forge | valid local/remote split, but mixed custody, custom capture and per-effect worker/Git hashes | one remote worker, bounded local Git, shared OS primitives, install-time package verification |
+| Claude journal | native intent, Store outbox, retention, cleanup, tombstones, boot markers and references share one 183-KB file | minimal native-effect record plus exact Store-delivery records with separate lifetimes |
+| Claude interactions | live callbacks have a second 119-KB journal with retention, pending index and tombstones | current pending callback projection plus one reply Operation; bridge loss settles unknown, never replayed |
+| Claude result | final body is retained only in bounded in-memory `NativeControl`; `module.result` is sent directly | persist exact terminal result bytes/identity before memory loss or read them from supported session history |
+| Claude result ACK | lost `module.result` ACK becomes `MODULE_RESULT_UNKNOWN` and exact resend is forbidden | never replay native work, but retry the identical already-formed Store page until exact ACK/readback |
 | Observation | unbound joined Governor view incomplete; metric hashing remains | local provider+OS+Git view without provider calls |
 | Product breadth | council, ratification/ACK and automatic projection remain | outside compact-core completion |
 | Tooling | compiler/checkout/cache equality and artifact validators remain | generic package boundary plus route-specific live qualification |
 
 These are findings and planned deletions, not completed runtime repairs.
+
+## Claude adapter audit
+
+The current Rust/Node route has a sound basic safety boundary: the Rust owner writes a
+native-effect intent before SDK input, gives each logical input a UUID, maps SDK frames
+back to the retained Operation, keeps callback replies exact, and never guesses that a
+lost pipe means the prompt did not run. The official SDK supplies the useful native
+primitives already used by the bridge: `startup()`, streaming `query()`,
+`canUseTool`/hooks, session IDs and session-history readers.
+
+The implementation around those primitives is much larger than the retained product
+requires:
+
+- `crates/swarm-adapter-claude/src/lib.rs`: 234,105 bytes;
+- `journal.rs`: 183,134 bytes;
+- `interactions.rs`: 118,974 bytes;
+- these three files alone exceed 536 KB before `native_state.rs` and the JS driver.
+
+`OperationJournal` combines six different responsibilities:
+
+1. native-effect intent/outcome;
+2. Store outcome delivery;
+3. result-operation references;
+4. startup inventory/recovery;
+5. retention/cleanup/compaction;
+6. tombstones and boot-dispatch markers.
+
+`InteractionJournal` repeats the same storage machinery for callbacks even though the
+SDK callback resolver belongs to the live query and cannot be reconstructed after
+bridge loss. Persistence can prove that a request/reply became uncertain; it cannot
+resume the JavaScript callback.
+
+A concrete delivery defect remains: `agent.result` builds and sends a `module.result`
+page directly. If the Store reply is lost, the adapter saves an Unknown outcome and
+`settle_result_intent_without_replay` refuses to submit the identical page again. That
+correctly forbids replaying the **native prompt**, but incorrectly treats the already
+formed idempotent **Store delivery** as another native effect. The body also exists
+only in the bounded in-memory result records, so adapter restart can lose a known
+terminal body even when the native session history still exists.
+
+### Claude implementation slices
+
+```text
+M0  one live session owner
+    Keep startup/query/input queue/frame pump and one ordered action loop.
+    Remove full descriptor echo and repeated Task/source hash validation as protocol
+    slices H/F migrate.
+
+M1  NativeEffectRecord
+    One small private record per input/reply/open/shutdown only until native
+    disposition is known. Fields: Operation, action, boot/session, native input or
+    request ID, exact bounded payload identity, disposition/readback cursor.
+    No Store ACK, cleanup queue, tombstone or cross-operation reference graph.
+
+M2  StoreDelivery
+    Persist exact already-formed `module.outcome` and `module.result` envelopes.
+    Reconnect resends identical bytes; exact ACK deletes them. This layer cannot
+    execute SDK input or choose recovery.
+
+M3  terminal result capture
+    At the SDK result frame, persist bounded immutable body + session/input/frame
+    identity before it can disappear from `NativeControl`, then deliver the exact
+    page. For larger/unavailable bodies use the supported session-history reader and
+    an explicit coverage gap; do not maintain a transcript mirror.
+
+M4  live interactions
+    Store exposes the current pending request as observation. `agent.reply` retains
+    one exact reply Operation before resolving the live callback. ACK settles it;
+    pipe/bridge loss makes it Unknown/Retired. Never replay a reply into a replacement
+    query. Delete interaction retention state, pending index, tombstones and cleanup
+    cursor after current callers switch.
+```
+
+Completion requires a connected open → dispatch → callback/reply → result path, lost
+Eliot ACK recovery without native replay, bridge loss with honest Unknown, exact
+session/result attribution, and net deletion across Rust + JS.
 
 ## External-effect audit result
 
@@ -113,21 +196,6 @@ owned by `swarm-process`. Therefore the target is not a universal runner. It is 
 execution route and one wire contract per domain, with package verification outside
 each Operation.
 
-Current source confirms:
-
-- `swarm-checks::execute_with_plan` is called by both standalone and hidden-host paths;
-- Check Store selects standalone only when `CheckConfig.executor` is present and
-  otherwise launches the host as `check-worker`;
-- new ScriptRuns already reject missing standalone pins; `None` is historical only;
-- Script host and worker duplicate compatible Work/plan/start/completion types;
-- Forge has a standalone remote worker and a separate legitimate local Git closure,
-  but repeats process/capture code and hashes worker/Git executables in per-effect
-  preparation;
-- Script host verifies the worker pin and the worker verifies the selected executable
-  again.
-
-Implementation K0-K4 defines the connected deletions.
-
 ## Runtime evidence retained
 
 Historical receipts remain scoped to their named artifacts/revisions:
@@ -136,20 +204,20 @@ Historical receipts remain scoped to their named artifacts/revisions:
 - [connected Store batch cases](remediation/2026-10-13/CONNECTED-STORE-BATCH-VERIFICATION.json);
 - [Antigravity EOF settlement](remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
 
-They do not qualify the planned protocol, TaskPacket, queue, correction flow, MCP or
-external-effect simplification, passive observation, executor deletion or installed
-fleet.
+They do not qualify the planned protocol, TaskPacket, queue, correction flow, MCP,
+Claude simplification, passive observation, executor deletion or installed fleet.
 
 ## Remaining audit tracks before a complete current-head claim
 
-1. Complete per-adapter state-machine audit for current Claude, Codex, Command ACP,
-   Muse, OpenCode and Antigravity and select executor retirements.
+1. Complete state-machine audits for Codex, Command ACP, Muse and OpenCode, then
+   select executor retirements. Claude is now source-audited but still needs live
+   qualification after implementation.
 2. Finish GitHub/mailbox/gateway effect tracing and execute the public method → role →
    exact object → Store/effect matrix.
 3. Execute migration/corruption/partial-upgrade cases against concrete retained DB
    states after the numeric migration slice is implemented.
-4. Measure IPC/Store fairness and writer occupancy after J0-J3; current source review
-   identifies the mechanisms but is not load qualification.
+4. Measure IPC/Store fairness and writer occupancy after J0-J3; source review identifies
+   the mechanisms but is not load qualification.
 5. Perform owner-machine qualification for native restart, Windows process-family
    custody, mixed-provider execution and scale. Open Issues #1, #3, #4, #5, #11,
    #140 and #159 remain evidence boundaries.
