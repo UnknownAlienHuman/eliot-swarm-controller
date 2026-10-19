@@ -15,13 +15,15 @@ evidence machinery are not measures of completion.
 
 ## Product boundary
 
-The compact core owns assignments, Operations, agent control, results, review,
-acceptance, selected helper schedules and local observation. Management is manual by
-default. Optional helpers invoke the same authorized actions as direct commands.
+The compact core owns Tasks, Attempts, Operations, assignment, agent control,
+workspace authority, results, review, acceptance, selected helper schedules and local
+observation. Management is manual by default. Optional helpers invoke the same
+authorized actions as direct commands.
 
 GitHub publication, hooks, scripts, remote access and diagnostics are integrations.
-Council rounds, generic ratification engines, automatic Issue-label publication and
-compatibility with abandoned internal experiments are not core requirements.
+Council rounds, generic ratification engines, automatic Issue-label publication,
+advisory contract bureaucracies and compatibility with abandoned internal
+experiments are not core requirements.
 
 ## One semantic language, thin adapters
 
@@ -47,6 +49,39 @@ and events. A shared provider connection is not duplicated per hosted session.
 Common adapter plumbing may own authenticated Eliot IPC and delivery of already
 formed Store records. It must not own provider state, native recovery policy, Task
 state or another scheduler.
+
+## Work admission, queue and lanes
+
+The queue is a read projection over current Tasks, Attempts, dependencies, workspace
+leases, routes, provider conditions and capacity. It is not another task database or
+append-only workflow. Ranking is deterministic and explainable; launch rechecks the
+current facts in one transaction.
+
+A **lane** is an operational view: one manager/project dispatch policy applied to an
+ordered set of routes and the current queue. It may be named in UI and reports, but it
+does not require a new durable entity, process, cursor, inbox or scheduler. Disabling
+a dispatch policy stops future admissions and does not cancel admitted work.
+
+One admission transaction selects the current Task revision, creates or reuses the
+current Attempt, reserves the workspace/write lease and creates the launch Operation.
+A blocked candidate remains a Task fact and is reconsidered from current state; Eliot
+does not copy it into a second pending-subject queue.
+
+## Workspace and write ownership
+
+A manager owns one worktree. The current Attempt owns one workspace lease and its
+repository-relative write paths. Overlapping active write paths in one project block
+another automatic launch. Read-only review needs no write lease.
+
+`TaskSpec.scope.initial_paths` is the source of intended writes;
+`forbidden_paths` remains a hard boundary. An empty write scope means the repository
+root, not “unknown but probably disjoint.” Path-prefix comparison uses path-segment
+boundaries. Symbols, interfaces, globs, proposal digests and document approvals do
+not create filesystem authority.
+
+The lease is acquired with launch and released by Attempt lifecycle. There is no
+separate propose/accept/override/expiry product for code scopes. To change ownership,
+the manager revises the Task/Attempt or releases the existing lease explicitly.
 
 ## Goals
 
@@ -103,7 +138,17 @@ liveness, native activity, connection health, Task completion, Git state, run us
 and account quota remain separate facts. Unknown is not converted to idle, dead,
 complete, available or zero.
 
-## State, trust and recovery
+## Process ownership and recovery
+
+Eliot controls only processes it can identify as its own by persisted owner record,
+binding/generation/boot and OS process-birth identity. PID, executable name and a
+recent timestamp are insufficient.
+
+At restart, a dead process clears its live record. A PID identity mismatch clears the
+record without killing the unrelated process. An uninspectable process remains
+unknown for later reconciliation. Only a positively matched Eliot-owned leftover may
+be terminated or recovered. Shared provider services are not killed merely because
+one hosted session or adapter disconnects.
 
 Store is the single durable authority for admitted work, rights and outcomes. Each
 external effect has one retry/readback owner. Commit related local state atomically;
@@ -113,10 +158,6 @@ Authenticate participants and protect credentials at access boundaries. Use stab
 IDs, revisions and native identities for relationships. Hashes are reserved for
 credentials, selected executable/package bytes and retained artifact content. They
 are not permissions, approvals, runtime health checks or compatibility systems.
-
-A restart reconstructs state from retained Operations and current local sources. An
-uncertain external action blocks conflicting work until readback or explicit
-disposition. It does not justify retaining every historical executor forever.
 
 ## Build the smallest complete slice
 
@@ -144,8 +185,9 @@ removed in the same change.
 
 ## Completion
 
-A manager can assign work, control the chosen harness, observe it locally, obtain
-complete output, request independent review, return corrections and accept the
-resulting candidate. Native and Eliot Goals work independently. Restart exposes known
-outcomes and unresolved work. Replaced paths are absent, and verification covers the
-changed boundary rather than recreating a second product around it.
+A manager can rank and assign work, reserve a non-overlapping workspace, control the
+chosen harness, observe it locally, obtain complete output, request independent
+review, return corrections and accept the resulting candidate. Native and Eliot
+Goals work independently. Restart exposes known outcomes and unresolved work.
+Replaced paths are absent, and verification covers the changed boundary rather than
+recreating a second product around it.
