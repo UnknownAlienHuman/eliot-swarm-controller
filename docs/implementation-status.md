@@ -2,124 +2,114 @@
 
 ## Current state
 
-**Overall: PARTIAL_PROGRESS.** `main` contains one completed runtime reduction and the
-current architecture/implementation preparation. Runtime source has not changed since
-commit `25a8e3b`; later commits through the source revision studied here,
-`4cfbbf84`, change documentation.
+**Overall: PARTIAL_PROGRESS.** `main` contains one completed runtime reduction and a
+source-backed refactoring specification. Runtime source is unchanged since
+`25a8e3b`; commits after it through the revision studied here,
+`9c6192a70382bb12a842f5b960cab904f95908a7`, change documentation.
 
-[Architecture](agent-operations/architecture.md) is the compact product manifesto.
+[Architecture](agent-operations/architecture.md) is the compact manifesto.
 [Implementation](agent-operations/implementation.md) is the only work order.
-[Source findings](agent-operations/refactoring.md) explain the current excess.
+[Findings](agent-operations/refactoring.md) explain existing excess.
 [Donor map](agent-operations/donor-map.md) records reusable mechanisms and limits.
 
-## Completed source change
+## Completed runtime change
 
-### CLI ownership reduction
-
-Commit `25a8e3b` removed the host's duplicate general application CLI and MCP
-launcher. Public `swarm` commands remain in `swarm-cli`; the host retains daemon,
-local administration and internal-worker entrypoints.
+Commit `25a8e3b` removed the host's duplicate general CLI and MCP launcher.
 
 - host `main.rs`: 1,949 → 743 physical lines;
 - net owned Rust reduction: 1,206 lines;
-- existing parser-test section retained.
+- public commands remain in `swarm-cli`;
+- daemon/admin/internal-worker entrypoints remain.
 
-This is the only runtime-code reduction in the current preparation series.
+No later documentation pass is counted as runtime reduction.
 
-## Current implementation order
+## Current executable order
 
-### Adapter route
+### A — Antigravity vertical slice
 
-1. **A0:** synchronize active Antigravity Rust selectors on v6.
-2. **A1:** make terminal outcome self-contained; remove observation ID/result copy and
-   `AntigravityDispatchSessionProof`.
-3. **A2:** add a minimal route-local durable Store-delivery spool; terminal/result
-   envelopes are immutable files, observation is one replaceable source checkpoint.
-4. **A3:** expose only real Antigravity semantic actions and simplify receipts.
-
-### Work admission and ownership
-
-5. **B0/B1:** keep one explainable current-state queue; a lane is an automation/route
-   policy view, not a new table/process.
-6. **B2:** replace cursor/pending/quarantine WorkDispatch with bounded
-   `dispatch_once` current-state admission.
-7. **C0/C1:** make the existing Attempt-bound workspace lease the only write
-   authority; delete advisory `code.scope.*` product and symbol/interface overlap.
-8. **D0/D1:** simplify module-owner launch identity and implement conservative exact
-   process reconciliation.
-
-Shared adapter bootstrap/delivery is extracted only after two current adapters delete
-their previous implementation in the same slice.
-
-## Confirmed structural gaps
-
-| Area | Current source condition | Target |
-| --- | --- | --- |
-| WorkDispatch | Tails Task observations into global/per-entry cursors, pending copies, rechecks, semantic slots, quarantine and duplicate launch settings. | Query ranked current Tasks and perform one atomic admission. Blocked Tasks remain Tasks. |
-| Lane | Operational policy is spread across automation entry, route, capacity, scripts and queue. | Named projection over existing facts; no new entity, process, cursor or scheduler. |
-| Write ownership | Advisory `code.scope` proposal/accept/override/index product does not enforce launch; workspace lease separately stores allowed paths and rejects conflicts. | One Task/Attempt-bound workspace/write lease using repository path prefixes. Delete `code.scope.*`. |
-| Process owner | Strong owner-first Job custody exists, but launch plan/resolver repeat artifact/version/build/protocol/full contract. | Keep exact process identity/security; remove duplicate runtime compatibility matrix. |
-| Common commands | String/vendor/internal methods leak into Store/capacity/descriptors. | Typed semantic adapter actions; internal lifecycle stays inside adapter. |
-| Module contract | Store/adapters exact-compare artifact versions, capabilities, config and command/event schema inventories. | One current protocol major and capability subset. |
-| Adapter bootstrap | Current adapters repeat env/owner/credential/hello/delivery code. | Small common readers in existing owners only after two consumers delete old code. |
-| Adapter journals | Command/Claude/OpenCode journals combine native recovery, Store delivery, retention and cleanup. | Native effect state stays adapter-specific; share only exact terminal Store delivery when proven twice. |
-| Antigravity | Terminal outcome depends on an observation ID/copy; dispatch needs refresh-generated proof. | Self-contained terminal outcome, ordinary state observation, minimal delivery spool. |
-| Quotas | Service/method/artifact allowlists and proof SHA; Muse Rust rejected. | Generic authenticated source/epoch/sequence/scope/condition snapshot. |
-| Passive observation | Joined local view is incomplete; binding-only inventory and stale connection/process facts remain. | Unbound inventory plus provider/OS/Git/GitHub facts readable without harness calls. |
-| Runtime duplication | Parallel OpenCode, Muse, Codex, Claude, Antigravity and Command profiles remain. | One current executor/format per retained runtime after finite disposition. |
-| Results/review | Missing-parent result association remains incomplete in standalone OpenCode; direct acceptance differs from automatic evidence gate. | One admitted-turn result window and one candidate-specific review/check gate. |
-| Store/automation | Most reads use writer; base SQL SHA gates open; automation transfer/schedulers duplicate ownership. | Bounded WAL reads, explicit migrations, stable automation ID and one scheduler. |
-| Product breadth | Concilium, integration ACK/ratification, automatic publication and large coordination surfaces remain. | Outside compact-core completion. |
-
-These are documented source findings, not completed repairs or measured performance
-improvements.
-
-## Runtime overview
-
-| Runtime | Current state relevant to refactoring |
+| Slice | Target |
 | --- | --- |
-| Antigravity | Rust descriptor/source v6 exists, active tooling still includes v5. Terminal result delivery can be lost before Store ACK. Node and Rust routes coexist. |
-| OpenCode | Built-in and standalone Rust paths coexist. Standalone adapter has durable inbox/history work but a very large combined journal and unresolved result association edges. |
-| Codex | Current Rust app-server executor exists; Python executor/SDK remains in repository/fixtures. Native Goal/live controls/account usage are not fully mapped through compact common actions. |
-| Muse | Node bridge remains example route; Rust adapter has exact-result evidence but its usage snapshot is rejected by Store artifact allowlist. One executor is not selected. |
-| Claude | Rust/SDK path and retained Node generations coexist. Bootstrap and a large journal repeat common and native responsibilities. |
-| Command | Batch and ACP implementations coexist with historical profile/version branches and the largest adapter journal. |
+| A0 | Make v6 the sole active new-work coordinate across source, descriptor, route, package, installer and qualification. |
+| A1 | Make terminal outcome self-contained; remove observation ID, duplicate result observation and dispatch proof packet. |
+| A2 | Persist exact terminal Store envelopes/result pages until ACK; observations use replaceable source checkpoints. Never replay native input. |
+| A3 | Retain only real semantic actions and remove placeholder handlers/receipt identity repetition. |
 
-## Old Swarm experience retained
+### B — queue, route and dispatch
 
-The old Claude scripts remain evidence, not a compatibility target. Current docs keep
-only useful behavior:
+| Slice | Target |
+| --- | --- |
+| B0 | One deterministic queue projection with `why_ranked`. |
+| B1 | Ordered explicit route aliases; lane is a view/configuration, not a stored workflow entity. |
+| B2 | Source-scoped provider usage/availability without Codex method/artifact proof matrices. |
+| B3 | Transactional root count/reservation; remove the per-operation capacity ledger. |
+| B4 | `dispatch_once` over current state; delete WorkDispatch cursors/pending copies/semantic slots. |
 
-- compact Task prompt;
-- explainable ranking;
-- route/provider/effort policy;
-- one worktree per manager and non-overlapping writes;
-- passive multi-source observation;
-- exact candidate evidence;
-- explicit unknown outcomes.
+### C — write ownership
 
-They do not justify file markers, daemons per lane, newest-log ownership, fixed-age
-restarts, automatic form answers or copied queue state.
+| Slice | Target |
+| --- | --- |
+| C0 | Repository-relative Task path prefixes define write scope. |
+| C1 | Workspace lease is the sole write authority; delete `code.scope.*`. |
+
+### D — process custody
+
+| Slice | Target |
+| --- | --- |
+| D0 | Minimal owner record: binding/boot, executable, credential ref, PID/birth and process group. |
+| D1 | Conservative restart reconciliation; kill only exact owned leftovers. |
+
+### E — scheduling
+
+| Slice | Target |
+| --- | --- |
+| E0 | One automation-entry schedule model; remove static ScheduleConfig registry. |
+| E1 | One in-process wake/timer admission loop over current Store state. |
+| E2 | Delete standalone automation scheduler service/process/credentials/page-admit protocol. |
+| E3 | Keep optional workers only for real external effects/custody. |
+
+Subsequent slices type the adapter protocol, consolidate one executor per harness,
+preserve the two Goal mechanisms, finish passive observation, unify result/review and
+remove optional product engines.
+
+## Confirmed source gaps
+
+| Area | Current source condition |
+| --- | --- |
+| Antigravity | Terminal result can be lost after native completion; outcome depends on a Store observation and proof packet; v5/v6 active selectors disagree. |
+| Adapter bus | String/vendor commands, artifact/schema profile ladders, repeated bootstrap/hello/delivery loops and proof-heavy receipts remain. |
+| Execution | Parallel OpenCode, Muse, Codex, Claude, Antigravity and Command generations remain. |
+| Queue | WorkDispatch copies Task facts into cursor/pending/semantic-slot state and can stall behind 128 blockers. |
+| Routes | Fallback policy is not a compact explicit ordered route list. |
+| Provider state | Shared DTOs are Codex-specific; transient facts can hold forever after retry/reset; source binding death creates sticky holds; Muse Rust source is rejected by allowlist. |
+| Capacity | A second `meta` ledger mirrors Operation phases and counts readback/control methods as capacity. |
+| Workspace | Advisory `code.scope.*` coexists with the actual workspace lease/write conflict gate. |
+| Scheduling | In-process scheduler, standalone automation scheduler and another automation loop overlap; eleven optional worker slots add lifecycle machinery. |
+| Observation | Unbound inventory/joined Governor view is incomplete; process metrics repeatedly hash executables. |
+| Results/review | OpenCode missing-parent association remains incomplete; direct and automatic acceptance do not share one candidate-specific evidence gate. |
+| Store | Most pure reads use the writer; base SQL text SHA gates open; automation identity depends on owner/name and transfer relocates journals. |
+| Product breadth | Concilium, integration ratification/ACK and automatic publication remain in source. |
+| Tooling | Qualification retains compiler/checkout/cache equality, artifact-specific validators and proof-packet checks. |
+
+These are findings and deletion targets, not completed runtime repairs.
 
 ## Runtime evidence retained
 
 Existing receipts remain scoped to their named artifacts/revisions:
 
-- Muse normalized result: `docs/remediation/2026-10-17/`;
-- connected Store cases: `docs/remediation/2026-10-13/`;
-- Antigravity settlement/readback: `docs/remediation/2026-10-10/` and
-  `docs/remediation/2026-10-12/`.
+- [Muse exact normalized result](remediation/2026-10-17/MUSE-NORMALIZED-RESULT-NATIVE-VERIFICATION.json);
+- [connected Store batch cases](remediation/2026-10-13/CONNECTED-STORE-BATCH-VERIFICATION.json);
+- [Antigravity EOF settlement](remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
 
-They do not qualify the planned compact adapter protocol, WorkDispatch deletion,
-write-lease migration, process reconciliation or all current installed routes.
+They do not qualify the planned compact protocol, every recovery path or installed
+fleet.
 
 ## Verification status
 
 The latest study changes documentation only. Runtime implementation starts with
-formatting and minimal affected warnings-denied Clippy/build checks, followed by the
-connected behavioral cases in
+formatting and minimal affected warnings-denied Clippy/build checks, then the
+connected cases in
 [implementation verification](agent-operations/implementation.md#verification).
 
-Do not interpret older broad CI/fixtures as qualification of planned source changes.
-Every completed slice updates this file with behavior, evidence and net owned Rust +
-JS + glue, separating tests.
+Do not treat older broad CI/fixtures as qualification of planned protocol, provider
+state, capacity deletion, scheduling consolidation or executor retirement. Record
+each landed source slice and net owned-code change here.

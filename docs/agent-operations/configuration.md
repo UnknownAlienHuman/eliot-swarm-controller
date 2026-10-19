@@ -1,604 +1,334 @@
-# Configuration — Automations Enabled by Their Manager
+# Configuration — Manager-Owned Automation and Route Policy
 
-**Current operator status:** See [Implementation Status](../implementation-status.md) for published revisions, gate results, and native qualification. This page owns the manager-facing configuration contract.
+This page owns the manager-facing target configuration. Current source still contains
+the v1 WorkDispatch cursors, duplicated launch bundle, transfer relocation and
+overlapping schedulers described in
+[findings](refactoring.md). [Implementation](implementation.md) owns their removal.
 
-[Architecture](architecture.md) owns purpose and principles; [Implementation](implementation.md) owns the source changes; [Delivery](delivery.md) owns work transitions. The [compact scope](architecture.md#product-boundary) selects which helpers remain: automatic publication and Issue-label projection are outside required core completion.
+## 1. One entry, one owner, no hidden global mode
 
-## 1. One control model
-
-**The manager works manually and enables individual automations that act on their behalf.** Each entry has one manager owner, scope, trigger/preset, selected actions/settings, revision and `enabled`. New entries default to false; an explicit manager request can create and enable one in the same call.
-
-No global mode, additional per-stage activation registry or Root approval is required for actions that manager already controls. Manual commands, observation, peer mail and requested one-shot watches remain available alongside automations. Fleet size, queue import, plugin discovery and model output do not enable entries.
-
-## 2. One editing interface
+A manager enables optional helpers that invoke the same authorized Store actions as
+manual commands. An entry has:
 
 ```text
-swarm.tools.search -> automation.config.get + runtime.catalog
-                  -> automation.config.preview (optional)
-                  -> automation.config.apply
+entry_id                 immutable internal identity
+automation_id            manager-facing name
+owner_manager_id
+project_id
+revision
+enabled
+trigger                   event | interval | cron
+selected typed actions/settings
 ```
 
-- `automation.config.get` returns scoped, paged entries, editable settings, revisions, effective owner, profiles and diagnostics; no secrets or global roster.
-- `automation.config.preview` is an effect-free validation/diff, useful for a bulk change. It is not mandatory approval or a second authority.
-- `automation.config.apply` atomically applies the explicitly requested changes, including `enabled`, using caller-owned request identity and expected entry revisions.
-- `automation.config.explain` shows why an entry/action is waiting or running, on whose behalf, its source cause, retained inputs and next useful action. It calls no model.
+New entries are disabled unless the creating request explicitly enables them. No
+Root approval, global workflow mode, lane daemon or second capability grant is
+created for an action the manager already controls.
 
-An invalid retained on-behalf link leaves the authorized entry explanation
-readable. Affected `linked_operations` or `linked_operation_history` collections
-are withheld with `truncated: true` and a `closed` marker containing
-`status: degraded`, `error_code: AUTOMATION_LINK_CORRUPT` and
-`category: automation_link_corrupt`. The held ScriptRun reason remains readable.
-An empty degraded collection is incomplete history. A missing link, invalid
-link identity, or corrupt/unsupported sealed link record closes only that
-diagnostic collection; it never supplies authority for an effect.
+Disabling an entry prevents future admissions. It does not cancel an admitted
+Operation, native turn, review, check or publication effect.
 
-The `affected_work[].work` projection returned by `automation.config.apply`
-uses the same closed representation. A link-integrity failure in this derived
-report does not roll back an otherwise valid disable or narrowing change.
-Manager authority, expected revisions, configuration validation and any
-include-existing action admission remain mandatory. Action execution still
-requires its valid retained links. SQLite, transaction and commit failures
-remain errors rather than successful applies with degraded diagnostics.
-
-The discarded `automation.control.*` proposal has no compatibility aliases. `runtime.profile.get/list/preview/apply` edits model/executor preferences; owned profile changes may be included in one configuration transaction without a separate call per field.
-
-### 2.1 Patch rules
-
-Use `expected_revision=0` only to create an absent entry. For an existing entry match the returned revision. The target has one immutable internal `entry_id`; `automation_id` is a manager-facing name and ownership is editable. Current owner-dependent keys are the [transfer replacement](implementation.md#automation-and-delivery), not a permanent identity rule.
-
-Automation IDs are case-sensitive. Names such as `audit_one`, `auditXone` and
-`Audit_one` remain distinct; an underscore is literal, not a search wildcard.
-The refactoring replaces current key-prefix lookup with an indexed entry query
-without changing that behavior.
-
-Known object fields are patched recursively; explicitly supplied arrays replace the whole array. Missing fields remain unchanged. `steps=[]` therefore removes all selected steps, while omitting `steps` does not. Missing `enabled` is false on creation and unchanged on update. Reject unknown fields, duplicates and null values except where the field schema explicitly permits null. Do not infer a toggle from a preset name.
-
-Only named entries are changed. Omitted entries are not removed or disabled. Bulk updates are bounded and all-or-nothing. Stale revisions return the current scoped values and a useful conflict; identical request retry returns its original receipt even after later changes. Apply validates the patch against those revisions. The target removes preview hashes as additional confirmation tokens. Current `store/automation.rs` still compares an optional supplied `preview_digest`; remove that field/comparison with its catalog consumers as described in [implementation](implementation.md#identity-and-hashes).
-
-A disable-only patch is a local operation. It must not depend on GitHub, model discovery, script validation or a healthy proposed replacement configuration. It returns the new revision and references to unstarted, in-flight and uncertain work. No external I/O occurs in its Store transaction.
-
-### 2.2 Enabling and current work
-
-A change may include `include_existing` alongside `patch`. It defaults false and is meaningful only when enabling an entry or adding executable steps/trigger coverage. With true, the manager requests evaluation of currently eligible work in that scope as well as future facts. It is not permission to replay historical deliveries.
-
-The apply transaction records the committed event cut for the newly enabled coverage. Unchanged steps keep their cursors. A bounded current-state evaluation covers selected waiting work at that cut; events after the cut are handled by the normal durable reader. Both paths share semantic action slots, so boundary races cannot lose or duplicate an audit.
-
-Turning an entry off and on, renaming it, changing a preferred model or importing the same template does not reset completed-action identity. Future-only re-enable does not silently release an old held backlog; those items require the explicit current-work choice or a manual command.
-
-## 3. Owner and current permissions
-
-The server derives `owner_manager_id` from the authenticated creating manager. A submitted owner, role or `run_as` string is not authority. Managers edit their own entries within their managed scope; executors/auditors may prepare proposals without enabling work on someone else's behalf.
-
-An actually appointed AI manager has the same configuration path regardless of how its session was launched. Profile titles and script role names do not appoint managers. Stable manager identity is separate from a native session and an ephemeral MCP connection.
-
-For recovery, `automation.config.get` and `automation.config.explain` accept an
-optional `owner_manager_id` read selector. Omission selects the authenticated
-manager. The designated current GM may inspect another manager's retained entries,
-cursors and linked history in the requested project. This read preserves the
-original owner and does not enable, copy, transfer or reset an entry. The GM
-profile permits `automation.config.get`, `automation.config.explain` and the
-explicit transfer below; `automation.config.preview` and
-`automation.config.apply` remain Manager-only. See
-[GM session continuity](../gm-session-continuity.md).
-
-### 3.1 Explicit transfer to the current GM
-
-Changing the designated GM does not silently change automation ownership. The
-current explicit call identifies one entry and its expected revision:
-
-```json
-{
-  "client_request_id": "transfer-submission-audit",
-  "project_id": "project-a",
-  "former_owner_manager_id": "GM-previous",
-  "automation_id": "submission-audit",
-  "expected_revision": 3
-}
-```
-
-The CLI is `swarm automation config transfer --file <json>`; the current GM or
-local Operator selects the current GM as destination. Ordinary configuration
-preview/apply remains under the Manager profile. Resolve an unknown response by
-reading the existing Operation rather than creating another transfer.
-
-**Refactoring target:** one immutable internal entry ID, with mutable owner and
-revision. Transfer updates that row atomically after current authorization/CAS.
-All state and occurrence rows retain the entry ID; no disabled former-owner copy,
-relocated journals, successor pointers or ancestry walk is required. Prior
-Operations keep their admitting actor/input. Pending new effects check current
-rights; late review/results remain tied to their original assignment/candidate.
-
-**Current source gap:** `automation_transfer::apply` still clones the entry and
-moves six state families plus cron. The retained target check prevents returning
-A→B→A for the same entry. Replace that mechanism during the
-[relational conversion](implementation.md#store-and-current-data), without
-changing the identity of already consumed occurrences or replaying native input.
-
-Effective automatic authority is:
+## 2. Public editing surface
 
 ```text
-manager's current action/object rights
-  intersect configured actions and targets
-  intersect host, project, candidate and resource policy
+automation.config.get
+automation.config.preview       optional read-only validation/diff
+automation.config.apply
+automation.config.explain
+automation.config.transfer
 ```
 
-Existing applicable grants are evaluated internally. Do not require a new automation-grant object for a capability the manager already has. Conversely, an enabled flag cannot make a forbidden publication or another manager's work available. The technical service never falls back to a GM credential.
+- `get` returns scoped entries, revision and current blockers.
+- `preview` is optional and grants nothing.
+- `apply` performs one bounded expected-revision transaction.
+- `explain` reads current facts and calls no model/provider.
+- `transfer` changes owner/revision of the same internal entry after current
+  authorization; it does not clone the entry or move journals.
 
-Record the manager, technical requester/executor, automation/revision and exact trigger/work references. Audit verdicts remain the assigned auditor's evidence, not the handoff sponsor's. GitHub retains its actual authenticated App/user identity.
+Patch rules:
 
-## 4. Example: automatic audit assignment only
+- `expected_revision=0` creates an absent entry;
+- existing entries require their current revision;
+- omitted fields remain unchanged;
+- supplied arrays replace the complete array;
+- unknown fields reject;
+- identical request retry returns the original Operation;
+- disable-only changes require no external I/O;
+- bulk changes are bounded and atomic.
 
-This manager already has review-assignment rights. One request enables that helper and includes currently waiting submissions in the project scope:
+Remove caller-supplied preview digests. Expected entry revision and current object
+state provide concurrency control.
+
+## 3. Trigger model
+
+A retained helper uses one trigger:
+
+```text
+event {
+  source_id
+  event_kind
+  optional status/filter from a closed typed vocabulary
+}
+
+interval {
+  anchor_ms
+  period_ms
+}
+
+cron {
+  expression
+  timezone
+  catch_up = latest_only
+}
+```
+
+A trigger admits an occurrence; it does not execute external work. Store retains
+occurrence identity and the resulting Operation. Replaying one occurrence returns
+the same Operation.
+
+Use one in-process timer/admission loop. Do not create one task/process/credential or
+cursor family per entry. A Store change notification wakes evaluation; the nearest
+due time drives the timer; a slow safety wake recovers a lost notification.
+
+## 4. Typed actions only
+
+Retained entries select closed product actions, not arbitrary Store method names or
+JSON workflows:
+
+```text
+work_dispatch
+review_dispatch
+review_disposition
+repair_dispatch
+acceptance
+check_run
+goal_message
+script_run
+explicit publication (optional integration)
+```
+
+Automatic Issue-label projection, Concilium and generic ratification are outside the
+compact core.
+
+Each action consumes current Store facts. It does not maintain a private copy of the
+Task/candidate/provider lifecycle.
+
+## 5. Work dispatch and route policy
+
+### Target shape
 
 ```json
 {
-  "client_request_id": "enable-my-submission-audit",
-  "project_id": "project-a",
-  "changes": [
-    {
-      "automation_id": "submission-audit",
-      "expected_revision": 0,
-      "include_existing": true,
-      "patch": {
-        "enabled": true,
-        "preset": "reviewed_delivery",
-        "scope": {"work_pool_id": null},
-        "steps": ["review_dispatch"],
-        "review": {"profile": "auditor", "required_reviewers": 1}
-      }
+  "automation_id": "implementation-dispatch",
+  "expected_revision": 0,
+  "patch": {
+    "enabled": true,
+    "trigger": {"kind": "event", "source_id": "controller", "event_kind": "task.changed"},
+    "actions": ["work_dispatch"],
+    "work_dispatch": {
+      "routes": ["codex-primary", "muse-fallback"],
+      "agent_profile": "implementation"
     }
-  ]
+  }
 }
 ```
 
-Only applied immutable submissions qualify. This `review_dispatch`-only example leaves queue launch, return, repair and acceptance manual; other effects require their explicit automation step and guards. Publication also requires the manager to explicitly select and configure the Publication step below. No extra global switch, Root decision or grant-creation round follows.
+The ordered aliases are explicit manager policy. Each route alias in host
+configuration owns its exact:
 
-To prevent future automatic audits:
+- harness/runtime;
+- native service/account/model/effort/options;
+- adapter artifact/current protocol;
+- root capacity;
+- credential reference.
 
-```json
-{
-  "client_request_id": "disable-my-submission-audit",
-  "project_id": "project-a",
-  "changes": [
-    {
-      "automation_id": "submission-audit",
-      "expected_revision": 1,
-      "patch": {"enabled": false}
-    }
-  ]
-}
-```
+WorkDispatch does not duplicate MCP profile/surface, workspace policy, purpose,
+budget and stop conditions. Participant tool profile derives from admitted role.
+Workspace policy is the single manager-owned worktree policy. Task/host policy owns
+requirements and bounds.
 
-The revision assumes no intervening edit; real calls use the current returned value. Running audits can finish and report. `review.assign` remains available manually.
+Automatic dispatch chooses the first currently eligible alias and writes that alias
+into the launch Operation. It never silently substitutes a provider/model/effort or
+changes permissions. Manual launch names exactly one alias.
 
-### 4.1 WorkDispatch: explicit manager-authorized launch settings
+A lane is a UI/Governor view over this entry, its route list, current queue,
+provider/capacity state and active bindings/workspaces. There is no lane table or
+daemon.
 
-The typed `work_dispatch` object is a complete launch-settings bundle, not a route-only switch. Replace the illustrative route/profile/surface names below with values from the manager's current `runtime.catalog`. Use `automation.config.preview` to check the patch and revision effects; each exact Task goes through the canonical launcher preview and checks route, workspace, and capacity readiness (never blocking `task.dispatch` on an `awaiting_native_mcp` callback).
+### Route configuration
 
-The authenticated current Manager enables one entry for one project. The server derives `owner_manager_id` from that Manager; do not submit an owner, role or `run_as`. Admission and pending-work rechecks require that owner to remain a registered, enabled Manager and recheck the current entry. The technical actor does not fall back to GM authority.
-
-```json
-{
-  "client_request_id": "enable-manager-work-dispatch",
-  "project_id": "project-a",
-  "changes": [
-    {
-      "automation_id": "manager-work-dispatch",
-      "expected_revision": 0,
-      "include_existing": false,
-      "patch": {
-        "enabled": true,
-        "scope": {"work_pool_id": null},
-        "steps": ["work_dispatch"],
-        "work_dispatch": {
-          "route": "route-from-runtime-catalog",
-          "agent_profile": "agent-profile-from-runtime-catalog",
-          "mcp_profile": "work-participant",
-          "mcp_surface": "participant-core",
-          "workspace_policy": "manager_owned_worktree",
-          "requested_model": null,
-          "requested_effort": null,
-          "budget": {
-            "max_turns": null,
-            "max_duration_ms": null,
-            "max_cost_units": null
-          },
-          "stop_conditions": [],
-          "purpose": "implementation"
-        }
-      }
-    }
-  ]
-}
-```
-
-`expected_revision: 0` creates a new entry; existing entries use the latest revision returned by `automation.config.get`. `include_existing: false` is the future-only choice. `scope` currently accepts only `work_pool_id`; a non-null pool has no committed membership reader and returns a visible scope gap rather than widening access. Keep it `null` for the current project-wide Task reader. The settings object validates known fields and requires `route`, `agent_profile`, `mcp_profile`, `mcp_surface`, `workspace_policy`, nullable `requested_model`/`requested_effort`, all three nullable budget fields, `stop_conditions` (at most 16 strings), and `purpose`. No route, profile, workspace policy, model, effort, budget, or stop-condition default is inferred. `workspace_policy` currently uses `manager_owned_worktree`. `null` budget values mean no requested numeric cap for that field; choose bounds required by the manager's policy instead of treating null as a safe default.
-
-The `work_dispatch` path reads committed local controller Task facts (`task.create`, `task.revise`, `task.claim`) and checks the exact current Task revision/Attempt before normal launch preview and manager-authorized admission. It does not consume GitHub/webhook events directly. At activation, Store records the current observation high-water as `activation_cut`. With `include_existing: false`, the durable per-entry cursor starts at that cut and processes later facts only. With `true`, it performs bounded catch-up only through the captured cut, then follows new facts; it does not replay arbitrary remote deliveries. Cursor, pending readiness state, semantic launch-slot reservation and admitted Operation are committed atomically through the Store path.
-
-The `automation.config.explain` `work_dispatch` projection contains: `cursor`, `activation_cut`, optional `catch_up_until`, retained `pending` subjects with readiness reason/wake conditions, and a bounded `recent` window. Pending readiness is distinct from a source-integrity `gap`; gaps are surfaced in recent dispositions and are not silently treated as empty success. The cursor and source observations remain durable, while the recent diagnostic window is bounded. Unavailable manager authority remains a pending reason; it does not switch to another owner.
-
-Manual and automatic launch admission share the manager-scoped immutable semantic slot for the exact Task revision/Attempt and launch parameters. The `swarm.launch` semantic-reuse acknowledgment is immutable and does not copy mutable progress or result data. Its receipt shape is:
-
-```json
-{
-  "operation_id": "<operation-id>",
-  "operation_state_at_receipt": "queued",
-  "receipt_recorded_at_ms": 0,
-  "current_state_read_method": "operation.get",
-  "semantic_reuse": true
-}
-```
-
-Treat `operation_state_at_receipt` as a historical acknowledgment field. Read current progress/result using `operation.get` with `operation_id`; the WorkDispatch recent entry carries the admitted Operation ID and semantic slot ID. In the example, timestamp `0` is a numeric placeholder; the server supplies the actual receipt time. Current progress and result come from live `operation.get`, not the immutable receipt snapshot.
-
-### 4.2 Publication: explicit accepted-candidate target
-
-Publication settings are optional. The project must also have an enabled local
-Forge mapping for the same project and target. Omitting `publication` when
-creating an entry leaves it unset; `publication: null` explicitly clears it.
-If `publication` is selected without settings, the entry reports
-`publication_settings_required` and reserves no Forge Operation.
-
-The manager supplies one exact target and one expected remote state. Set
-`expected_create: true` with `expected_old_ref: null` only for an explicit
-branch create. For an update, set `expected_create: false` and provide the full
-expected old object ID. The two forms are mutually exclusive:
-
-```json
-{
-  "client_request_id": "enable-accepted-candidate-publication",
-  "project_id": "project-a",
-  "changes": [
-    {
-      "automation_id": "publish-reviewed-candidate",
-      "expected_revision": 0,
-      "include_existing": false,
-      "patch": {
-        "enabled": true,
-        "scope": {"work_pool_id": null},
-        "steps": ["publication"],
-        "publication": {
-          "target_ref": "refs/heads/release",
-          "expected_old_ref": null,
-          "expected_create": true
-        }
-      }
-    }
-  ]
-}
-```
-
-`include_existing: false` starts at the activation cut and considers later
-acceptance facts. Setting it to `true` requests bounded catch-up only through
-the captured cut; it does not replay arbitrary remote history. An eligible
-accepted candidate reserves the normal immutable `forge.publish_ref` action
-under the current manager and GM epoch. Operation admission is separate from
-Git effect execution; this example makes no live publication qualification
-claim.
-
-## 5. Preset steps and prerequisites
-
-`steps` selects actions, not an executable array order. Each action has a typed trigger and committed prerequisites:
-
-| Step | Required fact before eligibility |
-|---|---|
-| `work_dispatch` | A committed local Task fact identifies a current ready Task revision/Attempt; current Manager, workspace and capacity admission are available. |
-| `review_dispatch` | Applied retained submission exists and its required review slot is unfilled. |
-| `review_disposition` | Assigned actionable findings apply to that exact current submission. |
-| `repair_dispatch` | Guarded feedback was applied and its current owner/continuation can receive the correction. |
-| `acceptance` | Exact candidate satisfies the configured audit and acceptance policy. |
-| `publication` | Exact acceptance exists and the selected target/effect is permitted. |
-| `github_projection` | The corresponding audit/acceptance/publication fact exists; only named projections are written. |
-
-Missing steps are manual. Manual completion of a prerequisite can make an enabled later step eligible; it does not need an earlier step to have been automated. Selecting publication alone cannot manufacture acceptance. Remote-review upload, Issue closure and cleanup remain explicitly configured action choices, not implied publication side effects.
-
-A preset may contain several steps in one enabled entry. Cron and event rules use the same owner/enabled model with registered typed actions; the planned Eliot Goal message plugin uses that model too. Native Harness Goal is controlled separately through `agent.goal`; it needs no automation entry.
-
-Multiple entries may observe the same scope. Equivalent requests share a semantic slot; incompatible auditor/profile/target choices return a specific conflict and the existing reservation. They do not create duplicate work or block unrelated Tasks. The first committed valid reservation is retained; a settings edit is not permission to displace it.
-
-## 6. Settings edits and already admitted work
-
-A saved Operation's original request and effective inputs are immutable. State the boundary explicitly:
-
-| Change | Effect |
-|---|---|
-| Description/display metadata | Changes presentation, not execution identity or cursors. |
-| Preferred model, route, script content or budget | New admissions resolve the new values. Previously admitted work retains its recorded values. |
-| Removed step, narrowed target or `enabled=false` | An unstarted action outside the new allowed set is held; later steps cannot start. |
-| Added step/trigger coverage | Establishes its activation cut; current work is included only when requested. |
-| Changed calendar | Future due selection follows the new calendar; retained occurrences/runs are not reinterpreted. |
-
-Before effect start, recheck the current manager rights and whether the already resolved action is still allowed by the current entry. A changed display revision alone must not stop valid work. Never apply old parameters under a newly substituted target/model without recording a new admission.
-
-To replace a provably unstarted admission, use the ordinary action's explicit replacement/takeover path and the same semantic slot. Keep both receipts. Sending/uncertain work needs readback first. Do not surprise the manager with a running-model swap or silently discard a valid queued assignment after a harmless profile edit.
-
-## 7. Files and defaults
-
-A complete manually operated project may have profiles and no automations:
+A route keeps the current small admission field:
 
 ```toml
-schema = "eliot-agent-operations"
-project = "project-a"
-automations = []
+[[routes]]
+alias = "codex-primary"
+runtime = "module"
+module_artifact_id = "current-codex-adapter"
+enabled = true
 
-[profiles.writer]
-role = "executor"
-when_to_use = "Implement the manager's assigned non-overlapping change."
-apply_changes = "next_assignment"
-fallback_on = []
-
-[[profiles.writer.candidates]]
-route = "writer-primary"
-model = "MODEL_FROM_WRITER_CATALOG"
-
-[profiles.writer.candidates.native_options]
-effort = "EFFORT_FROM_WRITER_CATALOG"
+[routes.admission_policy]
+max_concurrent_roots = 4
 ```
 
-Placeholders must resolve to actual supported values. Runtime profiles are preferences, not security roles.
+Do not add a second capacity object for every command. Route root capacity is checked
+transactionally against unresolved root opens and unreleased bindings.
 
-Store owns active entries; TOML/JSON is import/export. File-managed imports are not implemented in the first slice. Before enabling them, a future authenticated source registration must bind the canonical path, effective ACL and reparse-point proof to the manager; imported edits must use revision/owner-epoch compare-and-swap through the same apply path. A file merely found in a writer checkout is not authorization, and failure never falls back to Root.
+Provider availability is observed, not configured as truth. Explicit fallback aliases
+handle hard provider/model failures.
 
-MCP and file editing share one revision authority. A stale file cannot reverse a newer MCP disable. Invalid/partial saves keep the last valid values and show field errors. Watch parent-directory replacements and reconcile missed events in Rust. Imports create disabled entries unless the manager explicitly enables the named entries; a restore/import is not ordinary crash recovery of the same Store.
+## 6. Route decision
 
-## 8. Restart, disable and ownership
+Automatic selection uses:
 
-Saved enabled/disabled choices survive ordinary host restart and manager-client disconnect. Reconcile unresolved effects, current owner rights and target identity before proceeding. No compulsory re-enable ceremony, implicit fallback owner or history replay.
+1. route enabled/current configuration;
+2. required adapter capability;
+3. workspace/write availability;
+4. current root limit;
+5. provider availability observation.
 
-Disable stops new starts and separate follow-ups, not running agents, native Goals or remote writes. Manual tools keep working and share the same reservations. Results/readback from already started work remain recordable; revocation never justifies forging new output or losing observed effect evidence.
+Decision behavior:
 
-Revoked/deleted ownership blocks new affected actions. Restored rights can make a still-enabled entry eligible; explicitly disabled entries stay disabled. [Explicit ownership transfer](#31-explicit-transfer-to-the-current-gm) updates the same logical entry and preserves admitted actors/occurrences. Editing, session silence, queue balancing and `gm.handover` do not transfer entries implicitly. Resolve unknown outcomes through the existing Operation.
+| State | Result |
+| --- | --- |
+| no provider fact ever | one root-capacity-bounded probe may start |
+| available | eligible |
+| rate-limited/overloaded before retry | held |
+| quota exhausted before reset | held |
+| transient fact after retry/reset | one probe may start; timestamp is not recovery proof |
+| auth/data-policy/model gone | unavailable; use explicit fallback/config change |
+| fresh unknown or stale/gapped source | automatic hold; explicit manager probe allowed |
 
-### Module disconnect behavior
+The admitted probe itself is the in-flight guard. Do not create a probe table.
 
-A disconnect atomically marks in-flight `sending`/`native_accepted`
-Operations on the exact binding generation `outcome_unknown` and record the
-binding as disconnected, reusing the existing durable unknown-Operation event.
-The current authorized manager receives bounded Operation readback. If an
-unresolved `agent.open` has no native root, only exact `agent.reconcile`
-readback for that Operation, generation, and supported route is allowed at
-admission and dispatch. Never replay the original input or infer verified owner
-departure from disconnect; the existing verified-departure path remains
-separate. This is core behavior and requires no configuration switch.
+## 7. Current-state dispatch
 
+Enabling dispatch optionally asks for one immediate current-state evaluation.
+There is no `include_existing` event backlog, activation cut or copied pending list in
+the target.
 
-## 9. Dynamic runtime preferences
+```text
+enable/apply
+  -> dispatch_once(entry)
+  -> current ranked queue
+  -> first eligible Task and configured route
+  -> one launch Operation
+```
 
-`runtime.catalog` returns scoped installed/configured routes, actual model IDs/aliases, native options, capability evidence, trust, account-capacity grouping and freshness. Keep role, route, provider/billing, native options, MCP surface and OS identity separate.
+Future relevant Store changes wake another current-state query. A safety wake handles
+lost/coalesced notifications.
 
-Ordered candidates are complete route/model/options tuples. Do not equate effort labels across harnesses. Record requested/effective values and the reason for selection. Unknown capability or quota remains a gap, not a made-up supported value.
+Delete current WorkDispatch state:
 
-New admissions use current authorized preferences. Running jobs are not silently migrated. Compatible CLI/library updates require protocol/capability support, not equality to a fixed release. No runtime installer, callback-time download, automatic downgrade or prescribed old version.
+- global and per-entry cursors;
+- `activation_cut`, `catch_up_until`, `pending`, `recent`;
+- pending recheck rotation and 128-item cap;
+- semantic launch slots and duplicate operation links;
+- duplicated launch settings;
+- quarantine for ordinary blockers.
 
-Fallback is opt-in by cause and candidate. Unknown delivery, authentication failure or absent mandatory protection is not permission to try another provider. Routes sharing an account share its real capacity/budget; duplicate aliases do not create quota. A manager can select a permitted route for one manual launch without enabling automation.
+`automation.config.explain` reads live queue/route/workspace/provider facts and reports
+why no admission occurred.
 
-## 10. Scripts, Goal and MCP
+## 8. Goal message
 
-Script activation selects future runnable content. An authorized `script.run`
-is one invocation. The manager can configure a script action on **any system
-event**, including submissions, hooks, answers, messages, completion, errors
-and detected interruption, as well as a calendar occurrence. These examples
-are not a trigger whitelist. Event rules select exact source and kind with
-optional supported status filtering; a future configured kind waits for an
-authorized occurrence instead of requiring a new per-kind execution engine.
+Harness Goal is configured through the selected adapter and is not an automation
+entry.
 
-All triggers use the same durable event reader, enabled entry, action admission
-and script runner. Captured bundles/environment preserve admitted-run meaning;
-an invocation gets only declared API effects, not manager credentials or the
-right to enable more automations. Explicitly empty script rules disable those
-automatic invocations while direct authorized runs remain available.
+The Eliot Goal helper is an ordinary message action:
 
-An event need not have a Task or Attempt. Pass real scope when one exists;
-never fabricate a Task to run a hook or handle a host interruption. Task-owner
-effects require an actual authorized Task/Attempt. Event inputs are bounded
-authorized metadata and references, not raw message bodies, native results or
-secrets. A detected interruption with unknown cause must not be reported as a
-verified crash. Pending exact occurrences survive restart and explicit entry
-transfer; starting them rechecks the current owner, settings, script and scope.
-See [Implementation Status](../implementation-status.md) for the delivered
-subset; this paragraph specifies the complete configuration requirement.
-
-### Generic system-event ScriptRun
-
-The manager configures exact `source_id` and `event_kind`, with an optional
-normalized status. The selector reads metadata rather than arbitrary payload
-fields. Provider/harness adapters translate native facts into this common
-event contract; cursor management, action admission and execution belong to
-the shared transactional kernel.
-
-For example, this automation patch selects committed message sends:
-
-~~~json
+```json
 {
-  "enabled": true,
-  "steps": ["script_run"],
-  "script_run": {"script_id": "on_message_sent"},
-  "event_rules": [
-    {
-      "source_id": "controller:messages",
-      "event_kind": "message.sent",
-      "status": "sent",
-      "action": "script_run"
-    }
-  ]
+  "actions": ["goal_message"],
+  "trigger": {"kind": "interval", "anchor_ms": 0, "period_ms": 900000},
+  "goal_message": {
+    "task_id": "task-id",
+    "text": "Continue the assigned goal and report blockers."
+  }
 }
-~~~
+```
 
-Pass the patch through `automation.config.preview` and
-`automation.config.apply` for the selected project and entry. The script must
-have an active immutable revision owned by the authorized manager. Rules
-match only an authorized retained occurrence. A future source/kind can be
-configured before its adapter is available; a status filter waits for that
-adapter's supported safe projection. Raw and normalized views of the same
-phase/occurrence produce one invocation.
+It admits an ordinary `agent.send` Operation. A later occurrence may intentionally
+repeat the text. Disabling this helper does not pause native Harness Goal.
 
-The current normalized producers include message sends/replies, coordination
-answers, observed native terminal outcomes/result pages, host interruption,
-and Operation terminal facts. Additive SQLite migration `010` installs
-`AFTER INSERT` and `AFTER UPDATE OF state` triggers: every Operation first
-persisted or transitioned as `rejected` or `outcome_unknown` creates one
-bounded `controller:operations` fact in the same transaction, regardless of
-which action or provider wrote it. Its stable occurrence identifies the
-Operation and phase. The closed projection contains only the phase, status and
-fixed error category; it never copies request/result bodies, arbitrary error
-text or credentials. The migration does not backfill historical Operations.
+## 9. Review, repair, checks and acceptance
 
-Migration `011` applies the same rule to new cancellations. Select
-`controller:operations` / `operation.cancelled` with optional status
-`cancelled` to react to the target Operation's committed cancellation. The
-event identifies the target rather than the cancellation request and supports
-taskless actions. Historical cancellations are not added at installation;
-repeated readback and the same request do not create a second occurrence.
+- `review_dispatch` selects one current submission/candidate and one configured
+  reviewer profile.
+- `review_disposition` and `repair_dispatch` consume all retained actionable findings
+  for that candidate; do not create one manager round per finding.
+- `check_run` names an exact candidate and current check profile revision.
+- `acceptance` invokes the same candidate-specific Store gate used manually.
 
-Provider adapters may expose a safe alias of the same fact. In particular,
-only an exact raw `runtime.outcome` of `unknown` aliases the corresponding
-`operation.outcome_unknown` phase and occurrence; it is never labeled as a
-completed native operation. Applied and rejected native outcomes retain their
-existing terminal aliases, and accepted or invalid raw outcomes add no
-terminal projection. A validated accepted acknowledgement has the distinct
-`native_input_accepted` phase and no normalized status: a rule without a status
-filter can select it, while a `completed` filter cannot. Private receipt details
-are not selector data, and their size does not impose a separate event filter.
-Exact phase/occurrence identity coalesces duplicate views.
+The helper does not manufacture review proof. Candidate B requires B's own retained
+review/check evidence.
 
-The `controller:scripts` adapter projects `script.completed`, `script.failed`
-and `script.incomplete` from the exact retained ScriptRun, Operation and result.
-Status describes the ScriptRun result, including callbacks carried under
-`script.completed`; it does not complete the associated Task.
+## 10. Script actions
 
-The `controller:host-lifecycle` adapter projects a graceful `host.exit` as
-completed host lifecycle and a failed exit as failed lifecycle. `host.failed`
-and the corresponding raw `host.exit` share `host_terminal_exit_observed` and
-the `host-terminal-exit:<epoch>` occurrence, so selecting both invokes the
-script once. Failure metadata contains a closed `failure_category` and, when
-known, the fixed `failed_supervisor` name. A later detected interruption remains
-a separate `host_interruption_observed` occurrence. Host lifecycle events are
-taskless and do not establish Task completion.
+A script revision receives only explicitly configured closed grants. It may invoke
+typed manager actions already allowed to its owner. It cannot name arbitrary Store
+methods, change its owner, acquire GM authority or create a workflow language.
 
-### Native MCP failure selector
+If a recurring behavior is small and common—dispatch, Goal message, review, repair,
+check or acceptance—prefer the built-in typed action over a script.
 
-Native-MCP readback failures use the ordinary generic ScriptRun source
-and kind `controller:native-mcp` / `native.mcp.failure`. Omit `status` to select
-both normalized `failed` and `unknown` facts. Set `status` to `failed` or
-`unknown` to select only that normalized state; these values describe the
-failure observation, not Task completion. For example, this enabled entry
-selects either kind of native-MCP readback failure through the common
-`script_run` action:
+## 11. Ownership transfer
 
-~~~json
-{
-  "enabled": true,
-  "steps": ["script_run"],
-  "script_run": {"script_id": "on_native_mcp_failure"},
-  "event_rules": [
-    {
-      "source_id": "controller:native-mcp",
-      "event_kind": "native.mcp.failure",
-      "action": "script_run"
-    }
-  ]
-}
-~~~
+Target transfer:
 
-To narrow that selector, add `"status": "failed"` or `"status": "unknown"`.
-The event's safe projection contains the normalized status, bounded error code,
-closed failure category, fixed supervisor name, and occurrence identity. It does
-not forward native response text, credentials, artifact paths, or other private
-readback details. Review those diagnostics through the existing current-rights
-`operation.get` read. This is an ordinary generic event/action route: it adds no
-provider-specific runner or service. A launch event may be taskless; when Task
-scope exists, the usual exact Task/Attempt checks still apply, and the event
-never completes a Task.
+```text
+UPDATE automation_entry
+SET owner_manager_id = current_GM,
+    revision = revision + 1
+WHERE entry_id = ? AND revision = ?
+```
 
-### HookSource administration selectors
+State and occurrences reference `entry_id` and do not move. Prior Operations keep
+their admitting actor and input. Pending future effects recheck current owner rights.
 
-Use `controller:hook-source` with `hook.source.setup` or `hook.source.revoke`
-and the ordinary `script_run` action. Omitting `status` selects either kind;
-setup projects `applied`, while revocation projects `invalidated`. For example:
+Delete:
 
-~~~json
-{
-  "enabled": true,
-  "steps": ["script_run"],
-  "script_run": {"script_id": "on_hook_source_change"},
-  "event_rules": [
-    {"source_id": "controller:hook-source", "event_kind": "hook.source.setup", "action": "script_run"},
-    {"source_id": "controller:hook-source", "event_kind": "hook.source.revoke", "action": "script_run"}
-  ]
-}
-~~~
+- disabled former-owner copies;
+- successor pointers and ancestry walks;
+- six journal relocators and cron relocation;
+- A→B→A conflict caused by owner-dependent keys.
 
-Both committed facts may be drained after revocation. The retained source and
-disabled client must still agree, and current Manager/GM and project checks
-still govern admission. Safe input contains the occurrence identity and status;
-repository, actor, credentials and raw payload are withheld. Revoked source
-credentials remain disabled. Rules for new events may activate without
-`include_existing`; enabling historical catch-up first drains its fixed cut
-before advancing to later events.
+## 12. Storage
 
-The normalized `controller:messages` lifecycle facts feed event selection;
-they do not create a second addressed mailbox delivery in `report.delta` or
-`message.read`. Operation-linked observations are filtered by the existing
-Operation ACL in SQL before pagination and their exact Operation links are
-revalidated after paging. A selected rule receives only its authorized safe
-metadata. Detailed diagnostics remain available through ordinary current-rights
-Operation reads, not as a broadcast event payload. A retained script error or
-hold can be inspected through `automation.config.explain` when its bounded
-existing journal is present; that same-owner/current-GM read returns `null`
-when absent and does not create a journal or advance a cursor. See
-[Implementation Status](../implementation-status.md) for the current
-qualification result.
+Use indexed tables for:
 
-An integrity failure in one retained script revision holds only that entry.
-Its bounded history includes the captured revision and error category, while
-healthy entries continue. The same revision remains held across reconciliation
-and restart; a valid newly active revision permits ordinary revalidation.
-Underlying Store and I/O failures are still reported as supervisor errors.
+- entry identity/owner/project/revision/enabled;
+- trigger and next due/last occurrence;
+- action selection;
+- occurrence → admitted Operation;
+- current error/gap where needed.
 
-Goal tracking does not directly submit model input. The target Eliot Goal plugin uses one enabled manager entry for selected event/cadence messages. It may coexist with native Harness Goal, which the Governor uses by default where supported. Disabling the entry stops future plugin messages and leaves the native Goal alone. The current progression is terminal-event-only; recurring message settings remain [implementation work](implementation.md#harness-goals-and-the-eliot-goal-plugin). Requested one-shot watches remain available independently; their notices are not model inputs.
+Bounded action settings may remain versioned JSON in the entry row. Do not use EAV,
+key-prefix scans or a table per field. One explicit migration replaces the current
+`automation:v1:*` meta families, then old codecs/readers are removed.
 
-Keep #22's small eager cores. Config get/preview/apply/explain/transfer and detailed runtime, hook, script, schedule, Goal, review and forge methods are deferred groups. Schedule/rule/Eliot-plugin editors update the same entry and enabled flag; native Goal controls retain their session scope. Before exposing a new method, wire its real application handler and result reader.
+## 13. Explainability
 
-For review, the normal assigned-auditor result tool is `review.submit`; `task.request_changes` remains the guarded manager disposition. The target permits scoped Manager feedback through current caller/assignment/action checks. The current document-edition gate is a [removal candidate](refactoring.md#code-reduction-candidates); convert actually needed unfinished work explicitly instead of keeping v1/v2 business rules forever. Tool schemas do not grant rights. `automation.config.explain` and manual review/context reads must find on-behalf Operations through their owner linkage even though the service is their technical requester.
+Every automatic admission records:
 
-## 11. OpenCode external attach and retained service ownership
+- entry ID/revision and effective manager;
+- trigger occurrence/current-state cause;
+- Task/Attempt/candidate;
+- selected route;
+- resulting Operation;
+- current blocker when no Operation is admitted.
 
-### 11.1 Existing native OpenCode service (`external_attach`)
+A blocker is a current fact, not a copied waiting object. Explanations are read
+projections and never grant authority.
 
-OpenCode owns its provider accounts, authorization, configuration, and model loop. In the primary `external_attach` mode (`eliot-opencode-v2.rust-http.1`), the controller connects to an already running, already authorized native OpenCode service through HTTP/SSE without reading provider `auth.json` files or copying provider keys.
+## 14. Verification
 
-Set `routes.native_options.connection_file` to the native service registration used by the installed OpenCode client (`@opencode/client/service`), which records `url`, `pid`, and optional `version`, `id`, and local HTTP `password`. This local service-access record is distinct from provider authorization. The controller reads it in place and checks the loopback endpoint and live PID without rewriting the record or replacing the service. Provider/model/variant selection comes from that native service's catalog (or native defaults when omitted).
-
-### 11.2 Retained owned-service compatibility
-
-Fresh `fresh_owned_service` launches are retired in the current source.
-[`prepare_owned_service` and `start_foreground`](../../crates/swarm-kernel-host/src/runtime/opencode_v2/owned_service.rs)
-reject that origin; the [helper entrypoint](../../crates/swarm-kernel-host/src/runtime/opencode_v2.rs)
-also returns the native-harness-required error. Do not configure a fresh private
-Bun/OpenCode server or rebuild that launch path from an old example. New service
-connections use the native registration described above.
-
-Current readback still consumes service-owner and process-identity records. Resolve
-actually retained in-flight work through the [finite transition](implementation.md#current-format-and-existing-data),
-then remove the old reader and producer. Their source presence does not establish
-a user-data obligation or justify indefinite compatibility.
-Current source/native evidence remains in [Implementation status](../implementation-status.md).
-
-### Windows Git metadata path admission
-
-Choose repository and workspace roots whose normalized `.git` paths fit the
-workspace adapter's 220-byte Windows policy. Count UTF-8 bytes after supported
-verbatim-path normalization. This policy follows the explicit `GIT_DIR` startup
-guard in [Git for Windows v2.55.0.windows.5](https://github.com/git-for-windows/git/blob/v2.55.0.windows.5/setup.c#L1071-L1084)
-and the [MinGW-w64 `PATH_MAX` definition](https://github.com/mingw-w64/mingw-w64/blob/master/mingw-w64-headers/crt/limits.h#L18);
-it is not a portable filesystem limit. Review the policy when changing the Git
-integration. Non-Windows admission is unchanged.
-
-An over-limit path returns `WORKSPACE_GIT_PATH_TOO_LONG` before `worktree add`.
-Only a proven queued, unbound, preparing launch becomes a closed admission
-failure. Current Manager `operation.get` reports the exact code and the action
-to configure shorter roots, then admit a fresh launch. The rejected launch has
-no attempted native effect. A previously uncertain launch keeps its retained
-first failure and exact-readback requirement; shortening a root does not replay
-it. `core.longpaths` and global Git configuration are not changed by admission.
+- stale entry revision conflicts without partial changes;
+- disabling prevents new Operations and preserves in-flight work;
+- same occurrence admits once;
+- lost wake is recovered by current-state query;
+- route fallback uses only configured aliases;
+- 128 blocked Tasks do not hide an eligible Task;
+- transient provider reset opens one probe, not all routes;
+- transfer preserves entry/occurrence identity;
+- no `automation_scheduler` process/credential/page-admit protocol remains after
+  scheduler consolidation.
