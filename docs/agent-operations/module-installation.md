@@ -3,7 +3,7 @@
 This runbook separates the **current scripts** from the target package path. Current
 scripts remain usable during migration, but their provenance matrices and
 artifact-specific validators are not architecture. The target is implemented
-route-by-route under [implementation](implementation.md#11-build-install-ci-and-qualification-reduction).
+route-by-route under the [implementation order](implementation.md#implementation-order).
 
 Installation does not prove a successful model turn. Provider CLI/service, account,
 model and credentials are configured separately.
