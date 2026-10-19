@@ -2,10 +2,10 @@
 
 ## Current state
 
-**Overall: PARTIAL_PROGRESS.** Runtime source at
-`e6b03b72ccec03b378c70b883f51ba2f34fde8d2` contains one completed code
-reduction and a source-backed refactoring program. Later commits in this audit pass
-change documentation only.
+**Overall: PARTIAL_PROGRESS.** Runtime source was audited through
+`96a0d5a6632cfbd541e804d7969d3e76e716bf6a`; this commit changes documentation only.
+`main` contains one completed runtime reduction and a source-backed refactoring
+program.
 
 - [Architecture](agent-operations/architecture.md) — compact product law.
 - [Implementation](agent-operations/implementation.md) — the only work order.
@@ -14,159 +14,134 @@ change documentation only.
 
 ## Audit coverage
 
-The repository has **not** received a complete current-head line-by-line audit of
-every runtime path.
-
-Issue #153 audited `ed1df447482d87ced09b60a12b301a7b0cfc4092` on
-2026-10-14. Current runtime source is 644 commits ahead. That interval added or
-substantially changed Muse Rust, Claude, Codex, Command ACP, OpenCode, Store
-automation, launcher, custody, observation, checks, scripts, Forge, MCP and CI. The
-old audit remains evidence, not current-head qualification.
-
-Current coverage:
+The repository has **not** received a complete current-head line-by-line audit of every
+runtime path. The last broad audit, Issue #153, used `ed1df44` on 2026-10-14; current
+source is hundreds of commits ahead. Historical findings remain evidence, not current
+qualification.
 
 | Track | Coverage |
 | --- | --- |
-| Product boundary and ownership | deep source review; compact target defined |
+| Product boundary, ownership and main sources of overengineering | deep |
 | Adapter command/receipt/package protocol | deep cross-route review |
-| Antigravity dispatch/result/delivery | deep connected review; first executable slice defined |
-| Queue, route/provider state, capacity and WorkDispatch | deep review; duplicate state machines identified |
-| Workspace/code scope and process custody | deep review; one-authority targets defined |
-| Scheduling/optional workers | deep review; three overlapping control systems identified |
-| TaskPrompt/model context | connected cross-adapter review; repeated identity/hash/JSON confirmed |
-| Review/correction/acceptance automation | connected review; disposition/repair duplication confirmed |
-| Public method routing/authorization | connected cross-registry review; no bypass claim, structural drift confirmed |
-| Store schema/migrations | deep startup/migration review; exact-SQL compatibility system confirmed |
-| Passive observation and executor duplication | architecture plus selected source paths; not every branch |
-| Claude, Codex, Command, Muse and OpenCode internal state machines | partial targeted review; not complete line-by-line |
-| Checks, scripts, Forge, GitHub effects, mailbox/gateway | partial ownership/error-boundary review |
-| IPC/MCP fairness, backpressure and pagination | partial |
-| Installed/native behavior, Windows custody and scale | unqualified except named historical receipts/open owner-machine cases |
+| Antigravity dispatch/result/delivery | deep connected review |
+| Queue, WorkDispatch, provider state and capacity | deep |
+| Workspace/code scope, process custody and scheduling | deep |
+| TaskPrompt and review/correction/acceptance automation | deep connected review |
+| Public method routing/authorization ownership | deep structural review; no full privilege matrix execution |
+| Store schema/migration ownership | deep structural review; corruption/upgrade matrix not fully executed |
+| IPC/MCP multiplex, subscriptions, task projection and native streams | deep source review; live load not qualified |
+| Passive observation and executor duplication | architecture plus selected source paths |
+| Claude, Codex, Command, Muse and OpenCode internal state machines | partial targeted review |
+| Checks, scripts, Forge, GitHub effects, mailbox/coordination and gateway | partial |
+| Installed/native behavior, Windows custody and scale | unqualified except named historical receipts/open issues |
 
-Thus the architecture/reduction audit is mature; a complete current-runtime audit is
-not yet proven.
+“Architecture audit mostly complete” is accurate. “All code and runtime behavior
+checked” is not.
 
 ## Completed runtime source change
 
-Commit `25a8e3b` removed the host's duplicate general CLI and MCP launcher.
+Commit `25a8e3b` removed the duplicate host application CLI/MCP launcher:
 
 - host `main.rs`: 1,949 → 743 physical lines;
 - net owned Rust reduction: 1,206 lines;
 - public commands remain in `swarm-cli`;
 - daemon/admin/internal-worker entrypoints remain.
 
-No later documentation work is counted as runtime deletion.
+No later documentation pass counts as runtime reduction.
 
 ## Current implementation sequence
 
 ```text
-A0  synchronize active Antigravity v6 coordinates
-A1  remove Antigravity observation/proof coupling
-A2  add minimal durable Store-delivery spool
-A3  keep only real typed Antigravity actions
-
-B0  one current-state queue projection
-B1  explicit ordered route policy; lane remains a view
-B2  source-scoped provider availability/usage
-B3  transactional root count; remove capacity ledger
-B4  dispatch_once instead of WorkDispatch workflow state
-
-C0  Task path-prefix write scope
-C1  workspace lease as sole write authority; remove code.scope.*
-
-D0  minimal process owner record
-D1  conservative restart reconciliation
-
-E0  one automation-entry schedule model
-E1  one in-process wake/timer admission loop
-E2  delete standalone automation scheduler service/protocol
-E3  keep workers only for real external effects/custody
-
-F0  compact model-visible TaskPacket
-F1  separate Store identity from prompt text/adapter receipts
-F2  one renderer for initial assignment, correction and resume
-
-G0  review_once current-state query
-G1  one task.request_changes transition and optional child agent.send
-G2  bounded candidate-specific correction/no-progress handling
-G3  accept_once through the common acceptance gate
-G4  reduce automation steps to thin policy toggles
-
-H0  separate public, internal-host and adapter protocols
-H1  domain-owned typed parse/authorize/execute handlers
-H2  normalized Operation scope; remove method-name visibility SQL
-H3  delete each retired surface from Store, MCP, CLI, policy and tests together
-
-I0  numeric schema_migrations/current version
-I1  one finite bridge from known digest-marker states
-I2  delete exact base/extension SQL digests, custom DDL lexer/reference DB and duplicate verifiers
-I3  readers validate application ID + supported schema version
+A0-A3  Antigravity route/result/durable delivery/typed actions
+B0-B4  current queue, explicit routes, provider state, root capacity, dispatch_once
+C0-C1  Task path scope and one workspace write lease
+D0-D1  minimal process owner and conservative restart
+E0-E3  one schedule model and in-process admission loop
+F0-F2  compact TaskPacket; Store identity outside model text
+G0-G4  ordinary review/correction/acceptance transitions
+H0-H3  split public/internal/adapter protocols; one domain authorizer
+I0-I3  numeric migrations; remove SQL-text compatibility
+J0-J3  concurrent MCP IPC, one wake pump, exact pending-input read,
+       native content ring off writer
+K-L    shared adapter shell after proof, one executor per harness, Goals,
+       passive observation and remaining Store/product deletion
 ```
 
-Shared adapter plumbing, executor retirement, passive observation and remaining Store
-reduction follow only after vertical slices prove their boundaries.
-
-## Confirmed structural gaps
+## Confirmed current gaps
 
 | Area | Current source | Target |
 | --- | --- | --- |
-| Antigravity result | terminal outcome depends on observation/proof; in-memory delivery can disappear | self-contained outcome plus exact Store-delivery spool |
-| Adapter bus | string/vendor commands, package/schema ladders, repeated hello/delivery loops | typed semantic commands and proven shared plumbing only |
-| Execution | parallel generations remain for most harnesses | one current executor/format per retained runtime |
-| Prompt | controller identity JSON and repeated hashes enter model/adapters | bounded TaskPacket; identity stays in Store |
-| Queue | WorkDispatch copies Task facts into cursors/pending/slots/links | ranked query plus one atomic admission |
-| Routes/provider | duplicated policy/proof records and sticky per-binding facts | explicit ordered aliases plus source-scoped freshness |
-| Capacity | second meta ledger mirrors Operation lifecycle and counts read/control calls | transactional root count/read projection |
-| Review/correction | disposition, repair and acceptance engines repeat candidate identity | shared Task transitions and thin `*_once` automation |
-| Workspace | advisory code scope beside actual lease | Task path prefixes plus one workspace lease |
-| Process | owner record repeats package/protocol/contract | minimal custody identity and conservative recovery |
-| Scheduling | in-process, standalone and automation loops overlap | one in-process due/current-state admission loop |
-| Public API | registry, MCP, validator, router, apply, participant and visibility maps overlap | three protocols plus domain-owned exact authorization |
-| Schema | base and extensions pinned to exact SQL; special migration compilers/verifiers | numeric transactional migrations and finite marker bridge |
-| Observation | unbound joined Governor view incomplete; process sampling hashes executables | local provider + OS + Git facts without provider calls |
-| Acceptance | direct/automatic paths do not cleanly share all exact candidate evidence | one candidate-specific review/check gate |
-| Store/automation | writer-heavy reads, meta indexes, transfer chains and optional engines | bounded readers, explicit migrations, stable identities, deletion |
-| Product breadth | council, ratification/ACK, publication projection remain | outside compact-core completion |
-| Tooling | compiler/checkout/cache equality and artifact-specific validators | generic package boundary plus route-specific behavior checks |
+| Antigravity | result can be lost; outcome depends on observation/proof; v5/v6 selectors disagree | self-contained terminal result and exact Store-delivery spool on v6 |
+| Adapter bus | vendor strings, profile ladders, repeated hello/delivery and proof-heavy receipts | typed semantic protocol and shared shell only after two consumers |
+| Execution | parallel generations for most harnesses | one current executor/format per retained runtime |
+| Queue | WorkDispatch copies Task facts into cursors/pending/slots | ranked query plus atomic admission |
+| Provider/capacity | vendor proof matrix and second lifecycle ledger | source-scoped facts and transactional root count |
+| Workspace | advisory `code.scope.*` beside real lease | Task path prefixes plus one lease |
+| Scheduling | three overlapping control systems | one in-process due/current-state loop |
+| Prompt | identity JSON, launch packet and hashes enter model/adapters | compact TaskPacket and Store-owned identity |
+| Review/correction | disposition/repair/acceptance workflows repeat candidate state | common Store transitions and thin `*_once` queries |
+| Public API | parallel registries/routers/visibility rules include removal-target products | separate protocols and domain-owned authorizers |
+| Store schema | base SQL SHA, extension digests and custom DDL verifiers | numeric transactional migrations |
+| MCP tools | frontend mutex serializes the already multiplexed client | clone current `Arc<Client>` and release lock before RPC |
+| MCP subscriptions | up to 16 pollers/forwarders/queues per session mirror durable facts | one coalesced wake pump; Store cursor is authority |
+| MCP task projection | `tasks/get` scans every `report.attention` page | exact Operation/binding pending-input read |
+| Native streams | ephemeral ring operations run on the single Store writer | reader authorization plus ring operation outside writer |
+| Observation | unbound joined Governor view incomplete; metric hashing remains | local provider+OS+Git view without provider calls |
+| Product breadth | council, ratification/ACK and automatic projection remain | outside compact-core completion |
+| Tooling | compiler/checkout/cache equality and artifact validators remain | generic package boundary plus route-specific live qualification |
 
-These are findings/plans, not completed repairs.
+These are findings and planned deletions, not completed runtime repairs.
+
+## IPC/MCP audit result
+
+The host IPC server already bounds connections, in-flight requests, frames and write
+time and drains admitted work after disconnect. The client already correlates
+concurrent out-of-order replies and never replays an uncertain request. Do not replace
+it with a broker.
+
+The unnecessary complexity is above that boundary:
+
+- MCP holds its client-slot mutex during the whole awaited request, reserializing the
+  multiplexed client;
+- one MCP session can create 16 independent 250 ms subscription pollers and queues;
+- lag handling scans additional Store pages to count dropped category matches even
+  though notifications are documented as hints;
+- `tasks/get` pages global attention state to find one Operation;
+- ephemeral native stream publication/read uses the writer thread.
+
+The implementation now defines J0-J3 to remove these layers without changing
+uncertain-effect semantics.
 
 ## Runtime evidence retained
 
-Existing receipts remain scoped to named artifacts/revisions:
+Historical receipts remain scoped to their named artifacts/revisions:
 
 - [Muse exact normalized result](remediation/2026-10-17/MUSE-NORMALIZED-RESULT-NATIVE-VERIFICATION.json);
 - [connected Store batch cases](remediation/2026-10-13/CONNECTED-STORE-BATCH-VERIFICATION.json);
 - [Antigravity EOF settlement](remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
 
-They do not qualify the compact protocol, TaskPacket, queue, correction flow,
-migrations, passive observation, executor deletion or installed fleet.
+They do not qualify the planned protocol, TaskPacket, queue, correction flow, MCP
+simplification, passive observation, executor deletion or installed fleet.
 
-## Remaining audit tracks before “complete current-head audit”
+## Remaining audit tracks before a complete current-head claim
 
-1. Finish per-adapter state-machine audits for current Claude, Codex, Command ACP,
-   Muse, OpenCode and Antigravity implementations; select exact executor retirement.
-2. Trace all external effects end to end: native prompts, process launch/kill,
-   filesystem, Git/GitHub, checks and scripts; prove one retry/readback owner.
-3. Complete IPC/MCP backpressure, slow-consumer, pagination, fairness, cancellation and
-   writer-occupancy review.
-4. Recheck retained-format/corruption behavior after the numeric migration design is
-   implemented; current exact-DDL verification is understood but not yet replaced.
-5. Review remaining Store object-read/authorization domains after removal-target API
-   surfaces are deleted; do not spend effort perfecting visibility for products being removed.
-6. Run minimal current-head format/Clippy/build checks per implemented slice, then
-   connected tests for closed paths.
-7. Perform owner-machine qualification for native restart, Windows process-family
+1. Complete per-adapter state-machine audit for current Claude, Codex, Command ACP,
+   Muse, OpenCode and Antigravity and select executor retirements.
+2. Trace every external effect owner: native prompts, process launch/kill, filesystem,
+   Git, GitHub, checks and scripts; verify one retry/readback owner and no guessed replay.
+3. Execute the public method → role → exact object → Store/effect matrix, especially
+   removed-product boundaries and participant/GM projections.
+4. Execute migration/corruption/partial-upgrade cases against concrete retained DB
+   states after the numeric migration slice is implemented.
+5. Measure IPC/Store fairness and writer occupancy after J0-J3; current source review
+   identifies the mechanisms but is not a load qualification.
+6. Perform owner-machine qualification for native restart, Windows process-family
    custody, mixed-provider execution and scale. Open Issues #1, #3, #4, #5, #11,
    #140 and #159 remain evidence boundaries.
 
 ## Verification status
 
-This audit pass changes documentation only. Runtime implementation begins with A0/A1,
-using formatting and minimal affected warnings-denied Clippy/build checks, followed by
-the connected cases in
-[implementation verification](agent-operations/implementation.md#verification).
-
-Do not interpret old CI/fixtures as qualification of the planned protocol, prompt,
-queue, review flow, migration system, observation or executor deletion. Record each
-landed source slice and net owned-code change here.
+This pass changes documentation only. Runtime implementation begins with A0/A1 and
+the minimal affected formatting/warnings-denied Clippy/build checks. Connected tests
+run when each vertical slice closes; broad qualification follows the complete product
+path. Record each landed source slice and net owned-code change here.
