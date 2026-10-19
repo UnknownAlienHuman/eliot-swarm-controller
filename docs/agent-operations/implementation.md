@@ -1,70 +1,68 @@
 # Eliot Swarm Controller — Implementation
 
-This is the single implementation program for the
-[architecture](architecture.md). Runtime source, active tooling, old Claude Swarm
-scripts and current donor sources were rechecked at
-`9c6192a70382bb12a842f5b960cab904f95908a7` on 2026-10-19.
-[Findings](refactoring.md) preserve evidence; [status](../implementation-status.md)
-records completed work. This document says what to change, where to change it and
-what old mechanism must disappear.
+This is the only implementation program for the
+[architecture](architecture.md). Runtime source was rechecked at
+`e6b03b72ccec03b378c70b883f51ba2f34fde8d2`; audit/status documentation was
+updated through `aeb9c2a4c7f00d609cd7b1e3c176362088d42371` on 2026-10-19.
+[Findings](refactoring.md) retain source evidence; [status](../implementation-status.md)
+records what actually landed.
 
-Do not start another repository-wide framework migration. Implement one complete
-caller-to-result slice, delete the replaced path, then use a second real route to
-prove any shared abstraction.
+Do not start another repository-wide framework migration. Complete one vertical
+caller-to-result slice, delete the replaced path, and use a second real consumer to
+prove any shared implementation.
 
 <a id="implementation-order"></a>
 <a id="adapter-bus-first-migration"></a>
 
-## 1. Work as vertical slices
+## 1. Working rules
 
 Every coding slice states:
 
 - observable behavior;
 - exact source owners and symbols;
 - unsupported and uncertain cases;
-- old callers, formats, fixtures and configuration to delete;
+- old callers, records, config, fixtures and branches to delete;
 - one relevant donor mechanism or native API;
-- minimal format/Clippy/build command;
+- minimal affected format/Clippy/build command;
 - connected completion proof and net owned-code change.
 
 The manager owns shared contracts, Store transitions and integration. Leaf workers
 receive compact non-overlapping tasks. A type, schema, fixture or adapter stub is not
-progress unless a current caller uses it and the superseded path is removed.
+progress unless a current caller uses it and the superseded path disappears.
 
-Migration is route-by-route. An unmigrated route may temporarily remain on the
-current protocol, but receives no new compatibility profile. A migrated route admits
-no new work through its old producer.
+Migration is route-by-route and domain-by-domain. An unmigrated route may temporarily
+stay on its current protocol, but receives no new compatibility profile. A migrated
+route admits no new work through its old producer.
 
 ## 2. Current owners
 
 | Responsibility | Owner |
 | --- | --- |
-| Tasks, Attempts, Operations, rights, acceptance and durable observations | `crates/swarm-kernel-host/src/store` |
-| Shared semantic adapter commands and bounded records | `crates/swarm-contracts` |
+| Tasks, Attempts, Operations, rights, review, acceptance and durable observations | `crates/swarm-kernel-host/src/store` |
+| Current semantic adapter commands and bounded records | `crates/swarm-contracts` |
 | Authenticated Eliot IPC | `crates/swarm-client::ModuleLink` |
-| Adapter process membership and private durable files | `crates/swarm-process::module_owner`, `module_membership`, `permissions` |
+| Adapter membership, exact process custody and private durable files | `crates/swarm-process::{module_owner,module_membership,permissions}` |
 | Native transport, session state, provider readers and uncertain native effects | selected `swarm-adapter-*` or `modules/*-rust` implementation |
-| Workspace registration, worktree creation and write authority | `crates/swarm-kernel-host/src/store/workspace.rs`; `crate::workspace` performs filesystem/Git effects |
-| Queue, route decision and launch admission | current Store launcher owner; no second queue/capacity service |
-| Time-based admission | one in-process host control loop; Store owns durable due/occurrence state |
-| External effect execution | existing checks, scripts, Forge and adapter owners |
-| Process/worktree/Git collection | current host lifecycle/process owners |
-| Public CLI and MCP | `swarm-cli` and `swarm-mcp`, both calling Store handlers |
+| Workspace registration, worktree effects and write authority | `store/workspace.rs` plus `crate::workspace` |
+| Queue, route choice and launch admission | existing Store launcher owner |
+| Time-based admission | one in-process host loop; Store owns due/occurrence state |
+| Checks, scripts, Git/Forge and GitHub effects | existing dedicated effect owners |
+| Public CLI/MCP | `swarm-cli` and `swarm-mcp`, calling Store handlers |
 
 No adapter accepts a Task, changes ownership or interprets review. No common shell
-owns a vendor session, native retry policy, scheduler or transcript store.
+owns a provider session, native retry policy, scheduler or transcript store.
 
 ## 3. First executable route: Antigravity Rust
 
-Antigravity remains the first adapter route because it has one serialized native
-input window and a concrete lost-delivery defect. Do not start the common shell with
-Command, Codex or Muse: their profile ladders and native state machines would define
-the abstraction around the hardest legacy code.
+Antigravity remains first because it has one serialized native input window and a
+proven lost-delivery boundary. Do not define shared plumbing from Command, Codex or
+Muse first: their historical profiles and native state machines would infect the
+abstraction.
 
-### A0 — synchronize the active Antigravity coordinate
+### A0 — one active Antigravity coordinate
 
-Current source and descriptor use artifact version `6`, while active route/tooling
-selectors still name `5`.
+Current Rust and descriptor use artifact version `6`; active route/tooling selectors
+still contain `5`.
 
 Update together:
 
@@ -72,61 +70,51 @@ Update together:
 - `tools/ci/module-package-policy.json`;
 - `tools/qualification/New-NativeQualification.ps1::Get-AdapterContract`;
 - `tools/modules/Install-ModuleArtifact.ps1` Antigravity validator;
-- active catalog/qualification fixtures selecting new work.
+- active catalog/qualification fixtures used for new work.
 
-Do not rewrite historical v5 receipts under `docs/remediation`. New installation,
-selection and qualification use v6 only. Remove active `"5" | "6"` behavior after
-concrete unsettled v5 bindings receive a final disposition.
+Do not rewrite historical v5 receipts. Give concrete unsettled v5 bindings a final
+disposition, then remove active `"5" | "6"` behavior.
 
-Completion: descriptor, Rust constant, package policy, installer and qualification
-select one active version; no fallback silently chooses v5.
+Completion: source, descriptor, route, installer, package policy and qualification
+select v6 only.
 
-### A1 — remove observation/proof coupling
+### A1 — terminal outcome independent of observation/proof
 
-Current Antigravity terminal outcome is not self-contained. The adapter first emits
-`module.observe`, receives a Store `observation_id`, rewrites
-`local_execution_ref.observation_id`, then sends `module.outcome`. Store compares the
-outcome against a duplicate `local_execution_results` copy in the latest observation.
-A durable outbox built on this order would need dependency edges and mutable outcome
-revisions.
+Today Antigravity first copies a terminal result into `module.observe`, receives an
+`observation_id`, rewrites the pending outcome and then sends `module.outcome`. Store
+compares the outcome against the duplicated observation result. A durable queue built
+on this order would require mutable records and dependency edges.
 
-Make terminal outcome final at the native settle point. It contains only:
+Make the terminal outcome final at native settlement. Retain only:
 
 - Operation ID;
 - binding generation and adapter boot;
-- native conversation identity;
-- monotonically increasing result ordinal within that conversation/boot;
-- terminal native status and Eliot disposition;
-- response-content hash and result reference where bytes exist.
+- native conversation and result ordinal;
+- native terminal status and Eliot disposition;
+- result reference and content hash when bytes exist.
 
-Store validates these fields against its retained Operation, binding and boot. The
-same terminal result does not need to be duplicated in observation state.
+Store validates those facts against its retained Operation/binding/boot.
 
-Delete in the same change:
+Delete in the same slice:
 
 - `local_execution_ref.observation_id`;
-- duplicated `local_execution_results` receipts in observations;
-- outcome-to-current-observation matching in `runtime/warm_stream.rs`;
-- `AntigravityDispatchSessionProof` from `swarm-contracts::runtime`;
+- duplicated terminal results in observations;
+- outcome-to-latest-observation matching in `runtime/warm_stream.rs`;
+- `AntigravityDispatchSessionProof` and its constants;
 - proof production in `modules/antigravity-rust/src/controller.rs`;
-- `launcher_dispatch/antigravity_capability.rs` proof lookup/digests;
+- `launcher_dispatch/antigravity_capability.rs` proof validation/digests;
 - refresh-before-dispatch qualification and proof fixtures.
 
-`agent.refresh` remains safe readback. Model, stream phase, counters, gaps and native
-readiness remain `agent.state` observations; they do not authorize dispatch.
+`agent.refresh` remains readback. Model, stream, counters and gaps remain ordinary
+`agent.state` observations, not dispatch authority.
 
-Completion: a ready current binding receives first input without fresh refresh;
-stale Task/Attempt/binding/workspace facts still fail; terminal outcome is immutable
-before Store delivery; no proof DTO or observation dependency survives.
+### A2 — durable Store delivery, never native replay
 
-### A2 — make Store delivery durable without replaying native input
+After A1, add a route-local spool using existing private atomic file primitives in
+`swarm-process::permissions`. Do not add a database, append-only journal, tombstones,
+compaction or retention graph.
 
-After A1, implement a route-local delivery spool using existing private durable file
-primitives in `swarm-process::permissions`. Do not add a database, append-only
-journal, tombstones, compaction or retention graph.
-
-Terminal outcomes and result pages use one private file per already-formed Store
-request:
+Terminal outcomes/result pages use one private file per already-formed Store request:
 
 ```text
 sequence
@@ -136,11 +124,12 @@ binding generation + adapter boot
 exact bounded params
 ```
 
-Persist before the in-memory owner can forget it. Reconnect may send the same params.
-Delete only after exact Store ACK. A replacement boot does not silently adopt or
-delete predecessor files. The file never contains a native prompt or process launch.
+Persist before the in-memory owner can forget it. The same boot may resend identical
+params after Eliot IPC reconnect. Delete only after exact Store ACK. A replacement
+boot does not silently adopt predecessor records. The file never contains native
+prompt/process intent.
 
-Observations use at most one replaceable pending checkpoint per source:
+Observations use one replaceable pending checkpoint per source:
 
 ```text
 source_id + source_epoch
@@ -149,31 +138,12 @@ coverage or gap
 latest normalized state
 ```
 
-A newer unsent checkpoint replaces an older one. Store creates the durable
-observation journal after accepting it. Do not create one local file per native
-frame.
+A newer unsent checkpoint replaces an older one. Store creates durable observation
+history after accepting it.
 
-Edit:
+### A3 — only real Antigravity actions
 
-- `modules/antigravity-rust/src/controller.rs`;
-- `modules/antigravity-rust/src/main.rs`;
-- one small route-local spool module;
-- focused Antigravity tests;
-- only required `swarm-process` exports.
-
-Completion:
-
-- native input is written once;
-- Eliot disconnect after terminal settlement leaves one durable exact envelope;
-- same boot reconnect sends identical params and ACK removes them;
-- restart never converts the envelope into native execution;
-- predecessor-boot records remain visible for explicit disposition;
-- result pages remain attached to the original Operation;
-- observation bursts remain bounded by one checkpoint per source.
-
-### A3 — give Antigravity only its real semantic actions
-
-The retained route supports:
+Retain:
 
 ```text
 Open
@@ -182,282 +152,169 @@ Send(next_turn)
 Refresh
 Result
 Reconcile
-Shutdown/release of an explicitly owned process or session
+Shutdown/release of an explicitly owned resource
 ```
 
-Do not advertise or implement placeholder branches for `Reply`, `Configure`, `Goal`,
-`Background`, `Recover` or live steer. Unsupported actions fail at Store routing
-before `module.next`.
+Do not advertise placeholder `Reply`, `Configure`, `Goal`, `Background`, `Recover`
+or live steer. Unsupported actions fail before `module.next`.
 
-Replace string method switching with the typed semantic command for this route.
-Collapse per-outcome receipt identity to facts Store cannot derive:
-
-- Operation ID;
-- binding generation/adapter boot;
-- native conversation/input/result identity when observed;
-- disposition and bounded action details.
-
-Keep hashes on immutable result/artifact bytes. Remove artifact version, protocol,
-request hash and repeated Task/source hashes from every outcome.
-
-Completion: adding/removing an optional action changes one capability value and one
-adapter match, not artifact profiles, schema families or Store vendor branches.
+Replace string switching with the typed semantic command. Collapse outcome identity
+to Operation, generation/boot, observed native IDs, disposition and bounded details.
+Remove package/protocol/request and repeated Task/source hashes from outcomes.
 
 ## 4. Queue, route policy and current-state admission
 
 <a id="work-dispatch"></a>
 
-The current `store/automation_work_dispatch.rs` is another workflow engine. It tails
-Task observations, owns global/per-entry cursors, copies blocked Tasks into a bounded
-pending list, periodically rechecks them, creates semantic slots, retains operation
-links and quarantines source/config records. `automation/work_dispatch.rs` duplicates
-launch route/profile/model/effort/budget/stop-condition planning.
-
-The target is a current-state query, one admission transaction and no copied pending
-state.
+`store/automation_work_dispatch.rs` is a second workflow engine: global/per-entry
+cursors, activation cuts, copied blocked Tasks, recheck rotation, semantic slots,
+operation links, quarantine and recent history. The target is a current-state query
+and one admission transaction.
 
 ### B0 — one queue projection
 
-Keep `swarm.queue.get` as a read projection in the existing launcher/Store owner. It
-reads current:
+`swarm.queue.get` reads current:
 
 - Task revision/state and current Attempt;
-- review/change-request state;
-- dependencies and acceptance state;
-- active workspace leases/write conflicts;
-- selected route capability, provider state and root capacity;
-- current binding/session availability.
+- correction/review state;
+- dependencies and accepted prerequisites;
+- workspace leases/write conflicts;
+- route capabilities, provider availability and root capacity;
+- binding/session availability.
 
-Return deterministic rank and `why_ranked`:
+Return deterministic rank plus `why_ranked`:
 
 1. current candidate returned for correction;
-2. current unfinished Attempt needing continuation/relaunch;
+2. unfinished Attempt needing continuation/relaunch;
 3. ready unclaimed Task;
-4. explicit manager/task phase ordering;
+4. explicit manager/task phase order;
 5. oldest eligible Task, then stable Task ID.
 
-Do not infer “small” from prompt length or code heuristics. A queue page is not a
-reservation. Every launch rechecks current facts.
+A page is not a reservation. Every launch rechecks current facts.
 
-### B1 — route policy is explicit configuration, not a lane entity
+### B1 — explicit route policy; lane remains a view
 
-Replace the single duplicated WorkDispatch launch bundle with a small manager policy:
+One manager policy contains:
 
 ```text
 automation entry
-  enabled
-  project/task selector
-  ordered route aliases
-  optional agent profile
+enabled
+project/task selector
+ordered route aliases
+optional agent profile
 ```
 
 A route alias owns exact harness, native options, model/effort defaults and root
-limit. Participant/MCP profile is derived from the admitted role; the workspace
-policy is the single manager-owned worktree policy. Task requirements own the work,
-not another copied budget/stop-condition packet.
+limit. Automatic dispatch chooses the first eligible configured alias and stores it
+in the launch Operation. It never infers another provider/model/effort/permission.
 
-The ordered route list is explicit. Automatic dispatch chooses the first currently
-eligible alias and stores that exact alias in the launch Operation. It never changes
-provider, model, effort or permissions by inference. Manual launch names one alias.
+A lane is only a view of manager + project + policy + ordered routes + current queue +
+provider/capacity state + active bindings/workspaces. Do not add a lane table,
+process, cursor, inbox or scheduler.
 
-A “lane” is only the view of:
+### B2 — source-scoped provider state
 
-```text
-manager + project + automation entry
-+ ordered routes
-+ current queue
-+ provider/capacity state
-+ active bindings/workspaces
-```
-
-Do not add a lane table, process, cursor, inbox, state machine or scheduler.
-Disabling the entry stops future admissions and does not cancel active work.
-
-### B2 — simplify provider state
-
-Replace `NativeUsageSnapshot`/`ProviderConditionFact` proof matrices with two
-separate normalized records:
+Replace provider proof matrices with:
 
 ```text
 ProviderUsage {
-  source_key, source_epoch, source_sequence
-  observed_at, freshness, coverage
-  scope = account | service | connection
-  native-labelled buckets/windows/credits
+  source_key, source_epoch, source_sequence,
+  observed_at, freshness, coverage,
+  scope = account | service | connection,
+  native_labelled_buckets
 }
 
 ProviderAvailability {
-  same source coordinates and scope
-  available | rate_limited | quota_exhausted | overloaded
-  | auth_required | data_policy_required | model_gone | unknown
-  optional retry_at/reset_at
-  optional native_class
+  same source coordinates and scope,
+  available | rate_limited | quota_exhausted | overloaded |
+  auth_required | data_policy_required | model_gone | unknown,
+  optional retry_at/reset_at/native_class
 }
 ```
 
-The adapter owns native method names, rolling-patch folding and provider-specific
-fields. Store validates authenticated source, bounds and monotonic source sequence.
-Do not repeat route, binding, generation, model and auth hashes in every row.
+Adapters own native method names and rolling-patch folding. Store checks authenticated
+source, bounds and monotonic source sequence.
 
-Source scope rules:
+Rules:
 
-- account scope only when the provider supplies stable account identity;
-- service scope only when the service identity is explicit;
-- otherwise connection scope; never merge across connections;
-- a productive binding may report the fact but is not the durable identity of an
-  account/service condition.
+- account scope requires stable native account identity;
+- service scope requires explicit service identity;
+- otherwise retain connection scope and never merge across connections;
+- no fact permits one bounded probe under root capacity;
+- transient negative holds until retry/reset, then permits one probe—not recovery;
+- hard negative requires source/config change or explicit fallback;
+- unknown/stale/gapped holds automation but remains manually probeable.
 
-Decision rules:
+Delete `UsageService::{Codex,Muse}`, native-method/artifact allowlists,
+`auth_context_ref`, `details_digest`, Codex-only universal fields and per-binding
+copies of account/service facts.
 
-| Fact | Automatic admission |
-| --- | --- |
-| No fact ever observed | permit one bounded probe under root capacity |
-| Fresh `available` | eligible |
-| `rate_limited` / `overloaded` before retry | hold until retry time |
-| `quota_exhausted` before reset | hold until reset |
-| Transient fact after retry/reset | permit one probe; its admitted root prevents a stampede |
-| `auth_required` / `data_policy_required` / `model_gone` | unavailable until source/config changes or explicit configured fallback |
-| Fresh `unknown` | hold automatic dispatch; manager may explicitly probe |
-| Stale/gapped source with no applicable hard negative | hold automatic dispatch; manager may explicitly probe |
+### B3 — capacity from actual roots
 
-A retry/reset timestamp is not proof of recovery. It only opens one probe. A dead
-source binding must not turn an old transient condition into a permanent hold.
+Capacity currently mirrors every Operation/producer into reserved/active/released
+records and counts read/control methods. Keep only configured route root limits.
 
-Use current Codex semantics honestly: `ordinary_usage_allowed = null` is unavailable,
-not recovered. Muse usage is point-in-time “as of” data, not live truth.
+A claim is:
 
-Delete:
+- unresolved launch/open that may create a root; or
+- unreleased binding/native root;
+- never both for the same parent.
 
-- `UsageService::{Codex,Muse}` as a shared allowlist;
-- native method allowlists from shared DTOs;
-- `auth_context_ref` and `details_digest` as admission proofs;
-- artifact-version source allowlists;
-- Codex-specific permission fields in the universal DTO;
-- repeated route/binding/model columns;
-- per-binding copies of one account/service snapshot.
+Count and reserve in the same Store writer transaction that admits launch/open.
+Dispatch, send, reply, configure, Goal, refresh, result, reconcile and recover create
+no root claim.
 
-### B3 — capacity is a transactional root count, not a second lifecycle ledger
+Delete `CapacityLedger`, `CapacityEntry`, `ResourceEvidence`, capacity meta keys,
+v1/v2 migration/key helpers, refusal rows and lifecycle sync hooks. `report.capacity`
+becomes a projection.
 
-The current capacity ledger copies each Operation/producer into reserved/active/
-released phases, event references, unknown timestamps and `meta` indexes. It even
-counts `refresh`, `result` and `reconcile`, which perform no model execution.
-
-For the compact product, keep only the configured route root limit.
-
-A root claim is derived from current Store facts:
-
-- one unresolved `agent.open`/launch that may create a root;
-- one unreleased binding/native root;
-- never both for the same parent launch/binding;
-- rejected/cancelled opens and released bindings do not count.
-
-Count and reserve in the same Store writer transaction that admits the launch/open.
-The single writer makes the limit race-free. A recheck excludes its own exact
-Operation/binding.
-
-`task.dispatch`, `agent.send`, `reply`, `configure`, `goal`, `refresh`, `result`,
-`reconcile` and `recover` do not create another root claim. Adapter-native
-serialization and provider-native limits govern work inside an existing root.
-
-Delete after callers switch:
-
-- `CapacityLedger`, `CapacityEntry`, `ResourceEvidence` and phase merge code;
-- `capacity:*`, `capacity-entry:*` and refusal meta records;
-- v1/v2 capacity storage migration and encoded key helpers;
-- per-operation execution identity/event proof rows;
-- sync hooks from every Operation lifecycle transition.
-
-`report.capacity` becomes a bounded view over routes, current root claims, provider
-state and host resource facts.
-
-### B4 — `dispatch_once`, not observation replay
-
-Replace WorkDispatch reconciliation with:
+### B4 — `dispatch_once`
 
 ```text
-dispatch_once(automation_entry)
-  -> query ranked current Tasks
-  -> test a small bounded page
-  -> choose first eligible configured route
+dispatch_once(policy)
+  -> query a bounded ranked page
+  -> test candidates against current facts
+  -> select first eligible configured route
   -> atomically admit one launch
-  -> return Operation or current blocker reasons
+  -> return Operation or blocker reasons
 ```
 
-The admission transaction:
+The transaction validates manager/project/Task revision, creates or reuses Attempt,
+reserves the write lease, validates route/provider/root capacity and creates the
+launch Operation. External I/O follows after commit.
 
-1. validates manager/project/Task revision;
-2. creates or reuses current Attempt;
-3. reserves workspace/write lease;
-4. validates selected route/provider/root capacity;
-5. creates launch Operation with deterministic request identity.
+Delete WorkDispatch cursors, `PendingSubject`, catch-up state,
+`MAX_PENDING_SUBJECTS`, semantic launch slots, duplicate links, ordinary-blocker
+quarantine, mandatory preview digest and copied launch settings.
 
-External filesystem, Git and native I/O occur after commit through existing owners.
+## 5. One write authority
 
-Delete:
-
-- `GlobalWorkDispatchCursor`;
-- `WorkDispatchState`, `PendingSubject` and pending rechecks;
-- activation/catch-up cursors and `MAX_PENDING_SUBJECTS`;
-- semantic launch-slot and duplicate operation-link records;
-- WorkDispatch quarantine for ordinary blockers;
-- preview-digest binding in automated launch;
-- duplicated launch settings replaced by route aliases/current policy.
-
-Wake notifications merely cause another query; a safety wake recovers lost/coalesced
-notifications. A blocked Task never stalls a cursor behind it.
-
-Completion: 128 blocked Tasks do not hide a later eligible Task; Task revision needs
-no pending-copy repair; same Attempt cannot create two launches; fallback is explicit;
-disabling dispatch admits nothing new and cancels nothing active.
-
-## 5. Collapse advisory code scopes into workspace write leases
-
-Current `code.scope.*` is a separate product with proposal digests, revisions,
-overrides, expiry, paths, symbols, interfaces, indexes and overlap pages. Its own
-source states that it does not lock files, inspect Git or start work. Actual launch
-already reserves a workspace lease and calls `reject_scope_conflicts`.
-
-### C0 — simple scope semantics
+### C0 — simple Task scope
 
 - `TaskSpec.scope.initial_paths` → repository-relative write prefixes;
-- `TaskSpec.scope.forbidden_paths` → hard negative prefixes;
-- absent/empty initial paths → repository root;
+- `forbidden_paths` → hard negative prefixes;
+- empty initial paths → repository root;
 - review-only work → no write lease.
 
-Normalize separators and reject absolute paths, traversal, empty segments and `.git`.
-Use path-segment prefix comparison. `src/a` overlaps `src/a/file.rs`; it does not
-overlap `src/ab`.
+Normalize separators; reject absolute paths, traversal, empty segments and `.git`.
+Use path-segment prefix comparison. Symbols/interfaces/globs remain guidance only.
 
-Symbols/interfaces/globs are guidance, not concurrency authority. Remove
-`allowed_symbols` from the lease after callers migrate.
-
-### C1 — one launch-time decision
+### C1 — workspace lease is authority
 
 `reserve_lease_for_launch` checks overlap in the same transaction as Attempt/launch
-admission. Another active lease in the project with overlapping path prefixes blocks
-automatic launch and names the conflicting Task/Attempt/paths.
+admission. Another active overlapping project lease blocks automatic launch and names
+the conflicting Task/Attempt/paths.
 
-Do not add a generic override. Resolve intentional overlap by revising scope,
-settling/releasing one Attempt or assigning a non-overlapping slice.
+No generic override. Resolve overlap by revising scope, settling/releasing an Attempt
+or assigning a disjoint slice. Keep the lease while the candidate can change.
 
-The lease remains while the candidate can change and releases when the Attempt is
-accepted, abandoned or superseded, or after an explicit settled stop.
+Delete `coordination/code_scope.rs`, `store/code_scopes.rs`, `code.scope.*` public
+methods/catalog/schema, proposal digest, broad-scope acknowledgement, override,
+expiry, symbol authority and references from removal-target contract engines.
 
-Delete:
+## 6. Minimal process custody
 
-- `coordination/code_scope.rs`;
-- `store/code_scopes.rs`;
-- `code.scope.*` CLI/MCP/method-policy/catalog entries;
-- proposal digest, broad-scope acknowledgement, override and expiry;
-- code-scope references in removal-target contract/ratification engines.
-
-## 6. Simplify process ownership and recovery
-
-Current `swarm-process::module_owner` already uses owner-first Job/process-group
-custody. Keep it. CCCC's suspended-child primitive is useful only for a future proven
-child-first race; do not import it for this path.
-
-### D0 — one process owner record
+### D0 — one owner record
 
 Persist only:
 
@@ -468,132 +325,324 @@ Persist only:
 - Job/process-group identity;
 - parent/shared-service relation.
 
-Artifact version, build ID, protocol and full module-contract JSON remain
-installation/inventory facts. Verify bytes once at install/launch; authenticate
-ModuleLink; use binding/generation/boot for runtime ownership.
-
-Simplify `ModuleOwnerPlan` and `ProtectedResolverMap`. Keep path containment,
-no-link traversal, private permissions and exact credential scope.
+Package version/build/protocol/full module contract remain install/inventory facts.
+Verify bytes once at install/launch; authenticate ModuleLink; use
+binding/generation/boot for runtime ownership. Simplify `ModuleOwnerPlan` and
+`ProtectedResolverMap` while retaining path containment, no-link traversal and
+private permissions.
 
 ### D1 — conservative restart reconciliation
 
 - dead process → clear live record;
 - PID exists but birth/image/owner differs → clear record, kill nothing;
-- process cannot be inspected → retain `unknown`, retry later;
-- exact Eliot-owned leftover → route policy chooses recover/observe/terminate;
-- shared provider service → never terminate because one session disappeared.
+- uninspectable process → retain `unknown`, retry later;
+- exact owned leftover → route policy chooses recover/observe/terminate;
+- shared provider service → never kill because one session disappeared.
 
-Do not sweep by executable name, cwd, title, newest log or age. Do not hash the
-executable on every metric sample.
+Do not sweep by executable name, cwd, title, latest log or age. Do not hash executable
+bytes on every metric sample.
 
-## 7. One scheduling/admission loop, not scheduler products
+## 7. One scheduling/admission loop
 
 <a id="automation-and-delivery"></a>
 
-The repository currently contains:
+Current source has an in-process scheduler, a standalone scheduler service and another
+short-interval automation loop, plus optional-worker lifecycle slots.
 
-- `scheduler.rs`, an in-process timer handling static CheckRun schedules, automation
-  cron and Goal due state;
-- `store/automation_scheduler.rs` plus `swarm-automation-worker`, a second process
-  that pages/digests/admit the same due sources through its own credential, owner,
-  generation and process lifecycle;
-- `supervise_automation`, another two-second loop for automation actions/watches;
-- separate two-second launcher/native-MCP loops and an eleven-slot legacy worker
-  coordinator.
+### E0 — one schedule model
 
-### E0 — one current schedule model
-
-Use manager-owned automation entries as the retained schedule model. A schedule is:
+Use manager-owned automation entries:
 
 ```text
 entry_id
 enabled
 trigger = event | interval | cron
-typed retained action/settings
+typed action/settings
 last admitted occurrence
 next due time
 ```
 
-Keep typed actions; do not create a generic Store-method workflow language. Convert
-the operator `Config.schedules` CheckRun form into equivalent automation entries, then
-delete `ScheduleConfig` and `schedule_registry:v1`.
-
-Eliot Goal reminders use the same interval/cron occurrence mechanism but still emit
-ordinary `Send` Operations. Harness Goal remains native and independent.
+Convert static `Config.schedules` checks into equivalent entries; delete
+`ScheduleConfig` and `schedule_registry:v1`. Eliot Goal reminders use the same
+occurrence mechanism but emit ordinary `Send`; Harness Goal stays native.
 
 ### E1 — one in-process control loop
 
-Create one host-owned admission loop in existing host/scheduler code:
-
 ```text
-wait for Store-change notification or nearest due time
-  -> reconcile due schedule occurrences
-  -> dispatch_once for enabled work policies
-  -> reconcile review/repair/acceptance and watches
+wait for Store change or nearest due time
+  -> reconcile due occurrences
+  -> dispatch_once enabled policies
+  -> review/return_changes/accept/check/watch passes
   -> compute next due time
 ```
 
-All passes are bounded and commit ordinary Operations. They perform no native,
-filesystem, Git or network I/O. A slow safety wake (for example 60 seconds) recovers a
-lost/coalesced notification; no domain needs its own two-second poll.
+Passes are bounded and commit Operations; they perform no external I/O. A slow safety
+wake recovers lost/coalesced notifications.
 
-Failure in one malformed subject is returned as that subject's visible gap/quarantine
-where already supported. SQLite/kernel failure stops the loop. Do not invent a
-generic supervisor DSL or per-domain cursor framework.
+### E2 — delete standalone scheduler service
 
-### E2 — delete the standalone scheduler service
+Delete `swarm-automation` worker executable/config/credential lifecycle,
+`store/automation_scheduler.rs` page/admit service, declared scheduler scope,
+owner/generation/config digest/process group/readiness, worker slot/demand, service
+qualification and duplicate due snapshots/quarantine.
 
-Delete after occurrence parity:
+### E3 — keep workers only for external effects
 
-- `crates/swarm-automation` worker executable/config/credential logic;
-- `store/automation_scheduler.rs` page/admit service;
-- declared automation-scheduler service scope and registration;
-- scheduler owner/generation/config SHA/process group/readiness protocol;
-- `AutomationScheduler` slot and demand flag;
-- R48 scheduler qualification and service-specific remediation fixtures;
-- duplicate due snapshots, source digests and scheduler quarantine used only by that
-  service.
+Remove built-in executor/MCP/timer workers as their routes migrate. Retain checks,
+scripts, Forge, launcher and adapters only while they perform or recover real external
+I/O/custody.
 
-Keep one in-process timer owner. Store retains due/occurrence rows and idempotent
-Operation admission.
+## 8. Compact model-visible work
 
-### E3 — shrink optional workers to actual effect owners
+### F0 — one `TaskPacket`
 
-After route migrations and scheduler consolidation:
+Edit:
 
-- remove built-in OpenCode/Zed workers when their standalone/current routes own work;
-- remove native-MCP workers when MCP setup becomes adapter-internal;
-- remove Scheduler/AutomationScheduler/Automation slots replaced by the control loop;
-- keep checks, scripts, Forge, launcher and adapters only while they perform real
-  external effects or recover such effects.
+- `store/task_prompt.rs`;
+- `swarm-contracts/src/task_prompt.rs`;
+- `store/launcher_dispatch.rs`;
+- dispatch decoders in retained adapters.
 
-A worker lifecycle is justified by isolated external I/O/custody, not by a timer or
-a Store query.
+Render only current actionable context:
 
-## 8. Extract shared adapter plumbing only after proof
+```text
+Goal
+Requirements and review/check criteria
+Current phase: initial | continue | correct
+Selected source references/excerpts
+Write and forbidden paths
+Worktree, branch and baseline
+Selected route/model/effort
+Deliverable and completion checks
+Current correction or resume facts when applicable
+```
+
+Do not inject canonical Task JSON, launch manifest, binding generation, proof digests,
+full issue history or every MCP schema into model text.
+
+### F1 — Store identity stays in Store
+
+A dispatch carries retained Operation ID plus rendered body. Store resolves Task,
+Attempt, revision, binding and workspace through the Operation. Delete repeated
+`task_snapshot_sha256`, `source_text_sha256`, `source_text_bytes`, prompt hashes and
+nested contexts where they only echo Store-owned data.
+
+Keep a content hash only where exact persisted bytes require integrity. Adapters may
+verify the body they actually submit; they do not re-prove every Store relation.
+
+### F2 — one renderer for initial, correction and resume
+
+Initial assignment, correction and session recovery use the same renderer with a
+small phase-specific section. A correction contains the complete current actionable
+findings set. Resume contains only facts changed since the retained Attempt/candidate.
+Do not append historical packets or addendum chains.
+
+## 9. Review, correction and acceptance without workflow copies
+
+### G0 — `review_once`
+
+Query current candidates missing required independent review and admit at most one
+`review.assign` per exact candidate/auditor slot. Do not copy the submission into a
+review workflow state machine.
+
+### G1 — one `task.request_changes` transition
+
+`review.submit` retains verdict and all findings for one candidate.
+`task.request_changes` verifies the exact current candidate/review, sets the Attempt
+to `needs_correction`, stores one cause/findings set and optionally admits one child
+`agent.send` to a live binding.
+
+If no binding is live, the Task state remains sufficient; the next dispatch/resume
+renders the same correction. No pending-repair queue is needed.
+
+### G2 — bounded correction rounds
+
+Candidate B requires review B. Identical candidate identity after a correction is
+`no_progress`, not a fresh successful round. Count correction rounds in Attempt
+lifecycle and escalate to manager attention after the configured bound.
+
+### G3 — `accept_once`
+
+Automation queries candidates whose exact retained review/check evidence satisfies
+policy and invokes the same Store acceptance gate as manual `task.accept`. It does
+not construct caller-authored evidence arrays or a second acceptance semantics.
+
+### G4 — reduce automation steps
+
+Retain thin policy toggles only:
+
+```text
+dispatch
+review
+return_changes
+accept
+check
+goal_message
+script
+```
+
+Delete `ReviewDisposition`, `RepairDispatch`, publication and GitHub-projection
+workflow states, cursors, semantic slots, duplicate links, findings packages and
+ordinary blocker quarantine. Explicit accepted-candidate publication remains an
+integration, not a lifecycle stage.
+
+## 10. One public API route and one authorization owner
+
+Current method handling is duplicated across `METHOD_REGISTRY`, MCP catalog/profile,
+`model::validate_mutation`, `Store::call`, `Store::apply`, participant special cases,
+`mcp_authorization` and `OPERATION_VISIBILITY_SQL`.
+
+### H0 — split three protocols
+
+Keep distinct:
+
+1. **Application API** — manager/participant reads and mutations.
+2. **Internal host protocol** — module/supervisor/bus/service calls using typed
+   internal enums, never MCP/public method registry.
+3. **Adapter protocol** — typed semantic `AdapterCommand` and adapter deliveries.
+
+Remove internal and vendor-native names from the public registry. Remove optional
+products (`code.scope`, Concilium, contract ratification/ACK, managed-label
+projection) before designing the final public table.
+
+### H1 — domain-owned typed handlers
+
+For each retained public domain, define one current request enum/parser and one
+handler that performs:
+
+```text
+parse -> authenticate role -> authorize exact object/revision -> mutate/read
+```
+
+The central router dispatches to the domain and does not repeat field schemas or
+object rules. `METHOD_REGISTRY` may retain only small public classification needed by
+CLI/MCP discovery; delete coarse `ParticipantAccess` once domain handlers own exact
+rights.
+
+Do not create a generic policy DSL or generated method framework.
+
+### H2 — Operation scope, not method-name visibility SQL
+
+At Operation admission retain normalized scope needed for reads:
+
+```text
+project_id
+task_id / attempt_id / candidate when applicable
+owner/caller
+binding/generation when applicable
+integration subject when applicable
+```
+
+Generic Operation visibility uses these facts plus current grants. Delete method-name
+`LIKE`/`IN` branches, automation meta joins and historical product exceptions from
+`OPERATION_VISIBILITY_SQL` as their producers disappear. Domain-specific sensitive
+reads still use their domain authorizer.
+
+### H3 — remove a surface completely
+
+Every removed method disappears together from:
+
+- Store router/apply/read;
+- method policy and participant projection;
+- MCP schema/catalog/profile;
+- CLI/help/examples;
+- Operations/capacity/automation consumers;
+- tests and compatibility fixtures.
+
+Completion: adding one retained public method edits one domain handler and its actual
+frontend schema, not five independent allowlists.
+
+## 11. Numeric migrations, not source-text compatibility
+
+Current Store binds database identity to exact `001_core.sql` SHA, keeps
+`user_version=1`, digest-pins extensions, and implements special Rust verifiers for
+009/010/011. The script migration builds a reference database and contains a custom
+SQL lexer; failure/cancel migrations duplicate trigger-verification modules.
+
+SQLite already provides application-owned `application_id` and `user_version`; use
+them as intended. Run missing changes in one `IMMEDIATE` transaction.
+
+### I0 — one migration ledger
+
+Add a small current table:
+
+```sql
+CREATE TABLE schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_at_ms INTEGER NOT NULL
+);
+```
+
+`application_id` identifies Eliot. `user_version` and the highest migration row name
+the current schema version. New databases apply the ordered migration list from zero;
+existing databases apply only missing versions.
+
+Keep migration SQL immutable after release, but do not compare the current binary's
+base SQL text with the database on every open.
+
+### I1 — finite bridge from existing markers
+
+For one release, inspect existing `application_id`, `user_version`, known tables,
+columns and old `schema_extension:*` markers. If they match one supported current
+state, record the corresponding numeric migrations transactionally. Unknown or
+inconsistent state fails with an explicit diagnostic.
+
+This bridge supports only concrete known deployed states. After those databases move,
+delete old digest-marker readers and bridge fixtures. Do not build a generic old-SQL
+canonicalizer.
+
+### I2 — delete exact-DDL machinery
+
+Delete:
+
+- `SchemaIdentity::digest`, `schema_digest` write/read/verification and
+  `SchemaDigestMismatch`;
+- exact base-schema verification in status reader;
+- generic extension SQL-digest comparison;
+- `script_event_schema.rs` reference DB, DDL tokenizer and shape comparator;
+- separate failure/cancel trigger verifier modules and duplicate tests;
+- per-migration source-SHA markers once bridged.
+
+A normal migration may perform explicit precondition queries and postcondition checks
+for the columns/indexes it changes. Optional startup health can use bounded
+`foreign_key_check`/`quick_check`; it must not reconstruct a second schema compiler.
+
+### I3 — reader compatibility
+
+Read-only Store connections validate:
+
+- application ID;
+- supported current schema version;
+- query-only/WAL-visible connection settings.
+
+They do not require exact bundled base SQL bytes. Writer startup applies migrations
+before readers open.
+
+Completion: formatting or equivalent DDL changes cannot brick a compatible database;
+partial migration rolls back; unsupported versions fail before normal work; no custom
+SQL lexer/reference DB runs on every startup.
+
+## 12. Extract adapter plumbing only after proof
 
 <a id="processes-and-frontends"></a>
 
-Use Antigravity plus one second small current Rust route to prove common code. Claude
-`OwnedBootstrap` is a bootstrap candidate; it is not automatically a delivery-spool
-candidate.
+Use Antigravity plus one second small current Rust route. Claude `OwnedBootstrap` is a
+bootstrap candidate, not automatically a spool candidate.
 
-Extend existing owners rather than creating an adapter-framework crate:
+Extend existing owners:
 
 - `swarm-process::module_owner` returns verified binding/generation/boot, state dir,
   client/credential and selected protocol/capabilities;
 - `swarm-client::ModuleLink` owns Eliot connect/hello, command pull and exact
-  redelivery of already retained Store messages.
+  re-delivery of already retained Store messages.
 
-The shell does not own native session state, native command queue, result association,
-uncertain-effect readback, Tasks, timers or scheduling.
+The shell does not own provider session, native command queue, result attribution,
+uncertain-effect readback, Tasks, timers or scheduling. Extract only when two routes
+adopt it and delete both old outer loops in the same slice.
 
-Extract only when two routes adopt it in the same change and delete their old env
-parsing, hello equality checks and outer delivery loops.
+## 13. Typed semantic adapter protocol
 
-## 9. Typed semantic adapter protocol
-
-Target closed commands:
+Target commands:
 
 ```text
 Open
@@ -611,84 +660,58 @@ Reconcile
 Shutdown
 ```
 
-A route declares supported actions and scopes. Unsupported actions fail before native
-I/O. Vendor-only operations remain private.
+Unsupported actions fail before native I/O. Vendor-only operations stay private.
 
-Remove public/common internal names:
+Remove public/common internals:
 
 - `native.opencode.loop_step` → `Send { steer }`;
-- `native.command.cancel_turn` → `Cancel { turn }`;
-- `native.command.close_session` → `Shutdown`;
-- `native.command.release_evidence` → adapter cleanup;
+- Command cancel/close → `Cancel`/`Shutdown`;
+- release-evidence → adapter cleanup;
 - `native.mcp.*` → OpenCode adapter setup/observation.
 
-`Recover` remains explicit for known-session restoration without input replay.
-`Reconcile` remains readback for an uncertain effect.
+`Recover` restores a known session without input replay. `Reconcile` reads an
+uncertain effect. Hello becomes protocol major plus capability subset; delete package
+version/schema ladders and full descriptor echo. Outcomes retain Operation,
+generation/boot, native IDs, disposition and bounded details—not package/protocol/
+request hashes.
 
-Simplify hello to one current protocol major plus capability subset. Delete artifact
-version/schema profile ladders and full descriptor echo/comparison.
+## 14. One executor per harness
 
-Simplify outcomes to Operation ID, generation/boot, disposition, native IDs and
-bounded details. Do not repeat package/protocol/request hashes. Keep content hashes on
-actual immutable bytes.
-
-## 10. Retain one executor per harness
-
-- OpenCode: standalone Rust route; remove built-in host executor, legacy demand and
-  public MCP phases.
-- Codex: current Rust app-server route; remove Python executor/SDK/fixtures after
-  concrete old work is disposed.
-- Muse: choose Node or Rust by complete behavior and total maintained Rust+JS+glue;
-  delete the other.
-- Claude: one Rust adapter with thin supported SDK driver; delete retained Node
-  generations.
-- Command: one current Batch profile plus one current ACP generation; remove profile
-  ladders.
-- Antigravity: one current warm-stream implementation after A0–A3.
+- OpenCode: standalone Rust; remove built-in executor, legacy demand and public MCP
+  phases.
+- Codex: Rust app-server; remove Python executor/SDK/fixtures after concrete old work
+  is disposed.
+- Muse: select Node or Rust by complete behavior and total maintained code; delete the
+  other.
+- Claude: one Rust adapter with thin current SDK driver; delete old Node generations.
+- Command: one current Batch and one current ACP generation; remove profile ladders.
+- Antigravity: one current warm-stream route after A0–A3.
 
 Historical records do not keep an executor alive.
 
-## 11. Preserve Harness Goal and Eliot Goal
+## 15. Goals and passive observation
 
 <a id="harness-goals-and-the-eliot-goal-plugin"></a>
 
-Harness Goal maps through adapter `Goal` and is default where supported. Native
-set/resume may start a turn; associate it with the initiating Operation.
+Harness Goal maps through adapter `Goal` and is default where supported. Eliot Goal is
+an independent occurrence that sends an ordinary message Operation. Remove provider
+branches, pseudo-Goal continuation and Goal proof packets. Disabling Eliot Goal,
+pausing native Goal, cancelling a turn and clearing queued input remain independent.
 
-Eliot Goal becomes a small automation action:
+Adapters read native events and provider-local JSON/JSONL/SQLite. Host adds process
+and Git facts. Store joins Task/Attempt/Operation, binding, native session, process,
+worktree/branch/HEAD, remote ref, source cursor/gaps and provider usage.
 
-```text
-due/event occurrence -> ordinary Send message -> one Operation
-```
-
-Remove provider branches, OpenCode pseudo-Goal continuation, objective approval
-hashes and Goal-specific continuation proof packets. Replaying one occurrence returns
-the same Operation; a later occurrence may intentionally repeat text. Disabling the
-plugin, pausing native Goal, cancelling a turn and clearing queued input are
-independent.
-
-## 12. Passive observation and quotas
-
-Adapters fold native events and read provider-local JSON/JSONL/SQLite. Host adds OS
-process and Git facts. Store joins Task/Attempt/Operation, binding, native session,
-process, worktree, branch/HEAD, remote ref, source cursor/gaps and provider usage.
-
-Configured readers run without a Task/binding. Unmatched sessions remain inventory,
-not assigned work. `agent.list/state/family/usage` read Store without provider calls.
-
+Configured readers run without Task/binding; unmatched sessions remain inventory.
 Use selective `sysinfo` refresh and exact OS birth identity. Remove per-sample
-executable hashing and small diagnostic fleet limits. Shared services and account
-quota appear once, not once per session.
+executable hashing. Provider reads are byte/record/time bounded; source failure is a
+gap, not an empty fleet. Fix restart connection reset for every unreleased binding and
+preserve source identity in follow events.
 
-Provider readers are byte/record/time bounded. JSONL cursors stop at complete
-records; SQLite uses short read-only WAL-visible connections. Source failure records a
-gap, not an empty fleet.
+## 16. Remaining Store and product reduction
 
-Fix startup connection reset for every unreleased binding. Preserve source identity
-in follow events. A late source sequence may enter history without replacing newer
-current state.
-
-## 13. Launch, results, review and Store reduction
+<a id="store-and-current-data"></a>
+<a id="identity-and-hashes"></a>
 
 Make launch preview optional. Store resolves one launch plan under the Operation;
 remove caller-supplied plan hashes. First dispatch requires current assignment,
@@ -700,64 +723,52 @@ Keep one result path:
 Result -> module.result -> immutable artifact -> artifact.read/assemble -> submission
 ```
 
-Move independent review/check evidence into the common acceptance gate for the exact
-candidate. Candidate B cannot reuse A's review.
+Keep one Store writer; move pure bounded reads to WAL readers. Never hold Store
+transactions across external I/O or client pagination.
 
-Keep one Store writer. Move pure bounded reads to existing WAL readers. Do not hold a
-transaction across external I/O or pagination.
-
-Replace base-SQL text SHA with application ID, schema version and explicit migrations.
-Move retained indexed identity/state/due fields out of `meta`; bounded payload JSON
-may remain in its owning row. Do not add an ORM/EAV store.
-
-Give automation an immutable `entry_id`; transfer updates owner/revision in one
-transaction. Delete successor copies, journal relocation, transfer chains and cycle
-logic.
+Give automation immutable `entry_id`; transfer updates owner/revision in one
+transaction. Delete successor copies, journal relocation, chains and cycle logic.
 
 Remove from compact-core completion:
 
-- Concilium/council state;
-- generic integration ratification/ACK;
+- Concilium/council;
+- generic contract/integration ratification and ACK;
 - automatic publication/Issue-label projection;
 - document-edition rights and legacy acceptance behavior;
 - retired installers/provenance equality/duplicate validators;
 - host dependencies on worker implementation crates after contracts move.
 
-<a id="store-and-current-data"></a>
-<a id="identity-and-hashes"></a>
-
-## 14. Current format and existing data
+## 17. Finite transition
 
 <a id="current-format-and-existing-data"></a>
 
 Backward compatibility is not a product feature. Before deleting a protocol,
-executor or storage path, enumerate concrete unsettled Operations and required
+executor, method or storage path, enumerate concrete unsettled Operations and required
 results. Finish/read back with the current owner, export the result, or create a new
 Task revision/Attempt. Then remove producer, reader, schema branch, config, fixture
 and package together.
 
-Do not write generic converters for hypothetical old data. Completed history may
-remain opaque when current projections already hold required facts; it does not keep
-runtime code alive.
+Do not write converters for hypothetical history. Completed history may stay opaque
+when current projections retain required facts; it does not keep runtime code alive.
 
-## 15. Verification
+## 18. Verification
 
 <a id="verification"></a>
 
-Run scoped checks for the changed boundary.
-
 | Boundary | Required proof |
 | --- | --- |
-| Antigravity A0–A3 | v6 is the sole active coordinate; first dispatch needs no proof refresh; terminal outcome survives Eliot disconnect; no native replay; removed proof/handlers have no callers. |
-| Queue/route | deterministic `why_ranked`; blocked Tasks do not stall later work; fallback uses only configured aliases; no silent model/provider change. |
-| Provider state | first unobserved probe works; transient hold opens one probe after time; hard negatives persist until source/config change; stale source is visible, not permanent hidden denial. |
-| Capacity | concurrent root admissions cannot exceed limit; existing root rechecks exclude self; readback/result/refresh create no claims; old ledger/meta keys are gone. |
-| Workspace scope | overlapping writers cannot launch; disjoint prefixes can; review-only has no write lease; `code.scope.*` is absent. |
-| Scheduling | one timer/admission loop; restart/lost wake recomputes due work; same occurrence admits once; standalone scheduler process/credential/projection is absent. |
-| Adapter protocol | two current adapters use typed commands/common bootstrap; rights still reject unauthorized calls; optional action changes no Core artifact profile. |
-| Results/review | exact input/result attribution; stream gap stays unknown; manual/automatic acceptance use same candidate-specific evidence. |
-| Deletion | no config, package, CI, docs or fallback wrapper for removed paths; report net owned Rust+JS+glue separately from tests. |
+| Antigravity A0–A3 | v6 only; first dispatch needs no proof refresh; terminal outcome survives Eliot disconnect; no native replay; removed proof/handlers have no callers. |
+| Queue/route/provider/capacity | deterministic reasons; blockers do not stall later Tasks; fallback is explicit; provider freshness is honest; concurrent root admission respects limit; old ledgers are gone. |
+| Workspace/process | overlapping writers cannot launch; disjoint prefixes can; review-only has no lease; PID reuse cannot kill foreign process; uninspectable owner remains unknown. |
+| Scheduling | one due/admission loop; lost wake recomputes current state; same occurrence admits once; standalone scheduler service is absent. |
+| TaskPacket | model receives only actionable bounded work; initial/correction/resume share renderer; Store identity and repeated hashes are absent from prompt/adapters. |
+| Review/correction | all findings return together; B cannot reuse A review; identical corrected candidate becomes no-progress; automation uses common Store transitions. |
+| Public API | each retained method has one domain parser/authorizer/handler; internal/adapter protocols are separate; removed surfaces have no MCP/CLI/policy/visibility remnants. |
+| Migrations | new and bridged DBs reach one numeric version transactionally; equivalent SQL text does not block open; partial migration rolls back; readers reject unsupported versions. |
+| Adapter protocol/executors | two current adapters prove shared plumbing; rights still reject unauthorized calls; one executor per retained harness. |
+| Observation/results | unbound sessions and source gaps remain visible; exact input/result attribution; uncertain stream stays unknown; complete result path is singular. |
+| Deletion | no config, package, CI, docs or fallback wrapper remains; report net owned Rust+JS+glue separately from tests. |
 
-Documentation changes run content/link checks. Runtime slices start with formatting
-and minimal affected warnings-denied Clippy/build checks. Focused connected tests run
-when the slice closes; broad qualification follows the complete product path.
+Documentation changes run content/link checks. Runtime slices start with formatting and
+the minimal affected warnings-denied Clippy/build. Focused connected cases run when
+the slice closes; broad qualification follows the complete product path.
