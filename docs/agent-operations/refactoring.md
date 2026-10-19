@@ -1,7 +1,7 @@
 # Refactoring — Source Findings
 
 Runtime source was rechecked through
-`96a0d5a6632cfbd541e804d7969d3e76e716bf6a` on 2026-10-19.
+`9c28fb75009cc4f871db591ffa85a76a6f363db4` on 2026-10-19.
 [Architecture](architecture.md) owns the product boundary;
 [implementation](implementation.md) owns the only work order;
 [status](../implementation-status.md) records completed source changes.
@@ -178,7 +178,61 @@ can therefore queue behind or in front of unrelated mutations. Resolve authoriza
 on a WAL reader and operate the bounded ring outside the writer; revalidate every read
 and clear link-owned viewers on disconnect.
 
-### 22. Automation identity and optional product breadth remain excessive
+### 22. CheckRun still has two execution owners
+
+`CheckConfig.executor` is optional. New work with a pin launches standalone
+`swarm-checks`; absence still falls through to host `checks::worker::prepare_and_spawn`
+and the hidden root `check-worker`. Reconciliation branches again between
+`standalone_host::finalize_execution` and `worker::completion`.
+
+The low-level `swarm-checks::execute_with_plan` is already used by both paths, so the
+remaining duplication is bootstrap, worker identity/start files, direct child custody,
+packaging and recovery routing—not Check semantics. Require the standalone path for
+new CheckRuns and keep legacy receipts as finite readback only.
+
+The hidden host `check-worker` is also used by source/tool-version and Git-hook probes.
+That prevents deleting it with the full CheckRun fallback. Move those bounded probes
+to the selected check executable first; do not create another probe service.
+
+### 23. ScriptRun has one executor but two wire definitions
+
+New ScriptRuns already reject missing standalone worker pins; `None` survives only to
+decode old Work receipts. The hidden host script-worker entrypoint simply calls the
+standalone crate.
+
+Host `scripts::runner::Work` and worker `ScriptWork` are documented as intentionally
+wire-compatible but are independently defined. Executor pin, start decision,
+post-allow plan and completion coordinates are similarly repeated. The result is two
+validators and legacy Go/Deny branches around one execution route. Make
+`swarm-scripts` the existing domain DTO owner and remove the compatibility entrypoint
+and old readers after finite disposition.
+
+### 24. Forge combines two legitimate effects but repeats custody and hashes
+
+Local workspace Git reads/preparation and remote publication are different effects.
+Keeping local bounded Git in the host and remote push/readback in
+`swarm-forge-worker` is valid. The current Store owner, however, carries both blocking
+Git closure custody and standalone native-worker custody in one large file, while the
+worker implements another capture/termination loop.
+
+`ForgeExecutionPreparation::capture` hashes both the Forge worker and Git executable
+before an effect is admitted. Script and Check launch paths also hash selected worker
+binaries; Script retains the pin and the worker verifies it again. These full file
+reads repeat package installation checks on every Operation.
+
+Use installed package identity once, OS process identity for custody and content
+hashes only at actual immutable byte boundaries. Keep exact target serialization and
+remote-ref readback; remove per-effect executable digests and duplicate capture code.
+
+### 25. Existing OS primitives are sufficient
+
+`swarm-process` already owns Group/Job/process birth identity, bounded capture and
+private atomic files. Check and Script use them; Forge can use the same physical
+primitives. A new universal EffectRunner, workflow or receipt is not justified:
+Check coverage/verdict, Script result/effects and Git remote-ref reconciliation are
+different domain semantics.
+
+### 26. Automation identity and optional product breadth remain excessive
 
 Automation transfer clones entries and relocates journals because owner/name is part
 of identity. Concilium, contract/integration ratification/ACK, automatic publication/
@@ -202,6 +256,8 @@ outside compact-core completion.
 - One MCP exposure catalog is not automatically duplicate authorization; parallel
   routing/authorization ownership is the defect.
 - `stream.*` live content is not the same domain as durable `monitor.follow` history.
+- Check, Script and Forge do not share one business workflow merely because all spawn
+  processes.
 - Schemars is not a proven net deletion for current MCP inputs.
 - Octocrab is optional; current `gh` is not a giant HTTP implementation.
 - Result-page retention before ACK is necessary.

@@ -3,7 +3,7 @@
 ## Current state
 
 **Overall: PARTIAL_PROGRESS.** Runtime source was audited through
-`96a0d5a6632cfbd541e804d7969d3e76e716bf6a`; this commit changes documentation only.
+`9c28fb75009cc4f871db591ffa85a76a6f363db4`; this commit changes documentation only.
 `main` contains one completed runtime reduction and a source-backed refactoring
 program.
 
@@ -30,9 +30,10 @@ qualification.
 | Public method routing/authorization ownership | deep structural review; no full privilege matrix execution |
 | Store schema/migration ownership | deep structural review; corruption/upgrade matrix not fully executed |
 | IPC/MCP multiplex, subscriptions, task projection and native streams | deep source review; live load not qualified |
-| Passive observation and executor duplication | architecture plus selected source paths |
+| Check, Script and Forge execution ownership | deep source review; one-executor deletions specified |
+| Passive observation and harness executor duplication | architecture plus selected source paths |
 | Claude, Codex, Command, Muse and OpenCode internal state machines | partial targeted review |
-| Checks, scripts, Forge, GitHub effects, mailbox/coordination and gateway | partial |
+| GitHub effects, mailbox/coordination and gateway | partial |
 | Installed/native behavior, Windows custody and scale | unqualified except named historical receipts/open issues |
 
 “Architecture audit mostly complete” is accurate. “All code and runtime behavior
@@ -63,7 +64,9 @@ H0-H3  split public/internal/adapter protocols; one domain authorizer
 I0-I3  numeric migrations; remove SQL-text compatibility
 J0-J3  concurrent MCP IPC, one wake pump, exact pending-input read,
        native content ring off writer
-K-L    shared adapter shell after proof, one executor per harness, Goals,
+K0-K4  one Check executor, one Script wire protocol, one Forge remote-effect owner,
+       no per-Operation executable hashing
+L-M    shared adapter shell after proof, one executor per harness, Goals,
        passive observation and remaining Store/product deletion
 ```
 
@@ -86,31 +89,44 @@ K-L    shared adapter shell after proof, one executor per harness, Goals,
 | MCP subscriptions | up to 16 pollers/forwarders/queues per session mirror durable facts | one coalesced wake pump; Store cursor is authority |
 | MCP task projection | `tasks/get` scans every `report.attention` page | exact Operation/binding pending-input read |
 | Native streams | ephemeral ring operations run on the single Store writer | reader authorization plus ring operation outside writer |
+| Checks | optional executor leaves standalone and hidden-host execution active | standalone `swarm-checks` for all new work; old host receipts readback only |
+| Check probes | source/tool/Git-hook probes still spawn hidden host `check-worker` | bounded modes in selected check executable; no probe daemon |
+| Scripts | one standalone executor but duplicated host/worker DTOs and hidden compatibility entrypoint | shared `swarm-scripts` wire types and finite deletion of old readers |
+| Forge | valid local/remote split, but large mixed custody, custom capture and per-effect worker/Git hashes | one remote worker, bounded local Git, shared OS primitives, install-time package verification |
 | Observation | unbound joined Governor view incomplete; metric hashing remains | local provider+OS+Git view without provider calls |
 | Product breadth | council, ratification/ACK and automatic projection remain | outside compact-core completion |
 | Tooling | compiler/checkout/cache equality and artifact validators remain | generic package boundary plus route-specific live qualification |
 
 These are findings and planned deletions, not completed runtime repairs.
 
-## IPC/MCP audit result
+## External-effect audit result
 
-The host IPC server already bounds connections, in-flight requests, frames and write
-time and drains admitted work after disconnect. The client already correlates
-concurrent out-of-order replies and never replays an uncertain request. Do not replace
-it with a broker.
+The domain boundaries are not identical:
 
-The unnecessary complexity is above that boundary:
+- CheckRun owns profile/input resolution, cancellation, coverage and verdict;
+- ScriptRun owns bundle/interpreter/input/result schema and controller effects;
+- Forge owns exact accepted candidate, repository/ref serialization and unknown push
+  readback.
 
-- MCP holds its client-slot mutex during the whole awaited request, reserializing the
-  multiplexed client;
-- one MCP session can create 16 independent 250 ms subscription pollers and queues;
-- lag handling scans additional Store pages to count dropped category matches even
-  though notifications are documented as hints;
-- `tasks/get` pages global attention state to find one Operation;
-- ephemeral native stream publication/read uses the writer thread.
+Their common boundary is only physical process custody/capture/private files, already
+owned by `swarm-process`. Therefore the target is not a universal runner. It is one
+execution route and one wire contract per domain, with package verification outside
+each Operation.
 
-The implementation now defines J0-J3 to remove these layers without changing
-uncertain-effect semantics.
+Current source confirms:
+
+- `swarm-checks::execute_with_plan` is called by both standalone and hidden-host paths;
+- Check Store selects standalone only when `CheckConfig.executor` is present and
+  otherwise launches the host as `check-worker`;
+- new ScriptRuns already reject missing standalone pins; `None` is historical only;
+- Script host and worker duplicate compatible Work/plan/start/completion types;
+- Forge has a standalone remote worker and a separate legitimate local Git closure,
+  but repeats process/capture code and hashes worker/Git executables in per-effect
+  preparation;
+- Script host verifies the worker pin and the worker verifies the selected executable
+  again.
+
+Implementation K0-K4 defines the connected deletions.
 
 ## Runtime evidence retained
 
@@ -120,22 +136,21 @@ Historical receipts remain scoped to their named artifacts/revisions:
 - [connected Store batch cases](remediation/2026-10-13/CONNECTED-STORE-BATCH-VERIFICATION.json);
 - [Antigravity EOF settlement](remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
 
-They do not qualify the planned protocol, TaskPacket, queue, correction flow, MCP
-simplification, passive observation, executor deletion or installed fleet.
+They do not qualify the planned protocol, TaskPacket, queue, correction flow, MCP or
+external-effect simplification, passive observation, executor deletion or installed
+fleet.
 
 ## Remaining audit tracks before a complete current-head claim
 
 1. Complete per-adapter state-machine audit for current Claude, Codex, Command ACP,
    Muse, OpenCode and Antigravity and select executor retirements.
-2. Trace every external effect owner: native prompts, process launch/kill, filesystem,
-   Git, GitHub, checks and scripts; verify one retry/readback owner and no guessed replay.
-3. Execute the public method → role → exact object → Store/effect matrix, especially
-   removed-product boundaries and participant/GM projections.
-4. Execute migration/corruption/partial-upgrade cases against concrete retained DB
+2. Finish GitHub/mailbox/gateway effect tracing and execute the public method → role →
+   exact object → Store/effect matrix.
+3. Execute migration/corruption/partial-upgrade cases against concrete retained DB
    states after the numeric migration slice is implemented.
-5. Measure IPC/Store fairness and writer occupancy after J0-J3; current source review
-   identifies the mechanisms but is not a load qualification.
-6. Perform owner-machine qualification for native restart, Windows process-family
+4. Measure IPC/Store fairness and writer occupancy after J0-J3; current source review
+   identifies the mechanisms but is not load qualification.
+5. Perform owner-machine qualification for native restart, Windows process-family
    custody, mixed-provider execution and scale. Open Issues #1, #3, #4, #5, #11,
    #140 and #159 remain evidence boundaries.
 

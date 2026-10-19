@@ -2,7 +2,7 @@
 
 This is the only implementation program for the
 [architecture](architecture.md). Runtime source was rechecked through
-`96a0d5a6632cfbd541e804d7969d3e76e716bf6a` on 2026-10-19.
+`9c28fb75009cc4f871db591ffa85a76a6f363db4` on 2026-10-19.
 [Findings](refactoring.md) retain source evidence; [status](../implementation-status.md)
 records what actually landed.
 
@@ -33,11 +33,12 @@ progress unless a current caller uses it and the superseded path disappears.
 | Workspace/write authority | `store/workspace.rs` plus `crate::workspace` |
 | Queue, route choice and launch admission | existing Store launcher owner |
 | Time-based admission | one in-process host loop; Store owns due/occurrence state |
-| Checks, scripts, Git/Forge and GitHub effects | existing dedicated effect owners |
+| Check, Script and Forge semantics | their existing Store/domain owners; OS execution belongs to one selected worker/path per domain |
 | Public CLI and MCP | `swarm-cli` and `swarm-mcp`, calling Store handlers |
 
 No adapter accepts a Task or interprets review. No common shell owns a provider
-session, native retry policy, scheduler or transcript store.
+session, native retry policy, scheduler or transcript store. No generic external-
+effect runner owns CheckRun, ScriptRun or Git publication semantics.
 
 ## 2. Executable order
 
@@ -55,8 +56,10 @@ H0-H3  split public/internal/adapter protocols; one domain authorizer
 I0-I3  numeric Store migrations; delete SQL-text compatibility
 J0-J3  concurrent MCP IPC, one notification pump, exact task-attention read,
        ephemeral native streams off the Store writer
-K       shared adapter shell only after two current routes delete duplication
-L       one executor per harness, Goals, passive observation and remaining deletion
+K0-K4  one Check executor, one Script protocol, one Forge remote-effect owner,
+       package verification outside each Operation
+L       shared adapter shell only after two current routes delete duplication
+M       one executor per harness, Goals, passive observation and remaining deletion
 ```
 
 A later section does not block an earlier vertical slice unless the earlier slice
@@ -317,7 +320,94 @@ durable observations: it is bounded live content, not another event journal.
 Do not add a broker. Keep host IPC's existing bounded concurrent server, frame limits,
 write timeout and “admitted work drains after disconnect” semantics.
 
-## 10. K-L — adapter consolidation, Goals, observation and remaining deletion
+## 10. K — one physical owner per external-effect domain
+
+Checks, scripts and Forge legitimately have different admission/result semantics.
+They do not need a universal EffectRunner. They do need one selected execution path
+and one cross-process contract each.
+
+### K0 — one CheckRun executor
+
+`CheckConfig.executor` currently selects standalone `swarm-checks`; absence falls back
+to the hidden host `check-worker`. Make the standalone worker mandatory for every new
+CheckRun when checks are enabled. `None` remains readable only for concrete
+pre-cutover Work receipts.
+
+Keep `swarm-checks::execute_with_plan` as the Check process/capture implementation.
+Delete the new-work `None => worker::prepare_and_spawn` branch, the root-host full
+CheckRun worker entrypoint, duplicate child custody for that path and its packaging/
+fixtures. Keep Store admission, profile/input/source verification, CheckRun state and
+result validation in the host.
+
+Do not delete bounded source/tool probes accidentally: `checks/inputs.rs` and the Git
+hook also use the hidden `check-worker` protocol. Move those probe modes to the
+selected `swarm-checks` executable (or an existing `swarm-process` child primitive)
+first, then remove the hidden host command. One check-domain executable is enough; do
+not add a probe daemon.
+
+### K1 — one ScriptRun protocol
+
+New ScriptRuns already require `swarm-script-worker`; `None` exists only for old
+receipt reconciliation. Make that distinction explicit in config/admission and remove
+the hidden host `script-worker` compatibility entrypoint after concrete old runs are
+disposed.
+
+Host `scripts::runner::Work` and worker `ScriptWork` deliberately duplicate the same
+wire shape, while ExecutorPin, start decision, plan-ready and completion identity are
+also represented on both sides. Move the current cross-process DTOs into the existing
+`swarm-scripts` domain crate and have host/worker use them directly. Delete legacy
+Go/Deny decoders and schema branches after the finite transition.
+
+The host still admits/settles ScriptRun and owns the direct worker Child until its
+launch identity is durable. The worker owns interpreter input/output, effects and
+process-family departure. Do not merge Script semantics into CheckRun.
+
+### K2 — one Forge remote-effect owner
+
+Keep explicit accepted-candidate push and exact remote-ref readback in the standalone
+`swarm-forge-worker`. Local workspace Git reads/preparation remain bounded host Git
+operations; they are not remote publication and should not be forced through the
+worker.
+
+Keep one same-repository/ref serialization owner. Unknown push outcome is reconciled
+by exact remote-ref readback and never by replay. Retain PR-description write only if
+it has a current explicit caller; remove automatic label/publication projection.
+Delete the duplicate Forge installer in favor of the generic standalone installer.
+
+Move worker plan/result wire types to one existing cross-process owner and delete the
+parallel hand-built JSON validators. Do not add a generic Git workflow engine.
+
+### K3 — verify packages once, not on every Operation
+
+Check, Script and Forge currently hash selected worker executables at launch; Script
+and Forge then validate/have enough data to validate them again inside the worker.
+Forge additionally hashes both the worker and Git executable in per-effect preflight.
+This repeats up to hundreds of MiB of reads without adding authority in the same-user
+local threat model.
+
+The generic installer verifies selected package files once and publishes an immutable
+installed coordinate. Host launch verifies containment/current installed identity and
+records executable path; OS process birth/image identity protects custody. Do not hash
+the same worker on every CheckRun, ScriptRun or Forge Operation and do not put worker/
+Git SHA in every domain receipt. A deliberate package replacement creates a new
+installed coordinate/config revision.
+
+Keep hashes for credentials/verifiers, installed package publication and immutable
+result/artifact bytes. A system Git path may remain operator configuration and
+inventory; it is not a per-push authorization token.
+
+### K4 — share only existing OS primitives
+
+`swarm-process` owns `Group`, process birth/image identity, bounded capture and private
+atomic files. Check and Script already use these primitives; Forge should replace its
+custom bounded capture/termination code where the semantics are identical.
+
+Do not create `EffectRunner`, a universal effect journal or a generic completion DTO.
+Check verdict/coverage, Script result/controller effects and Git remote-ref readback
+remain domain code. Extract another OS helper only when at least two current consumers
+remove byte-identical lifecycle code in the same change.
+
+## 11. L-M — adapter consolidation, Goals, observation and remaining deletion
 
 <a id="processes-and-frontends"></a>
 
@@ -367,7 +457,7 @@ publication/Issue-label projection, document-edition rights, legacy acceptance,
 retired installers/provenance equality and worker implementation dependencies outside
 the compact core.
 
-## 11. Finite transition
+## 12. Finite transition
 
 <a id="current-format-and-existing-data"></a>
 
@@ -380,7 +470,7 @@ package together.
 Do not write converters for hypothetical history. Completed records may stay opaque
 when current projections contain the needed facts; they do not keep runtime code alive.
 
-## 12. Verification
+## 13. Verification
 
 <a id="verification"></a>
 
@@ -393,6 +483,7 @@ when current projections contain the needed facts; they do not keep runtime code
 | TaskPacket/review | model receives bounded actionable work; initial/correction/resume share renderer; all findings return together; B cannot reuse A review; no-progress stops. |
 | Public API/migrations | one domain authorizer per retained method; internal/adapter protocols separate; removed surface absent everywhere; numeric migration is atomic and readers reject unsupported version. |
 | IPC/MCP | slow tool call does not block unrelated call on the same session; lost mutation reply remains unknown and is never replayed; one wake pump is bounded/backed off; Task pending-input read is exact; native stream traffic does not occupy the writer. |
+| External effects | every new CheckRun uses one executor; probes no longer spawn the host as a generic worker; every ScriptRun uses one shared DTO/protocol; Forge push/readback has one worker/target lane; package binaries are not rehashed per Operation; unknown effects are never replayed. |
 | Adapter/executor/observation | two adapters prove shared shell; one executor per harness; unbound sessions/gaps visible; exact input/result attribution; uncertain stream stays unknown. |
 | Deletion | no config, package, CI, docs or fallback wrapper remains; report net owned Rust+JS+glue separately from tests. |
 

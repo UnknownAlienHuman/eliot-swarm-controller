@@ -32,9 +32,11 @@ session death. Waku is GPL-3.0; do not copy/link source without a licensing deci
 | `swarm-process::module_owner` | Process membership, private bootstrap and exact OS custody. |
 | `swarm-client::{ModuleLink,Client}` | Authenticated Eliot IPC and existing bounded multiplex. |
 | `swarm-contracts` | Current DTO owner; replace string/vendor proof matrices with semantic types. |
-| `swarm-process::permissions` | Atomic private files for exact Store-delivery envelopes/checkpoints. |
+| `swarm-process::{Group,capture,permissions}` | OS process family, bounded pipes and private atomic files. |
+| `swarm-checks::execute_with_plan` | One admitted Check command execution; select one host/standalone owner, not both. |
+| `swarm-scripts` | Existing Script domain/types; make it the single host/worker wire owner. |
 
-No new adapter framework, broker or universal journal crate is required.
+No new adapter framework, broker, EffectRunner or universal journal crate is required.
 
 ## 2. Harness mappings
 
@@ -110,7 +112,50 @@ session state itself is not replayed.
 `stream.*` is different: bounded ephemeral native content. Keep it separate from
 Store observation history while moving ring work off the writer.
 
-## 5. Claude Swarm operational lessons
+## 5. External-effect workers
+
+### Checks
+
+`swarm-checks::execute_with_plan` already owns one bounded command, process Group,
+stdout/stderr capture, cancellation and family-departure facts. The host and
+standalone routes both call it. Keep this implementation and select one process owner:
+standalone for new CheckRuns, with old host receipts read back finitely.
+
+Source/tool-version and Git-hook probes also use the hidden host check-worker. Move
+those bounded modes to the selected check executable before deleting the hidden host
+entrypoint. Do not create a long-lived probe service.
+
+### Scripts
+
+`swarm-script-worker` is already the only new-run interpreter owner. Host keeps
+admission and final settlement. Use `swarm-scripts` for the shared Work/plan/start/
+completion wire types instead of duplicated compatible structs. Keep Script-specific
+input pipe, controller effects and result-schema validation; they are not Check
+features.
+
+### Forge and GitHub
+
+Remote push is an uncertain external effect and needs exact per-repository/ref
+serialization plus remote-ref readback. Keep one standalone Forge worker for this.
+Local workspace Git reads/preparation are different bounded operations and may remain
+in the host.
+
+Do not copy a workflow system. Reuse `swarm-process` Group/capture/private-file
+primitives. Remove automatic label/publication projection and the duplicate Forge
+installer. PR-description mutation remains only with a current explicit caller.
+
+### Package integrity boundary
+
+Install/package publication verifies selected worker bytes once. Runtime ownership
+uses installed coordinate, path containment and OS process birth/image identity. Do
+not rehash the full Check, Script, Forge or Git executable for every admitted
+Operation or ask the child to verify the same package again. A package replacement is
+an explicit new installed coordinate.
+
+Keep content hashes for credentials/verifiers, package publication and immutable
+artifacts/results. They are not per-effect authority.
+
+## 6. Claude Swarm operational lessons
 
 Keep corrections/unfinished work ahead of fresh work, deterministic rank reasons, one
 manager per worktree, explicit route/model/effort, actual native/process facts, one
@@ -120,7 +165,7 @@ Do not copy marker files, lockdirs, newest-log ownership, route editing, hidden 
 fallback, fixed-age restart, infinite lane runners, raw Store/proof JSON in prompts,
 per-finding repair loops or another queue database.
 
-## 6. Provider state, capacity and current-state automation
+## 7. Provider state, capacity and current-state automation
 
 Normalize provider facts at the adapter with honest account/service/connection scope,
 source epoch/sequence, observation time, freshness and coverage. No fact permits one
@@ -135,14 +180,14 @@ reads current durable state. Eliot stores due occurrence, uses nearest timer plu
 safety wake, and admits ordinary idempotent Operations. Review/correction/acceptance
 query current candidate state rather than copy it into workflow journals.
 
-## 7. SQLite evolution
+## 8. SQLite evolution
 
 Use SQLite `application_id`, application-owned `user_version`, one small numeric
 migration ledger and `BEGIN IMMEDIATE`. Explicit migration pre/postconditions plus
 bounded `foreign_key_check`/`quick_check` are enough. Do not compare exact SQL text,
 build a reference DB, tokenize DDL or add an ORM/migration framework.
 
-## 8. Public API and IPC discipline
+## 9. Public API and IPC discipline
 
 Keep application, internal-host and adapter protocols distinct. Retained public
 domains own typed parse + exact authorization + handler. MCP exposure is frontend
@@ -157,7 +202,7 @@ Host IPC already has bounded connections, in-flight requests, frames and write t
 Do not add a broker. Move pure reads to WAL readers and keep high-volume ephemeral
 rings outside the writer.
 
-## 9. Current library integrations
+## 10. Current library integrations
 
 | Library | Keep for | Do not add |
 | --- | --- | --- |
@@ -172,7 +217,7 @@ rings outside the writer.
 `octocrab` is optional only if a retained requirement and net deletion justify
 replacing `gh`; never keep both.
 
-## 10. Integration discipline
+## 11. Integration discipline
 
 A donor is integrated only when a current caller uses it, replaced Eliot code is
 removed in the same slice, total owned Rust+JS+glue decreases or behavior becomes
