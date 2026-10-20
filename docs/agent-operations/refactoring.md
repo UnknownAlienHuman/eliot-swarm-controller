@@ -1,7 +1,7 @@
 # Refactoring — Source Findings
 
 Runtime source was rechecked through
-`9c28fb75009cc4f871db591ffa85a76a6f363db4` on 2026-10-19.
+`8355bdf0fbe561b5163bd3ab1ba6db24c0f8ddbc` on 2026-10-19.
 [Architecture](architecture.md) owns the product boundary;
 [implementation](implementation.md) owns the only work order;
 [status](../implementation-status.md) records completed source changes.
@@ -239,6 +239,49 @@ of identity. Concilium, contract/integration ratification/ACK, automatic publica
 Issue-label projection, document-edition permission and legacy acceptance remain
 outside compact-core completion.
 
+### 27. Claude has two storage engines around one live SDK query
+
+The current Claude route has a useful safety core: Rust writes intent before SDK
+input, assigns a UUID, correlates SDK frames to the retained Operation, and refuses to
+guess after transport loss. The official SDK supplies startup, streaming query,
+permission callback/hooks, session identity and session-history reads.
+
+The surrounding implementation is disproportionate:
+
+- `lib.rs` is 234,105 bytes;
+- `journal.rs` is 183,134 bytes;
+- `interactions.rs` is 118,974 bytes;
+- these three Rust files exceed 536 KB before `native_state.rs` and the Node driver.
+
+`OperationJournal` mixes native intent/outcome, Store outbox, result references,
+startup inventory/recovery, cleanup/compaction, tombstones, boot markers and an
+operation-reference graph. `InteractionJournal` repeats retention state, pending
+indexes, tombstones and cleanup cursors for callbacks whose JavaScript resolver cannot
+survive bridge loss.
+
+The result path exposes a concrete boundary error. `agent.result` sends
+`module.result` directly. If the Store ACK is lost, the adapter records
+`MODULE_RESULT_UNKNOWN`; `settle_result_intent_without_replay` then forbids submitting
+the same page again. Native prompt replay must remain forbidden, but exact delivery of
+an already formed idempotent Store page should be retried until ACK/readback.
+
+The bounded result body is also kept in `NativeControl` memory only. A bridge restart
+can lose a known terminal body even though the session/history may still exist. At the
+result frame, persist the immutable body/identity before memory loss or use the
+supported session-history reader; then deliver exact bytes through the Store-delivery
+spool.
+
+Target:
+
+1. one live session/action owner;
+2. one minimal `NativeEffectRecord` only until native disposition is known;
+3. one exact `StoreDelivery` record for outcome/result until ACK;
+4. one current pending interaction projection plus exact reply Operation;
+5. no generic tombstone, cleanup, retention or cross-operation reference framework.
+
+Bridge loss retires/unknowns unresolved callbacks; it never replays replies into a
+replacement query. Store observations and Operations retain the audit trail.
+
 <a id="code-reduction-candidates"></a>
 
 ## Additional reduction candidates
@@ -262,8 +305,10 @@ outside compact-core completion.
 - Octocrab is optional; current `gh` is not a giant HTTP implementation.
 - Result-page retention before ACK is necessary.
 - Transcript, alive PID or mtime does not settle uncertain native writes.
-- A Lane entity, ORM, migration framework, broker or universal journal is unnecessary.
+- A Lane entity, ORM, permanent migration framework, broker or universal journal is unnecessary.
 - CCCC suspended launch is unnecessary without a proven owner-first race.
+- Claude session persistence does not make uncertain prompt/reply replay safe; it is
+  a readback source, not an idempotency key.
 
 ## Implemented source reduction
 
