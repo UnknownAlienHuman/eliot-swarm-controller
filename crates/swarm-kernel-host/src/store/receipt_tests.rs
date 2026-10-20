@@ -32,23 +32,15 @@ fn database(runtime_name: &str, artifact: &str, rooted: bool) -> (Connection, Pr
     )
 }
 
-fn warm_receipt(db: &mut Connection, status: &str) -> RuntimeOutcome {
-    let fingerprint = json!({"input_operation_id":"dispatch","native_conversation_id":"session",
-        "bridge_boot_id":"boot","result_ordinal":1,"response_sha256":model::digest(b"reply"),"status":status});
-    let observation = json!({"boot_id":"boot","native_root_id":"session","native_scope_key":"scope",
-        "local_execution_results":[fingerprint]});
-    let receipt = runtime::observe(
-        db,
-        &Principal {
-            link_id: "link".into(),
-            client_id: "module".into(),
-            role: Role::Module,
-        },
-        &json!({"event_id":"terminal","sequence":1,"state":observation}),
-    )
-    .unwrap();
-    let mut fingerprint = fingerprint;
-    fingerprint["observation_id"] = receipt["observation_id"].clone();
+fn warm_receipt(_db: &mut Connection, status: &str) -> RuntimeOutcome {
+    let fingerprint = json!({
+        "input_operation_id":"dispatch",
+        "native_conversation_id":"session",
+        "bridge_boot_id":"boot",
+        "result_ordinal":1,
+        "response_sha256":model::digest(b"reply"),
+        "status":status
+    });
     RuntimeOutcome {
         operation_id: "dispatch".into(),
         outcome: if status == "SUCCESS" {
@@ -60,7 +52,10 @@ fn warm_receipt(db: &mut Connection, status: &str) -> RuntimeOutcome {
         native_scope_key: Some("scope".into()),
         turn_id: None,
         native_input_id: None,
-        details: json!({"completion_condition":"native_terminal_result_observed","local_execution_ref":fingerprint}),
+        details: json!({
+            "completion_condition":"native_terminal_result_observed",
+            "local_execution_ref":fingerprint
+        }),
     }
 }
 
@@ -78,6 +73,15 @@ fn warm_terminal_receipts_settle_execution_without_accepting_task_or_inventing_r
         assert_eq!(attempt["producers"][0]["disposition"], disposition);
         assert!(attempt["producers"][0]["native_run_id"].is_null());
         assert!(attempt["producers"][0]["native_input_id"].is_null());
+        assert_eq!(
+            attempt["producers"][0]["local_execution_ref"]["bridge_boot_id"],
+            "boot"
+        );
+        assert!(
+            attempt["producers"][0]["local_execution_ref"]
+                .get("observation_id")
+                .is_none()
+        );
         let operation = operations::get_operation(&db, "dispatch").unwrap();
         assert_eq!(operation["state"], operation_state);
         assert!(operation["native_refs"]["local_execution_ref"].is_object());
@@ -86,10 +90,10 @@ fn warm_terminal_receipts_settle_execution_without_accepting_task_or_inventing_r
 }
 
 #[test]
-fn warm_forged_observation_receipt_rolls_back_operation_and_producer() {
+fn warm_forged_boot_receipt_rolls_back_operation_and_producer() {
     let (mut db, p) = database(warm_stream::RUNTIME, warm_stream::ARTIFACT_ID, true);
     let mut outcome = warm_receipt(&mut db, "SUCCESS");
-    outcome.details["local_execution_ref"]["observation_id"] = json!(999);
+    outcome.details["local_execution_ref"]["bridge_boot_id"] = json!("forged-boot");
     let error = runtime::outcome(&mut db, &p, &serde_json::to_value(outcome).unwrap()).unwrap_err();
     assert_eq!(error.code, "NATIVE_IDENTITY_MISMATCH");
     assert_eq!(

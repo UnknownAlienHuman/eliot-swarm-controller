@@ -1337,7 +1337,7 @@ fn antigravity_result_line(conversation_id: &str, response: &str) -> Vec<u8> {
 }
 
 #[test]
-fn antigravity_terminal_receipt_needs_store_observation_and_keeps_task_unresolved() {
+fn antigravity_terminal_receipt_is_self_contained_and_keeps_task_unresolved() {
     let child_mode = std::env::var(ANTIGRAVITY_CHILD_MARKER_ENV)
         .map(|marker| marker == ANTIGRAVITY_CHILD_MARKER_VALUE)
         .unwrap_or(false);
@@ -1353,7 +1353,7 @@ fn antigravity_terminal_receipt_needs_store_observation_and_keeps_task_unresolve
         .map(|(_, module_path)| module_path)
         .unwrap_or(module_path!());
     let exact_test_name = format!(
-        "{test_module_path}::antigravity_terminal_receipt_needs_store_observation_and_keeps_task_unresolved"
+        "{test_module_path}::antigravity_terminal_receipt_is_self_contained_and_keeps_task_unresolved"
     );
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", exact_test_name.as_str(), "--nocapture"])
@@ -1436,8 +1436,8 @@ fn run_antigravity_terminal_receipt_regression() {
     assert!(controller.settle_terminal().is_none());
     assert!(controller.pending_receipts().is_empty());
 
-    // The stream cannot distinguish this replay from a new same-conversation
-    // result. Store may retain its observed terminal receipt as admission only.
+    // The CLI has no native parent edge. This exact local sequential result can
+    // settle the admitted Operation, but it still does not prove Task completion.
     controller.consume_line(&antigravity_result_line(
         ANTIGRAVITY_TEST_ROOT,
         replayed_response,
@@ -1469,8 +1469,8 @@ fn run_antigravity_terminal_receipt_regression() {
     );
     assert_eq!(admission_receipt.native_input_id, None);
 
-    let unbound_receipt = controller.pending_receipts().into_iter().next().unwrap();
-    let module_receipt = &unbound_receipt["details"]["module_receipt"];
+    let receipt = controller.pending_receipts().into_iter().next().unwrap();
+    let module_receipt = &receipt["details"]["module_receipt"];
     assert_eq!(admission["module_receipt"], *module_receipt);
     assert_eq!(module_receipt["module_id"], "antigravity");
     assert_eq!(
@@ -1489,48 +1489,23 @@ fn run_antigravity_terminal_receipt_regression() {
         command.input_sha256.as_deref().unwrap()
     );
 
-    let pending_observation = controller.prepare_observation();
-    let observed_state = pending_observation.state.clone();
-    let observation_ack = runtime::observe(
-        &mut db,
-        &module,
-        &json!({
-            "event_id":pending_observation.event_id,
-            "sequence":pending_observation.sequence,
-            "state":pending_observation.state
-        }),
-    )
-    .unwrap();
-    assert_eq!(observation_ack["recorded"], true);
-    let observation_id = observation_ack["observation_id"].as_i64().unwrap();
+    let execution_ref = &receipt["details"]["local_execution_ref"];
+    assert_eq!(execution_ref["input_operation_id"], command.operation_id);
     assert_eq!(
-        controller.acknowledge_observation(&observation_ack),
-        Some(observation_id)
-    );
-    let observed_results = observed_state["local_execution_results"]
-        .as_array()
-        .unwrap();
-    assert_eq!(observed_results.len(), 1);
-    assert_eq!(
-        observed_results[0]["input_operation_id"],
-        command.operation_id
-    );
-    assert_eq!(
-        observed_results[0]["native_conversation_id"],
+        execution_ref["native_conversation_id"],
         ANTIGRAVITY_TEST_ROOT
     );
+    assert_eq!(execution_ref["bridge_boot_id"], context["worker_boot_id"]);
     assert_eq!(
-        observed_results[0]["bridge_boot_id"],
-        context["worker_boot_id"]
-    );
-    assert_eq!(
-        observed_results[0]["response_sha256"],
+        execution_ref["response_sha256"],
         model::digest(replayed_response.as_bytes())
     );
-    assert_eq!(observed_results[0]["status"], "SUCCESS");
+    assert_eq!(execution_ref["status"], "SUCCESS");
+    assert!(execution_ref.get("observation_id").is_none());
 
-    let mut forged_receipt = controller.pending_receipts().into_iter().next().unwrap();
-    forged_receipt["details"]["local_execution_ref"]["observation_id"] = json!(observation_id + 1);
+    // The actual current boot remains a terminal identity guard.
+    let mut forged_receipt = receipt.clone();
+    forged_receipt["details"]["local_execution_ref"]["bridge_boot_id"] = json!("forged-boot");
     let error = runtime::outcome(&mut db, &module, &forged_receipt).unwrap_err();
     assert_eq!(error.code, "NATIVE_IDENTITY_MISMATCH");
     let operation_state: String = db
@@ -1553,19 +1528,33 @@ fn run_antigravity_terminal_receipt_regression() {
         json!([])
     );
 
-    let mut bound_outcome: swarm_contracts::runtime::RuntimeOutcome =
-        serde_json::from_value(controller.pending_receipts()[0].clone()).unwrap();
-    controller
-        .bind_observation_id(&mut bound_outcome, observation_id)
-        .unwrap();
-    let bound_receipt = controller.pending_receipts().into_iter().next().unwrap();
-    assert_eq!(
-        bound_receipt["details"]["local_execution_ref"]["observation_id"],
-        observation_id
-    );
-    let recorded = runtime::outcome(&mut db, &module, &bound_receipt).unwrap();
+    // Store accepts the original terminal outcome before any observation is
+    // recorded. Observation remains independent current-state data.
+    let recorded = runtime::outcome(&mut db, &module, &receipt).unwrap();
     assert_eq!(recorded["recorded"], true);
     controller.acknowledge_outcome(&command.operation_id);
+    assert!(controller.pending_receipts().is_empty());
+
+    let pending_observation = controller.prepare_observation();
+    let observed_state = pending_observation.state.clone();
+    assert!(observed_state.get("local_execution_results").is_none());
+    let observation_ack = runtime::observe(
+        &mut db,
+        &module,
+        &json!({
+            "event_id":pending_observation.event_id,
+            "sequence":pending_observation.sequence,
+            "state":pending_observation.state
+        }),
+    )
+    .unwrap();
+    assert_eq!(observation_ack["recorded"], true);
+    let observation_id = observation_ack["observation_id"].as_i64().unwrap();
+    assert_eq!(
+        controller.acknowledge_observation(&observation_ack),
+        Some(observation_id)
+    );
+    controller.finish_observation();
 
     let producers_raw: String = db
         .query_row(
@@ -1578,37 +1567,22 @@ fn run_antigravity_terminal_receipt_regression() {
     assert_eq!(producers.as_array().unwrap().len(), 1);
     assert_eq!(producers[0]["assignment_id"], command.operation_id);
     assert_eq!(producers[0]["dispatch_operation_id"], command.operation_id);
-    assert_eq!(producers[0]["admission_kind"], "normalized_task_dispatch");
-    assert_eq!(
-        producers[0]["completion_condition"],
-        "native_input_admitted"
-    );
-    assert_eq!(producers[0]["disposition"], "admitted");
-    assert_eq!(producers[0]["execution_complete"], false);
-    assert_eq!(producers[0]["task_completion"], "unknown");
-    assert_eq!(
-        producers[0]["task_snapshot_sha256"],
-        admission["task_snapshot_sha256"]
-    );
-    assert_eq!(
-        producers[0]["source_text_sha256"],
-        admission["source_text_sha256"]
-    );
-    assert_eq!(
-        producers[0]["source_text_bytes"],
-        admission["source_text_bytes"]
-    );
-    assert_eq!(
-        producers[0]["native_payload_sha256"],
-        admission["native_payload_sha256"]
-    );
-    assert_eq!(
-        producers[0]["native_payload_bytes"],
-        admission["native_payload_bytes"]
-    );
-    assert_eq!(producers[0]["module_receipt"], admission["module_receipt"]);
     assert_eq!(producers[0]["native_session_id"], ANTIGRAVITY_TEST_ROOT);
-    assert_eq!(producers[0]["native_input_id"], Value::Null);
+    assert_eq!(producers[0]["disposition"], "completed");
+    let producer_ref = &producers[0]["local_execution_ref"];
+    assert_eq!(producer_ref["kind"], "antigravity_warm_result");
+    assert_eq!(producer_ref["input_operation_id"], command.operation_id);
+    assert_eq!(
+        producer_ref["native_conversation_id"],
+        ANTIGRAVITY_TEST_ROOT
+    );
+    assert_eq!(producer_ref["bridge_boot_id"], context["worker_boot_id"]);
+    assert_eq!(
+        producer_ref["response_sha256"],
+        model::digest(replayed_response.as_bytes())
+    );
+    assert_eq!(producer_ref["status"], "SUCCESS");
+    assert!(producer_ref.get("observation_id").is_none());
 
     let task_state: String = db
         .query_row(

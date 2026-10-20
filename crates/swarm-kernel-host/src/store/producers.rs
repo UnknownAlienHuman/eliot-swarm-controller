@@ -426,6 +426,7 @@ pub(super) fn record_task_dispatch(
     let reported_completion = outcome.details["completion_condition"].as_str();
     let reported_execution_complete = outcome.details.get("execution_complete");
     let reported_task_completion = outcome.details.get("task_completion");
+    let warm_terminal = reported_completion == Some("native_terminal_result_observed");
     let (completion_condition, execution_complete, disposition) = if reported_completion
         == Some("native_turn_completed")
     {
@@ -439,17 +440,45 @@ pub(super) fn record_task_dispatch(
             ));
         }
         ("native_turn_completed", true, "completed")
+    } else if warm_terminal {
+        let terminal = terminal_observation.ok_or_else(|| {
+            Error::new(
+                "TASK_DISPATCH_ADMISSION_INVALID",
+                "warm terminal dispatch requires its validated self-contained producer",
+            )
+        })?;
+        let disposition = terminal["disposition"]
+            .as_str()
+            .filter(|value| matches!(*value, "completed" | "failed" | "cancelled"))
+            .ok_or_else(|| {
+                Error::new(
+                    "TASK_DISPATCH_ADMISSION_INVALID",
+                    "warm terminal producer has no closed disposition",
+                )
+            })?;
+        let outcome_matches = match disposition {
+            "completed" => matches!(outcome.outcome, crate::runtime::EffectOutcome::Applied),
+            "failed" | "cancelled" => {
+                matches!(outcome.outcome, crate::runtime::EffectOutcome::Rejected)
+            }
+            _ => false,
+        };
+        if reported_execution_complete.is_some_and(|value| value != false)
+            || reported_task_completion.is_some_and(|value| value != "unknown")
+            || !outcome_matches
+        {
+            return Err(Error::new(
+                "TASK_DISPATCH_ADMISSION_INVALID",
+                "warm terminal producer facts are inconsistent",
+            ));
+        }
+        ("native_terminal_result_observed", false, disposition)
     } else {
-        // A warm-stream terminal marker is admission-only here. The caller
-        // must already have validated its exact committed observation and
-        // local fingerprint; the marker alone is never evidence.
-        let observed_warm_result = reported_completion == Some("native_terminal_result_observed")
-            && terminal_observation.is_some();
         if reported_completion.is_some_and(|condition| {
             !matches!(
                 condition,
                 "native_input_admitted" | "native_result_observed"
-            ) && !observed_warm_result
+            )
         }) || reported_execution_complete.is_some_and(|value| value != false)
             || reported_task_completion.is_some_and(|value| value != "unknown")
             || !matches!(
@@ -466,7 +495,7 @@ pub(super) fn record_task_dispatch(
     };
     let task_completion = "unknown";
 
-    let producer = json!({
+    let mut producer = json!({
         "assignment_id": outcome.operation_id,
         "dispatch_operation_id": outcome.operation_id,
         "attempt_id": admission.attempt_id,
@@ -486,6 +515,9 @@ pub(super) fn record_task_dispatch(
         "task_completion": task_completion,
         "disposition": disposition
     });
+    if let Some(terminal) = terminal_observation {
+        producer["local_execution_ref"] = terminal["local_execution_ref"].clone();
+    }
     let mut producers: Vec<Value> = serde_json::from_value(attempt["producers"].clone())?;
     if let Some(index) = producers.iter().position(|item| {
         item["assignment_id"] == outcome.operation_id
@@ -497,7 +529,11 @@ pub(super) fn record_task_dispatch(
         for (field, value) in producer.as_object().expect("producer is an object") {
             if matches!(
                 field.as_str(),
-                "native_session_id" | "completion_condition" | "execution_complete" | "disposition"
+                "native_session_id"
+                    | "completion_condition"
+                    | "execution_complete"
+                    | "disposition"
+                    | "local_execution_ref"
             ) {
                 continue;
             }
@@ -522,16 +558,21 @@ pub(super) fn record_task_dispatch(
             producers[index]["native_session_id"] = producer["native_session_id"].clone();
             changed = true;
         }
-        if execution_complete {
-            if matches!(
-                producers[index]["disposition"].as_str(),
-                Some("failed" | "cancelled")
-            ) {
+        if execution_complete || warm_terminal {
+            if let Some(existing) = producers[index]["disposition"].as_str()
+                && matches!(existing, "completed" | "failed" | "cancelled")
+                && existing != disposition
+            {
                 return Err(Error::conflict(
-                    "completed dispatch conflicts with retained terminal producer evidence",
+                    "dispatch terminal disposition conflicts with retained producer evidence",
                 ));
             }
-            for field in ["completion_condition", "execution_complete", "disposition"] {
+            for field in [
+                "completion_condition",
+                "execution_complete",
+                "disposition",
+                "local_execution_ref",
+            ] {
                 if producers[index][field] != producer[field] {
                     producers[index][field] = producer[field].clone();
                     changed = true;
