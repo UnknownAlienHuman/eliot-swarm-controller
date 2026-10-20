@@ -1,97 +1,90 @@
 # Eliot Swarm Controller — Implementation
 
-This is the only implementation program for the
-[architecture](architecture.md). Runtime source was rechecked through
-`9c28fb75009cc4f871db591ffa85a76a6f363db4` on 2026-10-19.
-[Findings](refactoring.md) retain source evidence; [status](../implementation-status.md)
-records what actually landed.
+This is the single implementation program for the
+[architecture](architecture.md). Runtime source, active tooling, old Claude Swarm
+scripts and current donor sources were rechecked through
+`8355bdf0fbe561b5163bd3ab1ba6db24c0f8ddbc` on 2026-10-19.
+[Findings](refactoring.md) preserve source evidence; [status](../implementation-status.md)
+records completed work.
 
-Do not start another repository-wide migration. Complete one vertical
+Do not start another repository-wide framework migration. Implement one connected
 caller-to-result slice, delete the replaced path, then use a second real consumer to
-prove any shared implementation.
+prove any shared abstraction.
 
 <a id="implementation-order"></a>
 <a id="adapter-bus-first-migration"></a>
 
-## 1. Working rules and owners
+## 1. Work as vertical slices
 
-Every coding slice states observable behavior, exact source owners, unsupported and
-uncertain cases, old code/config/fixtures to delete, one relevant native API or donor
-mechanism, the minimal affected format/Clippy/build command, and net owned-code change.
+Every coding slice states:
+
+- observable behavior;
+- exact source owners and symbols;
+- unsupported and uncertain cases;
+- old callers, formats, fixtures and configuration to delete;
+- one relevant donor mechanism/native API;
+- minimal format/Clippy/build command;
+- connected completion proof and net owned-code change.
 
 The manager owns shared contracts, Store transitions and integration. Leaf workers
-receive non-overlapping local changes. A schema, fixture, wrapper or new crate is not
+receive compact non-overlapping tasks. A type, schema, fixture or adapter stub is not
 progress unless a current caller uses it and the superseded path disappears.
+
+Before adding durable state, answer:
+
+1. Which authoritative facts are insufficient?
+2. Why can the answer not be derived by one bounded query?
+3. Who owns mutation and recovery?
+4. Which old state disappears in the same change?
+
+If those answers are weak, do not add the state.
+
+## 2. Current owners
 
 | Responsibility | Owner |
 | --- | --- |
-| Tasks, Attempts, Operations, rights, review, acceptance and durable observations | `crates/swarm-kernel-host/src/store` |
-| Current semantic adapter commands and bounded records | `crates/swarm-contracts` |
-| Authenticated Eliot IPC | `crates/swarm-client::ModuleLink` / `swarm-client::Client` |
-| Process membership, custody and private durable files | `crates/swarm-process` |
-| Native transport, session state, local provider readers and uncertain native effects | selected adapter |
-| Workspace/write authority | `store/workspace.rs` plus `crate::workspace` |
-| Queue, route choice and launch admission | existing Store launcher owner |
-| Time-based admission | one in-process host loop; Store owns due/occurrence state |
-| Check, Script and Forge semantics | their existing Store/domain owners; OS execution belongs to one selected worker/path per domain |
-| Public CLI and MCP | `swarm-cli` and `swarm-mcp`, calling Store handlers |
+| Tasks, Attempts, Operations, rights, acceptance and durable observations | `crates/swarm-kernel-host/src/store` |
+| Shared semantic adapter commands and bounded records | `crates/swarm-contracts` |
+| Authenticated Eliot IPC | `crates/swarm-client::ModuleLink` |
+| Adapter process membership/private files | `crates/swarm-process::{module_owner,module_membership,permissions}` |
+| Native transport, session state, provider readers and uncertain native effects | selected `swarm-adapter-*` or `modules/*-rust` route |
+| Workspace/worktree/write authority | `store/workspace.rs`; `crate::workspace` performs filesystem/Git effects |
+| Queue, route decision and launch admission | current Store launcher owner; no second queue/capacity service |
+| Time-based admission | one in-process host control loop; Store owns due/occurrence state |
+| Check, Script and Forge effects | their existing domain owners |
+| Process/worktree/Git collection | current host lifecycle/process owners |
+| Public CLI/MCP | `swarm-cli` and `swarm-mcp`, both calling Store handlers |
 
-No adapter accepts a Task or interprets review. No common shell owns a provider
-session, native retry policy, scheduler or transcript store. No generic external-
-effect runner owns CheckRun, ScriptRun or Git publication semantics.
-
-## 2. Executable order
-
-```text
-A0-A3  Antigravity: one active route, self-contained result, durable Store delivery,
-       real typed actions only
-B0-B4  current-state queue, explicit routes, provider state, root capacity,
-       dispatch_once
-C0-C1  Task path scope and one workspace write lease
-D0-D1  minimal process owner record and conservative restart reconciliation
-E0-E3  one schedule model and one in-process admission loop
-F0-F2  compact TaskPacket; Store identity stays outside model text
-G0-G4  review/correction/acceptance through ordinary Store transitions
-H0-H3  split public/internal/adapter protocols; one domain authorizer
-I0-I3  numeric Store migrations; delete SQL-text compatibility
-J0-J3  concurrent MCP IPC, one notification pump, exact task-attention read,
-       ephemeral native streams off the Store writer
-K0-K4  one Check executor, one Script protocol, one Forge remote-effect owner,
-       package verification outside each Operation
-L       shared adapter shell only after two current routes delete duplication
-M       one executor per harness, Goals, passive observation and remaining deletion
-```
-
-A later section does not block an earlier vertical slice unless the earlier slice
-would otherwise preserve the mechanism being deleted.
+No adapter accepts a Task, changes ownership or interprets review. No common shell
+owns a vendor session, native retry policy, scheduler or transcript store.
 
 ## 3. A — first executable route: Antigravity Rust
 
-Antigravity is first because it has one serialized native input window and a proven
-lost-delivery boundary. Command, Codex and Muse are poor first abstractions because
-their historical profiles and native state machines would infect the common layer.
+Antigravity is first because it has one serialized native input window and a concrete
+lost-delivery defect. Do not define the common shell around Command, Codex or Muse;
+their historical profiles and native state machines would leak into the abstraction.
 
-### A0 — one active coordinate
+### A0 — one active v6 coordinate
 
-Source and descriptor use artifact version `6`; active route/tooling still contains
-`5`. Update route example, package policy, qualification, installer validator and
-active fixtures together. Historical v5 receipts remain historical. Give concrete
-unsettled v5 bindings a final disposition, then remove active `"5" | "6"` behavior.
+Synchronize source, descriptor, route example, package policy, installer,
+qualification and active fixtures on Antigravity v6. Historical v5 receipts remain
+historical; concrete unsettled v5 bindings receive final disposition. Remove active
+`5 | 6` behavior and never introduce v7 merely to mark the cleanup.
 
 ### A1 — outcome independent of observation/proof
 
-Make terminal outcome final at native settlement. Retain Operation ID,
-binding generation/adapter boot, native conversation/result ordinal, terminal status,
-Eliot disposition, result reference and content hash where bytes exist.
+Make terminal outcome final at native settlement. Retain Operation, generation/boot,
+native conversation/result ordinal, terminal status, disposition, result reference
+and content hash where bytes exist.
 
-Delete `local_execution_ref.observation_id`, duplicated terminal results in
-observations, outcome-to-observation matching, `AntigravityDispatchSessionProof`, its
-producer/validator/digests and refresh-before-dispatch fixtures. `agent.refresh`
-remains readback; model/stream/counter facts remain observations, not dispatch rights.
+Delete observation ID from outcome, duplicate terminal result in observations,
+outcome-to-observation matching, `AntigravityDispatchSessionProof`, its producer,
+validator/digests and refresh-before-dispatch fixtures. Refresh remains readback;
+model/stream/counter facts remain observations, not rights.
 
-### A2 — durable Store delivery, never native replay
+### A2 — exact Store delivery, never native replay
 
-Use existing private atomic file primitives. One file retains one already-formed
+Use existing private atomic files. One file retains one already formed
 `module.outcome` or `module.result` request scoped to Operation, generation and boot.
 Persist before memory can forget it; resend identical params after Eliot reconnect;
 delete only after exact Store ACK. A new boot never adopts predecessor files.
@@ -106,9 +99,10 @@ release/shutdown of an owned resource. Do not advertise placeholder Reply, Confi
 Goal, Background, Recover or live steer. Replace string switching with a typed command
 and remove package/protocol/request and repeated Task/source hashes from outcomes.
 
-## 4. B — queue, routes, provider state and capacity
-
 <a id="work-dispatch"></a>
+<a id="automation-and-delivery"></a>
+
+## 4. B — queue, routes, provider state and capacity
 
 ### B0 — one queue projection
 
@@ -128,365 +122,457 @@ cursor or scheduler.
 
 ### B2 — source-scoped provider facts
 
-Normalize separate `ProviderUsage` and `ProviderAvailability` records with source
-key/epoch/sequence, observation time, freshness/coverage and honest account/service/
-connection scope. Adapters own native method names and rolling patches. Remove
-provider method/artifact allowlists, auth hashes, vendor-only universal fields and
-per-binding copies of account/service facts.
+Normalize separate `ProviderUsage` and `ProviderAvailability` with source
+key/epoch/sequence, observed time, freshness/coverage and honest account/service/
+connection scope. Adapters own native method names and rolling patches. Remove method/
+artifact allowlists, auth proof hashes, vendor-only universal fields and per-binding
+copies of account/service facts.
 
-No fact permits one bounded probe. Transient negative facts hold until retry/reset,
-then permit one probe rather than claim recovery. Hard negative needs source/config
-change or explicit fallback. Unknown/stale/gapped holds automation but remains
-manually probeable.
+No fact permits one bounded probe. A transient negative holds until retry/reset, then
+permits one probe rather than claiming recovery. A hard negative requires source/
+config change or explicit fallback. Unknown/stale/gapped holds automation but remains
+explicitly probeable by a manager.
 
-### B3 — capacity from actual roots
+### B3 — transactional root count
 
-Count unresolved root-opening Operations and unreleased roots in the same writer
-transaction that admits launch/open. Dispatch, send, reply, configure, Goal, refresh,
-result, reconcile and recover create no root claim.
+Derive capacity from unresolved root-opening Operations and unreleased bindings;
+never count both for one root. Reserve/count in the launch/open transaction. Send,
+reply, configure, Goal, refresh, result, reconcile and recover consume no new root.
 
-Delete `CapacityLedger`, `CapacityEntry`, `ResourceEvidence`, capacity meta keys,
-v1/v2 codecs/migration, refusal rows and lifecycle sync hooks. `report.capacity`
-becomes a current projection.
+Delete `CapacityLedger`, phase/event evidence, `capacity:*` meta rows, v1/v2 key
+migration and lifecycle sync hooks. `report.capacity` becomes a bounded projection of
+routes, roots, provider and host facts.
 
-### B4 — `dispatch_once`
+### B4 — `dispatch_once`, not copied pending work
 
-A bounded pass queries ranked Tasks, selects the first eligible configured route and
-atomically validates manager/project/Task revision, creates or reuses Attempt,
-reserves write lease, checks provider/root capacity and creates launch Operation.
-External I/O follows commit.
+```text
+dispatch_once(policy)
+  -> read bounded ranked current Tasks
+  -> select first eligible configured route
+  -> atomically validate Task/Attempt, reserve workspace/root and create launch
+  -> return Operation or current blocker reasons
+```
 
-Delete WorkDispatch cursors, copied pending subjects, catch-up/recheck state,
-semantic slots, duplicate links, ordinary-blocker quarantine, mandatory preview
-digest and copied launch settings. Wakeups are hints; the next pass reads current
-state.
+External filesystem/Git/native I/O follows commit. Delete WorkDispatch global/per-
+entry cursors, pending subjects/rechecks, activation/catch-up state, semantic slots,
+duplicate links, blocker quarantine, preview-digest binding and copied launch config.
+Wakeups cause another query; a safety wake recovers lost/coalesced notification.
 
-## 5. C-D — one write authority and minimal process custody
+## 5. C — one workspace/write authority
 
-### C0-C1 — workspace lease
+### C0 — path-prefix scope
 
 `TaskSpec.scope.initial_paths` supplies repository-relative write prefixes;
-`forbidden_paths` is a hard negative; empty initial scope means repository root;
-review-only work has no write lease. Normalize separators and reject absolute paths,
-traversal, empty segments and `.git`. Symbols/interfaces/globs are guidance only.
+`forbidden_paths` is a hard negative boundary; empty initial paths means repository
+root; review-only work gets no write lease. Reject absolute paths, traversal, empty
+segments and `.git`. Compare by path segment, not string prefix. Symbols/interfaces/
+globs guide work but grant no write authority.
 
-`reserve_lease_for_launch` checks path-prefix overlap in the same admission
-transaction. No generic override. Delete `code.scope.*`, its records, digests,
-override/expiry/symbol authority and frontend/catalog/tests after callers switch.
+### C1 — one admission decision
 
-### D0-D1 — process ownership
+`reserve_lease_for_launch` checks overlap in the same transaction as Attempt/launch
+admission and names the conflicting Task/Attempt/paths. Do not add a generic override:
+revise scope, finish/release one Attempt or split the work.
 
-Persist binding/generation/boot, state directory, credential reference, selected
-executable, PID + OS birth/handle identity, Job/process-group identity and
-parent/shared-service relation. Package version/build/protocol remain installation
-facts.
+Delete `code.scope.*` coordination/Store code, CLI/MCP/policy/catalog entries,
+proposal digests, override/expiry and references from ratification products.
 
-On restart: dead clears record; PID identity mismatch clears record and kills nothing;
-uninspectable stays unknown; only an exact Eliot-owned leftover may be recovered or
-terminated; shared service is not killed for one lost session. Do not sweep by name,
-cwd, latest log or age, and do not hash the executable on every metric sample.
+## 6. D — process ownership and restart
 
-## 6. E — one scheduling/admission loop
+### D0 — minimal owner record
 
-<a id="automation-and-delivery"></a>
+Persist binding/generation/boot, private state/credential reference, selected
+executable, PID + OS birth identity, group/Job identity and parent/shared-service
+relation. Package/build/protocol/full contract remain installation facts. Simplify
+`ModuleOwnerPlan`/resolver while retaining containment, no-link traversal, private
+permissions and exact credential scope.
 
-Use one automation-entry schedule model: immutable entry ID, enabled state, event/
-interval/cron trigger, typed action/settings, last admitted occurrence and next due.
-Convert static schedules and delete their registry.
+### D1 — conservative reconciliation
 
-One in-process loop waits for Store changes or nearest due time, runs bounded
-current-state dispatch/review/return-changes/accept/check/watch passes and computes the
-next due time. A slow safety wake recovers lost/coalesced notifications.
+- dead process → clear live record;
+- PID exists but birth/image/owner differs → clear record, kill nothing;
+- uninspectable → retain `unknown` and retry later;
+- exact Eliot-owned leftover → recover/observe/terminate by route policy;
+- shared provider service → never kill because one session link disappeared.
 
-Delete the standalone automation scheduler service, credential/config digest,
-page/admit RPC, process custody, duplicate due snapshots/quarantine and timer-worker
-slots. Retain separate workers only while they perform real external I/O/custody.
+Do not sweep by executable name, cwd, title, newest log or age, and do not rehash an
+executable on every metric sample.
 
-## 7. F-G — compact TaskPacket and ordinary review transitions
+<a id="store-and-automation"></a>
 
-### F0-F2 — model-visible work
+## 7. E — one schedule/admission loop
 
-One renderer serves initial assignment, correction and resume. The `TaskPacket`
-contains goal, current requirements/check criteria, phase, selected sources, write and
-forbidden paths, worktree/branch/baseline, selected route/model/effort, deliverable and
-current correction/resume facts.
+### E0 — one retained schedule shape
 
-Store identity stays in Store and the retained Operation. Delete canonical Task JSON,
-launch packet, binding generation, proof digests, full history and repeated
-`task_snapshot_sha256`, `source_text_sha256`, size/prompt hashes where they only echo
-Store-owned data. Keep content hashes only on exact persisted bytes.
+```text
+entry_id
+trigger/calendar
+next_due_at
+last_occurrence_id
+catch_up = latest_only
+```
 
-### G0-G4 — review/correction/acceptance
+Static schedule config, manager cron and standalone scheduler pages cannot remain
+three representations of the same due work.
 
-`review_once` assigns missing review for an exact candidate. `review.submit` stores
-verdict and the complete findings set. `task.request_changes` verifies the current
-candidate/review, sets Attempt to `needs_correction`, stores one cause/findings set and
-optionally admits one child `agent.send`; without a live binding the Task state is
-sufficient for the next dispatch/resume.
+### E1 — one in-process wake/timer loop
 
-Candidate B requires review B. Identical candidate after correction is no-progress;
-correction rounds live in Attempt lifecycle and escalate after a bound. `accept_once`
-calls the same candidate-specific review/check gate as manual acceptance.
+One host loop waits for Store change or nearest due time, queries bounded due entries
+and admits actions through the same Store gates as manual commands. A slow safety wake
+recovers lost notification. The timer owns no credential/process identity.
 
-Retain only thin policy toggles: dispatch, review, return_changes, accept, check,
-goal_message and script. Delete ReviewDisposition/RepairDispatch workflow state,
-cursors, slots, duplicate links/evidence packages and automatic publication/GitHub
-projection stages.
+### E2 — delete the standalone scheduler service
 
-## 8. H-I — one API owner and numeric migrations
+Remove `automation.scheduler.page/admit`, service credential/config digest, worker
+process/group, duplicate cursors and status projections after the host loop serves all
+retained schedule types.
 
-### H0-H3 — public, internal and adapter protocols
+### E3 — workers only for real effects
 
-Split application API, internal host protocol and typed adapter protocol. Internal and
-vendor-native methods never enter the public registry. Remove optional products before
-freezing the final table.
+Checks, Scripts, Forge and adapters may remain separate because they perform external
+I/O or own native processes. Pure policy/query/reconciliation helpers remain in host.
+Delete optional worker slots that only call Store and wait.
 
-Each retained public domain owns one typed parser/authorizer/handler:
-`parse -> role -> exact object/revision -> read/mutate`. Central routing does not
-repeat field schemas or object rules. Operation visibility uses normalized retained
-scope, not method-name `LIKE`/`IN` branches and product-specific joins.
+<a id="identity-and-hashes"></a>
 
-A removed method disappears from Store routing, method policy, MCP, CLI, Operations,
-automation/capacity consumers, tests and fixtures together. Do not replace the current
-parallel maps with a generic policy DSL.
+## 8. F — one compact TaskPacket
 
-### I0-I3 — migration ledger
+### F0 — model-visible packet
 
-Use SQLite `application_id`, monotonic `user_version` and a small
-`schema_migrations(version, applied_at_ms)` table. Writer applies missing ordered SQL
-inside one `BEGIN IMMEDIATE` transaction before readers start.
+`store/task_prompt.rs` is the only renderer. Produce bounded Markdown with Goal,
+requirements, initial/correction/resume state, selected source references, write/
+forbidden paths, workspace/branch/baseline, deliverable and verification.
 
-For one finite release, map concrete known legacy digest/marker states to numeric
-versions after checking actual tables/columns. Unknown/inconsistent state fails.
-Then delete base SQL digest, generic extension SHA comparison, custom DDL lexer/
-reference DB, duplicate trigger verifiers and per-migration source hashes.
+Do not send raw Task/Attempt JSON, snapshot/plan/source hashes, package coordinates,
+launch manifest, proof packet, global queue, participant roster, full Issue thread or
+all MCP schemas. Default to 64 KiB; larger inputs remain artifacts/references.
 
-Readers validate application ID and supported numeric version, not exact bundled SQL
-bytes. Equivalent DDL text cannot brick a compatible DB; partial migration rolls back.
+### F1 — Store identity stays outside model text
 
-## 9. J — bounded IPC, one MCP wake pump and reader-owned live views
+Replace `TaskPromptEnvelopeV1` + `TaskDispatchContext` duplication with:
 
-### J0 — use the multiplex that already exists
+```text
+operation_id
+binding generation + adapter boot
+task_packet text
+optional native selectors
+```
 
-`swarm-client::Client` already correlates concurrent requests, bounds in-flight work
-and marks post-write cancellation/transport loss `OUTCOME_UNKNOWN` without replay.
-`swarm-mcp::request_on` currently holds `Mutex<Option<Client>>` across the whole RPC,
-serializing every tool call again.
+Store resolves Task/Attempt from Operation. Adapter validates authenticated binding
+and associates native input/output with Operation. A content hash is allowed only for
+actually retained immutable packet bytes; it is not authorization.
 
-Store `Option<Arc<Client>>`. Hold the mutex only to connect/install or compare-and-
-clear a failed current client. Clone the Arc, release the lock, then call
-`request_shared`. On transport failure clear the slot only if it still points to that
-same client. Never retry the request automatically.
+### F2 — one renderer across lifecycle
 
-### J1 — one session notification pump
+Initial assignment renders current work; correction adds all findings for the exact
+candidate; resume adds remaining requirements/current candidate and unresolved
+attention, not transcript history. Delete old prompt schemas/JS validators/fixtures as
+each route migrates.
 
-Current MCP permits 16 subscriptions; each owns a poller, forwarder, record queue and
-1 MiB byte budget, polling `report.delta` every 250 ms and scanning extra pages under
-lag. Replace this with one pump per MCP session:
+## 9. G — ordinary review, correction and acceptance
 
-- one last Store cursor and one bounded reconnect/backoff state;
-- one category/filter set for the session, or one subscription ID if API continuity is
-  temporarily required;
-- one coalesced `changed` notification containing latest known Store head/cut;
-- `monitor.follow` / `report.delta` remains the authoritative resync;
-- a slow client replaces the pending hint with a newer head instead of mirroring every
-  committed fact;
-- reconnect starts from the client's last acknowledged Store cursor; there is no MCP
-  session replay continuity.
+### G0 — `review_once`
 
-Delete per-subscription pollers/forwarders/queues, exact dropped-item scan-to-cut,
-per-category replay machinery and Concilium/contract categories when those products
-are removed. A notification is a wake hint, never history or authority.
+Query current submissions requiring review and lacking current assignment for that
+candidate/slot; call the existing `review.assign` gate with deterministic identity.
+Do not copy submissions into pending lists or keep a dispatch cursor.
+
+### G1 — one `task.request_changes`
+
+Request names the exact current review result and expected Task/Attempt/candidate.
+Store loads all ordered findings; caller does not submit a second package. In one
+transaction Store verifies authority/current candidate, records disposition, marks
+Attempt `needs_correction`, retains review as cause and, if a live binding exists,
+admits one child `agent.send` with correction TaskPacket.
+
+Delete ReviewDisposition, RepairDispatch, repair slots/links, duplicate findings
+packages and per-finding delivery.
+
+### G2 — candidate-specific bounded rounds
+
+Candidate B never reuses A's review. Return all findings in one round. Derive round
+count and identical-candidate no-progress from retained submissions/reviews. On no
+progress or configured limit, create manager attention and stop automatic correction.
+
+### G3 — `accept_once` uses the manual gate
+
+Query current candidate and call the same `task.accept` gate. Store resolves exact
+candidate review/check evidence; automation does not rebuild evidence arrays.
+
+### G4 — thin policy switches
+
+Retain `dispatch`, `review`, `return_changes`, `accept`, `check`, `goal_message` and
+`script`. Publication/Issue labels are explicit integrations. Current Task/review/
+acceptance state is queried directly.
+
+## 10. H — shrink and split the API
+
+The current catalog has 164 hand-written MCP tools while method policy, Store routers,
+role gates, CLI mapping and tests repeat the surface.
+
+### H0 — separate three protocols
+
+- public semantic methods for authenticated clients;
+- closed internal methods for module/supervisor/workers;
+- typed adapter commands.
+
+Internal or vendor methods never enter the public MCP catalog.
+
+### H1 — delete excluded products end-to-end
+
+For Concilium, generic contract/integration ratification, advisory code scopes,
+automatic publication/labels and retired vendor-internal methods, remove together:
+method policy, MCP schema/profile, CLI, Store router, model validation, auth
+projection, migrations/config/fixtures/docs. Keep no compatibility aliases for
+abandoned internal APIs.
+
+### H2 — one domain authorizer/handler
+
+Each retained public domain owns `parse -> coarse role -> exact object/revision ->
+read/mutate`. A small shared descriptor may own name/class/frontend exposure, but it
+must not replace object authorization or become a generated protocol family.
+
+### H3 — merge only truly identical aliases
+
+Trace callers before merging message/coordination methods. Shared storage does not
+prove identical scope semantics. Remove alias and consumers in one change.
+
+## 11. I — numeric Store migrations
+
+### I0 — current numeric schema authority
+
+Use SQLite application ID and integer version plus one ordered migration list owned by
+Store startup. Each migration runs transactionally, checks semantic preconditions and
+records version/receipt. Readers verify version and required shape, never SQL source
+bytes.
+
+### I1 — finite bridge for concrete active data
+
+Enumerate only unsettled Operations, current Tasks/Attempts/candidates/reviews/checks,
+active bindings/workspace leases, required results, enabled automation and non-
+reissuable credential/config references.
+
+Prefer a fresh current database and bounded import; archive old DB read-only. If one
+in-place transition is required, support exactly one known from-version → to-version
+migration and delete it after supported installs cross.
+
+### I2 — delete source-text compatibility
+
+Remove base schema SHA, `schema_extension:*` digests, reference-DB replay, custom DDL
+lexer/normalized `sqlite_master` equality and duplicate trigger verifiers once the
+numeric migration path owns startup.
+
+### I3 — relational admission scope
+
+At Operation admission persist small indexed scope facts Store already knows:
+caller/effective manager, project, Task/revision, Attempt, binding/generation, parent
+Operation and closed visibility class. Migrate one method family at a time from giant
+method-specific JSON/link visibility SQL, preserve exact object rights, then delete
+legacy branches/meta links.
+
+## 12. J — MCP/IPC and native live streams
+
+### J0 — concurrent RPC over the existing multiplexed client
+
+Do not hold the MCP session mutex across awaited Store RPC. Clone the current
+`Arc<Client>` under the lock and release it before `call`. Bound per-session in-flight
+requests and preserve request identity; lost mutation response remains unknown and is
+never retried automatically.
+
+### J1 — one coalesced subscription pump
+
+Replace per-subscription pollers/forwarders/queues with one session pump over the
+Store cursor. Fan out latest notifications to subscribers with bounded queues; drop
+and report a gap rather than rescanning history to count every filtered drop. Store
+cursor remains authority.
 
 ### J2 — exact pending-input projection
 
-`tasks/get` currently pages the entire `report.attention` inventory and filters one
-Operation in MCP. Add an exact bounded Store read keyed by Operation/binding, or include
-its current pending-input summary in `operation.get`. Preserve the native request's
-own shape and exact stale-request guard. One Task read must not be O(fleet attention).
+`tasks/get` must not page the entire attention inventory. Add exact bounded Store read
+by Operation/binding or include current pending-input summary in `operation.get`, with
+native request shape and stale-request guard.
 
-### J3 — native content stream off the writer
+### J3 — native content ring off the writer
 
-`module.stream.publish`, `stream.open`, `stream.read` and `stream.close` mutate/read an
-ephemeral in-memory ring but currently execute through `Store::run`, occupying the
-single writer while doing authorization and JSON/ring work.
+Resolve current principal/object/binding/source rights in a short WAL reader snapshot,
+then operate the bounded ephemeral ring outside Store writer. Revalidate every read
+and revoke link-owned viewers on disconnect. This remains distinct from durable
+observation history; do not add a broker.
 
-Use the existing WAL/status-reader transaction to resolve current principal, object
-rights, binding/generation/boot and source identity. After that bounded snapshot,
-mutate/read the ring outside the DB writer. Revalidate on every read; revoke viewers
-for a disconnected link instead of waiting only for TTL. Keep this path distinct from
-durable observations: it is bounded live content, not another event journal.
+<a id="build-install-ci-and-qualification-reduction"></a>
 
-Do not add a broker. Keep host IPC's existing bounded concurrent server, frame limits,
-write timeout and “admitted work drains after disconnect” semantics.
-
-## 10. K — one physical owner per external-effect domain
-
-Checks, scripts and Forge legitimately have different admission/result semantics.
-They do not need a universal EffectRunner. They do need one selected execution path
-and one cross-process contract each.
+## 13. K — one physical owner per external-effect domain
 
 ### K0 — one CheckRun executor
 
-`CheckConfig.executor` currently selects standalone `swarm-checks`; absence falls back
-to the hidden host `check-worker`. Make the standalone worker mandatory for every new
-CheckRun when checks are enabled. `None` remains readable only for concrete
-pre-cutover Work receipts.
+Make standalone `swarm-checks` mandatory for every new CheckRun. Keep old hidden-host
+receipts readback-only. Move bounded source/tool/Git-hook probe modes to the selected
+check executable first, then remove the root-host `check-worker`, duplicate custody,
+packaging and reconciliation branches. Store keeps Check admission/profile/coverage/
+verdict.
 
-Keep `swarm-checks::execute_with_plan` as the Check process/capture implementation.
-Delete the new-work `None => worker::prepare_and_spawn` branch, the root-host full
-CheckRun worker entrypoint, duplicate child custody for that path and its packaging/
-fixtures. Keep Store admission, profile/input/source verification, CheckRun state and
-result validation in the host.
+### K1 — one ScriptRun wire protocol
 
-Do not delete bounded source/tool probes accidentally: `checks/inputs.rs` and the Git
-hook also use the hidden `check-worker` protocol. Move those probe modes to the
-selected `swarm-checks` executable (or an existing `swarm-process` child primitive)
-first, then remove the hidden host command. One check-domain executable is enough; do
-not add a probe daemon.
-
-### K1 — one ScriptRun protocol
-
-New ScriptRuns already require `swarm-script-worker`; `None` exists only for old
-receipt reconciliation. Make that distinction explicit in config/admission and remove
-the hidden host `script-worker` compatibility entrypoint after concrete old runs are
-disposed.
-
-Host `scripts::runner::Work` and worker `ScriptWork` deliberately duplicate the same
-wire shape, while ExecutorPin, start decision, plan-ready and completion identity are
-also represented on both sides. Move the current cross-process DTOs into the existing
-`swarm-scripts` domain crate and have host/worker use them directly. Delete legacy
-Go/Deny decoders and schema branches after the finite transition.
-
-The host still admits/settles ScriptRun and owns the direct worker Child until its
-launch identity is durable. The worker owns interpreter input/output, effects and
-process-family departure. Do not merge Script semantics into CheckRun.
+New work already requires `swarm-script-worker`; `None` is historical only. Move
+cross-process Work/plan/start/completion DTOs to existing `swarm-scripts`, use them
+from host/worker, then delete hidden compatibility entrypoint and legacy Go/Deny
+readers after concrete old runs are settled.
 
 ### K2 — one Forge remote-effect owner
 
-Keep explicit accepted-candidate push and exact remote-ref readback in the standalone
-`swarm-forge-worker`. Local workspace Git reads/preparation remain bounded host Git
-operations; they are not remote publication and should not be forced through the
-worker.
+Keep accepted-candidate push and exact remote-ref readback in
+`swarm-forge-worker`; keep bounded local workspace Git in host. Preserve one
+repository/ref serialization owner and never replay unknown push. Delete duplicate
+installer, parallel JSON validators and automatic label/publication projection.
 
-Keep one same-repository/ref serialization owner. Unknown push outcome is reconciled
-by exact remote-ref readback and never by replay. Retain PR-description write only if
-it has a current explicit caller; remove automatic label/publication projection.
-Delete the duplicate Forge installer in favor of the generic standalone installer.
+### K3 — verify packages once
 
-Move worker plan/result wire types to one existing cross-process owner and delete the
-parallel hand-built JSON validators. Do not add a generic Git workflow engine.
+Installer verifies selected package bytes and publishes immutable installed identity.
+Launch checks containment/current identity; OS birth/image protects custody. Stop
+hashing worker/Git executables per Check/Script/Forge Operation and repeating those
+hashes in domain receipts. Keep hashes for credentials, package publication and actual
+result/artifact bytes.
 
-### K3 — verify packages once, not on every Operation
+### K4 — share only physical OS primitives
 
-Check, Script and Forge currently hash selected worker executables at launch; Script
-and Forge then validate/have enough data to validate them again inside the worker.
-Forge additionally hashes both the worker and Git executable in per-effect preflight.
-This repeats up to hundreds of MiB of reads without adding authority in the same-user
-local threat model.
+Use `swarm-process` Group/Job, birth/image identity, bounded capture and private atomic
+files. Do not create a universal EffectRunner/journal/completion DTO; Check, Script and
+Git retain distinct semantics.
 
-The generic installer verifies selected package files once and publishes an immutable
-installed coordinate. Host launch verifies containment/current installed identity and
-records executable path; OS process birth/image identity protects custody. Do not hash
-the same worker on every CheckRun, ScriptRun or Forge Operation and do not put worker/
-Git SHA in every domain receipt. A deliberate package replacement creates a new
-installed coordinate/config revision.
-
-Keep hashes for credentials/verifiers, installed package publication and immutable
-result/artifact bytes. A system Git path may remain operator configuration and
-inventory; it is not a per-push authorization token.
-
-### K4 — share only existing OS primitives
-
-`swarm-process` owns `Group`, process birth/image identity, bounded capture and private
-atomic files. Check and Script already use these primitives; Forge should replace its
-custom bounded capture/termination code where the semantics are identical.
-
-Do not create `EffectRunner`, a universal effect journal or a generic completion DTO.
-Check verdict/coverage, Script result/controller effects and Git remote-ref readback
-remain domain code. Extract another OS helper only when at least two current consumers
-remove byte-identical lifecycle code in the same change.
-
-## 11. L-M — adapter consolidation, Goals, observation and remaining deletion
-
+<a id="module-contract-and-adapter-shell"></a>
 <a id="processes-and-frontends"></a>
 
-Extract shared adapter bootstrap/delivery only after two current Rust routes adopt it
-and delete both old loops. Extend existing `swarm-process::module_owner` and
-`swarm-client::ModuleLink`; the common shell owns Eliot connect/hello, command pull and
-exact re-delivery of already retained Store messages—not vendor session, native queue,
-result attribution, retry policy, Task state or scheduling.
+## 14. L — semantic adapter protocol and shared shell after proof
 
-Target semantic commands are `Open`, `Dispatch`, `Send`, `Reply`, `Configure`, `Goal`,
+Target commands: `Open`, `Dispatch`, `Send`, `Reply`, `Configure`, `Goal`,
 `Background`, `Cancel`, `Recover`, `Refresh`, `Result`, `Reconcile`, `Shutdown`.
-Unsupported actions fail before native I/O. Remove vendor/internal method names,
-package/schema ladders and proof-heavy receipts.
+Unsupported actions fail before native I/O.
 
-Retain one executor per harness: standalone Rust OpenCode, Rust app-server Codex, one
-selected Muse, one Claude, one current Batch and ACP Command generation, one
-Antigravity warm stream. Concrete unsettled work receives finite disposition;
-historical records do not keep executors alive.
+Remove vendor/internal methods, package/schema ladders and proof-heavy receipts.
+Simplify hello to authenticated binding + current protocol major + capability subset.
+
+Extract common bootstrap/delivery only after two current Rust routes use identical
+behavior and delete both old loops. Extend existing `swarm-process::module_owner` and
+`swarm-client::ModuleLink`; common code owns Eliot IPC and exact already formed Store
+delivery, never vendor session, native queue/recovery, Task state or scheduling.
+
+## 15. M — Claude route reduction
+
+Current useful core: Rust writes intent before SDK input, assigns a user-message UUID,
+correlates SDK frames to Operation, and never guesses after transport loss. Preserve
+that. The official SDK already supplies `startup()`, streaming `query()`, permissions/
+hooks, session identity and session-history readers.
+
+### M0 — one live session owner
+
+Keep one ordered owner for startup/query/input queue/frames. Remove full descriptor
+echo and repeated Task/source hash validation as H/F land. The Node process remains a
+thin SDK driver; Rust owns Operation correlation.
+
+### M1 — split native effect from Store delivery
+
+Replace the 183-KB mixed `OperationJournal` with:
+
+```text
+NativeEffectRecord
+  operation_id, action, boot/session, native input/request ID
+  exact bounded native payload identity
+  disposition/readback cursor
+
+StoreDelivery
+  exact module.outcome or module.result params
+  generation + boot + sequence
+```
+
+Native record lives only until native disposition is known. Store delivery lives only
+until exact ACK. Neither owns retention graphs, tombstones, cleanup queues, generic
+references or Task state.
+
+### M2 — capture terminal result before memory loss
+
+At SDK result frame, persist bounded immutable body + session/input/frame identity
+before it can disappear from `NativeControl`, then enqueue exact `module.result`.
+For larger/unavailable bodies, use supported session-history reading with explicit
+coverage gap; do not maintain a transcript mirror.
+
+A lost Store ACK may resend identical already formed result bytes. It must not replay
+the native prompt. Delete `MODULE_RESULT_REPLAY_PREVENTED` behavior after exact
+Store-delivery idempotency/readback owns this boundary.
+
+### M3 — simplify live permissions/questions
+
+Expose current pending callback through observation. Before resolving it, admit one
+exact `agent.reply` Operation with request/session/boot/reply identity. ACK settles;
+bridge loss becomes Unknown/Retired. A replacement query never receives the old
+reply.
+
+Delete the 119-KB interaction retention engine: retention state/items, pending index,
+tombstones and cleanup cursor. Store Operations/observations retain the audit trail;
+a JavaScript resolver cannot be durably reconstructed anyway.
+
+### M4 — connected deletion proof
+
+Qualify open → dispatch → callback/reply → result; Eliot disconnect after terminal;
+bridge loss before/after callback delivery; result retrieval after adapter restart;
+exact session/Operation attribution. Report net Rust + JS deletion, not only moved
+files.
 
 <a id="harness-goals-and-the-eliot-goal-plugin"></a>
-
-Harness Goal maps through native `Goal`; Eliot Goal independently admits ordinary
-message Operations. Their controls do not affect each other. Remove provider branches,
-pseudo-Goal continuation and Goal proof packets.
-
-Adapters read native events and local JSON/JSONL/SQLite; host adds process and Git;
-Store joins Task/Attempt/Operation, binding, session, process, worktree/ref, source
-cursor/gaps and provider usage. Configured readers run without Task/binding and expose
-unmatched sessions. Remove per-sample executable hashing and provider calls from
-viewer reads.
-
+<a id="passive-agent-observation"></a>
 <a id="store-and-current-data"></a>
-<a id="identity-and-hashes"></a>
 
-Make launch preview optional; first dispatch needs current assignment, workspace
-lease, binding and usable session—not MCP readiness or a caller proof hash. Keep one
-result path: `Result -> module.result -> immutable artifact -> read/assemble ->
-submission`.
+## 16. N — remaining harnesses, Goals, observation and product deletion
 
-Move pure bounded reads to WAL readers; never hold a Store transaction across
-external I/O or client pagination. Give automation immutable entry ID and update
-owner/revision in one transaction; delete successor copies, relocated journals and
-chains.
+Retain one new-work executor per harness: standalone Rust OpenCode, Rust Codex app-
+server, one Muse, one Claude, current Command Batch + one ACP, one Antigravity warm
+stream. Concrete unsettled work receives finite disposition; history does not keep an
+executor alive.
 
-Remove Concilium, generic contract/integration ratification/ACK, automatic
-publication/Issue-label projection, document-edition rights, legacy acceptance,
-retired installers/provenance equality and worker implementation dependencies outside
-the compact core.
+Harness Goal maps through native Goal and is default when supported. Eliot Goal
+independently admits ordinary message Operations. Remove provider branches, pseudo-
+Goal continuation and Goal proof packets.
 
-## 12. Finite transition
+Adapters read native events and provider-local JSON/JSONL/SQLite; host adds process/
+Git; Store joins Task/Attempt/Operation, session, process, worktree/ref, source gaps
+and provider usage. Configured readers run without Task/binding and expose unmatched
+sessions. Viewer reads make no provider call.
+
+Move pure bounded reads to WAL readers; never hold Store transaction across external
+I/O/pagination. Give automation immutable entry ID and delete successor copies,
+relocated journals/chains. Remove Concilium, generic ratification/ACK, automatic
+publication/labels, document-edition rights, legacy acceptance, retired installers/
+provenance equality and worker implementation dependencies outside compact core.
 
 <a id="current-format-and-existing-data"></a>
 
-Backward compatibility is not a product feature. Before deleting a protocol,
-executor, method or storage path, enumerate concrete unsettled Operations and required
-results. Finish/read back with the current owner, export the result, or create a new
-Task revision/Attempt. Then remove producer, reader, schema branch, config, fixture and
-package together.
+## 17. Finite transition
+
+Before deleting a protocol, executor, method or format, enumerate concrete unsettled
+Operations and required results. Finish/read back with current owner, export result,
+or create a new Task revision/Attempt. Then remove producer, reader, schema branch,
+config, fixture and package together.
 
 Do not write converters for hypothetical history. Completed records may stay opaque
-when current projections contain the needed facts; they do not keep runtime code alive.
-
-## 13. Verification
+or in an archived old DB; they do not keep runtime code alive.
 
 <a id="verification"></a>
 
+## 18. Verification
+
 | Boundary | Required proof |
 | --- | --- |
-| Antigravity | v6 only; no proof refresh gate; terminal Store delivery survives reconnect without native replay; removed handlers have no callers. |
-| Queue/routes/provider/capacity | deterministic reasons; blockers do not hide later Tasks; fallback explicit; source freshness honest; concurrent root admission obeys limit; old ledgers absent. |
-| Workspace/process | overlapping writers cannot launch; disjoint prefixes can; PID reuse cannot kill foreign process; uninspectable owner stays unknown. |
-| Scheduling | one due/admission loop; lost wake recomputes current state; same occurrence admits once; standalone scheduler absent. |
-| TaskPacket/review | model receives bounded actionable work; initial/correction/resume share renderer; all findings return together; B cannot reuse A review; no-progress stops. |
-| Public API/migrations | one domain authorizer per retained method; internal/adapter protocols separate; removed surface absent everywhere; numeric migration is atomic and readers reject unsupported version. |
-| IPC/MCP | slow tool call does not block unrelated call on the same session; lost mutation reply remains unknown and is never replayed; one wake pump is bounded/backed off; Task pending-input read is exact; native stream traffic does not occupy the writer. |
-| External effects | every new CheckRun uses one executor; probes no longer spawn the host as a generic worker; every ScriptRun uses one shared DTO/protocol; Forge push/readback has one worker/target lane; package binaries are not rehashed per Operation; unknown effects are never replayed. |
-| Adapter/executor/observation | two adapters prove shared shell; one executor per harness; unbound sessions/gaps visible; exact input/result attribution; uncertain stream stays unknown. |
-| Deletion | no config, package, CI, docs or fallback wrapper remains; report net owned Rust+JS+glue separately from tests. |
+| Antigravity | v6 only; no refresh/proof gate; terminal Store delivery survives reconnect without native replay |
+| Queue/routes/provider/capacity | deterministic reasons; blockers do not hide later work; fallback explicit; root limit race-free; old ledgers absent |
+| Workspace/process | overlap blocks, disjoint runs; PID reuse kills nothing; uninspectable stays unknown |
+| Scheduling | one due loop; lost wake recomputes; same occurrence once; scheduler service absent |
+| TaskPacket/review | bounded actionable context; shared initial/correction/resume renderer; all findings together; B gets B review; no-progress stops |
+| Public API/migrations | domain authorizer per retained method; internal/adapter protocols separate; removed methods absent everywhere; numeric migration atomic |
+| IPC/MCP | slow call does not block unrelated call; one wake pump; exact pending-input read; live stream avoids writer |
+| External effects | one Check executor, one Script DTO/protocol, one Forge remote owner; no per-Operation executable hashes; unknown effects never replay |
+| Claude | exact Store result page retries after lost ACK; native input never repeats; callback cannot leak to replacement boot; result survives adapter restart |
+| Remaining adapters/observation | two consumers prove shared shell; one executor per harness; unbound sessions/gaps visible; exact input/result attribution |
+| Deletion | no config/package/CI/docs/fallback wrapper remains; net owned Rust+JS+glue reported separately from tests |
 
 Documentation changes run content/link checks. Runtime slices start with formatting and
-the minimal affected warnings-denied Clippy/build. Focused connected cases run when
-the slice closes; broad qualification follows the complete product path.
+minimal affected warnings-denied Clippy/build. Focused connected cases run when the
+slice closes; broad qualification follows the complete product path.
