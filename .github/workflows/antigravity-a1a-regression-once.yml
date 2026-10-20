@@ -19,20 +19,30 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Repair connected Antigravity regression
+      - name: Repair A1a runtime and regressions
         shell: bash
         run: |
           set -euo pipefail
           python tools/ci/antigravity-a1a-regression-once.py
-          rustfmt --edition 2024 crates/swarm-kernel-host/src/store/module_bridge_recovery_tests.rs
+          python tools/ci/antigravity-a1a-runtime-fix-once.py
+          rustfmt --edition 2024 \
+            crates/swarm-kernel-host/src/store/module_bridge_recovery_tests.rs \
+            crates/swarm-kernel-host/src/store/receipt_tests.rs \
+            crates/swarm-kernel-host/src/store/producers.rs
           git diff --check
 
-      - name: Run exact connected regression
+      - name: Run connected A1a regressions
         shell: bash
         run: |
           set -euo pipefail
           cargo test --locked -p swarm-kernel-host --lib \
             antigravity_terminal_receipt_is_self_contained_and_keeps_task_unresolved \
+            -- --nocapture
+          cargo test --locked -p swarm-kernel-host --lib \
+            warm_terminal_receipts_settle_execution_without_accepting_task_or_inventing_run \
+            -- --nocapture
+          cargo test --locked -p swarm-kernel-host --lib \
+            warm_forged_boot_receipt_rolls_back_operation_and_producer \
             -- --nocapture
 
       - name: Minimal Store Clippy
@@ -47,10 +57,15 @@ jobs:
           set -euo pipefail
           rm .github/workflows/antigravity-a1a-regression-once.yml
           rm tools/ci/antigravity-a1a-regression-once.py
+          rm tools/ci/antigravity-a1a-runtime-fix-once.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add crates/swarm-kernel-host/src/store/module_bridge_recovery_tests.rs \
-                  .github/workflows/antigravity-a1a-regression-once.yml \
-                  tools/ci/antigravity-a1a-regression-once.py
-          git commit -m 'test: align Antigravity terminal regression with A1a'
+          git add \
+            crates/swarm-kernel-host/src/store/module_bridge_recovery_tests.rs \
+            crates/swarm-kernel-host/src/store/receipt_tests.rs \
+            crates/swarm-kernel-host/src/store/producers.rs \
+            .github/workflows/antigravity-a1a-regression-once.yml \
+            tools/ci/antigravity-a1a-regression-once.py \
+            tools/ci/antigravity-a1a-runtime-fix-once.py
+          git commit -m 'fix: preserve Antigravity terminal producer disposition'
           git push origin HEAD:main
