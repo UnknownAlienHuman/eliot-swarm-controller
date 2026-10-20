@@ -1,184 +1,166 @@
-# Muse SDK bridge — current integration
+# Muse route — retained Node executor
 
-The default Muse route currently uses `muse-sdk-1.3.0-bridge.13` and the
-`@muse-code/sdk` 1.3.0 resolution in this directory's manifest/lockfile. The
-[Rust adapter](../../crates/swarm-adapter-muse/registration/INTEGRATION.md) has a
-working candidate and a disabled descriptor. Its
-[2026-10-17 native result receipt](../../docs/remediation/2026-10-17/MUSE-NORMALIZED-RESULT-NATIVE-VERIFICATION.json)
-records an applied dispatch and a publicly readable result on the recorded Core;
-it does not qualify the default Node route or complete native family recovery.
+## Current decision
 
-Refactoring chooses one executor by required behavior and total owned code
-across Rust, SDK drivers and glue. The
-[transition plan](../../docs/agent-operations/implementation.md#current-format-and-existing-data)
-removes the replaced implementation; these source versions do not promise
-permanent support for older bridges. [UPDATE.md](UPDATE.md) separates dependency
-updates, protocol changes and concrete saved-work transitions.
+New Muse work uses the current Node route:
 
-## Ownership and setup
-
-Muse owns provider authorization, settings, native tools and inference. The
-bridge owns the SDK connection and maps controller Operations to native command
-IDs. Host Store owns Task/Attempt admission, rights and acceptance.
-
-The existing Node setup uses `npm ci --ignore-scripts` in this directory. Select
-the route through the [module installation guide](../../docs/agent-operations/module-installation.md)
-and copy `module.example.json` to private configuration with the real Host
-endpoint, scoped module credential and native executable/arguments.
-
-```toml
-[[routes]]
-alias = 'muse-manager'
-runtime = 'muse'
-module_artifact_id = 'muse-sdk-1.3.0-bridge.13'
-enabled = true
-[routes.native_options]
-workspaceRoot = 'C:\Projects\YourRepository'
-# modelId, providerId and reasoningEffort are optional native overrides.
+```text
+muse-sdk-1.3.0-bridge.13
+@muse-code/sdk 1.3.0
 ```
 
-Current code requires the route and private `moduleArtifactId` to match
-bridge.13 and checks restored checkpoint identity. These are present source
-constraints, not a rule to create a permanent runtime namespace for every SDK
-update. Model/provider/effort omission uses native defaults; an explicit
-override must match readback. An observed model is never copied into a requested
-route constraint.
+The disabled custom Rust candidate `muse-rust-controller.1@0.1.2` is a retirement
+target. It is not a second supported new-work route and is not the basis of a shared
+adapter framework.
 
-After reserving the binding and creating its scoped module credential, the
-existing managed invocation is:
+This choice is based on current behavior, not language preference:
 
-```powershell
-swarm module-run --state-dir C:\SwarmModules\MC --command 'C:\Program Files\nodejs\node.exe' -- C:\SwarmCode\modules\muse\bridge.mjs --config C:\SwarmConfig\muse.json
-```
+- Node bridge.13 is the configured/default route;
+- it maps Store Operations to explicit native command IDs before native I/O;
+- it supports start/resume, send/steer, reply, configure, native Goal, refresh,
+  reconcile, result, usage and child/session observation;
+- recovery resumes the recorded session with no fresh-session/original-prompt fallback;
+- the Rust candidate is disabled, duplicates wire/schema/transport/fold/journal/
+  process/observation/result machinery and has only a narrow result qualification.
 
-Use a module-state directory separate from host data. The managed owner records
-the bridge/native process family and prevents a second launcher from adopting
-live work. Direct `node bridge.mjs` bypasses that ownership path. Runtime
-upgrades must handle any actual admitted work explicitly; they do not relabel
-its receipts or replay its prompt.
+Historical Rust receipts remain historical evidence. They do not require permanent
+Rust execution or a Node↔Rust journal converter.
 
-## Current SDK and MCP boundary
+## Ownership
 
-The bridge uses the SDK's public `spawnMspConnection`, `Connection`,
-`checkServedFingerprint` and `MspError`. The SDK owns wire framing and RPC
-routing; ELIOT owns Operation mapping and its checkpoint. The SDK `Session`,
-`PendingCommandSet` and `GapFiller` are not currently used. A proposed SDK
-substitution must remove existing transport/fold/glue and preserve explicit
-control over native input replay.
+Muse owns provider credentials, native session state, tools and inference.
 
-The bridge requests the native `sessionMcp` grant and can forward a configured
-`mcpServers` map. Observed `session/start` acceptance does not establish that
-the server or its tools are usable. The inspected native reads exposed no tool
-inventory, and the existing Store launch gate still refuses dispatch in that
-case. This is a [known source gap](../../docs/agent-operations/refactoring.md):
-[V3 requires asynchronous MCP observations](../../docs/agent-operations/implementation.md#launch-and-results),
-so unavailable inventory must not become a new permanent launch prerequisite.
+The bridge owns:
 
-## Commands and observation
+- one SDK connection and current session owner;
+- mapping one Eliot Operation to one native command ID;
+- native action/readback/reconciliation;
+- bounded normalized observation and result extraction;
+- exact already-formed delivery back to Store until ACK.
 
-| Host operation | Current bridge behavior |
+Host Store owns Tasks, Attempts, Operations, authorization, workspace authority,
+review and acceptance. Native Goal completion never accepts a Task.
+
+The bridge runs through `swarm module-run`; direct `node bridge.mjs` bypasses Eliot
+process custody.
+
+## Current command boundary
+
+| Store action | Muse mapping |
 | --- | --- |
-| `task.dispatch` | Consumes the Store TaskPrompt and dispatch context, validates the input identity and submits that prompt once. Maximum prompt size is 1,000,000 UTF-8 bytes. |
-| `agent.send` | Next-turn input or steering addressed to `expected_turn_id`. |
-| `agent.reply` | An explicit answer to current native approval/input request IDs. Presentation acknowledgement alone does not decide a request. |
-| `agent.configure` | Applies an explicit native setter. Model changes wait for matching native readback; an ACK alone does not release the input fence. |
-| `agent.goal` | Native set/edit/pause/resume/clear. Goal completion is separate from Task acceptance. |
-| `agent.refresh` | Reads the root or observed child and refreshes pending requests; does not resume it. |
-| `agent.reconcile` | Addresses the original unresolved Operation; no automatic blanket replay. |
+| `task.dispatch` | validate the current task packet and submit once |
+| `agent.send` | next turn or exact steer using expected turn |
+| `agent.reply` | answer the current native request ID |
+| `agent.configure` | one explicit setter plus matching readback |
+| `agent.goal` | native set/edit/pause/resume/clear |
+| `agent.refresh` | safe session/child/pending-request readback |
+| `agent.reconcile` | read back the original unresolved Operation |
+| `agent.recover` | resume the recorded session after confirmed old-family departure |
+| `agent.result` | read the requested native item/revision and return bounded bytes |
 
-Use `swarm call METHOD --file FILE` with binding/generation and the method's
-arguments. Configure one native setter per Operation. While a model change is
-unresolved, current code holds sends, dispatch and work-starting goals;
-replies, refresh and reconciliation remain available.
-
-Observations fit the existing 1 MiB Host frame. Omitted pending identities or
-oversized gaps produce partial coverage; they do not create decisions or prove
-that missing children completed. Opaque cursor pairs are preserved together or
-reported unavailable. Child freshness requires an exact current read; a restored
-snapshot or idle parent does not prove current family completion.
+A Host disconnect reconnects Eliot IPC; it does not close Muse or resend native
+input. A native command rejected by the server can fail; a transport loss after
+submission remains uncertain and is reconciled by its original command ID.
 
 ## Recovery
 
-The checkpoint contains native session identity, relevant settings, pending
-commands/ACKs and undelivered outcomes/result pages. Native transcript and
-credentials remain with their existing owners. A Host disconnect reconnects the
-same bridge; it does not close the SDK or resend native input.
+The retained session record names the exact native session and selected settings.
+Recovery:
 
-After bridge loss, the current recovery path first checks that the previous
-managed family has departed. Read `agent.state` for the current boot and submit
-an explicit `agent.recover` request for that binding:
+1. verifies the previous Eliot-owned family departed;
+2. addresses the current binding/boot;
+3. calls native session resume for the recorded session;
+4. never creates a fresh session;
+5. never resends the original Task prompt.
 
-```json
-{"binding_id":"EXISTING_BINDING","generation":1,"expected_boot_id":"CURRENT_BOOT","reason":"Resume the recorded session"}
+Corrupt/missing state or uncertain native creation remains a visible gap. A new
+adapter process does not silently adopt another boot's unresolved delivery or effect.
+
+## Results
+
+The bridge reads a selected native session/item/revision. It never substitutes the
+newest result or follows arbitrary stored file paths.
+
+```text
+agent.result
+  -> exact native read
+  -> module.result
+  -> immutable artifact
+  -> artifact.read / artifact.assemble
 ```
 
-Recovery uses `session/resume` for the recorded native session. It has no
-fresh-session or original-prompt fallback. An unknown admitted command needs
-targeted reconciliation with its original ID. Corrupt/missing checkpoints and
-uncertain creation remain reported recovery gaps; do not infer a successful
-effect or silently issue it again.
+Result availability is separate from Task submission, review and acceptance.
 
-This mechanism serves current work. Old inactive bridge generations are handled
-through the finite export/transition in [UPDATE.md](UPDATE.md), rather than kept
-as additional executors indefinitely.
+## Simplification work
 
-## Task-specific children
+Refactor the checkpoint into four concerns:
 
-Native managers spawn children. `attempt.bind_producer` associates an observed
-session/turn with the Task without launching another writer or accepting a result.
+```text
+SessionRecord
+  native session, workspace, effective settings and source epoch
 
-```powershell
-swarm task claim TASK --revision 1 --binding-id BINDING --generation 1
-swarm family BINDING --generation 1
-swarm --request-id bind-worker-1 task bind ATTEMPT --assignment worker-1 --session CHILD --turn TURN --observation-id OBSERVATION
+NativeEffectRecord
+  one unresolved command ID plus action/readback coordinates
+
+StoreDelivery
+  exact already-formed outcome/result parameters until ACK
+
+ObservationCheckpoint
+  replaceable latest normalized state plus cursor/coverage
 ```
 
-The caller still needs current Task/binding rights. Reusing a child session does
-not reuse the authority of its previous turn; family pagination does not prove
-complete discovery. `subagent/readResult` changes native state and is not used
-as an observation helper.
+Delete full descriptor/schema echo negotiation, repeated Task/source/package hashes,
+artifact-version source allowlists, copied Task/proof state in model prompts, generic
+retention structures outside these records and duplicate process ownership outside
+`swarm-process`.
 
-## Result retrieval and complete local export
+Use module-owner Job/process-group custody and bounded shutdown.
 
-Node `results.mjs` reads the requested native item revision using `view/page`
-and `item/readOutput`. It does not substitute a newer revision or follow
-arbitrary stored paths/URIs.
+## Official Rust SDK
 
-```json
-{"kind":"result","session_id":"PARENT_CONTAINING_ITEM","item_id":"OBSERVED_ITEM","item_revision":1}
-```
+The reviewed official `muse-code-sdk` Rust crate is version 1.4.11, MIT and requires
+Rust 1.97+. It provides spawn/attach, typed MSP, sessions, turns, approvals, fold, gap
+recovery and bounded close.
 
-Supported kinds are `result` (structured subagent result), `message` (agent
-message), and `output`/`patch` with the required `output_ref`. An optional
-`before_cursor` is native pagination; `expected_digest` identifies the source.
+It is a future replacement candidate, not an additional route. Its high-level
+`send_user_turn` currently mints a command ID internally, while Eliot needs the
+Operation→native-command association before uncertain submission. The low-level
+custom-minter constructor does not run the normal handshake.
 
-```powershell
-swarm --request-id page-1 result BINDING --generation 1 --file selector.json --offset 0 --length 65536
-# Read operation.get, then its result.details.artifact_ref:
-swarm artifact get ARTIFACT_ID
-swarm artifact read ARTIFACT_ID --offset 0 --length 65536
-```
+Re-evaluate only when upstream exposes the required production seam, or when a small
+adapter can use public low-level Connection/generated types while deleting more code
+than it adds.
 
-A result call returns one page. Continue with `next_offset_bytes`, the same
-selector/revision and a new request ID. Native-source offsets differ from local
-page offsets; respect UTF-8/base64 at split boundaries. The 64 KiB page limit is
-not a whole-result limit.
+Do not upgrade Node SDK/host from 1.3.0 during executor consolidation. SDK and host
+versions are paired; upgrade them in a separate exact-version live-qualified
+transition.
 
-Use the existing [complete-result workflow](../../README.md#complete-results-without-model-roundtrips)
-for `artifact.assemble`, `artifact.parts` and local export. This gathers actual
-bytes without another model call. File completeness remains separate from Task
-submission, review and acceptance.
+## Rust candidate retirement
 
-## Verification and remaining work
+Before deleting `crates/swarm-adapter-muse`:
 
-Use existing `selftest.mjs` cases for changed bridge behavior and the project's
-[scoped checks](../../docs/ci-scoped-builds.md). Historical passes are scoped
-evidence in [implementation status](../../docs/implementation-status.md);
-they are not extra instructions or permanent release gates.
+1. enumerate concrete unsettled Rust 0.1.2 Operations/results;
+2. finish/read back with the current owner or export required result bytes;
+3. record explicit disposition for unresolved work;
+4. remove the Cargo member, descriptor, route/configuration, package rules, custom
+   wire/schema, fixtures and Rust-only qualification branches;
+5. preserve completed results through Store/artifact history, not the executor.
 
-Outstanding work is recorded in the
-[refactoring map](../../docs/agent-operations/refactoring.md) and the
-[Rust integration status](../../crates/swarm-adapter-muse/registration/INTEGRATION.md).
-The native result receipt narrows the Rust candidate's gaps; it does not settle
-all native family/recovery behavior or choose which complete implementation
-should remain.
+Do not translate private Node/Rust journals or rewrite old receipts.
+
+## Verification
+
+Keep focused cases for:
+
+- one Operation → one command ID;
+- no prompt replay after Host/native uncertainty;
+- same-session recovery only;
+- native Goal independent of Eliot Goal;
+- complete result bytes and exact Store redelivery after lost ACK;
+- current request/reply identity;
+- bounded close and process-family custody;
+- source-scoped usage/coverage;
+- explicit gaps for missing children/cursors.
+
+Historical receipts prove only their named artifact/revision and do not qualify a new
+SDK/host version.
