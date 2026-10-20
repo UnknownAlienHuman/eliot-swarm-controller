@@ -35,7 +35,7 @@ the new source.
 | Codex adapter state machine | deep connected source review; installed route not re-qualified |
 | Command Batch/ACP state machines | deep connected source review; installed agents not re-qualified |
 | Muse Node/Rust state machines and upstream SDK | deep source review; installed route not re-qualified |
-| OpenCode internal state machine | partial targeted review |
+| OpenCode built-in/standalone state machines and current upstream contract | deep source review; selected installed contract not re-qualified |
 | Passive joined observation | architecture plus selected source paths |
 | GitHub effects, mailbox/coordination and gateway | partial |
 | Installed/native behavior, Windows custody and scale | unqualified except named historical receipts/open issues |
@@ -75,7 +75,8 @@ M       Claude: one session/effect/delivery/observation/result model
 N       Codex: one app-server owner, native Goal, small records
 O       Command: one Batch profile, one stable ACP v1 route
 P0-P6  Muse: keep Node bridge, simplify it, retire custom Rust, no third executor
-Q       OpenCode: complete state-machine audit, then standalone Rust only
+Q0-Q6  OpenCode: select one exact native contract, standalone Rust only,
+       exact parent result, restart readback, internal MCP, delete built-in host path
 R       native/Eliot Goals and passive local Governor observation
 S       delete optional product engines, compatibility/tooling bureaucracy
 ```
@@ -106,7 +107,7 @@ S       delete optional product engines, compatibility/tooling bureaucracy
 | Codex | monolith and full-snapshot checkpoint | explicit connection/session/effect/delivery/observation owners |
 | Command | five artifact profiles and two large persistence models | one Batch, one stable ACP v1, minimal effect/delivery |
 | Muse | active Node plus disabled 600-KB+ custom Rust source and two private journals | retain/simplify Node now; finite Rust deletion; official Rust SDK only as future replacement |
-| OpenCode | built-in host and standalone Rust paths coexist | standalone Rust only after result/restart audit |
+| OpenCode | active built-in host executor plus disabled standalone; old standalone contract lacks assistant parent while current upstream exposes it | select/live-qualify one exact native contract; standalone Rust only; exact parent result; delete built-in executor and giant journal machinery |
 | Observation | unbound joined Governor view incomplete; metric hashing remains | local provider+OS+Git view without provider calls |
 | Product breadth | council, ratification/ACK and automatic projection remain | outside compact-core completion |
 | Tooling | compiler/checkout/cache equality and artifact validators remain | generic package boundary plus route-specific qualification |
@@ -143,32 +144,46 @@ is the active/default route and preserves explicit Operation-derived native comm
 IDs, targeted recovery and native Goal/result/usage behavior.
 
 Retire disabled `muse-rust-controller.1@0.1.2` after concrete work disposition. Its
-`journal.rs`, `driver.rs`, `commands.rs`, `msp.rs`, `module_runtime.rs` and nearby
-tests already exceed 605 KB; additional owner/observation/result files are outside
-that subtotal. It duplicates transport, fold, journal, process custody and results.
+main state-machine files already exceed 605 KB before additional owner/observation/
+result files. It duplicates transport, fold, journal, process custody and results.
 
 The official upstream Rust SDK 1.4.11 is a future replacement candidate, not a third
 route. It supplies typed MSP/session/fold/gap recovery and bounded close, but its
-high-level `send_user_turn` mints command IDs internally. Eliot needs the
-Operation→native-command association before uncertain submission. Re-evaluate when
-that production seam exists or a small low-level adapter can delete more code than it
-adds.
+high-level turn path mints command IDs internally. Re-evaluate only when the required
+production seam exists or a small low-level adapter deletes more code than it adds.
 
-Muse implementation:
+### OpenCode
+
+Converge on `crates/swarm-adapter-opencode` as the only new-work executor after Q0-Q4.
+The current built-in host `runtime/opencode_v2` remains only until standalone closes
+the exact native contract.
+
+The prospective standalone route is pinned to an older public projection with no
+assistant input parent and correctly returns `NATIVE_ASSISTANT_PARENT_UNAVAILABLE`.
+Current upstream source reviewed at
+`930c0c8b6a3c41ceb73b9372f878b5a1186b4d4e` exposes durable inbox identity,
+process-global Session ownership, execution claims/restart interruption and public
+assistant `parentID`. This is source evidence, not installed qualification.
+
+OpenCode sequence:
 
 ```text
-P0  freeze new work on Node bridge.13; inventory concrete Rust 0.1.2 work
-P1  split Node checkpoint into SessionRecord, NativeEffectRecord,
-    StoreDelivery and latest Observation
-P2  preserve Operation-derived command IDs and targeted reconciliation
-P3  keep native Goal/turn/reply/config/result/usage through one connection
-P4  use module-owner custody and bounded close
-P5  finish/export Rust work; delete crate, Cargo member, descriptor,
-    custom wire/schema and Rust-only tooling/fixtures
-P6  upgrade SDK/host only as a separate exact-version live-qualified transition
+Q0  select and live-qualify one exact native contract with durable inbox,
+    execution claim/restart terminal and assistant parentID
+Q1  bind exact assistant result by assistant ID + parent input ID + part IDs
+Q2  map steer/reply/cancel/background and exact restart readback
+Q3  internalize MCP setup/readiness; remove first-input gate and public native.mcp.*
+Q4  switch current route/package/config to standalone; freeze built-in new work
+Q5  disposition built-in work; delete runtime/opencode_v2, legacy demand/worker slot,
+    built-in profiles/launcher paths/fixtures
+Q6  shrink standalone journal to SessionRecord, NativeEffectRecord,
+    StoreDelivery and latest Observation; delete old pinned profiles
 ```
 
-Do not translate Node/Rust private journals or relabel historical receipts.
+OpenCode has no reviewed native Harness Goal in the selected upstream source. Eliot
+Goal sends ordinary messages. The external service remains externally owned; Eliot
+never restarts/kills it. If restart cannot prove exact continuation or final
+interruption for an input, the Operation stays unknown.
 
 ## Runtime evidence retained
 
@@ -183,26 +198,24 @@ adapter reductions, passive observation, executor deletion or installed fleet.
 
 ## Remaining audit tracks before a complete current-head claim
 
-1. Complete the OpenCode state-machine audit and select the exact built-in/standalone
-   deletion sequence.
-2. Finish GitHub/mailbox/gateway effect tracing and execute the public method → role →
+1. Finish GitHub/mailbox/gateway effect tracing and execute the public method → role →
    exact object → Store/effect privilege matrix.
-3. Execute migration/corruption/partial-upgrade cases against concrete retained DB
+2. Execute migration/corruption/partial-upgrade cases against concrete retained DB
    states after numeric migration is implemented.
-4. Measure IPC/Store fairness and writer occupancy after J0-J3; source review is not
+3. Measure IPC/Store fairness and writer occupancy after J0-J3; source review is not
    load qualification.
-5. Perform owner-machine qualification for native restart, Windows process-family
+4. Perform owner-machine qualification for native restart, Windows process-family
    custody, mixed-provider execution and scale. Open Issues #1, #3, #4, #5, #11,
    #140 and #159 remain evidence boundaries, not completion proof.
-6. Re-run minimal current-head format/Clippy/build checks for each landed runtime
+5. Re-run minimal current-head format/Clippy/build checks for each landed runtime
    slice; connected and broad tests follow completed product paths.
 
 ## Verification status
 
-The latest Muse audit changes documentation only. Runtime implementation starts with
-A0/A1, then the connected cases in
+The latest OpenCode audit changes documentation only. Runtime implementation starts
+with A0/A1, followed by the connected cases in
 [implementation verification](agent-operations/implementation.md#verification).
 
 Do not interpret older broad CI or fixtures as qualification of the planned protocol,
-prompt, queue, review/correction flow, Muse consolidation, observation or executor
+prompt, queue, review/correction flow, adapter consolidation, observation or executor
 deletion. Record each landed source slice and net owned-code change here.

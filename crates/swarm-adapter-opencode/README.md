@@ -1,45 +1,219 @@
-# OpenCode V2 module adapter
+# OpenCode route — standalone Rust consolidation
 
-`eliot-opencode-v2.rust-http.1@0.7.3` is the prospective standalone OpenCode adapter. Its descriptor uses `opencode-v2-native-options@4` (SHA-256 `112d277fe7774bef1c05d127a60f6fb8adfef0c6c3dab0e749eef0eb07267ed8`) and protocol 1.0. It declares `swarm.task_prompt@1`; every selected `task.dispatch` requires the Store-produced immutable envelope and submits its exact prompt text to the OpenCode 2.0.7 inbox as flat `text` plus `metadata.eliot`. Admission checks the actual `SessionInbox.User` acknowledgement; later reconciliation reads `session.inbox.enqueued` and `session.inbox.delivered`. The acknowledgement has no admission or promotion sequence, so the adapter never invents one. A legacy public `promoted_sequence` may represent inbox delivery only; it is not execution evidence and does not set `execution_complete`. Artifact selection is explicit, disabled by default, and requires a trusted catalog entry.
+## Current decision
 
-Artifact 0.7.3 inherits the 2.0.7 SSE/forms/permission wire and native service registration, adds the direct input-delivery readback described below, and emits the Store's exact input-status body. Correlation limitations remain in source metadata. The development 0.7.2 package observed the exact native User row but retained an unacknowledged result: its body included two extra correlation fields that Store rejects. Existing installed 0.7.1/0.7.2 artifacts, bindings, receipts and unknown outcomes remain immutable. Native-options schema 4 requires only service, connection and directory; an explicit provider/model/variant trio is an optional caller-supplied invocation override with all-or-none validation, never defaulted by the controller. It exposes no provider credentials or isolated-owner launch configuration. Provider accounts remain entirely native. Current qualification and remaining failures are recorded in [Implementation Status](../../docs/implementation-status.md); no full CI or successful native model execution is claimed.
+Keep `crates/swarm-adapter-opencode` as the only target executor for new OpenCode
+work. The current host-integrated `runtime/opencode_v2` route remains active only
+until the standalone route closes the exact result and restart boundaries below.
+After cutover, delete the built-in executor and its worker/demand/package surface.
 
-The root-creation path inherited from 0.7.1 accepts an empty but fully synchronized session log only when read-only session and location readback match the deterministic root ID, root status, binding generation, selected directory, configured model when pinned, and the saved operation marker when available. Missing or mismatched readback remains unresolved; this path sends no model input and never replays the native request.
+Do not keep both implementations as permanent profiles. Historical completed records
+may remain readable through Store projections; they do not keep an executor alive.
 
-The descriptor declares agent.open, task.dispatch, agent.send/next_turn, agent.reply, agent.background, agent.refresh, agent.reconcile, and agent.result, along with the four native.mcp.* commands. Unknown OpenCode-native methods stay unsupported. This artifact does not declare native.opencode.loop_step because no supported internal producer exists.
+## Native contract selection
 
-The owner-approved human/current-GM continuation remains the host agent.goal action continue. It admits one deterministic queue input and is not a loop-step producer.
-No supported internal Manager or automation producer for native.opencode.loop_step exists in this source baseline. The OpenCode adapter no longer advertises the capability or command schema, and new input submissions fail closed with UNSUPPORTED_CAPABILITY. No MCP or CLI command is added.
-The adapter retains the loop-step delivery mapping only for exact readback of previously retained intents; uncertain prior POSTs remain unknown and are never replayed.
+The prospective adapter is currently pinned to an older OpenCode projection whose
+assistant message omitted the source input parent. It therefore fails every assistant
+result read with `NATIVE_ASSISTANT_PARENT_UNAVAILABLE`. This fail-closed behavior is
+correct for that contract, but it is not a permanent product limitation.
 
-The descriptor opts into `swarm.native_mcp_command@2`. Native MCP observe commands carry an explicit `installed_server` purpose for C8 install readback or `assigned_session` for the C7 assignment observation. Assigned-session readback is pinned to OpenCode 2.0.7, uses location-scoped GETs for the MCP list and exact assigned session, and returns only bounded identity/status facts with server errors and integration IDs removed or hashed. Other command and event schemas remain at version 1.
+Current upstream source reviewed at
+`930c0c8b6a3c41ceb73b9372f878b5a1186b4d4e` exposes the mechanisms Eliot needs:
 
-## Service lifecycle
+- durable session inbox/message identity;
+- one process-global execution owner per Session ID;
+- first-admission-wins input identity and coalesced wakeups;
+- a write-ahead execution claim and exact restart interruption settlement;
+- public assistant messages with `parentID`;
+- indexed session/message/inbox sequences.
 
-External attach uses the exact service ID, connection file and workspace from the selected route; the native harness supplies provider/model/variant defaults. An explicit caller-requested trio is passed through unchanged as an optional invocation override with all-or-none validation. The observed OpenCode version is diagnostic data, not an admission gate. The adapter never starts, stops, adopts, or restarts an externally attached service.
+This source review is **not** an installed-version qualification. Select one exact
+installed OpenCode contract that exposes the required fields, record its actual
+version/source coordinates, and qualify it before admitting new work. Do not add a
+2.0.7/newer compatibility matrix or guess support from semver.
 
-Fresh isolated SDK service starts are retired. Schema 4 rejects owner launch options, and the retained owner controller refuses a new `fresh_owned_service` start before any native effect. Historical owner/process receipts and custody checks remain readable; they do not authorize starting a replacement or replaying an uncertain launch. Old server source remains historical provenance. New frontend/kernel packages no longer carry that server or install its npm dependency closure; existing install receipts retain fenced read-only inventory support.
+## Ownership
 
-Registration examples use native defaults with no model field. When a caller explicitly requests a model, the trio is the exact selected route (for example inclusionai/ling-3.1-flash): `providerID` is `inclusionai`, `id` is `ling-3.1-flash`, and `variant` must be copied exactly with no alias, default or controller registry. The module's controller IPC credential is referenced through an opaque protected `credential_ref`; it is independent of native provider authorization. Examples contain no credential values or provider-auth file paths.
+The OpenCode service is externally owned. Eliot observes and controls sessions through
+the selected native API but does not start, update, restart or kill the shared service.
+A service PID change is not permission to adopt foreign state.
 
-## Native history and controls
+The standalone adapter owns:
 
-Queue sends use the durable OpenCode 2.0.7 inbox admission/readback path and persist their exact native delivery identity. Each admitted `SessionInbox.User` item must retain the exact flat text, `metadata.eliot` marker, session, input identity, and delivery. `session.inbox.enqueued` proves admission; `session.inbox.delivered` can extend an admitted input but cannot establish admission or provide a fabricated sequence. A legacy `promoted_sequence` may therefore mean inbox delivery only; it is not execution proof, and `execution_complete` remains false. The adapter retains loop-step delivery recognition only to reconcile previously retained intents; it does not admit new loop-step submissions. Filtered durable buses can leave sequence gaps; EOF without the scoped sync watermark and uncertain prior POSTs remain unknown.
+- one selected service/store identity;
+- one ordered native owner per Session ID;
+- Operation → durable inbox/input identity;
+- native reply/steer/cancel/background/readback;
+- exact result association;
+- provider-local observation and usage folding;
+- already-formed Store delivery until ACK.
 
-Questions and permissions are read from the current pending endpoints and projected as bounded typed observations. Replies bind the exact current request fingerprint. Generic permission replies allow only `once` and `reject`; `always` is unsupported. Lost reply responses reconcile from complete contiguous durable history and exact reply payload digests. Permission feedback text is not exposed by that history, so a reject carrying feedback remains unknown after a lost response.
+Host Store owns Tasks, Attempts, Operations, authorization, workspace authority,
+review and acceptance.
 
-Background first reads `backgroundSubagents`; false is rejected before POST. The documented boolean response distinguishes changed from no-op, while a lost response remains unknown and is never replayed. It does not claim child IDs or execution completion.
+## Semantic actions
 
-`agent.refresh` uses one bounded history page and queues `module.observe`; the cursor advances only after Store acknowledgement. Observations omit transcript and tool output. Result reads bind the exact input operation/session/message. OpenCode's public message projection omits the assistant-to-input parent edge, so assistant result correlation fails closed with `NATIVE_ASSISTANT_PARENT_UNAVAILABLE`; the adapter never substitutes the latest assistant message or guesses from ordering.
+The selected contract may expose:
 
-In 0.7.3, direct `agent.result` with `kind: "input_status"` reads the exact `GET /api/session/{sessionID}/message/{inputID}` User projection twice and requires equality. The saved receipt, deterministic root/input IDs, route/model, binding generation, full `metadata.eliot` marker including native delivery, prompt text digest/length, session and location must match. Root proof still requires its scoped synchronized log/readback checks; input-history admission or delivery events are not requested for this status read. At public OpenCode v2.0.31 pin [`22728d67461260d56bb9796b9b8f36e1de47202e`](https://github.com/anomalyco/opencode/blob/22728d67461260d56bb9796b9b8f36e1de47202e/packages/core/src/session/projector.ts#L618-L637), inbox delivery projects the immutable input ID into that User row even with Bus `persist=false`. An empty log alone supplies no input evidence. This readback records only input admission/delivery evidence: it neither changes the original send/reconcile/unknown outcome nor supplies a sequence, assistant correlation or execution completion. Ordinary history and uncertain-send reconciliation retain their existing evidence requirements; no native input is replayed.
+```text
+Open
+Dispatch
+Send(next_turn | exact steer)
+Reply
+Background
+Cancel(turn | queued_input)
+Refresh
+Result
+Reconcile
+```
 
-Acknowledged non-source operation journals are eligible for bounded reclamation only after exact outcome/result acknowledgements, reference checks, and root-checkpoint readback. Dispatch, send, and loop-step journals remain as result sources only when they retain the exact native input and root identity: later `agent.result` reads reopen that intent and admission, while a per-page Store acknowledgement settles only that read Operation and does not say that no future reader exists.
+Live Configure is advertised only when the selected native contract supplies an exact
+setter and matching readback. OpenCode has no reviewed native Harness Goal in the
+selected upstream source; Eliot Goal therefore sends ordinary `Send` messages.
 
-## Registration examples
+`native.opencode.loop_step` is not a product action. Public `native.mcp.*` setup phases
+are adapter internals. External service shutdown is not an Eliot action.
 
-- `registration/route.example.json` shows external attach with native defaults (no model override).
-- `registration/binding-launch-values.example.json` shows the route fields for external attach with native defaults. The native connection record is read in place; no provider authorization is projected.
-- `registration/select-route.request.example.json` selects prospective artifact version `0.7.3`.
+## Input and result identity
 
-The launch argument remains `--config <absolute-host-connection-config-path>`. That route-neutral file contains only host connection settings; descriptor-declared route values are supplied separately by the supervisor.
+One Eliot Operation creates one logical native input ID. OpenCode may perform several
+physical Attempts inside that input; they remain observation, not new Operations.
+
+```text
+Operation
+  -> durable inbox/input ID
+  -> process-global Session execution owner
+  -> exact assistant message ID
+  -> assistant.parentID == source input ID
+  -> exact selected part IDs/content
+  -> module.result
+```
+
+The result selector contains the exact assistant ID, expected parent input ID and
+selected part IDs/revision. The adapter reads that exact message and rejects:
+
+- missing or changed parent;
+- assistant from another input/session;
+- changed selected part set or revision;
+- newest-message/order/timestamp inference;
+- an unclassified stream/log gap.
+
+The old pinned contract continues to return `NATIVE_ASSISTANT_PARENT_UNAVAILABLE` for
+historical readback where the edge does not exist. New work moves to the single
+selected current contract rather than preserving two result implementations.
+
+## Restart and uncertainty
+
+A Host/adapter reconnect never replays native input. The native durable inbox and
+execution claim are the source of truth.
+
+The reviewed upstream restart path records an interrupted terminal for an execution
+claim left by the prior process. The selected installed service must prove one of:
+
+1. exact continuation linked to the same input;
+2. exact final interruption linked to that input.
+
+If neither is available, the Eliot Operation remains `outcome_unknown` and keeps its
+resource fence. Idle state, list absence, a new PID or elapsed time never settles it.
+Issue #3 remains the owner-machine qualification boundary for service restart.
+
+## Local observation
+
+The adapter reads provider-local state without a provider/model call:
+
+- known service/project/store identity;
+- session, message and inbox sequences;
+- execution claim/terminal state;
+- pending permission/form requests;
+- child/background sessions where the native source exposes them;
+- local usage/provider facts.
+
+Use one read-only WAL-visible SQLite connection per selected store and bounded indexed
+queries. Preserve source epoch/cursor and revisit known open messages that can update
+in place. `PRAGMA data_version` is only an unchanged-pass hint on the same connection.
+Do not use `immutable=1` on a live DB, copy the DB without WAL, or open a connection per
+viewer.
+
+Unmatched sessions remain visible inventory and grant no control rights. Issue #4
+remains the live child-discovery qualification boundary.
+
+## MCP boundary
+
+OpenCode MCP plugin installation/discovery/readiness belongs inside this adapter. It
+reports asynchronous observation and cannot gate the first assigned input. Remove
+Store/public `native.mcp.install|observe|arm|read` methods and their proof packets when
+the standalone route takes ownership.
+
+The Eliot MCP frontend remains independent and continues to call ordinary Store
+methods through `rmcp`.
+
+## Persistence simplification
+
+The current standalone journal combines native intent, execution periods, outcomes,
+result selectors/pages, Store ACKs, references, checkpoints, tombstones, cleanup and
+retention. Replace it with four bounded owners:
+
+```text
+SessionRecord
+  selected service/store/session identity and current source epoch
+
+NativeEffectRecord
+  one unresolved Operation/input plus native readback coordinates
+
+StoreDelivery
+  exact already-formed outcome/result parameters until ACK
+
+ObservationCheckpoint
+  replaceable latest normalized state plus cursor/coverage
+```
+
+Do not create a universal event journal, second transcript database, reference graph,
+tombstone/compaction system or another scheduler.
+
+## Cutover sequence
+
+```text
+Q0  select and live-qualify one exact native contract with durable inbox,
+    execution claim/restart terminal and assistant parentID
+
+Q1  update standalone native DTOs/reads; bind result by exact assistant ID + parentID
+
+Q2  map exact steer/reply/cancel/background and restart readback;
+    unsupported controls fail before native I/O
+
+Q3  move MCP setup/readiness fully inside the adapter and remove first-input gates
+
+Q4  switch current route/config/package selection to standalone Rust;
+    admit no new work through built-in host executor
+
+Q5  disposition concrete built-in unsettled work; delete runtime/opencode_v2,
+    legacy_worker_demand/OpenCode optional-worker slot, built-in package profiles,
+    launcher native-MCP/owned-service paths and built-in-only fixtures
+
+Q6  shrink the standalone journal to SessionRecord, NativeEffectRecord,
+    StoreDelivery and ObservationCheckpoint; remove old pinned profiles/readers after
+    required result export
+```
+
+Preserve generic Store Operation/result/artifact/observation APIs while removing
+OpenCode-specific host execution.
+
+## Verification
+
+Focused connected cases:
+
+- same input ID admits once; changed same-ID request conflicts;
+- repeated wake joins/coalesces rather than starting a second owner;
+- exact assistant result verifies `parentID` and selected parts;
+- old no-parent result fails closed without guessing;
+- graceful/forced service restart yields exact continuation/interruption or honest
+  unknown, never prompt replay;
+- queued cancel differs from active turn cancel;
+- reply addresses one current pending request;
+- MCP unavailability does not block first dispatch;
+- unbound sessions remain locally observable;
+- after cutover no config, package, worker demand, fallback or fixture starts the
+  built-in executor.
+
+Historical receipts qualify only their named contract and do not qualify the selected
+current native service.
