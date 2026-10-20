@@ -32,8 +32,9 @@ commits ahead. Historical findings remain evidence, not current qualification.
 | Check, Script and Forge execution ownership | deep source review; one-executor deletions specified |
 | Claude adapter state machine | deep connected source review; installed route not re-qualified |
 | Codex adapter state machine | deep connected source review; installed route not re-qualified |
+| Command Batch/ACP state machines | deep connected source review; current installed agents not re-qualified |
 | Passive observation and harness executor duplication | architecture plus selected source paths |
-| Command, Muse and OpenCode internal state machines | partial targeted review |
+| Muse and OpenCode internal state machines | partial targeted review |
 | GitHub effects, mailbox/coordination and gateway | partial |
 | Installed/native behavior, Windows custody and scale | unqualified except named historical receipts/open issues |
 
@@ -71,7 +72,9 @@ L       shared adapter shell only after two current routes delete duplication
 M0-M4  Claude: split native effect/Store delivery, persist result, simplify callbacks
 N0-N6  Codex: split session/effect/delivery/observation, map native Goal, delete
        full-snapshot checkpoint and retired executor
-O       Command, Muse, OpenCode, Goals, passive observation and remaining deletion
+O0-O6  Command: one Batch profile, one stable ACP v1 route, one session/effect/
+       delivery model, live permissions only, owner-led process custody
+P       Muse, OpenCode, Goals, passive observation and remaining deletion
 ```
 
 ## Confirmed current gaps
@@ -101,10 +104,14 @@ O       Command, Muse, OpenCode, Goals, passive observation and remaining deleti
 | Claude interactions | live callbacks have a second 119-KB retention engine | current pending callback plus one reply Operation; bridge loss remains unknown |
 | Claude result | terminal body is memory-only and lost Store result ACK cannot be resent | persist/read back body and retry identical Store page, never native work |
 | Codex implementation | almost the whole adapter lives in one 355-KB file | explicit connection/session/effect/delivery/observation owners |
-| Codex checkpoint | each change rewrites a full snapshot containing session, all live Operations, outcomes, result pages, observations, raw events and usage, plus SHA sidecar/tombstones | small independent records with different lifetimes; no full-state rewrite |
-| Codex events | raw app-server events are buffered, copied into checkpoint and then copied into one observation | normalized latest activity/usage plus bounded exact pending request/terminal facts |
-| Codex Goal | current adapter declares `agent.goal` unsupported but shared contracts maintain Goal-continuation admission/terminal proof around ordinary sends | map native `thread/goal/set|clear`; remove pseudo-continuation proofs |
-| Codex input identity | native `clientUserMessageId`, thread/turn and `expectedTurnId` exist, but receipts also repeat prompt/Task/package hashes | native IDs plus Operation; Store owns Task identity |
+| Codex checkpoint | each mutation rewrites a full snapshot containing session, all live Operations, outcomes, result pages, observations, raw events and usage | small independent records with different lifetimes |
+| Codex Goal | adapter rejects `agent.goal` while upstream has native Goal; Eliot adds continuation proof around sends | native Goal mapping plus ordinary Eliot Goal messages |
+| Command profiles | Batch v3/v4/v5 and ACP artifact profiles v1/v2 are active; both ACP profiles use ACP protocol v1 | one current Batch profile and one stable ACP v1 route; historical readers only |
+| Command storage | Batch `RunStore` and ACP `AcpJournal` separately implement admission, effect, outcome, result ACK and cleanup; together main runtime files exceed 730 KB | one minimal native-effect/session model plus one exact Store-delivery model per semantic route |
+| Command receipts | admission repeats artifact, route/input/prompt/Task/snapshot hashes; module host exact-compares capability/schema arrays | Operation + authenticated binding + native session/effect IDs; package metadata stays installation-only |
+| Command permissions | pending permission is a live oneshot but journal machinery treats callbacks as durable workflow | observe current callback, admit one exact Reply Operation; process loss makes it unknown, never resumable/replayed |
+| Command process family | ACP spawns direct child with `kill_on_drop`; source correctly admits direct exit is not family departure | module owner Job/group is custody authority; exact family readback before replacement/cleanup |
+| ACP protocol | Eliot `AcpV1/AcpV2` names are package generations, while both use stable ACP v1 `session/load`; upstream ACP v2 is still alpha and removes load | name current stable ACP v1 honestly; do not import draft v2 until stable and needed |
 | Observation | unbound joined Governor view incomplete; metric hashing remains | local provider+OS+Git view without provider calls |
 | Product breadth | council, ratification/ACK and automatic projection remain | outside compact-core completion |
 | Tooling | compiler/checkout/cache equality and artifact validators remain | generic package boundary plus route-specific live qualification |
@@ -133,8 +140,7 @@ survive bridge loss.
 A concrete delivery defect remains: `agent.result` sends `module.result` directly. A
 lost Store reply becomes `MODULE_RESULT_UNKNOWN` and the adapter refuses the identical
 page, conflating forbidden native prompt replay with safe exact Store-delivery retry.
-The body is also bounded memory-only, so adapter restart can lose a known terminal
-body.
+The body is bounded memory-only, so adapter restart can lose a known terminal body.
 
 Target M0-M4: one live session owner, minimal NativeEffectRecord, exact StoreDelivery,
 persist/read back terminal result, one live interaction projection, no generic
@@ -142,85 +148,109 @@ retention/tombstone/reference framework.
 
 ## Codex adapter audit
 
-The attach-only process boundary is useful: the adapter never starts or kills the
-Codex app-server. It also uses strong native identities—thread ID,
-`clientUserMessageId`, turn ID and `expectedTurnId`—and keeps exact pending result pages
-until Store acknowledgment.
+The attach-only process boundary is useful: Eliot never owns the app-server process.
+Strong native identities already exist: thread ID, `clientUserMessageId`, turn ID and
+`expectedTurnId`.
 
-The rest is concentrated in `crates/swarm-adapter-codex/src/lib.rs` (354,609 bytes).
-Its `Checkpoint` combines:
+Almost all implementation is in one 354,609-byte `lib.rs`. Its full `Checkpoint`
+contains package/boot/binding, root phase/configuration, all Operations and ACK IDs,
+native effects, dispatch/Goal proofs, pending outcomes/result pages, observation, raw
+events, usage and retirement. Every mutation clones/serializes the full state, writes
+and fsyncs a new file, writes a SHA sidecar, syncs the directory and prunes snapshots;
+terminal ACKs add sharded tombstones.
 
-- package/boot/binding identity;
-- root phase, opening Operation, workspace and requested/effective model;
-- all live Operation records and acknowledged IDs;
-- native-effect state, dispatch and Goal-continuation receipts;
-- pending Store outcomes/result pages;
-- pending observation and up to 1,024/1 MiB native events;
-- account usage and retirement state.
+Events exist in the in-memory queue, checkpoint and Store observation. Root proof
+repeats thread/workspace/provider/model in checkpoint and open Operation. Current
+adapter rejects native Goal despite upstream Goal set/clear and compensates with
+Goal-continuation proofs around ordinary sends.
 
-Every `save()` clones and serializes the complete checkpoint, creates a new file,
-fsyncs it, writes a SHA sidecar, syncs the directory and prunes previous snapshots.
-Terminal acknowledgments also create sharded tombstone files. This is algorithmic
-write amplification proportional to all retained live state for each mutation; no
-runtime latency claim is made here.
+Target N0-N6: one app-server connection, one SessionRecord, per-effect native records,
+exact StoreDelivery, latest normalized observation, direct native Goal/steer/input
+identity, and deletion of full checkpoints/tombstones/Python executor/profile ladders.
 
-The native event path first buffers events in memory, appends them to
-`pending_native_events`, saves the entire checkpoint, copies the vector into a Store
-observation, then clears it after ACK. Store is already the durable observation
-journal; Codex should retain only latest normalized activity/usage and exact unsettled
-request/terminal facts.
+## Command Batch/ACP audit
 
-Current root verification repeats thread/workspace/provider/model coordinates in both
-the checkpoint and the acknowledged `agent.open` Operation and uses a
-Pending/Candidate/Active proof state. Thread readback is necessary, but it should
-produce one current SessionRecord rather than a compatibility proof graph.
-
-The current adapter reports `agent.goal` unsupported even though current app-server
-protocol has native thread Goal set/clear. Shared Eliot contracts instead wrap ordinary
-send completion in Goal-continuation admission and a hashed terminal-event proof. The
-native Goal should be mapped directly; ordinary Eliot Goal messages remain ordinary
-`Send` Operations.
-
-### Codex implementation slices
+The crate combines two valid products but five historical Eliot profiles:
 
 ```text
-N0  AppServerConnection
-    One WebSocket owner/read pump with bounded pending RPC and one source epoch.
-    Keep app-server externally owned; connection loss never kills or replaces it.
-
-N1  SessionRecord
-    thread ID, workspace, requested/effective route, source epoch and last readback.
-    Replace root phase/proof duplication and repeated acknowledged open record.
-
-N2  NativeEffectRecord
-    one record per unsettled Open/Send/Steer/Cancel/Goal/Reply action:
-    Operation, action, thread, clientUserMessageId/request ID, turn/expectedTurnId,
-    exact bounded native params identity and disposition/readback cursor.
-
-N3  StoreDelivery
-    exact `module.outcome`/`module.result` params until ACK. Keep result byte/range
-    hashes; delete full checkpoint, acknowledged set, tombstone tree and result-page
-    state from the native-effect record after finite transition.
-
-N4  source observations
-    latest activity/usage checkpoint plus explicit source gap. Store only exact
-    pending request/terminal facts needed for control/result association; do not
-    checkpoint every app-server event or raw account patch.
-
-N5  native controls
-    map `agent.goal` to thread Goal set/edit/pause/resume/clear as supported; map
-    exact steer with `expectedTurnId`; use `clientUserMessageId` as logical input ID.
-    Delete GoalContinuationAdmission*, GoalTerminalEventRef/digests and prompt/Task
-    identity echoes from adapter receipts.
-
-N6  retire old code
-    remove Python executor/SDK/fixtures, descriptor version ladder and legacy v2/v3
-    checkpoint readers after concrete unsettled work is finished/exported.
+BatchV3, BatchV4, BatchV5
+AcpV1, AcpV2
 ```
 
-Completion: open/resume → next-turn/steer → native Goal → terminal/result; reconnect
-resends only exact Store delivery; app-server restart never replays input; usage remains
-source-scoped; checkpoint writes are bounded by the changed record, not all live state.
+`AcpV2` is an Eliot artifact/schema generation, not ACP protocol v2. Both ACP paths
+import ACP v1 types and use optional `session/load`. Current upstream ACP v2 remains an
+alpha draft and replaces load with resume/replay cursor. The refactor must not add a
+third protocol path now.
+
+Main runtime surface exceeds 730 KB before tests:
+
+- `adapter/acp.rs`: 304,695 bytes;
+- `journal.rs`: 199,925 bytes;
+- `adapter.rs`: 98,916 bytes;
+- `native.rs`: 67,841 bytes;
+- `result_page.rs`: 49,938 bytes;
+- `module_host.rs`: 19,239 bytes.
+
+Batch `RunStore` and ACP `AcpJournal` each persist command/admission, native intent and
+receipt, outcome, result page/ACK and cleanup state. Batch additionally has release
+intent/tombstones and profile-specific namespaces; ACP has session state/output
+capture and another per-Operation directory tree. The same Store-delivery contract is
+implemented twice.
+
+ACP recovery has a good boundary: capture is installed before `session/load`; load is
+used only if advertised; failure never creates a fresh session or replays TaskPrompt;
+requested model/effort/mode are read back. Preserve this behavior in one stable ACP v1
+route.
+
+Live permission requests contain a JavaScript/Rust oneshot reply channel. Files can
+prove request/reply uncertainty but cannot recreate that resolver. On adapter/process
+loss the request becomes unknown/retired; never send an old reply to a replacement
+session.
+
+The adapter spawns the native child itself with pipes and `kill_on_drop`, while source
+honestly records `family_departure_claimed=false`. Direct child exit is not descendant
+family departure. Custody must be delegated to the existing module-owner Job/process
+group, with explicit close/cancel semantics separate from process cleanup.
+
+### Command implementation slices
+
+```text
+O0  profile cut
+    New work uses BatchV5 and one current stable ACP v1 route. Enumerate concrete
+    unsettled BatchV3/V4/AcpV1 artifacts, finish/export them, then remove profile
+    enums, namespaces, capability/schema branches and installers.
+
+O1  one stable ACP session owner
+    SessionRecord = native session, workspace, effective options/capabilities,
+    source epoch and owner Operation. Preserve optional session/load no-replay
+    recovery; no draft ACP v2 parallel implementation.
+
+O2  NativeEffectRecord
+    one exact record per prompt/reply/cancel/close/load until native disposition.
+    Keep session/request/prompt IDs and readback cursor; remove Task/package/hash
+    proof copies and generic evidence directories.
+
+O3  StoreDelivery
+    exact outcome/result params until ACK, shared by current Batch and ACP only after
+    both delete their duplicate code. It cannot invoke command/ACP or choose recovery.
+
+O4  live permission and observations
+    keep one current pending request plus bounded latest tool/child/activity facts.
+    Admit reply before resolving live callback. Remove callback persistence that
+    pretends the resolver survives process loss.
+
+O5  process custody
+    native child runs under the module owner group/Job; bounded shutdown and exact
+    family readback own replacement. `kill_on_drop` direct-child status alone never
+    releases family custody.
+
+O6  semantic commands
+    ACP maps Open/Dispatch/Send/Reply/Cancel/Shutdown/Refresh/Result/Reconcile.
+    Batch exposes only one-shot Open/Dispatch/Refresh/Result/Reconcile/Shutdown as
+    actually supported. Remove `native.command.cancel_turn`,
+    `native.command.close_session`, release-evidence public commands and full
+    descriptor/schema echo.
+```
 
 ## External-effect audit result
 
@@ -242,9 +272,9 @@ adapter reductions, passive observation, executor deletion or installed fleet.
 
 ## Remaining audit tracks before a complete current-head claim
 
-1. Complete state-machine audits for Command ACP, Muse and OpenCode, then select
-   executor retirements. Claude/Codex are source-audited but still need connected/live
-   qualification after implementation.
+1. Complete state-machine audits for Muse and OpenCode, then select executor
+   retirements. Claude, Codex and Command are source-audited but still need connected/
+   live qualification after implementation.
 2. Finish GitHub/mailbox/gateway effect tracing and execute the public method → role →
    exact object → Store/effect matrix.
 3. Execute migration/corruption/partial-upgrade cases against concrete retained DB
