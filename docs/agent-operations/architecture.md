@@ -12,9 +12,9 @@ independent review, correction and acceptance. It tells the Governor who is work
 where, on what, through which native session and process, in which worktree and Git
 branch, and what is waiting, uncertain or broken.
 
-The product is valuable because it preserves identity, ownership and recoverable
-outcomes while many agents work concurrently. Activity, code volume, process count
-and elaborate evidence machinery are not measures of completion.
+The product preserves identity, ownership and recoverable outcomes while many agents
+work concurrently. Activity, code volume, process count and elaborate evidence
+machinery are not measures of completion.
 
 ## Product boundary
 
@@ -26,22 +26,21 @@ The compact core owns:
 - workspace/write ownership;
 - semantic harness control;
 - results, review and acceptance;
-- selected schedules and local observation.
+- selected schedules, durable messages and local observation.
 
-GitHub publication, hooks, scripts, remote access and diagnostics are integrations.
-Council rounds, generic ratification engines, automatic Issue-label publication,
-historical execution profiles and compatibility with abandoned experiments are not
-core requirements.
+GitHub, hooks, scripts, remote access and diagnostics are integrations. Council
+rounds, generic ratification engines, automatic Issue-label projection, historical
+execution profiles and compatibility with abandoned experiments are not core.
 
-A queue, lane, dashboard, provider status and capacity report are **views over current
-facts**. They are not additional workflow entities or databases.
+A queue, lane, dashboard, provider status, capacity report and work pool are **views
+over current facts**. They are not additional workflow entities or databases.
 
 ## One semantic language, thin adapters
 
 The controller gives every harness the same semantic actions. An adapter translates
-those actions into native calls and translates native facts back. Vendor method
-names, payloads, protocol versions, local database shapes and recovery details stop
-at that boundary.
+those actions into native calls and translates native facts back. Vendor methods,
+payloads, protocol versions, local database shapes and recovery details stop at that
+boundary.
 
 The common language covers opening or resuming a session, assigning work, sending or
 steering input, replying to a pending request, configuring supported options,
@@ -49,10 +48,9 @@ controlling native Goal, moving eligible work to background, cancelling an exact
 turn or queued input, recovering a known session, refreshing safe native facts,
 retrieving output, reconciling an uncertain action and releasing an owned resource.
 
-Capabilities describe which actions and scopes an adapter implements. They route
-commands; they never grant rights. Store authorization remains the permission
-boundary. Package versions, build IDs and schema inventories are installation facts,
-not a permanent behavioral matrix in Core.
+Capabilities route supported actions; they never grant rights. Store authorization
+is the permission boundary. Package versions, build IDs and schema inventories are
+installation facts, not a permanent behavioral matrix in Core.
 
 Each native session or shared service scope has one state owner that orders commands
 and events. A shared provider connection is not duplicated per session. Common
@@ -73,15 +71,15 @@ A route alias names one explicit harness configuration. Automatic fallback is an
 ordered list of route aliases chosen by the manager. Eliot never silently changes
 provider, model, effort, permissions or workspace policy.
 
-Provider availability is a time-stamped observation, not a permission proof. A fresh
-negative fact may hold or reject new work. Absence of a provider fact permits the
-first bounded probe. A transient limit may permit one new probe after its retry/reset
-time; it does not remain a permanent ban merely because the observing binding ended.
+Provider availability is a time-stamped source fact, not a permission proof. A fresh
+negative fact may hold or reject new work. Absence permits the first bounded probe. A
+transient limit may permit one probe after retry/reset; it does not remain a permanent
+ban because the observing binding ended.
 
 Capacity counts owned roots or genuinely active native work. Readback, result
 retrieval, refresh and reconciliation do not consume execution capacity. Admission
 checks and reserves capacity in one Store transaction; a second ledger does not copy
-the lifecycle of every Operation.
+every Operation lifecycle.
 
 ## Progress, native effects and Store delivery
 
@@ -107,29 +105,60 @@ candidate. Late results do not change ownership or acceptance.
 ## Workspaces and concurrency
 
 One manager owns one worktree. A Task's repository-relative path scope becomes the
-Attempt's write lease. The lease is the write authority and the concurrency guard;
+Attempt's write lease. The lease is the write authority and concurrency guard;
 advisory symbol/interface proposals are not another lock system.
 
 Two overlapping write leases cannot launch. Review-only work requires no write lease.
 Intentional overlap is resolved by revising the work split or settling one Attempt,
 not by a generic override protocol.
 
+## Messages and coordination
+
+Core has one durable addressed mailbox. One admitted message has one durable message
+identity; replies and cancellation reference it. A thread, when needed, is only a
+small grouping record over messages and Task scope. It is not a negotiation language,
+workflow engine or permission system.
+
+Consultation is an ordinary addressed message. Review remains the review subsystem.
+Write conflicts remain workspace leases. Watches remain current-state subscriptions or
+explicit automation conditions. Speech-act taxonomies, cards, participant-token
+registries, contracts, proposal/objection rounds, ratification and Concilium do not
+belong in compact Core.
+
 ## Observation
 
 Observation is core functionality, not optional telemetry. The Governor can read
 local state at any time without querying the provider harness or starting a model.
 Eliot correlates assignments, bindings, native sessions and provider-local
-JSON/JSONL/SQLite with OS processes, worktrees and GitHub refs. Unassigned and
+JSON/JSONL/SQLite with OS processes, worktrees and remote refs. Unassigned and
 unmatched native sessions remain visible.
 
 Each native source owns its cursor and coverage. Store owns a separate observation
-journal cursor for Governor readers. A source gap, expired cursor or failed scan
-remains visible and triggers bounded reconciliation; it is never represented as an
-empty fleet.
+cursor for Governor readers. A source gap, expired cursor or failed scan remains
+visible and triggers bounded reconciliation; it is never represented as an empty
+fleet.
 
 Process liveness, native activity, connection health, Task completion, Git state, run
 usage and account quota remain separate facts. Unknown is not converted to idle,
 dead, complete, available or zero.
+
+## External sources and effects
+
+Observation, import and mutation are separate responsibilities:
+
+1. a source collector retains bounded current external facts and coverage;
+2. an explicit import or manager policy creates/revises Eliot Tasks from selected
+   facts;
+3. an explicit effect Operation performs one external mutation and uses exact
+   readback after ambiguity.
+
+A GitHub poll is not a Task workflow. A source does not own the full Task spec. An
+external work pool does not duplicate Eliot's queue. Automatic labels or publication
+do not become another acceptance lifecycle.
+
+Each external write domain has one effect owner. Remote Git push remains Forge;
+GitHub API writes use one small GitHub effect owner. Neither retries an unknown write
+by guess.
 
 ## Scheduling
 
@@ -139,7 +168,17 @@ performs bounded admissions. Restart or a lost wake recomputes from Store.
 
 Do not create a process, credential, owner protocol, cursor family or polling loop for
 each schedule domain. Timers admit ordinary Operations; effect workers and adapters
-remain responsible for the actual external work.
+remain responsible for actual external work.
+
+## Remote access
+
+The remote gateway is a small single-tenant loopback bridge from one authenticated
+remote agent identity/profile to Eliot IPC. It is not a general identity broker,
+reverse proxy, TLS terminator or multi-tenant API platform. One gateway process maps
+to one Eliot client identity and fixed MCP profile; edge TLS/auth remains outside.
+
+Credentials are loaded only through the shared bounded private-file primitive. A
+request timeout reports uncertainty; it never proves a Store mutation did not commit.
 
 ## State, trust and recovery
 
@@ -171,10 +210,9 @@ connected product path.
 
 ## Simplicity is a design constraint
 
-Support one current protocol, implementation and storage format per retained
-runtime. Preserve only concrete required work through a finite transition, then
-delete obsolete producers, readers, fixtures, configuration and compatibility
-branches.
+Support one current protocol, implementation and storage format per retained runtime.
+Preserve only concrete required work through a finite transition, then delete obsolete
+producers, readers, fixtures, configuration and compatibility branches.
 
 Delete responsibilities before extracting packages. Reuse an existing owner or a
 maintained native API instead of adding another framework, workflow language,
@@ -186,6 +224,7 @@ replaced code disappears in the same change.
 
 A manager can select work, reserve a non-overlapping workspace, choose an explicit
 route, control the chosen harness, observe it locally, obtain complete output,
-request independent review, return corrections and accept the resulting candidate.
-Native and Eliot Goals work independently. Restart exposes known outcomes and
-unresolved work. Replaced paths are absent.
+request independent review, return corrections and accept the candidate. Native and
+Eliot Goals work independently. Durable messages work without a second coordination
+product. External sources and effects do not own Task lifecycle. Restart exposes
+known outcomes and unresolved work. Replaced paths are absent.

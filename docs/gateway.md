@@ -1,71 +1,161 @@
-# Local Remote Agent Gateway
+# Remote Agent Gateway
 
-`swarm gateway` serves Streamable HTTP MCP on a loopback address and forwards
-calls through the existing authenticated ELIOT IPC client. It does not open the
-database, start native agents, or add a shell or generic method passthrough.
+The gateway is an optional, small, single-tenant bridge from one remote MCP client to
+one fixed Eliot client identity and MCP profile. It is an integration, not Core.
 
-The gateway is disabled by default. When enabled, its local configuration fixes
-one MCP profile, one ELIOT credential file, and one local bearer-token file for
-the process lifetime. An HTTP caller cannot choose a client ID or profile. The
-selected profile must be configured under `[mcp.profiles]` and cannot use
-`full`; both the MCP profile filter and ELIOT application authorization apply.
+Source owners:
 
-## Local setup
+- `crates/swarm-gateway` — standalone process;
+- `swarm-mcp::profiled_facade` — MCP surface;
+- `swarm-client` — Eliot IPC;
+- `swarm-process::permissions` — target private-file loader.
 
-Copy [`config/gateway.example.toml`](../config/gateway.example.toml) to a
-user-private location outside the repository. Replace both `C:/REPLACE/...`
-paths with absolute paths in that private location. Keep the ELIOT credential
-and bearer token in separate files with user-only permissions. The example
-uses the read-only `observer` profile and a dedicated client ID.
-
-Start the local ELIOT host with that configuration, then register the
-dedicated observer credential while the host is running:
+## Boundary
 
 ```text
-swarm --config <private-config.toml> client-create remote-gateway-observer --role observer --out <private-credential.json>
+external TLS / tunnel / edge identity
+            |
+            v
+loopback-only swarm-gateway
+  fixed bearer
+  fixed Eliot credential
+  fixed MCP profile
+            |
+            v
+local Eliot IPC
 ```
 
-Set `gateway.credential_file` to the output file. Create a separate random
-bearer token of 32 to 512 printable ASCII characters and store it in the file
-named by `gateway.local_bearer_file`. The optional final line ending is
-ignored. Do not put either secret in TOML, a command argument, source control,
-or logs.
+One gateway process/listener represents one remote agent identity/profile. Multiple
+TCP/MCP sessions using its bearer are not distinct Eliot principals and share the same
+request namespace. Run another gateway instance for another identity/profile.
 
-Run the gateway in the foreground:
+The gateway is not:
 
-```text
-swarm --config <private-config.toml> gateway
+- a public Internet listener;
+- TLS termination;
+- an identity broker;
+- a multi-tenant API platform;
+- a general reverse proxy;
+- an Eliot credential minting service;
+- a second authorization database.
+
+## Current useful behavior
+
+The current standalone process already enforces useful limits:
+
+- loopback bind only;
+- fixed profile chosen at startup;
+- application bearer authentication;
+- Host and Origin validation;
+- bounded request body;
+- bounded TCP connections;
+- request timeout;
+- no remote-supplied Eliot credential or profile.
+
+A timeout is not proof that an Eliot mutation failed. The Store request may have
+committed. The caller must use the original request identity/readback and never resend
+an ambiguous mutation by guess.
+
+## Confirmed source gaps
+
+### Secret files are not yet safely loaded
+
+Current credential loading uses an ordinary whole-file read. Bearer loading caps bytes
+but still uses ordinary file open. The source does not yet enforce all properties that
+the operational documentation requires:
+
+- absolute/canonical path;
+- no symlink or Windows reparse traversal;
+- regular file only;
+- private owner/ACL/mode;
+- strict maximum size before allocation/read;
+- upper as well as lower token length.
+
+A FIFO/device/link can therefore violate the intended boundary even though the parsed
+content is validated afterward.
+
+### Connection limit is not a session/identity model
+
+`max_connections` limits TCP sockets. It does not make clients distinct or bound total
+MCP session lifetime. All successful sessions use the same Eliot credential/profile.
+The product must state this explicitly and bound active sessions plus idle lifetime.
+
+### A compatibility launcher remains
+
+Kernel-host still exposes a compatibility `gateway` command that starts the standalone
+binary. This keeps duplicate CLI/config/error paths. After a finite CLI transition,
+`swarm-gateway` is the sole entrypoint.
+
+## Target configuration
+
+Keep only operational fields needed by the bridge:
+
+```toml
+bind = "127.0.0.1:PORT"
+credential_file = "ABSOLUTE_PRIVATE_FILE"
+bearer_file = "ABSOLUTE_PRIVATE_FILE"
+profile = "manager|reviewer|observer|..."
+max_connections = 8
+max_sessions = 8
+max_request_bytes = 1048576
+request_timeout_seconds = 60
+idle_session_seconds = 900
+allowed_origins = ["https://edge.example"]
 ```
 
-The compatibility command forwards to the separately built `swarm-gateway`
-binary installed beside `swarm`; it passes only `--config` and `--data-dir`.
-You can launch that binary directly with the same two options. It reads the
-existing `[gateway]`, `[storage].data_dir`, `[ipc]`, and `[mcp]` TOML fields;
-unrelated controller configuration is ignored. The gateway stays disabled
-unless `gateway.enabled = true`.
+These are examples of shape, not a compatibility promise. One current schema replaces
+the existing one during V0–V2; do not add a version matrix.
 
-The running command refuses a disabled configuration, a non-loopback bind,
-the `full` MCP profile, a missing credential or bearer file, or a credential
-whose client ID does not match the configured profile. It also rejects the
-global `--credential` and `--request-id` overrides. The bearer token maps only
-to the configured ELIOT credential and profile.
+## V0 — private bounded file loading
 
-## Limits and authentication boundary
+Use one shared helper from `swarm-process::permissions` for credential and bearer:
 
-- `gateway.bind` must be a loopback socket address; the default is
-  `127.0.0.1:8787`.
-- `gateway.max_body_bytes` defaults to 1 MiB and cannot exceed 1 MiB or the
-  configured local IPC frame limit. It cannot be set below 1 KiB.
-- `gateway.request_timeout_seconds` defaults to 30 and is bounded from 1 to
-  300 seconds.
-- The local bearer file is a temporary local authentication mapping. It is
-  not Cloudflare Access JWT validation, OAuth, or a claim about an external
-  identity provider. Keep this listener private and loopback-only.
-- The gateway uses only the configured local credential for IPC. Profile
-  filtering blocks hidden MCP methods before IPC, while ELIOT still enforces
-  application roles, object scope, request identity, and GM epoch.
+1. require absolute path;
+2. reject traversal/symlink/reparse components;
+3. open exact regular file without following an unsafe final link;
+4. verify private ownership/ACL/mode;
+5. read under a strict byte cap;
+6. validate the closed JSON/text shape and token length;
+7. never log path contents or secret values.
 
-The example's `observer` profile exposes only the read surface documented in
-[`mcp-profiles.md`](mcp-profiles.md). Mutations require a separately reviewed
-configuration change and a dedicated named client; incoming requests still
-cannot widen the selected profile.
+The Eliot credential remains `{client_id, token}`. Bearer remains a single opaque
+secret. Do not copy provider credentials into gateway configuration.
+
+## V1 — explicit single tenancy and bounded sessions
+
+- one process = one Eliot client ID + one MCP profile;
+- one bearer authenticates that identity only;
+- cap TCP connections and active MCP sessions independently;
+- expire idle sessions;
+- reject profile/credential changes without process restart;
+- disconnect cancels only the transport wait, not an already admitted Store mutation;
+- no replay on reconnect.
+
+The external edge owns TLS, public routing, rate limiting and any user identity mapping.
+It may start multiple gateway processes with distinct private credentials when several
+remote agents are required.
+
+## V2 — standalone entrypoint only
+
+Retain `swarm-gateway` as the only launcher. Delete kernel-host gateway command,
+forwarded flags, compatibility diagnostics and fixtures after concrete callers move.
+The gateway opens Eliot IPC through the normal client; it does not embed Store or host
+runtime code.
+
+## Verification
+
+Minimum connected checks after implementation:
+
+- non-loopback bind is rejected;
+- symlink/reparse, non-regular, over-limit and non-private secret files are rejected;
+- token lower/upper bounds are enforced without logging secret data;
+- wrong bearer, Host or Origin is rejected before Store IPC;
+- remote input cannot choose Eliot credential/profile;
+- max connections, max sessions, body size, request timeout and idle expiry hold;
+- concurrent sessions are documented/tested as one Eliot principal;
+- timeout after Store commit remains recoverable through original request identity;
+- disconnect/reconnect never resends an ambiguous mutation;
+- kernel-host compatibility launcher is absent after cutover.
+
+Do not claim public-Internet safety from this process alone. That boundary belongs to
+the external edge/tunnel.
