@@ -3,9 +3,9 @@
 ## Current state
 
 **Overall: PARTIAL_PROGRESS.** Runtime source was audited through
-`8355bdf0fbe561b5163bd3ab1ba6db24c0f8ddbc`; this commit changes documentation only.
-`main` contains one completed runtime reduction and a source-backed refactoring
-program.
+`8355bdf0fbe561b5163bd3ab1ba6db24c0f8ddbc`; later commits in this series change
+documentation only. `main` contains one completed runtime reduction and a source-backed
+refactoring program.
 
 - [Architecture](agent-operations/architecture.md) — compact product law.
 - [Implementation](agent-operations/implementation.md) — the only work order.
@@ -15,9 +15,8 @@ program.
 ## Audit coverage
 
 The repository has **not** received a complete current-head line-by-line audit of every
-runtime path. The last broad audit, Issue #153, used `ed1df44` on 2026-10-14; current
-source is hundreds of commits ahead. Historical findings remain evidence, not current
-qualification.
+runtime path. Issue #153 used `ed1df44` on 2026-10-14; current source is hundreds of
+commits ahead. Historical findings remain evidence, not current qualification.
 
 | Track | Coverage |
 | --- | --- |
@@ -31,9 +30,10 @@ qualification.
 | Store schema/migration ownership | deep structural review; corruption/upgrade matrix not fully executed |
 | IPC/MCP multiplex, subscriptions, task projection and native streams | deep source review; live load not qualified |
 | Check, Script and Forge execution ownership | deep source review; one-executor deletions specified |
-| Claude adapter state machine | deep connected source review; live installed route not re-qualified |
+| Claude adapter state machine | deep connected source review; installed route not re-qualified |
+| Codex adapter state machine | deep connected source review; installed route not re-qualified |
 | Passive observation and harness executor duplication | architecture plus selected source paths |
-| Codex, Command, Muse and OpenCode internal state machines | partial targeted review |
+| Command, Muse and OpenCode internal state machines | partial targeted review |
 | GitHub effects, mailbox/coordination and gateway | partial |
 | Installed/native behavior, Windows custody and scale | unqualified except named historical receipts/open issues |
 
@@ -68,9 +68,10 @@ J0-J3  concurrent MCP IPC, one wake pump, exact pending-input read,
 K0-K4  one Check executor, one Script wire protocol, one Forge remote-effect owner,
        no per-Operation executable hashing
 L       shared adapter shell only after two current routes delete duplication
-M0-M4  Claude: split native-effect state from Store delivery, persist terminal result,
-       simplify live interactions, delete retention/tombstone/reference machinery
-N       one executor per remaining harness, Goals, passive observation and deletion
+M0-M4  Claude: split native effect/Store delivery, persist result, simplify callbacks
+N0-N6  Codex: split session/effect/delivery/observation, map native Goal, delete
+       full-snapshot checkpoint and retired executor
+O       Command, Muse, OpenCode, Goals, passive observation and remaining deletion
 ```
 
 ## Confirmed current gaps
@@ -96,10 +97,14 @@ N       one executor per remaining harness, Goals, passive observation and delet
 | Check probes | source/tool/Git-hook probes still spawn hidden host `check-worker` | bounded modes in selected check executable; no probe daemon |
 | Scripts | one standalone executor but duplicated host/worker DTOs and hidden compatibility entrypoint | shared `swarm-scripts` wire types and finite deletion of old readers |
 | Forge | valid local/remote split, but mixed custody, custom capture and per-effect worker/Git hashes | one remote worker, bounded local Git, shared OS primitives, install-time package verification |
-| Claude journal | native intent, Store outbox, retention, cleanup, tombstones, boot markers and references share one 183-KB file | minimal native-effect record plus exact Store-delivery records with separate lifetimes |
-| Claude interactions | live callbacks have a second 119-KB journal with retention, pending index and tombstones | current pending callback projection plus one reply Operation; bridge loss settles unknown, never replayed |
-| Claude result | final body is retained only in bounded in-memory `NativeControl`; `module.result` is sent directly | persist exact terminal result bytes/identity before memory loss or read them from supported session history |
-| Claude result ACK | lost `module.result` ACK becomes `MODULE_RESULT_UNKNOWN` and exact resend is forbidden | never replay native work, but retry the identical already-formed Store page until exact ACK/readback |
+| Claude journal | native intent, Store outbox, retention, cleanup, tombstones, boot markers and references share one 183-KB file | minimal native-effect record plus exact Store-delivery records |
+| Claude interactions | live callbacks have a second 119-KB retention engine | current pending callback plus one reply Operation; bridge loss remains unknown |
+| Claude result | terminal body is memory-only and lost Store result ACK cannot be resent | persist/read back body and retry identical Store page, never native work |
+| Codex implementation | almost the whole adapter lives in one 355-KB file | explicit connection/session/effect/delivery/observation owners |
+| Codex checkpoint | each change rewrites a full snapshot containing session, all live Operations, outcomes, result pages, observations, raw events and usage, plus SHA sidecar/tombstones | small independent records with different lifetimes; no full-state rewrite |
+| Codex events | raw app-server events are buffered, copied into checkpoint and then copied into one observation | normalized latest activity/usage plus bounded exact pending request/terminal facts |
+| Codex Goal | current adapter declares `agent.goal` unsupported but shared contracts maintain Goal-continuation admission/terminal proof around ordinary sends | map native `thread/goal/set|clear`; remove pseudo-continuation proofs |
+| Codex input identity | native `clientUserMessageId`, thread/turn and `expectedTurnId` exist, but receipts also repeat prompt/Task/package hashes | native IDs plus Operation; Store owns Task identity |
 | Observation | unbound joined Governor view incomplete; metric hashing remains | local provider+OS+Git view without provider calls |
 | Product breadth | council, ratification/ACK and automatic projection remain | outside compact-core completion |
 | Tooling | compiler/checkout/cache equality and artifact validators remain | generic package boundary plus route-specific live qualification |
@@ -108,93 +113,121 @@ These are findings and planned deletions, not completed runtime repairs.
 
 ## Claude adapter audit
 
-The current Rust/Node route has a sound basic safety boundary: the Rust owner writes a
-native-effect intent before SDK input, gives each logical input a UUID, maps SDK frames
-back to the retained Operation, keeps callback replies exact, and never guesses that a
-lost pipe means the prompt did not run. The official SDK supplies the useful native
-primitives already used by the bridge: `startup()`, streaming `query()`,
-`canUseTool`/hooks, session IDs and session-history readers.
+The Rust owner correctly writes native intent before SDK input, assigns an input UUID,
+correlates SDK frames to Operation and refuses guessed replay. The official SDK already
+supplies startup, streaming query, permission callbacks/hooks, session IDs and history
+readers.
 
-The implementation around those primitives is much larger than the retained product
-requires:
+The retained implementation is much larger than required:
 
-- `crates/swarm-adapter-claude/src/lib.rs`: 234,105 bytes;
+- `lib.rs`: 234,105 bytes;
 - `journal.rs`: 183,134 bytes;
 - `interactions.rs`: 118,974 bytes;
-- these three files alone exceed 536 KB before `native_state.rs` and the JS driver.
+- these three Rust files exceed 536 KB before `native_state.rs` and the JS driver.
 
-`OperationJournal` combines six different responsibilities:
+`OperationJournal` combines native intent/outcome, Store delivery, result references,
+startup/recovery, cleanup/compaction, tombstones and boot markers. `InteractionJournal`
+repeats retention/tombstones for live callbacks whose JavaScript resolver cannot
+survive bridge loss.
 
-1. native-effect intent/outcome;
-2. Store outcome delivery;
-3. result-operation references;
-4. startup inventory/recovery;
-5. retention/cleanup/compaction;
-6. tombstones and boot-dispatch markers.
+A concrete delivery defect remains: `agent.result` sends `module.result` directly. A
+lost Store reply becomes `MODULE_RESULT_UNKNOWN` and the adapter refuses the identical
+page, conflating forbidden native prompt replay with safe exact Store-delivery retry.
+The body is also bounded memory-only, so adapter restart can lose a known terminal
+body.
 
-`InteractionJournal` repeats the same storage machinery for callbacks even though the
-SDK callback resolver belongs to the live query and cannot be reconstructed after
-bridge loss. Persistence can prove that a request/reply became uncertain; it cannot
-resume the JavaScript callback.
+Target M0-M4: one live session owner, minimal NativeEffectRecord, exact StoreDelivery,
+persist/read back terminal result, one live interaction projection, no generic
+retention/tombstone/reference framework.
 
-A concrete delivery defect remains: `agent.result` builds and sends a `module.result`
-page directly. If the Store reply is lost, the adapter saves an Unknown outcome and
-`settle_result_intent_without_replay` refuses to submit the identical page again. That
-correctly forbids replaying the **native prompt**, but incorrectly treats the already
-formed idempotent **Store delivery** as another native effect. The body also exists
-only in the bounded in-memory result records, so adapter restart can lose a known
-terminal body even when the native session history still exists.
+## Codex adapter audit
 
-### Claude implementation slices
+The attach-only process boundary is useful: the adapter never starts or kills the
+Codex app-server. It also uses strong native identities—thread ID,
+`clientUserMessageId`, turn ID and `expectedTurnId`—and keeps exact pending result pages
+until Store acknowledgment.
+
+The rest is concentrated in `crates/swarm-adapter-codex/src/lib.rs` (354,609 bytes).
+Its `Checkpoint` combines:
+
+- package/boot/binding identity;
+- root phase, opening Operation, workspace and requested/effective model;
+- all live Operation records and acknowledged IDs;
+- native-effect state, dispatch and Goal-continuation receipts;
+- pending Store outcomes/result pages;
+- pending observation and up to 1,024/1 MiB native events;
+- account usage and retirement state.
+
+Every `save()` clones and serializes the complete checkpoint, creates a new file,
+fsyncs it, writes a SHA sidecar, syncs the directory and prunes previous snapshots.
+Terminal acknowledgments also create sharded tombstone files. This is algorithmic
+write amplification proportional to all retained live state for each mutation; no
+runtime latency claim is made here.
+
+The native event path first buffers events in memory, appends them to
+`pending_native_events`, saves the entire checkpoint, copies the vector into a Store
+observation, then clears it after ACK. Store is already the durable observation
+journal; Codex should retain only latest normalized activity/usage and exact unsettled
+request/terminal facts.
+
+Current root verification repeats thread/workspace/provider/model coordinates in both
+the checkpoint and the acknowledged `agent.open` Operation and uses a
+Pending/Candidate/Active proof state. Thread readback is necessary, but it should
+produce one current SessionRecord rather than a compatibility proof graph.
+
+The current adapter reports `agent.goal` unsupported even though current app-server
+protocol has native thread Goal set/clear. Shared Eliot contracts instead wrap ordinary
+send completion in Goal-continuation admission and a hashed terminal-event proof. The
+native Goal should be mapped directly; ordinary Eliot Goal messages remain ordinary
+`Send` Operations.
+
+### Codex implementation slices
 
 ```text
-M0  one live session owner
-    Keep startup/query/input queue/frame pump and one ordered action loop.
-    Remove full descriptor echo and repeated Task/source hash validation as protocol
-    slices H/F migrate.
+N0  AppServerConnection
+    One WebSocket owner/read pump with bounded pending RPC and one source epoch.
+    Keep app-server externally owned; connection loss never kills or replaces it.
 
-M1  NativeEffectRecord
-    One small private record per input/reply/open/shutdown only until native
-    disposition is known. Fields: Operation, action, boot/session, native input or
-    request ID, exact bounded payload identity, disposition/readback cursor.
-    No Store ACK, cleanup queue, tombstone or cross-operation reference graph.
+N1  SessionRecord
+    thread ID, workspace, requested/effective route, source epoch and last readback.
+    Replace root phase/proof duplication and repeated acknowledged open record.
 
-M2  StoreDelivery
-    Persist exact already-formed `module.outcome` and `module.result` envelopes.
-    Reconnect resends identical bytes; exact ACK deletes them. This layer cannot
-    execute SDK input or choose recovery.
+N2  NativeEffectRecord
+    one record per unsettled Open/Send/Steer/Cancel/Goal/Reply action:
+    Operation, action, thread, clientUserMessageId/request ID, turn/expectedTurnId,
+    exact bounded native params identity and disposition/readback cursor.
 
-M3  terminal result capture
-    At the SDK result frame, persist bounded immutable body + session/input/frame
-    identity before it can disappear from `NativeControl`, then deliver the exact
-    page. For larger/unavailable bodies use the supported session-history reader and
-    an explicit coverage gap; do not maintain a transcript mirror.
+N3  StoreDelivery
+    exact `module.outcome`/`module.result` params until ACK. Keep result byte/range
+    hashes; delete full checkpoint, acknowledged set, tombstone tree and result-page
+    state from the native-effect record after finite transition.
 
-M4  live interactions
-    Store exposes the current pending request as observation. `agent.reply` retains
-    one exact reply Operation before resolving the live callback. ACK settles it;
-    pipe/bridge loss makes it Unknown/Retired. Never replay a reply into a replacement
-    query. Delete interaction retention state, pending index, tombstones and cleanup
-    cursor after current callers switch.
+N4  source observations
+    latest activity/usage checkpoint plus explicit source gap. Store only exact
+    pending request/terminal facts needed for control/result association; do not
+    checkpoint every app-server event or raw account patch.
+
+N5  native controls
+    map `agent.goal` to thread Goal set/edit/pause/resume/clear as supported; map
+    exact steer with `expectedTurnId`; use `clientUserMessageId` as logical input ID.
+    Delete GoalContinuationAdmission*, GoalTerminalEventRef/digests and prompt/Task
+    identity echoes from adapter receipts.
+
+N6  retire old code
+    remove Python executor/SDK/fixtures, descriptor version ladder and legacy v2/v3
+    checkpoint readers after concrete unsettled work is finished/exported.
 ```
 
-Completion requires a connected open → dispatch → callback/reply → result path, lost
-Eliot ACK recovery without native replay, bridge loss with honest Unknown, exact
-session/result attribution, and net deletion across Rust + JS.
+Completion: open/resume → next-turn/steer → native Goal → terminal/result; reconnect
+resends only exact Store delivery; app-server restart never replays input; usage remains
+source-scoped; checkpoint writes are bounded by the changed record, not all live state.
 
 ## External-effect audit result
 
-The domain boundaries are not identical:
-
-- CheckRun owns profile/input resolution, cancellation, coverage and verdict;
-- ScriptRun owns bundle/interpreter/input/result schema and controller effects;
-- Forge owns exact accepted candidate, repository/ref serialization and unknown push
-  readback.
-
-Their common boundary is only physical process custody/capture/private files, already
-owned by `swarm-process`. Therefore the target is not a universal runner. It is one
-execution route and one wire contract per domain, with package verification outside
-each Operation.
+CheckRun, ScriptRun and Forge have different domain semantics. Their shared boundary is
+only process custody/capture/private files already owned by `swarm-process`; a
+universal EffectRunner is not justified. The target is one execution route and one
+wire contract per domain, with package verification outside each Operation.
 
 ## Runtime evidence retained
 
@@ -205,19 +238,19 @@ Historical receipts remain scoped to their named artifacts/revisions:
 - [Antigravity EOF settlement](remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
 
 They do not qualify the planned protocol, TaskPacket, queue, correction flow, MCP,
-Claude simplification, passive observation, executor deletion or installed fleet.
+adapter reductions, passive observation, executor deletion or installed fleet.
 
 ## Remaining audit tracks before a complete current-head claim
 
-1. Complete state-machine audits for Codex, Command ACP, Muse and OpenCode, then
-   select executor retirements. Claude is now source-audited but still needs live
+1. Complete state-machine audits for Command ACP, Muse and OpenCode, then select
+   executor retirements. Claude/Codex are source-audited but still need connected/live
    qualification after implementation.
 2. Finish GitHub/mailbox/gateway effect tracing and execute the public method → role →
    exact object → Store/effect matrix.
 3. Execute migration/corruption/partial-upgrade cases against concrete retained DB
-   states after the numeric migration slice is implemented.
-4. Measure IPC/Store fairness and writer occupancy after J0-J3; source review identifies
-   the mechanisms but is not load qualification.
+   states after numeric migration is implemented.
+4. Measure IPC/Store fairness and writer occupancy after J0-J3; source review
+   identifies mechanisms but is not load qualification.
 5. Perform owner-machine qualification for native restart, Windows process-family
    custody, mixed-provider execution and scale. Open Issues #1, #3, #4, #5, #11,
    #140 and #159 remain evidence boundaries.
@@ -225,6 +258,6 @@ Claude simplification, passive observation, executor deletion or installed fleet
 ## Verification status
 
 This pass changes documentation only. Runtime implementation begins with A0/A1 and
-the minimal affected formatting/warnings-denied Clippy/build checks. Connected tests
-run when each vertical slice closes; broad qualification follows the complete product
+minimal affected formatting/warnings-denied Clippy/build checks. Connected tests run
+when each vertical slice closes; broad qualification follows the complete product
 path. Record each landed source slice and net owned-code change here.
