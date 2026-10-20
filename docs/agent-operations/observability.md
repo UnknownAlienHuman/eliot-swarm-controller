@@ -1,264 +1,341 @@
-# Observability — Adjustable Logs and Live Agent Monitoring
+# Observability — local Governor truth
 
-Observation is required product behavior. The Governor reads local facts at any
-time without making a request to the provider harness or starting a model.
-[Implementation](implementation.md) owns the remaining source changes.
-At `311b770`, [swarm-telemetry](../../crates/swarm-telemetry/src/lib.rs) and
-[swarm-observer](../../crates/swarm-observer/src/host.rs) use a bounded
-Producer/HostRecorder chain. Tracing replacement and broader read-pool routing are
-targets, not implemented guarantees.
+Observation is core product behavior. The Governor must be able to determine who is
+working, where, on what, through which native session/process/worktree and what is
+waiting, uncertain or broken without calling a provider harness or starting a model.
 
-## 1. Three data classes, one explanation of reality
+[Implementation](implementation.md) owns source changes. This document defines the
+required boundary and records the current source audit through `cefd74e` on
+2026-10-20.
 
-| Data | Existing authority and lifetime |
+## 1. Three data classes
+
+| Class | Authority and lifetime |
 | --- | --- |
-| Business facts | Store Operations, observations and artifact references. Commit before acknowledging an action; log settings cannot disable these records. |
-| Diagnostic records | Optional bounded Producer/recorder output. Loss is counted; a log line is not an action receipt. |
-| Live view | Read-only projection of retained facts and real process/native observations, with explicit freshness and gaps. |
+| Business facts | Store Tasks, Attempts, Operations, results, reviews, acceptance and immutable artifact references. Log policy cannot disable them. |
+| Diagnostic records | Optional bounded local logs. Loss is counted. A log line is never an action receipt. |
+| Current Governor view | A read-only join of retained business facts and independently collected native/process/worktree/provider facts, with source time, freshness, coverage and gaps. |
 
-Keep large output once under its actual owner. A viewer does not maintain another
-conversation or Task store. Silence, disconnection, idle and completion differ;
-none requires asking the model for a heartbeat.
+Do not duplicate transcripts, Task state or workflow state in an observer. Silence,
+idle, disconnect, stale data, confirmed exit and completion are different states.
+None is inferred from age alone.
 
-### Host terminal events and retained diagnostics
+## 2. Current source audit
 
-[Host lifecycle](../../crates/swarm-kernel-host/src/store/host_lifecycle.rs) retains
-exit/failure receipts and their diagnostic codes. Normalized `host.exit` and
-`host.failed` can be views of the same host-epoch occurrence. Their shared safe
-selector payload is not an extensible copy of the diagnostic receipt. Preserve
-one occurrence when routing a selected action; changing a producer does not replay
-historical events or repair already-consumed malformed pairs.
+The current implementation does **not** provide the joined Governor view described
+below.
 
-### OpenCode catalog rejection receipt
+### 2.1 Inventory starts from bindings
 
-For the exact rejected `agent.open`, `operation.get` can retain a bounded
-`NATIVE_MODEL_UNAVAILABLE` category: catalog unavailable, model absent/disabled
-or variant absent. This existing [result projection](../../crates/swarm-kernel-host/src/store/operations/execution_diagnostic.rs)
-exposes neither raw catalog/error text nor credentials. It is a diagnostic,
-not readiness or permission to retry.
+`agent.list` enumerates Store bindings. `agent.state` addresses one exact
+binding/generation. `agent.family` reads one retained binding observation. These
+surfaces cannot enumerate a provider session or native process that has no current
+binding.
 
-## 2. Configurable depth without a restart
+`store/module_observations.rs::live_reads` narrows further: it reads only ready,
+unreleased bindings linked to one unreleased Attempt owned by the requesting Manager,
+for the current open Task revision and configured route alias. `reads_for_manager`
+then selects the newest matching generation per route.
 
-Level and content are separate choices. Current levels are
-`off/error/warn/info/debug/trace`; metadata is the default content.
-`redacted_text` is supported for selected module-supervisor diagnostics.
-Native frames are unsupported: no bounded frame producer exists. Trace cannot
-silently enable prompts, tool arguments, environment dumps or secrets.
+Consequences:
 
-The current operator live-policy format and diagnostic wire format are different
-contracts. Their existing parsers own version handling. Use one current format
-after the [finite transition](implementation.md#current-format-and-existing-data);
-do not maintain version tables or add old-format readers to every producer.
+- unmatched native sessions are invisible;
+- surviving processes without a current Eliot binding are invisible;
+- a shared provider service is represented through whichever binding supplied the
+  selected row, rather than once as a source;
+- losing or transferring a Task can remove native evidence from the route catalog even
+  when the native session/process remains alive.
 
-### Host recorder configuration
+Assignment is a relation applied to discovered subjects. It cannot be the discovery
+root.
 
-The optional diagnostic recorder is disabled by default. This setting does not
-disable the required agent observation projection. Current TOML fields are:
+### 2.2 Process facts are outside Store observation
 
-```toml
-[observability]
-enabled = true
-live_config_file = "diagnostics-live.json"
-queue_bytes = 8388608
-queue_records = 256
-max_record_bytes = 65536
-file_segment_bytes = 16777216
-retention_bytes = 134217728
-retention_days = 7
-```
+`swarm-observer::process_metrics` is an explicit one-shot CLI path. It accepts at most
+eight caller-selected identities, performs no Store join and reports that its cut is
+independent of Store state. Actual metric collection is Windows-only.
 
-Optional `directory` defaults to `<storage.data_dir>/diagnostics`; relative paths
-resolve against the controller config. These are bounded engineering defaults,
-not measured fleet sizing. Level/content belong in the separate live-policy file.
-The existing recorder loads it lazily; disabling the recorder creates no permanent
-idle recorder thread.
+The sample path revalidates process image/membership around each read and the host path
+recomputes executable image identity. This is useful qualification machinery, not a
+fleet collector. It also repeats package/image work that should be installation or
+custody evidence, not a per-sample metric cost.
 
-### Operator live policy
+`module_supervisor_observation::public_projection` exposes helper phase, boot, error
+and unresolved Operation IDs, but drops PID, OS birth identity, group/Job identity and
+actual liveness sample. Therefore `agent.state` cannot join the supervisor lifecycle
+with the concrete process it describes.
 
-The current schema-3 JSON file names the canonical local data root as `scope_id`.
-For example:
+### 2.3 Workspace projection is admission evidence, not live Git state
 
-```json
-{
-  "schema_version": 3,
-  "config_version": 1,
-  "scope_id": "C:\\path\\to\\canonical-data-root",
-  "level": "info",
-  "content": "metadata",
-  "included_kinds": [
-    "client_disconnected", "store_operation_failed", "module_started",
-    "module_stopped", "agent_delivery_failed", "recorder_failure"
-  ],
-  "overrides": [],
-  "retention_bytes": 134217728,
-  "retention_days": 7
-}
-```
+A held workspace lease retains assigned repository handle, baseline, branch,
+worktree handle and the clean-state evidence captured during preparation.
+`get_lease_view` simply rereads those durable fields. `workspace_lifecycle` is
+explicitly database-only and never inspects the filesystem or worktree.
 
-An override selects one module, client or Operation and has absolute expiry.
-The existing [live-config parser](../../crates/swarm-observer/src/live_config.rs)
-caps file size, overrides and selector lengths. Explicit operator `off`,
-excluded kinds and matching metadata-only restrictions remain effective.
-Validate a whole change before swapping its filter; invalid input must not enable
-content capture. This local reload is not a fleet-wide revision/ACK protocol.
+Current projections therefore do not answer:
 
-### Manager tool
+- actual checkout branch or detached/unborn state;
+- current HEAD;
+- tracked/untracked changes;
+- upstream and push target;
+- whether the worktree path still identifies the expected repository;
+- when each Git fact was observed.
 
-`logging.get/set` lets a registered Manager inspect and change its own scoped
-diagnostic policy. The MCP names are `logging_get` and `logging_set`; arguments
-are flat. Omitting selectors targets the authenticated Manager's client:
+The assigned branch/baseline remains valuable authority. It must be displayed next to,
+not substituted for, current Git observation.
 
-```json
-{
-  "client_request_id": "diagnostic-manager-debug-001",
-  "level": "debug",
-  "content": "redacted_text",
-  "ttl_seconds": 600
-}
-```
+### 2.4 Remote repository state exists only inside effects
 
-Task scope requires its complete Task/revision/Attempt tuple; binding scope requires
-ID and generation. Current policy TTL is 1–86,400 seconds. Store commits policy and
-reloads the existing Producer; expiry is checked during emission and after restart.
-Manager scope cannot expose another principal or override operator restrictions.
+Exact remote-ref readback exists in Forge and is correctly used to classify an
+uncertain push without replay. It runs inside publication/reconciliation work. There
+is no independent bounded remote repository/ref cache for a worktree that has not
+published.
 
-`logging.get` distinguishes source capability, loaded policy and runtime
-availability. A passing non-emitting probe is not proof that a recorder wrote a
-file. Saving policy starts no native session. Source/status gaps stay visible.
+Consequently the current system cannot show the last observed remote head, source time
+or read error independently of a publication Operation. Local tracking refs do not
+repair this gap.
 
-## 3. Common record and causal relationships
+### 2.5 Provider usage and availability are workflow ledgers
 
-Use the existing small diagnostic envelope: kind, severity, phase, observed time,
-bounded code/component and known scope IDs. The actual
-[`WireRecord`](../../crates/swarm-telemetry/src/lib.rs) already carries optional
-module, binding/boot, Task/Attempt and Operation correlation. Its sequence counts
-emission attempts, including loss; it is not a Store journal cursor or a total
-arrival order.
+`native_usage` is retained inside one binding observation and read by
+binding/generation. Its public result explicitly reports account overlap as unknown.
+The parser hard-codes current Codex/Muse artifact families.
 
-Add fields only where a producer observes them and a consumer needs them.
-Native turn, process exit, elapsed time and review outcome belong to their source
-records; they do not justify a universal event DTO with dozens of nullable fields.
-Use existing IDs/references to join views. Trace/span context is optional correlation,
-not authority. Compare durations only within one monotonic clock domain.
+`provider_conditions` stores source coordinates, but its durable rows still carry the
+source binding/generation and are used directly by route admission. Availability,
+usage, account/service identity and binding lifecycle are therefore entangled. A stale
+source binding can hold later route admission even when the underlying account/service
+is shared.
 
-Requested model/effort differs from observed effective model and usage. Missing
-usage remains unknown, not zero. Do not reconstruct unavailable reasoning or native
-identities. Show which work failed, the observed phase/outcome, its source freshness
-and the supported recovery action; retain original actors across handover.
+Target provider observations are source-scoped facts first. Admission derives a
+decision from a current source fact; it does not own another lifecycle database.
 
-## 4. Implementation and failure isolation
+### 2.6 Diagnostics and reports are parallel surfaces
 
-Replace the existing logging plumbing through its callers using `tracing`,
-`tracing-subscriber` filtering/reload and the selected recorder sink. Remove the
-old path as callers move. No second logging framework, control service or universal
-telemetry schema is needed.
+`swarm-observer` explicitly has no global subscriber or host service. Store readback is
+one-shot; local file following polls only while its CLI command is active. It is an
+optional diagnostic recorder, not the required collector.
 
-The reviewed [tracing-appender API](https://docs.rs/tracing-appender/0.2.5/tracing_appender/non_blocking/struct.NonBlockingBuilder.html)
-bounds queued lines, not total bytes. Preserve per-record and aggregate byte limits,
-loss accounting and the worker guard in the same sink. Check enabled level/content
-before expensive formatting. Graceful flush is bounded; power loss can lose trailing
-diagnostics. Do not claim exactly-once logs.
+`report.attention`, `report.capacity`, `report.delta`, `agent.state`, `agent.family`,
+runtime catalog and process metrics each assemble different partial projections. MCP
+and observers can page or poll them, but no single retained current-state join owns
+the answer. A frontend cannot safely repair this by reducing native events itself.
 
-Keep protocol stdout separate. Redact bounded logical records before serialization,
-persistence and fanout, including secrets split across native chunks. Existing Atlas
-calls are stateless, so a chunk buffer must establish that boundary. Suppress content
-whose safe bounds cannot be established. Escape terminal control sequences when
-rendering and keep files scoped to private controller state.
+## 3. Required Governor view
 
-One upstream reader fans out through bounded queues. A slow viewer cannot block
-control, cancellation or terminal evidence. Recorder/stderr failures have separate
-bounded error paths; recording an error must not recurse through its broken sink.
-Store journal failure remains a failed/unknown admission, never acknowledged log loss.
+The current projection is keyed by discovered subject and source, not only by binding.
+A bounded page answers which facts are known and which source failed.
 
-Rotate diagnostics by byte/age limits and expose disk exhaustion and lost intervals.
-Their retention must not remove evidence referenced by unresolved work. Diagnostic
-sampling cannot drop business receipts. Keep actual process/native ownership outside
-the recorder.
-
-## 5. Live monitoring and future charts
-
-### What the Governor must see
-
-The target `agent.state` joins existing records into a bounded local view. It must
-answer who owns the work, where it runs, what it is doing and which fact is missing.
-
-| Group | Required observation |
+| Group | Required facts |
 | --- | --- |
-| Assignment | Known manager/agent, Task/Attempt, Operation and binding/generation links. Unassigned sessions remain visible; retain historical work through replacement. |
-| Native work | Provider session/root and turn/input IDs; observed child relationships; active tool, pending question/approval/child wait, terminal/error and last content activity. A containing session and a spawning parent are different relations. |
-| Process | Known module/native process, PID and OS birth identity, liveness/exit and observation time. A shared server is counted once. Losing its Eliot owner does not hide a surviving process or authorize controlling it. |
-| Workspace and GitHub | Repository/worktree, assigned branch/baseline; observed checkout branch/HEAD/dirty state; upstream, push target and last remote repository/ref/head. Publication Operation is optional. Detached/unborn branches and local changes before push remain visible. |
-| Provider data | Local JSON/JSONL/database reference, native IDs, last consumed cursor/offset, source time and collection error/gap. The authorized Governor can inspect the relevant bounded native data. |
-| Coverage | Connection health, collector health and freshness of each source, independently of work status. Include visible unmatched processes/sessions; absence of a known assignment does not hide them. |
+| Assignment | Manager/agent, Task/revision, Attempt, Operation, binding/generation and historical replacement links. Unassigned subjects remain visible. |
+| Native work | Source/service/store, session/root, input/turn, child relations, active tool, pending question/approval/child wait, terminal/error and last content activity. Containment and spawning are separate relations. |
+| Process | Module/native/shared-service process, PID, OS birth identity, image identity, group/Job relation, liveness/exit, observed time and collection error. A shared process is counted once. |
+| Workspace | Trusted repository, worktree, assigned branch/baseline/write scope plus observed repository identity, actual branch/HEAD/dirty state, upstream and push target. |
+| Remote | Repository/ref/head, observation time, method, freshness and error. Publication is optional. |
+| Provider | Local JSON/JSONL/SQLite source reference, native IDs, epoch/cursor/offset, observed time, usage/availability and collection gap. |
+| Coverage | Per-source collector health, last successful/attempted read, truncation/overflow and whether more subjects may exist. |
 
-Retain launch/attach relationships and source/native IDs; discovery can precede
-both launch and assignment. The Governor's operational inventory/family read needs
-no Task Attempt or fabricated producer. Task and transcript access still follows
-actual grants. Do not infer ownership from the newest file, title or branch name.
+The same source/session/process/worktree may relate to several Operations over time.
+The join preserves those relations rather than copying the subject once per Operation.
 
-Native Git metadata may describe session creation. Read the actual worktree
-separately and show deviations from its assignment. A SHA alone names neither a
-branch nor a repository. GitHub state comes from a small independent remote-ref
-read/cache, not necessarily a publication; current Issue polling lacks that view.
-Keep the remote source time/error. Local tracking refs and repeated status reads
-do not establish a fresh remote observation.
+## 4. Target records
 
-### Collection and reading
+### SourceRecord
 
-Use [the selected owners](implementation.md#passive-agent-observation) and
-[vendor-local sources](donor-map.md#local-observation-sources): native event streams,
-local provider JSON/JSONL/SQLite, OS process state and local Git. Native parsing
-stays with the selected adapter. A lost control connection does not stop its local
-file/database reader or the adapter's separate Eliot ModuleLink. The planned core
-host task collects process/worktree facts independently of the optional recorder.
-If the adapter, its Eliot link or another collector fails, preserve its last facts
-and report lost coverage. Host restart invalidates old connections across all live
-binding states; native processes may survive. Reconcile known sources before
-claiming freshness.
+```text
+source_id
+kind = provider_store | provider_service | process | worktree | remote_ref
+stable native/local locator
+collector_epoch
+last_attempt_at
+last_success_at
+freshness
+coverage = full | partial | unknown
+cursor/offset/revision?
+gap/error?
+```
 
-Collect once per native store/service and shared worktree/process. Bound actual
-bytes, entries and elapsed work, not just returned page length; retain scan progress
-and coverage between passes. Per-pass limits must not hide excess subjects. Failed
-or filtered discovery does not prove a session disappeared. Coalesce changes with
-a periodic local recheck; viewer count does not multiply collection. `agent.state`,
-reports and subscriptions read the same projection. Explicit `agent.refresh` may
-request additional native facts. Ordinary observation never depends on it;
-disabling automation or diagnostic logging does not disable these collectors.
+A source ID is stable for the actual native store/service/process/worktree/ref. It is
+not an artifact version or binding ID.
 
-The initial snapshot uses a short authorized read transaction with its journal
-cut, followed by retained events after that cursor. Include the source and known
-binding/generation in the event envelope. Journal order is arrival history; Store
-can retain a late native sequence without applying it to current state. A live
-subscriber treats the record as an addressed invalidation, coalesces local reads
-and uses the projection's observation identity to avoid regressing. Historical
-event display stays separate from current state; no frontend native reducer.
-An expired cursor reports a gap and obtains a fresh snapshot. Apply the existing
-[Store read conversion](implementation.md#store-and-current-data); ordinary reads
-are not all on a read pool today. Retain compact facts/source references, not another
-transcript store.
+### NativeSubject
 
-An alive process with a pending child/tool, an alive process with no recent
-progress, a lost connection, a confirmed process exit and an unreadable provider
-file must remain distinguishable. Show possible stalls to the Governor with the
-supporting facts. Age, low CPU, unchanged Git or an old native `running` flag alone
-proves neither death nor useless work. Observation does not silently kill, restart
-or reassign. Provider-local history is not sufficient by itself to settle an
-uncertain command or declare a Task accepted.
+```text
+source_id
+native_subject_id
+kind = session | child | turn | input | pending_request
+parent/containing relations
+latest normalized state
+native sequence/cursor
+observed_at
+```
 
-Task completion, context occupancy, run cost and account limits remain distinct.
-Quota updates do not advance work activity. Share resource observations and scoped
-account snapshots; never count one shared process's RSS or one account allowance
-once per hosted session. Missing quota remains unknown.
+Adapters own vendor parsing. Store never learns vendor method matrices.
 
-Metrics use bounded dimensions such as runtime/status. Task and Operation IDs
-belong in logs, not unlimited metric labels. Add a bounded export or chart only
-for an actual consumer; OTLP, Prometheus and dashboards are optional integrations.
+### ProcessSubject
 
-## 6. Privacy and acceptance
+```text
+source_id
+pid + OS birth identity
+image/path identity
+parent/group/Job/shared-service relation
+alive | exited | unknown
+cpu/memory/io sample?
+observed_at
+```
 
-Check principal/object scope before reads, subscription and artifact pagination.
-Validate only the observation boundary changed: relevant filter reload/expiry,
-disabled-recorder behavior, bounded loss/slow-reader gaps, split-secret redaction
-or recorder failure. A failed optional recorder or one unavailable observation
-source cannot block assigned work; it must leave a visible coverage gap.
-These checks do not start a separate fleet/native qualification program.
+Package bytes are verified at installation/launch. Ordinary samples do not hash the
+entire executable again.
+
+### WorktreeSubject
+
+```text
+source_id
+repository identity
+worktree identity/path reference
+actual branch/HEAD/dirty
+upstream/push target
+observed_at
+```
+
+Absolute paths remain host-private. Public views expose opaque handles and authorized
+relative facts.
+
+### AssignmentEdge
+
+```text
+native/process/worktree subject
+<-> binding/generation
+<-> Operation
+<-> Attempt
+<-> Task/revision
+relation kind + observed/admitted time
+```
+
+An absent edge means unassigned, not invisible.
+
+## 5. Collection ownership
+
+Collect once per source, independent of viewer count.
+
+- Selected adapter: provider-native events and local provider JSON/JSONL/SQLite.
+- Host process collector: OS process identity/liveness and bounded metrics.
+- Host Git collector: local repository/worktree facts.
+- Remote-ref collector: bounded exact remote repository/ref readback with cache.
+- Store: source registry, normalized current facts, assignment edges and authorized
+  joined projections.
+
+A lost control connection does not disable provider-local readers. A failed collector
+preserves the last fact as stale and records a coverage gap. Host restart changes the
+collector epoch and invalidates old connection freshness; surviving native processes
+remain visible.
+
+Bound bytes, rows, subjects and elapsed work. Per-pass limits retain a continuation and
+explicit partial coverage; they do not silently discard later subjects. Coalesce
+change hints with periodic local rechecks. Ordinary viewer reads make no provider,
+model, filesystem or network call.
+
+## 6. Implementation sequence R0–R6
+
+```text
+R0  Source registry
+    Add stable SourceRecord identities, collector epoch/cursor/freshness/coverage and
+    bounded current subject tables. Keep event history separate from current state.
+
+R1  Provider-local readers
+    Run configured readers without Task/binding. Normalize sessions/children/activity,
+    pending input and provider usage/availability. Preserve unmatched subjects and
+    source gaps. Remove vendor method/artifact matrices from Store.
+
+R2  OS process collector
+    Use one selective system refresh for known/observed processes. Retain PID + birth
+    identity + image/group relation, shared-service ownership and bounded metrics.
+    Remove per-sample executable hashing and the separate receipt-driven metrics CLI
+    as the product path.
+
+R3  Git and remote collectors
+    Read actual worktree repository/branch/HEAD/dirty/upstream/push target. Maintain a
+    small independent remote-ref cache with source time/error. Do not require a
+    publication Operation.
+
+R4  Joined Store projection
+    Join SourceRecord/subjects to binding, Operation, Attempt and Task edges in one
+    short WAL snapshot. Include assigned and unassigned subjects. Do not copy provider
+    state into every binding.
+
+R5  One read/subscription model
+    `agent.state`/inventory, family views, reports and subscriptions read the same
+    current projection. Store events are addressed invalidations with a cursor, not a
+    second frontend reducer. Exact Task/transcript access still follows object grants.
+
+R6  Delete replaced paths
+    Remove binding-only runtime catalog reads, duplicate provider-condition lifecycle,
+    process-metrics product CLI, static lease-as-live-status claims, publication-only
+    remote status and parallel observer/report reducers after their consumers move.
+```
+
+Do not create a universal event broker, telemetry warehouse, ORM, transcript mirror or
+one process per source.
+
+## 7. Diagnostic logging
+
+Diagnostic logging remains optional and independent of required observation.
+
+Levels are `off/error/warn/info/debug/trace`; metadata is default. Selected local
+module-supervisor records may include bounded `redacted_text`. Trace never silently
+enables prompts, tool arguments, environments, credentials or raw native frames.
+
+The existing recorder keeps bounded records/bytes/segments/retention and explicit
+loss counters. A broken optional sink cannot block control or business receipts.
+Redact complete bounded logical records before persistence/fanout; split chunks need a
+buffered boundary. Protocol stdout stays separate.
+
+Manager `logging.get/set` may alter only its authorized scoped diagnostic policy and
+cannot broaden operator restrictions. Policy reload starts no native session and is
+not a fleet revision/ACK protocol.
+
+## 8. Failure semantics
+
+Keep these states distinct:
+
+- source current, subject active;
+- source current, subject idle;
+- source stale or unreadable;
+- Eliot link lost while provider-local source remains readable;
+- process alive but no recent native progress;
+- process exact exit observed;
+- subject disappeared from a partial scan;
+- terminal native fact observed;
+- uncertain native write awaiting readback.
+
+Low CPU, old activity, unchanged Git, parent idle, missing row in a partial scan or a
+new PID never proves completion/death. Observation does not kill, restart, reassign,
+accept or replay work.
+
+Provider-local history may classify an uncertain native input only when the adapter's
+native contract supplies exact identity/readback. It never accepts a Task.
+
+## 9. Authorization and verification
+
+Authorize source inventory, subject details, Task relations, transcript/results and
+private paths separately. A Governor may know that an unmatched session exists without
+receiving its prompt or output.
+
+Minimum connected proofs:
+
+- a session/process without a binding is visible as unassigned;
+- assignment and replacement update edges without deleting the subject;
+- one shared provider process/account is counted once;
+- host restart marks old collector epochs stale and rediscovers surviving subjects;
+- a partial/failed scan never claims absent subjects are gone;
+- current branch/HEAD/dirty can differ from assigned branch/baseline and both display;
+- remote head remains visible without publication and carries source time/error;
+- ordinary reads make no provider/model/filesystem/network call;
+- viewer count does not multiply collection;
+- slow subscriber gets a cursor gap and fresh snapshot, not silent loss;
+- PID reuse never grants control or kills an unrelated process.
+
+Runtime implementation starts only after the retained schemas/queries name the actual
+owners above. Documentation or synthetic fixtures alone do not qualify live Windows,
+provider restart or scale behavior.

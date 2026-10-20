@@ -2,22 +2,22 @@
 
 ## Current state
 
-**Overall: PARTIAL_PROGRESS.** Runtime source was audited through
-`8355bdf0fbe561b5163bd3ab1ba6db24c0f8ddbc`; later commits in this documentation
-series change no runtime source. `main` contains one completed runtime reduction and a
-source-backed refactoring program.
+**Overall: PARTIAL_PROGRESS.** Current runtime source was audited through
+`cefd74ee309e83660264d6ffb1a5b89d13af52f4` on 2026-10-20. Commits after the one
+runtime deletion named below are documentation/audit changes unless explicitly stated.
 
 - [Architecture](agent-operations/architecture.md) — compact product law.
 - [Implementation](agent-operations/implementation.md) — the only work order.
 - [Findings](agent-operations/refactoring.md) — confirmed excess/deletion boundaries.
+- [Observability](agent-operations/observability.md) — current Governor source audit
+  and R0–R6 implementation boundary.
 - [Donor map](agent-operations/donor-map.md) — reusable mechanisms and limits.
 
-## Audit coverage
+The architecture and main overengineering mechanisms are deeply audited. The product
+is not implemented according to the new architecture and the installed fleet is not
+qualified.
 
-The repository has **not** received a complete current-head line-by-line audit of
-every runtime path. Issue #153 used `ed1df44` on 2026-10-14; current source is
-hundreds of commits ahead. Historical findings remain evidence, not qualification of
-the new source.
+## Audit coverage
 
 | Track | Coverage |
 | --- | --- |
@@ -26,8 +26,8 @@ the new source.
 | Antigravity dispatch/result/delivery | deep connected review |
 | Queue, WorkDispatch, provider state and capacity | deep |
 | Workspace/code scope, process custody and scheduling | deep |
-| TaskPrompt and review/correction/acceptance | deep connected review |
-| Public method routing/authorization ownership | deep structural review; no full privilege-matrix execution |
+| TaskPacket and review/correction/acceptance | deep connected review |
+| Public method routing/authorization ownership | deep structural review; full privilege matrix not executed |
 | Store schema/migration ownership | deep structural review; corruption/partial-upgrade matrix not executed |
 | IPC/MCP multiplex, subscriptions, task projection and native streams | deep source review; live load not qualified |
 | Check, Script and Forge execution ownership | deep source review; one-executor deletions specified |
@@ -36,14 +36,14 @@ the new source.
 | Command Batch/ACP state machines | deep connected source review; installed agents not re-qualified |
 | Muse Node/Rust state machines and upstream SDK | deep source review; installed route not re-qualified |
 | OpenCode built-in/standalone state machines and current upstream contract | deep source review; selected installed contract not re-qualified |
-| Passive joined observation | architecture plus selected source paths |
+| Passive Governor observation/process/worktree/provider join | deep source review; collectors and live fleet not qualified |
 | GitHub effects, mailbox/coordination and gateway | partial |
-| Installed/native behavior, Windows custody and scale | unqualified except named historical receipts/open issues |
+| Windows/native restart, mixed providers and scale | unqualified except named receipts/issues |
 
-“Architecture and main reduction audit mostly complete” is accurate. “Every line and
-runtime behavior checked” is not.
+“Every line and runtime behavior checked” remains false. Historical Issue #153 evidence
+predates hundreds of source commits and is not current qualification.
 
-## Completed runtime source change
+## Implemented runtime reduction
 
 Commit `25a8e3b` removed the duplicate host application CLI/MCP launcher:
 
@@ -52,170 +52,167 @@ Commit `25a8e3b` removed the duplicate host application CLI/MCP launcher:
 - public commands remain in `swarm-cli`;
 - daemon/admin/internal-worker entrypoints remain.
 
-No later documentation pass counts as runtime reduction.
+No later documentation pass counts as runtime deletion.
 
 ## Current implementation sequence
 
 ```text
-A0-A3  Antigravity v6, self-contained result, durable delivery, typed actions
-B0-B4  current queue, explicit routes, provider state, root count, dispatch_once
+A0-A3  Antigravity v6, self-contained result, exact durable Store delivery
+B0-B4  current-state queue, explicit routes, source provider facts, root count,
+       dispatch_once
 C0-C1  Task path scope and one workspace write lease
 D0-D1  minimal process owner and conservative restart
-E0-E3  one schedule model and in-process admission loop
+E0-E3  one schedule model and one in-process admission loop
 F0-F2  compact TaskPacket; Store identity outside model text
 G0-G4  ordinary review/correction/acceptance transitions
-H0-H3  split public/internal/adapter protocols; domain authorizers
-I0-I3  numeric migrations; remove SQL-text compatibility
+H0-H3  separate public/internal/adapter protocols and domain authorizers
+I0-I3  numeric migrations; delete SQL-text compatibility
 J0-J3  concurrent MCP IPC, one wake pump, exact pending-input read,
        native content ring off writer
-K0-K4  one Check executor, one Script wire, one Forge remote-effect owner,
+K0-K4  one Check executor, one Script wire, one Forge remote owner,
        no per-Operation executable hashing
 L       shared adapter shell only after two current routes delete duplication
 M       Claude: one session/effect/delivery/observation/result model
-N       Codex: one app-server owner, native Goal, small records
-O       Command: one Batch profile, one stable ACP v1 route
-P0-P6  Muse: keep Node bridge, simplify it, retire custom Rust, no third executor
-Q0-Q6  OpenCode: select one exact native contract, standalone Rust only,
-       exact parent result, restart readback, internal MCP, delete built-in host path
-R       native/Eliot Goals and passive local Governor observation
-S       delete optional product engines, compatibility/tooling bureaucracy
+N       Codex: one app-server owner, native Goal, small lifetime-specific records
+O       Command: one Batch profile and one stable ACP v1 route
+P0-P6  Muse: retain/simplify Node route; finite custom-Rust deletion
+Q0-Q6  OpenCode: one exact standalone contract; exact parent result/restart;
+       delete built-in executor and giant journal machinery
+R0-R6  independent source collectors and one joined Governor projection
+S       delete optional product engines and compatibility/tooling bureaucracy
 ```
 
 ## Confirmed current gaps
 
 | Area | Current source | Target |
 | --- | --- | --- |
-| Antigravity | result can be lost; outcome depends on observation/proof; v5/v6 selectors disagree | self-contained terminal result and exact Store-delivery spool on v6 |
-| Adapter bus | vendor strings, profile ladders, repeated hello/delivery and proof-heavy receipts | typed semantic protocol and shared shell only after two consumers |
+| Antigravity | terminal result can be lost and outcome depends on proof/observation | self-contained terminal plus exact Store-delivery spool |
+| Adapter bus | vendor strings, profile ladders, repeated hello/delivery and proof receipts | typed semantic protocol; shared shell only after two consumers |
 | Execution | parallel generations for most harnesses | one current executor/format per retained runtime |
-| Queue | WorkDispatch copies Task facts into cursors/pending/slots | ranked query plus atomic admission |
-| Provider/capacity | vendor proof matrix and second lifecycle ledger | source-scoped facts and transactional root count |
-| Workspace | advisory `code.scope.*` beside real lease | Task path prefixes plus one lease |
-| Scheduling | three overlapping control systems | one in-process due/current-state loop |
+| Queue | WorkDispatch copies Task facts into workflow cursors/pending/slots | ranked current query plus atomic admission |
+| Provider/capacity | provider proof matrix and second lifecycle ledger | source-scoped facts and transactional root count |
+| Workspace authority | advisory `code.scope.*` beside real lease | Task path prefixes plus one lease |
+| Scheduling | overlapping host/standalone/automation schedulers | one in-process due/current-state loop |
 | Prompt | identity JSON, launch packet and hashes enter model/adapters | compact TaskPacket and Store-owned identity |
-| Review/correction | disposition/repair/acceptance workflows repeat candidate state | common Store transitions and thin `*_once` queries |
-| Public API | parallel registries/routers include removal-target products | separate public/internal/adapter protocols |
+| Review/correction | repair/disposition/acceptance workflows repeat candidate state | ordinary candidate-specific Store transitions |
+| Public API | parallel registries/routers include removal-target products | distinct protocols and domain authorizers |
 | Store schema | base SQL SHA, extension digests and custom DDL verifiers | numeric transactional migrations |
-| MCP tools | frontend mutex serializes an already multiplexed client | clone current `Arc<Client>` and release lock before RPC |
-| MCP subscriptions | multiple pollers/queues mirror durable facts | one coalesced wake pump; Store cursor is authority |
-| MCP task projection | `tasks/get` scans attention pages | exact Operation/binding pending-input read |
-| Native streams | ephemeral ring operations run on Store writer | authorize in Store, operate ring outside writer |
-| Checks | standalone and hidden-host execution coexist | standalone `swarm-checks` for all new work |
-| Scripts | one executor but duplicated wire types/compat entrypoint | `swarm-scripts` as sole wire owner |
-| Forge | valid local/remote split but mixed custody/custom capture/per-effect hashes | one remote worker, bounded local Git, shared OS primitives |
-| Claude | generic journal, separate callback retention and memory-only terminal body | minimal native effect, exact Store delivery, persisted result |
-| Codex | monolith and full-snapshot checkpoint | explicit connection/session/effect/delivery/observation owners |
-| Command | five artifact profiles and two large persistence models | one Batch, one stable ACP v1, minimal effect/delivery |
-| Muse | active Node plus disabled 600-KB+ custom Rust source and two private journals | retain/simplify Node now; finite Rust deletion; official Rust SDK only as future replacement |
-| OpenCode | active built-in host executor plus disabled standalone; old standalone contract lacks assistant parent while current upstream exposes it | select/live-qualify one exact native contract; standalone Rust only; exact parent result; delete built-in executor and giant journal machinery |
-| Observation | unbound joined Governor view incomplete; metric hashing remains | local provider+OS+Git view without provider calls |
+| MCP | serialized frontend calls, many pollers, global attention scan | direct multiplex, one pump, exact addressed reads |
+| Native streams | ephemeral ring work runs on Store writer | short authorization snapshot plus ring outside writer |
+| Checks/Scripts/Forge | duplicate execution/wire/custody and per-effect hashes | one executor/wire/remote owner; shared OS primitives |
+| Claude | generic journals, callback retention and memory-only terminal body | minimal native effect, exact Store delivery, persisted result |
+| Codex | monolith/full checkpoint/event copies/tombstones | connection/session/effect/delivery/latest observation owners |
+| Command | five profiles and two large persistence systems | one Batch, one stable ACP v1, minimal effect/delivery |
+| Muse | active Node plus disabled custom Rust and separate journals | retain/simplify Node; finite Rust deletion |
+| OpenCode | built-in host plus disabled standalone; old contract lacks parent edge | live-qualify one exact current contract; standalone only |
+| Governor inventory | `agent.list/state/family` start from bindings | source/subject inventory first; assignment is an edge |
+| Provider observation | route catalog requires ready current Task/Attempt binding; usage/conditions repeat binding/artifact identity | configured readers without Task/binding; source-scoped usage/availability |
+| Process observation | one-shot receipt-driven Windows CLI, max eight selected processes; image rechecked each sample | one shared collector, PID+birth/image/group and bounded metrics |
+| Workspace observation | lease exposes preparation baseline/clean state only | assigned facts plus independently observed branch/HEAD/dirty/upstream/push target |
+| Remote observation | exact ref readback exists only in Forge publication/reconcile | independent bounded remote repository/ref cache |
+| Observation surfaces | agent/report/runtime-catalog/diagnostic CLI each build a different partial view | one joined current projection and cursor invalidations |
 | Product breadth | council, ratification/ACK and automatic projection remain | outside compact-core completion |
-| Tooling | compiler/checkout/cache equality and artifact validators remain | generic package boundary plus route-specific qualification |
+| Tooling | checkout/compiler/cache equality and artifact-specific validators remain | generic package boundary and route-specific qualification |
 
 These are findings and planned deletions, not completed runtime repairs.
 
-## Adapter audit decisions
+## Adapter decisions
 
 ### Claude
 
-Retain one Rust adapter with thin official SDK driver. Split into live session,
-minimal NativeEffectRecord, exact StoreDelivery, latest Observation and persisted
-terminal result. A lost JS resolver becomes unknown, not durable resume. Delete old
-Node generations after finite transition.
+Retain one Rust adapter with a thin official SDK driver. Split live session,
+NativeEffectRecord, exact StoreDelivery, latest Observation and persisted terminal
+result. A lost JS callback resolver becomes unknown. Delete old Node generations after
+finite transition.
 
 ### Codex
 
-Retain the Rust app-server adapter and externally owned app-server. Replace the
-full-snapshot checkpoint/tombstones with SessionRecord, per-effect records, exact
-StoreDelivery and latest observation. Map native Goal directly. Delete Goal proof
-packets, retired Python executor and profile ladders.
+Retain the Rust app-server adapter and externally owned app-server. Replace the full
+checkpoint/tombstones with SessionRecord, per-effect records, exact StoreDelivery and
+latest observation. Map native Goal directly. Delete Goal proof packets, Python
+executor and profile ladders.
 
 ### Command Batch/ACP
 
 Keep one Batch and one stable ACP v1 route. Eliot `AcpV2` is an artifact generation,
 not upstream protocol v2. Preserve `session/load` no-fresh-fallback recovery and
-option readback. Replace duplicate journals with minimal session/effect/delivery
-owners. Module-owner Job/process group owns descendants.
+option readback. Module-owner Job/process group owns descendants.
 
 ### Muse
 
-Keep `muse-sdk-1.3.0-bridge.13` as the only new-work executor during refactoring. It
-is the active/default route and preserves explicit Operation-derived native command
-IDs, targeted recovery and native Goal/result/usage behavior.
-
-Retire disabled `muse-rust-controller.1@0.1.2` after concrete work disposition. Its
-main state-machine files already exceed 605 KB before additional owner/observation/
-result files. It duplicates transport, fold, journal, process custody and results.
-
-The official upstream Rust SDK 1.4.11 is a future replacement candidate, not a third
-route. It supplies typed MSP/session/fold/gap recovery and bounded close, but its
-high-level turn path mints command IDs internally. Re-evaluate only when the required
-production seam exists or a small low-level adapter deletes more code than it adds.
+Keep `muse-sdk-1.3.0-bridge.13` as the only new-work executor during refactoring.
+Retire disabled `muse-rust-controller.1@0.1.2` after concrete work disposition. The
+official Rust SDK is a future replacement candidate only when it exposes the required
+Operation-derived command-ID seam or a bounded low-level adapter deletes more than it
+adds.
 
 ### OpenCode
 
-Converge on `crates/swarm-adapter-opencode` as the only new-work executor after Q0-Q4.
-The current built-in host `runtime/opencode_v2` remains only until standalone closes
-the exact native contract.
+Converge on `crates/swarm-adapter-opencode` as the only new-work executor after Q0–Q4.
+Select and live-qualify one exact installed native contract that exposes durable inbox,
+execution claim/restart terminal and assistant `parentID`. Bind results by exact
+assistant ID + parent input ID + selected parts. Delete built-in
+`runtime/opencode_v2`, legacy worker demand/MCP/owned-service paths and giant journal
+machinery after finite disposition.
 
-The prospective standalone route is pinned to an older public projection with no
-assistant input parent and correctly returns `NATIVE_ASSISTANT_PARENT_UNAVAILABLE`.
-Current upstream source reviewed at
-`930c0c8b6a3c41ceb73b9372f878b5a1186b4d4e` exposes durable inbox identity,
-process-global Session ownership, execution claims/restart interruption and public
-assistant `parentID`. This is source evidence, not installed qualification.
+OpenCode has no reviewed native Harness Goal in the selected source. Eliot Goal sends
+ordinary messages. The shared service remains externally owned.
 
-OpenCode sequence:
+## Passive Governor observation audit
 
-```text
-Q0  select and live-qualify one exact native contract with durable inbox,
-    execution claim/restart terminal and assistant parentID
-Q1  bind exact assistant result by assistant ID + parent input ID + part IDs
-Q2  map steer/reply/cancel/background and exact restart readback
-Q3  internalize MCP setup/readiness; remove first-input gate and public native.mcp.*
-Q4  switch current route/package/config to standalone; freeze built-in new work
-Q5  disposition built-in work; delete runtime/opencode_v2, legacy demand/worker slot,
-    built-in profiles/launcher paths/fixtures
-Q6  shrink standalone journal to SessionRecord, NativeEffectRecord,
-    StoreDelivery and latest Observation; delete old pinned profiles
-```
+The target architecture in
+[observability](agent-operations/observability.md) is now source-backed.
 
-OpenCode has no reviewed native Harness Goal in the selected upstream source. Eliot
-Goal sends ordinary messages. The external service remains externally owned; Eliot
-never restarts/kills it. If restart cannot prove exact continuation or final
-interruption for an input, the Operation stays unknown.
+Confirmed current structure:
+
+1. `agent.list/state/family` is binding-rooted and cannot expose unmatched native
+   sessions/processes.
+2. `module_observations::live_reads` requires a ready live binding attached to one
+   current unreleased Manager Attempt and chooses one generation per route.
+3. module-supervisor public state omits PID, OS birth identity and process group/Job.
+4. process metrics is a separate explicit CLI read with no Store join and repeats image
+   verification rather than acting as a collector.
+5. workspace leases retain launch-time baseline/clean evidence; lifecycle reconciliation
+   performs no filesystem/Git read.
+6. remote-ref readback is attached to Forge publication/reconciliation, so no publish
+   means no current remote observation.
+7. native usage/provider condition rows remain binding/artifact-oriented admission
+   state; shared account overlap remains unknown.
+8. optional diagnostics and report pages do not share one current-state reducer.
+
+R0–R6 implements stable sources, provider-local readers, one OS collector, Git/remote
+collectors, current subject/assignment tables, one joined WAL projection and deletion
+of the replaced parallel paths. Unassigned subjects stay visible but grant no Task or
+transcript rights.
 
 ## Runtime evidence retained
 
-Historical receipts remain scoped to their named artifacts/revisions:
+Historical receipts remain scoped to their named artifact/revision:
 
 - [Muse exact normalized result](remediation/2026-10-17/MUSE-NORMALIZED-RESULT-NATIVE-VERIFICATION.json);
 - [connected Store batch cases](remediation/2026-10-13/CONNECTED-STORE-BATCH-VERIFICATION.json);
 - [Antigravity EOF settlement](remediation/2026-10-12/ANTIGRAVITY-EOF-SETTLEMENT-VERIFICATION.json).
 
-They do not qualify planned protocol, TaskPacket, queue, correction flow, MCP,
-adapter reductions, passive observation, executor deletion or installed fleet.
+They do not qualify the planned protocol, queue, TaskPacket, correction flow, MCP,
+adapter reductions, Governor collectors, executor deletion or installed fleet.
 
 ## Remaining audit tracks before a complete current-head claim
 
-1. Finish GitHub/mailbox/gateway effect tracing and execute the public method → role →
-   exact object → Store/effect privilege matrix.
+1. Finish GitHub/mailbox/coordination/gateway effect tracing and execute the public
+   method → role → exact object → Store/effect privilege matrix.
 2. Execute migration/corruption/partial-upgrade cases against concrete retained DB
    states after numeric migration is implemented.
-3. Measure IPC/Store fairness and writer occupancy after J0-J3; source review is not
+3. Measure IPC/Store fairness and writer occupancy after J0–J3; source review is not
    load qualification.
-4. Perform owner-machine qualification for native restart, Windows process-family
+4. Perform owner-machine qualification for provider restart, Windows process-family
    custody, mixed-provider execution and scale. Open Issues #1, #3, #4, #5, #11,
-   #140 and #159 remain evidence boundaries, not completion proof.
-5. Re-run minimal current-head format/Clippy/build checks for each landed runtime
-   slice; connected and broad tests follow completed product paths.
+   #140 and #159 remain evidence boundaries.
+5. Run minimal current-head format/warnings-denied Clippy/build for each landed runtime
+   slice. Focused connected cases run when a vertical product path closes; broad tests
+   follow the completed product.
 
 ## Verification status
 
-The latest OpenCode audit changes documentation only. Runtime implementation starts
-with A0/A1, followed by the connected cases in
-[implementation verification](agent-operations/implementation.md#verification).
-
-Do not interpret older broad CI or fixtures as qualification of the planned protocol,
-prompt, queue, review/correction flow, adapter consolidation, observation or executor
-deletion. Record each landed source slice and net owned-code change here.
+This pass changes documentation only. No Clippy/build/test result is claimed.
+Runtime implementation still begins with A0/A1 and proceeds by connected vertical
+slice. Record each landed source slice and net owned Rust + JS + glue change here.
