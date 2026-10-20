@@ -293,16 +293,16 @@ function Assert-PreInputOpen {
     }
 }
 
-function Assert-AntigravityV5DescriptorContract {
+function Assert-AntigravityV6DescriptorContract {
     param([Parameter(Mandatory = $true)][System.Collections.IDictionary] $Descriptor)
 
     # The generic descriptor validator remains shared by every module. This
-    # narrow check pins the exact Antigravity .1 v5 coordinate to the claim
+    # narrow check pins the exact Antigravity .1 v6 coordinate to the claim
     # consumed by the adapter and Store; it does not add a productive-body
     # promise to the descriptor's agent.result capability.
     if ($Descriptor.module_id -ne 'antigravity' -or
         $Descriptor.artifact.artifact_id -ne 'eliot-antigravity.rust-headless.1' -or
-        $Descriptor.artifact.version -ne '5') {
+        $Descriptor.artifact.version -ne '6') {
         return
     }
 
@@ -325,11 +325,11 @@ function Assert-AntigravityV5DescriptorContract {
     )
     if (($commands -join ',') -ne ($expectedCommands -join ',') -or
         ($events -join ',') -ne ($expectedEvents -join ',')) {
-        throw 'Antigravity artifact version 5 requires the exact normalized result, dispatch, and TaskPrompt schema sets.'
+        throw 'Antigravity artifact version 6 requires the exact normalized result, dispatch, and TaskPrompt schema sets.'
     }
     $schemas = @($Descriptor.command_schemas) + @($Descriptor.event_schemas)
     if ($schemas | Where-Object { $_.Contains('sha256') -and $null -ne $_.sha256 }) {
-        throw 'Antigravity artifact version 5 uses the unkeyed shared schema descriptors.'
+        throw 'Antigravity artifact version 6 uses the unkeyed shared schema descriptors.'
     }
 
     $capabilities = @($Descriptor.capabilities | ForEach-Object { [string]$_ } | Sort-Object)
@@ -342,7 +342,7 @@ function Assert-AntigravityV5DescriptorContract {
         'task.dispatch'
     )
     if (($capabilities -join ',') -ne ($expectedCapabilities -join ',')) {
-        throw 'Antigravity artifact version 5 capability set is not aligned with its adapter claim.'
+        throw 'Antigravity artifact version 6 capability set is not aligned with its adapter claim.'
     }
 }
 
@@ -708,7 +708,7 @@ try {
 }
 catch { throw "DescriptorTemplate is not valid JSON: $($_.Exception.Message)" }
 Assert-DescriptorTemplate -Descriptor $descriptor
-Assert-AntigravityV5DescriptorContract -Descriptor $descriptor
+Assert-AntigravityV6DescriptorContract -Descriptor $descriptor
 Assert-AntigravityNodeV4DescriptorContract -Descriptor $descriptor -SourceExecutable $sourcePath
 
 $coordinate = [ordered]@{

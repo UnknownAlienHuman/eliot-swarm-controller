@@ -82,11 +82,11 @@ belong to route configuration and provider-native discovery.
 
 ### Antigravity coordinate warning
 
-The shipped Rust constant and descriptor are version `6`. Current route example,
-package policy, native qualification and narrow installer validator still name `5`.
-Do not create another version. Synchronize active selectors to v6 in one source slice;
-leave historical v5 remediation receipts unchanged. After concrete v5 bindings are
-disposed, remove active `5 | 6` branches.
+The shipped Rust constant, descriptor, route example, package policy, native
+qualification and narrow installer validator use version `6`. Historical v5
+remediation receipts remain unchanged. Store no longer accepts v5 as a current
+dispatch capability; concrete old bindings require explicit disposition rather than
+a permanent compatibility branch.
 
 ## 4. Current transitional installer
 

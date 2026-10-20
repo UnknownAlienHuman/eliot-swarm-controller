@@ -55,7 +55,7 @@
           "adapter": "Antigravity",
           "module_id": "antigravity",
           "artifact_id": "eliot-antigravity.rust-headless.1",
-          "version": "5"
+          "version": "6"
         }
       ]
     },

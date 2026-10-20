@@ -3,8 +3,8 @@
 alias = 'antigravity-rust-example'
 runtime = 'antigravity'
 module_artifact_id = 'eliot-antigravity.rust-headless.1'
-# After registration, module.route.select must name descriptor version '5'.
-# Version 5 consumes the Store-produced swarm.task_prompt@1 envelope for
+# After registration, module.route.select must name descriptor version '6'.
+# Version 6 consumes the Store-produced swarm.task_prompt@1 envelope for
 # task.dispatch; it never renders or falls back to a raw Task snapshot.
 enabled = false
 [routes.native_options]

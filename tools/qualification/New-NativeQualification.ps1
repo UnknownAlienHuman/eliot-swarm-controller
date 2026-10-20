@@ -1339,7 +1339,7 @@ function Get-AdapterContract {
         }
         'Antigravity' {
             return [pscustomobject]@{
-                module_id = 'antigravity'; artifact_id = 'eliot-antigravity.rust-headless.1'; version = '5'; runtime = 'antigravity';
+                module_id = 'antigravity'; artifact_id = 'eliot-antigravity.rust-headless.1'; version = '6'; runtime = 'antigravity';
                 build_package = 'swarm-antigravity-adapter'; build_target = 'swarm-antigravity';
                 build_manifest = 'modules/antigravity-rust/Cargo.toml';
                 capabilities = @('agent.open', 'agent.reconcile', 'agent.refresh', 'agent.result', 'agent.send/next_turn', 'task.dispatch');

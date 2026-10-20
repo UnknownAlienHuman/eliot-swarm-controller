@@ -53,7 +53,7 @@ pub(super) fn validate_retained_descriptor(
     };
     if identity.module_id.as_str() != "antigravity"
         || identity.artifact.artifact_id.as_str() != ANTIGRAVITY_ARTIFACT_ID
-        || !matches!(identity.artifact.version.as_str(), "5" | "6")
+        || identity.artifact.version.as_str() != "6"
         || identity.protocol.major != 1
         || identity.protocol.minor != 0
         || !has_capability("agent.refresh")
