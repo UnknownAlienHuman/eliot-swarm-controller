@@ -266,21 +266,60 @@ the same page again. Native prompt replay must remain forbidden, but exact deliv
 an already formed idempotent Store page should be retried until ACK/readback.
 
 The bounded result body is also kept in `NativeControl` memory only. A bridge restart
-can lose a known terminal body even though the session/history may still exist. At the
-result frame, persist the immutable body/identity before memory loss or use the
-supported session-history reader; then deliver exact bytes through the Store-delivery
-spool.
+can lose a known terminal body even though session/history may still exist. Persist
+the immutable body/identity at the result frame or use the supported history reader;
+then deliver exact bytes through a Store-delivery spool.
 
-Target:
+Target: one live session owner, minimal native-effect records, exact Store-delivery
+records, one current pending interaction projection and no generic tombstone/cleanup/
+retention/reference framework. Bridge loss never replays a callback reply.
 
-1. one live session/action owner;
-2. one minimal `NativeEffectRecord` only until native disposition is known;
-3. one exact `StoreDelivery` record for outcome/result until ACK;
-4. one current pending interaction projection plus exact reply Operation;
-5. no generic tombstone, cleanup, retention or cross-operation reference framework.
+### 28. Codex rewrites the complete adapter state for each mutation
 
-Bridge loss retires/unknowns unresolved callbacks; it never replays replies into a
-replacement query. Store observations and Operations retain the audit trail.
+The current attach-only Codex boundary is useful: Eliot does not own the app-server
+process, and native thread, `clientUserMessageId`, turn and `expectedTurnId` provide
+strong identity.
+
+Almost all implementation lives in one 354,609-byte `lib.rs`. Its `Checkpoint`
+contains package/boot/binding identity, root phase and configuration, every live
+Operation, acknowledged IDs, native-effect fields, dispatch/Goal proofs, pending
+outcomes/result pages, pending observation, up to 1,024/1 MiB raw native events,
+usage and retirement state.
+
+Every `save()` clones and serializes the entire checkpoint, writes/fsyncs a new file,
+adds a SHA sidecar, syncs the directory and prunes older snapshots. A separate sharded
+operation tombstone tree preserves acknowledged terminal records. This is O(total
+retained live state) file work per mutation; no runtime latency claim is made.
+
+Native events are also represented three times: in the in-memory event queue, in
+`pending_native_events` inside the full checkpoint, and in the pending Store
+observation. Store already owns durable observation history. The adapter needs only a
+latest normalized activity/usage checkpoint and exact unsettled request/terminal
+facts.
+
+Root verification repeats thread/workspace/provider/model coordinates in the global
+checkpoint and retained open Operation, with Pending/Candidate/Active proof state.
+Thread readback is required; a second proof graph is not. Keep one current session
+record and native readback disposition.
+
+Current Codex reports `agent.goal` unsupported while upstream app-server exposes
+native thread Goal set/clear. Eliot instead maintains Goal-continuation admission and
+a hashed terminal-event proof around ordinary sends. Map Harness Goal to the native
+API and delete these pseudo-continuation receipts. Eliot Goal remains an ordinary
+message Operation.
+
+Target records have separate lifetimes:
+
+1. `AppServerConnection`: one socket/read pump and source epoch;
+2. `SessionRecord`: thread, workspace, requested/effective route and readback;
+3. `NativeEffectRecord`: Operation/action, native message/request/turn identity and
+   disposition/readback cursor;
+4. `StoreDelivery`: exact outcome/result params until ACK;
+5. latest observation/usage plus explicit source gap.
+
+Delete the full-snapshot checkpoint, raw event mirror, acknowledged set, tombstone
+index, legacy v2/v3 readers, package identity in runtime state, Goal continuation
+proofs and retired Python executor after finite disposition.
 
 <a id="code-reduction-candidates"></a>
 
@@ -309,6 +348,8 @@ replacement query. Store observations and Operations retain the audit trail.
 - CCCC suspended launch is unnecessary without a proven owner-first race.
 - Claude session persistence does not make uncertain prompt/reply replay safe; it is
   a readback source, not an idempotency key.
+- Codex thread/session persistence does not make a timed-out input safe to resend;
+  native message/turn history must classify it.
 
 ## Implemented source reduction
 
