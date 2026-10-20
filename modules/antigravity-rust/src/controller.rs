@@ -82,7 +82,6 @@ pub struct Controller {
     completed_turns: BTreeMap<String, CompletedTurn>,
     pending_receipts: VecDeque<serde_json::Value>,
     journal: VecDeque<serde_json::Value>,
-    local_execution_results: VecDeque<serde_json::Value>,
     observation_sequence: u64,
     pending_observation: Option<PendingObservation>,
 }
@@ -112,7 +111,6 @@ impl Controller {
             completed_turns: BTreeMap::new(),
             pending_receipts: VecDeque::new(),
             journal: VecDeque::new(),
-            local_execution_results: VecDeque::new(),
             observation_sequence: 0,
             pending_observation: None,
         }
@@ -364,7 +362,7 @@ impl Controller {
         if identity.method == "task.dispatch" && !self.normalized_dispatch_enabled {
             return Err(swarm_contracts::error::Error::new(
                 "TASK_PROMPT_CONTRACT_REQUIRED",
-                "artifact v5 requires the Store-produced TaskPrompt and dispatch admission schemas",
+                "artifact v6 requires the Store-produced TaskPrompt and dispatch admission schemas",
             ));
         }
         let conversation_id = self.native_root_id.as_deref().ok_or_else(|| {
@@ -462,12 +460,6 @@ impl Controller {
             disposition,
             dispatch_admission.as_ref(),
         );
-        if let Some(receipt) = outcome.details.get("local_execution_ref") {
-            if self.local_execution_results.len() == crate::stream::MAX_TURNS {
-                self.local_execution_results.pop_front();
-            }
-            self.local_execution_results.push_back(receipt.clone());
-        }
         self.pending = None;
         self.pending_observation = None;
         let _ = self.record_outcome(&outcome, &identity.method, &identity.module_receipt);
@@ -787,11 +779,6 @@ impl Controller {
         self.pending_receipts.iter().cloned().collect()
     }
 
-    pub fn receipt_needs_observation(value: &serde_json::Value) -> bool {
-        value["details"]["local_execution_ref"].is_object()
-            && value["details"]["local_execution_ref"]["observation_id"].is_null()
-    }
-
     /// Record a deterministic rejection for a manager-admitted but unsupported
     /// operation. Identity validation still binds it to this route and exact
     /// binding generation before it enters the local outbox.
@@ -843,10 +830,6 @@ impl Controller {
             object.insert(
                 "model_readback_state".to_owned(),
                 json!(self.model_readback_state),
-            );
-            object.insert(
-                "local_execution_results".to_owned(),
-                json!(self.local_execution_results),
             );
         }
         let pending = PendingObservation {
@@ -900,76 +883,14 @@ impl Controller {
         self.pending_observation = None;
     }
 
-    pub fn bind_observation_id(
-        &mut self,
-        outcome: &mut RuntimeOutcome,
-        observation_id: i64,
-    ) -> Result<()> {
-        if observation_id <= 0 {
-            return Err(swarm_contracts::error::Error::invalid(
-                "OBSERVATION_ID_MUST_BE_POSITIVE",
-            ));
-        }
-        if self
-            .pending_observation
-            .as_ref()
-            .and_then(|pending| pending.observation_id)
-            != Some(observation_id)
-        {
-            return Err(swarm_contracts::error::Error::invalid(
-                "OBSERVATION_ID_NOT_ACKNOWLEDGED",
-            ));
-        }
-        let receipt = outcome
-            .details
-            .get_mut("local_execution_ref")
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or_else(|| {
-                swarm_contracts::error::Error::invalid("LOCAL_EXECUTION_RECEIPT_REQUIRED")
-            })?;
-        receipt.insert("observation_id".to_owned(), json!(observation_id));
-        self.replace_pending_outcome(outcome)?;
-        Ok(())
-    }
-
     pub fn remember_acknowledged_outcome(&mut self, outcome: &RuntimeOutcome) {
         self.pending_receipts
             .retain(|value| value["operation_id"].as_str() != Some(outcome.operation_id.as_str()));
-        self.remove_local_execution_result(&outcome.operation_id);
-        self.pending_observation = None;
-    }
-
-    fn replace_pending_outcome(&mut self, outcome: &RuntimeOutcome) -> Result<()> {
-        let serialized = serde_json::to_value(outcome).map_err(|_| {
-            swarm_contracts::error::Error::new(
-                "MODULE_OUTCOME_INVALID",
-                "adapter could not retain its bound operation receipt",
-            )
-        })?;
-        let Some(entry) = self
-            .pending_receipts
-            .iter_mut()
-            .find(|entry| entry["operation_id"].as_str() == Some(outcome.operation_id.as_str()))
-        else {
-            return Err(swarm_contracts::error::Error::new(
-                "MODULE_OUTCOME_NOT_PENDING",
-                "bound receipt is absent from the adapter outbox",
-            ));
-        };
-        *entry = serialized;
-        Ok(())
     }
 
     pub fn acknowledge_outcome(&mut self, operation_id: &str) {
         self.pending_receipts
             .retain(|value| value["operation_id"].as_str() != Some(operation_id));
-        self.remove_local_execution_result(operation_id);
-        self.pending_observation = None;
-    }
-
-    fn remove_local_execution_result(&mut self, operation_id: &str) {
-        self.local_execution_results
-            .retain(|receipt| receipt["input_operation_id"].as_str() != Some(operation_id));
     }
 
     pub fn snapshot(&self) -> serde_json::Value {

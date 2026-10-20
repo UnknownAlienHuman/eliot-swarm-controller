@@ -3209,39 +3209,17 @@ pub(super) fn outcome_with_artifacts(
         EffectOutcome::Rejected => "rejected",
         EffectOutcome::Unknown => "outcome_unknown",
     };
-    // Warm CLI results have no native turn or inbox identity. Validate their
-    // explicit local receipt against the current, committed native observation.
+    // Warm CLI results have no native turn or inbox identity. Validate the
+    // self-contained terminal fingerprint against this exact Operation,
+    // binding generation and current authenticated adapter boot.
     let warm_producer = if crate::runtime::warm_stream::is_route(&b["route"])
         && matches!(o["method"].as_str(), Some("task.dispatch" | "agent.send"))
     {
-        let selected = b["observation"]["native_observation_id"].as_i64();
-        let observation: Option<String> = selected
-            .map(|selected| {
-                tx.query_row(
-                    "SELECT payload_json FROM observations WHERE observation_id=?1 AND binding_id=?2 AND binding_generation=?3 AND kind='runtime.state'",
-                    params![selected, id, generation],
-                    |row| row.get(0),
-                ).optional()
-            })
-            .transpose()?
-            .flatten();
-        let observation = observation
-            .map(|raw| serde_json::from_str::<Value>(&raw))
-            .transpose()?
-            .unwrap_or(Value::Null);
-        if observation != b["observation"]["native"] {
-            return Err(Error::new(
-                "NATIVE_IDENTITY_MISMATCH",
-                "warm-stream receipt requires the exact materialized observation",
-            ));
-        }
         crate::runtime::warm_stream::validate_outcome(
             crate::runtime::warm_stream::OutcomeContext {
                 binding: &b,
                 operation: &o,
                 outcome: &r,
-                observation_id: selected,
-                observation: &observation,
             },
         )?
     } else {

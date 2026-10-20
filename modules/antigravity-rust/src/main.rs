@@ -5,7 +5,7 @@ use swarm_client::IpcConfig;
 use swarm_contracts::{
     credential::Credential,
     error::{Error, Result},
-    runtime::{RuntimeCommand, RuntimeOutcome},
+    runtime::RuntimeCommand,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -789,7 +789,7 @@ async fn flush_reports(
     dirty: &mut bool,
     native_live: bool,
 ) -> Result<()> {
-    for mut value in controller.pending_receipts() {
+    for value in controller.pending_receipts() {
         let operation_id = value
             .get("operation_id")
             .and_then(Value::as_str)
@@ -797,23 +797,6 @@ async fn flush_reports(
                 Error::new("MODULE_OUTCOME_INVALID", "retained Operation ID is missing")
             })?
             .to_owned();
-        if Controller::receipt_needs_observation(&value) {
-            let observation_id =
-                record_observation_for_receipt(host, controller, native_live).await?;
-            let mut outcome: RuntimeOutcome = serde_json::from_value(value).map_err(|_| {
-                Error::new(
-                    "MODULE_OUTCOME_INVALID",
-                    "retained Operation receipt is invalid",
-                )
-            })?;
-            controller.bind_observation_id(&mut outcome, observation_id)?;
-            value = serde_json::to_value(outcome).map_err(|_| {
-                Error::new(
-                    "MODULE_OUTCOME_INVALID",
-                    "bound Operation receipt is invalid",
-                )
-            })?;
-        }
         let response = host
             .request_saved("module.outcome", value, controller, native_live)
             .await?;
@@ -862,38 +845,6 @@ async fn flush_reports(
         ));
     }
     Ok(())
-}
-
-async fn record_observation_for_receipt(
-    host: &mut HostSession,
-    controller: &mut Controller,
-    native_live: bool,
-) -> Result<i64> {
-    for _ in 0..MAX_OBSERVATION_RETRIES {
-        let observation = controller.prepare_observation();
-        let response = host
-            .request_saved(
-                "module.observe",
-                observation_params(&observation),
-                controller,
-                native_live,
-            )
-            .await?;
-        if let Some(observation_id) = controller.acknowledge_observation(&response) {
-            return Ok(observation_id);
-        }
-        if response["stale"] == true || response["replayed"] == true {
-            continue;
-        }
-        return Err(Error::new(
-            "MODULE_OBSERVATION_ACK_INVALID",
-            "manager did not record an observation for the local result receipt",
-        ));
-    }
-    Err(Error::new(
-        "MODULE_OBSERVATION_STALE",
-        "manager did not return a current observation identity for the local result",
-    ))
 }
 
 fn observation_params(
