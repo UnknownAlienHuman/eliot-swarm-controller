@@ -2,16 +2,28 @@
 
 ## Current state
 
-**Overall: AUDIT_PROGRAM_COMPLETE / RUNTIME_REFACTOR_IN_PROGRESS.**
+**Overall: AUDIT_INCOMPLETE / RUNTIME_REFACTOR_IN_PROGRESS.**
 
 The major product, ownership, adapter, Store, automation, observation, messaging,
-GitHub and gateway surfaces have source-backed target and deletion boundaries. Runtime
-source and the first Antigravity implementation slices were rechecked through
-`eeea3558d66a1525c9f5c2d9f3b4f75c62714bf8` on 2026-10-20.
+GitHub and gateway surfaces have source-backed findings and proposed deletion
+boundaries. That is a substantial structural review, not proof that all current code,
+requirements, cross-module contracts and failure paths have been audited.
 
-This does **not** mean that every line or live behavior is qualified. Remaining work
-includes implementation of the documented slices, exact privilege and migration
-execution matrices, load measurement and owner-machine qualification.
+Status and CI evidence were rechecked against
+`912df90f86320ff556c1dba23badc2c69e518e34` on 2026-10-21. This status correction is
+not a new exhaustive source review. The earlier `AUDIT_PROGRAM_COMPLETE` declaration
+was premature and is withdrawn.
+
+Still required at source-review level: reconcile retained requirements against the
+old specifications/scripts; trace retained public actions through current callers,
+authorizers, Store transitions, adapters and result consumers; cover failure,
+cancellation and restart branches; and reconcile findings against intervening source
+changes. These are audit gaps, not merely missing live tests. Maintain the evidence in
+the existing findings/implementation documents, not another roadmap or workflow.
+
+Privilege/migration execution matrices, load measurement and owner-machine
+qualification are separate remaining verification work. They do not need to precede
+the owner's requested code-first implementation and minimal affected Clippy checks.
 
 - [Architecture](agent-operations/architecture.md) — product law.
 - [Implementation](agent-operations/implementation.md) — the only work order.
@@ -40,10 +52,10 @@ remain historical; active new-work tooling no longer selects v5.
 A0 changes coordinates and deletes its one-shot CI runner. It is not a live native
 turn qualification.
 
-### Antigravity A1a — terminal outcome no longer depends on observation
+### Antigravity A1a — terminal outcome decoupling landed; verification open
 
-Commit `eeea3558d66a1525c9f5c2d9f3b4f75c62714bf8` made the warm-stream terminal
-receipt self-contained at Store settlement:
+Commit `eeea3558d66a1525c9f5c2d9f3b4f75c62714bf8` changed the warm-stream terminal
+receipt to carry its own Store settlement facts:
 
 - exact Operation and binding generation;
 - current adapter boot;
@@ -53,24 +65,28 @@ receipt self-contained at Store settlement:
 - closed terminal status and Eliot disposition.
 
 The Store validator no longer requires an `observation_id` or a duplicate
-`local_execution_results` entry before accepting the terminal outcome. The production
-Rust diff for this commit is 106 additions and 371 deletions, net **−265 Rust lines**;
-the temporary one-shot workflow and patch script were also removed.
+`local_execution_results` entry before accepting the terminal outcome. The recorded
+production Rust diff for that commit is 106 additions and 371 deletions, net
+**−265 Rust lines**; its temporary one-shot workflow and patch script were also
+removed. This is a per-commit delta, not a cumulative current-head deletion count.
 
-The one-shot pipeline formatted the changed Rust and ran warnings-denied Clippy for
-`swarm-antigravity-adapter` and `swarm-kernel-host` before creating the final commit.
-This is scoped build evidence, not installed/live Antigravity qualification.
+The original one-shot pipeline recorded formatting and warnings-denied Clippy for
+`swarm-antigravity-adapter` and `swarm-kernel-host`. Those checks do not establish
+correctness of later changes or rejected/cancelled terminal paths. The failed repair
+run described under Verification status leaves that boundary open; A1a is not a
+verified-complete slice.
 
 ## Active Antigravity slice
 
-A0 is complete. A1 is only partly complete.
+A0 is complete. A1 source changes have landed but are only partly complete and have
+an unresolved verification result.
 
 ```text
-A0   DONE  active v6 coordinate
-A1a  DONE  terminal outcome decoupled from observation
-A1b  NEXT  delete dispatch proof, refresh prerequisite and proof digests
-A2   NEXT  durable exact Store-delivery spool
-A3   NEXT  keep only real typed Antigravity actions
+A0   DONE                 active v6 coordinate
+A1a  LANDED / CHECK OPEN   terminal decoupling; rejected/cancelled path unresolved
+A1b  NOT IMPLEMENTED       delete dispatch proof, refresh prerequisite and digests
+A2   NOT IMPLEMENTED       durable exact Store-delivery spool
+A3   NOT IMPLEMENTED       keep only real typed Antigravity actions
 ```
 
 Still present after A1a:
@@ -84,21 +100,27 @@ Still present after A1a:
 - retained Node bridge profiles in the shared warm-route validator;
 - unsupported/placeholder command surface that A3 must remove.
 
-Therefore the original lost-delivery defect is **not fully fixed**. A terminal receipt
-is now independently valid once delivered, but process exit can still lose an
-unacknowledged in-memory outcome/result until A2 lands.
+Therefore the original lost-delivery defect is **not fully fixed**. Decoupling removes
+one delivery dependency, but process exit can still lose an unacknowledged in-memory
+outcome/result until A2 lands. Rejected/cancelled terminal evidence also remains an
+open check; do not claim every terminal outcome is already independently valid.
 
 ## Audit coverage
 
-| Track | Coverage |
+The labels below record prior qualitative review depth, not an exhaustive inventory
+of current files, branches or contracts. Reviewing every named subsystem does not
+prove all its paths were reviewed. Earlier block counts and percentage estimates
+must not be presented as measured audit completeness.
+
+| Track | Recorded review depth and known limit |
 | --- | --- |
-| Product boundary, ownership and overengineering mechanisms | deep |
+| Product boundary, ownership and overengineering mechanisms | deep structural review |
 | Adapter command/receipt/package protocol | deep cross-route review |
-| Antigravity dispatch/result/delivery | deep connected review; A0/A1a landed |
-| Queue, WorkDispatch, route/provider/capacity | deep |
-| Workspace/code scope/process custody/scheduling | deep |
+| Antigravity dispatch/result/delivery | deep connected review; A0/A1a landed; latest rejected-terminal check failed |
+| Queue, WorkDispatch, route/provider/capacity | deep targeted review |
+| Workspace/code scope/process custody/scheduling | deep targeted review |
 | TaskPacket and review/correction/acceptance | deep connected review |
-| Public method routing/authorization ownership | deep structural review; execution matrix remains |
+| Public method routing/authorization ownership | deep structural review; complete current-path coverage and execution matrix remain unestablished |
 | Store schema/migration ownership | deep structural review; concrete corruption/partial-upgrade execution remains |
 | IPC/MCP multiplex/subscriptions/task projection/native streams | deep source review; live load remains |
 | Check/Script/Forge execution ownership | deep source review |
@@ -113,8 +135,8 @@ unacknowledged in-memory outcome/result until A2 lands.
 | Remote gateway | deep source review; private-file/session fixes not implemented |
 | Windows/native restart, mixed providers and scale | unqualified except named receipts/issues |
 
-“Major structural/source audit complete” is accurate. “Every runtime path tested and
-qualified” is false.
+Source-backed reduction findings exist across the major subsystems. Exhaustive
+current-head source audit and complete runtime qualification are both unestablished.
 
 ## Implementation order
 
@@ -143,14 +165,14 @@ U  GitHub source/import/effect separation
 V  private single-tenant standalone gateway
 ```
 
-Do not skip from A1a to a shared adapter framework. The next connected change is A1b,
-then A2 and A3.
+Resolve the A1a discrepancy before claiming that slice complete. The subsequent
+connected changes remain A1b, A2 and A3, not a shared adapter framework.
 
 ## Confirmed current gaps
 
 | Area | Current source | Target |
 | --- | --- | --- |
-| Antigravity | A0/A1a landed; proof gate and in-memory delivery remain | no dispatch proof, exact durable Store delivery, real actions only |
+| Antigravity | A0/A1a landed; verification open; proof gate and in-memory delivery remain | no dispatch proof, exact durable Store delivery, real actions only |
 | Adapter bus | vendor strings, profile ladders, repeated hello/delivery/proofs | typed semantics; shared shell only after two users |
 | Execution | parallel generations for most harnesses | one current executor/format per runtime |
 | Queue | WorkDispatch copies Task state into another workflow | ranked query + atomic `dispatch_once` |
@@ -203,15 +225,21 @@ then A2 and A3.
 - **Gateway:** one loopback gateway process equals one Eliot identity/profile; secrets
   use the shared private bounded file primitive.
 
-## Remaining work before a full qualification claim
+## Remaining audit and implementation work
 
-1. Finish A1b–A3 and record the exact net production deletion.
+Source audit is not complete merely because all implementation headings exist. Close
+current caller-to-consumer and failure-branch coverage in the existing findings,
+including preservation of required behavior from old specifications and Claude
+scripts. Keep proposed simplifications distinct from demonstrated equivalence.
+
+1. Resolve A1a verification, finish A1b–A3 and record exact net production deletion.
 2. Implement B–V in vertical slices, deleting each replaced path in the same change.
-3. Execute the public method → role → exact object → Store/effect privilege matrix on
-   the reduced public surface.
-4. Execute migration/corruption/partial-upgrade cases against concrete retained DB
-   states after numeric migrations exist.
-5. Measure IPC/Store fairness and writer occupancy after J0–J3.
+3. Complete source tracing of public method → role → exact object → Store/effect
+   authorization and then execute the privilege matrix on the reduced surface.
+4. Check current migration/retained-format readers and writers; execute concrete
+   migration/corruption/partial-upgrade cases after numeric migrations exist.
+5. Review IPC/Store concurrency and cancellation boundaries; measure fairness and
+   writer occupancy after J0–J3.
 6. Perform owner-machine qualification for provider restart, Windows process-family
    custody, mixed-provider execution, remote gateway and scale. Open Issues #1, #3,
    #4, #5, #11, #140 and #159 remain evidence boundaries.
@@ -221,6 +249,20 @@ then A2 and A3.
 
 ## Verification status
 
-A0 and A1a have scoped source/build evidence. They have not been live-qualified
-against an installed Antigravity harness on the owner machine. This status update is
-documentation only and claims no new Clippy/build/test result.
+Evidence checked on 2026-10-21 at source head `912df90f`:
+
+- [Rust run 39463118348](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/39463118348)
+  succeeded in classification/tooling jobs. Rust package compilation, Clippy and Rust
+  formatting jobs were skipped. It is not a successful Rust verification of this head.
+- [Repair run 39463118074, job 118767359791](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/39463118074/job/118767359791)
+  applied temporary runtime/test patches, compiled the test binary, then failed the
+  Antigravity terminal regression: `completion_condition` was `Null` instead of
+  `native_terminal_result_observed` in the rejected-terminal assertion. This evidence
+  concerns that patched runner tree, not an untouched checkout of `main`.
+- The repair run did not reach its Clippy or commit/push steps. Its temporary repair
+  must not be described as a published or verified runtime fix. Root cause still
+  requires matching the producer projection, intended contract and test expectation.
+
+A0 and the original A1a commit have historical scoped source/build evidence, not live
+qualification of an installed Antigravity harness. This status-only correction claims
+no new compilation, Clippy, tests or runtime repair.
