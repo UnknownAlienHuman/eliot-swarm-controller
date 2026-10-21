@@ -1,284 +1,208 @@
 # Module API
 
-This page defines the target boundary between Store and native harness adapters.
-[Architecture](architecture.md) owns purpose;
-[implementation](implementation.md) owns source changes. Rust types in
+This is the target Store/harness boundary. [Architecture](architecture.md) owns
+purpose, [implementation](implementation.md) owns source changes, and
+[delivery](delivery.md) describes enabled autonomous handoffs. Rust types in
 `swarm-contracts` own field bounds; do not duplicate schemas here.
 
 ## Store methods and semantic actions
 
-Managers and frontends call Store. Store authenticates the caller, checks object
-scope, admits an Operation and sends one typed action to the selected adapter. The
-adapter never receives manager credentials and cannot create Tasks, change owners,
-submit review or accept work.
+Governor, managers and enabled helpers call the same Store handlers. Store authorizes
+current actor/object scope, retains an Operation and delivers a typed action. The
+adapter has binding-scoped credentials, not manager rights to create or accept Tasks.
 
 | Store surface | Adapter action | Meaning |
 | --- | --- | --- |
-| `agent.open` | `Open` | Open, resume or attach the selected native session. Attach/resume never silently creates a replacement. |
-| `task.dispatch` | `Dispatch` | Deliver the immutable Task/Attempt prompt for the first assigned logical input. |
-| `agent.send` | `Send` | Deliver `next_turn` input or exact active-turn `steer`. Unsupported steer never degrades into queued input. |
-| `agent.reply` | `Reply` | Answer one observed pending question/form/permission with a stale-request guard. |
-| `agent.configure` | `Configure` | Apply supported model/mode/effort/options at their native scope and report effective values. |
-| `agent.goal` | `Goal` | Set/edit/pause/resume/clear native Harness Goal as declared by the adapter. |
-| `agent.background` | `Background` | Move one specifically eligible native run/tool to background. |
-| `agent.cancel` | `Cancel` | Cancel one exact native turn or queued input. Unsent controller work uses `operation.cancel`. |
-| `agent.recover` | `Recover` | Restore one known session after confirmed owner/control loss without replaying input. |
-| `agent.refresh` | `Refresh` | Explicit safe native readback. Ordinary local state reads do not require it. |
-| `agent.result` | `Result` | Retrieve output attributable to one admitted logical input through normalized pages. |
-| `agent.reconcile` | `Reconcile` | Read back one uncertain admitted action; never repeat it. |
-| `agent.shutdown` | `Shutdown` | Release or stop one explicitly owned resource. It is not turn cancellation. |
+| `agent.open` | `Open` | Open, resume or attach the selected session. Resume never silently creates a replacement. |
+| `task.dispatch` | `Dispatch` | First assigned logical input of a controller-started Attempt. |
+| `agent.send` | `Send` | Next-turn input or supported steering with declared timing/target semantics. |
+| `agent.reply` | `Reply` | Answer one current pending question/form/permission. |
+| `agent.configure` | `Configure` | Apply supported model/mode/effort/options and report effective values. |
+| `agent.goal` | `Goal` | Native set/edit/pause/resume/clear as supported. |
+| `agent.background` | `Background` | Move an eligible native foreground run/tool to background. |
+| `agent.cancel` | `Cancel` | Cancel the exact turn or queued input; unsent controller work uses `operation.cancel`. |
+| `agent.recover` | `Recover` | Restore a known session after supported loss checks, without replaying input. |
+| `agent.refresh` | `Refresh` | Safe explicit native readback, not a prerequisite for ordinary local state reads. |
+| `agent.result` | `Result` | Read attributable output through normalized pages. |
+| `agent.reconcile` | `Reconcile` | Read back an uncertain action; never repeat it. |
+| `agent.shutdown` | `Shutdown` | Release/stop the explicitly owned resource, not an externally owned shared service. |
 
-The internal protocol is a closed semantic enum. Vendor RPC names and payloads stay
-inside adapters. Route migration removes:
+Preserve `Attempt.start_owner`: native-manager claims reserve before native spawn;
+controller dispatch must not race that first input while producer binding is pending.
+The existing `START_OWNED_BY_MANAGER` guard is retained.
 
-- `native.opencode.loop_step` → `Send { steer }`;
-- `native.command.cancel_turn` → `Cancel { turn }`;
-- `native.command.close_session` → `Shutdown`;
-- `native.command.release_evidence` → private cleanup;
-- `native.mcp.*` → OpenCode setup/observation.
+Remove public vendor/internal names during route migration:
 
-A route declares only supported actions. Unsupported behavior fails in Store routing,
-not through placeholder adapter handlers.
+- `native.opencode.loop_step`: remove the public method; translate retained callers to
+  an actually supported `Send` timing, not automatically to exact-turn steering;
+- `native.command.cancel_turn` / `close_session`: semantic Cancel / Shutdown;
+- `native.command.release_evidence`: private cleanup;
+- `native.mcp.*`: OpenCode internal setup/observation.
+
+Native inbox steering and atomic expected-turn steering are different guarantees.
+Current host OpenCode code rejects the latter when it lacks the native guard. Do not
+rename the weaker action as exact, nor remove useful native controls merely because
+another provider implements stronger ones. Report requested/effective semantics and
+reject only an unsupported guarantee. A future additional delivery mode needs a real
+caller, not placeholder handlers across adapters.
 
 ## Capabilities and hello
 
-Capabilities describe:
-
-```text
-supported actions
-input delivery: next_turn and/or exact steer
-cancel scopes: turn and/or queued_input
-native Goal verbs
-optional background control
-available local activity/result/account-capacity sources
-```
-
-Capabilities route commands; they are not permissions. Store checks caller rights,
-Task scope and current ownership before adapter delivery.
-
-The descriptor selects launch configuration and required actions. Package version,
-build ID and schema inventory remain installation/diagnostic facts. Hello verifies
-the authenticated binding, one current protocol major and the required capability
-subset; it does not echo and compare the full descriptor.
+Describe supported actions, input timing, cancel scopes, native Goal verbs, background
+control and available local activity/result/quota sources. Capabilities route; Store
+grants rights. The installed descriptor selects executable/configuration and required
+actions. Hello checks authenticated binding, current protocol major and capability
+subset. Package/build/schema inventories are not a second runtime permission system.
 
 ## One native state owner
 
-Each native session or shared service scope has one adapter state owner. A shared
-Codex/OpenCode service connection is not duplicated per hosted session. The common
-Eliot link cannot mutate native state.
-
-Queue acceptance, native input admission, physical model attempt, native terminal
-and Task completion are separate facts. A socket ACK or HTTP response proves only
-the boundary documented by that native method.
+One owner orders state for each native session/shared service scope. Share a native
+connection where supported. The common Eliot link does not mutate native state.
+Queue admission, physical execution, terminal result and Task acceptance remain
+separate. Native SDK retries must not create another Eliot Operation for the same
+logical input.
 
 ## Logical input and native identity
 
-One Eliot Operation represents one logical controller/user input. A harness may
-perform several physical provider attempts for that input. Physical attempt IDs,
-retry state and current attempt are observations; they do not create new Task
-Operations or multiple accepted results.
-
-Use the strongest native logical identity:
-
-| Harness | Native identity/readback |
+| Harness | Strongest relevant identity/readback |
 | --- | --- |
-| Muse | durable command ID and session event cursor |
-| OpenCode | durable inbox/message ID and session log |
-| Codex | `clientUserMessageId`, exact thread/turn IDs and `expectedTurnId` steer guard |
-| ACP/ACPX | queue request plus prompt-start/terminal watch; not an idempotent replay key |
-| Claude | session/resume identity and official history; a small prepared effect only where readback is insufficient |
-| Command batch/Antigravity | one serialized run/input window and captured output |
+| Muse | Native command ID and session event cursor |
+| OpenCode | Durable inbox/message ID and session history |
+| Codex | `clientUserMessageId`, thread/turn and `expectedTurnId` |
+| ACP/ACPX | Queue request plus prompt-start/terminal watch; not a general replay key |
+| Claude | Session/resume identity and selected SDK history/control interface |
+| Command batch / Antigravity | Serialized run/input window and captured output |
 
-Transport RPC IDs, PID, connection generation and ACK time are not universal replay
-keys. Lost response remains unknown until native readback or explicit disposition.
-Never create a replacement process/session merely to retry a prompt.
+RPC ID, PID and ACK time are not universal idempotency keys. Preserve native identity
+before an effect where necessary. Lost response leads to bounded readback, not another
+prompt or a replacement session under the old Operation.
 
 ## Store delivery storage
 
-Native effect state and delivery to Store are different responsibilities.
+Native effect recovery and delivery of already formed Store records are distinct.
 
 ### Immutable deliveries
 
-Terminal outcomes and result pages are already complete before delivery. Retain one
-exact private record per item:
+Retain complete terminal bytes and exact `module.outcome` / `module.result` parameters
+with Operation, original binding/generation, origin boot and item/page identity in
+private atomic storage before IPC. Same-boot reconnect sends the same parameters;
+Store ACK permits removal. Keep content integrity on actual artifact bytes, not a
+new hash-proof layer for every private JSON value.
 
-```text
-sequence
-method = module.outcome | module.result
-Operation lane
-exact params
-binding generation and adapter boot scope
-```
+### Restarted adapter
 
-Persist before IPC. After Eliot-link reconnect, send the retained params again.
-Remove only after that method's exact Store acknowledgment. Do not add a payload hash
-merely to replay a private retained JSON value; keep hashes on actual result/artifact
-bytes.
+A2 also covers process loss. The existing reconciliation owner fences the previous
+delivery owner, loads complete retained records and submits them for their original
+Operations under current authorized recovery. Store verifies original scope and
+receipt identity and deduplicates delivery. Origin boot is immutable; the successor
+is a recovery actor, not the original executor.
+
+This does not revive an old live binding or transfer a result to a new Attempt. If the
+assignment was superseded, keep late evidence as historical without changing current
+completion or acceptance. Missing/partial storage requires native readback or honest
+unknown. A crash before durable capture is not recoverable by pretending the spool
+contains the result.
 
 ### Replaceable observation checkpoint
 
-Observation is latest-value state, not an infinite delivery queue. Retain one pending
-checkpoint per source:
-
-```text
-source ID and epoch
-source sequence/cursor
-coverage or gap
-latest normalized state
-```
-
-A newer unsent checkpoint may replace an older one. Store journals each accepted
-checkpoint. Skipped native intermediate events are represented by source coverage.
+Retain only the latest pending normalized state per source, with epoch, source cursor
+and coverage/gap. New unsent state can replace older state. Store's journal records
+accepted checkpoints; a lost intermediate native frame is a coverage issue, not a
+reason for an infinite provider event mirror.
 
 ### Common exclusions
 
-Delivery storage never:
-
-- stores or repeats native input;
-- chooses recovery or reconciliation;
-- reconstructs a provider session;
-- owns Task state;
-- mirrors the provider transcript/event stream;
-- lets a replacement boot silently adopt predecessor files.
-
-A route-local implementation remains local until a second migrated adapter proves
-identical semantics and both old delivery loops are deleted.
+Delivery storage contains no native prompt intent, retry policy, session reconstruction,
+Task state or transcript mirror. A replacement boot cannot silently adopt old files.
+Authorized reconciliation above is an explicit recovery path, not a new broker or
+journal framework. Share implementation only after two current routes delete their
+previous delivery loops.
 
 ## Outcome and result identity
 
-Store retains the original Operation, request, binding and generation. The
-authenticated binding-scoped link identifies the adapter.
+Ordinary outcomes name Operation, binding/boot guard, native IDs, disposition and
+bounded action details. Store loads its retained request instead of demanding package,
+protocol, Task/source/prompt hashes again. Recovery additionally preserves origin
+identity as described above.
 
-An outcome therefore returns:
-
-- Operation ID;
-- adapter boot/generation needed to reject stale reports;
-- disposition;
-- optional native logical-input/turn/result IDs;
-- bounded action-specific details.
-
-The adapter does not repeat module/artifact/protocol identity, request hash and
-Task/source hashes in every receipt. Store validates against its retained Operation.
-
-For a serialized warm stream, a self-contained terminal outcome may include session,
-boot, result ordinal, native status and response-content hash. It must not require a
-separate observation row containing the same result.
-
-Result pages reference the original logical-input Operation and carry byte range,
-total/final markers and content hash.
+Warm-stream terminal evidence may include conversation, result ordinal, status and
+response-content hash. It does not require an observation row duplicating the result.
+Result pages name source Operation, byte range, final/total markers and content hash.
 
 ## Cancellation, recovery and shutdown
 
-Cancellation names one subject:
-
-- controller Operation not yet sent;
-- native queued input;
-- native active turn;
-- owned session/process shutdown.
-
-A closed transport, dropped future or timeout proves none of the native subjects.
-Use `Reconcile` or local observation when cancel outcome is uncertain.
-
-The common Eliot shell reconnects IPC and drains retained Store deliveries. The
-vendor adapter owns native reconnect, session resume and effect readback. `Recover`
-is explicit, supported per adapter, and never resends input.
+Address unsent controller Operation, queued native input, active turn and owned process
+separately. Socket close, timeout or a dropped future proves none of those cancelled.
+Recover/reconcile are ordinary commands that Governor or authorized policy can invoke.
+Readbacks have bounded retries; unchanged uncertainty coalesces rather than triggering
+repeated model prompts. Independent work proceeds.
 
 ## Harness Goal and Eliot Goal
 
-Harness Goal is native and controlled by `agent.goal`; it is the default where
-supported. Native set/resume may start work, and resulting turns remain associated
-with the initiating Operation and assigned Task/Attempt.
+Harness Goal is native and the default where supported. Native set/resume can start
+turns linked to its initiating Operation and current assignment; do not duplicate the
+initial input.
 
-Eliot Goal is a Store plugin that sends an ordinary `agent.send` message on an event
-or schedule. The Governor may use either mechanism or both.
-
-Each Eliot occurrence has one message Operation. Replaying the same occurrence
-returns it; a later occurrence may intentionally repeat the same text. Disabling the
-plugin does not pause native Goal, and pausing native Goal does not disable Eliot
-messages. Neither mechanism accepts a Task.
+Eliot Goal is an independent plugin sending ordinary messages on selected events or
+due occurrences. Both mechanisms may run together with different objectives. One due
+occurrence deduplicates its message; a later occurrence may repeat the same text.
+Pausing/clearing either mechanism does not pause the other or cancel already admitted
+input. Neither accepts a Task.
 
 ## Local state and source cursors
 
-`agent.list`, `agent.state`, `agent.family` and `agent.usage` read Store's local
-projection without provider calls.
+`agent.list/state/family/usage` read the joined local Store projection, not the provider.
+Keep assigned and unmatched native subjects, current input/turn/pending requests,
+process birth/liveness, assigned versus actual worktree/Git, remote-ref time/error and
+usage/limits separate. Source failures retain last facts with explicit freshness/gaps.
 
-| Projection | Meaning |
-| --- | --- |
-| Inventory | Bound and unbound native sessions/children from configured sources. Discovery grants no control. |
-| Activity | Native idle/running/waiting/terminal/unknown; pending reason; logical input, physical attempt/turn and last content activity. |
-| Process | Adapter/shared-service PID plus OS birth identity, liveness/exit, CPU/RSS and ownership confidence. |
-| Workspace/Git | Assigned and actual worktree/branch/HEAD, upstream/push target and last independent remote ref. |
-| Provider source | Local JSON/JSONL/SQLite identity, source epoch/cursor, source time and coverage/gap. |
-| Run usage | Tokens/cost/context occupancy for one run/session. Cumulative snapshots are not deltas. |
-| Account capacity | Current source/account availability, buckets/windows/reset/credits and freshness. Missing evidence is unavailable. |
-
-There are two cursor domains:
-
-1. provider/source cursor, opaque to Core and interpreted by the adapter reader;
-2. Store `observation_id`, used by `monitor.snapshot` and `monitor.follow`.
-
-The adapter closes replay/live races through a source watermark or subscribe-before-
-replay pattern where available. Cursor expiration, source replacement, truncated
-JSONL and WAL gaps become explicit source coverage gaps and bounded rescan. Store
-monitor cursor remains independent.
-
-A transcript or alive PID does not settle an uncertain command. Quota updates do not
-refresh work activity. Watcher disconnect does not affect native work or owner TTL.
+Provider cursor belongs to its native reader; Store `observation_id` belongs to
+Governor replay/snapshot. Close replay/live races with a native watermark or bounded
+subscribe-before-replay where supported. Expiry, source replacement, truncated JSONL
+or missing WAL coverage cause bounded rescan, not an empty fleet. Native readers must
+not fabricate events from changed schemas.
 
 ## Account capacity
 
-Adapters fold native quota method names and rolling patches into a normalized current
-snapshot:
-
-```text
-source key and epoch
-monotonic source sequence
-observed time and coverage/freshness
-actual account/service/connection scope
-availability and optional retry/reset
-bounded native-labelled buckets/windows/credits
-```
-
-Store validates the authenticated source, bounds and sequence. It does not maintain
-Codex/Muse native method allowlists, artifact-version allowlists, authentication
-digests or provider-specific permission fields in the universal contract.
-
-One account/service snapshot is retained once and referenced by relevant routes. If
-the provider supplies no stable account identity, keep it connection-scoped and do
-not merge it. Invalid optional quota cannot discard valid activity/result facts.
-Unknown is neither zero nor available.
+Adapters normalize native-labelled buckets/windows/credits and availability by stable
+source, epoch/sequence, observed time, coverage and real account/service/connection
+scope. Core validates that boundary, not vendor method/artifact allowlists or auth
+proof hashes. Share one account snapshot where actual account identity is available;
+otherwise keep connection scope. Invalid optional quota cannot discard valid terminal
+or activity facts. Unknown is not zero or available.
 
 ## Results and artifacts
 
-The single path is:
-
 ```text
-agent.result -> adapter page -> module.result -> artifact.read/assemble -> submission
+agent.result -> module.result -> immutable artifact -> artifact.read/assemble -> submission
 ```
 
-Associate output with an explicit native logical-input ID where present or one
-serialized admitted window. A second independent input, changed generation or
-unclassified source gap requires readback; never select the newest assistant message
-by guess.
+Use explicit native parent/input identity, or an actually verified serialized window.
+An independent concurrent input or unexplained source gap invalidates ordering-only
+association; never pick the newest assistant message. For selected current OpenCode,
+use its exact assistant parent edge when available.
 
-Store publishes immutable bytes before committing their receipt. A file without a
-committed receipt is not a result. Exact pages stay in delivery storage until ACK.
-`artifact.assemble` is the only multi-page assembler.
-
-Result availability does not submit, review or accept a Task.
+Store publishes immutable bytes before their Store receipt. A file with no committed receipt
+is not a published result. Keep the page until ACK; reuse `artifact.assemble` rather
+than adding another assembler. Availability is not submission or acceptance.
 
 ## Review and acceptance
 
-`review.assign` names one candidate and auditor. `review.submit` stores that auditor's
-verdict and requirement/check evidence. `task.request_changes` records manager
-disposition; sending repair instructions is separate.
+The assigned auditor submits candidate-specific verdict/evidence. Enabled return policy
+calls ordinary `task.request_changes` and admits its correction message transactionally;
+manual callers use the same transition. Native delivery remains a separate external
+effect after commit. If no live binding exists, correction remains current Attempt
+state for the next dispatch.
 
-Manual and automatic acceptance use the same Store gate and retained evidence for the
-exact candidate and frozen requirements. Caller-authored duplicate review arrays are
-removed. Candidate B cannot reuse A's review.
+Manual and automatic acceptance use one evidence gate. Candidate B cannot reuse A's
+review. Existing unanswered/inconclusive reviewer replacement stays available. An
+unchanged candidate can gain relevant missing evidence, but a new ID alone is not
+progress. Details are in [delivery](delivery.md).
 
 ## Optional integrations
 
-Hooks, scripts, GitHub effects and diagnostics call the same Store handlers and use
-ordinary Operations. They add neither adapter actions nor another Task authority.
-Disabling diagnostics cannot disable required local agent observation.
+Hooks, scripts and GitHub integrations call ordinary authorized Store commands. They
+may run automatically under selected policy without acquiring another Task authority.
+Diagnostic disable never disables required local observation. Native SDK permission
+rules handle permitted operations; unresolved questions go to Governor with exact
+request identity, not to a generic human approval queue.

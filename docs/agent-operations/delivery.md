@@ -1,212 +1,215 @@
-# Delivery — Manual Commands and Manager-Owned Automations
+# Delivery — autonomous work through ordinary commands
 
-This is the target delivery contract. [Implementation](implementation.md) names
-the source changes; [status](../implementation-status.md) records what actually
-works. One set of Store handlers serves manual actions and selected automations.
+This is the target work cycle, not a claim that all handoffs are implemented.
+[Implementation](implementation.md) owns source changes;
+[status](../implementation-status.md) records evidence. Governor and Manager are agent
+roles. They can act directly or enable helpers; neither means a human must approve
+every step. The owner sets scope, budgets, credentials and exceptional decisions.
 
 ## 1. Delivery without another Task ledger
 
-For review-required work, a manager assigns work, retains the complete candidate,
-obtains independent review, returns actionable findings to the owner, and accepts
-the corrected candidate after fresh review. Frozen Task requirements decide which
-reviews and checks are required. Task, Attempt, Operation, submission and review
-records already represent this cycle. Ready, reviewing and audited are useful
-projections; they do not require another workflow database or parallel state machine.
+An enabled policy connects selection, assignment, native execution, capture,
+independent review, correction, acceptance and selected publication. Existing Task,
+Attempt, Operation, candidate and review records represent the cycle. Helpers query
+these records and call the same handlers as the Governor. No second workflow ledger,
+coordination platform or model-driven heartbeat is needed.
 
-The manager chooses actions directly or enables individual handoffs. Waiting for
-the manager, evidence or capacity is a visible pending reason with a useful next
-action. It does not justify repeated prompts or a new orchestration service.
+`explicit` means an attributable command with current authority. It does not mean a
+manual click. A project can disable automation, but the automated path is a retained
+capability, not future work delegated to the operator.
 
 ## 2. Manual controls and automatic equivalents
 
-| Action | Finite effect |
-| --- | --- |
-| Plan/read/assign | Inspect or select existing work; reserve its owner and capacity before launch. |
-| Launch, steer or reply | Deliver to the named current assignment/native input. |
-| Capture and `task.submit` | Retain one candidate and apply its submission. |
-| `review.assign` / `review.submit` | Assign an auditor; retain that auditor's exact verdict and evidence. |
-| `task.request_changes` / owner continuation | Record manager disposition; separately deliver correction to the owner. |
-| `task.accept` | Apply one exact-candidate acceptance after the common evidence gate. |
-| Explicit Forge/GitHub command | Perform the authorized remote effect and read it back. |
+| Current fact | Enabled action | Completion or next decision |
+| --- | --- | --- |
+| Eligible work and available route/workspace | `dispatch_once` claims and launches or resumes | One initial input owner and one admitted Operation |
+| Native question or permission request | Native permission rules, then addressed Governor `Reply` | Exact request answered; no queued prompt pretending to be a reply |
+| Native result available | Capture complete output and submit current candidate | Submission applied, not merely queued |
+| Candidate lacks required review | `review_once` assigns an independent auditor | Verdict and evidence retained for this candidate |
+| Review requests changes | `task.request_changes` plus one correction message when owner is live | All actionable findings returned together |
+| Required evidence is ready | `accept_once` calls ordinary `task.accept` | Candidate-specific acceptance |
+| Accepted work with publication selected | Existing Forge/GitHub command | Exact target readback, then selected closure/next work |
 
-Manual local work needs no automation object or GitHub installation. An enabled
-helper calls the same handler with Store-derived manager authority. Neither tool
-visibility nor an internal-service role grants additional product rights.
+Each action records the represented manager and subject in its Operation. Helpers do
+not gain extra rights. Configuration changes affect future admissions; they do not
+rewrite outcomes already admitted under an earlier policy.
 
 ## 3. Queue and ownership
 
-A source Task refers to the registered forge/repository/item identity, with Issue
-and PR kinds distinct. Selected requirement changes create revisions. Preserve the
-canonical body, selected comments/documents and uncertain source gaps; a generated
-brief is a view, and webhook timestamps are not revision tokens.
+Rank corrections and unfinished work before new work, with explicit project priority
+and stable tie-breaking. Filter eligible rows before limiting admissions or continue a
+bounded keyset scan: blocked first-page items cannot hide the rest of the queue.
+Capacity/permission changes and due time wake the same host loop.
 
-Queue selection does not dispatch. At admission, recheck current Task/revision,
-pool selection where relevant, dependencies, owner, route and capacity. Reserve
-active work and workspace before external launch. Filter readiness before page
-limits and preserve the manager's chosen ordering.
+Reuse a compatible idle binding when continuation policy permits. A parent being idle
+does not settle its children, native Goal, pending requests or unknown effects. Drain
+stops new assignments while allowing replies, results and readback. Rotation is a
+selected action after work disposition, not an age-based kill.
 
-One manager owns one mutable worktree and one candidate being integrated. Writers
-take non-overlapping assignments and return changes to that owner. Auditors inspect
-the retained candidate. Capacity includes active and reserved work, including
-unknown outcomes; routes sharing a provider account share its budget. Waiting work
-remains indexed under the existing Store owner.
+Preserve `Attempt.start_owner`: native-manager delegation reserves before native
+spawn and later binds the observed producer; controller delivery reserves its own
+start. Existing `START_OWNED_BY_MANAGER` rejects a second controller start even before
+the native child has been bound. A follow-up message is not a new initial dispatch.
+
+One manager owns the mutable worktree and its Git index/commit operations. Leaf writers
+can edit disjoint assigned paths; that does not give each writer independent Git-index
+ownership. Leases coordinate Eliot admissions, not unrestricted shell access.
 
 ## 4. Exact triggers, not a chain that must have started automatically
 
-| Selected handoff | Required committed subject |
-| --- | --- |
-| Review dispatch | Applied submission with an unfilled required review slot. |
-| Review disposition | Actionable assigned findings for the current candidate. |
-| Repair delivery | Applied feedback and the actual current owner/continuation. |
-| Acceptance | Required passing reviews and checks for that candidate. |
-| Eliot Goal message | The existing assignment, selected plugin and event or due occurrence; ordinary message admission. Native Harness Goal has its own lifecycle and can coexist. |
+Manual and automatic callers can supply the same prerequisites. Derive action identity
+from the current subject: review slot/candidate, returned review/candidate, or accepted
+candidate/remote target. Scheduled Eliot messages instead use the due occurrence;
+a later occurrence may intentionally repeat the text.
 
-Manual work can supply any prerequisite. A corrected submission is eligible for
-fresh review even when its predecessor used the same automation. Persist the
-considered subject with its admitted Operation or pending reason and cursor; a lost
-wakeup cannot lose work. Domain identity deduplicates manual and automatic callers.
+Commit domain transition and child command admission together when they belong to one
+local action. Lost replies return the existing Operation. Lost wakes cause a bounded
+current-state rescan. Do not persist copied pending subjects, per-domain catch-up
+cursors or another operation-link registry.
 
-Automatic publication and Issue-label engines are
-[removal targets](implementation.md#implementation-order). Explicit remote commands
-remain optional. Their absence cannot block local completion.
+Removing automatic-publication machinery removes its duplicate lifecycle, not the
+ability of an enabled policy to call publication. Acceptance alone never silently
+pushes, merges or closes an Issue.
 
 ## 5. Submission and source freeze
 
-A queued `task.submit` is not an applied submission. Use
-[Store submissions](../../crates/swarm-kernel-host/src/store/submissions.rs) to
-retain and apply the complete intended candidate, claims and configured checks.
-Partial delivery requires an explicit project decision.
+TaskPacket includes required sources, selected source revisions, current findings,
+write boundaries, deliverable and verification. It omits controller proof JSON, not
+necessary requirements. A missing required comment/source remains a visible gap; an
+external document is task input, not a grant to change permissions.
 
-[Result retrieval and assembly](module-api.md#results-and-artifacts) must provide
-a complete attributable body. Model output alone is not source-tree or independent
-check evidence. Capture the intended source/tree, baseline and relevant untracked
-files; a mutable branch name is insufficient.
-
-Freeze the reviewed candidate. Before correction, finish or move any reader of the
-mutable checkout to retained inputs. A reviewer of immutable A may finish after B
-becomes current, but its result remains about A. Capture and apply B before asking
-for its review; retaining the same checklist text does not make B the same source.
+Capture the intended tree, baseline and relevant untracked files before review. A
+branch name, model claim or retained output page is not a frozen code candidate. The
+auditor reads immutable content or an isolated snapshot. Review of A may finish after
+B exists; its verdict stays about A. Correction must not mutate the auditor's input.
 
 ## 6. Review assignment, verdict and audited state
 
 ### 6.1 Assignment and retries
 
-Use the existing candidate-specific review slot. It binds sponsor, Task revision,
-Attempt, submission/candidate and declared review slot; record the actual auditor
-separately. Configuration revisions and request IDs do not create another slot.
+Use the existing review slot bound to Task revision, Attempt and candidate. Retain
+sponsor, assigned reviewer and actual author separately. Reassignment does not require
+a verdict from a missing reviewer: current `store/reviews.rs` already classifies
+Unanswered, Inconclusive and ReturnedForCorrection replacements. Preserve that path,
+its expected-assignment check and historical late results during reduction.
 
-Assignment carries the frozen sources, required coverage and expected result.
-Replacement requires disposition of the prior attempt; a timeout alone does not
-prove it stopped. Retain earlier output and reject its late reply as the
-replacement's result. Separate auditors occupy explicitly declared slots.
+Superseding a review slot does not prove a native process stopped. A read-only old
+reviewer may finish on A, but cannot satisfy the replacement slot or acquire writes.
 
 ### 6.2 Result
 
-`review.submit` is authored by the assigned auditor and names its exact candidate.
-A pass covers assigned requirements with evidence. A change request identifies a
-demonstrated requirement violation and actionable correction. Inconclusive records
-missing evidence or infrastructure uncertainty without demanding speculative edits.
+The assigned auditor returns verdict, all actionable findings and requirement-linked
+evidence in one result. Infrastructure failure or incomplete coverage is inconclusive,
+not code failure or pass. Return the whole findings set in one correction round; do
+not make the manager redispatch each finding.
 
-Keep verdict, findings and per-requirement evidence in that one retained result.
-Provider failure, incomplete coverage or missing required checks cannot become a
-pass because the envelope is valid JSON. Unresolved substantive findings remain
-visible even if a summary sounds positive.
-
-Authenticated late result/read access remains limited to the retained assignment;
-it grants no new work or generic historical artifact access. Credential revocation
-still applies. Supersession preserves authorship and original candidate scope.
+Native permission modes/rules handle already authorized tool operations. An unresolved
+form or judgment question goes to the Governor agent with its current request ID and
+options. Do not answer every question with the first/recommended choice, deny all tool
+calls or default to a human. Only missing access/authority or genuinely unresolved
+owner intent requires operator intervention.
 
 ### 6.3 Audited
 
-Derive eligibility from the required retained assignments/results and checks for
-the exact candidate and phase. Do not store another `audited` ledger or copy review
-text into an acceptance proof. Candidate replacement or a replacement assignment
-changes review applicability. Acceptance invalidation affects its retained decision;
-none of these changes erases history or requires a new review-retraction API.
+Required checks and reviews are read from retained candidate-specific evidence by the
+common acceptance gate. A caller does not supply another copy of an auditor's proof.
+Code changes require review of the changed candidate.
 
-Only required evidence matters; code review does not claim deferred live tests.
-A new submission ID alone does not resolve an unchanged finding. Corrected source
-or relevant new evidence permits re-review. Repeated unchanged evidence produces a
-focused pending reason, not endless model prompts.
+An unchanged tree can gain missing relevant evidence, such as a previously unavailable
+check. Conversely a new submission ID, prose explanation or irrelevant edit is not
+progress. Compare unresolved findings and applicable evidence, not only source hash.
+Known unrelated baseline failures remain distinct under project policy; absence of new
+failures alone does not prove a requirement passed.
 
 ## 7. Return and repair
 
-The auditor reports; the authorized manager applies relevant findings through
-`task.request_changes`. Only explicit owner input or selected repair delivery
-starts correction. Remove document-edition rights through the
-[current-format transition](implementation.md#current-format-and-existing-data).
+With return-changes enabled, the existing Store transition applies actionable review
+findings and admits one child `Send` for the live current owner in the same transaction.
+Otherwise `needs_correction` remains current Attempt state and the next dispatch/resume
+renders the correction packet. No separate RepairDispatch backlog is necessary.
 
-Target the current Attempt owner with exact findings. Keep a valid unreleased
-Attempt for correction; changed Task meaning or ownership follows the ordinary
-revision/Attempt rules. Reassignment preserves useful partial output and requires
-known native/workspace disposition. Infrastructure failure is not a code defect.
+Bound no-progress rounds and cost. When the bound is reached, send one addressed
+Governor decision: narrow work, change an approved route, replace the worker/reviewer,
+request missing evidence or defer the task. Do not loop indefinitely or require the
+human to perform normal manager work. Preserve refuted findings with their evidence so
+later agents do not repeat the same accusation.
 
 ## 8. Acceptance, upload and publication
 
-**Current source gap:** direct `task.accept` checks caller-supplied review texts
-against requirement IDs, while only the automatic producer requires an assigned
-pass. It can therefore accept a review-required candidate without its retained
-independent review. Ordinary acceptance authority and candidate checks still apply.
+Manual `task.accept` and `accept_once` resolve the same frozen requirements and current
+review/check references. Missing required evidence, unresolved findings or a review of
+another candidate cannot satisfy acceptance. The manager supplies a decision, not a
+fabricated reviewer result.
 
-The target [common acceptance gate](implementation.md#automation-and-delivery)
-resolves and retains required review/check references, validates them at admission
-and rechecks the same evidence before settlement. Both manual and automatic callers
-use it. The manager supplies a decision/reason, not a second purported auditor result.
-Missing, inconclusive, changes-requested or old-candidate reviews cannot satisfy a
-required pass. Acceptance of B needs B's evidence.
-
-The compact core ends at accepted local work. Optional `forge.upload_candidate`
-may upload a candidate for selected remote checks; that is not acceptance or
-publication. Explicit publication binds accepted candidate, target and effect.
-Audit, acceptance, upload, push, merge and Issue closure remain separate facts.
+Optional upload for remote checks is not acceptance. Push, merge and Issue closure are
+separate authorized effects which an enabled policy may invoke. None is mandatory for
+local-only work. Preserve useful partial output without advertising it as complete.
 
 ## 9. GitHub boundary
 
 ### Intake and feedback loops
 
-Use the existing `gh` transport and registered credentials. A replacement library
-must remove enough owned transport code to justify the change; octocrab is not a
-required migration. If webhooks are used, verify their source and signature,
-retain facts before acknowledgment and reconcile missed/duplicate events.
-
-Remote labels/comments do not choose credentials or revise frozen requirements.
-Correlate controller-generated echoes while preserving newly selected normative
-content and source uncertainty. GitHub sees the authenticated App/user; internal
-manager attribution does not create another independent remote approval.
+Collection, selected import and remote writes have different owners and may all be
+automatic. Imported source changes do not overwrite a working Task's frozen requirements
+without an explicit revision transition. Preserve repository/item identity, source gaps
+and conflict detection; do not recreate a second external work queue.
 
 ### Projection writes
 
-Explicit manager commands or project CI can write selected labels, Checks or
-summaries. Preserve unrelated content and bind evidence to the exact head.
-Correlation markers are not an exactly-once guarantee. Neutral/skipped conclusions
-are not a passed audit, and a stale label grants no new action.
+Keep existing transport and native authentication unless a replacement deletes actual
+code. Policy-selected labels, Checks or summaries call the ordinary effect owner;
+remove activation/quarantine/projection workflow copies. Preserve unrelated content.
 
 ### Push, merge and retries
 
-Retain the existing non-force accepted-candidate publication and remote readback.
-A preflight old-ref comparison is not atomic compare-and-swap; handle incompatible
-movement through the selected Git/forge policy. PR head, base and actual landed
-commit are different facts. Optional merge-queue behavior is not a local dependency.
-
-One owner decides retries for each effect. Bounded safe reads may retry; an
-ambiguous write requires exact readback before another action. A queued/enqueued
-request is not proof of publication or merge. Changing request ID, head or
-configuration cannot free the same uncertain target.
+Persist external intent before sending. Read-only recovery can retry under bounded
+policy; a timed-out write is not automatically safe to resend. Resolve exact remote
+state before another mutation. A fresh request ID cannot bypass the unresolved target.
 
 ### Disable and recovery
 
-Local disable holds future admissions; it does not undo an accepted native/remote
-effect. Continue authorized observation and exact readback. Cancellation is a
-separate supported action. Isolate the uncertain resource while other work proceeds.
+Unknown is a recoverable state with an owner, not an instruction to abandon the task.
+Existing reconciliation performs bounded reads; unchanged uncertainty coalesces into
+one Governor decision while independent work proceeds. Humans are not a generic retry
+service.
+
+A2 must cover a new adapter boot, not only IPC reconnect: fence the old delivery owner,
+read retained complete outcome/result bytes, and reconcile them to the original
+Operations without relabelling origin boot or resending input. Late evidence remains
+historical if its assignment was superseded. Missing durable bytes remain a stated
+limit, not an invented success.
 
 ## 10. Next task and complete handoff
 
-Retain issued outcomes regardless of enabled state. Cleanup, closure and next-task
-distribution each need their explicit command or currently enabled choice.
-Prepare the next Task in the worktree only after conflicting work is disposed of;
-retain or integrate useful writer output.
+The enabled cycle continues to the next eligible Task after current workspace and
+native work are disposed. Preserve delivered outcomes even after a helper is disabled.
+A useful connected proof runs assignment, question/reply, candidate A, all-findings
+correction, candidate B, independent review, acceptance and selected publication with
+no routine operator step, plus relevant reconnect/crash boundaries.
 
-Verify the changed path through assignment, complete result, candidate A review,
-correction B, fresh review and acceptance. Include the relevant restart/unknown
-outcome case. GitHub, hooks, scripts and every native runtime are not a compulsory
-test campaign for an unrelated local change.
+### Preservation evidence and donor limits
+
+This pass compared the pre-refactor
+[specification at f1b854b6](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/f1b854b6fd058dc2440d3848fc95acc279657d3f/docs/agent_swarm.md),
+the supplied October 6 audit and master audit v26, current code, and the retained
+[Claude-script review](../remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md).
+The original private ZIP was not reopened in this pass; script-line claims remain
+attributed to that review, not newly executed scripts.
+
+| Historical lesson | Retained mechanism / current owner |
+| --- | --- |
+| Native child already started before registration | `operations.rs` start-owner guard; `producers.rs` assignment correlation |
+| Queued steer did not answer a form | Adapter `Reply`, native permission rules and addressed Governor attention |
+| One finding per repair round wasted work | `reviews.rs` result + `submissions.rs::request_changes`, all findings together |
+| Missing reviewer blocked completion | Existing `ReviewReplacementClass`, not a newly invented workflow |
+| Compact TASK.md worked better than controller JSON | Existing `task_prompt.rs` renderer and required source selections |
+| Fixed-age rotation or newest-log ownership caused wrong decisions | Native identity/readback, exact process custody and explicit source gaps |
+| Old scripts controlled more than message/create | Existing helpers or narrow typed script actions, not another permissions DSL |
+
+Paseo's [loading code](https://github.com/getpaseo/paseo/blob/b4af508e2a9e5a34a8b0ffb8dfaff6fd679da6c7/packages/server/src/server/agent/agent-loading.ts)
+provides a small reusable pattern: coalesce loading by identity and recheck a close
+barrier before resume. It does not establish native exactly-once execution.
+Official Claude [permissions](https://code.claude.com/docs/en/agent-sdk/permissions)
+and [user input](https://code.claude.com/docs/en/agent-sdk/user-input) describe native
+policy/callback/defer mechanisms. Check the installed SDK seam before adopting newer
+features; do not build a private replacement merely from an old missing capability.

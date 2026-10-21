@@ -1,9 +1,10 @@
 # Eliot Swarm Controller — implementation
 
 This is the single implementation program for the
-[architecture](architecture.md). Runtime source, historical owner requirements and
-Claude Swarm scripts were rechecked through
-`6e470726c633209f98fea2bfd7bd12d039f285f1` on 2026-10-21.
+[architecture](architecture.md). The 2026-10-21 preservation pass compared
+`c92120ed70ca7e625440a8a19517c481e73b13c9` with the pre-refactor specification,
+October 6 audit, master audit v26 and retained Claude-script review. This is a
+focused requirements/contract review, not an exhaustive reread of every source file.
 [Findings](refactoring.md) explain the current excess;
 [status](../implementation-status.md) separates landed code from plans.
 
@@ -54,14 +55,26 @@ Deletion is allowed only if these behaviors remain connected:
 9. External writes have one domain owner and exact readback after ambiguity.
 10. One remote gateway process maps to one fixed Eliot identity/profile.
 
-The historical implementation machinery is not itself a requirement.
+The historical implementation machinery is not itself a requirement. Manager/Governor
+is an agent role, not a mandatory human. An enabled policy must run the whole selected
+work cycle without per-step human confirmation. `explicit` means an attributable
+Store command; the authorized Governor or helper can issue it.
+
+Preserve `Attempt.start_owner` and single initial dispatch: native delegation claims
+`native_manager` before spawn, then binds the observed producer; controller launch
+claims `controller`. `task.dispatch` must not start a native-managed Attempt again.
+This guard exists in `store/operations.rs` and `migrations/001_core.sql`; removing
+receipt duplication must not remove it. Follow-up input is a separate `Send`.
+
+[Delivery](delivery.md) defines the autonomous handoffs and historical requirement
+checks. It does not add a second implementation queue.
 
 ## 3. Current owners
 
 | Responsibility | Owner |
 | --- | --- |
 | Tasks, Attempts, Operations, authority, acceptance, durable messages/observations | `crates/swarm-kernel-host/src/store` |
-| Semantic adapter commands and bounded Store records | `crates/swarm-contracts` |
+| Semantic adapter commands and bounded Store records | `swarm-contracts` |
 | Authenticated Eliot IPC | `swarm-client::Client` / `ModuleLink` |
 | Process groups, birth identity and private atomic files | `swarm-process` |
 | Native transport/session/readback | selected adapter only |
@@ -100,11 +113,17 @@ native I/O. Capabilities route; Store authorization grants rights.
 
 Remove vendor/internal public methods:
 
-- `native.opencode.loop_step` → `Send(steer)`;
+- `native.opencode.loop_step` → remove the public method; map retained callers only
+  to supported `Send` timing, not automatically to exact-turn steering;
 - `native.command.cancel_turn` → `Cancel(turn)`;
 - `native.command.close_session` → `Shutdown`;
 - `native.command.release_evidence` → adapter-internal cleanup;
 - `native.mcp.*` → OpenCode adapter-internal setup/observation.
+
+Native inbox/loop-boundary steering is not atomic exact-turn steering. Current
+`runtime/opencode_v2/effects.rs` explicitly rejects exact-turn steering without a
+native expected-turn guard. Removing a vendor method must preserve the requested
+timing or report the unsupported scope, not rename a weaker action as exact.
 
 A normal outcome carries Operation ID, stale binding/boot guard, native identity,
 disposition and bounded action details. Do not repeat package version, protocol,
@@ -146,21 +165,32 @@ V  small single-tenant remote gateway
 **A0 — landed:** active v6 coordinate in source, route, installer, package policy and
 qualification. Historical v5 receipts stay historical.
 
-**A1a — landed, verification open:** terminal receipt no longer requires Store
-`observation_id` or duplicate `local_execution_results`. The later temporary repair
-run exposed an unresolved rejected/cancelled producer projection: do not mark A1a
-complete until the producer contract and connected regression agree.
+**A1a — landed, scoped check passed:** terminal receipt no longer requires Store
+`observation_id` or duplicate `local_execution_results`. Commit `c92120e` updates one
+existing dispatch producer across terminal SUCCESS/ERROR/CANCELED. Repair run
+[39579583956](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/39579583956)
+passed the connected terminal regression and Store Clippy before publishing that
+commit. This is not installed-harness or crash-recovery qualification.
 
 **A1b:** delete `AntigravityDispatchSessionProof`, refresh producer, latest-refresh
 lookup, binding/snapshot proof validator, assignment/lease/session digests and
 mandatory refresh-before-dispatch. Store already owns assignment, Attempt,
 binding/boot, workspace lease and Operation.
 
-**A2:** persist already-formed `module.outcome`/`module.result` parameters in private
-atomic files before memory can forget them. Scope by binding + generation + boot;
-same-boot reconnect resends exact parameters and deletes only after Store ACK. Never
-persist/replay native prompt or process intent. Observations use one replaceable
-checkpoint per source.
+**A2:** retain complete terminal bytes and final outcome/result parameters with
+Operation, original binding/generation and origin boot in private atomic files before
+acknowledging local retention. Same-boot IPC reconnect resends unchanged parameters;
+delete only after Store ACK. Observations use one replaceable checkpoint per source.
+
+A process restart is not an IPC reconnect. After existing custody checks fence the
+previous delivery owner, the authorized successor uses the existing reconciliation
+path to import retained deliveries for the original Operations. Store checks original
+assignment/source identity and deduplicates receipt/page identity. A superseded assignment receives historical
+evidence, not a new completion. Preserve origin boot; never relabel old facts as current activity or a new Attempt. This path starts
+no native process and resends no prompt. Implement this caller-to-Store path in A2,
+not a manual export instruction or a second recovery service. Missing/partial files
+require native readback or visible unknown; a crash before durable capture remains an
+explicit limit. Never put native intents into this delivery spool.
 
 **A3:** keep only real Open, Dispatch, Send(next_turn), Refresh, Result, Reconcile and
 explicit release of an owned resource. Delete placeholder Reply/Configure/Goal/
@@ -192,7 +222,16 @@ rows, codecs and lifecycle synchronization. `report.capacity` becomes a projecti
 **B4:** `dispatch_once` queries a bounded ranked page, chooses the first eligible
 explicit route and atomically creates/reuses Attempt, reserves workspace/root and
 creates launch Operation. Delete WorkDispatch cursors, copied pending subjects,
-watermarks, slots, links and ordinary-blocker quarantine.
+watermarks, slots, links and ordinary-blocker quarantine. Query eligible work before
+applying the admission limit; use bounded keyset scanning where eligibility needs
+inspection, so blocked first-page items cannot starve later work.
+
+Reuse a compatible idle binding under the route's continuation policy rather than
+unconditionally opening a session per Task. Before reuse, inspect pending inputs,
+native Goal/children and unresolved effects. Capacity is not released merely because
+a parent reports idle. A configured rotation drains only its affected scope and
+starts a new Attempt/session only after actual disposition; source age is not a kill
+condition.
 
 ### C — workspace authority
 
@@ -200,9 +239,13 @@ watermarks, slots, links and ordinary-blocker quarantine.
 `forbidden_paths` is hard negative. Empty allowed scope means repository root. Reject
 absolute paths, traversal, empty segments and `.git`; compare path segments.
 
-Attempt workspace lease is the only write authority/overlap guard. Review needs no
-write lease. Delete `code.scope.*`, symbol/interface authority, proposals, digests,
-override, expiry, indexes and contract links.
+Attempt workspace lease is the controller's write admission/overlap guard, not an OS
+sandbox for an unrestricted native shell. One manager owns the mutable worktree and
+serializes index/branch/commit changes; leaf writers get non-overlapping edits, not
+concurrent Git-index ownership. Review reads an immutable candidate or isolated
+read-only snapshot, never a concurrently changing writer checkout. It needs no write
+lease. Delete `code.scope.*`, symbol/interface authority, proposals, digests, override,
+expiry, indexes and contract links; preserve current Store role/object grants.
 
 ### D — process custody
 
@@ -220,6 +263,8 @@ Restart:
 
 <a id="automation-and-delivery"></a>
 
+<a id="harness-goals-and-the-eliot-goal-plugin"></a>
+
 ### E — scheduler and automation
 
 Keep one automation-entry schedule and one in-process loop waiting for Store change or
@@ -235,7 +280,26 @@ Automation toggles are current-state attempts:
 dispatch | review | return_changes | accept | check | goal_message | script
 ```
 
-They do not own another workflow lifecycle.
+They do not own another workflow lifecycle. Use the same admitted command for a
+Governor call or enabled helper; record represented manager, action and subject in
+that Operation and recheck current grants at admission. Human setup of budgets or
+permissions is not a per-action approval gate.
+
+On wake, query current subjects and admit at most the configured work budget. Persist
+the action's domain identity with its Operation, not another copied subject/cursor.
+Review assignment, correction delivery and publication keys include the current
+candidate/review or accepted-candidate/target; scheduled messages use occurrence ID.
+A new request ID cannot bypass these domain checks. Lost wakes trigger a bounded
+rescan; capacity/429/reset changes wake the same loop. Keep unrelated work running.
+
+For a native question/approval, first apply configured vendor permissions/rules, then
+route the unresolved addressed request to the Governor agent. Known policy may answer
+automatically; a choice requiring model judgment is one Governor task. Do not deny
+everything, pick the first option or require a human by default. Coalesce unchanged
+attention. `Send` is not `Reply`; recheck the exact pending request before answering.
+Operator input is reserved for missing authority/credentials or policy decisions the
+Governor cannot resolve. Use existing attention and mailbox records, not an incident
+platform or permission DSL.
 
 ### F — compact TaskPacket
 
@@ -269,7 +333,25 @@ accept_once          -> common candidate-specific task.accept gate
 
 Delete ReviewDisposition/RepairDispatch workflow state, per-finding delivery, slots,
 duplicate findings and automation-authored evidence arrays. Candidate B needs review
-B. Same candidate after correction is `no_progress`; bounded rounds escalate.
+B. Compare outstanding findings and relevant source/check evidence for progress:
+an unchanged tree can still gain missing verification; a fresh ID or irrelevant edit
+is not progress. Bounded unchanged rounds go to the Governor agent, which can revise
+the work split or replace the worker within policy, not automatically to a human.
+
+Use `store/reviews.rs`, `store/submissions.rs` and `store/acceptance.rs` as the existing
+owners. Return all actionable findings in one transition; if a live owner exists,
+admit one correction Send in the same transaction using the review/candidate cause.
+Otherwise `needs_correction` remains queryable and the next dispatch renders it.
+Preserve current `ReviewReplacementClass::{Unanswered,Inconclusive,ReturnedForCorrection}`
+from `store/reviews.rs`; these are already implemented, not a new missing feature.
+Replacement uses expected assignment/candidate and revokes the old slot without
+requiring a missing verdict. Late output remains history for its original candidate
+and never fills the replacement's slot.
+
+Required requirement-linked checks must pass. A known unrelated baseline failure is
+reported separately under selected policy, not turned into a demand that a worker fix
+the whole repository. Differential checks alone do not prove a new requirement.
+Run minimal affected Clippy during construction; broad tests remain product-stage.
 
 ### H — separate protocols and authorizers
 
@@ -304,7 +386,14 @@ Store transactions across native/file/Git/network I/O.
 then delete hidden host check worker.
 
 **Scripts:** `swarm-script-worker` executes; `swarm-scripts` owns one wire. Delete
-host DTO/compatibility duplication.
+host DTO/compatibility duplication. Current `schema.rs::ScriptControllerEffect`
+contains only TaskOwnerMessage, ManagerNotification and TaskCreate: that does not
+replace legacy reminder/form/route controls. Use existing helpers for common actions;
+where a retained script is the caller, add only its needed typed Send/Reply/Goal or
+Configure action to that enum and the existing Store admission path. No arbitrary
+method passthrough or second permissions registry. A bounded returned action list
+uses `(ScriptRun, action index)` identity and per-item current manager/object grants;
+readback returns child Operations without re-running already admitted script effects.
 
 **Remote Git:** Forge owns remote push/publication with exact target serialization and
 readback. Local Git stays bounded in host. Reuse `swarm-process` custody; verify worker
@@ -326,7 +415,12 @@ crate. Native session state, recovery, results, timers and Task state stay adapt
 Retain one Rust adapter with thin official SDK driver. Split live session,
 NativeEffectRecord, exact StoreDelivery, latest Observation and persisted terminal
 result. Delete generic journal, callback retention, tombstones/reference graph and old
-Node generations after finite disposition. Lost callback resolver remains unknown.
+Node generations after finite disposition. A lost live callback is not itself durable
+recovery. Current official SDK docs also expose hook `defer`/resume; evaluate that
+native seam only for the selected SDK version before writing callback persistence.
+Project `modules/claude-rust/README.md` still names SDK 0.3.287; current docs are not
+proof that this pin supports newer semantics. Advertise the verified capability and
+use ordinary Governor Reply; never simulate an unavailable native feature.
 
 ### N — Codex
 
@@ -385,7 +479,10 @@ Implement [observability](observability.md) R0–R6:
    parallel report reducers after consumers move.
 
 Unassigned subjects remain visible and grant no Task/transcript rights. Ordinary reads
-perform no provider/model/filesystem/network call.
+perform no provider/model/filesystem/network call. Source/subject/edge names describe
+facts, not a requirement for a generic entity graph, one table per word or a new
+registry framework. Reuse existing IDs and the smallest indexed Store representation
+needed by actual inventory/state consumers.
 
 ### S — non-core/tooling deletion
 
@@ -430,9 +527,12 @@ Messages remain mailbox rows; thread never grants authority or negotiates policy
 
 **T4 — delete coordination products.** Consultation becomes message. Review stays
 review. Write conflicts stay workspace leases. Watches become subscriptions/explicit
-automation conditions. Delete participant token registry, cards, speech-act/proposal
-workflow, contracts/ratification, integration ACK, Concilium, code scope and custom
-indexes/backfills/cursors, with policy/MCP/CLI/fixtures/storage.
+automation conditions. Delete the duplicate coordination participant-token registry,
+not base client authentication or Task/reviewer grants. Native children need no extra
+Store principal merely to be observed. Children that call Eliot use the existing
+scoped identity/grant path. Then remove cards, speech-act/proposal workflow,
+contracts/ratification, integration ACK, Concilium, code scope and their custom
+indexes/backfills/cursors and redundant policy/MCP/CLI/fixtures/storage.
 
 **T5 — finite transition.** Migrate only unresolved messages required by concrete
 work. Completed Operations remain readable history; do not keep permanent translators.
@@ -466,9 +566,14 @@ when required. Operation moves to sending before I/O, writes at most once, then 
 readback settles or remains unknown. Move PR PATCH out of Forge worker. Forge remains
 remote Git push only.
 
-**U4 — remove automatic projection.** Delete activation/catch-up watermarks,
-global/per-entry cursors, quarantine/recent state and effect-drain cursor. Acceptance
-does not implicitly mutate GitHub. Optional integration action is explicit.
+**U4 — remove the projection engine, preserve automation.** Delete activation/catch-up
+watermarks, per-entry copied lifecycle, quarantine and effect-drain cursor. An enabled
+manager integration policy queries accepted candidates/importable source changes and
+admits the same explicit publication/metadata/import Operation as a direct agent call.
+Acceptance and publication remain separate facts. Idempotency uses the accepted
+candidate + remote target + requested effect, so disabling/re-enabling does not
+repeat a write. Deleting the engine must not require a human to push, import or apply
+routine metadata. Use the existing loop, never another publication scheduler.
 
 **U5 — independent remote view.** Feed repository/ref/head/time/error into R3 remote
 collector independent of publication. Local tracking refs are not fresh remote facts.
@@ -543,11 +648,16 @@ Minimum connected proofs:
 
 - exact logical request is idempotent; changed request conflicts;
 - uncertain native/external write is never resent by transport guess;
-- stale binding/boot outcome fails; exact Store delivery redelivers safely;
+- stale live reports fail; same-boot delivery and authorized cross-boot reconciliation
+  preserve original Operation/source identity without native replay;
 - native and Eliot Goals work independently and together;
+- native-manager delegation cannot receive a second initial controller dispatch;
+- an enabled Governor policy completes submit/review/correct/accept/optional publish
+  without an operator; exact approval questions reach the authorized resolver;
 - queue/admission cannot duplicate Attempt/launch or starve eligible work;
 - overlapping write leases block; disjoint scopes proceed;
-- review B cannot reuse review A; all findings return together; no-progress stops;
+- review B cannot reuse review A; a missing reviewer can be replaced without its
+  verdict; all findings return together; evidence-only progress is not misclassified;
 - unmatched sessions/processes remain visible without provider calls;
 - assigned and observed Git facts may differ and both display;
 - GM reconnect/handover preserves current work and historical identities;
