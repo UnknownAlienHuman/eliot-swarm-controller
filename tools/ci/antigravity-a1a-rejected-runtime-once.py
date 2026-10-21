@@ -53,7 +53,7 @@ pub(super) fn record_warm_terminal(
     };
     if !outcome_matches
         || !terminal["local_execution_ref"].is_object()
-        || terminal["native_session_id"] != outcome.native_root_id
+        || terminal["native_session_id"].as_str() != outcome.native_root_id.as_deref()
         || terminal["local_execution_ref"]["input_operation_id"] != outcome.operation_id
     {
         return Err(Error::invalid(
