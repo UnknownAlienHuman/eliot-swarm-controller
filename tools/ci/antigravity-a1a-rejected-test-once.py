@@ -78,7 +78,9 @@ fn run_antigravity_rejected_terminal_regression(status: &str, expected_dispositi
         .unwrap();
     let producers: Value = serde_json::from_str(&producers_raw).unwrap();
     assert_eq!(producers.as_array().unwrap().len(), 1);
-    assert_eq!(producers[0]["admission_kind"], "normalized_task_dispatch");
+    assert_eq!(producers[0]["assignment_id"], command.operation_id);
+    assert_eq!(producers[0]["dispatch_operation_id"], command.operation_id);
+    assert_eq!(producers[0]["native_session_id"], ANTIGRAVITY_TEST_ROOT);
     assert_eq!(producers[0]["disposition"], expected_disposition);
     assert_eq!(
         producers[0]["completion_condition"],
