@@ -23,7 +23,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Third run corrects only the compile-time Value/Option comparison.
+          # The rejected/cancelled terminal has no repeated dispatch admission;
+          # assert the actual terminal producer identity instead.
           python tools/ci/antigravity-a1a-rejected-runtime-once.py
           python tools/ci/antigravity-a1a-rejected-test-once.py
           rustfmt --edition 2024 \
