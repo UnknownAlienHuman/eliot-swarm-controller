@@ -3393,17 +3393,14 @@ pub(super) fn outcome_with_artifacts(
         };
         tx.execute("UPDATE bindings SET state='reconciling',native_root_id=COALESCE(?3,native_root_id),native_scope_key=COALESCE(?4,native_scope_key),state_json=json_set(state_json,'$.opening_evidence',json(?5)) WHERE binding_id=?1 AND generation=?2",params![id,generation,reported_identity.0,reported_identity.1,model::canonical(&r.details)?])?;
     }
-    // The normalized dispatch already retained one producer for this exact
-    // Operation. Its warm receipt is validated above and retained on the
-    // Operation; appending another producer would duplicate its identity.
+    // Native input admission and terminal execution are two observations of
+    // the same dispatch producer. A rejected terminal does not repeat its
+    // admission receipt; update the already retained identity instead of
+    // appending a second producer.
     if normalized_dispatch_admission.is_none()
         && let Some(producer) = warm_producer
     {
-        let attempt = model::text(&o, "attempt_id")?;
-        tx.execute(
-            "UPDATE attempts SET state=CASE WHEN state='reserved' THEN 'running' ELSE state END,producers_json=json_insert(producers_json,'$[#]',json(?2)),updated_at_ms=?3 WHERE attempt_id=?1 AND released_at_ms IS NULL",
-            params![attempt, model::canonical(&producer)?, now],
-        )?;
+        producers::record_warm_terminal(&tx, &o, &r, &producer, now)?;
     }
     if let Some(configuration) = applied_configuration {
         tx.execute(
