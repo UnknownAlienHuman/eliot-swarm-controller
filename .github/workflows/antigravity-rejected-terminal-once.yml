@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Third run corrects only the compile-time Value/Option comparison.
           python tools/ci/antigravity-a1a-rejected-runtime-once.py
           python tools/ci/antigravity-a1a-rejected-test-once.py
           rustfmt --edition 2024 \
