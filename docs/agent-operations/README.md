@@ -12,6 +12,12 @@ is partial; [status](../implementation-status.md) records the available evidence
 3. The contract and source for the assigned responsibility. Read the
    [source findings](refactoring.md) when checking why a mechanism should disappear.
 
+For audit work or resuming an interrupted audit, start with
+[audit register](audit-register.md#resume-here): baseline, inspected paths, confirmed
+findings, untraced boundaries and next exact call chain. Update that checkpoint with
+the owning documentation; do not infer completeness from previous chat summaries.
+Coding workers need their assigned slice, not the whole audit register.
+
 [AGENTS.md](../../AGENTS.md) owns collaboration and verification practice.
 Older O/M/C/I programs, policy editions and prototype specifications describe
 their revisions; they do not add requirements to this target.
@@ -20,6 +26,7 @@ their revisions; they do not add requirements to this target.
 
 | Document | Responsibility |
 | --- | --- |
+| [Audit register](audit-register.md) | Durable source-review coverage and resume point; not another implementation plan. |
 | [Configuration](configuration.md) | Editable settings, ownership, enabling and effects of changes. |
 | [Delivery](delivery.md) | Assignment, submission, independent review, correction and acceptance. |
 | [Communication](../agent-communication-program.md) | Addressed messages supporting assigned work. |

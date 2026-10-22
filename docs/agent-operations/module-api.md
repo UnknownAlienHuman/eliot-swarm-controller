@@ -80,14 +80,30 @@ prompt or a replacement session under the old Operation.
 ## Store delivery storage
 
 Native effect recovery and delivery of already formed Store records are distinct.
+The following is A2 target behavior, not a claim that current adapters implement it.
+Concrete evidence and remaining traces are in the [audit register](audit-register.md).
 
 ### Immutable deliveries
 
 Retain complete terminal bytes and exact `module.outcome` / `module.result` parameters
 with Operation, original binding/generation, origin boot and item/page identity in
-private atomic storage before IPC. Same-boot reconnect sends the same parameters;
-Store ACK permits removal. Keep content integrity on actual artifact bytes, not a
-new hash-proof layer for every private JSON value.
+private atomic storage before IPC. Same-boot reconnect sends the same parameters.
+Keep content integrity on actual artifact bytes, not another proof layer for each
+private JSON value.
+
+An ACK releases only the item it acknowledges:
+
+- outcome ACK releases that outcome envelope, not its full source response;
+- page ACK releases that page envelope, not every remaining page;
+- complete durable Store capture, or explicit retention/release policy, permits
+  deleting the source body. An EOF page does not alone prove complete earlier coverage.
+
+Serve delayed and repeated page reads from the same retained body. Memory cache
+turn-count eviction cannot delete the only copy of an uncollected result. Reserve
+bounded storage for admitted output, pause new admissions when full and surface a
+specific storage fault rather than silently dropping data. Partial/oversized native
+output remains explicitly incomplete. This is result retention, not a transcript
+mirror or a new generic journal.
 
 ### Restarted adapter
 
@@ -103,12 +119,34 @@ completion or acceptance. Missing/partial storage requires native readback or ho
 unknown. A crash before durable capture is not recoverable by pretending the spool
 contains the result.
 
+Reuse the current normalized completion boundary in `runtime::admitted_result_scope`,
+`normalized_result::validate_source` and `results::prepare/record`. It already handles
+exact previously admitted pages without ordinary live-link/release gating and ACKs
+identical registered-page replay. It does not establish the entire successor or
+transport-revocation contract: those paths must be connected without removing scoped
+authorization. Do not invent another general receipt/recovery subsystem.
+
 ### Replaceable observation checkpoint
 
 Retain only the latest pending normalized state per source, with epoch, source cursor
 and coverage/gap. New unsent state can replace older state. Store's journal records
 accepted checkpoints; a lost intermediate native frame is a coverage issue, not a
 reason for an infinite provider event mirror.
+
+### Link loss is not native cancellation
+
+Keep reducing native events and durably capturing terminal output while Eliot IPC is
+unavailable. One bounded in-flight delivery or a small delivery task can run alongside
+the existing native owner; preserve its state rather than cancelling and recreating a
+write on every event-loop iteration. Do not await a whole reconnect/backoff loop inside
+the only native-event handler.
+
+Retry only saved Store deliveries. Hold new work on delivery/storage pressure, but do
+not close native stdin, terminate the session or forget terminal facts merely because
+an observation could not be posted. If an explicit authorized stop drains a terminal,
+that terminal follows the same durable capture path. True ownership loss or revoked
+authority is handled by its own policy; a network error is not evidence of either.
+No additional service, broker or scheduler is needed.
 
 ### Common exclusions
 
@@ -182,9 +220,10 @@ An independent concurrent input or unexplained source gap invalidates ordering-o
 association; never pick the newest assistant message. For selected current OpenCode,
 use its exact assistant parent edge when available.
 
-Store publishes immutable bytes before their Store receipt. A file with no committed receipt
-is not a published result. Keep the page until ACK; reuse `artifact.assemble` rather
-than adding another assembler. Availability is not submission or acceptance.
+Store publishes immutable bytes before their Store receipt. A file with no committed
+receipt is not a published result. Keep the page until ACK and its source body until
+complete capture/release; reuse `artifact.assemble` rather than adding another
+assembler. Availability is not submission or acceptance.
 
 ## Review and acceptance
 

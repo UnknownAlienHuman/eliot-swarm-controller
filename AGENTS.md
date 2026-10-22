@@ -9,6 +9,12 @@ plans. Historical specifications, audits and Claude scripts are evidence for the
 manager, not additional worker instructions. The owner's latest explicit decision
 wins.
 
+For audit tasks, read and update the [audit register](docs/agent-operations/audit-register.md#resume-here).
+Retain the inspected commit, actual paths/symbols, confirmed/refuted findings, untraced
+boundaries and next exact chain. After interruption compare source changes before
+continuing. A source review is not an executed check; neither is a completed fix.
+This is the audit checkpoint, not another implementation queue or worker context pack.
+
 ## Start with the requested code
 
 A runtime task starts by reading the exact current callers, owners and symbols and

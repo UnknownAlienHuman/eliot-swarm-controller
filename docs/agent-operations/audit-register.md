@@ -10,127 +10,165 @@ remains the work order; [status](../implementation-status.md) records landed beh
 - Pass: **2026-10-22 / result retention and control-link failure**.
 - Source baseline: **`3b9c21c35e24096c3e9b2dfcb0055aa58acb0801`**.
 - Overall audit: **incomplete**. No measured completeness percentage is available.
-- Last completed trace: Antigravity native terminal → in-memory retention → delayed
-  `agent.result`; and observation delivery failure → native stdin shutdown.
-- Next exact trace: `store/runtime.rs::admitted_result_scope` →
-  `store/normalized_result.rs::validate_source` → `store/results.rs::prepare` and
-  registration/replay → artifact publication/read. Determine which released-link,
-  original-boot and successor cases already work before adding recovery machinery.
-- No runtime code, Clippy, tests or installed harness were executed in this pass.
+- Traced: Antigravity terminal/cache/delayed result; report failure/native shutdown;
+  Store normalized-page scope, sealed-origin validation and exact registration replay.
+- Next exact trace: `runtime.rs` caller of `normalized_result::admitted_origin` for
+  `agent.result`, including continuation `agent.send`; then artifact publication,
+  authorized body read and `artifact.assemble` coverage. AR-006 is not yet a complete
+  caller-to-consumer finding.
+- Still open within AR-005: transport authentication/revocation, authorized successor
+  with a different credential, old-boot outcome import, and incomplete on-disk capture.
+- This pass changed documentation only. No runtime code, Clippy, tests or installed
+  harness were executed. Existing test source was read, not run.
 
 On resume, read this section and the open finding before rereading the archive. Compare
 changed source paths with the baseline. Unchanged evidence remains valid at its named
-head; changed callers or consumers require rechecking that row, not a claim that the
-whole audit remains current. Update this file in the same publication as related docs.
+head; changed callers or consumers require rechecking that row. Update this register
+in the same publication as related docs. An interrupted pass does not erase prior
+findings or make inherited claims current.
 
 ## Meaning of the evidence
 
 `source-confirmed` means the named control path was read and its consequence follows
-from the code; it is not a live reproduction. `partial` names the boundary not yet
-traced. `inherited` means earlier findings exist but have not been independently
-rechecked in this pass. `preserve` is verified useful behavior, not a deletion target.
-Runtime fixes and executed checks are recorded separately from these review labels.
-A search hit locates code; it is not a completed trace. Reading a test is not running it.
+from the code; it is not a live reproduction. `partial` names the untraced boundary.
+`inherited` means earlier findings have not been rechecked in this pass. `preserve`
+marks useful existing behavior rather than a deletion target. Source-review status,
+implementation status and executed-check evidence are separate. A search hit locates
+code; it is not a completed trace. Reading a test is not running it.
 
 ## Current pass: exact paths and results
 
-All current-source links below are pinned to the baseline above.
+Current-source evidence below is pinned to the baseline above.
 
 | ID | Requirement and inspected path | Evidence/result | Still needed |
 | --- | --- | --- | --- |
-| AR-001 | Control disconnect must not stop admitted native work. `main.rs::wait_for_terminal` → `flush_reports` → `HostSession::request_saved`; `run` error branch → `NativeSession::shutdown_and_drain` | **source-confirmed, open**: a report error propagates into stdin shutdown. Native events consumed during drain can create in-memory terminal receipts, then `run` returns an error without another delivery attempt. | Implement control-link retry independently of native draining and durable capture; exercise host-down-during-turn. |
-| AR-002 | A completed result remains retrievable until durable capture/release. `Controller::settle_terminal/remember_completed_turn/retained_response_for_operation`; stream bounds; `main.rs` result handler | **source-confirmed, open**: body/mapping retention is a 32-response in-memory window. The 33rd completion evicts the oldest mapping even when its full body has never reached Store. An outcome ACK is not a body/page ACK. | Tie source-body release to complete durable capture, not number of subsequent turns; exercise delayed/multi-page reads. |
-| AR-003 | Result identity must not be inferred from equal prompt hashes or newest output. `Controller::retained_response_for_operation`; sequential-retention cases | **preserve**: exact Operation and retained receipt are compared; conversation/stream generation are checked. ACK removes pending outcome but does not immediately remove the separate completed-turn mapping. Oversized bodies are not presented as complete truncated text. | Simplification must keep causal IDs and explicit oversized/incomplete results while removing repeated package proof fields. |
-| AR-004 | Retained data must survive adapter restart without native replay. `Controller::new/read_command`, same-process caches, A2 target | **source-confirmed gap, open**: a new Controller has empty caches; current `agent.reconcile` can emit history-unavailable, not reload old terminal bytes. A2 is a target, not present code. | Finish Store-side successor trace below; connect authorized import of original evidence without relabeling boot or starting native work. |
-| AR-005 | Existing Store completion paths should be reused, not replaced blindly. `results.rs::prepare`; `runtime.rs::admitted_result_scope` search/contract | **partial**: normalized pages already select a dedicated admitted-result scope; its stated purpose includes released/link-changed completion. Do not claim all historical pages are rejected. | Read the full scope and normalized-origin validators, duplicate ACK path and artifact consumer before selecting the minimum extension. |
+| AR-001 | Control disconnect must not stop admitted native work. `wait_for_terminal` → `flush_reports` → `request_saved`; `run` error → `shutdown_and_drain` | **source-confirmed, open**: report error reaches stdin shutdown; terminal facts read during draining remain in memory and the error return performs no further delivery. | Independent bounded Eliot delivery and continuous native draining; host-down-during-turn case. |
+| AR-002 | Complete results survive until durable capture/release. `settle_terminal`, `remember_completed_turn`, response lookup and result handler | **source-confirmed, open**: 32-response cache; 33rd completion evicts the oldest mapping even without full Store body capture. Outcome ACK is not body/page ACK. | Source-body lifetime tied to complete capture; storage pressure stops new admission, not retention of existing results. |
+| AR-003 | A result belongs to its exact logical input. `retained_response_for_operation` and sequential-retention cases | **preserve**: Operation, receipt, conversation and stream generation checks; ACK does not immediately remove the separate mapping; oversized body is not returned as complete truncated text. | Keep causal IDs and explicit incomplete output while removing duplicate package proofs. |
+| AR-004 | Restart recovers retained data without native replay. `Controller::new/read_command`, same-process caches, A2 target | **source-confirmed gap, open**: a new Controller has empty caches; reconcile can report history-unavailable but cannot reload terminal bytes. | Authorized successor import for original Operations; no relabeling origin boot or native launch. |
+| AR-005 | Reuse existing completion/replay behavior. `admitted_result_scope` → `validate_source` → `prepare` → `record` | **source-confirmed, preserve**: previously admitted normalized pages have an exact credential-tuple completion path without ordinary live-link/release gating; sealed origin is checked, registration rechecks it, identical settled page returns replay ACK. | Full transport/revocation/successor and file/body-consumer trace remains open; this is not unrestricted historical access. |
+| AR-006 | Continuation messages need attributable complete results too. `normalized_result::admitted_origin/validate_source` | **partial**: both inspected generic-origin paths require source method `task.dispatch`, not `agent.send`. The current target describes results for logical inputs more broadly. | Trace caller selection and other result paths before deciding which extension is required. Do not claim all send results are unavailable. |
 
 ### AR-001 — a reporting failure changes native lifecycle
 
 Sources: [run and dispatch error handling](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/src/main.rs#L38-L270),
-[request and report delivery](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/src/main.rs#L695-L860),
+[request/report delivery](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/src/main.rs#L695-L860),
 [drain and terminal wait](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/src/main.rs#L1030-L1240).
 
-The timer branch awaits `flush_reports`. While that branch awaits host retries, the
-native-event receiver is not being reduced; the stdout task can queue only 16 frames
-before backpressure. If reporting fails, the caller invokes `shutdown_and_drain`, which
-closes stdin and waits for direct-child exit. This is not proof that the remote work
-was killed, but it is a concrete violation of control-disconnect independence. The
-pre-exit wait has no deadline in this function; the two-second tail deadline applies
-only after exit. A terminal observed during drain is still only in memory.
+The timer handler awaits `flush_reports`. While it awaits host retries, the native
+receiver is not being reduced; stdout can queue only 16 frames before backpressure.
+On failure, the caller closes stdin and waits for direct-child exit. This does not
+prove remote work was killed, but control-link failure has changed native lifecycle.
+The pre-exit wait has no deadline here; the two-second tail deadline applies only
+after exit. A terminal observed during drain is still only in memory.
 
-Retained requirement: original [architecture §4](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/f1b854b6fd058dc2440d3848fc95acc279657d3f/docs/agent_swarm.md#4-владение-task-native-сессия-и-процесс-не-одно-и-то-же)
-says the long-lived bridge continues admitted work when host IPC disconnects. The
-current [architecture](architecture.md#progress-native-effects-and-store-delivery)
+Original [architecture §4](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/f1b854b6fd058dc2440d3848fc95acc279657d3f/docs/agent_swarm.md#4-владение-task-native-сессия-и-процесс-не-одно-и-то-же)
+requires a long-lived bridge to continue admitted work across host IPC disconnect.
+Current [architecture](architecture.md#progress-native-effects-and-store-delivery)
 also separates execution from delivery.
 
-A2 must keep the native reducer reading while one bounded Eliot delivery attempt is
-pending, stop taking new work on delivery/storage pressure, and retry saved deliveries
-with bounded backoff. An ordinary network/readback error is not a shutdown command.
-Keep one native-state owner; do not solve this with another service or broker.
+A2 keeps one native-state owner reducing events while a bounded Eliot delivery is
+pending. It pauses new admissions on storage/delivery pressure and retries saved
+records, not prompts. Keep the in-flight delivery state across event-loop iterations;
+do not repeatedly cancel/recreate native writes. Ordinary transport failure is not a
+shutdown command. Explicit stop, revoked authority and failed custody have their own
+policy. No new broker or process is needed.
 
 ### AR-002 — an ACKed outcome is not a retained complete answer
 
-Sources: [retention and result lookup](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/src/controller.rs#L450-L590),
+Sources: [retention/result lookup](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/src/controller.rs#L450-L590),
 [32-response bound](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/src/stream.rs#L10-L28),
-[existing eviction case](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/tests/sequential_retention.rs#L465-L505).
+[eviction case](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/modules/antigravity-rust/tests/sequential_retention.rs#L465-L505).
 
-The existing test deliberately completes and outcome-ACKs 33 turns and expects the
-oldest lookup to return `NATIVE_RESULT_BODY_UNAVAILABLE`. The test was read, not run.
-This confirms a current cache contract; the product defect is relying on that cache as
-the only source of an uncollected complete result. A crash is not required.
+The existing test completes and outcome-ACKs 33 turns and expects the oldest lookup to
+return `NATIVE_RESULT_BODY_UNAVAILABLE`. This establishes the current cache contract,
+not an executed product test in this pass. The product gap is relying on that cache as
+the only source of an uncollected complete result. A crash is unnecessary.
 
-Keep body identity/storage lifetime separate from delivery-envelope ACK lifetime. A2
-must persist the complete source body before forgetting it and serve all pages from
-that stable body. Delete it only after complete durable Store capture or explicit
-retention/release policy, not an outcome ACK, first-page ACK or later turn count.
-Bound bytes and apply admission backpressure rather than silently evicting uncollected
-results. No second transcript store is needed: this is the existing result boundary.
+Three lifetimes must stay distinct: native effect identity; complete source body;
+and exact Store-delivery envelope. Outcome ACK releases only its envelope. Page ACK
+releases only that page envelope. Keep the source body until complete durable Store
+capture or explicit retention/release. An EOF page alone is not proof of preceding
+coverage. Bound bytes and reserve capacity before admission; never silently discard
+uncollected bodies to admit more work. Use the existing result boundary, not a new
+transcript store or journal framework.
 
-## Inspection log (not a claim to have read each whole file)
+### AR-005 — existing normalized completion is a reusable boundary
+
+Sources: [scope](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/crates/swarm-kernel-host/src/store/runtime.rs#L728-L807),
+[sealed-origin validation](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/crates/swarm-kernel-host/src/store/normalized_result.rs#L212-L435),
+[registration/replay](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/crates/swarm-kernel-host/src/store/results.rs#L1320-L1450).
+
+Unlike ordinary `runtime::scope`, `admitted_result_scope` does not demand a current
+module link or unreleased binding. It checks Module role, registered module identity,
+exact binding/generation, result Operation and retained Task/Attempt origin. The later
+`prepare` restricts accepted Operation states further and invokes sealed-source checks.
+This narrow completion path is not permission to launch new work or read arbitrary
+historical data. New-connection authentication/revocation was not audited here.
+
+`record` reruns preparation inside its transaction. An already settled page is ACKed
+only when artifact identity, digest and metadata match. A new page registers artifact,
+settles its result Operation and writes observation before commit and ACK. This should
+be reused, not replaced with another receipt store. The separate filesystem publish,
+full assembly and successor credential path remain to be traced.
+
+### AR-006 — selected origin is narrower than the target API
+
+[New origin admission](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/crates/swarm-kernel-host/src/store/normalized_result.rs#L80-L137)
+and [source validation](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3b9c21c35e24096c3e9b2dfcb0055aa58acb0801/crates/swarm-kernel-host/src/store/normalized_result.rs#L316-L395)
+require `task.dispatch`. Before broadening this, trace the actual `agent.result`
+caller and selected source for a continuation Send. Preserve the initial-start guard;
+a continuation must never be relabeled as the Attempt's first dispatch. This row is
+an open coverage question, not a completed diagnosis of every result route.
+
+## Inspection log
+
+This lists inspected portions, not whole-file or runtime coverage.
 
 | Source | Read in this pass |
 | --- | --- |
-| `AGENTS.md`, `architecture.md`, `implementation-status.md` | complete current contents |
-| `implementation.md` | A1/A2 and adjacent B–E source/target instructions |
-| `modules/antigravity-rust/src/main.rs` | run/dispatch/result, HostSession retry, report delivery, channel setup, terminal wait and shutdown/drain |
-| `modules/antigravity-rust/src/controller.rs` | fields/new, open identity, terminal capture tail, completed mapping, read/reconcile/result lookup |
-| `modules/antigravity-rust/src/stream.rs` | bounds and response data shape; full parser not reviewed |
-| `modules/antigravity-rust/tests/sequential_retention.rs` | ACK/page/identity/oversize/eviction scenarios; not executed |
-| `store/results.rs` | cache preamble, status snapshot, Claude-specific origin, admitted result selection and prepare; final registration/read consumer not yet traced |
-| `store/runtime.rs` | dispatch context and selected receipt sections; admitted-result scope body remains next |
-| Original `agent_swarm.md@f1b854b6` | purpose/module/ownership requirements through §4 |
-| Rust `File::sync_all` documentation | stable file durability API; no platform power-loss guarantee inferred |
+| `AGENTS.md`, architecture, status, module API, Agent Operations README | complete current contents |
+| `implementation.md` | A1/A2 and adjacent B–E instructions |
+| Antigravity `main.rs` | run/dispatch/result, HostSession retry, report delivery, channel setup, terminal wait and shutdown/drain |
+| Antigravity `controller.rs` | fields/new, open identity, terminal capture tail, completed mapping, read/reconcile/result lookup |
+| Antigravity `stream.rs` | bounds and response shape; full parser not reviewed |
+| `tests/sequential_retention.rs` | ACK/page/identity/oversize/eviction cases; not run |
+| `store/results.rs` | selected status/legacy-origin paths, normalized prepare, record/replay, get and metadata authorization; body/assembly consumer remains open |
+| `store/runtime.rs` | dispatch context, selected receipt sections, scope/admitted-result scope and hello recovery; full admission routing remains open |
+| `store/normalized_result.rs` | new origin, admitted origin/source and page byte-range validation; final artifact/candidate consumers remain open |
+| Original `agent_swarm.md@f1b854b6` | purpose/module/ownership through §4 |
+| [Rust File durability API](https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all), [Tokio select semantics](https://docs.rs/tokio/1.53.1/tokio/macro.select.html) | documentation only; no platform power-loss or installed-version qualification |
 
 ## Remaining coverage map
 
-The rows below are **inherited/open**, not completed by this pass. They index existing
-findings and the implementation slice; they do not invent percentages or another
-schedule. Split a row only when a concrete path is actually inspected.
+All rows below are **inherited/open**, not completed by this pass. They index existing
+findings and implementation slices, not another schedule. Split a row only when a
+concrete path is inspected.
 
 | Area / implementation | Existing evidence and next boundary |
 | --- | --- |
-| Requirements/autonomy | Preservation matrix in status; remaining original specs and Claude archive must be mapped to live callers. |
-| Antigravity A | AR-001–005 above; dispatch proof and full result/successor chain still open. |
-| Queue/routes/provider/capacity B | Existing findings; recheck root reservation, fairness, shared account and prepared-work dependencies. |
-| Workspace/process C–D | Existing findings; trace shared worktree, release, PID reuse and successor fencing. |
-| Scheduler/Goals E | Current policy documents; trace occurrence dedupe, native Goal plus Eliot messages, drain and no-progress. |
-| TaskPacket/review F–G | Existing findings; trace frozen evidence plan, missing-reviewer replacement, all-findings correction and acceptance. |
-| Public/internal permissions H | Method registry is not proof of object authorization; enumerate retained actions and actual authorizers. |
-| Store formats/migrations I | Readers/writers and partial transaction states still need path-specific review. |
-| IPC/MCP J | Disconnect, slow consumers, replay/live boundary, writer occupancy and exact pending-request reads. |
-| Check/Script/Forge/GitHub K | Each admitted effect, authority recheck, cancellation, ambiguous response and readback owner. |
-| Shared shell L | No extraction until two complete callers establish the same lifetime/ownership. |
-| Claude/Codex/Command/Muse/OpenCode M–Q | Earlier adapter findings are inherited; refresh exact selected version, actions, results and restart paths per route. |
-| Governor R | Provider-local/OS/Git source join and unbound inventory; measure no per-viewer provider calls after implementation. |
-| Deletions S | Each removal needs a connected positive replacement and concrete unresolved-data disposition. |
-| Mailbox/handover T | Recipient identity, scoped read, cancel/reply, replacement manager and coalesced wake. |
-| GitHub/gateway U–V | Collector/import/effect split; page movement, credential scope, HTTP timeout and session limits. |
-| Installed/Windows/load qualification | Separate unexecuted work; not a reason to postpone useful source/document corrections. |
+| Requirements/autonomy | Preservation matrix in status; remaining old specs and Claude archive to map to live callers. |
+| Antigravity A | AR-001–006; dispatch proof and full result/successor chain remain open. |
+| Queue/routes/provider/capacity B | Root reservation, fairness, shared accounts and preparatory dependencies. |
+| Workspace/process C–D | Shared worktree, release, PID reuse and successor fencing. |
+| Scheduler/Goals E | Occurrence dedupe, native Goal plus Eliot messages, drain and no-progress. |
+| TaskPacket/review F–G | Frozen evidence plan, reviewer replacement, all-findings correction and acceptance. |
+| Public/internal permissions H | Retained actions and actual object authorizers, not just registry entries. |
+| Store formats/migrations I | Reader/writer pairs and partial transaction states. |
+| IPC/MCP J | Slow consumers, disconnect, replay/live, writer occupancy and exact pending-request reads. |
+| Check/Script/Forge/GitHub K | Admitted effects, authority recheck, cancel, ambiguous responses and readback owners. |
+| Shared shell L | Two complete callers must establish matching lifetime/ownership before extraction. |
+| Other adapters M–Q | Refresh selected versions, actions, result/restart paths; older findings are inherited. |
+| Governor R | Local sources/unbound join; qualify no per-viewer provider calls. |
+| Deletions S | Positive replacement and concrete unsettled-data disposition. |
+| Mailbox/handover T | Recipient identity, grants, cancel/reply, successor manager and wake. |
+| GitHub/gateway U–V | Collector/import/effect split, moved pages, credentials, HTTP timeouts and sessions. |
+| Installed/Windows/load | Separate unexecuted qualification; not a gate before useful source changes. |
 
 ## Checkpoint discipline
 
-A source-confirmed finding stays open until a fix and its exact evidence are linked.
-A documentation correction is not a runtime fix. Record refuted claims too, so another
-pass does not reintroduce them. Do not mark a whole subsystem complete from a handful
-of symbols or a green documentation workflow. Resume with AR-005, then update this
-register and the owning target document together.
+Findings stay open until a fix and exact evidence are linked. Documentation changes
+are not runtime repairs. Keep refuted claims so later passes do not resurrect them.
+Do not mark a subsystem complete from selected symbols or a green docs workflow.
+Resume at AR-006 and the remaining AR-005 boundaries; update this register and the
+owning target document together.
