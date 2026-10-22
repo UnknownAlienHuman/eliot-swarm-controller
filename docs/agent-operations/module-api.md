@@ -122,9 +122,24 @@ contains the result.
 Reuse the current normalized completion boundary in `runtime::admitted_result_scope`,
 `normalized_result::validate_source` and `results::prepare/record`. It already handles
 exact previously admitted pages without ordinary live-link/release gating and ACKs
-identical registered-page replay. It does not establish the entire successor or
-transport-revocation contract: those paths must be connected without removing scoped
-authorization. Do not invent another general receipt/recovery subsystem.
+identical registered-page replay. It does not establish the entire successor contract:
+that path must be connected without removing scoped authorization or inventing another
+general receipt/recovery subsystem.
+
+### Authentication versus admitted completion
+
+Keep new-connection authentication, new command admission and delivery of previously
+admitted evidence separate. Current `Store::authenticate` rejects disabled credentials.
+The normalized page handler has a narrow completion path for an already-authenticated,
+still-open carrier and its exact registered binding/Operation, even after live-link or
+release changes. It is not an arbitrary history reader or permission for a new prompt.
+
+Preserve this distinction when simplifying authorization. Do not blanket-reject all
+late pages using live-binding checks, or accept arbitrary predecessor files because a
+new module has connected. A successor with different credentials must use the scoped
+reconciliation owner and original source identity. Revocation side effects, successor
+provisioning and old-boot terminal import still need connected verification; the
+existing same-credential page path is not proof of those behaviors.
 
 ### Replaceable observation checkpoint
 
@@ -212,18 +227,65 @@ or activity facts. Unknown is not zero or available.
 ## Results and artifacts
 
 ```text
-agent.result -> module.result -> immutable artifact -> artifact.read/assemble -> submission
+source input Operation -> agent.result -> module.result -> immutable page
+                      -> artifact.read/assemble -> submission
 ```
+
+### Initial input and continuation use the same result path
+
+A result belongs to its actual logical input, not invariably to the Attempt's first
+Dispatch. This includes next-turn corrections and Eliot Goal messages. Current generic
+admission is narrower: `runtime::user_command_with_actor` and
+`normalized_result::admitted_origin` require `task.dispatch`; the strict Antigravity
+alternative returns status, not the complete answer. See AR-006 in the register.
+
+Extend the existing path, not a parallel Send-result API:
+
+1. At admission retain the continuation Operation's authorized Task/Attempt and native
+   input/turn relation. Reuse ordinary Operation fields and the selected adapter's
+   native facts; do not infer assignment later from the current session or newest Task.
+2. Resolve result origin from that source Operation and its retained execution facts.
+   Keep `Attempt.start_owner` and `start_operation_id` unchanged. A correction does not
+   need a new Attempt or a second initial dispatch just to make its result readable.
+3. Use the same page registration, exact replay, byte reads and assembly as Dispatch.
+   Historical results retain their original scope and cannot complete a newer Attempt.
+4. Steering may contribute to the current native turn rather than produce a separate
+   terminal response. Retain the actual turn relation; do not manufacture an independent
+   answer for every steer or count the same terminal twice.
+
+The connected change includes `runtime::user_command_with_actor`, the normalized-origin
+admission/retained-source validators and artifact/candidate consumers, plus the selected
+adapter's body lookup. Merely accepting another method string leaves the dispatch
+producer and first-start assumptions behind. Keep taskless or ambiguous multi-Attempt
+commands distinct until their actual source scope is established; do not silently
+attach their output to a Task. No new Task ledger, producer workflow or proof family.
 
 Use explicit native parent/input identity, or an actually verified serialized window.
 An independent concurrent input or unexplained source gap invalidates ordering-only
 association; never pick the newest assistant message. For selected current OpenCode,
 use its exact assistant parent edge when available.
 
-Store publishes immutable bytes before their Store receipt. A file with no committed
-receipt is not a published result. Keep the page until ACK and its source body until
-complete capture/release; reuse `artifact.assemble` rather than adding another
-assembler. Availability is not submission or acceptance.
+### Capture and assembly stay automatic and reuse existing owners
+
+Enabled result handling retrieves missing pages of the retained source, uses the
+existing whole-result path when needed, and advances to submission only after complete
+capture. The Governor is not expected to manually collect page IDs or repeat prompts.
+Current Store facts and the existing policy loop determine the next missing action;
+do not add a result-collection service or duplicate workflow state.
+
+Preserve `artifacts::assembly::plan/ArtifactFiles::assemble`: matching source identity,
+contiguous non-overlapping ranges from zero through total length, correct EOF, verified
+page bytes and full payload digest. Different page-read Operation IDs are not different
+source inputs. A valid empty body is not a missing result. Object authorization remains
+separate from content integrity; metadata access alone does not grant bytes.
+
+Store publishes immutable bytes before their receipt. A file with no committed receipt
+is not a published result. Assembly returns an admission receipt; its settled
+`operation.get` outcome establishes success, not the returned `queued` receipt. Release
+the source body only after complete capture for that source is recorded, or explicit
+retention/release policy. Reuse `artifact.assemble` and existing registration/replay;
+do not add another assembler, release-proof engine or receipt database. Availability,
+submission and acceptance remain distinct.
 
 ## Review and acceptance
 
