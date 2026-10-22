@@ -24,7 +24,7 @@ capability, not future work delegated to the operator.
 | --- | --- | --- |
 | Eligible work and available route/workspace | `dispatch_once` claims and launches or resumes | One initial input owner and one admitted Operation |
 | Native question or permission request | Native permission rules, then addressed Governor `Reply` | Exact request answered; no queued prompt pretending to be a reply |
-| Native result available | Capture complete output and submit current candidate | Submission applied, not merely queued |
+| Required output or code candidate available | Capture the required complete output or frozen source candidate and submit | Submission applied, not merely queued |
 | Candidate lacks required review | `review_once` assigns an independent auditor | Verdict and evidence retained for this candidate |
 | Review requests changes | `task.request_changes` plus one correction message when owner is live | All actionable findings returned together |
 | Required evidence is ready | `accept_once` calls ordinary `task.accept` | Candidate-specific acceptance |
@@ -83,6 +83,32 @@ branch name, model claim or retained output page is not a frozen code candidate.
 auditor reads immutable content or an isolated snapshot. Review of A may finish after
 B exists; its verdict stays about A. Correction must not mutate the auditor's input.
 
+### Continuation attribution and candidate consumption
+
+Task-linked `Send` retains its authorized Task/Attempt on the existing Operation at
+admission. Current selected Manager, Repair and Goal paths already store this relation;
+reuse it rather than adding a continuation ledger. Binding-only commands do not all
+have an assignment. Ambiguous task-linked input needs an exact target chosen by the
+Governor; deliberately taskless session input stays unassigned. Preserve current role
+and object grants; do not enable Participant control merely to attach provenance.
+
+Result origin follows the actual source Operation and native input/turn facts, not the
+newest Task on a session. Keep first `start_operation_id` and `start_owner` unchanged.
+Extend the common result-origin validators through `validate_page_artifact`,
+`validate_candidate_origin` and `submissions::candidate_for_attempt`; accepting another
+method string at admission alone is not a connected fix. The selected Antigravity
+path currently still rejects normalized results from Send. The shared page/assembly
+path in [module API](module-api.md#results-and-artifacts) remains the only one.
+
+Preserve existing same-Attempt resubmission: `submissions::current` already permits
+unreleased `needs_correction` with expected Task revision and prior submission.
+`reserve/begin/finish` retain original provenance and apply only current output; late
+published evidence stays historical. Do not introduce another repair-submit state or
+new Attempt just to submit a corrected result. A frozen source snapshot is already a
+separate code-candidate path; reconstructing model prose is not an extra prerequisite
+for that candidate unless the Task requires that output. Required complete native
+results still follow durable capture and exact source attribution.
+
 ## 6. Review assignment, verdict and audited state
 
 ### 6.1 Assignment and retries
@@ -127,6 +153,26 @@ With return-changes enabled, the existing Store transition applies actionable re
 findings and admits one child `Send` for the live current owner in the same transaction.
 Otherwise `needs_correction` remains current Attempt state and the next dispatch/resume
 renders the correction packet. No separate RepairDispatch backlog is necessary.
+
+### Delivery is not a successful correction
+
+Use the selected adapter's normalized facts, not one provider's receipt string:
+
+| Observed fact for the exact correction input | Meaning and next action |
+| --- | --- |
+| Native admission confirmed | Input delivered; await execution/output, not another Send. |
+| Attributable native terminal observed | Delivery happened; retain success, failure or cancellation separately, capture required output and follow the configured repair policy. |
+| Confirmed rejection before input or cancellation while still unsent | No native execution; the ordinary policy may choose the next authorized action. |
+| Response lost or effect uncertain | Bounded exact readback; do not resend from a generic failed/rejected label. |
+
+Current `automation_repair::delivery_state` and historical direct readback require
+`native_input_admitted` plus a native input ID. Antigravity reports an attributable
+terminal without that ID, so these readers leave it pending. They also treat every
+Rejected/Cancelled row as no effect, although a terminal failure can follow execution.
+Remove these duplicate readers with G's RepairDispatch deletion; consume the common
+Operation's real admission/terminal facts instead. Do not fabricate IDs or add another
+vendor/version allowlist. Delivered input, captured body, successful correction,
+submission and acceptance remain different facts.
 
 Bound no-progress rounds and cost. When the bound is reached, send one addressed
 Governor decision: narrow work, change an approved route, replace the worker/reviewer,
@@ -179,6 +225,11 @@ Operations without relabelling origin boot or resending input. Late evidence rem
 historical if its assignment was superseded. Missing durable bytes remain a stated
 limit, not an invented success.
 
+Existing `task.submit.recover` is a narrower downstream path: scoped current GM/Operator
+reads an already-published submission while preserving its original submitter and
+historical target. Reuse it. It does not itself recover an adapter's lost native body;
+do not merge both responsibilities into a new generic recovery service.
+
 ## 10. Next task and complete handoff
 
 The enabled cycle continues to the next eligible Task after current workspace and
@@ -189,12 +240,14 @@ no routine operator step, plus relevant reconnect/crash boundaries.
 
 ### Preservation evidence and donor limits
 
-This pass compared the pre-refactor
+The historical preservation pass compared the pre-refactor
 [specification at f1b854b6](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/f1b854b6fd058dc2440d3848fc95acc279657d3f/docs/agent_swarm.md),
 the supplied October 6 audit and master audit v26, current code, and the retained
 [Claude-script review](../remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md).
-The original private ZIP was not reopened in this pass; script-line claims remain
-attributed to that review, not newly executed scripts.
+The original private ZIP was not reopened; script-line claims remain attributed to
+that review, not newly executed scripts. The 2026-10-22 continuation/submission pass
+is recorded as AR-009–011 in the [audit register](audit-register.md); it changes target
+instructions, not runtime code or qualification status.
 
 | Historical lesson | Retained mechanism / current owner |
 | --- | --- |
