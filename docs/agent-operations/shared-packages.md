@@ -1,48 +1,116 @@
 # Shared package boundaries
 
-This is the V3 ownership map, not a claim that the target Cargo graph is complete.
-Use [implementation](implementation.md#processes-and-frontends) for current
-edges and their removal. One workspace lockfile records resolved dependencies.
-Add a library where its API has a real consumer and replaces an existing mechanism.
+This is the compact target ownership map, not a claim that the current Cargo graph
+already matches it. [Implementation](implementation.md) owns connected migrations and
+deletions. Add or enlarge a library only when current callers use the same behavior
+and the replaced implementations disappear in the same slice.
 
-| Package | Owns | Local / donor dependencies at the target boundary |
+## 1. Retained shared packages
+
+| Package | Owns | Does not own |
 | --- | --- | --- |
-| `swarm-contracts` | Shared wire DTOs, request/outcome/receipt identity, method policy and module catalog. No SQLite, process or vendor runtime types. | `serde`, `serde_json` |
-| `swarm-client` | Authenticated bounded local IPC, endpoint discovery and typed `ModuleLink`. | `swarm-contracts` |
-| `swarm-checks` | Bounded admitted native-check execution and authenticated status readback. Store retains admission/custody; host sheds the executor dependency. | `swarm-client`, `swarm-contracts`, `swarm-process` |
-| `swarm-process` | OS ownership, exact birth/departure checks, private durable files and module-owner bootstrap. | `swarm-contracts`, `cccc-windows-process`, selective `sysinfo` observation |
-| `swarm-store` | WAL connection/transaction mechanics and database identity checks. Store owns domain DDL/conversion. | `rusqlite` |
-| `swarm-kernel` | Existing pure Task/dispatch/review/acceptance policy, bounded writer actor/readiness/batching, and target bounded reader dispatch. Host Store retains DB/rights/receipts. | `swarm-store`, `swarm-contracts` |
-| `swarm-telemetry` | Structured events, reloadable filters, redaction, bounded sinks and local loss counters. | `tracing`, `tracing-subscriber`, `tracing-appender`, `atlas-redact` |
+| `swarm-contracts` | Current semantic command/outcome/result/observation DTOs, public method/catalog metadata and bounded field types. | Vendor RPC/state, artifact-version profiles, Task database, process custody or universal proof packets. |
+| `swarm-client` | Authenticated bounded local IPC, request multiplexing, endpoint discovery and `ModuleLink`; no blind replay after an uncertain response. | Task state, native session/recovery, scheduler or delivery database. |
+| `swarm-process` | OS process groups/Jobs, PID + birth/image identity, bounded pipe capture, private bounded atomic files and module-owner bootstrap. | Provider session semantics, model retry policy or package compatibility matrix. |
+| `swarm-store` | SQLite/WAL connection and transaction mechanics, application/schema identity primitives. | Domain policy, domain migrations, authorization or generic repository/EAV layer. |
+| `swarm-kernel` | Pure Task/dispatch/review/acceptance rules and bounded writer/read primitives that genuinely have several callers. | Host IPC, provider types, SQL domain ownership or workflow engines. |
+| `swarm-checks` | One selected bounded Check execution primitive and result shape where standalone Check worker remains. | Duplicate host executor, Task acceptance or arbitrary shell service. |
+| `swarm-scripts` | One Script manifest/work/result/typed-action wire shared by host and selected worker. | Second interpreter, permissions registry or workflow language. |
+| `swarm-telemetry` | Optional structured diagnostics, filtering, bounded sinks/redaction and loss counters. | Required Governor state, business receipts or durable event authority. |
 
-`swarm-kernel-host` owns authentication policy, domain transactions, server IPC and
-routing. It must not link `swarm-adapter-*` or worker implementations: automation,
-bus, checks, forge, observer, script-worker or supervisor. Shared packages never
-import the host or adapters. Move shared DTOs to their existing owner; do not add a
-new general-purpose crate for each extraction. Package movement reduces coupling;
-the [implementation order](implementation.md#implementation-order) removes the
-unnecessary responsibilities identified in [source findings](refactoring.md).
+`swarm-kernel-host` owns authentication, domain authorization/transactions, Store
+routing and the single control loop. It must not link adapter or effect-worker
+implementations after their selected contracts move. Adapters do not depend on one
+another or import host internals. Frontends call the same application methods through
+`swarm-client`.
 
-## Contract boundaries
+Current `swarm-bus`, `swarm-automation`, `swarm-observer`, `swarm-supervisor` and
+standalone workers are evaluated responsibility by responsibility. Package existence
+is not proof that a separate process or permanent package remains necessary.
 
-| Boundary | Preserve | Canonical detail |
+## 2. Contract boundaries
+
+| Boundary | Retained rule | Target owner |
 | --- | --- | --- |
-| Module catalog | Data-only selection; exact admitted descriptor, catalog-revision CAS and receipt identity. Catalog lookup neither reads an executable nor proves its provenance. IDs are opaque; path components require encoding. | [Module protocol](modularity.md#3-module-protocol-and-registration) |
-| Client | Named-pipe/Unix-socket discovery and hello; retries only before application traffic. An uncertain/malformed reply poisons the link and permits no blind request replay. | [Module contract](../agent_swarm.module-contract-v2.md), [`swarm-client`](../../crates/swarm-client/src/lib.rs) |
-| Process owner | Nonkilling module groups on owner loss; check/script cancellation remains separately scoped. Exact process birth is not native-session identity; unknown reads are not departure. | [Lifecycle](modularity.md#5-demand-driven-lifecycle-unified-supervision-and-recovery), [`swarm-process`](../../crates/swarm-process/src/lib.rs) |
-| Check execution | Durable Store Go precedes source resolution/launch, bounded capture keeps pipes drained, and uncertain family disposition retains custody. Diagnostics do not change check/cache input identity. | [CheckRunner](../check-runner.md) |
-| Module bootstrap | Absolute private plan, explicit resolver, cleared child environment and exact owner/artifact receipts. Pre-spawn `not_started` still requires exact owner/family readback before replacement. | [Module installation](module-installation.md), [ModuleLink contract](../agent_swarm.module-contract-v2.md) |
-| Database | DataRoot lock remains on the writer through initialization/shutdown. Domain schema and reconciliation share existing transactional initialization; callback errors pass through unchanged. Keep the new/existing database distinction and explicit application/schema identity; remove the base-SQL text-digest gate through the existing schema owner. Reads authorize and project in one short read-only snapshot. | [Store and conversion](implementation.md#store-and-current-data) |
-| Diagnostics | Redact before persistence/fanout; bound records and bytes, count sink loss independently. Diagnostic acceptance/sequence is neither a business ACK nor a durable event cursor. | [Observability](observability.md) |
+| Public application methods | One current name/schema catalog; profile exposure narrows, exact domain authorization decides. | `swarm-contracts` + owning Store domain |
+| Adapter commands | Closed semantic actions and supported scopes; vendor methods remain adapter-local. | `swarm-contracts` + selected adapter |
+| Hello/bootstrap | Authenticated binding/generation/boot, protocol major and required capability subset. | `swarm-process`, `swarm-client`, Store handshake |
+| Package/catalog | Installed executable/resources/current descriptor for inventory and route selection. Reading catalog launches nothing and grants nothing. | Generic installer + supervisor catalog |
+| Store delivery | Exact already-formed outcome/result records may be retained until ACK; observations use replaceable source checkpoints. | Route-local adapter first; shared only after two users delete duplicates |
+| Native effects | Strongest provider identity, one native state owner and exact readback. | Selected adapter only |
+| Process custody | PID + OS birth/image/group/Job and conservative adoption/termination. | `swarm-process` / supervisor |
+| Database | One writer, short transactional domain mutation, bounded WAL reads, numeric application migrations. | Host Store + `swarm-store` mechanics |
+| Diagnostics | Redaction/bounds/loss counters; no business ACK semantics. | `swarm-telemetry` / optional observer |
 
-The process child-membership helper checks an exact distinct native child against
-an existing live module owner; it does not adopt/start a process, validate the
-worker as its own child or prove whole-family departure. Preserve the existing
-family scan before replacement. Private-path checks do not claim an atomic race
-barrier or a same-user sandbox.
+Do not make artifact version, build ID, compiler, checkout, schema inventory, document
+hash or TaskPrompt digest a behavioral API or permission. Verify selected package
+bytes at install/launch and immutable result/artifact bytes at storage boundaries.
 
-Implementation status and historical receipts belong in [Implementation status](../implementation-status.md).
-Build/delegation rules belong in [AGENTS.md](../../AGENTS.md) and [scoped builds](../ci-scoped-builds.md).
-Large integration suites move with their real seam; small local unit tests may
-remain beside code. Neither moving tests nor splitting files deletes production
-behavior or demonstrates a performance improvement.
+Current full descriptor/schema echo, `ModuleReceiptIdentity`, Task dispatch hash echo
+and `swarm.task_prompt@1` are transitional consumers. Migrate them route by route to
+the semantic protocol/TaskPacket and remove their old caller/schema/profile in the
+same slice.
+
+## 3. Process and worker boundaries
+
+A separate process is justified by native SDK isolation, replaceable adapter, external
+I/O/custody or fault containment—not by a small pure helper.
+
+Target examples:
+
+- one selected adapter process per required native ownership scope;
+- selected Check/Script/Forge/GitHub effect worker only where real external work or
+  process custody benefits from isolation;
+- one host time-admission loop for Store bookkeeping;
+- optional diagnostic recorder independent of required local collectors;
+- one single-tenant gateway per Eliot identity/profile.
+
+Remove parallel lifecycle owners and hidden host executors as current callers switch.
+A wrapper around the old implementation is not extraction.
+
+Conditional donors do not become dependencies in this map. For example,
+`cccc-windows-process` remains a possible child-first Windows launch primitive only if
+a proven path needs it and it deletes current code. The existing owner-first Job
+boundary stays until a connected replacement is demonstrated.
+
+## 4. Data and authority placement
+
+- Store commits domain state and its durable receipt/observation together.
+- Bus/notification distributes facts and wake hints; it owns no database.
+- Queue, lane, provider state and capacity are read projections/current facts, not
+  shared packages with their own lifecycle.
+- Workspace lease is controller write admission, not an OS sandbox.
+- Mailbox is normalized recipient-indexed data; optional thread groups messages but
+  grants nothing.
+- Provider/process/worktree/remote collectors feed one Governor projection; telemetry
+  is not that projection.
+- Effect workers receive a closed admitted plan and return bounded evidence. They do
+  not receive Manager/operator credentials or decide Task acceptance.
+
+## 5. Dependency and build rules
+
+1. Host/kernel/frontends do not link adapter implementations.
+2. Adapters do not link other adapters or host.
+3. Shared packages use the smallest dependency/features needed by actual callers.
+4. One workspace lockfile records dependencies; default members remain normal small
+   entrypoints, not every adapter/test fixture.
+5. Test-only fake runtimes stay in tests/dev support, not production binaries.
+6. Adapter-only changes should not rebuild/restart unrelated adapters or host unless a
+   genuinely shared contract changed.
+7. Build provenance is diagnostic; runtime compatibility is current protocol and
+   connected behavior.
+
+## 6. Completion test for extraction
+
+An extraction is complete only when:
+
+- at least two current callers use the shared behavior, or one well-defined public
+  package is the natural existing owner;
+- previous copies, wrappers, config, fixtures and dependency edges are removed;
+- retry/lifecycle/durable-state ownership remains singular;
+- automatic positive behavior remains connected;
+- affected format/Clippy/build and one connected behavior case pass;
+- net production Rust/JS/glue is measured separately from tests.
+
+Moving files, creating a crate or changing language without deleting a responsibility
+is not simplification.

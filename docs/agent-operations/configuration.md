@@ -1,99 +1,267 @@
-# Configuration — Manager-Owned Automation and Route Policy
+# Configuration — agent policy and one automation loop
 
-This page owns the manager-facing target configuration. Current source still contains
-the v1 WorkDispatch cursors, duplicated launch bundle, transfer relocation and
-overlapping schedulers described in
-[findings](refactoring.md). [Implementation](implementation.md) owns their removal.
+This document defines the target manager-facing policy. Governor and Manager are agent
+roles. A configured action runs through the same Store command as a direct agent call;
+it is not a request for a human to perform the step.
 
-## 1. One entry, one owner, no hidden global mode
+Current source still contains `WorkDispatch`, `ReviewDisposition`, `RepairDispatch`,
+publication/GitHub-projection workflows, owner-dependent relocation and overlapping
+schedulers. Their removal is owned by
+[implementation](implementation.md#automation-and-delivery). This target is not an
+implementation claim.
 
-A manager enables optional helpers that invoke the same authorized Store actions as
-manual commands. An entry has:
+## 1. One entry, one owner
+
+A policy entry has one stable internal identity:
 
 ```text
-entry_id                 immutable internal identity
-automation_id            manager-facing name
+entry_id                 immutable
+name                     manager-facing
 owner_manager_id
 project_id
 revision
 enabled
 trigger                   event | interval | cron
-selected typed actions/settings
+selected actions/settings
 ```
 
-New entries are disabled unless the creating request explicitly enables them. No
-Root approval, global workflow mode, lane daemon or second capability grant is
-created for an action the manager already controls.
+The owning Manager agent configures it once. Enabled entries act on its behalf after
+rechecking current rights and object state. They do not mint a Manager credential,
+create a second capability grant or require per-occurrence approval.
 
-Disabling an entry prevents future admissions. It does not cancel an admitted
-Operation, native turn, review, check or publication effect.
+Disabling prevents future admissions. It does not cancel an admitted Operation,
+native turn, review, check, message or external write. Transfer updates owner and
+revision of the same entry; it does not clone entries or relocate journals.
 
-## 2. Public editing surface
+## 2. Editing surface
 
 ```text
 automation.config.get
-automation.config.preview       optional read-only validation/diff
+automation.config.preview       optional validation/diff
 automation.config.apply
 automation.config.explain
 automation.config.transfer
 ```
 
 - `get` returns scoped entries, revision and current blockers.
-- `preview` is optional and grants nothing.
-- `apply` performs one bounded expected-revision transaction.
-- `explain` reads current facts and calls no model/provider.
-- `transfer` changes owner/revision of the same internal entry after current
-  authorization; it does not clone the entry or move journals.
+- `preview` is read-only and grants nothing.
+- `apply` is one expected-revision transaction.
+- `explain` reads current facts without provider/model calls.
+- `transfer` preserves `entry_id` and admitted history.
 
-Patch rules:
+Create uses `expected_revision=0`; updates require the current revision. Omitted fields
+stay unchanged, supplied arrays replace the array, unknown fields reject, and an
+identical request retry returns its original Operation. Remove caller-supplied preview
+hashes.
 
-- `expected_revision=0` creates an absent entry;
-- existing entries require their current revision;
-- omitted fields remain unchanged;
-- supplied arrays replace the complete array;
-- unknown fields reject;
-- identical request retry returns the original Operation;
-- disable-only changes require no external I/O;
-- bulk changes are bounded and atomic.
+## 3. Retained actions
 
-Remove caller-supplied preview digests. Expected entry revision and current object
-state provide concurrency control.
-
-## 3. Trigger model
-
-A retained helper uses one trigger:
+The target has a small closed action set:
 
 ```text
-event {
-  source_id
-  event_kind
-  optional status/filter from a closed typed vocabulary
-}
+dispatch
+review
+return_changes
+accept
+check
+goal_message
+script
+```
 
-interval {
-  anchor_ms
-  period_ms
-}
+Optional integrations may additionally select:
 
-cron {
-  expression
-  timezone
-  catch_up = latest_only
+```text
+source_import
+publish
+```
+
+These names describe current-state actions, not workflow types.
+
+| Action | Positive path |
+| --- | --- |
+| `dispatch` | Query the current ranked queue and admit at most the configured work budget. |
+| `review` | Assign a missing required review slot for the current candidate. |
+| `return_changes` | Apply current actionable findings with `task.request_changes` and admit one correction `Send` when the owner is live. |
+| `accept` | Call the common candidate-specific acceptance gate when frozen review/check evidence is ready. |
+| `check` | Admit an exact candidate/profile CheckRun. |
+| `goal_message` | Admit an ordinary scheduled/event `agent.send`; native Harness Goal remains separate. |
+| `script` | Run one bounded script revision whose returned typed actions use ordinary Store authorization. |
+| `source_import` | Select current external source facts and create/revise a Task in a separate mutation. |
+| `publish` | Admit the selected accepted-candidate remote effect through its one effect owner. |
+
+Delete target equivalents of `review_disposition`, `repair_dispatch`, automatic Issue
+label projection and publication state machines. Their useful behavior is folded into
+`return_changes` or the optional `publish` action; it is not transferred to a human.
+
+## 4. Trigger and loop
+
+A retained entry has one trigger:
+
+```text
+event { source_id, event_kind, closed typed filter? }
+interval { anchor_ms, period_ms }
+cron { expression, timezone, catch_up = latest_only }
+```
+
+A trigger or Store change is a wake hint. One in-process host loop waits for the
+nearest due time, Store changes and a slow safety wake, then queries current state.
+Store atomically claims a due occurrence and admits ordinary Operations. Replaying the
+same occurrence returns its existing Operation.
+
+Do not create a process, credential, poller, cursor family or private pending queue per
+action/entry. A lost wake causes a bounded rescan. Downtime coalesces missed interval
+or cron ticks according to the selected policy rather than replaying a burst of stale
+model prompts.
+
+## 5. Route, session and permission policy
+
+A dispatch policy selects an ordered list of route aliases and an optional agent
+profile:
+
+```json
+{
+  "enabled": true,
+  "trigger": {"kind":"event","source_id":"controller","event_kind":"task.changed"},
+  "actions": ["dispatch", "review", "return_changes", "accept"],
+  "dispatch": {
+    "routes": ["codex-primary", "muse-fallback"],
+    "agent_profile": "implementation",
+    "reuse_compatible_session": true
+  }
 }
 ```
 
-A trigger admits an occurrence; it does not execute external work. Store retains
-occurrence identity and the resulting Operation. Replaying one occurrence returns
-the same Operation.
+Each route owns exact harness, account/service, model, effort, native options,
+credential reference, required semantic capabilities and root limit. The ordered
+aliases are the complete fallback policy. Eliot does not silently change provider,
+model, effort, permissions or workspace policy.
 
-Use one in-process timer/admission loop. Do not create one task/process/credential or
-cursor family per entry. A Store change notification wakes evaluation; the nearest
-due time drives the timer; a slow safety wake recovers a lost notification.
+Automatic selection checks:
 
-## 4. Typed actions only
+1. current route/configuration and required capability;
+2. current Task/Attempt and write lease;
+3. root capacity;
+4. fresh provider availability/usage observation;
+5. unresolved native Goal, children, pending requests and effects on a reusable
+   binding.
 
-Retained entries select closed product actions, not arbitrary Store method names or
-JSON workflows:
+No provider fact permits one bounded first probe. A current hard negative uses the
+next configured alias or holds work. Rate limit/reset permits a bounded probe after its
+native retry/reset boundary. Stale/gapped facts hold automatic launch while the
+Governor may issue an attributable probe under policy; this is not a human-only path.
+
+Reuse a compatible idle session when selected policy permits. Rotation drains the
+specific session after current input, children, Goal and uncertain effects are
+disposed. Age or low CPU alone never kills or rotates work.
+
+Use the harness's native permission/sandbox/policy controls. A known authorized tool
+request is handled by policy. An unresolved form or judgment request is addressed to
+the Governor agent with exact request identity and current options. `Send` never
+pretends to be `Reply`. Operator intervention is reserved for missing credentials,
+missing authority or owner intent not encoded in policy.
+
+## 6. Current-state action semantics
+
+### Dispatch
+
+```text
+wake
+-> bounded ranked queue
+-> first eligible Task + configured route
+-> atomic Attempt/workspace/root reservation
+-> one launch/open/dispatch Operation chain
+```
+
+Rank corrections, unfinished Attempts and explicit project priority before new work.
+Filter eligibility before limiting or continue a bounded keyset scan so blocked first
+rows cannot starve later work. Reuse the same Attempt/Operation on retry.
+
+Delete WorkDispatch global/per-entry cursors, copied pending subjects, activation
+cuts, catch-up watermarks, semantic launch slots, duplicate operation links and
+ordinary-blocker quarantine.
+
+### Review and correction
+
+`review` selects one current candidate/slot and configured reviewer profile.
+`review.submit` retains verdict, all findings and requirement-linked evidence.
+
+`return_changes` defaults to the complete current actionable findings set. A Governor
+may dismiss or defer a disputed finding only through an attributable candidate/review
+decision with reason; no human step is implied. The action performs one
+`task.request_changes` transition and one child correction `Send` if the current owner
+is ready. Otherwise `needs_correction` stays visible for the next resume/dispatch.
+
+Preserve existing reviewer replacement for Unanswered, Inconclusive and
+ReturnedForCorrection. Bound unchanged rounds; after the bound, admit one Governor
+decision task rather than looping or stopping the entire queue.
+
+### Acceptance
+
+`accept` reads the frozen per-requirement evidence plan, current candidate-specific
+reviews and exact CheckRuns. It calls the same acceptance gate as a direct Governor
+request. The entry never fabricates review text or evidence. Candidate B cannot reuse
+A's review.
+
+### Goal message
+
+Harness Goal is native adapter state. `goal_message` is an independent ordinary
+message action:
+
+```text
+selected event/due occurrence
+-> current Goal/assignment
+-> one agent.send Operation
+```
+
+A later occurrence may intentionally repeat text. Disabling this action does not pause
+or clear native Goal.
+
+## 7. Script policy
+
+A script revision receives only configured closed grants. Current common helpers
+should be preferred for dispatch, review, correction, acceptance, Goal messages and
+checks. A retained script may return only the typed actions it genuinely needs, such
+as exact `Send`, `Reply`, `Configure` or `Goal`, and every returned item is admitted as
+an ordinary child Operation under current Manager/object rights.
+
+Do not add arbitrary Store method passthrough, a second permission registry or a
+workflow language. Script execution identity is `(ScriptRun, action index)`, so lost
+responses do not re-run already admitted effects.
+
+## 8. Transfer and disable
+
+Transfer changes owner/revision of the same `entry_id`. Due occurrences and child
+Operations keep their original admitting identity. Future actions recheck current
+owner rights.
+
+Remove disabled former-owner copies, successor chains, ancestry walks and domain
+journal relocators. A→B→A transfer must preserve one entry rather than collide with
+historical copies.
+
+## 9. Storage and explanation
+
+Use one indexed automation-entry representation for identity, owner, project,
+revision, enabled state, trigger/next due and selected settings. Store occurrence →
+Operation identity only where recurrence requires it. Bounded settings may remain JSON
+inside the row.
+
+Do not persist queue items, provider state, candidate lifecycle or action-specific
+workflow copies. Those remain in their owning domains.
+
+`automation.config.explain` returns current blockers and next possible action:
+
+- no eligible Task;
+- overlapping lease;
+- route capability or provider/capacity hold;
+- pending native request/effect;
+- missing current review/check evidence;
+- disabled or stale policy.
+
+Explanations grant nothing and invoke no provider/model.
+
+## 10. Current source removal map
+
+Current `AutomationStep` still contains:
 
 ```text
 work_dispatch
@@ -101,234 +269,31 @@ review_dispatch
 review_disposition
 repair_dispatch
 acceptance
+publication
 check_run
-goal_message
+github_projection
+goal_progression
 script_run
-explicit publication (optional integration)
 ```
 
-Automatic Issue-label projection, Concilium and generic ratification are outside the
-compact core.
+Current source also retains per-domain cursors, activation state, operation links,
+quarantine, transfer relocation, standalone scheduler protocol and legacy worker
+demand. Migrate one connected action at a time; once callers use the target action,
+remove its old enum value, schemas, policy, Store state, fixtures and worker demand in
+the same slice.
 
-Each action consumes current Store facts. It does not maintain a private copy of the
-Task/candidate/provider lifecycle.
+## 11. Verification
 
-## 5. Work dispatch and route policy
-
-### Target shape
-
-```json
-{
-  "automation_id": "implementation-dispatch",
-  "expected_revision": 0,
-  "patch": {
-    "enabled": true,
-    "trigger": {"kind": "event", "source_id": "controller", "event_kind": "task.changed"},
-    "actions": ["work_dispatch"],
-    "work_dispatch": {
-      "routes": ["codex-primary", "muse-fallback"],
-      "agent_profile": "implementation"
-    }
-  }
-}
-```
-
-The ordered aliases are explicit manager policy. Each route alias in host
-configuration owns its exact:
-
-- harness/runtime;
-- native service/account/model/effort/options;
-- adapter artifact/current protocol;
-- root capacity;
-- credential reference.
-
-WorkDispatch does not duplicate MCP profile/surface, workspace policy, purpose,
-budget and stop conditions. Participant tool profile derives from admitted role.
-Workspace policy is the single manager-owned worktree policy. Task/host policy owns
-requirements and bounds.
-
-Automatic dispatch chooses the first currently eligible alias and writes that alias
-into the launch Operation. It never silently substitutes a provider/model/effort or
-changes permissions. Manual launch names exactly one alias.
-
-A lane is a UI/Governor view over this entry, its route list, current queue,
-provider/capacity state and active bindings/workspaces. There is no lane table or
-daemon.
-
-### Route configuration
-
-A route keeps the current small admission field:
-
-```toml
-[[routes]]
-alias = "codex-primary"
-runtime = "module"
-module_artifact_id = "current-codex-adapter"
-enabled = true
-
-[routes.admission_policy]
-max_concurrent_roots = 4
-```
-
-Do not add a second capacity object for every command. Route root capacity is checked
-transactionally against unresolved root opens and unreleased bindings.
-
-Provider availability is observed, not configured as truth. Explicit fallback aliases
-handle hard provider/model failures.
-
-## 6. Route decision
-
-Automatic selection uses:
-
-1. route enabled/current configuration;
-2. required adapter capability;
-3. workspace/write availability;
-4. current root limit;
-5. provider availability observation.
-
-Decision behavior:
-
-| State | Result |
-| --- | --- |
-| no provider fact ever | one root-capacity-bounded probe may start |
-| available | eligible |
-| rate-limited/overloaded before retry | held |
-| quota exhausted before reset | held |
-| transient fact after retry/reset | one probe may start; timestamp is not recovery proof |
-| auth/data-policy/model gone | unavailable; use explicit fallback/config change |
-| fresh unknown or stale/gapped source | automatic hold; explicit manager probe allowed |
-
-The admitted probe itself is the in-flight guard. Do not create a probe table.
-
-## 7. Current-state dispatch
-
-Enabling dispatch optionally asks for one immediate current-state evaluation.
-There is no `include_existing` event backlog, activation cut or copied pending list in
-the target.
-
-```text
-enable/apply
-  -> dispatch_once(entry)
-  -> current ranked queue
-  -> first eligible Task and configured route
-  -> one launch Operation
-```
-
-Future relevant Store changes wake another current-state query. A safety wake handles
-lost/coalesced notifications.
-
-Delete current WorkDispatch state:
-
-- global and per-entry cursors;
-- `activation_cut`, `catch_up_until`, `pending`, `recent`;
-- pending recheck rotation and 128-item cap;
-- semantic launch slots and duplicate operation links;
-- duplicated launch settings;
-- quarantine for ordinary blockers.
-
-`automation.config.explain` reads live queue/route/workspace/provider facts and reports
-why no admission occurred.
-
-## 8. Goal message
-
-Harness Goal is configured through the selected adapter and is not an automation
-entry.
-
-The Eliot Goal helper is an ordinary message action:
-
-```json
-{
-  "actions": ["goal_message"],
-  "trigger": {"kind": "interval", "anchor_ms": 0, "period_ms": 900000},
-  "goal_message": {
-    "task_id": "task-id",
-    "text": "Continue the assigned goal and report blockers."
-  }
-}
-```
-
-It admits an ordinary `agent.send` Operation. A later occurrence may intentionally
-repeat the text. Disabling this helper does not pause native Harness Goal.
-
-## 9. Review, repair, checks and acceptance
-
-- `review_dispatch` selects one current submission/candidate and one configured
-  reviewer profile.
-- `review_disposition` and `repair_dispatch` consume all retained actionable findings
-  for that candidate; do not create one manager round per finding.
-- `check_run` names an exact candidate and current check profile revision.
-- `acceptance` invokes the same candidate-specific Store gate used manually.
-
-The helper does not manufacture review proof. Candidate B requires B's own retained
-review/check evidence.
-
-## 10. Script actions
-
-A script revision receives only explicitly configured closed grants. It may invoke
-typed manager actions already allowed to its owner. It cannot name arbitrary Store
-methods, change its owner, acquire GM authority or create a workflow language.
-
-If a recurring behavior is small and common—dispatch, Goal message, review, repair,
-check or acceptance—prefer the built-in typed action over a script.
-
-## 11. Ownership transfer
-
-Target transfer:
-
-```text
-UPDATE automation_entry
-SET owner_manager_id = current_GM,
-    revision = revision + 1
-WHERE entry_id = ? AND revision = ?
-```
-
-State and occurrences reference `entry_id` and do not move. Prior Operations keep
-their admitting actor and input. Pending future effects recheck current owner rights.
-
-Delete:
-
-- disabled former-owner copies;
-- successor pointers and ancestry walks;
-- six journal relocators and cron relocation;
-- A→B→A conflict caused by owner-dependent keys.
-
-## 12. Storage
-
-Use indexed tables for:
-
-- entry identity/owner/project/revision/enabled;
-- trigger and next due/last occurrence;
-- action selection;
-- occurrence → admitted Operation;
-- current error/gap where needed.
-
-Bounded action settings may remain versioned JSON in the entry row. Do not use EAV,
-key-prefix scans or a table per field. One explicit migration replaces the current
-`automation:v1:*` meta families, then old codecs/readers are removed.
-
-## 13. Explainability
-
-Every automatic admission records:
-
-- entry ID/revision and effective manager;
-- trigger occurrence/current-state cause;
-- Task/Attempt/candidate;
-- selected route;
-- resulting Operation;
-- current blocker when no Operation is admitted.
-
-A blocker is a current fact, not a copied waiting object. Explanations are read
-projections and never grant authority.
-
-## 14. Verification
-
-- stale entry revision conflicts without partial changes;
-- disabling prevents new Operations and preserves in-flight work;
-- same occurrence admits once;
-- lost wake is recovered by current-state query;
-- route fallback uses only configured aliases;
-- 128 blocked Tasks do not hide an eligible Task;
-- transient provider reset opens one probe, not all routes;
+- enabling a policy can run assignment → result → review → all-findings correction →
+  fresh review → acceptance without a routine human step;
+- same trigger occurrence admits once; lost wake rescans current state;
+- blocked first-page Tasks do not hide eligible work;
+- only configured route aliases/fallbacks are used;
+- native permission policy answers known requests and exact unresolved requests reach
+  Governor without default denial/first-choice behavior;
+- correction returns all current actionable findings once;
+- candidate-specific requirement evidence is required for acceptance;
+- disabling stops future admissions but preserves in-flight work/results;
 - transfer preserves entry/occurrence identity;
-- no `automation_scheduler` process/credential/page-admit protocol remains after
-  scheduler consolidation.
+- no separate scheduler process, WorkDispatch queue, repair workflow or projection
+  workflow remains after its migration.

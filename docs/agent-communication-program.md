@@ -1,111 +1,170 @@
-# Agent communication — compact contract
+# Agent communication — one mailbox, direct collaboration
 
-This is the active communication contract for the compact controller refactoring.
-The implementation queue lives in the
-[code reduction candidates](agent-operations/refactoring.md#code-reduction-candidates).
-Older communication programs and numbered stages do not add completion requirements.
-The changes below define the target; they do not claim that existing runtime code
-has already been removed.
+This is the target communication contract. It preserves autonomous agent work while
+removing the current coordination platform. [Implementation](agent-operations/implementation.md#t--one-mailbox-not-a-coordination-platform)
+owns source migration; [status](implementation-status.md) records evidence.
 
-## 1. Useful work
+Governor and Manager are agent roles. A message, review request or decision addressed
+to them does not imply a human relay. Operator intervention is reserved for missing
+credentials/authority or owner intent not represented in current policy.
 
-The manager assigns work once. Agents read the current assignment and contact the
-relevant owner directly when a fact is missing. Routine technical questions and
-implementation choices inside that assignment need no manager relay, separate
-ratification record or approval form. The manager resolves conflicting assignments
-and changes to the requested outcome.
+## 1. Useful communication
 
-Keep the useful path small:
+Agents receive one current assignment with the necessary goal, requirements, selected
+sources, write boundary, deliverable and verification. They ask the exact current
+owner when a fact is missing and continue unrelated work where possible.
 
-| Need | Controller behavior |
+| Need | Compact mechanism |
 | --- | --- |
-| Understand the assignment | Return Task/Attempt, expected result, relevant source references and assigned workspace/paths. Fetch detail on demand. |
-| Find the right peer | Read current assignments and declared paths. Show unresolved ownership or overlap explicitly; Git history is not current ownership. |
-| Ask or answer | Send one bounded message to an exact recipient in the authorized Task scope, with an optional reply reference. |
-| Resolve an interface question | Discuss it directly and put the chosen interface in the source/assignment. Shared types and the actual producer/consumer establish integration. |
-| Obtain independent judgment | Use ordinary review/research assignments and collect their results. The manager records the resulting decision. |
+| Understand work | TaskPacket plus on-demand exact Task/Attempt/candidate/source reads. |
+| Find current owner | Current assignments, workspace leases and observed bindings/processes. Git history or newest log is not ownership. |
+| Ask/answer | One bounded addressed mailbox message with optional Task/Attempt/thread and reply reference. |
+| Native question/form | Exact pending request through adapter `Reply`; native permission policy first, then Governor attention. |
+| Review | Candidate-specific `review.assign` / `review.submit`; not a generic message vote. |
+| Resolve conflicting work | Manager/Governor revises assignments or settles a lease; mailbox itself grants no write authority. |
+| Record a durable product decision | Update the owning Task/policy/source/implementation object through its normal command, with message as evidence/reference when useful. |
 
-Current assignment/path views are projections of existing work, not another work
-registry or lease system. An overlap is information for the people editing the
-files; it does not create a second filesystem lock or transfer the assignment.
+Routine implementation choices inside assigned scope need no council, ratification,
+reasonability questionnaire or manager relay. A shared interface becomes authoritative
+through its source/Task revision and concrete producer/consumer verification.
 
-## 2. One message path
+## 2. One durable mailbox
 
-Reuse the existing authenticated IPC/MCP, mailbox and Store records. Keep exact
-public tool names and schemas in the
-[shared registry](../crates/swarm-contracts/src/mcp_catalog.rs) and
-[MCP surfaces](mcp-canonical-surfaces-and-topologies.md); this document adds no
-parallel aliases or wire format.
+Normalize directed delivery into recipient-indexed rows. The admitted Operation ID is
+the durable message identity. Store:
 
-- Participants use their own assignment-scoped credentials. Registration and
-  current Task/Attempt checks remain in
-  [Store coordination](../crates/swarm-kernel-host/src/store/coordination.rs).
-  A participant must not fall through to general manager/writer authority.
-- Address an existing recipient. A missing or stale recipient is reported to the
-  sender; do not silently redirect to a replacement process or create an agent.
-- Use the existing request identity for retries and reply identity for answers.
-  Sending a message needs no preview digest, agreement digest, membership ACK or
-  five-field reasonability questionnaire.
-- Bound bodies, recipient lists and read pages; use existing artifact references
-  for large material. Keep full threads and unrelated project history out of the
-  initial prompt and automatic notifications.
-- Store an unanswered message for inbox reads. Supported native notifications may
-  expose a short header during active work. Ordinary messages do not start an idle
-  model, interrupt a tool call or schedule follow-up work.
-- Mailbox storage proves storage. Claim presentation or consumption only when the
-  runtime supplies that fact. Recover a lost notice through the inbox; do not
-  repeat a model invocation to manufacture delivery evidence.
+```text
+message/Operation ID
+sender and recipient
+optional Task/Attempt/thread
+kind
+bounded inline body or artifact reference
+reply target
+cancellation reference
+recipient cursor
+created/admitted time
+```
 
-Read-only context and inbox operations change no work. The receiver may answer,
-report unknown information or continue another part of its assignment. Unknown
-facts are visible gaps, not a requirement to construct another negotiation state
-machine or stop unrelated work.
+`message.send` inserts one row atomically with its Operation. `message.read` pages the
+current recipient's rows directly; reading never deletes. Reply and cancellation
+reference the message Operation ID. Same durable `client_id` resumes its cursor.
 
-## 3. Review and Goal remain product behavior
+Delete multiple identities (`cmsg-*`, random delivery ID beside Operation), legacy/
+typed delivery unions, global observation-timeline mailbox scans, JSON expression
+indexes and corruption sentinel queries after concrete unresolved messages move.
 
-Keep the existing submission, independent review, manager disposition and
-acceptance path in the [delivery contract](agent-operations/delivery.md).
-Reviewers report findings for their assigned submission/candidate. A later Task
-revision does not turn a late finding into evidence about the new candidate;
-valid retained assignment access remains scoped to that result. Ordinary
-Participant submission rights and assigned-reviewer rights remain distinct.
+Mailbox storage proves durable admission, not model presentation or consumption. A
+lost notification is recovered by mailbox read. Do not repeat a model call to create
+delivery evidence.
 
-Peer agreement, majority opinion and a message saying “done” do not accept a Task.
-Goal tracking and explicitly selected Goal continuation remain supported product
-requirements. Messages and notifications do not acquire Goal ownership or turn
-into an automatic continuation loop.
+## 3. Attention and automatic wake
 
-## 4. Remove optional workflow engines from completion scope
+Ordinary mail does not automatically interrupt an active tool or start an unrelated
+model turn. That does not make delivery manual.
 
-The following existing mechanisms are candidates for source deletion. They are
-not prerequisites for the compact communication path or mandatory follow-up
-implementation phases.
+- Current active agents receive a bounded notification/wake through their selected
+  runtime when supported.
+- Idle assigned agents are resumed or scheduled by the same current-state automation
+  policy that owns their work.
+- Native forms/questions use exact `Reply`, not a queued `Send`.
+- Unchanged attention coalesces; expiration or stale request is reported rather than
+  answered by guess.
+- A missing/stale recipient remains visible. Policy may resume or replace an assigned
+  worker after exact disposition; mailbox never silently redirects to the newest
+  process.
 
-| Existing mechanism | Compact replacement |
-| --- | --- |
-| Concilium proposals, preview/open confirmation, round/slot/packet states and council-specific result records | Ordinary independent assignments/reviews followed by one manager decision. |
-| Separate contract proposal/ratification/rejection lifecycle and mandatory reasonability forms for routine questions | Addressed messages plus the actual source/assignment change. |
-| Generic producer-offer/consumer-requirement comparator, integration cells, membership/material digests and peer ACK ledger | Current interface/source references and verification of the concrete integration. |
+Known permission policy can answer automatically. A model-judgment question becomes
+one addressed Governor task. Do not auto-pick the first/recommended option, deny all
+requests or default to a human.
 
-Delete each selected engine with its routes, special settings and consumers;
-do not leave it disabled behind a new compatibility mode. Preserve the useful
-registration, direct-message and review/submission functions sharing the same
-files. Keep any required inspection of actual saved data separate from the new
-message path; the mere existence of an old schema is not a mandate for permanent
-compatibility machinery.
+## 4. Scoped access
 
-## 5. Sources and implementation work
+Preserve base client authentication and scoped Task/reviewer/participant access.
+Deleting the coordination participant registry does **not** grant participants Manager
+rights and does not remove assigned-worker or assigned-reviewer access.
 
-Start with the relevant source owner: [coordination](../crates/swarm-kernel-host/src/store/coordination.rs),
-[threads](../crates/swarm-kernel-host/src/store/coordination_threads.rs),
-[integration](../crates/swarm-kernel-host/src/store/integration.rs) or
-[Concilium](../crates/swarm-kernel-host/src/store/concilium.rs).
-Use [AGENTS.md](../AGENTS.md) for the common work process and
-[implementation status](implementation-status.md) for what has actually changed.
-There is no separate communication build, qualification or donor-adoption program.
+A participant can read/send only within its granted current/historical object scope.
+Late authenticated result/message access remains tied to the original assignment or
+review. Revocation stops new actions while preserving already admitted authorship and
+results.
 
-The superseded Concilium, tool-contract, peer-autonomy and peer-implementation
-specifications remain available in
-[Git history](https://github.com/UnknownAlienHuman/eliot-swarm-controller/tree/25a8e3bceaadeefb700defa164a4e401885f7e1c/docs).
-Their detailed state machines and old acceptance matrices are historical design
-choices, not additional instructions for the compact implementation.
+Native children need no extra Store principal merely to be observed. A child that
+calls Eliot uses the existing scoped identity/grant path. Never pass operator or
+Manager bearer credentials to a model, native child, script or gateway.
+
+## 5. Optional tiny Task thread
+
+Keep a thread only if a current consumer needs grouping:
+
+```text
+thread_id
+Task/Attempt scope
+creator
+bounded participants
+open | closed
+```
+
+Messages remain mailbox rows. A thread grants no authority, owns no negotiation state
+and has no speech-act/proposal/objection/ratification lifecycle. Closing a thread does
+not accept a Task, cancel native work or erase mail.
+
+## 6. Product decisions remain in their domains
+
+- Consultation is an addressed message.
+- Review and findings remain in the review subsystem.
+- Correction is `task.request_changes` plus one exact correction message.
+- Acceptance is the candidate-specific acceptance gate.
+- Write conflicts are workspace leases.
+- Goal continuation is native Goal and/or scheduled ordinary messages.
+- Watches are current-state subscriptions or explicit automation conditions.
+- Interface changes are source/Task revisions and connected verification.
+
+A message saying “done”, peer majority or council agreement never accepts work.
+Conversely, removing council/contract/integration products must not remove direct peer
+questions, independent research/review or automatic follow-up.
+
+## 7. Remove the duplicate collaboration platform
+
+After mailbox/thread consumers move, delete together:
+
+- coordination participant-token registry and duplicate directory/indexes;
+- work/contract cards;
+- consultation-specific schema/workflow;
+- speech-act/proposal/counterproposal/objection machinery;
+- contract ratification/rejection;
+- generic integration offer/requirement/ACK cells;
+- Concilium rounds/slots/packets;
+- coordination watches that duplicate subscriptions;
+- `code.scope.*`, which duplicates workspace write authority;
+- associated MCP/CLI methods, policy, storage, backfills, cursors, fixtures and docs.
+
+Keep authentication, assigned-worker/reviewer access, mailbox, optional tiny thread,
+Task revisions, reviews and leases. Do not leave deleted products disabled behind a
+compatibility facade.
+
+## 8. Finite transition
+
+Enumerate concrete unresolved directed messages and open threads required by current
+work. Migrate them to normalized mailbox/thread rows with original sender, recipient,
+Task scope, reply relation and admitted time. Completed historical Operations remain
+readable history and need no permanent translator.
+
+GM handover changes current designation/epoch only. It does not rewrite Attempt owner,
+message recipient, candidate author or reviewer. A successor reads current
+Task/Attempt/native attention through authoritative projections; historical mail stays
+with its original recipient unless a new addressed handover message is admitted.
+
+## 9. Verification
+
+- same durable client reconnect resumes mailbox cursor without restarting work;
+- one message has one durable ID and supports send/read/reply/cancel;
+- lost notification is recovered from mailbox without duplicate send/model turn;
+- exact native question is answered by `Reply`; stale reply fails;
+- known permission policy works without human relay; unresolved judgment reaches
+  Governor once;
+- missing recipient does not silently redirect;
+- participant cannot read unrelated Task/message or acquire Manager rights;
+- GM handover preserves original recipients/authors while exposing current attention;
+- review/correction/acceptance continue after coordination products are removed;
+- no cards/contracts/integration/Concilium/code-scope indexes or compatibility routes
+  remain.

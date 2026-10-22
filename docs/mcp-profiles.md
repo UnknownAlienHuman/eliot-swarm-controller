@@ -1,14 +1,13 @@
 # MCP tool profiles
 
-`swarm mcp` is a stdio client of the running host over authenticated local IPC. It does not open the database or a network listener. MCP profiles narrow the visible method set before the existing application authorization runs; they do not assign ELIOT roles, Task ownership, or GM authority.
+`swarm mcp` is a local stdio frontend over authenticated Eliot IPC. A profile filters
+which tools the frontend advertises and accepts. It does **not** assign an Eliot role,
+Task ownership, GM authority or native capability. Store repeats current role/object/
+revision authorization for every forwarded application request.
 
-## Selecting a profile
+## 1. Selection and identity
 
-Profile names and ELIOT client bindings live in the local typed TOML configuration. `--profile NAME` selects one configured entry; when omitted, `mcp.default_profile` applies. The selected profile is fixed for the life of that stdio process. Start a new MCP session to select a different profile.
-
-The default configuration selects `local-observer` for the `operator` client. Use `swarm mcp --profile local-full` to explicitly restore the complete local tool table for the same local operator. `full` is a compatibility surface, not a second authorization mode: the application still checks the credential role, object ownership, request identity, and GM epoch.
-
-Each configured entry binds one local profile name to exactly one expected ELIOT client ID. Restricted profiles must use distinct client IDs. For example, use separate bindings for Dot and Muse; a credential whose client ID does not match the selected entry is rejected before the MCP server starts. The ID is not a secret. Keep credential files and local configuration outside shared repository content when they contain private installation details.
+A named local profile binds one presentation profile to one expected Eliot client ID:
 
 ```toml
 [mcp]
@@ -18,59 +17,161 @@ default_profile = "dot-observer"
 tool_profile = "observer"
 expected_client_id = "eliot-dot-observer"
 
-[mcp.profiles.muse-observer]
-tool_profile = "observer"
-expected_client_id = "eliot-muse-observer"
+[mcp.profiles.manager]
+tool_profile = "manager"
+expected_client_id = "eliot-manager"
 
 [mcp.profiles.local-full]
 tool_profile = "full"
 expected_client_id = "operator"
 ```
 
-Launch either named profile with `swarm mcp --profile dot-observer` or `swarm mcp --profile muse-observer`, and supply the corresponding local credential through the existing `--credential` option. No credential, token, path, tunnel, domain, or cloud account setting is exposed by MCP tools, resources, or diagnostics.
+The selected name is fixed for one stdio process. A credential whose client ID does
+not match the selected entry is rejected before serving tools. Restricted profiles
+use distinct identities; `full` is an explicit local compatibility presentation and
+still bypasses no Store check.
 
-## Closed tool surfaces
+Credentials, paths, tunnels, domains and provider secrets remain outside model-visible
+MCP tools/resources.
 
-At source `2aec51bb` (2026-10-05), the implementation has 120 exact tools: 54 reads and 66 mutations. These counts describe the closed `TOOLS` registry in `src/mcp.rs`, not the number injected into every model session; deferred loading is described in [Tool Catalog](mcp-tool-catalog-and-loading.md). The `full` profile exposes this entire table. Restricted profiles use explicit method allowlists; adding a tool to the table does not make it visible or callable through a restricted profile.
+## 2. Current closed profile names
 
-**Known authorization defect, reproduced at that source:** although the manager
-surface includes `task.create` and `task.revise`, both Store handlers still call
-`require_operator()`. A registered manager and the designated GM are rejected.
-The [modular-runtime correction](agent-operations/modularity.md#4-less-authorization-ceremony-one-effective-policy)
-removes this unintended gate without distributing the operator credential or
-widening Participant/Module/Observer rights. This documentation update does not
-fix the executable. Treat the table below as profile scope, not successful-call
-qualification; exact current public names and assigned-reviewer scope are owned
-by [Canonical MCP Surfaces](mcp-canonical-surfaces-and-topologies.md).
+Current code defines:
 
-| Profile | Current method scope (summary, not an exhaustive registry) |
-|---|---|
-| `observer` | Search/dashboard/status and selected Task, Attempt, Operation, family, check, artifact, report and mailbox reads. |
-| `reviewer` | Legacy observer-plus-`task.request_changes` profile. This is not the assignment-bound auditor role. |
-| `participant` | Scoped context, peer/card/inbox/watch/consultation/integration, exact current Task submission and candidate/artifact reads, plus selected review/evidence methods. Application assignment checks remain authoritative. |
-| `assigned_reviewer` | Selected review context/get/list/submit and linked submission/check/artifact/Operation reads. After release, only the exact retained reads permitted by the canonical assignment contract remain available. |
-| `manager` | Observer plus Task/Attempt/agent control, messages, participant administration, review assignment, manager-owned automation configuration, manual scheduled invocation, hooks, Goal, scripts, queue/launch/overlap, scoped watches and selected GitHub effects. No generic shell passthrough or automatic acceptance rights. |
-| `gm` | Most manager methods plus client/host/acceptance/Forge, GitHub source/work-pool and recovery methods, and GM handover. **Current code excludes `automation.config.preview` and `automation.config.apply` from this profile**; it is not an unconditional superset of manager. Application role/GM epoch checks still apply. |
-| `full` | Entire closed tool registry; opt-in local compatibility. It does not bypass application checks or prove native capability. |
+```text
+observer
+reviewer
+participant
+assigned_reviewer
+manager
+gm
+full
+```
 
-The exact allowlist is [`src/mcp/profiles.rs`](../src/mcp/profiles.rs); public names
-and deferred groups are specified by the canonical surfaces/catalog documents.
-The intended simplification is one effective method policy with explicit profile
-narrowing, not multiple contradictory tables or extra approvals. Do not silently
-broaden a remote profile while fixing a local manager's application rights.
+These are current presentation categories, not permanent product architecture.
+`reviewer` is a legacy profile distinct from the assignment-bound auditor. The compact
+target retains only profiles required by current clients and removes coordination/
+Concilium/tool surfaces when those products are deleted.
 
-Every `tools/list` result is filtered by the selected profile and current Store `allowed_methods`. Every ordinary `tools/call` repeats that current membership read after the session-fixed profile check and rejects a live-hidden method before target application IPC; the authorization read itself remains one bounded authenticated Store call. Tool annotations mark only read methods as read-only.
+| Profile | Intended scope |
+| --- | --- |
+| `observer` | Bounded status, Task/Attempt/Operation, result/check/report/mailbox and local Governor reads allowed by the credential. |
+| `participant` | Exact assigned Task/Attempt context, mailbox, current candidate/result and selected agent actions within its scoped grant. No general Manager authority. |
+| `assigned_reviewer` | Exact assigned review/candidate/source/check/artifact reads and `review.submit`; historical access remains assignment-scoped. |
+| `manager` | Task planning, queue/route/workspace/agent control, messages, review/correction/acceptance policy, Goal, scripts/checks and configured integrations within current Manager scope. |
+| `gm` | Current-GM actions such as handover and cross-manager current-work decisions in addition to its configured Manager surface. It is not automatically every local tool. |
+| `full` | Entire current closed catalog for explicit trusted local compatibility; application authorization still applies. |
 
-The MCP Tasks projection follows the same boundary: `tasks/get` requires the profile's `operation.get` and `report.attention` reads; `tasks/cancel` requires both `operation.get` and `operation.cancel`. A profile without those methods receives method-not-found before IPC. Restricted profiles also require a caller-owned `client_request_id` in `tasks/cancel` request `_meta`; the full profile alone preserves optional generated-ID compatibility. Custom `eliot/subscribe` requests are also checked before the subscription pump starts: every category requires `report.delta`, mailbox requires `message.read`, and operations requires `operation.get`. `eliot/unsubscribe` only closes session-local subscription state.
+The old operator-only Task planning defect is already fixed: current Task handlers use
+`require_task_planner`. Do not add another grant or approval layer to solve an obsolete
+finding.
 
-## Projected Phase-B operations
+## 3. One catalog, two checks
 
-`message.send` exposes `recipient`, `text`, optional `in_reply_to` and `in_reply_to_digest`, and the optional `admission_deadline_ms`, `delivery_deadline_ms`, and `reply_deadline_ms`. Its structured output schema includes the delivery ID and payload digest, sender/recipient scopes and actor, all deadlines, reply reference, and cancellation reference. `message.cancel` requires both the exact `delivery_id` and `payload_digest`; its result records the cancellation reference and leaves the original delivery unchanged. Application digest, sender, stale-request, and unsupported-runtime errors are forwarded with their original ELIOT error codes and messages.
+`swarm-contracts::mcp_catalog` owns public names/schemas and profile exposure. The MCP
+frontend checks the selected presentation profile; Store checks live application
+policy and exact object authority.
 
-Mailbox and receipt reads are addressed. `message.read` and the Mailbox subscription return only entries addressed to the authenticated recipient; cancellation receipts are not mailbox entries. `report.delta` and the Reports/Operations subscriptions expose each `message.send` or `message.cancel` receipt only to its authenticated sender/canceler and the original recipient; cancellation recipient visibility is resolved from the unique immutable settled send matching both delivery ID and payload digest. The same sender/recipient scope applies to `operation.get` and `operation.list`, with filtering before pagination. An object list examines at most 200 committed positions per call; hidden rows do not consume the requested visible item limit. A short page with `has_newer` advances `next_after` through examined positions so the next call continues the bounded scan. A verified bootstrap local operator retains the global Operation and report diagnostic view. These are application API scopes, not OS isolation between processes running as the same full-access user.
+```text
+MCP profile exposure
+-> current Store allowed-method read
+-> typed application request
+-> exact domain authorization
+-> handler
+```
 
-This receipt scope applies only to `message.send` and `message.cancel`. Shared `task.feedback` report events and Task review/acceptance history retain their existing visibility in `report.delta` and Operation reads. A directed notification in `message.read` is a delivery projection, not a confidentiality boundary.
+A tool appearing in a profile does not prove that the current credential owns the
+object or that the selected adapter implements the native action. Conversely,
+`manual_tools`/catalog presentation means an explicitly selected schema, not that a
+human must call it or that an authorized helper cannot automate it.
 
-`agent.background` requires `binding_id` and `generation`; optional `session_id` targets an owned family member, and omission targets the binding root. It forwards the existing addressed application operation. It is a mutation and is visible only in manager, GM, and full profiles.
+Do not maintain contradictory profile tables in several documents. Source registry
+and current configuration are authoritative for current exposure; this document owns
+the boundary and target.
 
-Restricted-profile mutations require a non-empty caller-owned `client_request_id` in `tools/call` arguments and reject a missing or blank ID before IPC. The full profile keeps optional generated-ID compatibility only for ordinary compatibility mutations. `swarm.launch` and `schedule.run_now` require the caller to choose the ID before dispatch in every profile because a response can be lost after their durable effect is admitted. A generated ID is echoed only with a received result and cannot make a lost response retryable. The facade does not retry requests. Profile selection does not change the operation's application-level owner or authority, and application errors such as stale revisions, digest mismatches, and unsupported runtimes keep their original codes.
+## 4. Requests, retries and unknown outcomes
+
+Restricted-profile mutations require a caller-owned nonempty `client_request_id`.
+Compatibility-generated IDs in `full` do not make a lost response safely retryable.
+The frontend never automatically replays a request after transport failure.
+
+A timeout/disconnect means the Store outcome may be unknown. Reconnect with the same
+identity and read the exact Operation/current object. Do not change request ID to
+bypass an unresolved effect.
+
+`tasks/get`, `tasks/cancel` and subscriptions require the exact underlying read/action
+methods in the selected profile. Notifications are bounded wake hints; authoritative
+history is Store readback. Slow or disconnected clients resume from their Store
+cursor, not a second MCP event log.
+
+## 5. Autonomous agents, not human-only tools
+
+Governor and Manager are agent identities. Their profile must expose the ordinary
+commands required by the configured autonomous work cycle:
+
+```text
+select/dispatch or resume
+read attention and exact native request
+Reply/Send/Configure/Goal where route supports it
+capture result and submit candidate
+assign/read review
+return all findings
+run checks
+accept
+selected import/publication integration
+```
+
+The positive path still passes Store authorization and adapter capability routing.
+Do not hide every mutation from an agent and then call the resulting operator work a
+safety feature. Use narrow identity/object scope, current revisions, typed actions and
+readback—not per-step human confirmation.
+
+Workers receive only the small surface needed for their assignment. A participant
+should not see fleet administration or unrelated Task history. A Manager agent should
+not need the operator credential for ordinary owned work.
+
+## 6. Mailbox and subscriptions
+
+The target mailbox is recipient-indexed and uses one durable message/Operation ID.
+`message.read` returns only rows addressed to the current client; reading does not
+delete. Reply/cancel uses exact message identity.
+
+Current subscription categories still include Concilium/coordination. Remove those
+categories and method requirements when the duplicate coordination platform is
+removed. Retain:
+
+- current Governor/report invalidation;
+- mailbox wake;
+- exact Operation/current-object reads;
+- cursor gap/resync behavior.
+
+A subscription never creates facts, starts a model or grants rights. Current-state
+automation decides whether an idle assigned agent should resume to handle mail.
+
+## 7. Target simplification
+
+As implementation slices land:
+
+- delete public `module.*`, `native.*` and standalone scheduler-service RPC from MCP;
+- remove coordination/Concilium/contract/card/watch methods and profile entries with
+  their products;
+- expose closed semantic agent actions instead of vendor methods;
+- keep high-level common-path tools small and searchable/deferred lower-level tools;
+- preserve exact assigned-reviewer and participant scopes;
+- derive profile exposure from the single catalog rather than copied allowlists;
+- keep public profile changes synchronized with actual Store handlers in the same
+  slice.
+
+Do not replace the current catalog with a policy DSL or generic JSON passthrough.
+
+## 8. Verification
+
+- profile and expected client identity mismatch rejects before serving;
+- profile exposure cannot grant a Store action or unrelated object read;
+- Manager can perform ordinary owned Task planning/execution without operator bearer;
+- participant and assigned reviewer cannot escape their Task/candidate scope;
+- lost mutation response is recovered through Operation readback, never replayed;
+- autonomous Manager cycle has the required tools without `full`/operator profile;
+- removal of coordination products removes their tools/subscriptions without breaking
+  mailbox, review or current Governor reads;
+- no documentation claims an already-fixed operator-only Task defect is current.

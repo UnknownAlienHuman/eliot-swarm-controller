@@ -1,332 +1,243 @@
-# Modular Runtime — Build, Process and Authority Boundaries
+# Modular Runtime — build, process and authority boundaries
 
-Owner direction: 2026-10-05. **Implementation specification, not an implementation claim.**
-Current source boundaries and reduction order: [refactoring map](refactoring.md).
-[Review and defects](modularity-review-2026-10-05.md) retains the earlier `2aec51bb` inspection;
-[Observability](observability.md) defines logging/live monitoring;
-[Donor map](donor-map.md) records inspected mechanisms and rejected assumptions.
+This is the compact target, not a claim about current source. The earlier
+[review](modularity-review-2026-10-05.md) remains historical evidence;
+[implementation](implementation.md) owns migration and deletion order;
+[status](../implementation-status.md) records landed code.
 
 ## 1. Required outcome
 
-An ordinary registered manager can plan and run its work without borrowing the
-operator credential or obtaining repeated approvals. An adapter, script bundle,
-bus dispatcher or recorder can be built and replaced without rebuilding every
-other component. Unused optional modules have no running worker, polling timer,
-network connection or loaded native model. One failed optional worker does not
-stop the host or unrelated agents. Recovery restarts software, not the original
-model input or an uncertain external write.
+A registered Manager agent can plan, execute, review and deliver work without the
+operator credential or repeated human approvals. Optional adapters and effect workers
+can be built, started, replaced and failed independently. Recovery restarts software
+and reads retained/native state; it does not replay uncertain model or external input.
 
-Keep durable Operations, Task/Attempt association, mailbox and independent
-review/acceptance for the compact core. Publication is an explicit optional action.
-Do not replace these with a new scheduler, broker product, model loop or workflow DSL.
+Keep one durable Task/Attempt/Operation authority, one addressed mailbox, one review/
+acceptance path and one local Governor view. Do not replace them with another broker,
+workflow language, compatibility service or model-driven heartbeat.
 
-Three boundaries are different: a Rust source module is not a compilation unit;
-a Cargo package is not a fault-isolated process; a restarted adapter process is
-not a resumed native execution. Implement all three deliberately.
+Three boundaries are different:
+
+- source module versus Cargo package;
+- package versus process/fault boundary;
+- restarted adapter versus resumed native session/effect.
+
+Use a boundary only when it isolates a retained responsibility and deletes concrete
+duplication.
 
 ## 2. Package and process map
 
-Use one Cargo workspace/lockfile and the existing [shared package map](shared-packages.md).
-The kernel process is `swarm-kernel-host`; `swarm-kernel` and `swarm-store` are
-libraries inside it. Do not create another daemon or move domain migrations into
-`swarm-store` to satisfy an old package sketch.
+Use one Cargo workspace/lockfile. The target process map is:
 
-| Runtime responsibility | Package / process boundary |
+| Responsibility | Target owner/boundary |
 | --- | --- |
-| Durable domain authority | Host Store owns authentication, domain SQL/migrations, receipts and routing. `swarm-kernel` owns its existing pure Task/dispatch/review/acceptance rules and bounded writer actor; `swarm-store` owns connection mechanics. |
-| Worker lifecycle | `swarm-supervisor` uses shared contracts/client/process primitives; it starts selected worker executables without linking their implementations. |
-| Native execution | Each `swarm-adapter-*` is independently built. Compatible bindings may share a worker where the native contract permits. It owns protocol/native lifecycle, not a second Task database. |
-| Durable bus / optional automation | `swarm-bus` delivers facts; `swarm-automation` coordinates eligible actions/timers through bounded kernel IPC. Cursor/action commits remain in Store. |
-| Checks / Forge / scripts | `swarm-checks`, `swarm-forge-worker`, `swarm-script-worker` execute admitted work on demand. `swarm-scripts` remains shared planning/contracts, not a second runner. |
-| Observation | `swarm-telemetry` is the shared producer; `swarm-observer` is the independently replaceable recorder/live reader. |
-| Frontends | `swarm-cli`, `swarm-mcp`, `swarm-gateway` consume `swarm-client`. CLI keeps public `swarm`; the launcher starts the host. Gateway is optional. |
+| Durable domain authority | `swarm-kernel-host` with Store, one writer and bounded WAL readers. `swarm-kernel` keeps pure Task/review/acceptance rules; `swarm-store` keeps SQLite mechanics. |
+| Time admission | One in-process host loop computes current due work and admits ordinary Operations. No standalone scheduler service for Store bookkeeping. |
+| Process custody | `swarm-supervisor` + `swarm-process` own exact executable, PID/birth, Job/process group, private bootstrap and lifecycle. |
+| Native execution | One selected `swarm-adapter-*` implementation per retained harness. Adapter owns native transport/session/readback, never a second Task database. |
+| External effects | On-demand selected executables for checks, scripts and remote Git/GitHub only where real external I/O or process custody justifies a process. |
+| Bus/observation | Store commits facts/cursors with domain state. `swarm-bus`/observer components may distribute or record them but own no second database or Task lifecycle. Required provider/process/Git collectors run independently of optional diagnostics. |
+| Frontends | `swarm-cli`, `swarm-mcp` and optional single-tenant `swarm-gateway` call the same application methods through `swarm-client`. |
 
-Extract external execution from Store without moving its transactional admission,
-custody or acceptance into a worker. Keep shared DTOs/pure matching in existing
-contract owners; neither importing the host from a worker nor linking the old
-worker through a new wrapper establishes an independent boundary.
+Current `swarm-automation`, legacy optional workers and built-in adapters remain
+migration surfaces, not permanent target processes merely because a package exists.
 
-**Dependency rules:**
+Dependency rules:
 
-1. Host/kernel, supervisor and frontends do not link adapter implementations;
-   adapters do not depend on one another. Shared libraries never import the host.
-2. Host/kernel do not link worker implementations (automation, bus, checks, Forge,
-   observer, script-worker or supervisor). Worker communication uses the existing
-   contracts/client IPC; remove transitive edges as well as direct manifest entries.
-3. `swarm-cli` owns public application command parsing and request mapping. Host
-   keeps daemon/worker bootstrap and the local administrative commands explicitly
-   delegated by `command_uses_host`; its repeated application mapping is already removed.
-   Migrating a remaining delegated local command is its own connected change, not
-   a reason to delete bootstrap or recreate the public CLI inside another crate.
+1. Host/kernel, supervisor and frontends do not link adapter implementations.
+2. Adapters do not depend on one another or on host internals.
+3. Host does not link effect-worker implementations after their selected contracts are
+   moved to shared owners.
+4. Shared libraries never import the host or encode vendor state machines.
+5. Public command parsing belongs to `swarm-cli`; host keeps daemon/bootstrap and only
+   genuinely local administration.
 
 ### 2.1 Bus modularity without broken transactions
 
-The durable journal append remains a Store operation in the **same transaction**
-as the state change/receipt. The bus module owns delivery, fanout and consumer
-scheduling, not that database. Losing the bus cannot turn a committed command
-into an unsaved fact. A queued command remains queued, not falsely delivered.
+Domain state and its durable observation/receipt are committed in the same Store
+transaction. A bus can wake consumers and deliver retained facts; it cannot be the
+place where a Task transition becomes durable.
 
-Consumers use the existing atomic admission pattern through a narrow kernel
-request: identify consumer + expected cursor + source occurrence + requested
-ordinary action(s); persist the resulting Operation(s) or bounded pending state
-and advance the cursor together. The authenticated consumer context, not an
-arbitrary `run_as` string, determines authority. No arbitrary SQL or callback is
-accepted across IPC. Enforce bounded batches and existing semantic dedup slots.
+A consumer supplies its authenticated identity, expected Store cursor/current subject
+and requested ordinary actions. Store authorizes and admits bounded Operations, then
+advances durable cursor/occurrence identity where needed. No arbitrary SQL, closure or
+`run_as` string crosses IPC.
 
-A bus restart resumes retained cursors; volatile notifications are only hints.
-Direct status/readback and already-admitted native work remain usable during a
-bus outage. A missing recorder never prevents state transitions. A broken
-journal/DB does prevent new durable admission; restarting cannot manufacture a
-commit. Keep this irreducible storage/kernel fault domain explicit.
+A bus/notification restart resumes from Store. Volatile notifications are coalesced
+wake hints. Missing recorder or bus does not stop already admitted work, direct
+readback or state transitions. Store failure does stop new durable admissions; another
+process cannot manufacture the missing commit.
 
 ## 3. Module protocol and registration
 
-Extend the current bounded IPC/RuntimeCommand boundary rather than introducing
-an in-process Rust dynamic-library ABI. Each installed module has local metadata:
-module ID, artifact/build identity, executable and separate argv, config schema,
-protocol major/minor range, command/event schemas, capabilities and lifecycle
-ownership (`external_attach`, `owned_service`, `one_shot`). Secrets are references
-to local protected configuration, never manifest values exposed to agents.
+Use the existing bounded IPC and replace the current string/vendor proof matrix with
+one current typed semantic protocol.
 
-This is a registry of locally installed modules, not a remote package catalogue, installer or second activation ledger. The operator registers an installed executable/location once. A manager selects
-an admitted route or script by ID; normal dispatch does not require another
-installation approval. Catalogue reads use retained descriptors and do not spawn
-a process, start WSL, load models or probe every provider. Distinguish installed,
-enabled, active, unhealthy and unavailable in the catalogue.
+An installed package records only:
 
-Handshake binds module ID/version, fresh worker boot ID, supported protocol and
-exact assigned bindings/generations. A compatible additive schema change does
-not require replacing every process. Reject incompatible messages with a bounded
-capability error before effect; unknown optional event fields are retained only
-under a bounded extension envelope, never interpreted as new authority.
-
-The normalized dispatch pair is an explicit descriptor opt-in: a module advertises
-`swarm.task_dispatch_context@1` as a command schema together with
-`swarm.task_dispatch_admission@1` as an outcome schema. Store adds the context
-to that exact `task.dispatch` command with operation, binding and generation,
-worker boot, Attempt and Task identity, Task revision, immutable snapshot digest,
-and original source text digest and byte count. The adapter returns the context
-unchanged, echoes the strict `ModuleReceiptIdentity`, and records the digest and
-byte count of the exact native payload it submitted plus an optional native input
-ID. Store recomputes the context from the original Operation and retained Attempt,
-requires the outer identity and native input ID to match, and records an existing
-Attempt producer for `Accepted` or `Applied`. `Unknown` remains unresolved and
-cannot mark the Task complete. The original dispatch context is retained before
-the command leaves Store, so recovery validates the original admitted worker
-boot. Current descriptors lacking these schemas still use runtime-specific
-codecs; convert needed consumers and remove that path under the finite transition.
-
-Current TaskPrompt artifacts also advertise `swarm.task_prompt@1`. Store builds
-one exact prompt envelope from the retained Task snapshot and source text; it
-contains Task/Attempt/revision identity, the snapshot digest, prompt bytes and
-their digest. The adapter validates the envelope against the dispatch context
-and submits its prompt unchanged. Retire legacy snapshot renderers after the
-actual old consumers/data are converted; do not add a fallback to current dispatch.
-
-The adapter owns native schemas, workspace-field mapping, connection identity,
-capability interpretation, command translation and normalization of observations.
-The kernel owns command identity, authorization, durable ordering, deduplication
-and state transitions. Move `reserve_workspace_open`'s runtime-name switch and
-OpenCode-specific evidence interpretation out of Store. An adapter validates
-its own native options and returns a normalized prepared launch/observation;
-Store validates generic identity/digests and capability contract, not vendor keys.
-
-Prepared launch metadata is not a promise that a process already ran. Preparing
-an adapter may start its worker, but native execution begins only for the exact
-admitted launch. Stale replies from an older boot, configuration, generation or
-closed connection cannot attach a second native owner.
-
-Target local configuration shape (illustrative, not accepted by current Config):
-
-```toml
-[modules.opencode]
-executable = "<private-module-root>/opencode/<artifact>/swarm-adapter-opencode"
-args = []
-enabled = true
-activation = "on_demand"
-ownership = "external_attach"
-idle_timeout_seconds = 60
-
-[modules.opencode.restart]
-policy = "on_failure"
-max_starts = 5
-window_seconds = 60
+```text
+module/package inventory identity
+executable + argv/resources
+current protocol major
+required semantic actions
+lifecycle ownership
+bounded typed configuration
+selected byte identity verified at install/launch
 ```
 
-`enabled` permits demand-driven technical activation; it does not enable any
-manager automation or install/update the executable. Idle timeout applies only
-when the worker has no session/operation/stream/owner obligations. Windows uses
-its native executable path and private Named Pipe, not a forced Unix launcher.
-Schema errors keep the last valid configuration and identify the affected
-module; a partially applied update must not restart unrelated services.
+Build commit/toolchain may be diagnostic. Artifact version, full command/event schema
+arrays and source checkout are not runtime authorization or behavior switches.
+
+At hello:
+
+1. `swarm-process` verifies the supervisor-owned process, binding, generation, boot,
+   client credential and private state directory.
+2. Adapter reports protocol major and compiled semantic capabilities.
+3. Store verifies the selected required subset and marks the authenticated link ready.
+
+Do not echo/compare the entire descriptor on both sides. One package/version profile
+ladder per new capability is a failure of the common boundary.
+
+The semantic action set is owned by
+[module API](module-api.md): Open, Dispatch, Send, Reply, Configure, Goal, Background,
+Cancel, Recover, Refresh, Result, Reconcile and Shutdown with explicit supported
+scopes. Vendor method names, local database shape and native recovery stop at the
+adapter.
+
+Store retains Task/Attempt/Operation/binding identity. The adapter receives an
+Operation reference plus a compact rendered TaskPacket where needed. Current
+`swarm.task_prompt@1`, full dispatch context and repeated receipt hashes remain
+transitional formats for old consumers; they are not the target. Preserve the frozen
+per-requirement evidence plan in Store and render its meaningful verification criteria
+for the agent. Do not replace useful criteria with controller proof JSON.
+
+A normal outcome returns Operation ID, stale generation/boot guard, native identity,
+disposition and bounded action details. Result pages retain byte range/content digest.
+Package/protocol/request/Task hashes are not repeated in every receipt.
+
+Terminal/result delivery to Eliot is separate from native effect recovery. Adapters
+may retain already-formed Store deliveries until ACK. They never persist/replay native
+prompt in the common delivery spool. Observation is a replaceable current source
+checkpoint with explicit coverage, not an infinite event mirror.
+
+Registration/catalog reads use retained installed metadata and do not spawn providers,
+load models or contact accounts. Selection affects future bindings. A module catalog
+entry grants no Store action right.
 
 ## 4. Less authorization ceremony, one effective policy
 
-**Local trust model:** one user-owned controller, not a multi-tenant cloud IAM
-product. Authenticate once per connection and keep stable client identity across
-reconnect. Register/assign the manager once; its ordinary planning, observations,
-peer coordination and execution do not require per-step Root approval. Automatic
-worker recovery is infrastructure, not opt-in business automation.
+This is a local user-owned controller, not a multi-tenant cloud IAM product.
+Authenticate once per connection and keep stable client identity across reconnect.
+Register/assign Manager once; ordinary planning, execution, observation and peer work
+do not require repeated Root/operator approval.
 
-Use one positive method policy shared by CLI/MCP, manual calls, scripts and
-on-behalf automation. Generate discovery/schema classifications from that
-registry; a profile can narrow it, not grant new rights. Keep deferred tool
-loading as UX, not another authorization/activation bureaucracy.
+Use one positive method policy shared by CLI, MCP, helpers and scripts. Frontend
+profiles may narrow exposure; they never grant new rights. Each retained domain owns:
 
-Current [Task handlers](../../crates/swarm-kernel-host/src/store/tasks.rs) already
-call `require_task_planner`, which admits Operator/Manager. The separate
-`authorize_foreign_live_attempt_revision` handles another manager's live Attempt.
-Keep these existing checks; do not assign the old operator-only defect again.
-Planning a Task must not depend on an installed runtime, workspace launch,
-provider quota, MCP proof or observer readiness. Native prerequisites apply to
-that native action when it is actually requested.
+```text
+typed parse
+exact role + object + revision/generation checks
+state/effect handler
+```
 
-For revision, retain expected-revision checks and frozen old Attempts. Resolve
-an active Attempt's existing owner: an ordinary manager cannot alter another
-manager's live assignment; current GM/operator or an explicit existing ownership
-handoff handles that case. Do not introduce a new grant database as a condition
-for making local manager Task commands work. Remote/restricted entrypoints keep
-their explicit existing scope/profile limits; broad local trust is not public
-anonymous access.
+An enabled helper acts on behalf of its current Manager and rechecks the same object
+rights at admission/effect. It does not receive a manager bearer or create another
+credential exchange. Governor and Manager are agent roles; direct command does not
+mean human approval.
 
-Retain only checks that protect a real boundary: actor identity, current resource
-ownership, stale revisions/generations, secret/endpoint protection, independent
-acceptance, and exact candidate/GM epoch for publication. For deferred external
-effects, recheck relevant revocation/ownership/epoch immediately before effect.
-That is a machine check, not another human approval or new credential exchange.
-Late authenticated results still need to be collected after the actor loses the
-right to start **new** work.
+Preserve real boundaries:
 
-Participant, hook-source, module and observer credentials remain scoped; never
-pass the operator/manager bearer to a model, script, child or remote gateway.
-Missing an optional capability stops only its affected action. Every denial has
-one actionable reason and exact next action; do not return a list of invented
-approval stages or repeatedly ask the manager for unchanged information.
+- actor identity and exact Task/Attempt/candidate/resource scope;
+- current owner/revision/generation/boot;
+- secret and endpoint protection;
+- independent review and requirement-linked acceptance evidence;
+- exact external target and readback after ambiguous write;
+- late result collection without granting new work.
+
+Remove document-edition hashes, package-version policy, preview digests and historical
+contract matrices as permissions. Missing optional capability stops only that action
+with one exact next step. Known native permission rules answer authorized requests;
+unresolved judgment is routed once to the Governor agent. Operator input is for
+missing credentials/authority or owner intent not represented in policy.
+
+Participant/reviewer/module/observer/gateway identities remain scoped. Never pass
+operator or Manager credentials to a model, script, native child or remote bridge.
 
 ## 5. Demand-driven lifecycle, unified supervision and recovery
 
-The target has one lifecycle owner for each selected process, reusing
-`ModuleSupervisor` (`swarm-supervisor`). Remove parallel `ManagedWorkerSupervisor`/
-`legacy_optional_workers` paths as their used responsibilities move. Do not create
-an executable, descriptor or supervisor registration for every small helper;
-pure mechanics belong in the existing shared packages.
+Each process/service scope and native session has one owner. Reuse `ModuleSupervisor`
+and `swarm-process`; remove parallel supervisors and legacy worker slots as their
+retained responsibilities move.
 
-The supervisor keeps cheap installed/configured metadata. Optional workers start
-only for an admitted command, a configured due action, or an explicit live
-subscription. One single-flight start per module/service scope coalesces parallel
-demand (following Paseo's `pendingAgentInitializations` single-flight pattern). A worker preparing to stop and a concurrent start use one generation/
-state transition; a late startup response cannot resurrect a disabled worker.
+Optional components start only for:
 
-Disabled/unused modules have no task loop, periodic provider read, extra socket,
-model process or recorder thread. Stored descriptors and the small core registry
-still consume memory; do not advertise literal zero system overhead. Long-lived
-native sessions are active resources even between turns; an idle timeout must
-not kill them or forget children/unknown effects. A configured continuous hook
-or selected live monitor is intentional demand, not an unused component.
+- an admitted command/effect;
+- configured due work;
+- an explicitly enabled source collector/live subscription.
 
-One-shot script bundles capture their version, inputs and allowed effects before
-execution. Editing a script/config changes subsequent invocations only. A script
-built as Rust has its own package/executable; existing typed-action bundles are
-data, not a reason to invent another language or interpreter. Optional user
-Python/PowerShell extensions remain external and are not mandatory internals.
+Pure Store bookkeeping stays in the host. Do not register a process/credential for
+every helper.
+
+Single-flight start coalesces parallel demand. A close and concurrent start share one
+generation/state transition; a late startup cannot resurrect a disabled component.
+Shared native services are not duplicated per session. Adapter disconnect does not
+prove native process/session death and must not call native close by default.
+
+Long-lived native sessions, Goals, children, pending requests and uncertain effects
+remain active obligations even between model turns. Idle timeout applies only when
+none exists. Observation never restarts or kills work merely to make status green.
 
 ### 5.1 Restart policy
 
 | Failure | Required behavior |
-|---|---|
-| Optional worker error/panic/exit | Record worker/boot/exit evidence, restart **that** worker if still needed, reconnect and read back pending Operations. Kernel/listener and other modules stay running. |
-| IPC disconnect, process still alive or identity unknown | Reconnect/read-only reconciliation. Preserve the unknown-outcome transition; disconnect is not proof that the process died. |
-| Adapter worker dead, native execution survives | Restart adapter and attach only through its supported recorded-session contract. Do not recreate the native family or replay model input. |
-| Proven native interruption | Preserve exact terminal evidence; a new work attempt is a separate manager decision unless an existing enabled policy explicitly requests it. |
-| Uncertain native/remote effect | Recover by exact readback. Only the affected operation/resource remains unresolved; unrelated work continues. Never convert a timeout into success, failure or safe retry without evidence. |
-| Invalid config, incompatible protocol, repeated identical startup failure | Isolate module, expose concrete error and recovery control; wait for changed config/artifact/evidence rather than hot-looping. No global stop. |
-| Kernel/Store failure | Stop new durable admissions, retain native process ownership, restart kernel under its lock and reconcile. Never initialize an empty replacement database over retained state. |
-| Recorder/monitor failure or disk quota | Degrade diagnostics with visible loss counters/fallback; do not stop agents or the event journal. |
+| --- | --- |
+| Optional effect worker exits | Record boot/exit; restart only if current work still needs it; read back its exact Operation. Unrelated work continues. |
+| Eliot IPC disconnect, process/native state may survive | Reconnect and drain retained Store deliveries; preserve unknown native outcome. |
+| Adapter dead, native session survives | Verify previous owner departure and resume/attach only through the selected native contract; never replay input. |
+| Proven native interruption | Retain exact evidence; policy may create a separate retry/Attempt after disposition. |
+| Uncertain native/external write | Exact readback or visible unknown; isolate only its resource. |
+| Invalid config/protocol/startup loop | Isolate selected module and wait for changed config/artifact/evidence; no global stop or hot loop. |
+| Host/Store restart | Stop new admissions, preserve process custody, reopen retained DB under lock and reconcile. Never initialize an empty replacement over retained state. |
+| Collector/diagnostic failure | Keep last fact stale with gap/loss counters; never stop agents or erase fleet. |
 
-Proposed default for transient worker crashes: exponential delay from 250 ms to
-30 s with jitter, at most five starts in 60 s; reset budget after 60 s healthy.
-Budget exhaustion isolates that module with a visible reason; a changed valid
-configuration/artifact or explicit restart resets it. These are configurable
-starting defaults, **not measured reliability figures**. A library timeout must
-not secretly retry a non-idempotent POST underneath this policy.
+Restart/adoption requires PID + OS birth/image/group/Job identity, not PID alone. An
+identity mismatch clears stale ownership but kills nothing. Uninspectable remains
+unknown. Bound shutdown waits; do not kill unproven native work to make shutdown clean.
 
-Restarted supervisor/kernel must adopt verified existing owners under OS locks,
-not duplicate them. Retain Windows Job/process birth (`cccc-windows-process` + `sysinfo`) and Unix process-group
-identity; PID alone is insufficient. Preserve owner-first non-killing native
-ownership. Bound worker shutdown waits, but do not kill unproven native work to
-make shutdown appear clean. A plugin process boundary contains a crash; it is
-not an OS sandbox against arbitrary same-user code or a hard memory/CPU quota.
+A route may define bounded restart/backoff defaults, but timeout does not authorize
+retry of a non-idempotent native request.
 
-### 5.2 Independent update, build and production `src/` hygiene
+### 5.2 Independent update, build and production source hygiene
 
-**Keep large integration suites and mock executables outside production `src/`:**
+Keep large integration suites and fake runtimes outside production `src/` or behind
+`#[cfg(test)]`; do not expose production internals merely to relocate tests. Test
+relocation is source hygiene, not runtime simplification by itself.
 
-- Place new integration suites and mock/fake runtime executables (`fake_codex_app_server`, `fake_claude`, `fake_opencode`, etc.) in Cargo `tests/` directories or dev-only support packages. Move existing suites as their implementation seam is extracted; do not expose private production APIs solely to relocate tests.
-- Mock/fake executables must not be production `[[bin]]` targets. Small `#[cfg(test)]` unit tests may remain beside the implementation: they are already excluded from ordinary production builds. Relocation improves source ownership and navigation; it does not by itself establish a runtime or build-time gain.
+Install executables in versioned private package directories. Validate current
+protocol/actions and selected bytes, then atomically select the package for new
+bindings. Existing work drains under its selected package or uses a supported attach
+handover. Do not overwrite running Windows binaries or keep historical versions as
+permanent compatibility branches.
 
-Place executable artifacts in versioned module directories. Validate compatibility
-and atomically change the selected version for **new** admissions. Existing
-bindings retain their old artifact until drain or a supported attachment handover.
-Keep a prior release only for an actual rollback/drain window; remove obsolete
-versions after the [finite transition](implementation.md#current-format-and-existing-data).
-Do not overwrite a running Windows binary.
-Compatible recorder/adapter updates never require restarting kernel or unrelated
-native sessions. Kernel/schema upgrades still require their own controlled
-handover and supported database backup/migration, not a claim of universal hot
-swap. Snapshot bytes include any required WAL state; never copy only a live DB
-file and call it a verified backup.
+Cargo workspace `default-members` should be the small normal entrypoints. Adapter-only
+changes should not relink host or unrelated adapters. Build provenance is diagnostic;
+checkout/compiler/cache-path equality is not protocol compatibility.
 
-Cargo workspace `default-members` must be the small CLI/kernel entrypoints,
-not every adapter. Shared root dependency declarations disable unwanted features
-at the workspace level as needed by the supported compiler. Build provenance
-may be diagnostic; host/adapter equality of checkout, compiler or build-cache
-path is not a protocol requirement.
-
-Use a fast local profile; keep optimized release packaging separate. Example
-**target root-manifest settings**:
-
-```toml
-[profile.iterate]
-inherits = "dev"
-opt-level = 1
-debug = "line-tables-only"
-strip = "none"
-incremental = true
-lto = "off"
-```
-
-After extraction, a manager's final scoped pass is, for example:
-
-```sh
-cargo fmt -p swarm-adapter-opencode -- --check
-cargo clippy --locked -p swarm-adapter-opencode --lib --bins --no-deps -- -D warnings
-cargo build --locked -p swarm-adapter-opencode --profile iterate
-```
-
-No automatic `cargo clean`, repeated full release build or `--workspace` pass
-for every script/adapter edit. Preserve vendored donor bytes; do not include
-upstream snapshots in blanket formatting. One manager owns one worktree and
-integrates writers before the scoped pass. CI follows changed packages plus
-actual reverse dependencies; contracts/lockfile/platform changes widen that
-set. Keep existing checks; add PR triggers and coverage of `tests/**`, `tools/**`
-and build recipes. A docs-only PR needs docs validation, not native model calls.
-
-Measure cold build, warm no-op, adapter-only edit, kernel-only edit and shared
-contract edit separately, recording toolchain/profile/target and built packages.
-Acceptance is absence of unrelated rebuilds/restarts, not an invented speedup.
+Measure cold build, warm no-op, adapter-only, kernel-only and shared-contract edits
+separately. Acceptance is absence of unrelated rebuild/restart and connected behavior,
+not an invented speedup.
 
 ## 6. Implementation ownership
 
-[Implementation](implementation.md#processes-and-frontends) owns the work order
-and current source owners. Former M1–M6 labels describe historical package-boundary
-work; they are not another program to complete. Task planner authorization and the
-host's duplicate public CLI have already been corrected; do not reassign them.
+[Implementation](implementation.md) owns the only work order and exact source slices.
+This document owns boundaries only. Historical M1–M6 programs, current package
+existence and old descriptor schemas do not add work to the target.
 
-A retained adapter/worker can change without rebuilding or restarting unrelated
-execution. Its removal includes obsolete consumers and dependency edges. Verify
-that connected behavior through existing scoped checks; source movement alone is
-not a performance result. Small shared functions remain in the existing libraries.
+A modularity slice is complete when:
 
-References for package/profile behavior: [Cargo workspaces](https://doc.rust-lang.org/cargo/reference/workspaces.html)
-and [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html),
-read 2026-10-05. These justify the mechanism, not a benchmark or installed version.
+- the selected owner is connected end-to-end;
+- previous owner/callers/config/fixtures/package branches are removed;
+- retained automatic behavior still works without routine human intervention;
+- unknown effects remain honest;
+- minimal affected format/Clippy/build and one connected behavior check pass;
+- net production Rust/JS/glue is reported separately from tests.

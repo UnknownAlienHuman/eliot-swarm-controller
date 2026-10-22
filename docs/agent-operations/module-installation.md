@@ -1,16 +1,13 @@
 # Build, install and qualify Eliot components
 
-This runbook separates the **current scripts** from the target package path. Current
-scripts remain usable during migration, but their provenance matrices and
-artifact-specific validators are not architecture. The target is implemented
-route-by-route under the [implementation order](implementation.md#implementation-order).
+This runbook separates the current transitional scripts from the compact target.
+[Implementation](implementation.md) owns migration order;
+[status](../implementation-status.md) records actual code and evidence. Installation
+or compilation alone never proves a working native turn.
 
-Installation does not prove a successful model turn. Provider CLI/service, account,
-model and credentials are configured separately.
+## 1. One current package contract
 
-## 1. Target package contract
-
-One current package contains:
+A retained component has one current package:
 
 ```text
 package-manifest.json
@@ -19,38 +16,53 @@ module-descriptor.json
 resources/<required files only>
 ```
 
-The manifest names:
+The manifest contains:
 
-- package/module coordinate for inventory;
-- current protocol major;
+- inventory coordinate;
+- current Eliot protocol major;
 - required semantic actions;
-- executable and required resource relative paths;
-- selected byte digests used once during installation/launch;
-- optional build commit/toolchain as diagnostics only.
+- executable/resource relative paths;
+- selected byte digests verified at install/launch;
+- optional build provenance for diagnosis only.
 
-The descriptor contains launch/lifecycle/configuration and semantic actions. It does
-not duplicate command/event schema inventories or create behavior branches from
-artifact version.
+The descriptor owns typed launch/lifecycle/configuration and required semantic
+actions. It does not duplicate full command/event schema inventories or select Core
+behavior from artifact version.
 
-The generic installer:
+A generic installer:
 
-1. requires an absolute explicit install root;
-2. rejects traversal through reparse/symlink targets where the platform check exists;
+1. requires an absolute explicit private install root;
+2. rejects traversal and symlink/reparse escape where the platform supports the
+   check;
 3. validates bounded regular package files and protected credential references;
-4. verifies selected package bytes once;
+4. verifies selected bytes once;
 5. atomically publishes one package directory;
-6. returns the installed descriptor and executable identity;
-7. does not launch, register a route or contact a provider.
+6. returns installed descriptor/executable identity;
+7. does not launch a model, register a route or contact a provider.
 
-Supervisor registration validates the installed package and current protocol/actions.
-Runtime hello validates authenticated binding, protocol major and required action
-subset. It does not compare source checkout, compiler, Cargo.lock, target-cache path
-or a full echoed descriptor.
+Supervisor registration validates the installed package. Runtime hello validates the
+authenticated binding, one protocol major and the required semantic capability subset.
+It does not compare source checkout, compiler, Cargo.lock or target-cache path and does
+not echo the whole descriptor back to itself.
 
-## 2. Current build command
+## 2. Selected current runtime direction
 
-Until the generic package path replaces the current scripts, build one selected Cargo
-binary into one external shared target:
+| Runtime | Selected target | Transition boundary |
+| --- | --- | --- |
+| Antigravity | Rust adapter, active coordinate v6 | Finish A1b–A3: remove dispatch proof, add durable Store delivery, keep real actions only; then retire remaining Node profiles. |
+| OpenCode | standalone `swarm-adapter-opencode` against one exact live-qualified current native contract | Freeze built-in new work, disposition concrete old bindings, delete host `runtime/opencode_v2`, legacy worker/MCP/service paths and universal journal machinery. |
+| Codex | Rust app-server adapter over the current external app-server | Delete Python writable route, profile ladders, full checkpoint/event mirror and Goal proof machinery after finite disposition. |
+| Muse | **Node bridge `.13` over the official low-level SDK** | This is the only new-work route during refactor. Finish/export concrete custom-Rust work, then remove `swarm-adapter-muse`, disabled descriptor, custom MSP wire/schema and Rust-only fixtures. Do not keep both or add the official Rust SDK as a third executor. |
+| Claude | one Rust adapter with a thin driver for the selected official SDK/runtime | Retire old Node generations after current work is disposed. Advertise only capabilities verified on the selected installed SDK. |
+| Command | one current Batch route and one stable ACP v1 route | Delete Batch/ACP artifact-profile ladders, generic journals and public `native.command.*` methods while preserving `session/load`, exact prompt/reply/cancel/close and option readback. |
+
+Model names, account selection, effort and permission policy belong to route
+configuration/native discovery, not package compatibility.
+
+## 3. Current build path
+
+Until the generic package path replaces the current scripts, build the exact selected
+binary into one shared external target directory:
 
 ```powershell
 $Target = 'D:\build-cache\eliot-shared-target'
@@ -59,38 +71,16 @@ cargo build --locked --release --target-dir $Target `
 ```
 
 Use the corresponding package/target for another retained component. Build
-parallelism follows machine/Cargo capacity, not the number of agents. Do not allocate
-a separate target directory per worker.
+parallelism follows machine and Cargo capacity, not agent count. Do not allocate one
+target directory per worker.
 
-The current owner helper is built from `swarm-process` as
-`swarm-module-owner`. It remains a separate selected executable until process
-ownership is simplified.
+`swarm-module-owner` remains the current selected helper until process ownership is
+simplified. Its existence does not justify repeating package/contract identity in
+every runtime receipt.
 
-## 3. Current adapter inventory
+## 4. Transitional installer
 
-| Runtime | Current primary Rust package | Current descriptor source | Direction |
-| --- | --- | --- | --- |
-| Antigravity | `swarm-antigravity-adapter` | `modules/antigravity-rust/module-descriptor.template.json` | active coordinate is v6; converge route/tooling selectors and retire Node after consumers switch |
-| OpenCode | `swarm-adapter-opencode` | `crates/swarm-adapter-opencode/registration/descriptor.template.json` | standalone Rust only |
-| Codex | `swarm-adapter-codex` | package descriptor | Rust app-server only |
-| Muse | `swarm-adapter-muse` plus Node bridge | current candidates | select one complete executor before installation is normalized |
-| Claude | `swarm-adapter-claude` | `modules/claude-rust/module-descriptor.template.json` | one Rust adapter with thin SDK driver |
-| Command | `swarm-adapter-command` | batch and ACP templates | first delete historical profiles; keep only retained current products |
-
-Do not hardcode promotional model names into package or qualification policy. Models
-belong to route configuration and provider-native discovery.
-
-### Antigravity coordinate warning
-
-The shipped Rust constant, descriptor, route example, package policy, native
-qualification and narrow installer validator use version `6`. Historical v5
-remediation receipts remain unchanged. Store no longer accepts v5 as a current
-dispatch capability; concrete old bindings require explicit disposition rather than
-a permanent compatibility branch.
-
-## 4. Current transitional installer
-
-The current command remains:
+The current installer remains usable while the target package path is implemented:
 
 ```powershell
 $Source = 'D:\build-cache\eliot-shared-target\release\swarm-antigravity.exe'
@@ -103,30 +93,32 @@ pwsh -NoProfile -File tools/modules/Install-ModuleArtifact.ps1 `
   -WhatIf
 ```
 
-Review the preview, then repeat without `-WhatIf`.
-
-Current behavior creates a coordinate-hashed directory and several receipt/coordinate
-files. It also contains artifact-specific Antigravity and Node validators. This is a
-migration constraint, not the target. Do not add another per-artifact validator.
+Reviewing `-WhatIf` is useful for an operator installing packages, but normal agent
+execution after installation needs no repeated approval. Repeat without `-WhatIf`
+when performing the installation action.
 
 Keep during migration:
 
 - absolute install root outside checkout/vendor data;
 - regular-file and path-containment checks;
-- protected credentials rather than secret literals;
-- atomic publication and exact installed byte verification.
+- private credentials rather than descriptor secret literals;
+- atomic publication and exact installed-byte verification.
 
-Delete when the generic package installer is connected:
+Delete when the generic installer is connected:
 
 - per-artifact capability/schema validators;
-- multiple hashes of the same local metadata used only for self-comparison;
-- coordinate identity based on behavior version;
+- coordinate/version branches that decide behavior;
+- repeated hashes of local metadata used only for self-comparison;
 - duplicate Forge/worker installers;
-- checks of retired sibling frontend resource trees.
+- retired sibling frontend inventory and compatibility fixtures.
+
+Do not add another per-runtime installer or validator while deleting the existing
+ones.
 
 ## 5. Host configuration and route selection
 
-The module supervisor receives installed descriptor paths and the owner helper:
+Supervisor configuration references installed descriptors and the current owner
+helper. Provider secrets remain protected references.
 
 ```toml
 [module_supervisor]
@@ -140,102 +132,104 @@ owner_helper_sha256 = '<selected-file-digest>'
 protected_files = {}
 ```
 
-Provider tokens do not belong in descriptor literals. Route configuration selects
-workspace and optional native model/options. The descriptor/catalog is the source of
-module and active package identity; do not maintain another version table in this
-runbook.
-
-Example:
+A route selects one installed module plus native account/service/model/effort/options,
+permission policy, workspace and root capacity:
 
 ```toml
 [[routes]]
 alias = 'antigravity-local'
-runtime = 'antigravity'
+runtime = 'module'
 module_artifact_id = 'eliot-antigravity.rust-headless.1'
 enabled = true
+
 [routes.native_options]
 workspaceRoot = 'D:\work\repository'
 reasoningEffort = 'high'
 ```
 
-After startup, read `module.catalog.get` and select the exact current catalog entry.
-Selection affects future bindings only. A route descriptor or capability does not
-grant Store rights and does not prove a successful native turn.
+Catalog/descriptor provides current package identity. Route selection affects future
+bindings only. It grants no Store rights and proves no native turn.
+
+The active Antigravity source, descriptor, route example, package policy and native
+qualification use version 6. Historical v5 receipts remain historical; they do not
+keep an active v5 capability branch.
 
 ## 6. Frontends and host chain
 
-Public components are `swarm` (`swarm-cli`), `swarm-mcp` and optional
-`swarm-gateway`. Host chain is `swarm-host`, `swarm-kernel-host` and
-`swarm-supervisor`.
+Public components are `swarm`, `swarm-mcp` and optional `swarm-gateway`. Host chain is
+`swarm-host`, `swarm-kernel-host` and `swarm-supervisor`.
 
-The current frontend provenance builder requires clean checkout/build manifests and
-the installer inventories historical sibling resources. Target packaging uses the
-same generic package rules as adapters:
+Package frontends by selected binaries/resources and current IPC protocol. Do not
+require CLI, launcher, host and supervisor to share source commit, compiler or cache
+directory. Build provenance may be retained for diagnosis; behavior compatibility is
+the current protocol and exercised capability.
 
-- selected binaries/resources;
-- current host IPC protocol requirement;
-- atomic install;
-- no requirement that CLI, launcher, runtime and supervisor share source commit,
-  compiler or cache directory.
+## 7. Qualification through the public product
 
-A release may record build provenance for diagnosis. Runtime compatibility depends on
-the current protocol and behavior, not identical build environment.
-
-## 7. Qualification
-
-Qualification must exercise the installed product through public interfaces:
+Qualification is an executable product path, not another proof document:
 
 ```text
-start isolated host
-create authorized manager
+start isolated installed host
+create/use an authorized Manager agent identity
 select installed route
-create/claim Task
-open session
-submit one input
-observe admitted/native/terminal state
-retrieve exact result or honest unknown
-shutdown without replay
+create or select Task and workspace
+open/resume native session
+submit one logical input
+observe admission, native progress and terminal/unknown state
+retrieve exact result
+exercise one question/reply when supported
+restart/reconnect at the selected boundary
+shutdown/release without input replay
 ```
 
-The receipt records selected image/package identity and observable outcomes. It does
-not claim account/model consumption unless the provider source supplies it.
+The resulting receipt records selected package/image and observable outcomes. It does
+not infer account/model consumption or provider success without native evidence.
 
-Remove from qualification as their migrated route permits:
+Automate this path in CI or an owner-machine qualification runner where the real
+provider/account/Windows environment exists. “Owner-machine” identifies the required
+environment; it does not mean a human must perform each command. Humans provide local
+credentials/access and decide unresolved product intent. The runner performs the
+repeatable sequence and publishes exact evidence.
 
-- host/module source commit/tree equality;
-- Cargo.toml/Cargo.lock/toolchain/rustc/cargo equality;
-- target-directory hash equality;
+Remove from qualification as each migrated route permits:
+
+- checkout/compiler/toolchain/cache equality;
 - exact artifact capability/schema arrays duplicated from Rust;
-- mandatory preview plan digest;
+- mandatory launch-preview digest;
 - Antigravity refresh/proof prerequisite;
-- provider catalog response-body hashes as dispatch authority;
-- legacy frontend compatibility inventory.
+- provider catalog response-body hashes as authority;
+- legacy frontend/resource compatibility inventory;
+- incident-specific workflow modes once a lasting regression test exists.
 
-A provider or transport timeout leaves the operation unknown and forbids replay. A
-failed qualification does not kill or reconfigure an externally owned harness.
+Timeout/transport loss leaves the exact Operation unknown and forbids guessed replay.
+A failed qualification does not kill or reconfigure an externally owned harness.
 
-## 8. CI
+## 8. CI during implementation
 
-Normal CI should remain small:
+Normal construction checks stay small:
 
 1. changed Markdown/link/whitespace validation;
 2. rustfmt for changed Rust;
-3. `cargo check` and warnings-denied Clippy for affected packages and local reverse
-   dependencies derived from `cargo metadata`;
+3. `cargo check` and warnings-denied Clippy for affected packages and actual local
+   reverse dependencies derived from `cargo metadata`;
 4. `node --check` for changed JavaScript;
-5. connected focused tests when a product slice closes.
+5. one connected focused regression when a vertical behavior slice closes.
 
-Full native/product qualification is a manual/release gate. Do not add another
-workflow-dispatch mode for each incident. Convert a lasting regression into a normal
-behavioral test, then delete the focused mode and its script branch.
+Broader installed/native/restart/load qualification runs when its connected product
+path exists. Do not create a permanent workflow-dispatch mode per incident. Convert a
+lasting failure into a normal test, then remove the one-shot workflow and patch
+script.
 
-## 9. Current standalone workers
+## 9. Completion for a package slice
 
-Use the existing generic `Install-StandaloneWorker.ps1` for retained standalone
-workers. The separate Forge installer is a duplicate to remove. Script, bus, checks
-and automation executables remain optional selected components; installing an image
-does not create Store admission or execution rights.
+A package migration is complete only when:
 
-Each retained component needs one current package path and one current configuration
-owner. Historical build manifests and executable versions do not justify keeping
-parallel installers or runtime branches.
+- one current installed package owns new work;
+- route/catalog/hello agree on the semantic actions actually implemented;
+- old package/profile gets no new bindings;
+- concrete unsettled work is finished, exported or explicitly re-attempted;
+- replaced descriptor, installer rules, compatibility branches, fixtures and CI are
+  deleted together;
+- public qualification demonstrates the retained positive path and honest unknown
+  outcomes;
+- no normal runtime action has been replaced by an operator procedure.
