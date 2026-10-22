@@ -1,9 +1,9 @@
 # Task policy, specification and model-visible brief
 
 This document defines the target boundary. Current source still retains historical
-owner-policy editions and acceptance branches; [implementation](agent-operations/implementation.md)
-owns their finite removal. [Status](implementation-status.md) records what actually
-works.
+owner-policy editions, acceptance branches and an unconditional dependency gate at
+claim; [implementation](agent-operations/implementation.md) owns their finite removal.
+[Status](implementation-status.md) records what actually works.
 
 ## 1. Three different objects
 
@@ -31,14 +31,15 @@ How an authorized Manager/Governor agent may execute the Task:
 ```text
 route/fallback/profile
 permission/sandbox policy
-session reuse/rotation
+dependency dispatch mode
+session reuse/continuation/rotation budgets
 reviewer/check requirements
 correction/no-progress budget
 selected publication/integration behavior
 ```
 
 Policy affects future admissions. It does not rewrite historical authorship,
-candidates or results and is not embedded as a document hash capability.
+candidates or results and is not embedded as a document-hash capability.
 
 ### TaskPacket
 
@@ -49,6 +50,7 @@ Goal
 Requirements + meaningful verification criteria
 Initial | continuation | correction state
 Selected sources/files/symbols
+Resolved and unresolved dependencies
 Write/forbidden paths
 Worktree/branch/baseline
 Selected route/model/effort
@@ -62,12 +64,9 @@ proof JSON, package receipts or digest chains.
 
 ## 2. Current authority target
 
-One current policy checks:
-
-- authenticated role/client;
-- exact Task/Attempt/assignment/candidate/review/resource scope;
-- expected revision/generation/boot;
-- action permitted by current Manager/GM/project policy.
+One current policy checks authenticated role/client, exact Task/Attempt/assignment/
+candidate/review/resource scope, expected revision/generation/boot and the action
+permitted by current Manager/GM/project policy.
 
 A document path, heading, SHA or historical policy edition is not another permission.
 Manager/Governor is an agent role and uses ordinary scoped rights; operator approval is
@@ -85,12 +84,10 @@ hash gates and old executable branches together.
 ## 3. Requirements and evidence
 
 The current V2 `requirement_evidence_plan` is retained behavior, not bureaucracy to
-delete. Every requirement must name at least one accepted evidence source, such as:
-
-- exact CheckProfile/CheckRun;
-- assigned independent review coverage;
-- retained artifact/result/property readback;
-- explicit selected manual/external evidence only where no executable source exists.
+delete. Every requirement must name at least one accepted evidence source, such as
+exact CheckProfile/CheckRun, assigned independent review coverage, retained artifact/
+property readback or explicitly selected external evidence where no executable source
+exists.
 
 Freeze the plan in the Attempt snapshot. Review assignment and acceptance validate the
 same plan for the exact candidate. A new submission ID, prose confidence or absence of
@@ -100,7 +97,31 @@ reported separately under project policy; they do not waive requirement evidence
 TaskPacket renders concise meaningful criteria for the agent. It does not expose the
 full internal JSON plan or remove the criteria from Store.
 
-## 4. Sources and revisions
+## 4. Dependencies: start policy versus acceptance truth
+
+A dependency expresses the revision/phase that must be accepted before this candidate
+can be accepted. It need not always prohibit preparatory research or implementation.
+
+Target dispatch policy chooses one of two explicit modes:
+
+- `hold`: unresolved dependency keeps automatic dispatch pending;
+- `allow_preparatory`: an Attempt may be claimed and worked, but TaskPacket exposes the
+  unresolved dependencies and acceptance/publication remains impossible until exact
+  dependency acceptance receipts are current.
+
+Direct Governor action uses the same explicit policy; it does not silently bypass the
+acceptance gate. Default automated policy is `hold`.
+
+Current `task.claim` resolves every dependency before creating a new Attempt. That
+unconditional gate is a source gap against the selected target. Move dependency choice
+to dispatch policy and keep exact revalidation in acceptance. Do not create another
+“blocked Task” state machine, dependency workflow or mutable copied receipt ledger.
+
+When a dependency changes required meaning, revise the dependent Task as appropriate.
+A completed old dependency receipt remains historical but does not satisfy a different
+required revision/phase.
+
+## 5. Sources and revisions
 
 Selected source entries retain actual reference, revision/time where available,
 content or bounded excerpt/artifact reference and source gap. A generated brief cannot
@@ -114,7 +135,7 @@ External-source collection does not mutate a working Task automatically. Policy 
 select new source facts and admit an explicit Task revision. A webhook timestamp or
 label alone is not a revision token.
 
-## 5. Assignment and initial input
+## 6. Assignment and initial input
 
 `task.claim` reserves one Attempt and freezes specification/policy/evidence plan.
 `Attempt.start_owner` selects one initial-input owner:
@@ -127,7 +148,7 @@ label alone is not a revision token.
 One Attempt has one `start_operation_id`; follow-up/correction is `agent.send`, not a
 new initial dispatch. A changed request ID cannot repeat the initial prompt.
 
-## 6. Corrections and policy changes
+## 7. Corrections and policy changes
 
 All actionable findings for one candidate return in one `task.request_changes`
 transition. Current owner receives one correction message when live; otherwise the
@@ -141,29 +162,31 @@ Bound unchanged correction rounds. Relevant new evidence can progress the same s
 new IDs or unrelated edits cannot. After the bound, create one addressed Governor
 decision with concrete options, not a permanent human approval step.
 
-## 7. Finite transition
+## 8. Finite transition
 
 Before removing old policy/prompt/acceptance formats:
 
 1. enumerate concrete unsettled Attempts/Operations and required results;
-2. finish/read back under the current owner, export retained evidence or create an
-   explicit new revision/Attempt;
-3. switch new admissions to the current format;
+2. finish/read back under current owner, export retained evidence or create an explicit
+   new revision/Attempt;
+3. switch new admissions to current format;
 4. delete old producer, reader, schema/policy branch, config, fixture and package path
    together.
 
 Completed historical records may remain readable as opaque history through existing
 projections. They do not keep an executable policy engine or universal converter.
 
-## 8. Verification
+## 9. Verification
 
 - Manager agent can create/revise/claim owned Tasks without operator bearer;
 - Task revision freezes specification, policy and evidence plan for its Attempt;
+- dependency `hold` blocks automatic claim; `allow_preparatory` permits visible work
+  but acceptance/publication fails until exact dependency receipts exist;
 - native-manager and controller initial-start paths cannot both send;
-- TaskPacket contains required goal/sources/criteria but no controller proof dump;
+- TaskPacket contains required goal/sources/dependencies/criteria but no proof dump;
 - missing required source remains an explicit gap;
 - each requirement is covered by retained exact-candidate evidence;
 - correction/resume renders current findings without replaying initial prompt;
 - policy change affects future admissions and does not rewrite history;
-- removing document-edition/legacy acceptance branches leaves current scoped rights
-  and evidence semantics connected.
+- removing document-edition/legacy branches preserves current scoped rights and
+  evidence semantics.
