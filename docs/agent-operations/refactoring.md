@@ -1,341 +1,328 @@
-# Refactoring — source-backed findings
+# Refactoring — source-backed findings and deletion map
 
-Runtime source, retained historical requirements and the current documentation were
-rechecked through `6e470726c633209f98fea2bfd7bd12d039f285f1` on 2026-10-21.
-[Architecture](architecture.md) owns the product boundary;
-[implementation](implementation.md) owns the work order;
-[status](../implementation-status.md) separates landed code from plans.
+Current runtime findings were reconciled through
+`c92120ed70ca7e625440a8a19517c481e73b13c9`; active target documents were reconciled
+through `3e4bf9c24fd3024fcbf99107ab572e5bf56559d8` on 2026-10-22.
+[Architecture](architecture.md) owns product law;
+[implementation](implementation.md) owns the only work order;
+[status](../implementation-status.md) records landed evidence.
 
-This is not a claim that every line or live failure mode has been qualified. It is the
-current evidence/deletion map. A proposed simplification is valid only when the
-retained behavior below remains connected and the replaced implementation disappears.
+This is not an exhaustive audit claim. It records confirmed ownership/code-growth
+mechanisms, retained behavior and concrete deletion boundaries. A simplification is
+valid only when its automatic positive path remains connected.
 
-## 1. Behavior that must survive simplification
+## 1. Retained behavior
 
-The old specifications, owner decisions and Claude scripts contain useful behavior as
-well as obsolete machinery. The following requirements are retained.
-
-| Required behavior | Retained authority | What may be deleted |
+| Required behavior | Retained owner/mechanism | Obsolete machinery may be removed |
 | --- | --- | --- |
-| Reconnect the same manager identity after chat/link loss without restarting work | durable `client_id`, current Task/Attempt/Operation and exact native readback | link-specific state, marker files and chat-owned workflow state |
-| Appoint a successor GM while preserving original owners, authors, reviewers and candidates | GM designation/epoch plus current object grants | copying Attempts, rewriting historical actors or adopting old unknown effects |
-| Historical directed mail stays with its original recipient; successor reads current Task/native attention separately | normalized mailbox + Task/Attempt/Operation projections | mailbox reassignment, opaque inherited live stream and coordination participant registry |
-| Lost reply or timeout never authorizes replay of a prompt or external write | retained request/Operation identity plus domain readback | transport-level retry guesses and generic recovery loops |
-| Harness Goal and Eliot Goal remain independent and may be combined | adapter-native Goal + ordinary scheduled/event `Send` | vendor-branched continuation workflow and Goal proof packets |
-| Governor can inspect native/process/worktree/provider facts locally without model/provider calls | stable local source collectors and joined Store projection | optional diagnostic recorder as product state, newest-log/PID/age heuristics |
-| One manager owns one worktree; concurrent writers use non-overlapping path scopes | Task path scope + Attempt workspace lease | advisory symbol/interface locks and generic override workflow |
-| Review/acceptance address the exact candidate | submission/review/check/acceptance records | review disposition/repair slot workflow and caller-authored proof arrays |
-| External writes happen at most once and settle by exact readback after ambiguity | one effect owner per write domain | duplicate GitHub/Forge writers and automatic projection workflow |
-| Remote gateway exposes one fixed Eliot identity/profile behind loopback and external edge security | one gateway process/configured credential/profile | multi-tenant identity broker, proxy platform and gateway database |
+| Same Manager reconnect never restarts work | durable client, Task/Attempt/Operation and native readback | chat/link workflow state and marker files |
+| GM handover preserves Attempt owners, authors, reviewers, candidates and historical recipients | GM designation/epoch + exact current grants | rewriting/adopting old objects |
+| Native-manager delegation never receives a second controller initial prompt | `Attempt.start_owner`, `START_OWNED_BY_MANAGER`, exact producer binding | repeated dispatch receipts/proofs |
+| Lost response never authorizes prompt/external-write replay | retained Operation/native identity + exact readback | transport retry guesses |
+| Harness Goal and Eliot Goal coexist | adapter-native Goal + ordinary scheduled/event Send | vendor-branched Goal workflow/proof packets |
+| Agents execute the full routine work cycle | one current-state policy loop using ordinary commands | WorkDispatch/review-repair/publication workflow engines |
+| Native questions and permissions do not hang or default to deny/first choice | native policy + exact Reply + addressed Governor decision | queued Send masquerading as answer and manual relay |
+| Corrections return all findings; missing reviewers can be replaced | current review result/replacement classes + one request-changes transition | ReviewDisposition/RepairDispatch slots/links/cursors |
+| Acceptance proves frozen requirements for exact candidate | per-requirement evidence plan + exact CheckRuns/reviews | prose “done”, caller-authored proof copies and legacy policy branch |
+| Governor observes native/process/worktree/provider facts locally | provider/process/Git/remote collectors + one joined Store view | optional diagnostics as product truth and newest-log/PID heuristics |
+| One manager owns mutable Git/worktree; leaf writers are disjoint | Task path scope + workspace lease + manager Git ownership | `code.scope.*` proposal/override system |
+| Results survive link/process failure without input replay | exact retained StoreDelivery + origin Operation/boot readback | memory-only pending receipts and universal journals |
+| External writes happen at most once and settle by readback | one effect owner per domain | duplicate GitHub/Forge writers/projection workflow |
+| Direct peer work remains available | normalized addressed mailbox + scoped grants + optional tiny Task thread | cards/contracts/integration/Concilium platform |
+| Remote gateway exposes one fixed identity/profile | one loopback gateway + private credential loader | identity broker/proxy/database |
 
-Old defaults such as fixed-age restart, newest-session guessing, automatic form answers,
-forced model rotation and independent lane daemons are historical operating policy, not
-product requirements.
+Historical implementation is not itself a requirement. Fixed-age rotation,
+newest-session ownership, automatic “recommended” answers, silent model fallback and
+independent lane daemons are rejected operating heuristics.
 
-## 2. Implemented reductions and current verification truth
+## 2. Landed source reduction and verification truth
 
 ### Duplicate host CLI
 
-Commit `25a8e3b` removed the duplicate host application CLI/MCP launcher:
+`25a8e3b` removed the duplicate host application CLI/MCP launcher: host `main.rs`
+1,949 → 743 physical lines, recorded net −1,206 Rust lines.
 
-- host `main.rs`: 1,949 → 743 physical lines;
-- net owned Rust reduction: 1,206 lines.
+### Antigravity
 
-### Antigravity A0
+- `cba98b7`: active Rust coordinate aligned on v6.
+- `eeea355`: terminal receipt no longer requires Store observation ID or duplicate
+  `local_execution_results`; recorded net −265 production Rust lines for that commit.
+- `c92120e`: one dispatch producer is updated across SUCCESS/ERROR/CANCELED instead of
+  appending another identity. Run `39579583956`, job `119153571930`, passed the
+  connected terminal regression and minimal Store Clippy before publishing it.
 
-Commit `cba98b755ff8d93405f91751a00d6dd6d91bbb60` synchronized active Rust
-Antigravity selection on artifact version 6. Historical v5 receipts remain history,
-not a current selection branch.
+Still open: dispatch proof/refresh gate, crash-unsafe in-memory delivery and extra
+command/profile surface. Installed harness, crash and scale behavior remain
+unqualified.
 
-### Antigravity A1a
-
-Commit `eeea3558d66a1525c9f5c2d9f3b4f75c62714bf8` removed the terminal receipt's
-required Store observation ID and duplicate `local_execution_results` dependency. Its
-production Rust diff was net −265 lines.
-
-This slice is not verified complete. The later repair run tested a temporary patched
-tree and failed because a rejected terminal producer projected a null
-`completion_condition`. The main Rust workflow for the latest head skipped changed
-Rust compilation/Clippy. The producer contract, test expectation and final intended
-rejected/cancelled semantics still require one connected correction.
-
-A1b, A2 and A3 remain unimplemented: dispatch proof removal, durable Store delivery
-and real-action-only Antigravity surface.
-
-## 3. Recurring causes of code growth
+## 3. Repeated causes of growth
 
 ### One fact becomes several products
 
-Eliot repeatedly represents one authority/state/recovery decision as a Store row, JSON
-receipt, proof packet, workflow state machine, cursor family, compatibility profile and
-qualification fixture. Refactoring must remove duplicate ownership rather than move it.
+The same decision is repeatedly represented as domain state, JSON receipt, proof
+packet, workflow state, cursor family, compatibility profile and qualification
+fixture. Refactoring must choose one owner and delete the others, not relocate them.
 
-### Package metadata drives runtime behavior
+### Metadata becomes behavior and permission
 
-Store/adapters compare artifact versions, builds and exact schema inventories. Optional
-behavior creates another profile and branch. Package identity belongs to install/
-inventory; Store authorization and semantic capabilities govern behavior.
+Artifact version/build, schema inventories, document editions, source checkout,
+compiler/cache path and payload hashes select runtime behavior or authorization.
+Target behavior uses authenticated actor/object scope, current revision/generation/
+boot and semantic capability. Verify package bytes at install/launch and artifact bytes
+at storage boundaries.
 
 ### Receipts echo Store-owned identity
 
-Package/protocol, Task/Attempt/revision, request/source/prompt hashes and nested receipts
-are repeated through dispatch/outcome/result. Keep only stale binding/boot guards,
-native identity/disposition and hashes of actual immutable bytes.
+Task/Attempt/revision, request/source/prompt hashes and nested package/protocol receipts
+are repeated across dispatch, outcome and result. Store already retained the Operation
+and authenticated binding. Keep stale generation/boot guard, native identity,
+disposition and real immutable-byte integrity only.
 
-### Adapter persistence became universal journals
+### Adapter persistence becomes universal journals
 
-Claude, Codex, Command, Muse and OpenCode persistence mixes native intent, Store
-delivery, results, observations, callbacks, startup inventory, tombstones and
-compaction. Separate only real lifetimes:
+Claude, Codex, Command, Muse and OpenCode combine native intent, Eliot delivery,
+results, observations, callbacks, startup inventory, tombstones, compaction and
+retention. Use only actual lifetimes:
 
 ```text
 SessionRecord
 NativeEffectRecord
 StoreDelivery
 ObservationCheckpoint
-persisted/readable result when required
+persisted/readable result where required
 ```
 
-Do not build a shared event-sourcing framework.
+Do not extract another shared event-sourcing framework.
 
-### Parallel executor generations remain
+### Parallel executors survive every migration
 
-| Runtime | Current duplication | Target |
+| Runtime | Current duplication | Selected target |
 | --- | --- | --- |
+| Antigravity | Rust + retained Node profiles | one Rust route after A1b–A3 |
 | OpenCode | built-in host + standalone Rust | one exact live-qualified standalone route |
-| Muse | active Node + disabled custom Rust | simplify Node, delete custom Rust after disposition |
-| Codex | current Rust + retired Python/profile history | one Rust app-server route |
-| Claude | Rust/SDK + retained Node generations | one Rust adapter |
-| Antigravity | Rust + retained warm bridge profiles | one Rust route after transition |
+| Codex | Rust + retired Python/profile history | one Rust app-server route |
+| Muse | active Node + disabled custom Rust | simplify Node `.13`; retire custom Rust |
+| Claude | Rust/SDK + retained Node generations | one Rust adapter with selected official SDK driver |
 | Command | Batch profile ladder + ACP generations | one Batch + one stable ACP v1 |
 
-Historical completed records do not keep executors alive.
+Completed history does not keep an executor or permanent translator alive.
 
-## 4. Workflow and authority duplication
+<a id="code-reduction-candidates"></a>
+## 4. Confirmed workflow/authority duplication
 
 ### WorkDispatch copies Task lifecycle
 
-It stores global/per-entry cursors, pending subjects, rechecks, slots, links and
-quarantine. A bounded current queue plus one atomic `dispatch_once` is sufficient.
+It retains global/per-entry cursors, pending subjects, activation/catch-up state,
+rechecks, semantic slots, links and quarantine. Its 128-item pending behavior can hide
+later eligible work. Replace with a ranked current query and one atomic
+`dispatch_once`; reuse suitable sessions according to explicit continuation policy.
+
+### Automation action registry hides missing ordinary actions
+
+Current `AutomationStep` lists ten workflow steps and `has_consumer()` returns true for
+all, making `capability_gap()` ineffective. `supported_action_for()` maps only some
+steps; ReviewDisposition, RepairDispatch and Acceptance rely on separate consumers
+rather than one ordinary Store action.
+
+This is why “all steps have a consumer” does not prove a complete positive path.
+Target actions are:
+
+```text
+dispatch | review | return_changes | accept | check | goal_message | script
+optional source_import | publish
+```
+
+Each queries current state and calls the ordinary domain handler. Remove old enum
+values, consumers, policy, config/schema, worker demand, cursors, slots, links and
+fixtures in the same connected slice.
+
+### Review/correction repeats one candidate relation
+
+`automation_repair.rs` duplicates review/candidate/manager identity in semantic slots,
+operation links, entry links, finding packages and digests after an explicit review
+disposition and feedback chain. The domain already owns `review.submit`,
+`task.request_changes`, review replacement and candidate evidence.
+
+Use one `return_changes` action: select current actionable findings, apply one exact
+Task transition and admit one correction Send when owner is live. Preserve current
+`ReviewReplacementClass::{Unanswered, Inconclusive, ReturnedForCorrection}`. Do not
+reimplement a fixed missing-reviewer defect.
 
 ### `code.scope.*` duplicates workspace authority
 
-It models proposals, symbols, digests, modes, override and expiry but does not own the
-worktree. Task path prefixes plus the Attempt workspace lease are the actual write
-authority and conflict guard.
+It models paths/symbols/interfaces, proposals, digests, modes, override and expiry but
+does not own the worktree. Task path prefixes and Attempt workspace lease are the
+actual controller write authority/conflict guard. Preserve role/object grants and
+manager Git ownership; delete the advisory product.
 
 ### Capacity copies Operation lifecycle
 
-Capacity phases/evidence/meta indexes count read/control methods as execution. Count
-unresolved root opens and unreleased root bindings transactionally; report capacity as
-a projection.
+Capacity phases/evidence/refusal rows and meta indexes mirror Operations and include
+read/control methods. Count/reserve unresolved root opens and unreleased root bindings
+inside launch admission; provider usage/availability is source observation;
+`report.capacity` is a projection.
 
 ### Scheduling is triplicated
 
-In-process scheduler, standalone scheduler service and automation loop overlap. One
-in-process Store-change/nearest-due loop admits ordinary Operations. Separate workers
-remain only for real external effects/custody.
+Host scheduler, standalone scheduler service and automation loops overlap. One
+in-process Store-change/nearest-due/safety loop admits ordinary Operations. Separate
+workers remain only for actual external I/O/custody.
 
-### Review/correction is another workflow family
+## 5. Task, prompt, review and acceptance findings
 
-ReviewDisposition, RepairDispatch, slots and separate Acceptance repeat one candidate/
-review/manager relation. Keep `review.submit`, one `task.request_changes` transition
-and the common candidate-specific acceptance gate.
+### TaskPrompt spreads controller proof through every runtime
 
-## 5. Store, API and frontend findings
+`TaskPromptEnvelopeV1` is consumed by Store, batch/zed paths and all major adapters.
+Model input includes controller identity/JSON/hash structure, while adapters echo it
+through dispatch context and admission receipts.
+
+Target TaskPacket renders goal, requirements, current initial/continue/correction
+state, selected sources, write boundary, workspace, route settings, deliverable and
+verification. Store retains Task/Attempt/Operation/binding identity. Migrate consumers
+route by route; do not introduce a flag-day prompt format.
+
+### Verification criteria are not bureaucracy to delete
+
+Current V2 acceptance has a frozen `requirement_evidence_plan`; every requirement must
+name at least one evidence source. Reviews, checks and acceptance already validate it.
+Preserve that semantic plan while removing duplicate hashes/envelopes. Expose meaningful
+criteria in TaskPacket so an agent can finish the work; never reduce acceptance to
+prose confidence or “no new errors” alone.
+
+### Manual and automatic acceptance must converge
+
+One common gate resolves current candidate-specific review/check evidence and frozen
+requirements. Manager/Governor supplies a decision/reason, not another auditor result.
+Candidate B needs B's evidence. Known unrelated baseline failures remain separate under
+selected policy, but differential cleanliness alone proves no requirement.
+
+## 6. API, Store and frontend findings
 
 ### Public API ownership is fragmented
 
-Method policy, MCP catalog/profiles/schemas, mutation validation, Store dispatch and
-visibility SQL each encode part of the surface. A retained domain needs one typed
-parser/authorizer/handler. Public, internal-worker and adapter protocols must separate.
+Method registry, MCP catalog/profiles, request validation, Store routing, role checks
+and visibility SQL each encode part of the surface. A retained domain owns typed parse,
+exact role/object/revision authorization and handler. Public, internal-worker and
+adapter protocols separate. Removing a product removes all its schemas/routes/policy/
+storage together.
 
-### Store migration protects SQL text
+The old MCP profile document still claimed an already-fixed operator-only Task defect;
+active docs now use current `require_task_planner` behavior. Stale defect text is itself
+a code-growth hazard because it causes agents to add unnecessary grants.
 
-Base-schema SHA, extension digests, reference database and DDL-token validation protect
-historical source text. Use application ID, numeric `user_version`, ordered
-transactional migrations and bounded postconditions. Convert only concrete retained
-data once.
+### Store evolution protects historical SQL text
 
-### MCP underuses its multiplexed client
+Base SQL SHA, extension digests, reference database and DDL-token checks protect source
+text rather than current schema semantics. Use application ID, numeric `user_version`,
+ordered transactional migrations and bounded postconditions. Migrate concrete retained
+data only.
 
-`swarm-client::Client` can correlate concurrent requests while MCP holds a connection
-mutex through awaited calls. Clone the current client and release the mutex before RPC.
-One coalesced wake pump should replace per-subscription poller/forwarder/queue stacks.
+### MCP underuses multiplexing and duplicates wake paths
 
-### Hot views perform broad scans
+`swarm-client::Client` correlates concurrent requests while MCP retains a connection
+mutex across calls. Clone the current client and release the mutex before RPC. Replace
+per-subscription poller/forwarder/queue stacks with one coalesced wake pump; Store
+history is replay authority.
 
-`tasks/get` pages global attention to find one pending input. Mailbox reads scan the
-shared observation timeline. Native in-memory stream operations run through the Store
-writer. Add exact addressed reads and move ephemeral ring work outside the writer.
+### Hot reads perform broad work
 
-### TaskPrompt sends controller internals to the model
+`tasks/get` pages global attention to find exact pending input. Mailbox reads scan the
+global observation timeline. Native in-memory ring operations run through Store writer.
+Add exact addressed reads; move ephemeral ring work outside writer after a short
+authorization snapshot.
 
-Identity JSON, canonical brief, launch packet and hash chains enter the prompt and are
-then echoed through adapters/results. Model-visible input needs only goal,
-requirements, sources, scope, workspace, deliverable and verification; Store retains
-identity.
+## 7. Governor observation findings
 
-## 6. Governor observation findings
+Current inventory starts from ready bindings, so unmatched provider sessions/processes
+and surviving shared services can disappear. Process metrics is a separate selected
+Windows CLI path and repeats executable verification. Workspace lease shows launch-time
+baseline/clean evidence rather than current branch/HEAD/dirty. Remote-ref readback is
+attached to Forge publication. Provider usage/conditions remain binding/artifact
+oriented.
 
-Current inventory starts from ready bindings. Unbound native sessions/processes and a
-surviving shared service can disappear. Process metrics is a separate Windows CLI for
-at most eight selected identities and repeats executable verification. Workspace lease
-projects preparation-time baseline/clean evidence, not current branch/HEAD/dirty.
-Remote-ref readback exists only inside Forge publication. Provider usage/conditions are
-binding/artifact-oriented.
+Target uses concrete provider/process/worktree/remote sources with epoch/cursor/
+freshness/coverage, current native/process/Git facts and assignment edges in one joined
+WAL projection. Ordinary reads invoke no provider/model/filesystem/network call.
+Do not build a generic entity graph or telemetry warehouse.
 
-The replacement uses stable source records, provider-local readers independent of
-Task/binding, one process collector, one worktree collector, independent remote-ref
-cache, current subjects plus assignment edges and one joined WAL projection. Ordinary
-reads make no provider/model/filesystem/network call.
+## 8. Mailbox and coordination findings
 
-## 7. Mailbox and coordination audit
+Current message bodies/identities live in settled Operation JSON; `message.read` scans
+the common observation timeline. One message may have request ID, Operation ID,
+`cmsg-*` ID and random delivery ID. Reply/cancel lookup uses JSON expression indexes
+and corruption sentinels.
 
-### Current mailbox mechanics
+Normalize recipient-indexed mailbox rows keyed by Operation/message ID. Preserve
+sender, recipient, Task/Attempt/thread, reply/cancel and cursor. Same client reconnects;
+GM handover changes designation/epoch but never rewrites historical recipients.
 
-`message.send` and typed coordination sends settle as Operations whose message body and
-identities live in `operations.result_json`. `message.read` is not a recipient-indexed
-mailbox table: it scans the common observation timeline, filters candidate rows by
-recipient/role, resolves object grants and then loads each payload. The scan is bounded
-and disclosure checks are careful, but every mailbox page traverses the global event
-surface.
+Delete duplicate participant directory, cards, consult vocabulary, speech-act thread
+workflow, watches, contracts/ratification, integration ACK, Concilium and code scope
+after current callers move. Preserve base authentication, scoped worker/reviewer
+access, direct peer mail, review and optional tiny grouping thread. Define automatic
+wake/resume so simplification does not become a human relay.
 
-One logical message can have four identities:
+## 9. External integration and gateway findings
 
-- caller `client_request_id` for idempotent admission;
-- Operation ID;
-- typed coordination `cmsg-*` message ID;
-- randomly allocated delivery ID.
+### GitHub
 
-Reply/cancel lookup searches settled Operation JSON across legacy and typed methods,
-using JSON expression indexes and corruption sentinels. This is valid historical
-behavior, not a compact storage model.
+Current poll wraps a GET in Operation/lease/recovery state, pages mutable `updated desc`
+and in the same transaction stores facts, mutates Tasks and updates a separate work
+pool. API writes have direct-label and Forge-PR owners; automatic projection adds
+activation/catch-up/quarantine/drain workflow state.
 
-### Continuity semantics that must remain
+Separate:
 
-Current `gm.handover` correctly changes only GM designation/epoch. It does not rewrite
-Attempt owner, restart native work or reassign historical mail. Its report/mailbox
-watermarks are explicitly not acknowledgements; the successor resynchronizes
-`report.delta`, `message.read` and current attention. Preserve this behavior.
+1. bounded source collector with stable coverage/high-water;
+2. policy-selected Task import in a separate mutation;
+3. one GitHub API effect owner with durable sending and exact readback;
+4. Forge for remote Git only;
+5. independent remote-ref observation.
 
-A reconnect with the same durable `client_id` retains its mailbox cursor and existing
-work. A different successor gains current Task/Attempt control through exact GM scope,
-not through ownership rewrite. Historical recipients/authors/reviewers remain intact.
+Enabled policy may import/publish automatically through ordinary actions. Removing the
+projection engine must not create a manual publication requirement.
 
-### Coordination is a second collaboration platform
+### Gateway
 
-Beyond mailbox delivery, the current coordination surface adds participant token
-registrations, work/contract cards, consult vocabulary, threads with speech acts and
-proposal revisions, watches, contracts/ratification, integration ACK, Concilium and
-code scopes. These overlap existing identities:
+Keep loopback-only, exact path, one credential/profile/bearer, Host/Origin/body/header/
+request/connection bounds and timeout-as-unknown. Replace plain secret-file reads with
+the shared private bounded loader, cap negotiated sessions/idle lifetime and remove the
+compatibility launcher after callers switch. One process is one Eliot principal; no
+identity broker/proxy/database.
 
-- consultation is an addressed message;
-- review is the review subsystem;
-- write conflict is the workspace lease;
-- watch is a subscription or explicit automation condition;
-- agreement does not grant Store authority;
-- GM continuity comes from durable identities and current object grants.
+## 10. Packaging, modularity and documentation findings
 
-### Target
+Active `modularity.md` still described the full descriptor/schema echo,
+`ModuleReceiptIdentity` and hashed `swarm.task_prompt@1` as target after implementation
+had selected a compact semantic protocol. `configuration.md` retained workflow actions
+scheduled for deletion. `module-installation.md` left Muse executor selection open and
+called product qualification manual. `mcp-profiles.md` repeated an already-fixed Task
+planner defect.
 
-Add one normalized recipient-indexed mailbox table keyed by the admitted Operation ID
-as the durable message ID. Store sender, recipient, optional Task/Attempt/thread, kind,
-bounded body or artifact ref, reply target, cancellation reference and monotonic
-mailbox cursor. Reading is non-destructive and cursor-based. Historical messages remain
-addressed to the original recipient.
+These active contradictions were corrected in `3e4bf9c`: target protocol major +
+semantic capability subset, one selected runtime route, agent policy actions, automated
+public qualification and current profile boundary. Historical docs remain evidence,
+not active requirements.
 
-Keep a minimal Task-scoped thread only if a current consumer needs grouping. Delete the
-participant registry, cards, consult/watch/contracts/integration/Concilium/code-scope
-products and their policy, indexes, backfills, cursors and fixtures after callers move.
-Migrate only unresolved messages required by concrete work; completed Operations remain
-historical records without a permanent translator.
+Package existence does not justify a process or permanent crate. A separate process is
+for native SDK isolation, external I/O/custody or real fault containment. Conditional
+donors such as CCCC remain conditional until a connected path needs them and deletes
+current code.
 
-## 8. GitHub integration audit
+## 11. Audit gaps
 
-### Source polling is modeled as an effect workflow
+The audit remains incomplete. Before a final-complete claim:
 
-`github.source.poll` is a read-only GET represented as queued/sending/
-outcome_unknown Operation plus a poll lease, cancellation/recovery and source state.
-Reads page Issues sorted by mutable `updated desc` and persist the next page between
-polls. Items can move across pages, so a later poll can miss a changed item even though
-coverage is reported honestly as partial.
+1. trace every retained public action from current caller through typed parse,
+   authorization, Store transition, effect/readback and final consumer;
+2. include cancellation, restart, late result, transfer and partial-write branches;
+3. map every retained historical requirement to current owner and connected behavior;
+4. recheck findings after each runtime slice and remove stale/contradictory active docs;
+5. execute privilege and retained-format/migration/corruption matrices on the reduced
+   surface;
+6. qualify installed providers, Windows custody, IPC/Store fairness, mixed routes,
+   gateway, autonomous end-to-end cycle and scale in the required environment.
 
-### Collection, Task import and queue selection are coupled
-
-The poll commit stores source facts and, in the same transaction, creates/revises
-Tasks, records mapping conflicts, updates work-pool members and settles the poll.
-`github.work_pool.apply` then stores another selected/order queue beside Eliot's Task
-queue. Source observation, Task import and work selection are separate responsibilities.
-
-### Writes have two owners
-
-Managed Issue labels use the direct `GhCli` path with durable `sending`, at-most-one
-write and exact Issue readback. PR description updates use `swarm-forge-worker`, its
-private job/custody/result protocol and then exact PR readback. The semantic safety
-rule is correct; the duplicate execution/custody path is not.
-
-Automatic GitHub projection adds activation/catch-up watermarks, global/per-entry
-cursors, quarantine/recent state and an effect-drain cursor to turn acceptance events
-into labels. This is another workflow engine and is not part of Task acceptance.
-
-### Target
-
-1. A bounded source collector reads current Issue/PR facts from page one to a stable
-   high-water/cursor, retains source epoch/freshness/partial coverage and periodically
-   reconciles. A GET does not create an Operation lifecycle.
-2. Explicit manager/policy import turns selected source facts into compact Task specs in
-   a separate transaction. Imported Tasks enter the ordinary Eliot queue; delete the
-   GitHub work pool.
-3. One GitHub API effect owner performs explicit label/PR metadata writes: durable
-   sending, one write attempt and exact readback. Forge remains remote Git push only.
-4. Delete automatic projection watermarks/cursors/quarantine/drain. Remote
-   repository/ref/head/time/error feeds the independent Governor remote collector.
-
-Preserve immutable repository ID checks, bounded response/text limits, no credential
-storage in Store, unknown-after-write semantics and exact readback before any retry.
-
-## 9. Remote gateway audit
-
-The gateway already has the right narrow product boundary:
-
-- loopback-only listener;
-- exact `/mcp` path and no query;
-- one configured Eliot credential and restricted MCP profile;
-- bearer auth with duplicate-header rejection and constant-time comparison;
-- Host/Origin validation delegated to RMCP;
-- body/header/request-time/connection limits;
-- timeout explicitly reports unknown outcome rather than safe retry;
-- stopping the HTTP route does not cancel admitted Eliot work.
-
-Remaining defects:
-
-- credential and bearer files are read with ordinary `std::fs` calls: no shared
-  regular-file/private owner/ACL/mode/symlink-reparse enforcement;
-- one credential/profile/bearer is shared by all connections and negotiated sessions;
-  this is one principal, so one process/listener must be treated as one tenant;
-- connections are bounded, but negotiated session count/idle lifetime needs an explicit
-  bound rather than relying on transport disconnect behavior;
-- the kernel-host compatibility launcher remains an extra entry path after callers move.
-
-Use the existing bounded private-file primitive, bind one gateway process to one
-identity/profile, cap active sessions and idle lifetime, retain loopback/Host/Origin/
-body/time controls and leave TLS/edge identity outside. Do not add an identity broker,
-reverse-proxy product or gateway database.
-
-## 10. Findings that remain unproved
-
-The audit is still incomplete. Remaining source work includes:
-
-- reconcile every retained requirement from old specs/scripts against current callers;
-- finish public method → role → exact object → Store/effect/result tracing;
-- cover cancellation, late result, restart and partial-write branches for retained
-  paths;
-- reconcile findings after intervening runtime commits;
-- execute migration/corruption/partial-upgrade and privilege matrices after the reduced
-  surface exists;
-- live-qualify Windows custody, provider restarts, mixed-provider routes, gateway and
-  scale on the owner machine.
-
-Do not turn these gaps into another issue hierarchy or framework. Record evidence in
-this file, implement the existing vertical slices and keep status honest.
+Do not turn these gaps into another framework or global gate before coding. Close the
+matching audit path while implementing each existing vertical slice and keep status
+honest.
