@@ -1,228 +1,221 @@
 # Audit register
 
-Durable source-audit resume point: inspected commit, paths, confirmed/refuted findings,
-useful mechanisms and untraced boundaries. Not a runtime registry, approval gate or
-second implementation queue. [Implementation](implementation.md) owns the work order;
+Durable source-audit resume point: inspected revision, exact paths, findings, preserved
+behavior and untraced boundaries. Not a runtime registry or second implementation
+queue. [Implementation](implementation.md) owns changes;
 [status](../implementation-status.md) records landed behavior.
 
 ## Resume here
 
-- Pass: **2026-10-23 / queue progress and root-capacity admission**.
-- Inspected head: **`a0bc1dcb69fa4a2d3dea1e51e3c5b0d148bde1bb`**. The preceding commit
-  changed documentation, not the runtime findings carried below.
+- Pass: **2026-10-23 / cancellation, resource disposal and read/control admission**.
+- Inspected head: **`c0d1b91f15636982f977768474f7246b97308d61`**. Its comparison with
+  `a0bc1dcb` changes only audit-register/launcher documentation. Earlier runtime
+  findings remain open; this comparison is not a reread of every source.
 - Overall audit: **incomplete**; no measured completeness percentage.
-- Traced selected root-count, route-admission, WorkDispatch and launch-reservation
-  paths, plus provider-condition selection and Antigravity's native-default model.
-- Added **AR-036–AR-040**. Root deduplication and the existing stable launch scan are
-  preserved; history-dependent capacity and the separate pending-subject cap are not.
-- Owning target updated: [launcher/queue](../swarm-launcher-assignment-context.md).
-  Implementation B remains the only implementation order.
-- **Next exact chain:** `runtime::next_internal` route-admission hold and control/read
-  bypasses -> direct `operations::open` and launcher callers ->
-  `launcher::fail_launch`, workspace release, binding release and
-  `owned_service_starts` disposition -> surviving root claims. Check cancellation,
-  rejected/unknown Open, configured-limit reduction and route edits before asserting
-  either a leaked reservation or a safe release.
-- Also trace provider-source invalidation on release/disconnect/account change. AR-039
-  proves precedence when old and fresh rows coexist; it does not claim every release
-  leaves that pair or that independent quota windows may be discarded.
-- Documentation only. No runtime change, Clippy, test, installed harness, benchmark or
-  independent verifier ran. Selected transaction bodies were read; the complete direct
-  caller/concurrency matrix was not executed or exhaustively traced.
+- Traced next-command selection/guards/quota hold, direct Open reservation, generic
+  cancellation, held-workspace commit and later admission, workspace release,
+  owned-service pre-start cancellation, current root policy and native/IPC disconnect.
+- Added **AR-041–AR-044**; extended AR-039. Read/control quota bypass and the exact
+  pre-spawn cancellation fence are preserved. Cancellation/rejection must also dispose
+  attributable no-effect reservations, not merely change an Operation.
+- Owning target: [launcher/queue](../swarm-launcher-assignment-context.md).
+- **Next exact chain:** successful `agent.shutdown` / native close -> exact resource
+  departure -> binding retirement -> root-count and workspace release. Trace externally
+  attached services separately from owned processes, active children and native Goals.
+  Then inspect launch cancellation after binding/Open attachment, route-edit budget
+  continuity and the complete direct-call transaction/concurrency path. Never infer
+  native death from socket close or a terminal Task.
+- AR-044 confirms the predicate after lowering a limit, not an executed live reload.
+  AR-042 covers a verified-held unbound lease, not every cancellation.
+- Documentation only. No runtime change, Clippy, tests, benchmark, installed harness
+  or independent verifier ran. External donors/SDKs were not freshly qualified.
 
-On resume compare source changes with this head and revisit changed callers/consumers.
-A finding remains open until repaired with connected evidence. A search hit or read
-test is not a completed runtime check.
+On resume compare changed source and recheck callers/consumers. A search hit, read test
+or docs commit is neither executed qualification nor a runtime repair.
 
 ## Evidence labels
 
-**Source-confirmed** means the named path supports the consequence, not live
-reproduction. **Preserve** means useful existing behavior. **Partial** names an
-untraced boundary; **inherited** means earlier evidence not reread in this pass.
-Review, implementation and executed verification remain separate.
+**Source-confirmed** means a named path supports the consequence, not live reproduction.
+**Preserve** identifies useful behavior. **Partial** names an untraced boundary. Earlier
+rows remain inherited evidence unless explicitly reread.
 
 ## Findings and coverage
 
 | ID | Requirement / path | Disposition | Remaining boundary |
 | --- | --- | --- | --- |
-| AR-001 | Antigravity reporting versus native execution | **Open.** Report retries block the terminal reducer; failure reaches stdin shutdown and drained facts can remain memory-only. | Independent Store delivery and continuous native draining. |
-| AR-002 | Complete result retention | **Open.** The 32-response cache can evict the only uncollected body. | Durable source lifetime and pressure before new admission. |
-| AR-003 | Exact result identity | **Preserve.** Operation/conversation/generation and unavailable oversized-output semantics. | Keep causality while deleting package-proof copies. |
+| AR-001 | Antigravity reporting versus execution | **Open.** Report retries block native reducer; failure closes stdin and drained facts can remain memory-only. | Independent delivery and continuous native draining. |
+| AR-002 | Complete result retention | **Open.** The 32-response cache can evict the only uncollected body. | Durable source lifetime and admission pressure. |
+| AR-003 | Exact result identity | **Preserve.** Operation/conversation/generation and explicit unavailable oversized output. | Keep causality, delete package-proof copies. |
 | AR-004 | Adapter restart | **Open.** New Antigravity Controller has empty body/delivery caches. | Original-Operation successor delivery, no prompt replay. |
-| AR-005 | Admitted page completion | **Preserve.** Sealed normalized origin permits narrow late completion and exact replay ACK. | First historical admission and partial storage. |
-| AR-006 | Continuation output | **Open, cross-route.** Generic origin and selected adapters remain Dispatch-centric; Muse item addressing does not repair Store admission. | Same source-Operation/page/candidate path for attributable Send. |
-| AR-007 | Assembly and byte reads | **Preserve.** Publication/registration, contiguous coverage, digests and object grants. | Crash/power-loss and remaining grant/cache races. |
-| AR-008 | Authentication versus completion | **Preserve boundary.** Disabled credentials fail new handshake; an authenticated carrier has narrow prior-page completion. | Revocation and successor delivery. |
-| AR-009 | Send attribution | **Mixed.** Selected Manager/Repair/Goal paths retain Operation scope; session-only input can be taskless. | Explicit task-linked versus taskless authority. |
-| AR-010 | Repair delivery classification | **Open.** Requires provider-specific ID/condition and maps every Rejected/Cancelled to no effect. | Common admission/terminal facts; executed failure is not non-delivery. |
-| AR-011 | Same-Attempt correction | **Preserve.** `needs_correction` can resubmit against expected revision/prior submission; stale publication stays historical. | Continuation origin through candidate validation. |
-| AR-012 | Revision fences input | **Open.** Old Attempt survives revision; direct Send can become accidentally taskless or dispatch without revision recheck. | Supersede unsent old work and check exact subject before effect. |
-| AR-013 | GM cleanup of old work | **Open.** Current GM can revise beneath another owner but then cannot release that superseded Attempt. | Historical cleanup authority without rewriting owner. |
-| AR-014 | Release preserves capture | **Open.** Release cancels queued Result together with non-check Operations. | Cancel by effect semantics, not broad method exclusion. |
-| AR-015 | Restart credential | **Preserve.** Stable binding-scoped credential; no implicit token rotation. | Live restart/revocation. |
-| AR-016 | Old-boot first delivery | **Open.** Unseen old-boot terminal fails current-boot validation; identical committed outcome may replay-ACK. | Execution origin distinct from delivery actor. |
-| AR-017 | Recovery-fenced capture | **Open.** Recovery predicate filters Result before completion-only exception. | Exact completion/readback without native readiness. |
-| AR-018 | Supervisor recovery | **Scope correction.** Intake/process-demand recovery is not native-byte import. | Keep import in adapter/Store owners. |
-| AR-019 | Inconclusive lookup completion | **Open.** Antigravity labels a completed inconclusive Reconcile itself Unknown. | Applied lookup with `resolved:false`; target still unknown. |
-| AR-020 | Terminal versus release | **Boundary.** Late terminal can update an immutable unreleased old Attempt; terminal does not prove capture. | Preserve output obligation and producer fences. |
-| AR-021 | First historical Result | **Open.** New normalized admission requires current open unreleased Task/Attempt. | Source-scoped completion admission; retain sealed late-page path. |
-| AR-022 | Automatic capture/readback | **Open.** Current automatic consumers do not create Result/Reconcile; Doctor recommends only. | Bounded current-state helpers through ordinary commands. |
-| AR-023 | Supervisor readback | **Scope correction.** Unresolved IDs/status do not settle targets. | Store/adapter semantic recovery. |
-| AR-024 | Page ACK and source release | **Open; target corrected.** Boolean ACK is insufficient. An adapter-local ACK-range ledger would duplicate Store. | Store-authoritative complete/next-missing coverage. |
-| AR-025 | Heterogeneous sources | **Boundary.** Local body/file and provider locator have different lifetimes. | Share ready-record delivery, not source journal. |
-| AR-026 | Claude ready-page loss | **Open.** Intent is journaled but ready page bytes are not; ambiguous ACK becomes Unknown and replay is refused. | Persist exact ready page; never replay SDK execution. |
-| AR-027 | Codex delivery | **Preserve plus gaps.** Exact page params survive restart; new reads are Dispatch/current-root dependent. | Keep delivery, remove full checkpoint/tombstones; AR-032/033 qualify source reading. |
-| AR-028 | OpenCode retention | **Preserve plus gaps.** Exact page replay and assistant parent; permanent `result_source` and Dispatch-only target. | Coverage-driven release, no retention graph. |
-| AR-029 | Command release | **Preserve plus excess.** Exact saved page works; source cleanup has release-proof Operations/tombstones. | Store-complete coverage then local cleanup. |
-| AR-030 | Muse source read | **Preserve plus qualification.** Exact item/revision/output ref and native range validation; ready page checkpoint. | AR-034 identifies unbounded repeated discovery; not all native reads are bounded. |
-| AR-031 | Coverage owner | **Target correction.** Store owns pages; per-page next offset is not aggregate source completeness. | Exact coverage ACK/replay; no local range union. |
-| AR-032 | Historical source versus active session | **Boundary, not a universal reachable root-swap bug.** Codex/Claude compare active root; OpenCode fixes root per binding generation; Muse requires observed family membership. | Source-authorized reader with original service/account scope; prove actual transitions. |
-| AR-033 | Codex per-page read amplification | **Open.** Each new page rereads thread/history/turn/full final body, then slices at most 24 KiB. Saved-page replay bypasses this. | Native ranges or one bounded selected-result materialization; measure later. |
-| AR-034 | Muse discovery budget | **Open.** Each range calls `readItem`; backward walk detects cycles but has no aggregate page/byte/time budget. | Bounded resumable discovery and reuse of exact item/ref. |
-| AR-035 | Historical capture/disclosure grants | **Preserve plus target clarification.** Receipt, Bytes and Assemble differ; exact result caller is capped at Bytes; historical reviewer gets no new bytes. | Current scoped capture authority, not invented Operator or widened grants. |
-| AR-036 | Root capacity depends on history | **Source-confirmed defect, open.** Global binding/ledger census and per-scope historical Operation roster precede root counting. Historical limits/damage can yield unknown capacity despite no corresponding live claim. | Indexed current-claim projection; no full-history ledger verification on admission. |
-| AR-037 | Antigravity native-default root limit | **Source-confirmed defect, open.** Service-less root identity requires `modelId`, while the selected adapter explicitly permits its absence. With root policy enabled, the count is unknown even before the first root. | Stable configured budget identity independent of optional model selection. |
-| AR-038 | WorkDispatch pending saturation | **Source-confirmed defect, open.** At 128 pending subjects, an entry stops reading later Task facts; repeated checks of persistent blockers do not admit a later eligible Task. | Current-state fair candidate scan; remove copied pending subjects rather than raise cap. |
-| AR-039 | Stale provider row outranks fresh availability | **Source-confirmed predicate defect, open.** For matching retained shared-resource rows, stale source ranks 2 and current Available ranks 1; cross-binding same-source refresh need not supersede the old row. | Source/bucket-scoped supersession; trace lifecycle invalidation; retain independent constraints. |
-| AR-040 | Existing admission/dedup/scan mechanisms | **Preserve, selected paths.** Root set deduplicates normal binding/open/dispatch/service representations; launch callback rereads/reserves in its transaction; pending launches use stable keyset/ceiling. | Full direct caller/concurrency, failure-disposal and route-edit matrix remain open. |
+| AR-005 | Admitted page completion | **Preserve.** Sealed normalized origin permits narrow late completion and replay ACK. | First historical admission and partial storage. |
+| AR-006 | Continuation output | **Open, cross-route.** Generic origin/adapters remain Dispatch-centric; Muse item addressing does not fix Store admission. | Same source-Operation/page/candidate path for attributable Send. |
+| AR-007 | Assembly and byte reads | **Preserve.** Publication/registration, contiguous coverage, digests and object grants. | Crash/power-loss and grant/cache races. |
+| AR-008 | Authentication versus completion | **Preserve boundary.** Disabled credentials fail new handshake; authenticated carrier can finish a narrow prior page. | Revocation and successor delivery. |
+| AR-009 | Send attribution | **Mixed.** Selected Manager/Repair/Goal paths retain scope; session input can be taskless. | Explicit task-linked versus taskless authority. |
+| AR-010 | Repair delivery classification | **Open.** Requires provider-specific ID/condition and treats every Rejected/Cancelled as no effect. | Common admission/terminal facts; executed failure is not non-delivery. |
+| AR-011 | Same-Attempt correction | **Preserve.** `needs_correction` can resubmit against revision/prior submission; stale publication stays historical. | Continuation origin through candidate validation. |
+| AR-012 | Revision fences input | **Open.** Old Attempt survives revision; direct Send can become taskless or dispatch without revision recheck. | Supersede unsent old work; check exact subject before effect. |
+| AR-013 | GM cleanup of old work | **Open.** GM can revise beneath another owner but cannot release that superseded Attempt. | Scoped historical cleanup without rewriting owner. |
+| AR-014 | Release preserves capture | **Open.** Release cancels queued Result together with non-check Operations. | Cancellation by effect semantics. |
+| AR-015 | Restart credential | **Preserve.** Stable binding credential; no implicit rotation. | Live restart/revocation. |
+| AR-016 | Old-boot first delivery | **Open.** Unseen old-boot terminal fails current-boot validation; committed identical outcome may replay-ACK. | Execution origin separate from delivery actor. |
+| AR-017 | Recovery-fenced capture | **Open; predicate reread.** Recovery filters Result before completion-only exception. | Exact completion/readback without native readiness. |
+| AR-018 | Supervisor recovery | **Scope correction.** Intake/process recovery is not native-byte import. | Import stays with adapter/Store. |
+| AR-019 | Inconclusive lookup completion | **Open.** Antigravity labels completed inconclusive Reconcile itself Unknown. | Applied lookup `resolved:false`; target stays unknown. |
+| AR-020 | Terminal versus release | **Boundary.** Late terminal may update unreleased old Attempt; terminal does not prove capture. | Preserve output obligation and producer fences. |
+| AR-021 | First historical Result | **Open.** New normalized admission requires current open unreleased Task/Attempt. | Source-scoped completion admission. |
+| AR-022 | Automatic capture/readback | **Open.** Automatic consumers do not create Result/Reconcile; Doctor recommends only. | Bounded helpers using ordinary commands. |
+| AR-023 | Supervisor readback | **Scope correction.** Unresolved IDs/status do not settle targets. | Semantic recovery in Store/adapter. |
+| AR-024 | Page ACK/source release | **Open; target corrected.** Boolean ACK insufficient; local ACK-range ledger duplicates Store. | Store-authoritative complete/next-missing coverage. |
+| AR-025 | Heterogeneous sources | **Boundary.** Local bytes/files and provider locators have different lifetimes. | Share ready-record delivery, not source journal. |
+| AR-026 | Claude ready-page loss | **Open.** Intent persists, ready page does not; ambiguous ACK becomes Unknown and replay is refused. | Persist exact page before IPC; never repeat SDK input. |
+| AR-027 | Codex delivery | **Preserve plus gaps.** Exact page survives restart; reads depend on Dispatch/current root. | Keep delivery, remove checkpoint/tombstones; see AR-032/033. |
+| AR-028 | OpenCode retention | **Preserve plus gaps.** Exact replay/assistant parent; permanent `result_source` and Dispatch-only target. | Coverage-driven release without retention graph. |
+| AR-029 | Command release | **Preserve plus excess.** Saved pages work; source cleanup uses release-proof Operations/tombstones. | Store-complete coverage then local cleanup. |
+| AR-030 | Muse source read | **Preserve plus gap.** Exact item/revision/ref and native ranges; ready page checkpoint. | AR-034 bounds discovery. |
+| AR-031 | Coverage owner | **Target correction.** Store owns pages; per-page offset is not aggregate completeness. | Exact coverage ACK/replay, no local union. |
+| AR-032 | Historical source versus active root | **Boundary.** Root/family guards protect scope; deleting them cannot recover missing bytes. | Source-authorized reader and actual transition cases. |
+| AR-033 | Codex read amplification | **Open.** Each new page rereads thread/history/turn/full body, then slices 24 KiB. Saved replay bypasses this. | Native ranges or one selected-result materialization. |
+| AR-034 | Muse discovery budget | **Open.** Repeated `readItem` walk detects cycles but has no aggregate page/byte/time budget. | Resumable discovery and locator reuse. |
+| AR-035 | Capture/disclosure grants | **Preserve.** Receipt, Bytes and Assemble differ; historical reviewer gets no new bytes. | Scoped first capture, no invented Operator or wider grants. |
+| AR-036 | History-dependent capacity | **Open.** Global historical census/ledger verification precedes current root count. | Indexed current claims, no full-history admission scan. |
+| AR-037 | Native-default Antigravity | **Open.** Root identity requires optional `modelId`; root policy can block an empty route. | Budget identity independent of optional model. |
+| AR-038 | WorkDispatch saturation | **Open.** 128 pending subjects stop intake of later eligible Task facts. | Fair current-state scan, delete copied pending list. |
+| AR-039 | Stale provider precedence | **Open; lifecycle narrowed.** Stale matching row outranks fresh Available. Eliot link loss retains rows; delivered native account/closed snapshot invalidates its own source. | Same-source supersession; retain independent quota constraints. |
+| AR-040 | Root dedup/admission/scan | **Preserve.** Parent/Open/Dispatch/service share a claim; transaction handoff and stable scan exist. | Full direct concurrency and route-edit matrix. |
+| AR-041 | Reads/control under quota hold | **Preserve plus earlier gate.** Result/Refresh/strict Reconcile and stop/reply controls bypass the starts-only quota predicate. Recovery/ready/scope gates still apply. | AR-017; shutdown in reconciling/draining states. |
+| AR-042 | Cancel held unbound launch | **Open defect.** Generic Cancelled parent cannot satisfy workspace sweep's Settled no-effect contract; current verified-held unbound lease can stay fenced. | Stage-aware cancellation; read back in-flight workspace effects. |
+| AR-043 | Pre-send Open rejection | **Open defect.** Guards reject unsent Open without retiring rootless opening binding; cancellation then refuses non-Queued target. | Known-no-effect rejection/cancellation must converge with resource disposal. |
+| AR-044 | Lowered root limit and reuse | **Source-confirmed policy boundary.** Same-root input uses `other_claims >= limit`; lowering below live total can hold zero-root-growth continuation. | Separate root delta from input/quota/drain policy; live reload unqualified. |
 
 ## Current pass evidence
 
-Sources below refer to `a0bc1dcb`; line spans locate this inspected revision, not future
-worker instructions. Only the named portions were read.
+Sources below refer to the inspected head. Only named portions are covered.
 
-### AR-036 — an activity limit has become a history limit
+### AR-041 — preserve the real read/control bypass
 
-`store/capacity.rs`:
+`store/runtime.rs::next_internal` (roughly 1263–1840) prioritizes control and permits
+readback around unresolved ordinary mutations. Strict selected-module Reconcile is
+read-only. Result, Refresh and strict Reconcile are not `starts_native_work`; neither
+are steer, Goal pause/clear and reply controls. Only starts enter the later route/quota
+predicate. A held start remains queued with a due time, before the sending CAS.
 
-- `collect_scopes` (around 2960–3070) enumerates all bindings, including closed ones,
-  with a 10,001-row sentinel, then loads the ledger roster. Overflow creates global
-  damage and `unknown:capacity-roster-limit`.
-- `roster_check_inner` (around 3130–3305) enumerates every Operation and Attempt for
-  the selected bindings, not just unresolved work; it also counts producers toward
-  the 10,000 visited-row limit and compares the duplicated evidence ledger both ways.
-- `root_claims_for_route` (around 3898 onward) calls those routines before assembling
-  live root identities. Global roster damage returns `None`. Its owned-service scan
-  also includes terminal rows before applying its bounded-row decision.
-- `launcher::route_admission` passes that `None` to
-  `provider_conditions::route_admission`, which returns `ROUTE_CAPACITY_UNKNOWN`
-  for an enabled root policy.
+Tracking a read in the old capacity ledger does not prove it allocates a root. Earlier
+fences still matter: recovery filters Result before its completion exception (AR-017);
+readiness/authority/shutdown checks are independent. Connect the needed positive paths
+rather than removing every guard.
 
-Thus more than 10,000 retained bindings can hold policy-governed routes even when the
-old bindings are closed. A sufficiently large completed Operation history can hold
-its target scope as well. No production incident or measured latency is claimed.
-Even below the limit, admission repeats history decoding/ledger validation rather than
-querying only the resource claims that can still consume capacity.
+### AR-042 — cancellation and workspace release do not converge
 
-Replace that dependency with a current-claim projection over existing launch/binding
-owners, counted in the admission transaction. Index the actual active predicate and
-budget key. Keep genuinely unresolved roots, but exclude closed/disposed history.
-Do not solve this with a larger cap, history deletion, periodic ledger repair or a
-second capacity database. Diagnostic history remains independently pageable.
+- `Store::reconcile_launches_once` in `store/mod.rs` (about 1260–1490) commits verified
+  held workspace before a fresh transaction admits the Attempt/Open.
+- `launcher::launch_after_workspace_held` can leave that parent queued on route Hold
+  before attaching an Attempt/binding. A later pass reuses the held lease.
+- `operations::cancel` (about 3850–4005) accepts a queued parent and writes Cancelled
+  with `{reason,cancelled_by}`. It has no unbound-launch lease disposition; only the
+  agent.open branch closes an opening binding.
+- `workspace_lifecycle::candidates` selects a current unbound held lease for closed
+  launch cleanup only for a Settled parent with native effect not attempted.
+  `closed_launch_has_no_native_effect` separately requires Settled plus the exact
+  domain launch result. Generic cancellation satisfies neither check.
+- Root counting selects unbound launches only while Queued/Unknown: cancellation drops
+  that root reservation, not the held workspace authority.
 
-### AR-037 — optional model is required by an unrelated gate
+Thus cancelling a verified-held, current, unbound launch waiting for admission can leave
+its workspace authority retained. This is not every cancellation or a live reproduction.
+Later invalidation to stale does not make Cancelled satisfy the release helper.
 
-`modules/antigravity-rust/src/launch.rs::{selected_model_id,build_launch_spec}` returns
-`None` for absent `modelId` and deliberately omits `--model`. In
-`capacity.rs::root_route_identity` (around 3450–3525), the selected Antigravity artifact
-instead requires `root_route_text(options.get("modelId"))`. The missing field returns
-`None`, propagated by `root_claims_for_route` before any existing-root query.
+Use the existing launch/workspace owner in cancellation. When preparation completed and
+no child/native/service effect or unresolved resource remains, release that exact
+reservation/lease authority in the cancellation transaction. Preserve files and history.
+If Git/process work crossed its effect boundary, hold it for exact readback. Queued
+parent does not mean no Git work started. No directory deletion, routine manual SQL or
+new cleanup daemon.
 
-For an otherwise valid service-less Antigravity route with `admission_policy`, this
-makes even an empty root roster unknown. The defect does not imply every Antigravity
-configuration is blocked; a supplied model or different scope takes another path.
+### AR-043 — no-effect rejection needs resource disposition
 
-Count the configured root budget by its retained route/resource identity. Model and
-provider observations still matter to selection/quota, but omission of a supported
-native-default override cannot erase root identity. Do not force a fake explicit model
-or infer an account/provider from a model name. Route edits must not detach still-live
-claims from the budget they actually reserve.
+`operations::reserve_open_route` (about 2940–3050) creates a rootless opening binding
+and ties it to Open in a transaction. Another Open on its unreleased lane is refused.
 
-### AR-038 — bounded storage silently becomes queue eligibility
+Before `queued -> sending`, `runtime::next_internal` can reject that Open after caller
+revocation, disabling new work or making the route Unavailable. Those traced branches
+commit the rejected Operation without retiring its binding or synchronizing the old
+capacity entry. Local cancellation then refuses the non-Queued target; its special
+rootless-opening cleanup is unreachable. Root counting retains an unreleased claim or
+reports unknown when its historical ledger no longer agrees.
 
-`store/automation_work_dispatch.rs::reconcile_entry` (around 466–559) rechecks at most
-eight pending subjects, then calls `consume_work_fact_page` only while
-`state.pending.len() < MAX_PENDING_SUBJECTS` (128). If those subjects remain blocked,
-new facts past the entry cursor are never considered. A later Task whose dependencies
-or write scope are ready cannot get past that local backlog.
+This is a missing transition in those paths, not proof that all administrative recovery
+is absent. Route known-no-effect rejection and safe cancellation through one existing
+resource disposition. Inspect independent owned-service starts/children before closing
+anything. Native Rejected may follow spawn: `outcome_with_artifacts` correctly keeps
+that ownership/identity. Do not apply a generic Rejected-implies-free rule.
 
-This is not lack of every kind of fairness: `enabled_entry_page` rotates automation
-entries and the separate launcher scan already has stable pagination. They cannot
-free a saturated entry's pending list.
+### AR-044 — root allocation and new input are different questions
 
-B4 should query current Tasks/Attempts and eligibility, not replay every creation fact
-into another pending queue. Filter cheap eligibility before LIMIT; continue a bounded
-keyset scan for checks that need inspection. Retain only the host loop's scan position,
-not copied Task state. A blocked source remains in its owning Task/dependency domain.
+`runtime::binding_route_admission` preserves native route/workspace identity and overlays
+only current enablement/root policy. Keep that protection against silent retargeting.
 
-### AR-039 — availability is not a vote among binding histories
+Same-root counting excludes its own claim, but provider admission still requires other
+claims < limit. Three live roots with a new limit of two therefore fail each same-root
+check (two other claims). `next_internal` applies this to Dispatch/next-turn Send, not
+only new roots. This is the confirmed predicate; live config reload was not executed.
 
-`provider_conditions.rs::route_admission` (around 888–1071) loads matching shared-scope
-rows. It assigns stale source rank 2, current Available rank 1, current Hold rank 3 and
-Unavailable rank 4. A stale old binding therefore wins over a fresh Available row when
-both match the same resource. `source_binding_matches` rejects released bindings;
-`invalidate_all`, `clear_absent_bucket_facts` and `delete_exact` operate on the selected
-source binding/generation rather than superseding another binding's row.
+Target root-limit reduction prevents positive root growth. Reuse with zero root growth
+still obeys new-input, quota, Task and explicit drain policy. An intentional pause of
+new turns must be explicit, not hidden in root arithmetic. Do not kill sessions or
+hide unresolved claims to make the count fit.
 
-The decision-rule mismatch is confirmed for that retained input state. Whether each
-release/disconnect path leaves those rows is not fully traced. A stale independent
-quota window or a genuinely ambiguous account is not equivalent to a superseded copy.
+### AR-039 follow-up — distinguish native invalidation from Eliot link loss
 
-Use the latest valid observation of the actual source/account/bucket/window, with its
-source epoch and applicable ordering. Then combine independent current constraints.
-Do not let an old duplicate veto its successor, choose only the newest global timestamp,
-or convert all unknown facts to Available. Reset/retry time makes a bounded refresh or
-policy-selected probe due; it is not proof that quota recovered.
+`runtime::disconnected` (about 3745–3820) marks its exact Eliot link disconnected and
+sent/accepted Operations unknown; it does not invalidate provider rows. Permission
+source freshness requires that connection to be connected, so its retained row can
+become stale.
 
-### AR-040 — preserve useful mechanisms, not their proof scaffolding
+`provider_conditions::observe_usage` (385–535), in contrast, calls `invalidate_all`
+when an accepted native snapshot reports account/updated or connection/closed. This
+is source-binding scoped. A fresh binding updates its own rows, not the old binding's
+copy. That establishes a path to the audited stale-rank-2 versus Available-rank-1
+conflict for matching shared resources; an already-delivered native invalidation is
+not that case.
 
-`capacity::root_claims_for_route` uses a `BTreeSet<RootClaimIdentity>`: the same native
-root or pre-root binding is not counted again for its Open, Dispatch and owned-service
-records. An admitted unbound launch is a temporary root claim; after binding it must
-be the same reservation, not another slot. Same-root exclusions are applied after the
-sources are collected. The ADMISSION_METHODS ledger includes reads, but that alone
-is **not** evidence that each Result/Refresh consumes another root slot.
+Keep exact account/auth attribution and independent buckets. Neither deleting all
+negative facts on IPC loss nor selecting the globally newest timestamp repairs it.
+Full release/revocation/reboot/account-change combinations remain unqualified.
 
-`launcher::admit_work_dispatch` and `launch_for_actor` reread the plan and reserve the
-ordinary launch in the supplied Store transaction. `launch_after_workspace_held`
-rechecks admission and carries it through the Attempt/Open-child transition in that
-same transaction, avoiding a count of its own half-constructed parent. Preserve atomic
-check/reserve and exact subject authority; remove duplicate manifests/digests around
-those facts, not the checks themselves. The complete outer direct-call transaction
-and concurrent native qualification remain unverified here.
+## Useful disposal mechanisms to retain
 
-`launcher::{pending_launch_ceiling,pending_launches}` (around 4030–4125) already scans
-outstanding launches using immutable `(created_at_ms, operation_id)` and a fixed cycle
-ceiling. Updating `updated_at_ms` while held cannot move the candidate back ahead of
-that cursor. `launch_reconciliation_snapshot` excludes timestamp-only admission
-refreshes from semantic progress. Reuse this pattern; do not invent another scheduler
-or describe this existing scan as the WorkDispatch pending-cap defect.
+`operations::fail_reserved_owned_service_start` CASes the existing start row only before
+its process boundary; Unknown/observed starts refuse release, departed/no-effect ones
+can proceed. `prepare_owned_service_attempt_release` uses it for linked queued work.
+Preserve that race boundary, not all duplicate proof encodings. The complete coordinator
+process path was not reread here.
 
-## Source/target map
+`workspace_lifecycle::workspace_resource_use` retains holds for unresolved effects,
+checks, producers, exact unreleased binding and owned service. Attempt release is not
+native departure. Connect real disposition to these owners instead of deleting fences
+or freeing resources by age.
 
-| Inspected owner | Target action |
+## Inspected sources
+
+| Source | Boundary read |
 | --- | --- |
-| `store/capacity.rs` scope collection, root identity/count and roster checks | B3: retain unique current-root semantics; delete evidence-ledger/history dependency. |
-| `store/launcher.rs` route predicate, WorkDispatch admission, launch/Open handoff and stable pending scan | B0/B4: one eligibility projection, transactional admission and fair scan. |
-| `store/automation_work_dispatch.rs` activation, pending recheck and source-page gate | B4: delete copied pending subjects/cursors with the working current-state path. |
-| `store/provider_conditions.rs` shared-source selection, freshness and binding-local invalidation | B2: source-scoped observations and explicit freshness/supersession. |
-| Antigravity `launch.rs` optional model handling | Preserve native-default choice while repairing B3 root attribution. |
-| Retained Claude-script review: `issue_settled.py`, `plan_next.py`, `state.py` | Keep actionable dependency ranking and omission of parked/review-waiting work until relevant change; not a separate queue. |
-
-The script donor was read through the retained
-[review](../remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md), not a freshly opened
-private ZIP. External donor repositories and installed SDKs were not requalified.
+| `store/runtime.rs` | queue selection, starts/guard/hold/rejection, sending CAS, route overlay, Open outcome branches, disconnect/hello. |
+| `store/operations.rs` | Open reservation, owned-service pre-start cancellation, linked release and generic cancel. |
+| `store/mod.rs::reconcile_launches_once` | held-workspace commit before final admission; external I/O and lifecycle invocation. |
+| `store/workspace_lifecycle.rs` | candidate SQL, closed-launch release test, transitions and resource holds. |
+| `store/capacity.rs::root_claims_for_route` | unreleased binding/unbound launch selection and same-root exclusions. |
+| `store/provider_conditions.rs` | root gate, source identity, native invalidation and retained condition entry. |
 
 ## Remaining coverage
 
-Continue the exact failure/disposal and control-read chains at the top. Then workspace
-custody, Goals/scheduling, review/acceptance, public-object permissions, migrations,
-IPC fairness, external writes and independent observation remain open tracks.
-Historical capture revocation, root/account changes, coverage query indexes and live
-restart/power-loss are still unqualified; this pass does not close result work merely
-because the focus moved to B.
+Next: shutdown/close/binding retirement, then route edits and full concurrency.
+Workspace/process custody, Goals/scheduling, review/acceptance, permissions, migrations,
+IPC fairness, external writes and observation remain open tracks. Historical capture
+across revocation, source discovery/indexes and installed restart/Windows/load are not
+closed by this pass.
 
-Detailed AR-001–AR-035 evidence and prior pass links remain in the
-[preceding register](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/a0bc1dcb69fa4a2d3dea1e51e3c5b0d148bde1bb/docs/agent-operations/audit-register.md).
-All dispositions remain in the table above. A documentation commit is not a runtime
-repair or complete current-head qualification.
+Prior detailed evidence and donor references remain in the
+[preceding register](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c0d1b91f15636982f977768474f7246b97308d61/docs/agent-operations/audit-register.md)
+and its linked passes. All earlier dispositions remain above. Docs do not close runtime
+findings.

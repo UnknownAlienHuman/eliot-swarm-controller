@@ -2,189 +2,205 @@
 
 Target contract subordinate to [architecture](agent-operations/architecture.md) and
 [implementation B](agent-operations/implementation.md#b--queue-routes-provider-state-and-admission).
-The [audit register](agent-operations/audit-register.md) owns source evidence and gaps.
-This replaces the old parallel Launcher program, not Task/Attempt/Operation authority.
+The [audit register](agent-operations/audit-register.md) owns evidence and gaps.
+Launcher connects existing Task/Attempt/Operation/workspace owners; it is not another
+scheduler, task database or compatibility product.
 
 ## 1. Product law
 
 ```text
-Governor selects or enables work policy
+Governor enables work policy
 -> Store ranks current work and explains eligibility
 -> one transaction authorizes and reserves one launch
 -> existing owners perform workspace/native effects after commit
 -> ordinary capture, review, correction and acceptance continue
 ```
 
-Governor and Manager are agent roles. Routine admission, recovery and route selection
-run under configured policy, not a human click. Preview is optional and reserves
-nothing. Launch rereads current facts; callers supply no plan digest or proof packet.
+Governor and Manager are agents. Routine admission, recovery, cleanup and route choice
+run under configured authority, not human clicks. Preview is optional and reserves
+nothing. Launch rereads facts; callers supply no plan digest or proof packet.
 
-## 2. Queue is a read projection
+## 2. Queue is a projection
 
-`swarm.queue.get` joins current Task/revision/Attempt, feedback/review, accepted
-dependencies, workspace leases, selected routes, provider facts and root availability.
-A row carries subject IDs, rank/reasons, eligibility/blockers, actual route candidates,
-write conflicts and coverage/gaps. It is not editable queue storage.
+`swarm.queue.get` joins current Tasks/Attempts, review/correction, accepted dependencies,
+workspace leases, selected routes, provider facts and resource claims. Rows expose
+subject, rank/reasons, eligibility/blockers, route candidates, write conflicts and gaps.
 
-Default priority is correction, unfinished work, then ready unclaimed Tasks, refined
-by explicit project/phase policy and stable age/Task-ID tie-breaking. Do not infer
-size or value from prompt length. Parked, delivered or review-waiting work is not
-redispatched until a relevant fact changes. Unsatisfied dependencies block automatic
-work; explicitly authorized investigation may proceed, but acceptance still enforces
-its frozen requirements and dependencies.
+Priority is correction, unfinished work, then ready unclaimed Tasks, refined by explicit
+project/phase order and stable age/ID ties. Parked, delivered and review-waiting work
+waits for relevant change. Automatic work respects dependencies; explicitly authorized
+investigation does not bypass later acceptance requirements.
 
-Eligibility is evaluated before limiting admitted work. Cheap filters belong in the
-query; expensive checks use bounded keyset continuation. A first page of blocked
-Tasks must not prevent a later eligible Task from being examined.
+Filter cheap eligibility before LIMIT; use bounded keyset continuation for remaining
+checks. Blocked first-page Tasks cannot hide later eligible work. Preserve the existing
+launch scan's immutable `(created_at_ms, operation_id)` order and fixed cycle ceiling,
+not mutable `updated_at_ms`. Fairness applies between policies and their candidates.
+Keep the host loop's scan position, not per-Task copied pending subjects/event catch-up.
+Restart recomputes facts. Raising the old 128-subject cap is not a repair.
 
-Use one host loop's stable scan position and cycle boundary. The existing launcher
-`pending_launches` pattern orders by `(created_at_ms, operation_id)`, not mutable
-`updated_at_ms`; preserve that property. Fairness between enabled policies and between
-candidates within a policy both matter. A restarted scan recomputes current facts.
-Do not retain a second pending-subject list, event catch-up queue or eligibility cursor
-per Task. Raising the old 128-subject cap does not fix starvation.
+## 3. Lane, routes and existing sessions
 
-## 3. Lane and routes
+A lane is Manager/project/policy plus ordered routes, current queue, resource/provider
+facts and bindings/workspaces. No lane table, daemon, inbox or heartbeat.
 
-Lane is an operational view of Manager/project/policy, primary and explicitly ordered
-fallback routes, current queue, capacity/provider state and active bindings/workspaces.
-No lane table, daemon, inbox or heartbeat.
+Disabling work policy stops future admissions, not admitted execution or required
+capture/readback. Fallback is explicit and revalidated; no hidden model, effort,
+account, permission or workspace substitution. Compatible session reuse considers
+pending inputs, native Goal/children and unknown effects; parent idle is insufficient.
 
-Disabling policy stops future admissions, not admitted execution or required result
-capture. Fallback revalidates the selected route and never silently changes model,
-effort, account, permissions or agent profile. A compatible idle binding may be reused
-under continuation policy, after considering pending inputs, native Goal/children and
-unknown effects. Parent idle alone is not availability or release.
+Keep the original binding's native endpoint/account/workspace identity. Current config
+may change enablement/budgets, but cannot silently move existing work elsewhere. Route
+edits also cannot hide live claims behind a new alias/model/digest.
 
-## 4. Atomic admission, not atomic external I/O
+## 4. Admission and effect boundaries
 
-Direct `swarm.launch` and automatic `dispatch_once` use the same Store boundary:
+Direct launch and `dispatch_once` use the same Store transaction:
 
-1. verify current actor/project/Task/revision and exact existing Attempt, if any;
-2. recheck route, provider conditions, root budget and write-scope conflicts;
-3. atomically retain the ordinary launch, its root claim and workspace reservation;
+1. check current actor/project/Task/revision and exact Attempt, when present;
+2. recheck route, provider, resource budgets and write conflicts;
+3. retain the ordinary launch and attributable root/workspace reservation;
 4. return admission only after commit.
 
-A later caller sees the earlier reservation. Native-ready observation is not required
-before a pending root counts. A preview page or cached capacity report cannot authorize
-this transaction. Actual filesystem/Git/native work occurs outside it through the
-existing owners and is revalidated at its relevant effect boundary.
+A later caller sees the reservation before native-ready observation. Parent launch,
+binding and Open child represent one reservation, not three. Preserve the existing
+transaction-local handoff; delete repeated manifests/hashes, not atomic check/reserve.
 
-Claiming the Attempt, attaching its binding and admitting the Open child must transfer
-one reserved launch identity, not count parent and child separately. The existing
-transaction-local Open handoff is a useful mechanism; its duplicated manifests and
-hashes are not a requirement. Do not add a reservation service or per-root workflow.
+Git/filesystem/native I/O runs outside Store. Revalidate before each actual effect.
+A parent launch can remain Queued while its workspace effect is already in flight;
+its generic Operation state is not a complete description of all child resources.
 
-An uncertain external effect retains its exact Operation and resource claim for
-readback. Definitively unsent cancellation may dispose its reservation; generic
-Rejected, timeout, client exit or Task acceptance is not proof of native departure.
-Release of workspace, root and retained result source has separate conditions.
+### Cancellation and failure must finish resource disposition
 
-## 5. Count current root claims, not historical paperwork
+Use existing `operations::cancel`, launch, workspace and process owners for a common
+terminal disposition, rather than just changing the parent Operation's state.
 
-A configured concurrent-root budget counts unique live/reserved roots:
-
-| State | Counted identity |
+| Exact current facts | Automatic disposition |
 | --- | --- |
-| Admitted launch before binding exists | Existing launch Operation reservation |
-| Bound opening before native identity is known | Exact binding/generation |
-| Native root observed | Exact service scope + native root, linked to its binding |
-| Several Open/Dispatch/service records for that root | The same claim, not additional slots |
-| Root outcome unknown or resource departure unresolved | Claim remains held |
-| Definitively disposed reservation/root | No current claim; retain history separately |
+| No workspace/native/service effect admitted | Cancel/reject unsent work and release its own reservations atomically. |
+| Verified held workspace, no attached Attempt/binding or admitted child/resource effect | Release that lease authority and root reservation with cancellation; preserve prepared files and evidence. |
+| Workspace preparation in flight or outcome unknown | Stop later admissions; retain the workspace hold and complete/join exact readback. Do not repeat Git preparation blindly. |
+| Rootless Open rejected before sending, no independent service/process effect | Retire the exact opening binding/lane claim and dispose its unused reservation through the same no-effect path. |
+| Open/input may have executed, or native process/service is observed/unknown | Keep attributable ownership; bounded native/process readback or supported exact cancellation, never infer no effect from Rejected. |
+| Exact owned resource departure established | Retire its remaining claim; release workspace only when its other writers/checks/producers are resolved. |
 
-Readback, Result, Refresh and ordinary control do not acquire another model/root slot.
-A same-root recheck excludes only its own claim; it does not erase other active work.
-Root count is not the number of active model turns, native children or RPCs.
+Cancel versus send/start is a transaction/CAS race. A winner before the effect boundary
+prevents that effect. A late cancellation cannot retroactively erase it. Preserve the
+owned-service reserved -> failed-no-effect versus start-permit fence; do not replace it
+with a timestamp or process-name guess.
 
-Derive this projection from existing current launch/binding/resource facts in the
-writer transaction. Keep budget keys and active predicates indexed. Closed bindings,
-completed Operations and historical evidence-ledger size cannot exhaust current root
-capacity. Do not load all history, compare a second ledger or fail the whole fleet
-because unrelated old records exceed a diagnostic page budget.
+A required cleanup must not depend on the spelling Settled versus Cancelled or on an
+unrelated success-shaped receipt. Record attributable disposition with the existing
+Operation/resource rows. Retrying that disposition is idempotent; unknown effects stay
+held. Never require routine manual SQL, a new cleanup daemon or a second proof ledger.
 
-The configured route/budget identity must be independent of optional native model
-selection. A supported default model remains a valid route without inventing its
-provider/model. Model-specific quota uses observed or configured model facts separately.
-Route edits cannot hide still-live claims by changing a display alias, model or digest;
-explicit budget changes affect future admission without deleting existing reservations.
+Workspace authority release does not delete a worktree or its unpublished changes.
+Task acceptance/release, native shutdown, root retirement and output-source release are
+different events. Connection detach from an externally owned shared service does not
+prove the native work or service departed.
 
-Delete the capacity phase/evidence ledger and its sync/refusal/compatibility machinery
-only when the indexed current projection serves all admission/report callers. Do not
-replace it with another counter database, periodic repair engine or mandatory pruning.
-Genuinely ambiguous active ownership remains a scoped gap, not an assumed free slot.
+## 5. Root budgets count current allocations
 
-## 6. Provider conditions are source facts
-
-Quota, concurrency, transport health, host resources and root slots are different.
-Normalize availability by real source/service/account/bucket/window with epoch,
-ordering, observed time and coverage. Alias or model text is not account identity.
-Multiple bindings observing one account do not create independent account limits.
-
-First select the valid current observation for the same actual source/bucket; then
-combine independent applicable constraints. An obsolete copy from a replaced source
-must not permanently veto newer verified availability. Conversely, a fresh observation
-for one window does not clear another window's quota, and a global newest timestamp
-cannot resolve uncertain account attribution. Preserve original provenance for diagnosis.
-
-| Current fact | Enabled action |
+| Resource representation | Count |
 | --- | --- |
-| Available | Admit subject to current root/write/resource checks |
-| Rate limited / overloaded / quota exhausted | Hold new affected work; make bounded refresh or permitted probe due at retry/reset time |
-| Model gone | Use only an explicitly selected compatible fallback or addressed Governor decision |
-| Authentication/data-policy requirement | Governor uses authorized remediation; operator only for missing credentials/authority/intent |
-| Stale or ambiguous required source | Reconcile exact source under bounded policy; unrelated resources proceed |
-| Optional meter never observed | Report unknown; apply configured policy rather than invent a hard meter requirement |
+| Admitted unbound launch | One launch reservation |
+| Bound opening without native identity | The same claim under binding/generation |
+| Native root observed | The same claim under exact service/root identity |
+| Open, Dispatch and service records for that root | No additional slots |
+| Unresolved native ownership | Claim retained |
+| Definitively disposed reservation/resource | No current claim; history retained |
 
-Retry/reset time is not evidence of recovery. Probes use the existing source reader or
-an explicitly authorized single native attempt, not a prompt flood or new probe daemon.
-Coalesce unchanged holds and wake on relevant source change/due time. Current results,
-replies, cancellation and reconciliation remain available when new workload is held,
-subject to their actual native permissions.
+Readback, Result, Refresh and control do not allocate another root. Distinguish the
+root-count delta of the proposed action: new root +1, already-reserved same root +0.
+A reduced root limit blocks additional allocations; it does not implicitly pause all
+existing roots' next turns. New-input mode, provider quota and explicit drain policy
+still apply to continuation. An explicit pause policy is not hidden in root arithmetic.
+Do not kill roots or erase claims to make a lowered limit fit.
 
-## 7. Workspace and compact assignment
+Count indexed current launch/binding/resource facts in the admission transaction.
+Closed bindings and completed historical Operations cannot consume a current budget.
+No full-history ledger comparison, global damage from unrelated diagnostic limits,
+periodic counter repair or mandatory history deletion. Ambiguous active ownership is a
+scoped gap, not an assumed free slot.
 
-Freeze repository-relative `initial_paths` and hard `forbidden_paths` into the Attempt.
-Empty allowed scope means repository root. Reject absolute paths, traversal, empty
-segments and `.git`; overlap uses path segments (`src/a` is not `src/ab`).
+Budget identity is independent of optional model selection. A supported native-default
+route is valid without a fabricated provider/model. Model-specific quota and selected
+model facts remain separate. Delete capacity ledger/sync/refusal/compatibility code when
+this projection serves every admission/report consumer; do not create another ledger.
 
-The workspace lease is Eliot's write-admission/overlap authority, not an OS sandbox or
-replacement for caller permissions. One Manager owns one mutable worktree and its Git
-index/branch/commit operations. Leaf writers may edit disjoint scopes, not compete for
-Git-index ownership. Review reads an immutable candidate or isolated snapshot and
-needs no writer lease. Remove advisory `code.scope.*`, not base authentication/grants.
+## 6. Provider conditions and non-work commands
 
-One TaskPacket contains goal/phase, requirement-linked verification, selected sources,
+Quota, root slots, active turns, transport and host resources are distinct. Normalize
+facts by actual service/account/bucket/window, source epoch/order/time and coverage.
+Alias or model text does not prove account identity.
+
+Resolve current evidence for the same source before combining independent applicable
+constraints. An obsolete duplicate cannot veto its verified successor. A fresh window
+does not clear another window's quota; global newest timestamp is not sufficient.
+
+Distinguish native account/connection invalidation from loss of Eliot reporting IPC.
+The latter is a coverage/connection event, not evidence of quota recovery or native
+death. Keep provenance, reconcile source state independently and supersede only copies
+whose source relation is established. Do not keep an obsolete binding's stale permission
+as a permanent veto after the same account is freshly observed elsewhere.
+
+| Fact | Enabled behavior |
+| --- | --- |
+| Available | Admit subject to relevant resource/write checks |
+| Rate limit / overload / exhausted quota | Hold affected new work; schedule bounded refresh or explicitly permitted probe at due time |
+| Model gone | Selected compatible fallback or one addressed Governor decision |
+| Authentication/data-policy requirement | Authorized remediation; human only for missing access/authority/undecided intent |
+| Required source stale/ambiguous | Targeted bounded readback; unrelated sources continue |
+| Optional meter never observed | Report unknown and apply policy; do not invent a mandatory meter |
+
+Reset/retry time is not recovery proof. Coalesce holds and wake on relevant source
+change/due time. No probe daemon or prompt flood.
+
+Keep the current `starts_native_work` distinction: Result, Refresh and strict read-only
+Reconcile bypass model/root admission. Replies and exact stop controls retain their
+own permissions. Recovery fencing must allow authorized saved-output completion and
+safe readback without claiming the session is ready. It must not grant new input or
+permit an arbitrary historical read. Native resume can start work and remains distinct
+from reading saved bytes. Control priority must not starve result delivery indefinitely.
+
+## 7. Workspace and assignment
+
+Freeze allowed/forbidden repository-relative prefixes into the Attempt. Empty allowed
+scope means repository root. Reject traversal, absolute paths, empty segments and
+`.git`; compare path segments, not raw string prefixes.
+
+Lease authority coordinates Eliot writers, not unrestricted native shells. One Manager
+owns the mutable worktree and Git index/branch/commit. Leaf writers edit disjoint scope;
+review uses an immutable candidate/isolated snapshot without a writer lease. Remove
+advisory `code.scope.*`, not base authentication or Task/reviewer grants.
+
+TaskPacket carries goal/phase, requirement-linked verification, selected sources,
 current findings/dependencies, write boundary, worktree/branch/baseline, selected route
-and deliverable. Render initial/continue/correction through the existing owner. Keep
-required criteria; omit full Issue/audit history, global queue, raw Store JSON and proof
-digests. Missing sources remain explicit gaps, not permission to drop requirements.
+and deliverable. One renderer handles initial/continue/correction. Keep actionable
+criteria; omit Issue/audit history, raw Store JSON and controller proof digests.
 
-## 8. Observation and small public surface
+## 8. Observation and public surface
 
-The Governor's local view joins Task/Attempt/Operation/binding with native session,
-input/turn/children, provider source cursor, PID + birth identity, actual worktree/Git,
-last remote-ref observation and quota/activity/connection facts. Unmatched subjects and
-source gaps remain visible. A live PID, recent output or unchanged branch proves none
-of the other axes. Ordinary reads do not call a provider harness.
+Governor reads local Task/Attempt/Operation/binding, native inputs/children, provider
+source, PID/birth identity, worktree/Git/remote ref and quota/activity/connection facts.
+Unmatched subjects and gaps stay visible. No provider call on ordinary view reads.
 
-Keep existing small surfaces: queue, launch/optional preview, agent state/family/usage,
-semantic controls, Operation readback, result capture and review/acceptance. Launcher
-does not require council, contract ratification, integration ACK, code-scope approval,
-mandatory MCP readiness or automatic Issue-label publication.
+Keep queue, launch/optional preview, agent state/family/usage, semantic controls,
+Operation readback, results and review/acceptance. No council, ratification, integration
+ACK, code-scope approval, mandatory MCP readiness or label-publication workflow gate.
 
 ## 9. Connected completion cases
 
-- Corrections/unfinished work rank before new work without redispatching review-waiting work.
-- 128 blocked Tasks do not hide later eligible Tasks; held launches keep stable scan position.
-- Concurrent admissible launches cannot exceed the same root budget; parent/Open/service records count once.
-- Large closed/completed history does not change an otherwise identical current admission decision.
-- A valid native-default Antigravity route works with a configured root limit and no model override.
-- Fresh same-source quota evidence supersedes its stale duplicate without clearing independent constraints.
-- Policy disable admits no new work and cancels neither active work nor capture/readback.
-- Overlapping writers are rejected before effects; disjoint writers retain one Manager's Git ownership.
-- Direct launch works without mandatory preview/proof packets; automatic work uses the same handlers.
-- Unknown effects receive bounded readback and an addressed Governor decision, not routine human repair.
+- Corrections/unfinished work rank first; blocked first pages and 128 old blockers do not hide eligible Tasks.
+- Concurrent admissions respect one root budget; parent/Open/service represent one allocation.
+- Large terminal history cannot change an otherwise identical current admission decision.
+- Native-default Antigravity works with a root limit and no model override.
+- Lowering a root limit prevents growth while zero-growth continuation follows explicit input/quota policy.
+- Cancellation of verified-held unbound launch releases authority without removing files; in-flight Git remains fenced until readback.
+- Pre-send Open rejection retires only a proven unused binding; post-spawn failure retains ownership.
+- Fresh same-source facts supersede stale copies without clearing independent quota windows.
+- Held/disabled new work does not block authorized results, readback and exact stop/reply controls.
+- Overlapping writers are blocked before effects; review reads a frozen candidate.
+- Direct and automatic launch share handlers without mandatory preview/proof packets or routine human repair.
 
-These are target cases, not executed results. Current findings and untraced disposal,
-concurrency and route-change boundaries remain in the audit register.
+These are target cases, not executed results. Shutdown/departure, route-edit continuity,
+revocation and live concurrency remain explicit audit boundaries.
