@@ -7,41 +7,39 @@ second implementation queue. [Implementation](implementation.md) owns the work o
 
 ## Resume here
 
-- Pass: **2026-10-23 / historical source reads, capture cost and object authority**.
-- Inspected head: **`9c47d88a09a543e9f0ea74228370833f14a6c619`**. The comparison from
-  `f5ccc418` contains two documentation-only commits; earlier runtime findings are not
-  repaired by that interval.
-- Overall audit: **incomplete**. No measured completeness percentage.
-- Read selected Codex/Claude/OpenCode/Muse result readers, root/family guards, Store
-  normalized-origin admission, retained object grants and the base Operation/artifact
-  schema. Rechecked original specification sections 6–8 for bounded I/O, fair progress,
-  drain and no native start during readback.
-- Added **AR-032–AR-035**. Historical reading is not permission to remove root checks.
-  The target now distinguishes source lookup, bounded byte reading and exact page
-  delivery; a temporary selected-result file is not a transcript mirror.
-- **Next exact chain: queue/root capacity B.** Trace
-  `capacity::root_claims_for_route` -> launcher route admission/reservation ->
-  `automation_work_dispatch::reconcile` -> `runtime::next_internal`, including two
-  concurrent launch admissions, one root represented by several Operations, quota hold,
-  release and blocked first-page candidates. Check the actual caller/transaction before
-  declaring a double count, race or starvation defect.
-- Remaining result boundaries: reachable cross-root/account transitions, first historical
-  capture grant across revocation/handover, source discovery for every retained route,
-  coverage query indexes and live restart/power-loss behavior. This pass does not close
-  those by deleting a guard or drawing a new schema.
+- Pass: **2026-10-23 / queue progress and root-capacity admission**.
+- Inspected head: **`a0bc1dcb69fa4a2d3dea1e51e3c5b0d148bde1bb`**. The preceding commit
+  changed documentation, not the runtime findings carried below.
+- Overall audit: **incomplete**; no measured completeness percentage.
+- Traced selected root-count, route-admission, WorkDispatch and launch-reservation
+  paths, plus provider-condition selection and Antigravity's native-default model.
+- Added **AR-036–AR-040**. Root deduplication and the existing stable launch scan are
+  preserved; history-dependent capacity and the separate pending-subject cap are not.
+- Owning target updated: [launcher/queue](../swarm-launcher-assignment-context.md).
+  Implementation B remains the only implementation order.
+- **Next exact chain:** `runtime::next_internal` route-admission hold and control/read
+  bypasses -> direct `operations::open` and launcher callers ->
+  `launcher::fail_launch`, workspace release, binding release and
+  `owned_service_starts` disposition -> surviving root claims. Check cancellation,
+  rejected/unknown Open, configured-limit reduction and route edits before asserting
+  either a leaked reservation or a safe release.
+- Also trace provider-source invalidation on release/disconnect/account change. AR-039
+  proves precedence when old and fresh rows coexist; it does not claim every release
+  leaves that pair or that independent quota windows may be discarded.
 - Documentation only. No runtime change, Clippy, test, installed harness, benchmark or
-  independent verifier ran. Source evidence is not executed qualification.
+  independent verifier ran. Selected transaction bodies were read; the complete direct
+  caller/concurrency matrix was not executed or exhaustively traced.
 
 On resume compare source changes with this head and revisit changed callers/consumers.
-Keep findings until repaired with connected evidence. A search hit or a read test is
-not a completed runtime check.
+A finding remains open until repaired with connected evidence. A search hit or read
+test is not a completed runtime check.
 
 ## Evidence labels
 
-**Source-confirmed** means the named path was read and supports the stated consequence,
-not live reproduction. **Preserve** means useful existing behavior. **Partial** names
-an untraced boundary; **inherited** means earlier evidence not reread in this pass.
-Review, implementation and executed verification are separate.
+**Source-confirmed** means the named path supports the consequence, not live
+reproduction. **Preserve** means useful existing behavior. **Partial** names an
+untraced boundary; **inherited** means earlier evidence not reread in this pass.
+Review, implementation and executed verification remain separate.
 
 ## Findings and coverage
 
@@ -78,124 +76,153 @@ Review, implementation and executed verification are separate.
 | AR-029 | Command release | **Preserve plus excess.** Exact saved page works; source cleanup has release-proof Operations/tombstones. | Store-complete coverage then local cleanup. |
 | AR-030 | Muse source read | **Preserve plus qualification.** Exact item/revision/output ref and native range validation; ready page checkpoint. | AR-034 identifies unbounded repeated discovery; not all native reads are bounded. |
 | AR-031 | Coverage owner | **Target correction.** Store owns pages; per-page next offset is not aggregate source completeness. | Exact coverage ACK/replay; no local range union. |
-| AR-032 | Historical source versus active session | **Source-confirmed boundary, not a universal reachable root-swap bug.** Codex/Claude compare active root; OpenCode fixes root per binding generation; Muse requires observed family membership. | Source-authorized reader with original service/account scope; retain custody checks and prove actual transition cases. |
-| AR-033 | Codex per-page read amplification | **Open efficiency defect.** Each new page rereads thread/history/turn/full final body, then slices at most 24 KiB. Exact saved-page replay bypasses this. | Native range read or one bounded selected-result materialization; measure later. |
-| AR-034 | Muse discovery budget | **Open boundedness defect.** Each result range calls `readItem`; its backward walk has cycle detection but no total page/byte/time budget. | Bounded resumable discovery; reuse exact item/ref instead of repeating the scan. |
-| AR-035 | Historical capture and disclosure grants | **Preserve plus target clarification.** Receipt, Bytes and Assemble grants differ; exact result caller is capped at Bytes, historical reviewer gets no new bytes. | Derive first historical capture under current scoped authority; capture cannot create a new grant or widen assembly rights. |
+| AR-032 | Historical source versus active session | **Boundary, not a universal reachable root-swap bug.** Codex/Claude compare active root; OpenCode fixes root per binding generation; Muse requires observed family membership. | Source-authorized reader with original service/account scope; prove actual transitions. |
+| AR-033 | Codex per-page read amplification | **Open.** Each new page rereads thread/history/turn/full final body, then slices at most 24 KiB. Saved-page replay bypasses this. | Native ranges or one bounded selected-result materialization; measure later. |
+| AR-034 | Muse discovery budget | **Open.** Each range calls `readItem`; backward walk detects cycles but has no aggregate page/byte/time budget. | Bounded resumable discovery and reuse of exact item/ref. |
+| AR-035 | Historical capture/disclosure grants | **Preserve plus target clarification.** Receipt, Bytes and Assemble differ; exact result caller is capped at Bytes; historical reviewer gets no new bytes. | Current scoped capture authority, not invented Operator or widened grants. |
+| AR-036 | Root capacity depends on history | **Source-confirmed defect, open.** Global binding/ledger census and per-scope historical Operation roster precede root counting. Historical limits/damage can yield unknown capacity despite no corresponding live claim. | Indexed current-claim projection; no full-history ledger verification on admission. |
+| AR-037 | Antigravity native-default root limit | **Source-confirmed defect, open.** Service-less root identity requires `modelId`, while the selected adapter explicitly permits its absence. With root policy enabled, the count is unknown even before the first root. | Stable configured budget identity independent of optional model selection. |
+| AR-038 | WorkDispatch pending saturation | **Source-confirmed defect, open.** At 128 pending subjects, an entry stops reading later Task facts; repeated checks of persistent blockers do not admit a later eligible Task. | Current-state fair candidate scan; remove copied pending subjects rather than raise cap. |
+| AR-039 | Stale provider row outranks fresh availability | **Source-confirmed predicate defect, open.** For matching retained shared-resource rows, stale source ranks 2 and current Available ranks 1; cross-binding same-source refresh need not supersede the old row. | Source/bucket-scoped supersession; trace lifecycle invalidation; retain independent constraints. |
+| AR-040 | Existing admission/dedup/scan mechanisms | **Preserve, selected paths.** Root set deduplicates normal binding/open/dispatch/service representations; launch callback rereads/reserves in its transaction; pending launches use stable keyset/ceiling. | Full direct caller/concurrency, failure-disposal and route-edit matrix remain open. |
 
 ## Current pass evidence
 
-All paths below were read at the inspected head unless a historical revision is named.
-These are selected connected portions, not whole-file coverage claims.
+Sources below refer to `a0bc1dcb`; line spans locate this inspected revision, not future
+worker instructions. Only the named portions were read.
 
-### AR-032 — do not remove identity checks to repair historical reading
+### AR-036 — an activity limit has become a history limit
 
-- `swarm-adapter-codex/src/lib.rs::build_normalized_result_page` checks saved input/turn,
-  current root, service scope, workspace and current requested/effective model facts.
-- `swarm-adapter-opencode/src/lib.rs::handle_assistant_result` requires the selected
-  session to match the command root and original input. `set_root_hint` / `verify_hello`
-  enforce a deterministic binding-generation root. That is a custody boundary, not
-  evidence of an arbitrary root replacement bug.
-- `modules/muse/bridge.mjs` invokes `readResult` only for root/observed children.
-- `swarm-adapter-claude/src/lib.rs::handle_result` requires the current SDK session and
-  reads `NativeControl::result_for_operation`; a new process starts with empty control
-  state. Removing the root comparison cannot recreate missing bytes.
+`store/capacity.rs`:
 
-Separate the immutable source locator from the currently active executor. A historical
-reader must still use an authorized provider/service/account/workspace and the original
-Operation/binding/native output. Never route an old page through an unrelated new
-binding, call Open/Resume to make a read pass, or accept a caller-supplied arbitrary
-session. Saved ready pages remain Store deliveries independent of this discovery path.
-Reachability of every root/account transition is still unqualified.
+- `collect_scopes` (around 2960–3070) enumerates all bindings, including closed ones,
+  with a 10,001-row sentinel, then loads the ledger roster. Overflow creates global
+  damage and `unknown:capacity-roster-limit`.
+- `roster_check_inner` (around 3130–3305) enumerates every Operation and Attempt for
+  the selected bindings, not just unresolved work; it also counts producers toward
+  the 10,000 visited-row limit and compares the duplicated evidence ledger both ways.
+- `root_claims_for_route` (around 3898 onward) calls those routines before assembling
+  live root identities. Global roster damage returns `None`. Its owned-service scan
+  also includes terminal rows before applying its bounded-row decision.
+- `launcher::route_admission` passes that `None` to
+  `provider_conditions::route_admission`, which returns `ROUTE_CAPACITY_UNKNOWN`
+  for an enabled root policy.
 
-### AR-033 — bounded page output can hide repeated full reads
+Thus more than 10,000 retained bindings can hold policy-governed routes even when the
+old bindings are closed. A sufficiently large completed Operation history can hold
+its target scope as well. No production incident or measured latency is claimed.
+Even below the limit, admission repeats history decoding/ledger validation rather than
+querying only the resource claims that can still consume capacity.
 
-[Codex reader](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/9c47d88a09a543e9f0ea74228370833f14a6c619/crates/swarm-adapter-codex/src/lib.rs#L6341-L6742):
-`read_thread`, `read_history`, `read_turn`, then `read_final_assistant_response` precede
-byte slicing and full-body hashing on each new page Operation. If the body has B bytes
-and requires P pages, the selected body is materialized approximately P times, in
-addition to history work. This is a source-level cost observation, not measured latency.
-The earlier command handler reuses a saved pending page; transport retry is not the cause.
+Replace that dependency with a current-claim projection over existing launch/binding
+owners, counted in the admission transaction. Index the actual active predicate and
+budget key. Keep genuinely unresolved roots, but exclude closed/disposed history.
+Do not solve this with a larger cap, history deletion, periodic ledger repair or a
+second capacity database. Diagnostic history remains independently pageable.
 
-Use a real native range API when available. Otherwise materialize only the selected
-immutable final output once, page that private body with existing file primitives, and
-release it after Store coverage. This temporary source is not a conversation replica,
-generic cache service or new journal. Keep identity/hash checks on actual output bytes.
+### AR-037 — optional model is required by an unrelated gate
 
-### AR-034 — one-page memory is not a bounded history lookup
+`modules/antigravity-rust/src/launch.rs::{selected_model_id,build_launch_spec}` returns
+`None` for absent `modelId` and deliberately omits `--model`. In
+`capacity.rs::root_route_identity` (around 3450–3525), the selected Antigravity artifact
+instead requires `root_route_text(options.get("modelId"))`. The missing field returns
+`None`, propagated by `root_claims_for_route` before any existing-root query.
 
-[Muse reader](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/9c47d88a09a543e9f0ea74228370833f14a6c619/modules/muse/results.mjs):
-`readItem` loops backward with `limit:100`, a cycle-detection Set and exact item/revision
-matching. It has no aggregate page/byte/elapsed-work bound. `readResult` calls it before
-every range, including output-ref reads that subsequently use native `item/readOutput`.
-A long missing-item lookup can traverse the whole available history; unique cursors also
-keep growing the Set. Other Muse recovery limits do not bound this helper.
+For an otherwise valid service-less Antigravity route with `admission_policy`, this
+makes even an empty root roster unknown. The defect does not imply every Antigravity
+configuration is blocked; a supplied model or different scope takes another path.
 
-Retain the useful native range/digest checks and refusal to fetch arbitrary URI/path.
-Separate bounded locator discovery from byte reading. A budget stop retains the exact
-continuation cursor in the existing source/read action and reports partial coverage,
-not absence or success. Reuse the located item revision/ref on following pages. Do not
-mirror events or repeatedly restart at the newest page.
+Count the configured root budget by its retained route/resource identity. Model and
+provider observations still matter to selection/quota, but omission of a supported
+native-default override cannot erase root identity. Do not force a fake explicit model
+or infer an account/provider from a model name. Route edits must not detach still-live
+claims from the budget they actually reserve.
 
-### AR-035 — preserve object grants instead of borrowing execution authority
+### AR-038 — bounded storage silently becomes queue eligibility
 
-Read `store/object_scope.rs::identity_for_attempt`, `current_manager_task_basis`,
-`resolve_task_read`, `artifact_level_for_relation`, `exact_operation_artifact_grant`,
-`native_source_grant` and `resolve_assembly_sources`.
+`store/automation_work_dispatch.rs::reconcile_entry` (around 466–559) rechecks at most
+eight pending subjects, then calls `consume_work_fact_page` only while
+`state.pending.len() < MAX_PENDING_SUBJECTS` (128). If those subjects remain blocked,
+new facts past the entry cursor are never considered. A later Task whose dependencies
+or write scope are ready cannot get past that local backlog.
 
-The retained Attempt supplies frozen revision/binding identity. Current Manager/GM
-Task/project relations and exact result/input callers are separate positive read bases.
-Exact-caller artifact access is capped at Bytes; it does not alone authorize Assemble.
-Historical reviewer receipt rights do not reopen candidate bytes. Module credentials
-cannot inspect arbitrary artifacts. Assembly intersects the source-page grants.
+This is not lack of every kind of fairness: `enabled_entry_page` rotates automation
+entries and the separate launcher scan already has stable pagination. They cannot
+free a saturated entry's pending list.
 
-Reuse these identity and policy owners for first historical Result admission, without
-requiring the old Task to be current and without treating Operation receipt visibility
-as a byte grant. The missing capture authorization remains a scoped Store action, not
-an invented Operator principal or a new permission registry. New native work still
-requires current Task/Attempt authority. Capture/submission/acceptance stay separate.
+B4 should query current Tasks/Attempts and eligibility, not replay every creation fact
+into another pending queue. Filter cheap eligibility before LIMIT; continue a bounded
+keyset scan for checks that need inspection. Retain only the host loop's scan position,
+not copied Task state. A blocked source remains in its owning Task/dependency domain.
 
-## Capture-query contract clarified, not implemented
+### AR-039 — availability is not a vote among binding histories
 
-The base schema has authoritative Operations, Attempts, artifacts and observations;
-it has no complete-capture flag that this pass can honestly query as implemented.
-[Module API](module-api.md#current-state-correctness-loop) specifies the next action as
-one current-state projection: exact output-ready source, missing coverage, no active
-same-source read, current capture authority and due retry. Reserve an ordinary Result
-in the existing mutation transaction, then perform provider/file I/O outside Store.
+`provider_conditions.rs::route_admission` (around 888–1071) loads matching shared-scope
+rows. It assigns stale source rank 2, current Available rank 1, current Hold rank 3 and
+Unavailable rank 4. A stale old binding therefore wins over a fresh Available row when
+both match the same resource. `source_binding_matches` rejects released bindings;
+`invalidate_all`, `clear_absent_bucket_facts` and `delete_exact` operate on the selected
+source binding/generation rather than superseding another binding's row.
 
-Two important gaps are explicit: the first page may require adapter-local exact-output
-locator discovery, and a completed failed read cannot be retried forever under the same
-immutable rejected request key. These are read attempts, not native prompt retries.
-No capture queue, copied Task state or adapter ACK-range ledger is introduced.
+The decision-rule mismatch is confirmed for that retained input state. Whether each
+release/disconnect path leaves those rows is not fully traced. A stale independent
+quota window or a genuinely ambiguous account is not equivalent to a superseded copy.
 
-## Inspection and preservation limits
+Use the latest valid observation of the actual source/account/bucket/window, with its
+source epoch and applicable ordering. Then combine independent current constraints.
+Do not let an old duplicate veto its successor, choose only the newest global timestamp,
+or convert all unknown facts to Available. Reset/retry time makes a bounded refresh or
+policy-selected probe due; it is not proof that quota recovered.
 
-| Source | Read boundary |
+### AR-040 — preserve useful mechanisms, not their proof scaffolding
+
+`capacity::root_claims_for_route` uses a `BTreeSet<RootClaimIdentity>`: the same native
+root or pre-root binding is not counted again for its Open, Dispatch and owned-service
+records. An admitted unbound launch is a temporary root claim; after binding it must
+be the same reservation, not another slot. Same-root exclusions are applied after the
+sources are collected. The ADMISSION_METHODS ledger includes reads, but that alone
+is **not** evidence that each Result/Refresh consumes another root slot.
+
+`launcher::admit_work_dispatch` and `launch_for_actor` reread the plan and reserve the
+ordinary launch in the supplied Store transaction. `launch_after_workspace_held`
+rechecks admission and carries it through the Attempt/Open-child transition in that
+same transaction, avoiding a count of its own half-constructed parent. Preserve atomic
+check/reserve and exact subject authority; remove duplicate manifests/digests around
+those facts, not the checks themselves. The complete outer direct-call transaction
+and concurrent native qualification remain unverified here.
+
+`launcher::{pending_launch_ceiling,pending_launches}` (around 4030–4125) already scans
+outstanding launches using immutable `(created_at_ms, operation_id)` and a fixed cycle
+ceiling. Updating `updated_at_ms` while held cannot move the candidate back ahead of
+that cursor. `launch_reconciliation_snapshot` excludes timestamp-only admission
+refreshes from semantic progress. Reuse this pattern; do not invent another scheduler
+or describe this existing scan as the WorkDispatch pending-cap defect.
+
+## Source/target map
+
+| Inspected owner | Target action |
 | --- | --- |
-| `store/normalized_result.rs` | descriptor checks, live first admission and retained result validation entry. |
-| `store/object_scope.rs` | retained identity, Manager/GM/participant/reviewer grants, exact callers, Bytes/Assemble distinction and source intersection. |
-| `swarm-adapter-codex/src/lib.rs` | saved-page command short circuit; normalized body lookup, current-root/config checks, history reads and byte slicing. |
-| `swarm-adapter-opencode/src/lib.rs` | exact assistant selector/input/parent, root hint, route and hello validation. |
-| `swarm-adapter-claude/src/lib.rs` | startup empty NativeControl, selected current-session result lookup, body/page publication. |
-| `modules/muse/results.mjs` / selected `bridge.mjs` caller | exact revision search, family-membership predicate, range and output-ref validation. |
-| `migrations/001_core.sql` | Operation identity/due/state, Task/Attempt and artifact/observation owners; not every schema extension/index. |
-| Original `docs/agent_swarm.md` at `f1b854b6`, sections 6–8 | bounded service work, fair ready-target progress, drain preserving results, readback without native start. |
+| `store/capacity.rs` scope collection, root identity/count and roster checks | B3: retain unique current-root semantics; delete evidence-ledger/history dependency. |
+| `store/launcher.rs` route predicate, WorkDispatch admission, launch/Open handoff and stable pending scan | B0/B4: one eligibility projection, transactional admission and fair scan. |
+| `store/automation_work_dispatch.rs` activation, pending recheck and source-page gate | B4: delete copied pending subjects/cursors with the working current-state path. |
+| `store/provider_conditions.rs` shared-source selection, freshness and binding-local invalidation | B2: source-scoped observations and explicit freshness/supersession. |
+| Antigravity `launch.rs` optional model handling | Preserve native-default choice while repairing B3 root attribution. |
+| Retained Claude-script review: `issue_settled.py`, `plan_next.py`, `state.py` | Keep actionable dependency ranking and omission of parked/review-waiting work until relevant change; not a separate queue. |
 
-The original specification supports these constraints; its older mutually exclusive
-Goal wording is not restored over the owner's newer independent-Goals decision.
-External donor repositories/installed SDKs were not freshly requalified in this pass.
-Existing Eliot implementations were inspected as positive/negative donors.
+The script donor was read through the retained
+[review](../remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md), not a freshly opened
+private ZIP. External donor repositories and installed SDKs were not requalified.
 
-## Next work and remaining coverage
+## Remaining coverage
 
-Start with queue/root-capacity B as named above. Then continue workspace/process,
-Goals/scheduling, review/acceptance, public-object permissions, migrations, IPC fairness,
-external writes and independent observation. Historical read/capture revocation and
-multi-root reachability remain named open boundaries, not reasons to invent another
-framework before reading those owners.
+Continue the exact failure/disposal and control-read chains at the top. Then workspace
+custody, Goals/scheduling, review/acceptance, public-object permissions, migrations,
+IPC fairness, external writes and independent observation remain open tracks.
+Historical capture revocation, root/account changes, coverage query indexes and live
+restart/power-loss are still unqualified; this pass does not close result work merely
+because the focus moved to B.
 
-Earlier detailed evidence, including the result-source matrix and anti-donor list,
-remains in the [preceding register](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/9c47d88a09a543e9f0ea74228370833f14a6c619/docs/agent-operations/audit-register.md)
-and its linked prior passes. All AR-001–AR-031 dispositions remain above. A docs commit
-is not a runtime repair; installed/native/Windows/load qualification remains separate.
+Detailed AR-001–AR-035 evidence and prior pass links remain in the
+[preceding register](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/a0bc1dcb69fa4a2d3dea1e51e3c5b0d148bde1bb/docs/agent-operations/audit-register.md).
+All dispositions remain in the table above. A documentation commit is not a runtime
+repair or complete current-head qualification.
