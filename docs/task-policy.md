@@ -87,12 +87,26 @@ The current V2 `requirement_evidence_plan` is retained behavior, not bureaucracy
 delete. Every requirement must name at least one accepted evidence source, such as
 exact CheckProfile/CheckRun, assigned independent review coverage, retained artifact/
 property readback or explicitly selected external evidence where no executable source
-exists.
+exists. Freeze this plan in the Attempt snapshot and evaluate it against the exact
+candidate, retained CheckRuns and assigned review coverage. Store validates identities,
+scope, structure and allowed evidence references; the assigned reviewer remains
+responsible for substantive criterion judgment. A model's confidence or opaque prose
+does not stand in for evidence selected by the plan.
 
-Freeze the plan in the Attempt snapshot. Review assignment and acceptance validate the
-same plan for the exact candidate. A new submission ID, prose confidence or absence of
-new failures does not prove a requirement. Known unrelated baseline failures may be
-reported separately under project policy; they do not waive requirement evidence.
+Review results are immutable and bound to their exact submission/candidate slot.
+CheckRuns and other selected evidence may accumulate for the same candidate without
+rewriting its review result; the acceptance gate evaluates the current exact-candidate
+evidence against the frozen plan. A new submission ID, fresh identifier, prose
+confidence or absence of new failures does not prove a requirement. Known unrelated
+baseline failures may be reported separately under project policy; they do not waive
+requirement evidence.
+
+Direct and automatic acceptance must resolve required assigned reviews and current
+finding dispositions through the same gate. Decision/reason belongs to the accepting
+agent; auditor evidence belongs to its retained review. Today the candidate/check/
+dependency gate is shared, but direct acceptance still takes caller-authored review
+arrays and the feedback cursor checks only freshness. This source gap is
+[AR-064](agent-operations/audit-register.md#ar-064), not permission to bypass review.
 
 TaskPacket renders concise meaningful criteria for the agent. It does not expose the
 full internal JSON plan or remove the criteria from Store.
@@ -158,9 +172,29 @@ A requirement/policy change that alters the requested product creates the approp
 Task revision/new Attempt. A route retry or worker replacement under already selected
 policy does not rewrite Task meaning.
 
-Bound unchanged correction rounds. Relevant new evidence can progress the same source;
-new IDs or unrelated edits cannot. After the bound, create one addressed Governor
-decision with concrete options, not a permanent human approval step.
+Bound correction and no-progress rounds with finite policy budgets that survive
+resubmission, policy edits, owner transfer and restart. Reserve a round when admitting
+one new correction input. Assess its progress only after the attributable outcome and
+required output capture/readback and review disposition are available; pending input,
+uncertain effects, wait time and retries of the same readback do not reserve additional
+rounds. Keep uncertain effects under exact readback, preserve capture duties and let
+unrelated work continue.
+
+Relevant candidate changes, newly satisfied requirement-linked evidence or disposition
+of an actionable finding can count as progress; new IDs, repeated text, unrelated edits
+or a fresh Operation alone cannot. After a bound is reached, coalesce one addressed
+Governor-agent decision through ordinary scoped commands, with concrete choices to
+revise the work split, replace the worker, explicitly authorize remaining budget or
+stop. This is not a permanent human approval step. Any explicit budget increase keeps
+prior consumption; it does not reset counters.
+
+Review replacement is an ordinary authorized Manager/Governor action bound to the
+current assignment and candidate. The Store supports explicit direct replacement for
+unanswered, inconclusive or returned-for-correction assignments, but the current
+enabled ReviewDispatch caller does not automatically replace an assigned unanswered or
+inconclusive review. Target automation must make any replacement decision explicit;
+see [implementation G](agent-operations/implementation.md#g--reviewcorrectionacceptance)
+and the [current audit resume point](agent-operations/audit-register.md#resume-here).
 
 ## 8. Finite transition
 
@@ -186,7 +220,18 @@ projections. They do not keep an executable policy engine or universal converter
 - TaskPacket contains required goal/sources/dependencies/criteria but no proof dump;
 - missing required source remains an explicit gap;
 - each requirement is covered by retained exact-candidate evidence;
+- Store checks frozen-plan identity, scope and evidence shape; assigned review supplies
+  substantive judgment, while prose alone is never accepted as proof;
+- new CheckRuns for an unchanged candidate can satisfy its frozen evidence plan without
+  rewriting an immutable review result;
+- a passed review cannot be overwritten; if the same candidate needs a fresh review,
+  resubmit it under the same unreleased Attempt with the current expected prior-submission
+  reference to create a new immutable submission/slot;
 - correction/resume renders current findings without replaying initial prompt;
+- finite correction/no-progress counters survive policy edits, transfer and restart;
+  pending/unknown work and readback retries do not reserve additional rounds;
+- an authorized agent may explicitly replace an eligible review; no human approval is
+  required for routine review replacement;
 - policy change affects future admissions and does not rewrite history;
 - removing document-edition/legacy branches preserves current scoped rights and
   evidence semantics.

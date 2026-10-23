@@ -5,24 +5,25 @@
 **SOURCE_AUDIT_INCOMPLETE / TARGET_DOCUMENTS_WORKING_DRAFT / RUNTIME_REFACTOR_IN_PROGRESS.**
 
 Repository inspected on **2026-10-23** at
-`73ba7009bbc5c5515fe4c5f85743066e944106ef`. The latest runtime change is
+`4af640ea6edc190d58a7320674c85cbc5bd3c6b3`. The latest runtime change is
 `c92120ed70ca7e625440a8a19517c481e73b13c9` (2026-10-21). Comparing those revisions
-shows **18 documentation-only commits**. This update also changes documentation only.
+shows **19 documentation-only commits**. This update also changes documentation only.
 
-The previous checkpoint indexed AR-001–050. This pass continued the Goal policy chain
-through admission, runtime selection and terminal evidence; it added AR-051–058 and
-checked calendar occurrence continuity plus exact official Codex/Muse Goal sources.
-The target now states phase-gated ordinary messages, finite budgets, disable/transfer
-semantics and capability limits that a coding agent can implement and verify. No
-runtime defect is marked repaired.
+The previous checkpoint reached AR-058. This pass traced submission → assigned review
+→ all-findings correction → same-Attempt resubmission → acceptance and recovery. It
+adds AR-059–064, preserves AR-011 and extends AR-052 to queued repair input. The target
+now gives concrete automatic replacement, finite correction, blocker isolation and
+shared required-review checks while preserving the working frozen-evidence/byte gate.
+No runtime defect is marked repaired. Earlier long traces are linked at immutable
+commits rather than copied into every version of the active register.
 
-- [Resume point and 58 finding records](agent-operations/audit-register.md#resume-here).
+- [Resume point and 64 finding records](agent-operations/audit-register.md#resume-here).
 - [Evidence/source index](agent-operations/audit-index.md): exact traces and remaining coverage.
 - [Document index](agent-operations/README.md): current contracts versus historical evidence.
 - [Implementation](agent-operations/implementation.md): the only work order.
 - [Donor register](agent-operations/donor-map.md): what to reuse, source links and version limits.
 
-The records include defects, preserved mechanisms and partial boundaries, not 58 bugs
+The records include defects, preserved mechanisms and partial boundaries, not 64 bugs
 or a measured audit percentage. Historical requirement mapping is selected, not an
 exhaustive reread of all archives. The private Claude-script ZIP was not re-executed.
 
@@ -73,6 +74,8 @@ uncaptured bodies remain at risk in current code.
 | Shutdown/resource retirement, AR-045–048 | Non-ready shutdown barrier, intentional-detach/demand mismatch and missing attached-binding finalizer confirmed through the running sweep | Implementation of eventual retirement; actual detach/Goal/child and crash-only behavior. |
 | Goal policy/admission/transfer, AR-051–056 | OpenCode actor rejection before dispatch; Codex policy-edit rejection of queued input; submitted/correction eligibility, missing finite bounds and unclaimed-event cursor gap. Exact terminal identity/atomic deduplication preserved | Ordinary Send replacement, phase/budget fixes and installed disable/transfer/restart. Native terminal still does not prove result capture or acceptance. |
 | Calendar/native Goals, AR-057–058 | Current CheckRun occurrence continuity and latest-only catch-up; current native mappings separated from pinned upstream Goal contracts | General automation loop, Codex native Goal mapping and selected installed-native qualification. Muse's SDK lock does not identify its native binary. |
+| Submission/review/correction, AR-011/052, 059–061 | All-findings feedback and same-Attempt immutable resubmission preserved; direct replacement exists but automatic caller cannot use it. Correction rounds lack a finite bound; 64 pending results can block later work for one entry; queued repair also rechecks policy revision | Automatic replacement/finite progress/fair selection, admitted-intent fix and actual correction output capture. No infinite loop or live starvation measured. |
+| Acceptance/dependency recovery, AR-062–064 | Common frozen-plan/candidate/check/byte gate and late-check retry preserved. Revoked dependency pin aborts review pass and skips queued verification on that call. Direct acceptance lacks automatic assigned-review/finding checks | Per-subject replan, independent verification progress and required review provenance in the common gate. CheckRun producer/cache and live execution remain unqualified. |
 | Other implementation areas | Inherited structural and selected source reviews | Remaining chains listed in the audit index; no whole-project completion claim. |
 
 No AR entry is closed merely because its target documentation was corrected. Preserve
@@ -101,8 +104,8 @@ target, not runtime-complete; current gaps remain explicit.
 | Preparatory work with honest dependencies — `dependency-revalidation.json` | [Dependencies](task-policy.md#4-dependencies-start-policy-versus-acceptance-truth); claim/acceptance | `hold` or explicit preparatory mode; current claim gates every dependency. |
 | Explicit route/model/effort/fallback — v18 §9 | [Route policy](agent-operations/configuration.md#5-route-dependency-session-and-permission-policy); launcher | Retained; no silent substitution. AR-049 records edit-accounting gap. |
 | Reuse/drain/retire actual resources — v18 §§4, 8; script review | [Launcher lifecycle](swarm-launcher-assignment-context.md#scoped-shutdown-and-retirement); runtime/workspace | Attached-binding finalizer absent, AR-048. Closing a link is not native death. |
-| All findings together, missing reviewer replaceable — script review | [Correction](agent-operations/delivery.md#9-review-correction-and-resubmission); reviews/submissions | Existing replacement classes stay; RepairDispatch and wrong no-effect classification remain. |
-| Every requirement and exact candidate verified — v18 §§11–12; R10/R11 | [Evidence](task-policy.md#3-requirements-and-evidence); reviews/checks/acceptance | Retained; common direct/automatic gate still requires source work. |
+| All findings together, missing reviewer replaceable — script review | [Correction](agent-operations/delivery.md#9-review-correction-and-resubmission); reviews/submissions | All-findings package/direct replacement preserved. Automatic replacement absent (AR-059), finite rounds absent (AR-060); RepairDispatch/no-effect and policy-edit gaps remain. |
+| Every requirement and exact candidate verified — v18 §§11–12; R10/R11 | [Evidence](task-policy.md#3-requirements-and-evidence); reviews/checks/acceptance | Common frozen-plan/check/byte gate preserved (AR-063); assigned-review/finding validation is not shared by direct acceptance (AR-064). Revoked-pin isolation remains AR-062. |
 | Compact TaskPacket with real criteria — v18 R10; script review | [TaskPacket](task-policy.md#taskpacket); `task_prompt`, Task/Attempt owners | Prompt proof/hash envelope remains; do not delete executable criteria. |
 | Quota, activity, connection and capacity separate — v18 §§8–9, 14 | [Provider facts](swarm-launcher-assignment-context.md#6-provider-conditions-and-non-work-commands); provider_conditions/capacity | Stale-copy precedence and history-dependent ledgers remain. |
 | Passive joined observation, unmatched subjects and gaps — v18 §8; script review | [Observability](agent-operations/observability.md); adapter/OS/Git/remote collectors | Joined fleet is target work; no empty-fleet inference from a failed source. |
@@ -140,9 +143,10 @@ missing a live machine does not excuse leaving source paths untraced.
 
 ## Next work
 
-**Audit:** the selected Goal-policy/terminal/disable/transfer and calendar occurrence
-chains are source-traced. Resume candidate submission → reviewer assignment/replacement
-→ all-findings correction → corrected submission → acceptance in
+**Audit:** the selected submission/review/correction/acceptance chain is now traced in
+source, including direct/automatic differences and dependency invalidation. Continue
+frozen source → CheckRun worker/process → completion/parser coverage → cache reuse →
+acceptance in
 [audit-register](agent-operations/audit-register.md#resume-here). The
 [audit index](agent-operations/audit-index.md) keeps other untraced boundaries visible.
 

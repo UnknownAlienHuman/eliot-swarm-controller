@@ -216,9 +216,18 @@ cleanliness alone.
 
 ### Manual and automatic acceptance must converge
 
-One gate resolves candidate-specific review/check/dependency evidence and frozen
-requirements. Manager/Governor supplies decision/reason, not another auditor result.
-Candidate B needs B's evidence.
+`store/acceptance.rs::{reserve_with_actor,evidence}` and their asynchronous verification
+already share the candidate, frozen-plan, check, dependency and byte gate. Preserve
+that working path. Automatic acceptance copies retained assigned-auditor evidence;
+the earlier instruction to remove fabricated automatic review arrays was too broad.
+
+Reviewer provenance has not converged: direct acceptance supplies caller-authored
+requirement reviews, while assigned-review/empty-findings checks live in automatic
+preflight. The common feedback cursor checks freshness, not finding resolution.
+Resolve required reviews and finding dispositions in the common gate; Manager/Governor
+supplies decision/reason, not another auditor result. Candidate B needs B's evidence.
+The [current trace](audit-register.md#trace-2026-10-23-review-acceptance) records these
+preserved checks and the distinct missing automatic replacement/progress paths.
 
 ## 6. API, Store and frontend findings
 

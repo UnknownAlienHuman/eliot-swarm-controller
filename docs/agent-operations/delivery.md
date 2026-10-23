@@ -39,7 +39,7 @@ only their exact resource while unrelated work continues.
 | Uncertain effect with declared readback | `reconcile_once` → `agent.reconcile` | Target resolved or lookup settled inconclusive |
 | Complete pages needing one artifact | `artifact.assemble` | Whole artifact or exact failure |
 | Complete candidate | `task.submit` | Current or historical submission |
-| Missing review | `review_once` | Independent assignment |
+| Missing or policy-replaceable review | `review_once` | Independent assignment or exact replacement |
 | Changes requested | `task.request_changes` + one correction `Send` | All findings delivered together |
 | Required evidence ready | `accept_once` → `task.accept` | Candidate-specific acceptance |
 | Accepted work + publication policy | Forge/GitHub effect | Exact remote readback and selected closure |
@@ -218,17 +218,29 @@ custody and does not settle semantic targets.
 
 ## 9. Review, correction and resubmission
 
-Use one review slot bound to Task revision, Attempt and candidate. Retain sponsor,
-reviewer and actual author separately. Preserve unanswered/inconclusive/
-returned-for-correction replacement. Late old review is historical.
+Use one review slot bound to Task revision, Attempt, submission and candidate. Retain
+sponsor, reviewer and actual author separately. `review_once` queries current work:
+assign a missing review, or replace the exact unanswered, inconclusive or returned
+assignment under policy. An unanswered result needs the configured response
+deadline/current-state decision; silence alone proves no failure. Replacement uses the
+expected current assignment and a distinct eligible reviewer. Bound replacements and
+send one addressed Governor decision when policy has no eligible choice. Direct Store
+replacement exists today; the automatic caller still lacks this path (AR-059).
+
+A result is immutable for its assignment. Identical replay coalesces; a different
+result cannot overwrite it. Late old output may be retained only under the exact
+non-revoked reviewer scope; it is historical and cannot fill a replacement's slot.
 
 Auditor returns verdict, all actionable findings and requirement-linked evidence in one
 result. Infrastructure failure/incomplete coverage is inconclusive, not pass or code
 failure.
 
-`task.request_changes` applies exact current findings package. With live owner, admit
-one next-turn correction in same local action; otherwise `needs_correction` remains for
-next resume. No RepairDispatch backlog.
+`task.request_changes` applies the exact current findings package. In one Store
+transaction retain all actionable findings, set `needs_correction`, and admit one
+next-turn correction if its owner binding is eligible. Native I/O occurs after commit.
+Otherwise the retained correction remains queryable for resume. The existing automatic
+path already builds the full package; preserve it while removing RepairDispatch state.
+Feedback committed to the mailbox does not prove the Send was delivered.
 
 Delivery facts:
 
@@ -246,14 +258,43 @@ Same unreleased `needs_correction` Attempt may submit corrected candidate agains
 expected revision/prior submission. Stale publication stays historical. No second
 repair-submit state or replacement Attempt solely for result submission.
 
-Bound no-progress/cost and escalate once to Governor with concrete options, not a human
-routine-work queue.
+Reserve a finite round at each new correction admission and assess no-progress from
+settled work and required evidence. Retries/readback/waiting do not create new rounds.
+Resubmission, policy edits, transfer or restart do not reset consumption. Preserve
+capture and uncertain-effect readback when a bound stops further correction input;
+send one Governor decision with concrete options and continue unrelated work.
 
 ## 10. Acceptance and publication
 
-Manual `task.accept` and `accept_once` use one candidate-specific evidence gate. Review
-of A cannot accept B. Missing checks/unresolved findings/new unrelated ID do not pass;
-unchanged candidate may gain relevant evidence.
+Manual `task.accept` and `accept_once` must resolve the same required assigned reviews,
+actionable-finding disposition, frozen evidence plan, exact CheckRuns and pinned
+dependencies for the current candidate. Keep decision actor distinct from auditor and
+author. A current feedback cursor proves freshness only; unresolved findings still
+block acceptance unless explicitly disposed by authorized candidate/review policy.
+Prose in a new acceptance request cannot replace retained auditor evidence. Review of A
+cannot accept B. Store validates identities, coverage and bytes; the reviewer judges
+whether those facts satisfy each substantive criterion.
+
+The source already shares `acceptance::evidence` and off-DB byte verification, but
+assigned-review checks are currently automatic-caller preflight, not common-gate
+validation. Direct acceptance can supply its own review array. AR-063 preserves the
+working evidence checks; AR-064 records this remaining provenance/finding gap.
+
+`accept_once` rechecks ready current candidates after evidence changes or a lost wake.
+Before admission, late required CheckRuns already retry against the retained pass.
+An unchanged artifact can gain those checks without another review. If the review
+itself needs renewal, retain the old result and use an eligible replacement or a new
+same-Attempt submission with the expected prior submission; never overwrite a pass or
+count the new identity alone as progress. Current automation supports one primary
+required reviewer; reject an unsupported count rather than silently reduce it.
+
+A prerequisite invalidated after claim leaves a revoked receipt in the dependent
+Attempt's frozen snapshot. Preserve the candidate and address a replan/reclaim decision
+to its Governor; accepting the prerequisite again cannot change that pin. Close existing
+effect obligations before releasing/reclaiming under a new valid snapshot. Missing
+evidence or this local replan must not roll back unrelated review work or prevent
+verification of queued acceptances. Unknown/terminal failed acceptance Operations keep
+their original readback/receipt; new evidence needs a new attributable decision.
 
 Upload, push, merge, Issue closure and acceptance are distinct authorized effects which
 policy may automate. Persist external intent before write; timeout requires exact
@@ -298,8 +339,9 @@ A complete proof covers:
 4. candidate A, independent review and all findings;
 5. one correction Send and attributable correction output;
 6. same-Attempt candidate B;
-7. reviewer replacement where needed;
-8. acceptance and selected publication;
+7. unanswered/inconclusive replacement, concurrent result, and bounded no-progress;
+8. common direct/automatic acceptance, late checks, invalidated dependency isolation
+   and selected publication;
 9. Task revision with queued/sent/unknown old input;
 10. release cancelling unsent effects but preserving/finalizing capture;
 11. GM cleanup of superseded foreign Attempt without human fallback;

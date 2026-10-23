@@ -378,29 +378,71 @@ source/prompt hash echo chains.
 ### G — review/correction/acceptance
 
 ```text
-review_once          -> assign missing review for current candidate
+review_once          -> assign missing or replace eligible current review
 review.submit        -> retain verdict + all findings
 task.request_changes -> exact candidate/review; one Attempt transition;
                         optional child Send with all findings
 accept_once          -> common candidate-specific task.accept gate
 ```
 
-Delete ReviewDisposition/RepairDispatch workflow state, per-finding delivery, slots,
-duplicate findings and automation-authored evidence arrays. Candidate B needs review
-B. Compare outstanding findings and relevant source/check evidence for progress:
-an unchanged tree can still gain missing verification; a fresh ID or irrelevant edit
-is not progress. Bounded unchanged rounds go to the Governor agent, which can revise
-the work split or replace the worker within policy, not automatically to a human.
+Use `store/reviews.rs`, `store/submissions.rs` and `store/acceptance.rs`. The
+[connected source trace](audit-register.md#trace-2026-10-23-review-acceptance)
+separates the useful existing path from missing automation and review checks.
 
-Use `store/reviews.rs`, `store/submissions.rs` and `store/acceptance.rs` as the existing
-owners. Return all actionable findings in one transition; if a live owner exists,
-admit one correction Send in the same transaction using the review/candidate cause.
-Otherwise `needs_correction` remains queryable and the next dispatch renders it.
-Preserve current `ReviewReplacementClass::{Unanswered,Inconclusive,ReturnedForCorrection}`
-from `store/reviews.rs`; these are already implemented, not a new missing feature.
-Replacement uses expected assignment/candidate and revokes the old slot without
-requiring a missing verdict. Late output remains history for its original candidate
-and never fills the replacement's slot.
+**Review:** preserve `ReviewReplacementClass::{Unanswered,Inconclusive,ReturnedForCorrection}`
+and immutable result replay/conflict handling. Direct Store replacement already works;
+current `automation_dispatch::attempt_review_assignment` only assigns from a submission
+and its on-behalf actor forbids replacement. Connect `review_once` to the same ordinary
+replacement handler under exact represented rights. Query current missing/inconclusive
+slots and unanswered assignments past a configured response deadline; compare-and-swap
+the expected assignment and choose a distinct eligible reviewer. Recheck any result
+that arrived concurrently. Bound replacements and coalesce one Governor decision if
+policy cannot continue. Preserve narrow non-revoked historical result access; late
+output never fills the replacement's slot. No new reviewer service or copied backlog.
+
+**Correction:** current disposition already packages all committed actionable findings;
+keep that behavior. Move its positive path into one `task.request_changes` transaction:
+record exact candidate/review feedback, set the same Attempt to `needs_correction`, and
+admit at most one child Send if the owner binding is eligible. Native I/O follows commit.
+Otherwise current-state resume renders the retained package. Mailbox feedback is not
+native delivery. Keep the admitted child's request/actor across policy disable/edit;
+actual rights, current candidate, phase and binding still fence unsent input. Preserve
+same-Attempt resubmission and historical retention of a stale publication (AR-011/052).
+
+Reserve a finite correction-round allowance when admitting a new correction, and assess
+no-progress once the round's required output/evidence/disposition is available. Waiting,
+readback retry and replay of the same receipt do not reserve another round. Compare
+outstanding findings and relevant source/check evidence: unchanged bytes can gain real
+verification; fresh IDs or unrelated edits cannot renew a budget. Retain consumption
+across resubmission, policy edits, transfer and restart. On exhaustion admit one
+Governor-agent decision with concrete revise/replace/renew/stop choices. Unknown native
+effects keep exact readback and never become permission for another Send.
+
+**Acceptance:** preserve `acceptance::{reserve_with_actor,evidence,begin,finish}` and
+their on-behalf variants: frozen V2 plan, exact candidate/check/dependency receipts,
+off-DB artifact verification and revalidation before Task transition. These owners
+already share the substantive evidence gate. The automatic caller copies the assigned
+auditor's retained requirement evidence; it does not invent it. The remaining gap is
+review provenance: direct acceptance accepts caller-authored review arrays, and the
+common feedback cursor is only a freshness fence. Move required assigned-review and
+unresolved-finding validation into that common gate. Resolve immutable review facts
+there for direct and automatic decisions; the accepting agent supplies decision/reason,
+not replacement auditor evidence. Reject unsupported reviewer counts before work.
+
+Late exact CheckRuns can unlock the same candidate without rewriting a review. A passed
+review is immutable; if a new review is needed, submit the same artifact under the same
+Attempt with the expected prior submission, producing a new slot. That identity change
+alone is not progress. A revoked frozen dependency receipt requires an addressed
+replan/new-Attempt decision; a later prerequisite receipt cannot silently replace it.
+Classify that subject locally and keep unrelated review and queued acceptance work
+running. An already-admitted failed/unknown acceptance keeps its receipt/readback;
+changed evidence requires a fresh attributable decision, not replay of the old effect.
+
+Delete ReviewDisposition/RepairDispatch workflow state, copied pending lists, duplicate
+findings and redundant correction/evidence copies only as these paths connect. Preserve
+the ordinary review slot and Operation identity. The current 64-pending-result cap can
+hide later ready work for that entry; replace event-backlog eligibility with bounded
+fair current-state queries, keeping unresolved effects in their existing owners.
 
 Required requirement-linked checks must pass. A known unrelated baseline failure is
 reported separately under selected policy, not turned into a demand that a worker fix
@@ -725,8 +767,13 @@ Minimum connected proofs:
   without an operator; exact approval questions reach the authorized resolver;
 - queue/admission cannot duplicate Attempt/launch or starve eligible work;
 - overlapping write leases block; disjoint scopes proceed;
-- review B cannot reuse review A; a missing reviewer can be replaced without its
-  verdict; all findings return together; evidence-only progress is not misclassified;
+- review B cannot reuse review A; an eligible unanswered assignment can be replaced
+  after its configured deadline; all findings return together; evidence-only progress
+  is not misclassified;
+- direct and automatic acceptance resolve the same required assigned reviews and
+  outstanding findings; a fresh feedback cursor cannot bypass a requested correction;
+- a revoked dependency pin blocks only its subject; unrelated reviews and already
+  queued acceptance verifications continue; late exact checks unblock their candidate;
 - unmatched sessions/processes remain visible without provider calls;
 - assigned and observed Git facts may differ and both display;
 - GM reconnect/handover preserves current work and historical identities;

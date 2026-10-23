@@ -78,9 +78,9 @@ publish
 | Action | Positive path |
 | --- | --- |
 | `dispatch` | Query current ranked work and admit within the configured budget. |
-| `review` | Assign a missing required review slot for the current candidate. |
-| `return_changes` | Apply all current findings and admit one correction Send when the owner is live. |
-| `accept` | Call the common candidate-specific acceptance gate when frozen review/check evidence is ready. |
+| `review` | Assign a missing required review slot for the current candidate; replace a timed-out or explicitly unusable assignment by compare-and-swap. |
+| `return_changes` | Apply all current actionable findings in one local feedback transition and admit at most one exact correction Send when the owner is live. |
+| `accept` | Call the common candidate-specific acceptance gate when frozen review/check evidence is ready; recheck late evidence against that same candidate. |
 | `check` | Admit an exact candidate/profile CheckRun. |
 | `goal_message` | Admit an ordinary bounded scheduled/event `agent.send`; native Harness Goal remains separate. |
 | `script` | Run one bounded script revision; returned typed actions use ordinary Store authorization. |
@@ -121,14 +121,25 @@ a later current-state pass rechecks it after rights, ownership or capacity chang
 Do not rewind the entire event history or replay an already-admitted input to recover
 that blocked subject.
 
+Keep missing review results and other unresolved prerequisites attached to their exact
+Task/candidate/slot. Wait for that subject's configured finite response deadline or
+current-state check; silence alone is not a reviewer failure. On an expired deadline,
+replace only the exact unanswered assignment by comparing its current identity,
+selecting a distinct eligible reviewer under ordinary policy. Bound replacements
+per slot. If the bound is exhausted or no eligible reviewer route exists, coalesce one
+addressed Governor decision for that subject. A blocker on one subject must not roll
+back unrelated admissions in the pass. Deadlines are checked by the shared loop; do
+not add a per-review timer, cursor or backlog.
+
 Do not create a process, credential, poller, cursor family or private pending queue per
 action/entry. A lost wake causes a bounded rescan. Downtime coalesces missed ticks
 according to selected policy rather than replaying stale model prompts.
 
 ## 5. Route, dependency, session and permission policy
 
-A dispatch policy selects ordered route aliases, optional agent profile and dependency
-mode:
+A target policy selects ordered route aliases, an optional agent profile, dependency
+mode and finite review/correction limits. This example is a target shape, not a
+configuration accepted by the current legacy parser:
 
 ```json
 {
@@ -146,6 +157,12 @@ mode:
       "max_native_turns": null,
       "rotate_on_context_pressure": true
     }
+  },
+  "review": {
+    "response_deadline_ms": 3600000,
+    "max_replacements_per_slot": 2,
+    "max_correction_rounds": 3,
+    "max_no_progress_rounds": 2
   }
 }
 ```
@@ -161,6 +178,10 @@ Dependency modes:
 - `allow_preparatory`: claim/execute is allowed and unresolved dependencies are shown
   in TaskPacket, but acceptance/publication still requires exact current dependency
   acceptance receipts.
+
+Hold and retry each blocked subject against its own current dependencies. A missing
+dependency must not roll back otherwise eligible admissions or stall unrelated
+subjects; unknown effects remain attached to their exact resource for readback.
 
 This removes the current unconditional claim gate without pretending dependencies are
 satisfied. Manager/Governor may explicitly select preparatory work; ordinary automatic
@@ -220,19 +241,55 @@ retains verdict, all findings and requirement-linked evidence.
 
 `return_changes` defaults to all current actionable findings. Governor may dismiss or
 defer a disputed finding only by an attributable candidate/review decision with
-reason. The action performs one `task.request_changes` transition and one correction
-Send if owner is ready. Otherwise `needs_correction` remains for resume/dispatch.
+reason. Preserve the full ordered actionable package in one local
+`task.request_changes` transition. In the same Store transaction, write attributable
+feedback, move the current Attempt to `needs_correction`, and admit at most one child
+`agent.send` carrying that exact package when the owner binding is eligible. Native
+I/O occurs after commit. Otherwise retain `needs_correction` for current-state resume.
+Never split findings into competing Sends or treat mailbox feedback as native delivery.
 
-Preserve reviewer replacement for Unanswered, Inconclusive and ReturnedForCorrection.
-Bound unchanged rounds; after the bound admit one Governor decision task rather than
-looping or stopping the queue.
+For review replacement, distinguish a missing result from a terminal result. A
+configured finite response deadline, measured from the retained assignment admission,
+plus a current-state check may make an unanswered slot replaceable; an `inconclusive`
+result is replaceable under policy, and a
+`ReturnedForCorrection` candidate may receive a replacement assignment for the same
+Attempt/current candidate. Use the expected current assignment as a compare-and-swap
+precondition and a distinct eligible reviewer; do not infer failure from silence or
+replace an assignment whose result/identity changed concurrently. Bound replacement
+count. If that limit is reached or no eligible reviewer route remains, coalesce one
+addressed Governor decision with the exact candidate, prior assignments/results and
+available choices. No independent timer or replacement backlog is needed.
+
+Reserve one of the finite correction rounds when admitting each new correction input.
+Assess no-progress from the round's settled candidate, review, check and delivery
+evidence; missing or unknown evidence is pending, not an empty result or progress.
+Waiting, receipt replay and readback retries do not reserve additional rounds.
+Repeated findings/no-change outcomes cannot reset the bound by changing IDs or making
+unrelated edits. Resubmission, policy edits, transfer and restart keep prior consumption;
+an explicit budget increase adds allowance without erasing it. On exhaustion, stop
+new correction admissions and coalesce one
+addressed Governor decision while unrelated subjects continue. Preserve unknown native
+effects and exact Operation readback until resolved; a budget never authorizes replay
+or discarding uncertain delivery.
 
 ### Acceptance
 
 `accept` reads the frozen per-requirement evidence plan, current candidate-specific
 reviews/checks and exact dependency receipts. It calls the same gate as direct
-Governor request. It never fabricates review text/evidence. Candidate B cannot reuse
-A's review.
+Governor request. Both callers must resolve required assigned reviews and actionable
+finding dispositions from retained candidate-specific facts. An acceptance reason or
+fresh feedback cursor cannot substitute for them. Current automatic acceptance copies
+the assigned auditor's V2 `requirement_reviews`; preserve that behavior while closing
+the direct caller's provenance gap in the common gate ([AR-064](audit-register.md#ar-064)).
+Candidate B cannot reuse A's review. If a CheckRun completes after an
+initial hold, re-evaluate its retained receipt against the same current candidate and
+rerun the common gate; do not reuse it for a replacement candidate. A missing check
+may remain pending while that candidate is current. A dependency receipt invalidated
+after claim is different: a replacement receipt does not silently rewrite the
+Attempt's frozen dependency pin. Return `DEPENDENCY_REVALIDATION_REQUIRED` to a
+per-subject replan/reclaim decision under ordinary rights, retaining the candidate
+while that decision is made; do not confuse this with `DEPENDENCY_NOT_READY` at claim
+resolution or roll back unrelated subjects.
 
 ### Goal message and native Goal
 
@@ -314,10 +371,15 @@ Operations keep original admitting identity; future actions recheck current righ
 
 | Change | Effect on existing work |
 | --- | --- |
-| Disable or edit entry settings | Stop/change future admissions. A queued Operation keeps its admitted request and attribution; entry revision mismatch alone does not reject it. |
-| Transfer entry | Future admissions use the successor's current rights. Existing Operations keep their original represented actor; no retroactive reattribution or replay. Recheck unclaimed blocked subjects under the successor's rights. |
+| Disable or edit entry settings | Stop/change future admissions. Every queued Operation, including Goal/correction Send, keeps its admitted request and attribution; entry revision mismatch alone does not reject it. Actual rights, Task/candidate/phase and binding still fence unsent effects. |
+| Transfer entry | Future admissions use the successor's current rights. Existing Operations retain the original represented actor and exact validated continuation authority; no retroactive reattribution or replay. Recheck unclaimed blocked subjects under the successor's rights. |
 | Actual grant revocation, Task revision/release, changed candidate phase or binding scope | Revalidate the exact unsent action and reject/supersede it when no longer authorized or eligible. Policy disable is not an authority revocation. |
 | Input already sent, accepted or uncertain | Preserve its ordinary lifecycle and exact readback/result obligations. Changing policy cannot prove cancellation or authorize replay. |
+
+Current repair dispatch has an exact transfer-continuation branch, unlike Goal's
+ordinary revision check. Its no-continuation branch still rejects queued repair input
+after pure disable/edit. Preserve validated current authority when removing that
+policy/intent coupling; do not copy another transfer ledger into the target.
 
 Remove disabled former-owner copies, successor chains, ancestry walks and journal
 relocators. A→B→A preserves one entry rather than colliding with historical copies.
@@ -351,7 +413,16 @@ specific gaps: OpenCode's generated `agent.goal` is rejected at the runtime acto
 guard; Codex rechecks enabled/exact policy revision after admission; submitted and
 correction Attempts lack a generic-Goal phase fence; finite total/no-progress policy
 is absent; ownership-conflict cursor advancement can hide an unclaimed event after
-transfer. Terminal deduplication and calendar occurrence continuity are useful
+transfer. Direct `reviews::reserve_assign` supports expected-assignment replacement,
+but `automation_dispatch` invokes it as `ReviewActor::OnBehalf`, whose request guard
+forbids replacement. Configured `ReviewDispatch` therefore cannot perform that
+replacement path. Current review-result retry caps limit backoff only, not correction
+rounds; no current-state round budget or no-progress Governor disposition is
+implemented. The common acceptance gate already checks frozen plan/candidate/check
+evidence, but required assigned-review and unresolved-finding checks are not yet shared
+by direct acceptance; a revoked dependency pin can abort the review-disposition pass.
+The [review trace](audit-register.md#trace-2026-10-23-review-acceptance) qualifies these
+separate gaps. Terminal deduplication and calendar occurrence continuity are useful
 existing behavior, not evidence that these gaps are fixed.
 
 Migrate one connected action at a time. Once callers use the target action, remove old
@@ -359,8 +430,13 @@ enum value, schemas, policy, Store state, fixtures and worker demand in the same
 
 ## 11. Verification
 
-- enabled policy runs assignment→result→review→all-findings correction→fresh review→
-  acceptance without routine human step;
+- enabled policy runs assignment→result→review→one all-findings local feedback plus
+  at most one exact child correction Send→fresh review→acceptance without routine
+  human step;
+- unanswered reviews wait on a finite configured deadline and current-state check;
+  replacement uses expected-assignment CAS, a distinct eligible reviewer and bounded
+  replacements; no eligible route or exhausted replacement budget produces one
+  addressed Governor decision;
 - same occurrence admits once; lost wake rescans current state;
 - blocked Tasks do not hide eligible work;
 - dependency `hold` blocks automatic start; `allow_preparatory` starts visibly but
@@ -370,10 +446,17 @@ enum value, schemas, policy, Store state, fixtures and worker demand in the same
 - native/Eliot Goals work alone/together with selected budgets and no infinite default;
 - a submitted candidate pauses generic Goal input while capture/check/review/accept
   continue; correction admits one findings-bearing Send for its exact subject;
-- no-progress leads to bounded Governor decision; safe rotation drains/checkpoints;
-- correction returns all findings once; candidate-specific evidence gates acceptance;
+- correction rounds are reserved once at new input admission; no-progress is assessed
+  from settled evidence and leads to one
+  addressed Governor decision; unknown deliveries remain in exact readback;
+- correction returns all actionable findings in one feedback package; candidate-
+  specific evidence gates acceptance, including late CheckRun evidence rechecked for
+  the same candidate without fabricating V2 requirement review evidence;
 - disable/transfer preserve in-flight and occurrence identity;
-- disable/edit alone do not reject admitted input; real revocation/stale subject still
-  fences unsent input; transfer retries an unclaimed blocker without replaying history;
+- direct acceptance cannot substitute caller-authored reviews or a fresh cursor for
+  required assigned evidence; revoked dependency pins block only their own subject;
+- disable/edit alone do not cancel admitted Goal/correction input; real
+  revocation/stale Task, candidate, phase or binding scope still fences unsent input;
+  transfer retries an unclaimed blocker without replaying history;
 - no standalone scheduler, WorkDispatch queue, repair workflow, Goal cursor workflow
   or GitHub projection workflow remains after its migration.
