@@ -107,39 +107,57 @@ mirror or a new generic journal.
 
 ### Restarted adapter
 
-A2 also covers process loss. The existing reconciliation owner fences the previous
-delivery owner, loads complete retained records and submits them for their original
-Operations under current authorized recovery. Store verifies original scope and
-receipt identity and deduplicates delivery. Origin boot is immutable; the successor
-is a recovery actor, not the original executor.
+Normal process replacement reuses the stable binding-scoped credential; it does not
+mint another identity or rotate its token. After existing custody checks establish
+prior-owner departure, the accepted successor boot can deliver retained evidence but
+is not the executor that produced it. Keep original outcome/body bytes and origin boot
+unchanged. Recovery linkage belongs to the delivery context, not a rewritten outcome.
 
-This does not revive an old live binding or transfer a result to a new Attempt. If the
-assignment was superseded, keep late evidence as historical without changing current
-completion or acceptance. Missing/partial storage requires native readback or honest
-unknown. A crash before durable capture is not recoverable by pretending the spool
-contains the result.
+Connect A2 through the existing owners:
 
-Reuse the current normalized completion boundary in `runtime::admitted_result_scope`,
-`normalized_result::validate_source` and `results::prepare/record`. It already handles
-exact previously admitted pages without ordinary live-link/release gating and ACKs
-identical registered-page replay. It does not establish the entire successor contract:
-that path must be connected without removing scoped authorization or inventing another
-general receipt/recovery subsystem.
+1. Adapter startup/`Controller::read_command` loads complete private captures before
+   requiring native open. Current startup already waits for `agent.open` to spawn;
+   preserve that. No native process, prompt or model call is needed to drain files.
+2. Store retains the execution boot with the original input Operation at dispatch.
+   Reuse the existing dispatch context where present; ordinary Send needs the same
+   attributable origin without a second producer ledger. A mutable
+   `previous_bridge_boot_id` alone is insufficient after two replacements. Missing
+   historical attribution stays unknown rather than being inferred from the current
+   root, file timestamp or latest boot.
+3. `outcome_with_artifacts` uses one settlement path with Store-derived live or retained
+   completion authority. The latter checks current delivery actor, custody and exact
+   original Operation/binding/origin. Keep ordinary live boot checks; do not replace
+   them with a blanket current-or-previous test. Already committed identical outcomes
+   retain replay ACK behavior; conflicting terminal bytes never replace them.
+4. `next_internal` permits authorized completion-only result/readback work while new
+   execution remains fenced by `recovery_required`. `admitted_result_scope`,
+   `normalized_result::validate_source` and `results::prepare/record` remain the page
+   owners. Complete required historical ranges under the original source scope; do not
+   clear recovery or claim a live native session merely to retrieve saved bytes.
+
+The existing `module.supervisor.recovery.reconcile` only reconciles automation/Hook
+source intake; it is not a terminal importer. Do not route native evidence into that
+journal or add a recovery daemon. The successor path must explicitly connect the
+adapter capture, Store settlement and existing page delivery.
+
+A superseded assignment receives historical evidence, not completion of a new Attempt.
+An existing page completion grant is not permission to create arbitrary historical
+reads. Missing page admissions need exact completion authority for the retained source,
+not a new prompt or broad access to old Tasks. Missing/partial bytes require bounded
+native readback or visible unknown. A crash before durable capture remains a real limit.
 
 ### Authentication versus admitted completion
 
-Keep new-connection authentication, new command admission and delivery of previously
-admitted evidence separate. Current `Store::authenticate` rejects disabled credentials.
-The normalized page handler has a narrow completion path for an already-authenticated,
-still-open carrier and its exact registered binding/Operation, even after live-link or
-release changes. It is not an arbitrary history reader or permission for a new prompt.
+New connections authenticate normally and reject disabled credentials. New native
+commands require current execution authority. A previously admitted normalized page
+has a narrow registered-binding/Operation completion path on an authenticated carrier;
+it does not grant arbitrary reads or new work after release/link changes.
 
-Preserve this distinction when simplifying authorization. Do not blanket-reject all
-late pages using live-binding checks, or accept arbitrary predecessor files because a
-new module has connected. A successor with different credentials must use the scoped
-reconciliation owner and original source identity. Revocation side effects, successor
-provisioning and old-boot terminal import still need connected verification; the
-existing same-credential page path is not proof of those behaviors.
+Reuse the stable credential for ordinary replacement. Credential revocation is a
+separate policy: never bypass authentication, reinterpret old bytes as a new identity,
+or rotate automatically to make recovery succeed. Any exceptional completion actor
+must be explicitly scoped through existing host authority. Revocation side effects
+and released-binding recovery still need connected implementation/qualification.
 
 ### Replaceable observation checkpoint
 
@@ -189,6 +207,14 @@ separately. Socket close, timeout or a dropped future proves none of those cance
 Recover/reconcile are ordinary commands that Governor or authorized policy can invoke.
 Readbacks have bounded retries; unchanged uncertainty coalesces rather than triggering
 repeated model prompts. Independent work proceeds.
+
+A completed readback and its target's outcome are separate. If an exact local lookup
+finishes but finds no usable terminal, settle the Reconcile Operation with
+`resolved:false` and a bounded reason; the original target remains unknown. Only an
+interrupted/uncertain read itself stays pending or unknown. When evidence is found,
+commit/replay the original target first, then settle the summary with `resolved:true`.
+This reuses the existing target-before-summary validation and batch readback pattern.
+Neither summary permits prompt replay, Task acceptance or automatic native resume.
 
 ## Harness Goal and Eliot Goal
 
