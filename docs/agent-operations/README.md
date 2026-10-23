@@ -53,3 +53,18 @@ requirements to the current target.
 Supporting documents cannot reintroduce a removed product engine, permanent
 compatibility path, separate execution authority or routine human handoff in place of
 working automation.
+
+## Current contracts and historical evidence
+
+| Question | Read | How to use it |
+| --- | --- | --- |
+| What must the product do? | [Architecture](architecture.md), [delivery](delivery.md), [requirement preservation](../implementation-status.md#historical-behavior-preservation-matrix) | Current target; implementation status is separate. |
+| What should the next coding agent change? | [Implementation](implementation.md#5-runtime-order) and its named source owner | The only implementation order. A worker receives one connected slice. |
+| Which commands work in the current build? | Root [README](../../README.md), module guides, [CheckRunner](../check-runner.md), [schedules](../schedules.md) | Current source contracts; an unexecuted native path stays unqualified. |
+| Where did the previous audit stop? | [Audit register](audit-register.md#resume-here), [source/evidence index](audit-index.md) | Exact inspected revision, findings and next untraced chain. |
+| What can be reused, and what changed upstream? | [Donor map](donor-map.md), [version/provenance inventory](../agent_swarm.donors-20260929.toml) | Current selection in the map; reviewed, locked and upstream versions are distinct. |
+| Why did older agents choose another mechanism? | [Old program](../documentation-program.md), [program review](../documentation-program-implementation-review.md), [v18 artifacts](../agent_swarm.spec-v18/README.md), [old implementation](../agent_swarm.implementation-v6.md), [owner decisions](../owner-decisions.md) | Historical requirements and evidence. Do not resume their obsolete work orders. |
+
+Update the owning contract and the existing register in the same change. Keep the
+implementation queue, finding dispositions and donor coordinates in their respective
+owners above; add navigation links instead of copying their state into a new plan.

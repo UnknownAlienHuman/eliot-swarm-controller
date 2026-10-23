@@ -219,12 +219,29 @@ per-binding copies of shared account facts.
 bindings in the launch transaction. Delete capacity phase/evidence ledgers, refusal
 rows, codecs and lifecycle synchronization. `report.capacity` becomes a projection.
 
+Keep a live claim's budget scope stable across model, artifact, option or limit edits
+when the underlying provider/account/service capacity identity is unchanged. Current
+`capacity::compare_root_route_identity` splits model/artifact revisions and
+`launch_route_match` drops pending launches when the whole route digest changes;
+[AR-049](audit-register.md#ar-049) records the exact limitation. Use the admitted
+launch/binding and real service scope, not a full config hash, to count work. A change
+to actual resource identity keeps a separate scope. An alias edit must retain unsettled
+claims or be refused until their disposition; do not infer shared budget from matching
+display text.
+
 **B4:** `dispatch_once` queries a bounded ranked page, chooses the first eligible
 explicit route and atomically creates/reuses Attempt, reserves workspace/root and
 creates launch Operation. Delete WorkDispatch cursors, copied pending subjects,
 watermarks, slots, links and ordinary-blocker quarantine. Query eligible work before
 applying the admission limit; use bounded keyset scanning where eligibility needs
 inspection, so blocked first-page items cannot starve later work.
+
+Preserve the existing two-stage transaction boundary: `launcher::launch_for_actor`
+records the pending launch reservation; after workspace I/O, `launch_after_workspace_held`
+rechecks current facts and commits claim/Open/binding association together. Direct and
+WorkDispatch already converge there ([AR-050](audit-register.md#ar-050)). Simplifying
+the manifest must retain both reservations and must not move Git/native I/O inside
+SQLite or introduce an unreserved gap between stages.
 
 Reuse a compatible idle binding under the route's continuation policy rather than
 unconditionally opening a session per Task. Before reuse, inspect pending inputs,
@@ -260,6 +277,18 @@ Restart:
 - uninspectable → unknown;
 - exact Eliot-owned leftover → route policy recover/observe/terminate;
 - shared service → never kill because one session disappeared.
+
+**Connect retirement before calling lifecycle complete.** Existing production writers
+close only rootless pre-native openings; there is no finalizer for an attached binding
+([AR-048](audit-register.md#ar-048)). In the existing runtime/Store disposition owner,
+fence new input, join exact native/process closure and required output/readback facts,
+then retire that binding generation once its obligations are resolved. Recompute after
+late outcomes and restart. The existing `workspace_lifecycle` sweep can then release an
+eligible lease. Preserve stored result bytes and existing reader authorization; verify
+post-release artifact/result reads separately, since the source trace did not audit the
+complete grant matrix. Do not hold a live root merely because historical bytes exist.
+Attempt release, service-helper departure and socket close alone cannot prove that a
+native session or its children stopped.
 
 <a id="automation-and-delivery"></a>
 

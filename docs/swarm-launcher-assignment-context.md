@@ -52,6 +52,14 @@ Keep the original binding's native endpoint/account/workspace identity. Current 
 may change enablement/budgets, but cannot silently move existing work elsewhere. Route
 edits also cannot hide live claims behind a new alias/model/digest.
 
+Carry the admitted budget scope on the existing launch/binding facts. Preserve it when
+editing a logical route if the underlying provider/account/service capacity identity is
+unchanged; keep a separate scope when actual resource identity changes. Refuse an alias
+change that would orphan unsettled claims. Count proven shared-service roots once. Do
+not merge unrelated services from matching model/alias text. Current configuration is
+loaded at host start, so file edits take effect after restart, not by an implemented
+hot-reload contract.
+
 ## 4. Admission and effect boundaries
 
 Direct launch and `dispatch_once` use the same Store transaction:
@@ -66,6 +74,13 @@ binding and Open child represent one reservation, not three. Preserve the existi
 transaction-local handoff; delete repeated manifests/hashes, not atomic check/reserve.
 
 Git/filesystem/native I/O runs outside Store. Revalidate before each actual effect.
+
+Current direct and WorkDispatch callers already share `launch_for_actor`, then
+`launch_after_workspace_held` after workspace preparation. The latter commits exact
+Attempt claim, Open/binding reservation and lease association in one Immediate
+transaction. Preserve that handoff while removing manifest/proof duplication; never
+combine the two stages by keeping a transaction open across workspace I/O.
+
 A parent launch can remain Queued while its workspace effect is already in flight;
 its generic Operation state is not a complete description of all child resources.
 
@@ -137,6 +152,14 @@ Workspace release removes only its authority, not the worktree or unpublished ch
 When native activity really remains after transport detach, retain its resource hold;
 when all relevant obligations are resolved, the ordinary disposition must retire the
 binding rather than leave its mere existence as a permanent workspace/root blocker.
+
+The source trace at `b2519aa` found no ordinary attached-binding finalizer:
+[AR-048](agent-operations/audit-register.md#ar-048). Only rootless pre-native Open
+cancellation sets binding release today. Add the final disposition in the existing
+Store owner; keep the already-running workspace sweep. Preserve retained Store artifacts
+and existing reader authorization across retirement, then verify post-release read paths
+separately; the source trace did not audit the complete artifact/grant matrix. Historical
+bytes do not themselves reserve a live root.
 
 ## 5. Root budgets count current allocations
 
@@ -244,5 +267,6 @@ ACK, code-scope approval, mandatory MCP readiness or label-publication workflow 
 - Overlapping writers are blocked before effects; review reads a frozen candidate.
 - Direct and automatic launch share handlers without mandatory preview/proof packets or routine human repair.
 
-These are target cases, not executed results. Post-binding cancellation, route-edit
-continuity, revocation, crash-only departure and live concurrency remain audit boundaries.
+These are target cases, not executed results. The post-binding finalizer gap, route-edit
+accounting and common admission transactions are source-traced in AR-048–050. Actual
+restart/concurrency, revocation and crash-only departure remain unqualified.

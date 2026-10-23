@@ -8,34 +8,37 @@ queue. [Implementation](implementation.md) owns changes;
 
 ## Resume here
 
-- Checkpoint: **2026-10-23 / interruption recovery, evidence indexing and status reconciliation**.
-- Verified repository head: **`3c4c8599f1614460fe69d54d0b59715a26ada797`**.
-  Both interrupted passes were published: `c2b998b` contains AR-041–AR-044;
-  `3c4c859` contains AR-045–AR-047. Neither changed runtime source.
-- Last connected source pass: **scoped shutdown, adapter demand and resource retirement**,
-  inspected at **`c2b998b079fe8517c592192c18d6ecbfb6b26aae`** and published in `3c4c859`.
-  The evidence below is retained from that pass, not presented as a fresh full audit.
+- Checkpoint: **2026-10-23 / attached-binding retirement, route edits and common launch admission**.
+- Inspected repository head: **`b2519aa1b70706eeb8a77f76df01e7c4de65c787`**.
+  Earlier interrupted passes are retained: `c2b998b` contains AR-041–AR-044,
+  `3c4c859` contains AR-045–AR-047, and `b2519aa` indexes them.
+- Last connected pass: cancellation/late Open → Attempt/service disposition →
+  binding-release writer inventory → periodic workspace sweep; route identity/edit
+  accounting; direct and WorkDispatch admission through claim/Open reservation.
+  New evidence is [AR-048–050](#trace-2026-10-23-retirement-admission).
 - Runtime baseline: **`c92120ed70ca7e625440a8a19517c481e73b13c9`**, 2026-10-21.
-  The compared interval through the verified head contains 16 documentation-only
-  commits. This establishes unchanged source, not exhaustive source coverage.
-- Overall audit: **incomplete**. There are **47 entries**, including defects, preserved
+  The compared interval through the inspected head contains **17 documentation-only
+  commits**. This establishes unchanged source, not exhaustive source coverage.
+- Overall audit: **incomplete**. There are **50 entries**, including defects, preserved
   mechanisms and partial boundaries; no measured completeness percentage.
-- This checkpoint indexes AR-001–AR-047 with stable `ar-NNN` anchors, flattens the
-  evidence-history links and updates status/navigation. It adds no new defect, marks
-  none repaired and does not advance the unfinished cancellation trace.
-- **Next exact chain:** cancellation after a launch has attached its Attempt/Open
-  binding → child cancellation/late outcome → owned-service disposition → binding
-  retirement → workspace release. Then route-edit budget continuity and the complete
-  direct-call transaction/concurrency path. Trace the ordinary finalizer before
-  claiming that a guarded historical record can never be released.
+- The missing attached-binding finalizer is now source-confirmed. Route-edit counting
+  differs from the target; existing pre-effect revalidation is preserved, so this pass
+  does **not** claim oversubscription. Common transactional claim/Open admission is
+  confirmed. None of these findings is a runtime repair.
+- **Next exact chain:** `automation::apply` / enabled Goal policy →
+  `automation_goal_progression::reconcile_entry` → `admit_goal_progression_operation`
+  → `runtime::next_internal` → selected adapter → terminal/result consumer.
+  Trace disable/transfer/restart, same-event deduplication, independent native Goal,
+  budgets and no-progress behavior. Compare scheduled CheckRun occurrence admission
+  separately; its existence does not implement general Goal-message scheduling.
 - Source/target entry points: [index](audit-index.md#source-and-target-map),
-  [launcher/queue contract](../swarm-launcher-assignment-context.md), implementation B/C/D.
-- Still unqualified: actual shutdown/restart; native Goal/child quiescence after
-  external detach; crash without clean-stop receipts; successor stop authority;
+  [configuration](configuration.md), implementation E and the named source owners.
+- Still unqualified: actual concurrent launch/shutdown/restart; native Goal/child
+  quiescence after detach; crash without clean-stop receipts; successor stop authority;
   post-shutdown historical capture. No duplicate execution or respawn loop is claimed.
-- Documentation only. No runtime change, Clippy, tests, benchmark, installed harness,
-  external donor requalification or independent verifier ran. Local network fetch
-  failed DNS; repository reads and publication use the GitHub connector.
+- Documentation only. No runtime change, Clippy, tests, benchmark or installed-harness
+  qualification ran. Official donor APIs/release metadata were read on this date;
+  [donor map](donor-map.md) separates those reads from locked/installed versions.
 
 On resume compare changed source with the verified head, then reopen only affected
 callers/consumers. Preserve IDs, evidence and qualifications. A source read or docs
@@ -92,16 +95,19 @@ runtime evidence. Current dispositions below override older broader claims; the
 | <a id="ar-037"></a>AR-037 | Native-default Antigravity | **Open.** Root identity requires optional `modelId`; root policy can block an empty route. | Budget identity independent of optional model. |
 | <a id="ar-038"></a>AR-038 | WorkDispatch saturation | **Open.** 128 pending subjects stop intake of later eligible Task facts. | Fair current-state scan, delete copied pending list. |
 | <a id="ar-039"></a>AR-039 | Stale provider precedence | **Open.** Stale matching row outranks fresh Available. Eliot link loss retains rows; accepted native account/closed snapshot invalidates its own source. | Same-source supersession, independent quota constraints and remaining lifecycle cases. |
-| <a id="ar-040"></a>AR-040 | Root dedup/admission/scan | **Preserve.** Parent/Open/Dispatch/service share a claim; transaction handoff and stable scan exist. | Full direct concurrency and route-edit matrix. |
+| <a id="ar-040"></a>AR-040 | Root dedup/admission/scan | **Preserve.** Parent/Open/Dispatch/service share a claim; transaction handoff and stable scan exist. | Route edits and common transaction traced in AR-049/050; live concurrency remains unqualified. |
 | <a id="ar-041"></a>AR-041 | Reads/control under quota hold | **Preserve plus earlier gates.** Reads/strict Reconcile and stop/reply controls bypass starts-only quota. | Recovery/ready/scope barriers; AR-017 and AR-045. |
 | <a id="ar-042"></a>AR-042 | Cancel held unbound launch | **Open.** Cancelled parent fails workspace sweep's Settled no-effect contract; verified-held unbound lease can stay fenced. | Stage-aware cancellation and in-flight workspace readback. |
 | <a id="ar-043"></a>AR-043 | Pre-send Open rejection | **Open.** Guard rejects unsent Open without retiring rootless opening binding; cancel refuses non-Queued target. | Known-no-effect disposition through existing resource owners. |
 | <a id="ar-044"></a>AR-044 | Lowered root limit/reuse | **Open policy mismatch.** `other_claims >= limit` can hold zero-root-growth continuation after limit reduction. | Separate root delta from input/quota/drain policy; live reload unqualified. |
 | <a id="ar-045"></a>AR-045 | Shutdown when execution is not Ready | **Source-confirmed open barrier.** Admission and pre-effect validator require Ready; recovery queue independently excludes Shutdown. | Authorize exact resource cleanup by custody/scope, not new-work readiness. |
 | <a id="ar-046"></a>AR-046 | Explicit detach versus adapter demand | **Source-confirmed open integration gap.** Applied transport shutdown leaves native identity retained; demand still anchors attachment to settled Open and holds its lease. | Separate desired attachment from native occupancy and output obligations; no respawn-loop claim. |
-| <a id="ar-047"></a>AR-047 | Departure and binding/workspace disposal | **Preserve plus partial handoff.** Historical service departure reader survives stale Task/owner; its writer changes service row only. Unreleased binding independently holds workspace/root. | Connect ordinary retirement after all relevant facts; neither auto-release on socket close nor delete guards. |
+| <a id="ar-047"></a>AR-047 | Departure and binding/workspace disposal | **Preserve plus open handoff.** Historical service departure reader survives stale Task/owner; its writer changes service row only. AR-048 completes the ordinary finalizer search. | Connect retirement after all relevant facts; neither auto-release on socket close nor delete guards. |
+| <a id="ar-048"></a>AR-048 | Attached binding never reaches ordinary retirement | **Source-confirmed open.** Only rootless pre-native Open cancellation writes binding release. Attempt/service completion and periodic sweep do not retire an attached binding. | Existing Store disposition must retire the exact resolved binding, then let the sweep release an eligible lease; preserve results and unresolved native work. |
+| <a id="ar-049"></a>AR-049 | Budget continuity across route edits | **Source-confirmed target mismatch; bounded claim.** Model/artifact changes split root identity; whole-route digest changes exclude old pending launch claims. Limit-only edits preserve bound-root identity. | Stable admitted budget scope. Stale-plan/current-capacity revalidation already fences launch effects; no oversubscription demonstrated. |
+| <a id="ar-050"></a>AR-050 | Direct/automatic claim and Open transaction | **Preserve.** Both actors converge on the same launcher; after external workspace preparation, an Immediate transaction rechecks facts and commits claim/Open/binding association. | Preserve reservation continuity when removing proof manifests. Actual concurrent/restart/native execution remains unqualified. |
 
-## Last connected source trace: AR-045–AR-047
+## Prior connected source trace: AR-045–AR-047
 
 Retained from the pass inspected at `c2b998b` and published at `3c4c859`. The indexing
 checkpoint has not rerun it. Earlier details are directly linked in the
@@ -170,9 +176,9 @@ a shared service, another writer, unknown input or uncaptured local output may r
 
 Join these facts in the existing disposition path. When actual obligations resolve,
 retire binding claim and let workspace lifecycle release its authority, preserving
-files/results. Never invent native outcomes from OS exit. Finalizer/administrative
-callers and crash without clean-stop receipts remain open; not every resource has
-been proved unreleasable.
+files/results. Never invent native outcomes from OS exit. The ordinary attached-binding
+finalizer search is completed by AR-048 below. Crash without clean-stop receipts remains
+open; not every resource is unreleasable.
 
 ## Inspected source boundaries for that trace
 
@@ -189,19 +195,109 @@ been proved unreleasable.
 | `runtime/opencode_v2/owned_service.rs` | helper custody, graceful close and read-only retained handle; recovered handle does not gain original stop authority. |
 
 Selected paths, not whole-file audit. External SDK behavior, live OS trees and native
-Goals were not executed. This checkpoint additionally sampled public Operation
+Goals were not executed. That checkpoint additionally sampled public Operation
 projection/readback diagnostics in `operations.rs`; those reads did not close the
-post-binding cancellation chain and create no new finding.
+post-binding cancellation chain. The later trace below does.
+
+<a id="trace-2026-10-23-retirement-admission"></a>
+
+## Source trace at b2519aa: AR-048–AR-050
+
+Inspected on 2026-10-23 at `b2519aa1b70706eeb8a77f76df01e7c4de65c787`.
+These are source conclusions, not executed failure reproductions.
+
+### AR-048 — the attached-binding finalizer is missing
+
+`operations::cancel` permits queued work; sent work returns `NOT_QUEUED`. For owned
+service starts, `fail_reserved_owned_service_start` permits only the exact reserved,
+rootless opening scope. Preserve this fence: late cancellation cannot erase a possible
+effect. Production binding-release SQL was enumerated across Store. The only writers
+are rootless Open cancellation in `operations::cancel` and
+`cancel_owned_service_linked_operation`; both require no native root/scope. No ordinary
+attached-binding release handler was found.
+
+Late Open outcome branches in `runtime::outcome` retain root/scope and ready/reconciling
+state, including a non-Applied result that reports native identity. `tasks::release`
+updates Attempt state after `prepare_owned_service_attempt_release`; it does not retire
+that binding. `launcher_owned_service::persist_departure` updates only the service row.
+
+The consumer is connected: `host::supervise_launcher` periodically calls
+`Store::reconcile_workspace_lifecycle_once`, which reconciles service departures and
+then sweeps leases. `workspace_lifecycle::workspace_resource_use` treats the exact
+binding with `released_at_ms IS NULL` as an independent hold. Consequently an attached
+binding still fences the lease even after Attempt release and service departure, when
+those transitions otherwise succeed. This is a missing final disposition, not a missing
+timer and not a reason to remove conservative guards.
+
+Use the existing Store/runtime owner: stop new input, collect exact native/process
+closure and required output/readback facts, retire the resolved binding generation,
+then let the existing sweep release eligible authority. Keep unresolved children/effects
+held. Preserve stored result bytes and their existing reader authorization across
+retirement, and verify post-release read paths separately; this source trace did not
+audit the complete artifact/grant matrix. Historical result access should not require a
+live native binding by default. Do not create a cleanup daemon or equate helper-process
+exit with native session completion.
+
+### AR-049 — route version is not a resource budget
+
+`capacity::compare_root_route_identity` compares alias, runtime, artifact and optional
+provider/model. For the no-explicit-service branch, a model/artifact change therefore
+excludes the old binding from the new target identity. Admission-limit-only changes do
+not change this bound-root identity. Separately, `launch_route_match` returns OtherRoute
+when retained `selected_route_sha256` differs from the whole current route digest, so
+pending unbound launches can disappear from that target's census after an options or
+limit edit.
+
+The limiting evidence matters: `current_launch_admission` recounts current facts;
+`launch_workspace_plan_inner` and `launch_after_workspace_held` reject changed plan
+identity before claim/Open. Configuration is loaded at host start and cloned into Store,
+not hot-reloaded by these paths. This trace does not demonstrate concurrent native
+over-admission or replay after restart. Preserve those effect barriers.
+
+The current target already requires route edits not to hide live claims. Preserve the
+admitted budget scope across model/artifact/options/limit revisions when the underlying
+provider/account/service capacity identity is unchanged, using existing launch/binding
+facts; keep current route settings for new-work policy. A change to actual resource
+identity keeps a separate scope. Alias changes must retain unsettled claims or be
+refused. Do not infer account/service identity from matching display labels or merge
+genuinely independent resources.
+
+### AR-050 — preserve the working admission transaction
+
+Direct `Store::mutate` starts an Immediate transaction and routes `swarm.launch` to
+`launcher::launch` / `launch_for_actor`. WorkDispatch's Immediate reconciliation calls
+`admit_work_dispatch`, creates the same ordinary launch, then calls `launch_for_actor`.
+Both retain the pending launch before returning; WorkDispatch additionally retains its
+semantic slot/link. An unbound admitted launch already represents a root reservation.
+
+After workspace preparation outside SQLite, `reconcile_launches_once` enters another
+Immediate transaction. `launch_after_workspace_held` rechecks current admission and
+plan, uses `mutate_launch_child_in_transaction` for `task.claim`, pins the lease to the
+exact Attempt, admits Open through `open_for_launch_for_actor` / `reserve_open_route`,
+and CAS-links the binding back to the Attempt. The admission projection passes through
+this transaction to avoid recounting its parent as a second root. Native execution
+follows commit.
+
+This is a useful existing boundary. Simplifying WorkDispatch/manifests must preserve
+queued-launch reservation, shared direct/automatic authorization, and the later atomic
+claim/Open handoff. It must not hold SQLite across external workspace/native work.
+
+| Inspected owner | Exact read boundary |
+| --- | --- |
+| `store/operations.rs` | `cancel`, linked Open cancellation, owned-service Attempt release, `open_for_launch_for_actor`, `reserve_open_route`. |
+| `store/tasks.rs`, `store/runtime.rs` | Attempt release, late Open outcome and ordinary Operation settlement. |
+| `store/launcher_owned_service.rs`, `store/workspace_lifecycle.rs` | Departure CAS, exact binding/resource holds and lease release sweep. |
+| `host.rs`, `store/mod.rs` | Periodic sweep caller, config loading, direct/automation Immediate transactions, workspace preparation and nested launch mutations. |
+| `store/capacity.rs` | Root route comparison, whole-route launch matching, census/deduplication. |
+| `store/launcher.rs`, `store/automation_work_dispatch.rs` | Direct/automatic launch, current admission, workspace-plan revalidation and claim/Open continuation. |
 
 ## Next work and retained evidence
 
-Continue the post-binding cancellation chain in Resume here. Its completion must show
-both safe refusal after a possible external effect and eventual release after actual
-obligations are resolved. Follow ordinary callers/triggers before adding any cleanup
-worker. Then trace route edits and direct admission races.
+Resume the Goal/automation chain named above. The launch/finalizer source search is no
+longer the next untraced task; AR-048/049 remain open implementation work and AR-050 is
+preserved behavior. Installed concurrency, restart and actual native closure remain
+separate unexecuted qualification.
 
-[Coverage still open](audit-index.md#coverage-still-open) names the remaining areas;
-[evidence checkpoints](audit-index.md#evidence-checkpoints) provides all prior detailed
-traces directly. Findings keep their IDs and dispositions across interruptions.
-Documentation updates do not repair runtime; installed/native/Windows/load evidence
-remains separate.
+[Coverage still open](audit-index.md#coverage-still-open) names the other areas;
+[evidence checkpoints](audit-index.md#evidence-checkpoints) links prior detailed traces.
+Keep IDs and refuted/narrowed claims stable. A documentation commit repairs no runtime.

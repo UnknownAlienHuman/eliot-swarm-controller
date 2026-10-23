@@ -23,13 +23,20 @@ Runtime source, fixtures and native observations have different coverage.
 
 ### Capability and qualification matrix
 
-Use the [current source and completion map](docs/implementation-status.md#current-source-and-completion-map)
-for artifact versions, implemented behavior and remaining qualification. Runtime
+Use the [implementation status](docs/implementation-status.md)
+for landed behavior and remaining qualification; each module guide owns its artifact
+coordinate. Runtime
 guides below describe current commands and transition gaps. [Architecture](docs/agent-operations/architecture.md)
 owns the product manifesto; [implementation](docs/agent-operations/implementation.md)
 owns source changes and deletion order. Historical evidence
 applies to its recorded revision; a fixture pass is not native qualification.
 V3 is the required refactoring target, not a description of a completed rewrite.
+
+Start documentation work at the [current document index](docs/agent-operations/README.md),
+resume the [source audit](docs/agent-operations/audit-register.md#resume-here), and use
+the [donor register](docs/agent-operations/donor-map.md) for upstream links and the
+mechanism to reuse. Old programs/specifications are dated evidence, not additional
+implementation queues.
 
 ## Build and run
 

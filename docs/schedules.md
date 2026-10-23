@@ -1,9 +1,16 @@
 # Scheduled CheckRuns
 
-The controller keeps the existing operator-authored interval registry and
-manager-owned calendar automations on one Store scheduler loop. Both admit only
-the closed `check_run` action through the normal CheckRun path. Neither accepts
-an arbitrary method, shell command, model prompt, or runtime-selected target.
+This guide covers the **current CheckRun-only scheduling surface**: the operator-authored
+interval registry and manager-owned calendar automations described here admit only the
+closed `check_run` action through the normal CheckRun path. They do not schedule arbitrary
+methods, shell commands, model prompts, or runtime-selected targets.
+
+The broader **target** automation contract includes dispatch, review, correction,
+acceptance, Goal messages, and scripts through the ordinary Store command path. That
+target is specified in [agent configuration](agent-operations/configuration.md) and
+owned by the [implementation work order](agent-operations/implementation.md); it is
+not implemented or documented by this CheckRun guide. Use
+[implementation status](implementation-status.md) for current evidence and qualification.
 
 ## Manager-owned calendar automation
 

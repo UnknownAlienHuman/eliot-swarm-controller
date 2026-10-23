@@ -3,13 +3,15 @@
 **Редакция:** 1 · 2 октября 2026  
 **Проверенный baseline:** `c99a71fbba2de2f663e2709a31e3ccc205621df3`  
 **PR:** #13 `Documentation Program`  
-**Назначение:** сверка фактической реализации с действующей документацией и донорскими контрактами.  
+**Назначение:** сверка реализации и донорских контрактов на указанном историческом baseline.
 **Scope:** документация и implementation handoff. Этот файл не меняет runtime-код и не объявляет live-квалификацию.
 
-Это исторический аудит указанного baseline. Его таблицы задач не являются
-дополнительным текущим планом; дальнейшие изменения определяет
-[implementation](agent-operations/implementation.md) по
-[архитектуре](agent-operations/architecture.md).
+Это исторический аудит указанного baseline. Его таблицы задач и Phase B work order
+ниже не являются текущим планом и не задают новых требований сверх актуальных
+операционных документов. Текущую продуктовую цель определяет
+[architecture](agent-operations/architecture.md), единственный work order —
+[implementation](agent-operations/implementation.md), фактическое состояние и
+пределы проверки — [implementation status](implementation-status.md).
 
 ## 0. Метод
 
@@ -628,6 +630,11 @@ Do not repeat:
 
 ### Remaining documentation edits
 
+> **Исторический список на baseline 2 октября 2026.** Пункты ниже фиксируют
+> предложенные тогда редакционные действия; не исполняйте их как текущий handoff.
+> Текущие изменения определяет [implementation](agent-operations/implementation.md),
+> а их статус — [implementation status](implementation-status.md).
+
 1. Update Documentation Program baseline and mark Phase A complete.
 2. Add this implementation review as the Phase B source.
 3. Resolve OpenCodex service/baseline compatibility language across:
@@ -642,6 +649,12 @@ Do not repeat:
 8. Keep owner workflow policy explicitly unresolved where supplied field instructions conflict; do not silently choose one historical line.
 
 ## 12. Phase B work order
+
+> **Историческое предложение для baseline 2 октября 2026, не текущее задание.**
+> B1–B8 сохранены для происхождения анализа и прежних зависимостей. Новый срез
+> выбирайте по [единственному текущему work order](agent-operations/implementation.md),
+> в рамках [architecture](agent-operations/architecture.md), проверяя фактическое
+> состояние по [implementation status](implementation-status.md).
 
 ### B1 — OpenCodex compatibility re-baseline
 
@@ -697,6 +710,11 @@ Documentation-only, independent after exact tag resolution.
 
 ## 13. Negative acceptance scenarios
 
+> These are historical review scenarios for the recorded baseline, not a current
+> standalone gate. Current implementation checks and slice scope are owned by
+> [implementation](agent-operations/implementation.md); current evidence is in
+> [implementation status](implementation-status.md).
+
 An implementation pass is incomplete unless these cases remain safe:
 
 1. OpenCodex service is newer than adapter baseline: read-only evidence may be available; unknown mutation compatibility sends no write.
@@ -714,6 +732,11 @@ An implementation pass is incomplete unless these cases remain safe:
 
 ## 14. Do not redo
 
+> This is the historical PR #13 “do not redo” list, not an active worker instruction.
+> Current source owners and deletion order are in
+> [implementation](agent-operations/implementation.md); current facts are in
+> [implementation status](implementation-status.md).
+
 The next implementation agent must not recreate:
 
 - Store/Task/Attempt/Operation;
@@ -728,6 +751,11 @@ The next implementation agent must not recreate:
 - a second scheduler, message ledger, workflow journal or acceptance store.
 
 ## 15. Definition of done for this review
+
+> **Historical closeout criteria for PR #13.** These criteria record the original
+> review's completion conditions and do not govern current work. Use
+> [implementation](agent-operations/implementation.md) and
+> [implementation status](implementation-status.md) for current scope and evidence.
 
 This review is complete when:
 

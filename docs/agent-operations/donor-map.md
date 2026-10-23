@@ -2,9 +2,10 @@
 
 Borrow a mechanism for a retained responsibility and delete replaced Eliot code in the
 same slice. A donor is not a reason to import an application. [Implementation](implementation.md)
-owns adoption; [audit register](audit-register.md) records source limits. The 2026-10-23
-refinement inspected selected result paths at `9c47d88a`; external patterns below are
-retained earlier research, not a fresh installed-SDK or upstream qualification.
+owns adoption; [audit register](audit-register.md) records source limits. The selected
+result-path trace at `9c47d88a` is inherited from an earlier review. The 2026-10-23 metadata
+refresh is separate and does not qualify an installed SDK, CLI, native service or
+changed source revision.
 
 ## 1. Existing Eliot owners to keep
 
@@ -22,6 +23,32 @@ retained earlier research, not a fresh installed-SDK or upstream qualification.
 | Scripts | `swarm-scripts` plus one selected worker wire |
 
 No new adapter framework, broker, universal journal, EffectRunner or result database.
+
+## Current donor/source register
+
+These entries name bounded mechanisms and the Eliot owner that may use them. Upstream
+release metadata is a freshness check, not an instruction to upgrade. Eliot package
+locks and inspected source commits are recorded separately from the installed native
+CLI/service version, which remains unknown unless an actual launch reports it. Checked
+2026-10-23.
+
+| Donor / source | Reuse and exact inspection point | Eliot state; current upstream fact | Owner and limit |
+| --- | --- | --- | --- |
+| [Muse SDK](https://github.com/meta-models/muse-code-sdk) | Official rolling [`turn/start`](https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/turn-start/), [`view/page`](https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/view-page/) and [`item/readOutput`](https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/item-readoutput/): command identity, cursor and output-ref/range. | Eliot locks `@muse-code/sdk` 1.3.0 (`modules/muse/package-lock.json`); inherited schema/source review is pinned to [a7c10c5](https://github.com/meta-models/muse-code-sdk/tree/a7c10c5dd3f66be412077d29f9d11111af70317b). Rolling `/next` docs checked 2026-10-23 do not qualify every field for 1.3.0. Native Muse version is runtime-reported, not inferred from the lock. | `modules/muse/bridge.mjs`: retain Operation-derived command IDs before submission; use exact output-ref IDs, not URIs, and bounded cursors. The rolling contract caps `item/readOutput` at 6 MiB and allows short view pages; also bound total discovery work. No third executor or repeated unbounded source discovery. |
+| [Codex app-server](https://github.com/openai/codex) | V2 turn identity and history in [`turn.rs`](https://github.com/openai/codex/blob/2b21129c6b8120e63f9ac510fe99e8b02ef43292/codex-rs/app-server-protocol/src/protocol/v2/turn.rs). `clientUserMessageId` correlates input with history; `expectedTurnId` scopes active-turn steering. | Eliot Rust adapter talks to app-server; no locked SDK/runtime version establishes the installed native Codex revision. Upstream `turn.rs` last checked at commit [`2b21129`](https://github.com/openai/codex/commit/2b21129c6b8120e63f9ac510fe99e8b02ef43292), 2026-10-23. | `crates/swarm-adapter-codex`: use identity for correlation and readback while retaining exact pre-IPC page persistence. Neither field is a durable idempotency guarantee for retry; the upstream [open idempotency proposal #32254](https://github.com/openai/codex/issues/32254) requests that extension and is not runtime proof. Do not replay an uncertain prompt. Historical Python bridge is provenance only. |
+| [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript) | SDK hooks/control and terminal result frames; retain selected body and ready page before their only copy disappears. [Release history](https://github.com/anthropics/claude-agent-sdk-typescript/releases). | Eliot locks `@anthropic-ai/claude-agent-sdk` 0.3.287 and matching platform packages in `modules/claude/package-lock.json`. SDK launches its bundled Claude Code binary by default; a configured `pathToClaudeCodeExecutable` may override it. The actual native version is reported by the init frame. Latest official release checked: 0.3.309, published 2026-10-22 22:18:33 UTC. | `crates/swarm-adapter-claude` and `modules/claude`: defer/resume is a native control seam, not durable Store delivery. Upstream issues [#474](https://github.com/anthropics/claude-agent-sdk-typescript/issues/474) (reports against .251) and [#395](https://github.com/anthropics/claude-agent-sdk-typescript/issues/395) (reports against .220) remain unverified against Eliot’s .287 and upstream .309; do not generalize them as confirmed behavior. |
+| [OpenCode](https://github.com/anomalyco/opencode) | Eliot endpoint wiring in [the standalone adapter](../../crates/swarm-adapter-opencode/src/native.rs) and its [source review](../../crates/swarm-adapter-opencode/README.md). | Host `runtime/opencode_v2` remains active until standalone cutover. The module-local package lock 2.0.7 does not identify the current external service; the built-in route reports its version and offers an optional `expected_version` check. [R6 evidence](../qualification-2026-10-03.md) stays scoped to the recorded built-in installation. Official V2 docs were captured 2026-10-01; inherited source review is at `930c0c8b6a3c41ceb73b9372f878b5a1186b4d4e`. | Target owner `crates/swarm-adapter-opencode`: select and qualify the actual native contract exposing durable inbox/input identity and assistant `parentID`. Its older selected projection currently rejects result reads without that parent edge. Local endpoint code alone does not establish installed API support. |
+| [Paseo](https://github.com/getpaseo/paseo) | Timeline live/canonical split, ranges/gaps, declaration-first child discovery; prior exact review [`v0.10.3`](https://github.com/getpaseo/paseo/tree/v0.10.3). | Pattern only, no import. Latest stable release checked: v0.12.0 (2026-10-19). Historical reviewed code remains v0.10.3, not current source review. | Existing Eliot projection/observation owners. Transfer semantics only; no Paseo authority, storage, UI or app. |
+| [ACPX](https://github.com/openclaw/acpx) | Optional ACP owner/queue/watch and session continuity; reviewed source is [v0.19.3](https://github.com/openclaw/acpx/tree/v0.19.3) at `ee6090df63afa9d6f7fc1c091e1961e50f2f1476`. | No code installed. v0.19.4 (`8e396609238086dee6a407fdb3b3ac46dbdedd70`) was a resolved candidate whose source review remains owed. Latest release metadata checked: v0.20.0 (2026-10-20), not reviewed here. | `crates/swarm-adapter-command` owns selected ACP backend. ACPX is conditional for a real consumer; its queue/watch is not a general replay key or another Store. |
+| [Waku](https://github.com/egoist/waku) | External-service ownership, one sequential worker, reconnect distinct from process exit, terminal from execution outcome; historical source [`v0.1.20`](https://github.com/egoist/waku/tree/10bcd728c9b2f07d664cfece3c8c870d3418ddd2). | Pattern only, no import. Current upstream main checked 2026-10-23 at [`10bcd72`](https://github.com/egoist/waku/commit/10bcd728c9b2f07d664cfece3c8c870d3418ddd2); GPL-3.0-only. | `crates/swarm-adapter-opencode`: semantics only; do not vendor/link Waku or import its desktop product. Reject same-ID fresh-session fallback and ignored settings failures. |
+
+To refresh this register, inspect the Eliot lock/manifest and adapter call sites, then
+the canonical upstream release/source at an exact commit. Record the date, release tag
+and full commit separately; distinguish a rolling docs page from a tagged schema, a
+locked library from the native runtime, and current release metadata from the source
+revision actually reviewed. Keep old fixture/qualification evidence attached to its
+original artifact; never mark it newly passed because upstream advanced. Update the
+specific owner and capability limits above only when the inspected contract changed.
 
 ## 2. Result source and Store-delivery matrix
 

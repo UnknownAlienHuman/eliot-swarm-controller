@@ -4,13 +4,13 @@
 **Редакция:** 6 · 2 октября 2026.
 **Baseline repository:** `UnknownAlienHuman/eliot-swarm-controller` at `c99a71fbba2de2f663e2709a31e3ccc205621df3`.
 **Field evidence:** `eliot-root-scripts-20261002-1030.zip` (SHA-256 `f1279a409597912f8a9b4eeab0ebe1e74b68b760b9d73e26b31988112f3a457e`) and `MANAGER-BRIEF(1).md`, supplied separately and intentionally not committed.
-**Status:** Phase A документации уже частично применена в `main`; этот PR теперь является актуальным Phase B implementation handoff. PR меняет только документацию. Предложенный метод, поле или state не считается реализованным до product commit и отдельной qualification evidence.
+**Status:** Historical documentation-program snapshot for the 2 October 2026 baseline and PR #13. It is not a current implementation or documentation handoff. Current product direction is in [Agent Operations architecture](agent-operations/architecture.md), the only current work order is [Agent Operations implementation](agent-operations/implementation.md), and implementation/qualification evidence is in [implementation status](implementation-status.md).
 
 ## 0. Как использовать этот документ
 
-Это единый handoff-документ для следующего прохода по документации. It does not replace the architecture, module contract, implementation plan or module guides. It says exactly which existing documents must change, which current mechanisms must be preserved, which manual-control failure modes must be removed, and which donor units are approved for adoption, pilot or research.
+Этот раздел описывает исходное назначение и правила программы на baseline 2 октября 2026; это не действующая инструкция для следующего прохода. Для текущей работы сначала используйте [architecture](agent-operations/architecture.md), затем [единственный implementation work order](agent-operations/implementation.md), а состояние и пределы доказательств сверяйте с [implementation status](implementation-status.md). Следующие требования и доказательства сохранены как исторический материал и не создают отдельную очередь.
 
-Исполнитель документации должен соблюдать четыре правила:
+На историческом проходе применялись четыре правила:
 
 1. **Read current source before editing documentation.** A capability already present on `main` is documented as implemented, not planned from scratch. A compiled or fixture-checked capability is not called live-qualified.
 2. **Preserve authority boundaries.** ELIOT Task/Attempt/Operation, Store, immutable artifacts, CheckRunner and acceptance remain authoritative. No donor adds a second scheduler, task store, session owner or acceptance authority.
@@ -34,7 +34,7 @@ acceptance committed and still current
 
 Ни один слой не может повышать следующий уровень по косвенным признакам: `idle`, process exit, silence, age, successful HTTP status, branch name, a model report or the absence of an item from a partial projection.
 
-### 0.2 Карта текущей реализации на baseline
+### 0.2 Карта реализации на baseline 2 октября 2026
 
 Проход начинается от уже существующей реализации:
 
@@ -50,7 +50,7 @@ acceptance committed and still current
 
 Документация не должна описывать эти части как отсутствующие. Для каждой возможности указывается `implemented`, `fixture_checked`, `live_observed`, `qualified`, `unavailable` or `unknown` per capability.
 
-### 0.3 Phase A уже применена на `main`
+### 0.3 Исторический статус Phase A на baseline
 
 После открытия PR основная ветка продвинулась. На baseline этой редакции уже выполнены следующие пункты первоначальной программы:
 
@@ -63,7 +63,7 @@ acceptance committed and still current
 - MCP предупреждает, что caller обязан сохранить logical request ID до mutation;
 - donor inventory получил adoption classes и stable/pin/qualification distinctions.
 
-Их **не следует реализовывать повторно**. Оставшаяся работа определяется [Implementation Review](documentation-program-implementation-review.md): две P0-противоречия, vendor-neutral prerequisite boundary, составная подготовка, Muse donor conformance, OpenCode background, timeline/family/attention и нормализация donor evidence.
+Это перечень состояния и предлагаемого остатка на указанном baseline, а не текущий список оставшихся задач. Датированный [Implementation Review](documentation-program-implementation-review.md) хранит исходный разбор; актуальный приоритет и остаток определяет только [implementation work order](agent-operations/implementation.md), а фактические статусы — [implementation status](implementation-status.md).
 
 Текущие документы всё ещё должны сохранять distinction:
 
@@ -96,12 +96,12 @@ Source review и compilation не являются live qualification. Исто�
 | Verifier semantics | Borrow Claw's `verified/refuted/unverified`, not its file workflow authority |
 | Alternative facades | Helicon and Atlas ACP are research alternatives, not additional owners behind ELIOT |
 
-### 0.5 Текущие P0 после сверки кода с документацией
+### 0.5 Исторические P0 на baseline программы
 
 1. **OpenCodex compatibility:** donor inventory объявляет operator-owned current service без mutation-blocking version pin, но `bridge.mjs` всё ещё реализует exact `2.73.0` gate и запрещает preview/configure при mismatch. Нельзя просто снять gate: reviewed upstream `2.75.0` содержит изменения Management API. Нужно разделить observed service version, adapter contract baseline и operation-kind compatibility.
 2. **OpenCode goal evidence:** `goal.rs` выставляет `model_work_started=true` по наличию activation input ID. Это доказывает admission, но не `session.execution.started`. Goal result должен разделить record applied, activation admitted и execution started.
 
-Подробный source-level разбор, donor comparison, файлы Phase B и negative acceptance cases находятся в [Implementation Review](documentation-program-implementation-review.md).
+Подробный source-level разбор, donor comparison, первоначальные файлы Phase B и negative acceptance cases сохранены в [Implementation Review](documentation-program-implementation-review.md) как свидетельства того baseline, а не как текущие задачи.
 
 ## 1. Цель и ограничения
 
@@ -159,6 +159,8 @@ Source review и compilation не являются live qualification. Исто�
 6. **ELIOT CheckRunner:** exact captured Git source, trusted profile, process group, immutable outputs and incomplete-on-uncertainty are already stronger than donor terminal self-reports.
 
 ## 2. Как обновить существующие документы
+
+> **Исторический checklist.** Следующие указания описывают план работы для baseline 2 октября 2026. Не выполняйте их как текущие изменения и не создавайте из них новый work order. Текущие требования к изменению продукта и их владельцы находятся в [architecture](agent-operations/architecture.md) и [implementation](agent-operations/implementation.md); реализованное и квалифицированное состояние — в [implementation status](implementation-status.md).
 
 ### `README.md`
 
@@ -249,7 +251,12 @@ Every module guide must answer:
 
 ## 3. R0–R9: что сохраняется из v3
 
-These items remain required but must be updated against the current baseline:
+> **Исторический статус требований на baseline 2 октября 2026.** Формулировка ниже
+> отражает тогдашнюю классификацию и не является актуальным work order. Сверяйте
+> текущее покрытие с [implementation](agent-operations/implementation.md) и
+> [implementation status](implementation-status.md).
+
+At the time, these items were classified as requirements to update against the then-current baseline:
 
 - **R0:** document truth/status cleanup, not product code.
 - **R1:** caller-owned logical request ID for MCP mutations.
@@ -262,7 +269,7 @@ These items remain required but must be updated against the current baseline:
 - **R8:** optional ACPX backend, whole package.
 - **R9:** module/source/artifact/grant provenance.
 
-The implementation agent must read current source first: some portions landed after the earlier analysis, while the remaining gaps are narrower than the original headings.
+The historical program instructed its implementation agent to read then-current source first; that instruction is retained here as provenance for the review method, not as a current assignment.
 
 ## 4. R10. Единый рабочий контракт Issue и роли
 
