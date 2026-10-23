@@ -27,8 +27,8 @@ select current work
 
 Task, Attempt, Operation, binding, candidate, review and artifact records already own
 this cycle. Helpers query current facts and call the same Store handlers as agents.
-Do not add another workflow ledger, repair queue, continuation registry or model-driven
-heartbeat.
+Do not add another workflow ledger, repair queue, continuation registry, result queue or
+model-driven heartbeat.
 
 `explicit` means attributable Store intent with current authority. It does not mean a
 manual click. Unknown effects block only their exact resource while unrelated work
@@ -40,7 +40,9 @@ continues.
 | --- | --- | --- |
 | Eligible work plus route/workspace capacity | `dispatch_once` claims and launches or resumes | One initial-input owner and one admitted Operation |
 | Native question/permission request | Native permission rule or addressed Governor `Reply` | Exact request answered |
-| Attributable terminal/output available | Capture all pages and assemble if needed | Complete artifact retained |
+| Attributable terminal with incomplete Store coverage | `capture_once` admits the next missing `agent.result` range | Complete immutable pages retained |
+| Uncertain exact native effect with declared readback | `reconcile_once` admits one `agent.reconcile` | Target resolved or lookup settled `resolved:false` |
+| Complete pages needing one candidate artifact | Ordinary `artifact.assemble` | Settled whole artifact or exact failure |
 | Complete candidate available | `task.submit` | Candidate-specific submission applied or historical |
 | Review missing | `review_once` | Independent assignment retained |
 | Review requests changes | `task.request_changes` plus one correction `Send` | All actionable findings delivered together |
@@ -49,6 +51,10 @@ continues.
 
 Automation receives no extra Task authority. Configuration affects future admissions;
 it does not rewrite already admitted effects or evidence.
+
+Result preservation and readback of uncertain admitted effects are correctness duties,
+not optional automation products. Policy still decides whether taskless output is kept,
+which complete artifact is submitted and whether accepted work is published.
 
 ## 3. Initial input, continuation and native ownership
 
@@ -61,11 +67,11 @@ Preserve `Attempt.start_owner`:
 
 A follow-up `Send`, correction, Goal continuation, Reply or steer is not a new initial
 Dispatch. One native owner orders each session. Queue acceptance, native execution,
-terminal output, submission and Task acceptance are separate facts.
+terminal output, complete capture, submission and Task acceptance are separate facts.
 
-Task-linked input must retain the exact Task, Task revision and Attempt on its existing
-Operation at admission. Result attribution later follows that source Operation and its
-native input/turn facts. Do not derive ownership from the newest Task on a session.
+Task-linked input retains exact Task, Task revision and Attempt on its existing
+Operation at admission. Result attribution follows that source Operation and its native
+input/turn facts. Do not derive ownership from the newest Task on a session.
 
 Some session input may be intentionally taskless. That is a distinct explicit policy
 and authority, not a fallback when current Task/Attempt selection fails. A stale
@@ -83,7 +89,8 @@ classify pending work instead of leaving it to a later binding-level guess.
 | Queued, unsent task-linked prompt/config/reply/Goal mutation | Cancel or mark superseded without native I/O. |
 | Sending, native-accepted or outcome-unknown mutation | Preserve exact Operation; bounded readback/reconcile only. |
 | Terminal outcome or late native evidence | Retain under the old Task/Attempt; never complete the new revision. |
-| Admitted `agent.result`, result-body/page capture or reconcile | Keep deliverable until exact capture/readback settles. |
+| Missing complete result coverage | Keep or admit exact historical capture until bytes are durable or explicitly disposed. |
+| Admitted `agent.result`, page delivery or reconcile | Keep deliverable until its exact completion settles. |
 | Deliberately taskless session control | Follow its own explicit scope and lifecycle. |
 
 Every new task-linked native effect rechecks:
@@ -105,9 +112,10 @@ Continuation authority and cleanup authority are different.
 
 - Continuing/starting work requires the exact current Task revision and Attempt.
 - The current scoped GM may reconcile and release a superseded historical Attempt after
-  checking its immutable Task/project scope and unresolved effects.
+  checking immutable Task/project scope and unresolved effects.
 - Sent/unknown effects require readback before release.
 - Unsent old-revision effects are cancelled by the supersession transition.
+- Terminal execution does not imply that complete output bytes were captured.
 - Original owner identity remains history; it is not rewritten to the current GM.
 - Routine cleanup must not require the former Manager or local Operator.
 
@@ -157,7 +165,7 @@ source Operation
 -> attributable native terminal/body
 -> agent.result / module.result pages
 -> immutable page artifacts
--> complete page or artifact.assemble
+-> complete page set or artifact.assemble
 -> task.submit
 ```
 
@@ -165,8 +173,8 @@ Use explicit native parent/input identity or an actually verified serialized inp
 window. Independent concurrent input or unexplained source gap invalidates
 ordering-only association. Never select the newest assistant message.
 
-The common result-origin path must support attributable task-linked `agent.send` as
-well as the initial Dispatch. Extend its source-Operation model through:
+The common result-origin path supports attributable task-linked `agent.send` as well as
+the initial Dispatch. Extend its source-Operation model through:
 
 - admission and retained Task/Attempt relation;
 - adapter body lookup;
@@ -179,16 +187,57 @@ continuation as the initial Dispatch. A steer may contribute to an existing nati
 instead of owning a separate terminal response; preserve that real relationship and do
 not count the terminal twice.
 
+### Current-state capture owner
+
+No configured workflow step is needed. One bounded host pass derives work from current
+Operations and artifacts:
+
+1. Select an attributable terminal source with retained-result capability and no proven
+   complete Store coverage.
+2. Resolve its immutable Task/Attempt/source scope. Current assignment is required for
+   new execution, not for finishing historical result capture.
+3. Compute the first missing byte range from retained pages; do not persist another
+   capture cursor.
+4. Admit at most one ordinary `agent.result` with deterministic identity derived from
+   source Operation + range.
+5. After its settled readback, repeat for the next gap. A pending/unknown Result blocks
+   only that source.
+6. When coverage is complete, optionally assemble and submit under selected policy.
+
+A page-created event is too late to trigger the first page. The correctness loop queries
+current source Operations directly and coalesces duplicate wakeups.
+
+### Historical completion authority
+
+A Result admitted before revision/release already has a sealed completion path. The
+same exact source authority is needed when complete capture starts only after terminal:
+
+```text
+terminal source Operation
++ immutable Task/Attempt/binding relation
++ native result identity
++ authorized current capture actor
+-> bounded result read only
+```
+
+This grants no new prompt, Task mutation or completion of a later revision. Deliberately
+taskless output follows explicit retention policy. Ambiguous source ownership remains
+unknown.
+
 ### Page and body lifetimes
 
-Native effect identity, complete source body and Store-delivery envelopes have separate
+Native effect identity, source body and Store-delivery envelopes have separate
 lifetimes:
 
 - outcome ACK releases only its outcome envelope;
 - page ACK releases only that page envelope;
-- complete durable Store capture or explicit retention/release permits deletion of the
-  source body;
-- an EOF page alone does not prove earlier byte coverage.
+- source body remains until exact Store-ACKed ranges cover `[0,total)` or explicit
+  retention policy disposes it;
+- an EOF page alone does not prove earlier coverage.
+
+Persist with each source body only its immutable source identity, total/digest and the
+union of ACKed ranges. ACK replay is idempotent. Do not create a transcript, generic
+journal or Store-side duplicate of the bytes.
 
 Retain body bytes under bounded storage before delivery. On pressure, stop admitting
 new work and expose the storage fault; never evict an uncollected result to make room.
@@ -200,19 +249,36 @@ digest. A valid empty body is not missing. Object authorization is separate from
 content integrity. Metadata access does not grant bytes.
 
 `artifact.assemble` returns an admission receipt. The settled `operation.get` outcome
-proves assembly completion. Enabled capture policy obtains missing pages and advances
-to submission only after complete capture; the Governor is not expected to manually
-collect page IDs.
+proves assembly completion. Complete page coverage is already durable source capture;
+assembly provides the convenient whole artifact and canonical whole-digest proof.
 
 ### Attempt release and late evidence
 
-`attempt.release` must not cancel previously admitted result/readback Operations merely
-because they remain queued. Cancel unsent native mutations, preserve sent/unknown
-mutations for readback, and preserve exact Result/Reconcile/capture Operations until
-they settle. Evidence arriving after supersession stays historical and cannot complete
-the new Attempt.
+Release must continue blocking unresolved native effects/producers, but terminal alone
+is not proof that output is safe to discard. Cancel unsent native mutations; preserve
+or admit exact Result/Reconcile/capture work required for Task-linked terminal output.
+Evidence arriving after supersession stays historical and cannot complete the new
+Attempt.
 
-## 8. Review, correction and resubmission
+## 8. Readback of uncertain effects
+
+`reconcile_once` is a bounded current-state operation, not an AutomationStep:
+
+1. Select an exact `sending` / `native_accepted` / `outcome_unknown` target whose route
+   declares readback and has no active reconcile child.
+2. Admit one deterministic ordinary `agent.reconcile`.
+3. Adapter performs read-only native/local inspection; it never replays input.
+4. If target evidence is found, record the target outcome first, then settle lookup
+   `resolved:true`.
+5. If inspection completed without evidence, settle lookup `resolved:false`; target
+   remains unknown.
+6. Retry only after relevant source epoch/cursor change or bounded due time. An
+   unchanged inconclusive lookup does not spin.
+
+Supervisor operation readback only tracks unresolved IDs/process lifecycle. It does not
+settle targets and must not become a result-recovery daemon.
+
+## 9. Review, correction and resubmission
 
 Use one review slot bound to Task revision, Attempt and candidate. Retain sponsor,
 assigned reviewer and actual author separately. Preserve existing replacement classes
@@ -241,8 +307,8 @@ Normalize the exact correction input facts:
 
 Do not require one provider-specific native input ID or completion string across all
 harnesses. A terminal Rejected/Cancelled state may follow real execution and is not
-proof of no effect. Remove duplicate RepairDispatch readers when the common Operation
-facts serve this decision.
+proof of no effect. Remove duplicate RepairDispatch readers when common Operation facts
+serve this decision.
 
 The same unreleased `needs_correction` Attempt may submit the corrected candidate using
 expected Task revision and prior submission. A published stale submission is retained
@@ -253,7 +319,7 @@ Bound no-progress rounds and cost. Escalate once to the Governor with concrete o
 narrow work, approved route change, worker/reviewer replacement, missing evidence or
 deferral. Do not make the human perform routine Manager work.
 
-## 9. Acceptance and publication
+## 10. Acceptance and publication
 
 Manual `task.accept` and `accept_once` use the same candidate-specific evidence gate.
 A review of A cannot accept B. Missing required checks, unresolved findings or an
@@ -269,7 +335,7 @@ Collection, requirement import and external writes have different owners. Import
 source changes do not silently overwrite frozen working requirements. Preserve remote
 identity, gaps and conflicts without creating an external work queue inside Eliot.
 
-## 10. Restart, credential and old-boot delivery
+## 11. Restart, credential and old-boot delivery
 
 A binding-scoped module credential is stable across adapter process restarts. The
 successor normally uses the same deterministic module client identity and protected
@@ -286,38 +352,42 @@ The successor-delivery boundary requires:
 same binding-scoped credential
 + new accepted boot/link
 + proven previous owner departure
-+ retained previous boot transition
-+ exact original Operation/binding/request
++ retained original Operation execution boot
 + complete immutable old-boot delivery bytes
 ```
 
-Store records the evidence for the original Operation and deduplicates exact delivery.
-It grants no native replay, no new command and no transfer to another Attempt. Ordinary
+Store records evidence for the original Operation and deduplicates exact delivery. It
+grants no native replay, no new command and no transfer to another Attempt. Ordinary
 live outcomes still require current-boot identity; recovery is an explicit narrow path,
 not a weakened validator. Missing or partial bytes remain unknown.
+
+Supervisor startup recovery provides status-only unresolved IDs. Adapter startup loads
+its own complete private captures before native open; Store settlement and page owners
+validate them. Do not route native bytes through supervisor automation/Hook journals.
 
 Control-link failure alone is not native cancellation. Continue reducing native events
 and capturing terminal output while Store IPC is unavailable. Retry only saved Store
 deliveries. Hold new work on delivery/storage pressure; do not close native stdin or
 forget terminal facts because an observation could not be posted.
 
-## 11. Connected verification
+## 12. Connected verification
 
 A complete connected proof covers:
 
 1. initial assignment and exactly one input owner;
 2. question/Reply;
-3. candidate A and complete output capture;
-4. independent review with all findings;
+3. automatic terminal capture from offset zero through complete coverage;
+4. candidate A submission and independent review with all findings;
 5. one correction Send and attributable correction output;
 6. same-Attempt candidate B submission;
 7. replacement reviewer where required;
 8. acceptance and selected publication;
-9. Task revision while an old Send is queued/sent/unknown;
-10. release that cancels unsent effects but preserves result capture;
-11. GM handover and cleanup of a superseded foreign Attempt without human fallback;
+9. Task revision while old Send is queued/sent/unknown;
+10. release that cancels unsent effects but preserves/finishes output capture;
+11. GM handover and cleanup of superseded foreign Attempt without human fallback;
 12. IPC disconnect, adapter restart, old-boot delivery and exact dedupe;
-13. unrelated work progressing while one effect remains unknown.
+13. complete inconclusive Reconcile that settles the lookup without retry spin;
+14. unrelated work progressing while one effect remains unknown.
 
 During construction run formatting and minimal affected warnings-denied Clippy/build.
 Focused connected cases run when a vertical slice closes; installed Windows/native/load

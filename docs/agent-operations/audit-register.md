@@ -8,27 +8,26 @@ It is not another runtime registry, implementation queue or approval gate.
 
 ## Resume here
 
-- Pass: **2026-10-23 / successor delivery, recovery queue and readback completion**.
-- Inspected head: **`ec0190526508af1daf0da3a1aae51ee425b6ab04`**. Its diff from
-  `1c61629b` changes only audit-register/delivery documentation. Earlier source evidence
-  remains unchanged; that comparison does not constitute a new audit of those paths.
+- Pass: **2026-10-23 / automatic result capture, historical admission and body release**.
+- Inspected runtime head: **`f5ccc418ba401733d1f778619abeec5c0554416b`**.
 - Overall audit: **incomplete**. No measured completeness percentage is claimed.
-- Newly traced: `module.outcome` scope, receipt/recovery-link validation, duplicate ACK,
-  terminal settlement; Antigravity boot validation; hello boot replacement; the
-  `module.next` recovery predicate; supervisor recovery routing; adapter startup and
-  `Controller::read_command` reconciliation.
-- New rows: **AR-017–AR-019**. AR-016 is narrowed: first-time old-boot import is blocked,
-  but exact already-recorded outcomes have an earlier replay-ACK path when preceding
-  scope/receipt checks succeed. Do not reintroduce the blanket rejection claim.
-- **Next exact chain:** retained outcome -> `producers::record_task_dispatch` /
-  `record_warm_terminal` -> superseded or released Attempt; then missing historical
-  `agent.result` admission -> `normalized_result::admitted_origin` -> page registration
-  -> automatic capture/release. Establish how to retain original evidence without
-  requiring a current Task or leaving a second result collector. Also trace whether
-  any current consumer automatically schedules/coalesces Antigravity Reconcile calls;
-  AR-019 does not claim a reproduced retry loop.
-- No runtime code, Clippy, tests, installed harness or independent verifier ran.
-  Documentation review/publication uses the GitHub connector; local clone failed DNS.
+- Newly traced:
+  - warm terminal settlement through `producers::record_task_dispatch` and
+    `record_warm_terminal`;
+  - `attempt.release` unresolved-effect/producer gates and queued-operation cancellation;
+  - normalized-result admission versus already-admitted page completion;
+  - Store automation actions and current automatic consumers;
+  - module-supervisor status readback and startup recovery projection;
+  - Antigravity result-page ACK handling and response-body eviction.
+- New findings: **AR-020–AR-024**.
+- **Next exact chain:** compare result/delivery ownership in current Codex, OpenCode,
+  Command, Muse and Claude routes: source-body lifetime, page/outcome outbox, ACK
+  coverage, restart import and release. Then define the route-independent
+  `capture_once` / `reconcile_once` Store query and exact historical object authority.
+  Reuse existing adapter mechanisms only where they delete route-local code.
+- This pass changes documentation only. No runtime code, Clippy, tests, installed
+  harness or independent verifier ran. Source tests and historical receipts are not
+  new executed evidence.
 
 On resume compare changed source paths with this head. Recheck changed callers and
 consumers, not the entire archive. Update this register with the owning target
@@ -49,220 +48,236 @@ not a completed trace; reading a test is not running it.
 
 | ID | Inspected requirement/path | Evidence and disposition | Remaining boundary |
 | --- | --- | --- | --- |
-| AR-001 | Antigravity report failure → native shutdown | **Source-confirmed, open.** Report retry runs in the only terminal-wait reducer; failure reaches stdin shutdown, and facts observed during drain can remain only in memory. | Independent bounded Store delivery and continuous native draining; host-down case. |
-| AR-002 | Complete result retention | **Source-confirmed, open.** The 32-response cache can evict the only uncollected body on the 33rd completion. Outcome ACK is not body capture. | Durable source-body lifetime, pressure before new admission and complete-capture release. |
-| AR-003 | Exact result identity | **Preserve.** Operation/receipt/conversation/generation checks and explicit unavailable oversized bodies. | Keep causal identity while deleting duplicate package proofs. |
-| AR-004 | Adapter restart without native replay | **Source-confirmed gap, open.** A new Antigravity Controller has empty response/delivery caches. | Original-Operation successor delivery; no replay or origin relabeling. |
-| AR-005 | Previously admitted normalized-page completion | **Preserve.** Exact registered module tuple and sealed origin allow narrow late page completion without ordinary current-link/release gating; identical registered pages receive replay ACK. | Successor delivery and partial-storage cases; AR-017 shows a separate earlier queue barrier. |
-| AR-006 | Complete continuation results | **Source-confirmed, open, route-scoped.** Generic origin and candidate validators require the initial `task.dispatch`; strict Antigravity can retain a Send body but its public fallback exposes status only. | Extend the same source-Operation/page/candidate path to attributable continuation input. |
-| AR-007 | Full assembly and artifact reads | **Preserve.** Page publication/registration, contiguous range and digest checks, complete assembly and Bytes-level authorization. | Grant/cache races and crash/power-loss qualification. |
-| AR-008 | Authentication versus finishing admitted output | **Source-confirmed boundary.** Disabled credentials fail a new handshake; an already-authenticated carrier has a narrow path to finish its prior page. | Revocation side effects and post-restart delivery. |
-| AR-009 | Continuation Task/Attempt attribution | **Source-confirmed, mixed.** Selected Manager, Repair and Goal paths can write Operation scope; ordinary binding-level sends may be deliberately taskless. | Require an explicit distinction instead of accidental fallback. |
-| AR-010 | Repair delivery readback | **Source-confirmed predicate mismatch, open.** Repair readers require applied + native input ID + `native_input_admitted`; Antigravity terminal facts use another condition and no native input ID. Rejected/cancelled is also treated as no effect even after execution. | Consume common admission/terminal facts; distinguish pre-input rejection from executed terminal failure. |
-| AR-011 | Correction submission and historical recovery | **Preserve.** The same unreleased `needs_correction` Attempt may submit against expected revision/prior submission; stale published submissions remain historical. | Extend continuation origin through existing candidate validators. |
-| AR-012 | Task revision fences new work | **Source-confirmed defect, open.** `task.revise` preserves the old Attempt and does not classify its queued Operations. Direct Manager Send can fall through binding-level ownership with no current Attempt, becoming taskless; queued task-linked Send can dispatch without a Task-revision recheck. Repair/Goal perform current-subject checks. | Supersede unsent old-revision mutations and recheck exact Task/Attempt before task-linked effects. |
-| AR-013 | Current GM can dispose superseded work | **Source-confirmed defect, open.** Revision beneath another Manager's live Attempt makes foreign-GM `require_attempt_control` fail while `task.claim` sees the unreleased Attempt. | Separate continue/start authority from scoped historical reconcile/release authority; preserve original owner. |
-| AR-014 | Release preserves admitted result capture | **Source-confirmed defect, open.** Release cancels queued non-check Operations including admitted `agent.result`; normalized validators reject cancelled and closed-binding selection requires queued. | Cancel unsent native mutations, not required result/readback/capture. |
-| AR-015 | Module credential across process restart | **Preserve.** Binding-scoped client/credential is reused and implicit rotation is forbidden. A successor normally has the same credential and a new boot. | Live restart and explicit revocation policy. |
-| AR-016 | Old-boot terminal delivery | **Source-confirmed defect, open, narrowed.** An unseen terminal from the departed boot fails current-boot validation. An identical already-committed outcome can reach an earlier replay ACK after scope/receipt checks. | Separate delivery actor from immutable execution origin; survive multiple successor boots without using only the mutable previous-boot field. |
-| AR-017 | Capture while native execution is recovery-fenced | **Source-confirmed defect, open.** `next_internal` selects only Recover/Reconcile while `recovery_required`; even sealed, previously admitted Result is filtered before its completion exception. | Permit exact completion-only result/readback without declaring the native session ready. |
-| AR-018 | Meaning of supervisor recovery | **Source-confirmed scope correction / preserve.** `module.supervisor.recovery.reconcile` reconciles automation/Hook intake, not adapter files or native terminals. Startup already spawns native only on Open. | Connect capture loading and Store completion in existing adapter/result owners, not that event journal or another daemon. |
-| AR-019 | A completed lookup is not an unknown lookup | **Source-confirmed mismatch, open.** Antigravity Reconcile always emits Unknown for the lookup Operation, even when its local inspection completed. Target uncertainty and readback completion are conflated. | Settle the lookup with `resolved:false` when complete but inconclusive; retain the target unknown and bounded retry policy. Automatic retry-loop reachability remains untraced. |
-
-## Retained revision/release trace
-
-The following AR-012–AR-015 evidence was established at `1c61629b`; source is unchanged
-at this pass. Full prior notes remain in the [preceding register](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/docs/agent-operations/audit-register.md).
-
-### AR-012 — revision leaves two unsafe interpretations of Send
-
-Sources: `store/tasks.rs::revise`, `store/runtime.rs::current_attempts_for_binding`,
-`user_command_with_actor`, `next_internal`; `automation/repair.rs::require_current_for_effect`;
-`store/automation_goal_progression.rs::require_current_for_dispatch`; public Send shape.
-
-`task.revise` updates Task revision/spec and reports `existing_attempt_preserved`;
-it neither releases the Attempt nor classifies queued Operations. For direct Manager
-Send, current-Attempt selection requires matching Task revision, but the fallback
-`owns` query accepts any unreleased owned Attempt on that binding. After revision,
-Send can therefore be admitted without Task/Attempt columns. An already linked queued
-Send also encounters the binding-level shortcut at dispatch without an independent
-Task-revision check. Repair and Goal perform stricter exact-subject checks; preserve
-those semantics when deleting their duplicate workflow machinery.
-
-Target: revision atomically supersedes unsent task-linked native mutations, retains
-sent/unknown effects for readback and preserves capture. New task-linked input needs
-one exact current subject; deliberately taskless input needs explicit authority.
-Use existing Operation scope and dispatch transaction, not a continuation ledger.
-
-### AR-013 — revision can strand an Attempt behind the original owner
-
-Sources: `tasks.rs::authorize_foreign_live_attempt_revision/revise/claim/release` and
-`gm.rs::require_attempt_control`.
-
-Current GM may revise another Manager's live Task, but foreign Attempt control then
-fails the Task/Attempt revision equality check. The old owner remains immutable and
-new claim is blocked by that unreleased Attempt. Permit current scoped GM disposition
-of exact superseded work without granting continuation rights or rewriting owner.
-Unsent mutations are cancelled; sent/unknown effects still require readback. This
-routine recovery belongs to the Governor, not a mandatory human/operator.
-
-### AR-014 — release cancels queued capture
-
-Sources: `tasks.rs::release`, `normalized_result.rs::validate_admitted_operation`,
-`runtime.rs::next_internal` admitted-result-only branch.
-
-Release blocks unresolved sent effects, then cancels queued non-check Operations,
-including admitted Result. Cancelled is outside normalized-result validation and
-closed-binding selection; new result admission requires a current unreleased Attempt.
-Classify by effect: cancel unsent native mutations, preserve evidence collection,
-readback and reconciliation, and retain uncertain effects without replay. Do not keep
-the broad `method <> 'check.run'` cancellation predicate.
-
-### AR-015 — reuse the binding credential
-
-`store/module_credential.rs` derives/reuses the same registered private credential
-for its binding/descriptor scope; missing registered files fail rather than silently
-rotating. Hello establishes the new delivery boot/link after departure checks. New
-credentials are not the normal restart solution. Revocation is a separate policy.
+| AR-001 | Antigravity report failure → native shutdown | **Source-confirmed, open.** Report retry runs in the terminal reducer; failure reaches stdin shutdown and drained facts can remain memory-only. | Independent bounded Store delivery and continuous native draining. |
+| AR-002 | Complete result retention | **Source-confirmed, open.** The 32-response cache can evict the only uncollected body. | Durable body lifetime, admission pressure and complete-capture release. |
+| AR-003 | Exact result identity | **Preserve.** Exact Operation/receipt/conversation/generation checks and explicit unavailable oversized output. | Keep causal identity while deleting duplicate package proofs. |
+| AR-004 | Adapter restart without native replay | **Source-confirmed gap, open.** New Antigravity Controller has empty body/delivery caches. | Original-Operation successor delivery. |
+| AR-005 | Previously admitted page completion | **Preserve.** Sealed normalized origin permits narrow late page completion and exact replay ACK. | First-time historical admission and partial storage. |
+| AR-006 | Complete continuation result | **Source-confirmed, open, route-scoped.** Generic origin/candidate validators require initial `task.dispatch`; strict Antigravity retains Send output but exposes status only. | Extend the same source-Operation/page/candidate path to attributable Send. |
+| AR-007 | Assembly and artifact reads | **Preserve.** Publish/register separation, contiguous coverage, digest checks and Bytes authorization. | Crash/power-loss and remaining grant/cache races. |
+| AR-008 | Authentication versus admitted completion | **Source-confirmed boundary.** Disabled credentials fail new handshake; an authenticated carrier has narrow prior-page completion. | Revocation and successor delivery. |
+| AR-009 | Continuation Task/Attempt attribution | **Source-confirmed, mixed.** Selected Manager, Repair and Goal paths retain scope; binding-only input may be deliberately taskless. | Make task-linked versus taskless authority explicit. |
+| AR-010 | Repair delivery readback | **Source-confirmed defect, open.** Repair reader requires one provider-specific input ID/condition and treats all Rejected/Cancelled as no effect. | Consume common admission/terminal facts. |
+| AR-011 | Correction submission | **Preserve.** Same unreleased `needs_correction` Attempt can resubmit; stale publication remains historical. | Extend continuation origin through candidate validators. |
+| AR-012 | Task revision fences input | **Source-confirmed defect, open.** Revision preserves old Attempt; direct Send can become accidentally taskless or dispatch without current-revision recheck. | Supersede unsent old-revision effects and recheck exact Task/Attempt. |
+| AR-013 | GM disposes superseded work | **Source-confirmed defect, open.** Current GM can revise beneath another owner but then cannot release the old Attempt. | Separate current execution authority from scoped historical cleanup. |
+| AR-014 | Release preserves result capture | **Source-confirmed defect, open.** Release cancels queued `agent.result` with every non-check Operation. | Classify cancellation by effect semantics. |
+| AR-015 | Module credential on restart | **Preserve.** Binding-scoped client/credential is reused; implicit rotation is forbidden. | Live restart/revocation qualification. |
+| AR-016 | Old-boot first delivery | **Source-confirmed defect, open.** Unseen old-boot terminal fails current-boot validation; exact already-committed outcome may receive earlier replay ACK. | Separate immutable execution origin from delivery actor. |
+| AR-017 | Capture while execution is recovery-fenced | **Source-confirmed defect, open.** `recovery_required` filters sealed Result before completion-only exception. | Permit exact completion/readback without declaring session ready. |
+| AR-018 | Supervisor recovery meaning | **Preserve/correction.** `module.supervisor.recovery.reconcile` handles automation/Hook intake, not native outcomes. | Keep native import in adapter/Store owners. |
+| AR-019 | Complete inconclusive readback | **Source-confirmed defect, open.** Antigravity Reconcile reports its own lookup Unknown even after a completed inconclusive inspection. | Settle lookup `resolved:false`; retain target unknown and bounded retry. |
+| AR-020 | Terminal evidence versus Attempt release | **Source-confirmed boundary.** Warm dispatch terminal can update its immutable old-revision Attempt while unreleased; release blocks unresolved Operations/producers. Once terminal disposition is recorded, release no longer requires complete response capture. | Add complete-output obligation without weakening producer/release fences. |
+| AR-021 | First historical result admission | **Source-confirmed defect, open.** New normalized Result requires current open unreleased Task/Attempt; only a Result admitted earlier can finish after release/revision. | Admit capture from immutable terminal source Operation and historical object scope. |
+| AR-022 | Automatic Result/Reconcile owner | **Source-confirmed defect, open.** Current automation steps/consumers create neither `agent.result` nor `agent.reconcile`; Doctor only recommends an explicit command. | One bounded current-state host loop using ordinary Operations; no new workflow ledger. |
+| AR-023 | Supervisor operation readback | **Source-confirmed scope correction.** Supervisor readback retains unresolved IDs and lifecycle gates only; it neither settles targets nor creates Result/Reconcile. Antigravity constructs a fresh Controller without consuming startup recovery records. | Use supervisor for custody/demand only; connect semantic recovery in Store/adapter. |
+| AR-024 | Page ACK and source-body release | **Source-confirmed defect, open.** Antigravity checks only `recorded:true`; it records no ACKed byte ranges and has no source-release path. Bodies disappear only through count eviction/truncation. | Track exact Store-ACKed coverage and release only after full durable coverage. |
 
 ## Current pass details
 
-All links in this section pin the inspected head, not a moving branch.
+### AR-020 — terminal settlement is not complete output capture
 
-### AR-016 — distinguish first import, duplicate ACK and repeated replacement
+Sources:
 
-Sources: [scope and recorder entry](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/runtime.rs#L2747-L2765),
-[duplicate/settlement ordering](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/runtime.rs#L3080-L3260),
-[terminal validator](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/runtime/warm_stream.rs#L39-L167),
-[hello replacement](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/runtime.rs#L957-L1045).
+- `store/producers.rs::record_task_dispatch` and `record_warm_terminal`;
+- `store/tasks.rs::release`;
+- `runtime::outcome_with_artifacts`;
+- `modules/antigravity-rust/src/controller.rs::terminal_outcome`.
 
-`outcome_with_artifacts` first calls live `scope(check_link=true)`, checks retained
-receipt/dispatch facts, then searches exact prior outcome observations. That early
-branch can ACK an already committed outcome before `warm_stream::validate_outcome`.
-The previous blanket claim that every old-boot retry is rejected was too broad.
+Warm dispatch settlement updates the exact retained producer on its immutable Attempt.
+It deliberately does not require the Task to remain the current revision, so late
+terminal evidence for a revised Task can remain historical. Preserve this. It does
+require the Attempt to remain unreleased; normal release separately blocks unresolved
+Operations and unresolved producer dispositions. Do not “fix” recovery by allowing
+arbitrary producer mutation after release.
 
-A never-recorded terminal reaches the warm validator and fails when its origin boot
-is not the current binding boot. Ordinary outcome scope additionally rejects released
-bindings/stale links before duplicate lookup; page completion has a different narrow
-scope. A recovery path must address both layers rather than remove one comparison.
+The missing condition is output capture. A terminal producer disposition is enough for
+release even when the only complete response body still lives in adapter memory. For a
+terminal `agent.send`, Store retains the terminal on the source Operation and creates no
+new Attempt producer, so the same distinction is even clearer.
 
-`validate_registered_module_recovery_link` already checks an exact admitted reconcile
-and forbids a resolved summary before the target is terminal. Reuse this ordering.
-Do not inject new reconciliation fields into an immutable saved outcome merely to
-make a different byte sequence pass; delivery context and execution evidence differ.
+Target facts remain separate:
 
-Hello overwrites `previous_bridge_boot_id` on each accepted replacement. It is a
-one-hop recovery hint, not durable evidence of which boot executed every Operation.
-`next_internal` retains boot in the task-dispatch context, but no equivalent ordinary
-Send context is written in that inspected branch. Keep execution origin with the
-original Operation at dispatch, reusing existing fields; do not build a boot-chain
-proof registry. Legacy missing attribution remains unknown.
+```text
+native input admitted
+native execution terminal
+complete result bytes durably captured
+candidate submitted
+Task accepted
+```
 
-### AR-017 — recovery fences capture as well as execution
+Release may dispose execution ownership only after exact unresolved effects are handled;
+it must not silently destroy a pending complete-output obligation for Task-linked work.
 
-Source: [next selection](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/runtime.rs#L1260-L1405),
-[resume settlement](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/runtime.rs#L3423-L3440).
+### AR-021 — late completion works only if Result was already admitted
 
-The query requires either `recovery_required = false` or method Recover/Reconcile.
-It excludes Result before later `normalized_result_admitted` exceptions run. The
-closed-binding branch can find a queued sealed Result and still lose it at the same
-query. This is independent of AR-014's cancellation problem.
+Sources:
 
-For warm-stream input, recording terminal evidence does not establish that the old
-native session was resumed. The ordinary flag-clearing path requires an applied
-Recover confirming `native_session_resumed`; Antigravity capture must not depend on
-inventing that capability. Native readiness and local evidence delivery are separate.
+- `store/normalized_result.rs::admitted_origin` and
+  `validate_admitted_operation`;
+- `store/runtime.rs::admitted_result_scope`;
+- `store/tasks.rs::release`.
 
-Permit exact authorized capture/readback while native mutation stays fenced. Reuse
-existing page admission/registration/assembly; do not set ready just to read files,
-launch a replacement session, or require a human to export result pages. First-time
-historical page admission after supersession remains the next explicit source trace.
+`admitted_origin` requires the Task to be open at the Attempt revision, the Attempt to
+be current and unreleased, and the target to be the first normalized Dispatch producer.
+After that origin is sealed, page validation intentionally no longer requires current
+Task/binding lifecycle and exact pages can finish or replay. This is a good split, but
+it leaves no way to create the first capture Operation after revision/release.
 
-### AR-018 — supervisor recovery is not an outcome importer
+The compact replacement uses the immutable terminal source Operation:
 
-Sources: [supervisor handler](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/mod.rs),
-[source-intake helper](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/mod.rs#L1129-L1146),
-[adapter startup/Open](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/modules/antigravity-rust/src/main.rs#L47-L158).
+1. Task-linked terminal fact identifies source Operation, Task, Attempt, binding and
+   native result identity.
+2. `capture_once` derives the next missing bounded range and admits one ordinary
+   `agent.result` under historical completion authority.
+3. Historical authority grants only result bytes for that source; it cannot send input,
+   mutate the old Attempt or complete a newer Task revision.
+4. Existing `module.result`, page registration, replay, assembly and artifact grants
+   remain the only byte path.
 
-The supervisor method accepts no target or capture data. It calls
-`reconcile_module_recovery_journal_page`, which reconciles automation source intake
-and registered HookCommit events. It does not read terminal spool files, establish
-native outcome evidence or settle the target Operation. Its `reconciled:true` means
-that bounded intake pass ran, not that native work was recovered.
+No continuation registry or second result database is needed.
 
-Preserve adapter startup's existing positive boundary: hello and a Controller are
-created before any native process; `spawn_owned` occurs only in Open. Add capture
-loading/draining there and reuse ordinary Store result owners. Do not expand the
-supervisor event-intake RPC into another recovery product.
+### AR-022 — autonomous capture/readback is absent
 
-### AR-019 — completed readback versus unresolved target
+Sources:
 
-Sources: [Antigravity read_command](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/modules/antigravity-rust/src/controller.rs#L573-L672),
-[Store recovery-link validation](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/runtime.rs#L2470-L2600),
-[settlement](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/crates/swarm-kernel-host/src/store/runtime.rs#L3220-L3260).
+- `automation/actions.rs::AutomationStep` and `supported_action_for`;
+- Store automation source search for `agent.result` / `agent.reconcile`;
+- `Store::reconcile_automations_once`;
+- `doctor.rs` outcome-unknown recommendation;
+- `automation_intake` / `native.result.available`.
 
-Reconcile checks the in-memory pending target. When missing, it records an Unknown
-target; regardless of the lookup outcome it records the Reconcile Operation itself
-as Unknown with `native_history_unavailable`. Store persists that as `outcome_unknown`.
-A completed local inspection has therefore been confused with an interrupted request.
-This is a source-confirmed classification gap, not a demonstrated infinite retry loop.
+Current automatic domains cover work/review/repair/acceptance/publication/check/GitHub/
+Goal/script, but none owns result-page creation or uncertain native-effect readback.
+`native.result.available` is emitted only after a page was already registered, so it
+cannot trigger the first page. Doctor is read-only and tells a caller to issue
+`agent.reconcile`; this is diagnosis, not autonomous recovery.
 
-The existing batch/Zed readback path already separates an applied readback summary
-from `resolved:false`. Use that semantic pattern: record/replay target evidence first;
-settle completed lookup with resolved true/false; keep the original target unknown
-when evidence is missing. Infrastructure failure remains separate. Preserve bounded
-policy and exact target identity; a resolved readback never accepts a Task or grants
-new execution. Do not create a second recovery-state machine.
+Add no optional `ResultCapture` workflow step. Result preservation and uncertain-effect
+readback are correctness obligations of the existing host loop:
 
-## Earlier findings retained
+```text
+capture_once:
+  terminal attributable source without complete Store coverage
+  -> derive first missing range from current pages
+  -> admit one deterministic agent.result
+  -> repeat only after settled page readback
+  -> assemble/submit only when selected policy requires it
 
-Detailed prior traces are preserved in repository history:
+reconcile_once:
+  unresolved target with declared exact readback and no active reconcile child
+  -> admit one deterministic agent.reconcile
+  -> complete lookup as resolved:true or resolved:false
+  -> retry only after source epoch/cursor change or bounded due time
+```
 
-- [result retention and control-link failure at `c3e331a`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c3e331a37ef58b3b98f7859bfb9e40935501e106/docs/agent-operations/audit-register.md);
-- [continuation results and assembly at `70b99db3`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/70b99db3d8732d10a69d03d1dbe83afdd39a7229/docs/agent-operations/audit-register.md);
-- [continuation attribution and repair readback at `1c61629b`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/1c61629b49e8d6b9763dc7f5be32a0135509d7e3/docs/agent-operations/audit-register.md).
+A complete inconclusive lookup settles its own Operation and leaves the target unknown.
+One target has at most one active capture range and one active readback. Unrelated work
+continues. The loop queries current state; it stores no copied pending subjects/cursors.
 
-Those pages are evidence, not additional implementation programs. AR-001–AR-015 stay
-open/preserved as classified above; AR-016's first-import finding remains open with
-its duplicate-ACK claim corrected in this pass.
+### AR-023 — supervisor readback is custody, not semantic recovery
+
+Sources:
+
+- `store/module_demand.rs::scoped_operation_readback` and
+  `startup_recovery_projection`;
+- `swarm-supervisor::SupervisorRegistry::apply_operation_readback` and
+  `Service::apply_readback`;
+- `modules/antigravity-rust/src/main.rs::controller_from_hello`.
+
+The Store projection contains bounded status-only unresolved IDs. Supervisor replaces
+its unknown-ID set, clears/retains lifecycle readback gates and may keep a worker runner
+attached. It has no inputs, result bytes or authority to settle an Operation.
+Antigravity hello currently constructs a fresh in-memory Controller from binding/root
+identity and does not restore those unresolved records into result/outcome delivery.
+
+Preserve supervisor process custody and demand. Do not turn it into a universal result
+importer. Adapter startup loads its private complete captures; Store owns historical
+settlement and page admission; the host correctness loop owns current-state scheduling.
+
+### AR-024 — ACKed page coverage is not retained
+
+Sources:
+
+- Antigravity `main.rs` `agent.result` branch;
+- `store/results.rs::record`;
+- Antigravity `stream.rs::retain_response`;
+- Antigravity Controller completed-turn retention.
+
+Store registers one immutable page and returns `recorded:true` plus its artifact ref.
+The adapter knows that page's source, offset, byte length and total from the exact
+request it built, but currently discards the ACK after checking `recorded`. No method
+records acknowledged ranges or removes the source body after full capture. The only
+normal deletion is the 32-entry eviction; oversized/truncated bodies are dropped.
+
+The minimal local record is per retained source body:
+
+```text
+source Operation / body digest / total bytes
++ union of exact Store-ACKed [offset,end) ranges
+```
+
+ACK replay is idempotent. Release the body only when the union covers `[0,total)` or an
+explicit retention policy disposes it. EOF without earlier ranges is insufficient.
+Assembly is optional after complete page coverage; its existing verifier remains the
+canonical whole-artifact path. Persist the coverage with the body in A2 so restart does
+not forget which bytes Store accepted. This is not a transcript or general journal.
+
+## Preserved boundaries from this pass
+
+- Late terminal evidence may remain attached to the immutable old Attempt while it is
+  unreleased; it must never complete the new Task revision.
+- Release must continue blocking unresolved native effects and producers.
+- Already-admitted normalized pages remain finishable through their narrow completion
+  authority and exact replay ACK.
+- Supervisor status readback remains bounded and payload-free.
+- Page publication/registration and assembly remain the Store byte authority.
 
 ## Inspection log for this pass
 
 | Source | Inspected portion |
 | --- | --- |
-| `AGENTS.md`, audit register, module API | Current task/ownership instructions, checkpoint and target delivery contract. |
-| `implementation.md` | Retained behavior, owners and A0–A3; the program is not a claim of landed A2. |
-| `store/runtime.rs` | Hello replacement; recovery queue predicate; dispatch-origin storage; typed receipt, recovery-link, duplicate and terminal outcome ordering/settlement. |
-| `runtime/warm_stream.rs` | Complete production terminal validator and its current-boot check; test source not executed. |
-| `store/mod.rs` | Supervisor recovery routing and source-intake helper, not a reread of the entire Store. |
-| `swarm-supervisor/control.rs` | Supervisor recovery method/DTO boundary; no native capture importer established. |
-| Antigravity `main.rs` | Startup through native Open and Dispatch; no spawn at constructor/hello. |
-| Antigravity `controller.rs` | Completed body lookup and full Refresh/Reconcile read_command path. |
-| Prior task/release and module credential sources | Inherited at unchanged source revision, not relabeled as newly inspected. |
+| `store/producers.rs` | normalized dispatch producer creation, terminal update and release guards. |
+| `store/tasks.rs` | release unresolved checks and broad queued-operation cancellation. |
+| `store/normalized_result.rs` | current admission versus immutable admitted-page validation. |
+| `store/runtime.rs` | ordinary/admitted result scopes and outcome settlement ordering. |
+| `store/results.rs` | page registration, replay ACK, result event and next-offset receipt. |
+| `automation/actions.rs` | all configured automatic steps and supported actions. |
+| Store automation sources | no `agent.result` or `agent.reconcile` action consumer. |
+| `doctor.rs` | read-only manual reconciliation recommendation. |
+| `store/module_demand.rs` | unresolved status projection and startup recovery DTO. |
+| `swarm-supervisor/supervisor.rs` | status-only operation readback application. |
+| Antigravity `main.rs` | fresh Controller startup, result-page send/ACK handling. |
+| Antigravity `controller.rs` / `stream.rs` | completed-turn/body ownership and count eviction. |
 
 ## Remaining coverage map
 
 | Area | Next unclosed boundary |
 | --- | --- |
-| Antigravity A | Original-Operation producer settlement after supersession; historical page admission and automatic capture. Implement/qualify AR-001/002/004/006/010/016/017/019. |
+| Antigravity A | Implement/verify AR-001/002/004/006/010/016/017/019/021/024 and delete proof packet after positive path works. |
+| Cross-adapter result delivery | Compare Codex/OpenCode/Command/Muse/Claude ACK, body lifetime, restart and release; extract only proven shared code. |
 | Queue/routes/provider/capacity B | Root reservation, fairness and shared-account source scope. |
 | Workspace/process C–D | Shared worktree release, PID reuse and exact successor custody. |
-| Scheduler/Goals E | Due occurrence dedupe, drain and no-progress across selected routes. |
-| TaskPacket/review F–G | Frozen evidence plan, reviewer replacement, all-findings correction and common acceptance gate. |
-| Permissions H | Retained public actions and exact object authorizers, including explicit taskless Send and historical completion. |
+| Scheduler/Goals E | One correctness loop plus policy actions; due dedupe and drain. |
+| TaskPacket/review F–G | Frozen evidence plan, reviewer replacement, all-findings correction and common acceptance. |
+| Permissions H | Historical result completion and explicit taskless Send object authority. |
 | Store formats I | Reader/writer pairs, numeric migration and partial-upgrade/corruption cases. |
 | IPC/MCP J | Slow consumers, disconnect, replay/live boundary and writer occupancy. |
-| Check/Script/Forge/GitHub K | Exact effect owner, ambiguous response and readback for each write. |
-| Other adapters M–Q | Selected installed contract, result/restart path and one-executor deletion per route. |
-| Governor R | Provider-local/OS/Git source join and unbound inventory. |
+| Check/Script/Forge/GitHub K | Exact effect owner and ambiguous-write readback. |
+| Other adapters M–Q | Selected installed contract, one executor and connected result/restart path. |
+| Governor R | Provider/OS/Git source join and unbound inventory. |
 | Deletions S | Positive replacement and unsettled-data disposition for every removed product. |
 | Mailbox/GitHub/gateway T–V | Scoped recipient/read, external write recovery and remote limits. |
 | Installed/Windows/load | Separate unexecuted qualification; not a substitute for source audit. |
 
-## Checkpoint discipline
+## Earlier detailed traces
+
+- [result retention/control failure at `c3e331a`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c3e331a37ef58b3b98f7859bfb9e40935501e106/docs/agent-operations/audit-register.md)
+- [continuation result/assembly at `70b99db3`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/70b99db3d8732d10a69d03d1dbe83afdd39a7229/docs/agent-operations/audit-register.md)
+- [continuation attribution/repair at `1c61629b`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/1c61629b49e8d6b9763dc7f5be32a0135509d7e3/docs/agent-operations/audit-register.md)
+- [revision/release/old-boot at `ec019052`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/docs/agent-operations/audit-register.md)
+- [successor delivery/readback at `f5ccc418`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/f5ccc418ba401733d1f778619abeec5c0554416b/docs/agent-operations/audit-register.md)
 
 A finding remains open until a runtime change and exact evidence are linked. A docs
-commit is not a repair. Keep refuted claims and preserved behavior so a later agent
-does not rebuild the same bureaucracy or delete a useful boundary. Resume with the
-historical producer/capture chain above; update this register and the owning target
-contract together.
+commit is not a repair. Preserve refuted claims and useful mechanisms so later agents
+do not rebuild the same bureaucracy or delete a working boundary.
