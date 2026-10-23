@@ -1,171 +1,201 @@
 # Audit register
 
-Durable resume point for the source audit. It records the inspected commit, exact
-paths, confirmed/refuted findings, preserved mechanisms and the next untraced chain.
-It is not another runtime registry, implementation queue or approval gate.
-[Implementation](implementation.md) remains the work order;
+Durable source-audit resume point: inspected commit, paths, confirmed/refuted findings,
+useful mechanisms and untraced boundaries. Not a runtime registry, approval gate or
+second implementation queue. [Implementation](implementation.md) owns the work order;
 [status](../implementation-status.md) records landed behavior.
 
 ## Resume here
 
-- Pass: **2026-10-23 / cross-adapter result source and Store-delivery ownership**.
-- Inspected runtime head: **`ac3389c013840b02a78dc310bcee481d24086402`**.
-- Overall audit: **incomplete**. No measured completeness percentage is claimed.
-- Newly traced: selected Claude, Codex, OpenCode, Command and Muse result sources,
-  pre-IPC page retention, ACK replay, restart behavior and source release.
-- New findings: **AR-025–AR-031**. AR-006 is broadened beyond Antigravity; AR-024 is
-  corrected: an adapter-local ACK-range ledger would duplicate Store coverage and is
-  removed from the target.
-- **Next exact chain:** current root/session replacement and historical result reads in
-  Codex, OpenCode, Muse and Claude; then Store object authorization for a first
-  historical `agent.result` and the exact `capture_once` query. After that continue
-  with queue/root capacity B rather than another result framework.
-- This pass changes documentation only. No runtime code, Clippy, tests, installed
-  harness or independent verifier ran. Source tests are not new executed evidence.
+- Pass: **2026-10-23 / historical source reads, capture cost and object authority**.
+- Inspected head: **`9c47d88a09a543e9f0ea74228370833f14a6c619`**. The comparison from
+  `f5ccc418` contains two documentation-only commits; earlier runtime findings are not
+  repaired by that interval.
+- Overall audit: **incomplete**. No measured completeness percentage.
+- Read selected Codex/Claude/OpenCode/Muse result readers, root/family guards, Store
+  normalized-origin admission, retained object grants and the base Operation/artifact
+  schema. Rechecked original specification sections 6–8 for bounded I/O, fair progress,
+  drain and no native start during readback.
+- Added **AR-032–AR-035**. Historical reading is not permission to remove root checks.
+  The target now distinguishes source lookup, bounded byte reading and exact page
+  delivery; a temporary selected-result file is not a transcript mirror.
+- **Next exact chain: queue/root capacity B.** Trace
+  `capacity::root_claims_for_route` -> launcher route admission/reservation ->
+  `automation_work_dispatch::reconcile` -> `runtime::next_internal`, including two
+  concurrent launch admissions, one root represented by several Operations, quota hold,
+  release and blocked first-page candidates. Check the actual caller/transaction before
+  declaring a double count, race or starvation defect.
+- Remaining result boundaries: reachable cross-root/account transitions, first historical
+  capture grant across revocation/handover, source discovery for every retained route,
+  coverage query indexes and live restart/power-loss behavior. This pass does not close
+  those by deleting a guard or drawing a new schema.
+- Documentation only. No runtime change, Clippy, test, installed harness, benchmark or
+  independent verifier ran. Source evidence is not executed qualification.
 
-On resume compare changed source paths with this head. Recheck changed callers and
-consumers, not the whole archive. Update this register and the owning contract together.
-An interrupted chat does not clear findings or make inherited claims current.
+On resume compare source changes with this head and revisit changed callers/consumers.
+Keep findings until repaired with connected evidence. A search hit or a read test is
+not a completed runtime check.
 
 ## Evidence labels
 
-- **source-confirmed**: named path read; consequence follows; not live reproduction.
-- **preserve**: useful current behavior, not a deletion target.
-- **partial**: exact untraced boundary named.
-- **inherited**: earlier source evidence not rechecked in this pass.
-
-Source review, implementation and executed verification remain separate.
+**Source-confirmed** means the named path was read and supports the stated consequence,
+not live reproduction. **Preserve** means useful existing behavior. **Partial** names
+an untraced boundary; **inherited** means earlier evidence not reread in this pass.
+Review, implementation and executed verification are separate.
 
 ## Findings and coverage
 
 | ID | Requirement / path | Disposition | Remaining boundary |
 | --- | --- | --- | --- |
-| AR-001 | Antigravity report failure → native shutdown | **Open defect.** Report retry runs in the terminal reducer; failure reaches stdin shutdown and drained facts can stay memory-only. | Independent Store delivery and continuous native draining. |
-| AR-002 | Complete result retention | **Open defect.** Antigravity's 32-response cache can evict the only uncollected body. | Durable body/source lifetime and admission pressure. |
-| AR-003 | Exact result identity | **Preserve.** Operation/receipt/conversation/generation checks and explicit unavailable oversized output. | Keep causal identity while deleting package-proof copies. |
-| AR-004 | Adapter restart without native replay | **Open defect.** New Antigravity Controller has empty body/delivery caches. | Original-Operation successor delivery. |
-| AR-005 | Previously admitted page completion | **Preserve.** Sealed normalized origin permits narrow late completion and replay ACK. | First historical admission and partial storage. |
-| AR-006 | Complete continuation result | **Open defect, now cross-route.** Store generic origin and selected Antigravity, Claude, Codex and OpenCode normalized-result paths remain initial-Dispatch-centric. Muse can address a native item, but Store admission is still narrower. | One source-Operation path for attributable `agent.send`; taskless input stays distinct. |
-| AR-007 | Assembly and artifact reads | **Preserve.** Publish/register separation, contiguous coverage, digest checks and Bytes authorization. | Crash/power-loss and remaining grant/cache races. |
-| AR-008 | Authentication versus admitted completion | **Preserve boundary.** Disabled credentials fail new handshake; an authenticated carrier has narrow prior-page completion. | Revocation and successor delivery. |
-| AR-009 | Continuation Task/Attempt attribution | **Mixed.** Selected Manager, Repair and Goal paths retain scope; binding-only input may be intentionally taskless. | Explicit task-linked versus taskless authority. |
-| AR-010 | Repair delivery readback | **Open defect.** Reader requires provider-specific input ID/condition and treats every Rejected/Cancelled as no effect. | Common admission/terminal facts. |
-| AR-011 | Correction submission | **Preserve.** Same unreleased `needs_correction` Attempt can resubmit; stale publication remains historical. | Continuation origin through candidate validators. |
-| AR-012 | Task revision fences input | **Open defect.** Revision preserves old Attempt; direct Send can become accidentally taskless or dispatch without current-revision recheck. | Supersede unsent old-revision effects and recheck exact Task/Attempt. |
-| AR-013 | GM disposes superseded work | **Open defect.** Current GM can revise beneath another owner but then cannot release the old Attempt. | Scoped historical cleanup authority without owner rewrite. |
-| AR-014 | Release preserves result capture | **Open defect.** Release cancels queued `agent.result` with every non-check Operation. | Cancellation by effect semantics. |
-| AR-015 | Module credential on restart | **Preserve.** Binding-scoped credential is reused; implicit rotation is forbidden. | Live restart/revocation qualification. |
-| AR-016 | Old-boot first delivery | **Open defect.** Unseen old-boot terminal fails current-boot validation; exact already-committed outcome may replay-ACK. | Execution origin distinct from delivery actor. |
-| AR-017 | Capture while execution is recovery-fenced | **Open defect.** `recovery_required` filters sealed Result before completion-only exception. | Permit exact completion/readback without session readiness. |
-| AR-018 | Supervisor recovery meaning | **Preserve/correction.** Supervisor recovery reconciles automation/Hook intake and process demand, not native bytes. | Keep import in adapter/Store owners. |
-| AR-019 | Complete inconclusive readback | **Open defect.** Antigravity Reconcile reports the lookup itself Unknown after completed inconclusive inspection. | Applied lookup with `resolved:false`; target remains unknown. |
-| AR-020 | Terminal evidence versus release | **Boundary.** Late terminal may update immutable unreleased old Attempt; terminal alone does not prove body capture. | Complete-output obligation without weakening producer fences. |
-| AR-021 | First historical result admission | **Open defect.** New normalized Result requires current open unreleased Task/Attempt; only a previously admitted Result can finish later. | Historical source-Operation completion authority. |
-| AR-022 | Automatic Result/Reconcile owner | **Open defect.** Current automatic consumers create neither Result nor Reconcile; Doctor only recommends a command. | Bounded `capture_once` / `reconcile_once` current-state loop. |
-| AR-023 | Supervisor operation readback | **Scope correction.** It carries unresolved IDs/status only; it does not settle targets. | Store/adapter semantic recovery. |
-| AR-024 | Antigravity page ACK/source release | **Open defect, target corrected.** Adapter checks only `recorded:true` and has no complete-source release. A local range union would duplicate Store state and is rejected. | Store-authoritative `coverage_complete` / next missing range in exact replay-safe ACK. |
-| AR-025 | Result sources are heterogeneous | **Source-confirmed design boundary.** Local body/file, provider history and provider output-ref sources have different recovery/lifetime semantics. | Share Store delivery only; keep source reader adapter-local. |
-| AR-026 | Claude result delivery | **Open defect.** Selected Rust adapter persists result intent, but not exact page bytes before `module.result`; ambiguous ACK is settled Unknown and replay is explicitly refused on same/replacement boot. | Persist ready exact page before IPC; replay only Store delivery, never SDK execution. |
-| AR-027 | Codex result delivery | **Preserve donor plus gap.** Exact full `module.result` params are persisted before IPC and replayed after restart. Provider history remains source. Result read requires current root and initial Dispatch. | Keep exact delivery; remove full-snapshot/tombstone machinery and current-root-only historical gate. |
-| AR-028 | OpenCode result delivery/retention | **Preserve donor plus defects.** Exact page params are journaled and replayed; exact assistant parent is verified. Input Operations marked `result_source` are excluded from reclamation with no release transition; normalized result targets Dispatch only. | Coverage-driven source release and continuation result; delete retention graph/full journal. |
-| AR-029 | Command result release | **Preserve donor plus overengineering.** Exact page is saved, ACKed and removable. Source-file release is wrapped in public/private release-evidence Operation, tombstones and cleanup markers. | Release local source from Store-complete coverage; delete proof protocol. |
-| AR-030 | Muse Node result source | **Preserve donor.** On-demand exact item/revision/cursor/output-ref read, bounded range and digest validation; ready page/outcome checkpointed for retry. | Capture promptly before provider retention disappears; no transcript mirror. |
-| AR-031 | Page coverage owner | **Source-confirmed correction to target.** Store already owns immutable pages and per-page `next_offset_bytes`; immediate ACK exposes only recorded/artifact ref. Adapter-local ACK-range state would duplicate authority. | Store returns authoritative complete/next-missing coverage on exact ACK/replay; adapter retains source until complete. |
+| AR-001 | Antigravity reporting versus native execution | **Open.** Report retries block the terminal reducer; failure reaches stdin shutdown and drained facts can remain memory-only. | Independent Store delivery and continuous native draining. |
+| AR-002 | Complete result retention | **Open.** The 32-response cache can evict the only uncollected body. | Durable source lifetime and pressure before new admission. |
+| AR-003 | Exact result identity | **Preserve.** Operation/conversation/generation and unavailable oversized-output semantics. | Keep causality while deleting package-proof copies. |
+| AR-004 | Adapter restart | **Open.** New Antigravity Controller has empty body/delivery caches. | Original-Operation successor delivery, no prompt replay. |
+| AR-005 | Admitted page completion | **Preserve.** Sealed normalized origin permits narrow late completion and exact replay ACK. | First historical admission and partial storage. |
+| AR-006 | Continuation output | **Open, cross-route.** Generic origin and selected adapters remain Dispatch-centric; Muse item addressing does not repair Store admission. | Same source-Operation/page/candidate path for attributable Send. |
+| AR-007 | Assembly and byte reads | **Preserve.** Publication/registration, contiguous coverage, digests and object grants. | Crash/power-loss and remaining grant/cache races. |
+| AR-008 | Authentication versus completion | **Preserve boundary.** Disabled credentials fail new handshake; an authenticated carrier has narrow prior-page completion. | Revocation and successor delivery. |
+| AR-009 | Send attribution | **Mixed.** Selected Manager/Repair/Goal paths retain Operation scope; session-only input can be taskless. | Explicit task-linked versus taskless authority. |
+| AR-010 | Repair delivery classification | **Open.** Requires provider-specific ID/condition and maps every Rejected/Cancelled to no effect. | Common admission/terminal facts; executed failure is not non-delivery. |
+| AR-011 | Same-Attempt correction | **Preserve.** `needs_correction` can resubmit against expected revision/prior submission; stale publication stays historical. | Continuation origin through candidate validation. |
+| AR-012 | Revision fences input | **Open.** Old Attempt survives revision; direct Send can become accidentally taskless or dispatch without revision recheck. | Supersede unsent old work and check exact subject before effect. |
+| AR-013 | GM cleanup of old work | **Open.** Current GM can revise beneath another owner but then cannot release that superseded Attempt. | Historical cleanup authority without rewriting owner. |
+| AR-014 | Release preserves capture | **Open.** Release cancels queued Result together with non-check Operations. | Cancel by effect semantics, not broad method exclusion. |
+| AR-015 | Restart credential | **Preserve.** Stable binding-scoped credential; no implicit token rotation. | Live restart/revocation. |
+| AR-016 | Old-boot first delivery | **Open.** Unseen old-boot terminal fails current-boot validation; identical committed outcome may replay-ACK. | Execution origin distinct from delivery actor. |
+| AR-017 | Recovery-fenced capture | **Open.** Recovery predicate filters Result before completion-only exception. | Exact completion/readback without native readiness. |
+| AR-018 | Supervisor recovery | **Scope correction.** Intake/process-demand recovery is not native-byte import. | Keep import in adapter/Store owners. |
+| AR-019 | Inconclusive lookup completion | **Open.** Antigravity labels a completed inconclusive Reconcile itself Unknown. | Applied lookup with `resolved:false`; target still unknown. |
+| AR-020 | Terminal versus release | **Boundary.** Late terminal can update an immutable unreleased old Attempt; terminal does not prove capture. | Preserve output obligation and producer fences. |
+| AR-021 | First historical Result | **Open.** New normalized admission requires current open unreleased Task/Attempt. | Source-scoped completion admission; retain sealed late-page path. |
+| AR-022 | Automatic capture/readback | **Open.** Current automatic consumers do not create Result/Reconcile; Doctor recommends only. | Bounded current-state helpers through ordinary commands. |
+| AR-023 | Supervisor readback | **Scope correction.** Unresolved IDs/status do not settle targets. | Store/adapter semantic recovery. |
+| AR-024 | Page ACK and source release | **Open; target corrected.** Boolean ACK is insufficient. An adapter-local ACK-range ledger would duplicate Store. | Store-authoritative complete/next-missing coverage. |
+| AR-025 | Heterogeneous sources | **Boundary.** Local body/file and provider locator have different lifetimes. | Share ready-record delivery, not source journal. |
+| AR-026 | Claude ready-page loss | **Open.** Intent is journaled but ready page bytes are not; ambiguous ACK becomes Unknown and replay is refused. | Persist exact ready page; never replay SDK execution. |
+| AR-027 | Codex delivery | **Preserve plus gaps.** Exact page params survive restart; new reads are Dispatch/current-root dependent. | Keep delivery, remove full checkpoint/tombstones; AR-032/033 qualify source reading. |
+| AR-028 | OpenCode retention | **Preserve plus gaps.** Exact page replay and assistant parent; permanent `result_source` and Dispatch-only target. | Coverage-driven release, no retention graph. |
+| AR-029 | Command release | **Preserve plus excess.** Exact saved page works; source cleanup has release-proof Operations/tombstones. | Store-complete coverage then local cleanup. |
+| AR-030 | Muse source read | **Preserve plus qualification.** Exact item/revision/output ref and native range validation; ready page checkpoint. | AR-034 identifies unbounded repeated discovery; not all native reads are bounded. |
+| AR-031 | Coverage owner | **Target correction.** Store owns pages; per-page next offset is not aggregate source completeness. | Exact coverage ACK/replay; no local range union. |
+| AR-032 | Historical source versus active session | **Source-confirmed boundary, not a universal reachable root-swap bug.** Codex/Claude compare active root; OpenCode fixes root per binding generation; Muse requires observed family membership. | Source-authorized reader with original service/account scope; retain custody checks and prove actual transition cases. |
+| AR-033 | Codex per-page read amplification | **Open efficiency defect.** Each new page rereads thread/history/turn/full final body, then slices at most 24 KiB. Exact saved-page replay bypasses this. | Native range read or one bounded selected-result materialization; measure later. |
+| AR-034 | Muse discovery budget | **Open boundedness defect.** Each result range calls `readItem`; its backward walk has cycle detection but no total page/byte/time budget. | Bounded resumable discovery; reuse exact item/ref instead of repeating the scan. |
+| AR-035 | Historical capture and disclosure grants | **Preserve plus target clarification.** Receipt, Bytes and Assemble grants differ; exact result caller is capped at Bytes, historical reviewer gets no new bytes. | Derive first historical capture under current scoped authority; capture cannot create a new grant or widen assembly rights. |
 
-## Current pass: route matrix
+## Current pass evidence
 
-| Route | Native/result source | Exact Store-delivery behavior | Keep | Delete / repair |
-| --- | --- | --- | --- | --- |
-| Antigravity | Boot-local serialized response body; no history API | Outcome memory queue; result page not durable; ACK only boolean | Sequential Operation/body identity | Memory-only body, count eviction, no complete-source ACK, report failure changing native lifecycle |
-| Claude Rust | Boot-local SDK result frame/body in `NativeControl` | Result intent journaled; page bytes sent directly; ambiguous ACK becomes Unknown and replay is refused | Exact SDK frame/input/digest validation; Applied `resolved:false` Reconcile pattern | Persist ready page; remove result-intent-without-bytes dead end and dispatch-only target |
-| Codex Rust | App-server thread/turn/final assistant history | Exact full `module.result` params persisted before IPC and replayed after restart | This exact Store-delivery pattern; exact user/turn/final assistant read | Full checkpoint/tombstones; current-root-only historical gate; dispatch-only result |
-| OpenCode standalone | Provider session/message history with exact assistant parent edge | Exact page params/outbox persisted, ACKed and replayed | Exact delivery, native input ID, parent edge, Applied `resolved:false` Reconcile | Permanent `result_source`, full journal/retention graph, dispatch-only normalized result |
-| Muse Node | Provider `view/page` and `item/readOutput` using item revision/cursor/output ref | Checkpointed outcome/page retried exactly after reconnect/restart | Provider locator, bounded range/digest checks, exact ready page delivery | Broad checkpoint copies and proof duplication; do not snapshot transcript |
-| Command | Local captured output files | Exact saved page → Store ACK → delete | Local source file and exact ready-page delivery | Release-evidence method, tombstones, cleanup/proof state machine |
+All paths below were read at the inspected head unless a historical revision is named.
+These are selected connected portions, not whole-file coverage claims.
 
-The sources cannot share one journal format. A local body needs durable bytes; a
-provider-history source needs a stable locator and honest expiry/gap; a captured file
-needs path custody. Translating them into one schema would recreate the current tumor.
+### AR-032 — do not remove identity checks to repair historical reading
 
-## Minimal common boundary
+- `swarm-adapter-codex/src/lib.rs::build_normalized_result_page` checks saved input/turn,
+  current root, service scope, workspace and current requested/effective model facts.
+- `swarm-adapter-opencode/src/lib.rs::handle_assistant_result` requires the selected
+  session to match the command root and original input. `set_root_hint` / `verify_hello`
+  enforce a deterministic binding-generation root. That is a custody boundary, not
+  evidence of an arbitrary root replacement bug.
+- `modules/muse/bridge.mjs` invokes `readResult` only for root/observed children.
+- `swarm-adapter-claude/src/lib.rs::handle_result` requires the current SDK session and
+  reads `NativeControl::result_for_operation`; a new process starts with empty control
+  state. Removing the root comparison cannot recreate missing bytes.
 
-Only these mechanics qualify for shared extraction after two routes delete their old
-loops:
+Separate the immutable source locator from the currently active executor. A historical
+reader must still use an authorized provider/service/account/workspace and the original
+Operation/binding/native output. Never route an old page through an unrelated new
+binding, call Open/Resume to make a read pass, or accept a caller-supplied arbitrary
+session. Saved ready pages remain Store deliveries independent of this discovery path.
+Reachability of every root/account transition is still unqualified.
 
-```text
-StoreDelivery
-  method = module.outcome | module.result
-  immutable delivery key/digest
-  exact serialized params (including ready page bytes)
-  binding/generation + origin Operation/boot metadata needed by Store
-  atomic publish before IPC
-  resend identical params until exact Store ACK
-  remove after ACK; if removal durability is unknown, safe replay remains
-```
+### AR-033 — bounded page output can hide repeated full reads
 
-No persistent ACK tombstone is required. If Store committed but the process crashed
-before local deletion, resending identical params must return replay ACK. Conflicting
-params fail.
+[Codex reader](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/9c47d88a09a543e9f0ea74228370833f14a6c619/crates/swarm-adapter-codex/src/lib.rs#L6341-L6742):
+`read_thread`, `read_history`, `read_turn`, then `read_final_assistant_response` precede
+byte slicing and full-body hashing on each new page Operation. If the body has B bytes
+and requires P pages, the selected body is materialized approximately P times, in
+addition to history work. This is a source-level cost observation, not measured latency.
+The earlier command handler reuses a saved pending page; transport retry is not the cause.
 
-`ResultSource` remains adapter-local:
+Use a real native range API when available. Otherwise materialize only the selected
+immutable final output once, page that private body with existing file primitives, and
+release it after Store coverage. This temporary source is not a conversation replica,
+generic cache service or new journal. Keep identity/hash checks on actual output bytes.
 
-- durable local body/file; or
-- provider locator + native identity/cursor/digest/coverage; or
-- explicit unavailable/expired gap.
+### AR-034 — one-page memory is not a bounded history lookup
 
-Store is the page-coverage authority. `module.result` ACK/replay should return the
-registered artifact plus either complete coverage or the next missing range for the
-same source identity. The adapter does not maintain a second union of ACKed ranges.
-It retains local source bytes/locator until Store reports complete coverage or explicit
-policy disposes them.
+[Muse reader](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/9c47d88a09a543e9f0ea74228370833f14a6c619/modules/muse/results.mjs):
+`readItem` loops backward with `limit:100`, a cycle-detection Set and exact item/revision
+matching. It has no aggregate page/byte/elapsed-work bound. `readResult` calls it before
+every range, including output-ref reads that subsequently use native `item/readOutput`.
+A long missing-item lookup can traverse the whole available history; unique cursors also
+keep growing the Set. Other Muse recovery limits do not bound this helper.
 
-Observation remains one replaceable latest checkpoint per source. Native intent and
-native effect recovery remain adapter-specific.
+Retain the useful native range/digest checks and refusal to fetch arbitrary URI/path.
+Separate bounded locator discovery from byte reading. A budget stop retains the exact
+continuation cursor in the existing source/read action and reports partial coverage,
+not absence or success. Reuse the located item revision/ref on following pages. Do not
+mirror events or repeatedly restart at the newest page.
 
-## Why the existing journals are anti-donors
+### AR-035 — preserve object grants instead of borrowing execution authority
 
-- **OpenCode:** full operation journals, reverse-reference graph, address memos,
-  startup census, retention cursor and permanently pinned result sources.
-- **Codex:** large full checkpoint, per-operation pending page/ACK/tombstone state and
-  route/session state in one file.
-- **Command:** output capture, Store page delivery and release-proof cleanup combined.
-- **Claude:** effect journal records result intent but omits the ready page bytes that
-  actually need exact retry.
-- **Antigravity:** simple but memory-only and coupled to the native event loop.
+Read `store/object_scope.rs::identity_for_attempt`, `current_manager_task_basis`,
+`resolve_task_read`, `artifact_level_for_relation`, `exact_operation_artifact_grant`,
+`native_source_grant` and `resolve_assembly_sources`.
 
-Do not generalize any one of these. Extract exact Store delivery only after the first
-vertical route proves the boundary and a second current route deletes its duplicate.
+The retained Attempt supplies frozen revision/binding identity. Current Manager/GM
+Task/project relations and exact result/input callers are separate positive read bases.
+Exact-caller artifact access is capped at Bytes; it does not alone authorize Assemble.
+Historical reviewer receipt rights do not reopen candidate bytes. Module credentials
+cannot inspect arbitrary artifacts. Assembly intersects the source-page grants.
 
-## Inspection log for this pass
+Reuse these identity and policy owners for first historical Result admission, without
+requiring the old Task to be current and without treating Operation receipt visibility
+as a byte grant. The missing capture authorization remains a scoped Store action, not
+an invented Operator principal or a new permission registry. New native work still
+requires current Task/Attempt authority. Capture/submission/acceptance stay separate.
 
-| Source | Inspected portion |
+## Capture-query contract clarified, not implemented
+
+The base schema has authoritative Operations, Attempts, artifacts and observations;
+it has no complete-capture flag that this pass can honestly query as implemented.
+[Module API](module-api.md#current-state-correctness-loop) specifies the next action as
+one current-state projection: exact output-ready source, missing coverage, no active
+same-source read, current capture authority and due retry. Reserve an ordinary Result
+in the existing mutation transaction, then perform provider/file I/O outside Store.
+
+Two important gaps are explicit: the first page may require adapter-local exact-output
+locator discovery, and a completed failed read cannot be retried forever under the same
+immutable rejected request key. These are read attempts, not native prompt retries.
+No capture queue, copied Task state or adapter ACK-range ledger is introduced.
+
+## Inspection and preservation limits
+
+| Source | Read boundary |
 | --- | --- |
-| `crates/swarm-adapter-claude/src/lib.rs` | result intent, SDK body lookup, direct page send, ACK ambiguity/replay refusal, Reconcile outcome. |
-| `crates/swarm-adapter-codex/src/lib.rs` | provider-history result build, pending page checkpoint, ACK/tombstone and current-root check. |
-| `crates/swarm-adapter-opencode/src/lib.rs` | exact result intent/page/outbox, assistant parent validation, restart replay and Reconcile. |
-| `crates/swarm-adapter-opencode/src/journal.rs` / `journal/retention.rs` | result-source marking, reclamation eligibility and retention graph. |
-| `crates/swarm-adapter-command/src/journal.rs` / adapter result path | saved page, exact ACK and release-evidence cleanup. |
-| `modules/muse/results.mjs` / `bridge.mjs` | on-demand provider read, range/digest checks, checkpointed result delivery. |
-| `store/results.rs::record` | page Operation settlement, replay ACK, `next_offset_bytes`; immediate ACK lacks aggregate coverage. |
+| `store/normalized_result.rs` | descriptor checks, live first admission and retained result validation entry. |
+| `store/object_scope.rs` | retained identity, Manager/GM/participant/reviewer grants, exact callers, Bytes/Assemble distinction and source intersection. |
+| `swarm-adapter-codex/src/lib.rs` | saved-page command short circuit; normalized body lookup, current-root/config checks, history reads and byte slicing. |
+| `swarm-adapter-opencode/src/lib.rs` | exact assistant selector/input/parent, root hint, route and hello validation. |
+| `swarm-adapter-claude/src/lib.rs` | startup empty NativeControl, selected current-session result lookup, body/page publication. |
+| `modules/muse/results.mjs` / selected `bridge.mjs` caller | exact revision search, family-membership predicate, range and output-ref validation. |
+| `migrations/001_core.sql` | Operation identity/due/state, Task/Attempt and artifact/observation owners; not every schema extension/index. |
+| Original `docs/agent_swarm.md` at `f1b854b6`, sections 6–8 | bounded service work, fair ready-target progress, drain preserving results, readback without native start. |
 
-## Next work
+The original specification supports these constraints; its older mutually exclusive
+Goal wording is not restored over the owner's newer independent-Goals decision.
+External donor repositories/installed SDKs were not freshly requalified in this pass.
+Existing Eliot implementations were inspected as positive/negative donors.
 
-1. Trace historical provider-root/session replacement for Codex, OpenCode, Muse and
-   Claude and identify which source locators survive without another native effect.
-2. Define exact Store query/authorization for `capture_once`, including taskless output
-   retention and superseded Task scope.
-3. Update implementation with the first Antigravity vertical slice only after the
-   caller-to-Store path is fully specified; no shared crate first.
-4. Then continue queue/root-capacity audit B.
+## Next work and remaining coverage
 
-Earlier detailed traces remain in repository history:
+Start with queue/root-capacity B as named above. Then continue workspace/process,
+Goals/scheduling, review/acceptance, public-object permissions, migrations, IPC fairness,
+external writes and independent observation. Historical read/capture revocation and
+multi-root reachability remain named open boundaries, not reasons to invent another
+framework before reading those owners.
 
-- [`c3e331a`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c3e331a37ef58b3b98f7859bfb9e40935501e106/docs/agent-operations/audit-register.md)
-- [`70b99db3`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/70b99db3d8732d10a69d03d1dbe83afdd39a7229/docs/agent-operations/audit-register.md)
-- [`1c61629b`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/1c61629b49e8d6b9763dc7f5be32a0135509d7e3/docs/agent-operations/audit-register.md)
-- [`ec019052`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/docs/agent-operations/audit-register.md)
-- [`f5ccc418`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/f5ccc418ba401733d1f778619abeec5c0554416b/docs/agent-operations/audit-register.md)
-- [`ac3389c`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ac3389c013840b02a78dc310bcee481d24086402/docs/agent-operations/audit-register.md)
-
-A docs commit is not a repair. A finding closes only with connected runtime behavior
-and exact evidence.
+Earlier detailed evidence, including the result-source matrix and anti-donor list,
+remains in the [preceding register](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/9c47d88a09a543e9f0ea74228370833f14a6c619/docs/agent-operations/audit-register.md)
+and its linked prior passes. All AR-001–AR-031 dispositions remain above. A docs commit
+is not a runtime repair; installed/native/Windows/load qualification remains separate.
