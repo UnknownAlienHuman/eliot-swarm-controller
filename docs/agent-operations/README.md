@@ -1,42 +1,55 @@
 # Agent Operations
 
-The V3 target is a compact controller for native-agent work. The implementation
-is partial; [status](../implementation-status.md) records the available evidence.
+The V3 target is a compact controller for native-agent work. Implementation is partial;
+[status](../implementation-status.md) separates landed code, open source audit and
+unexecuted runtime qualification.
 
 ## Read in this order
 
-1. [Architecture](architecture.md): the short product manifesto. Keep it in the
-   lead developer's context; it explains purpose, boundaries and principles.
-2. [Implementation](implementation.md): the single work order, actual source
-   owners, replacements, donor choices and relevant behavior checks.
-3. The contract and source for the assigned responsibility. Read the
-   [source findings](refactoring.md) when checking why a mechanism should disappear.
+1. [Architecture](architecture.md): short product manifesto for the lead developer.
+2. [Implementation](implementation.md): the single work order, source owners,
+   replacements, donors and relevant behavior checks.
+3. The assigned contract and current source. [Source findings](refactoring.md) explain
+   why existing machinery should be reduced.
 
-For audit work or resuming an interrupted audit, start with
-[audit register](audit-register.md#resume-here): baseline, inspected paths, confirmed
-findings, untraced boundaries and next exact call chain. Update that checkpoint with
-the owning documentation; do not infer completeness from previous chat summaries.
-Coding workers need their assigned slice, not the whole audit register.
+## Resume research after a lost chat
 
-[AGENTS.md](../../AGENTS.md) owns collaboration and verification practice.
-Older O/M/C/I programs, policy editions and prototype specifications describe
-their revisions; they do not add requirements to this target.
+Start at [audit register / Resume here](audit-register.md#resume-here). It names the
+verified head, last connected source trace and exact unfinished chain. Compare live
+`main` before continuing; a documentation-only interval does not fix runtime findings.
+
+Use the [audit index](audit-index.md) for direct evidence checkpoints, stable AR links,
+source symbols, target owners, historical requirements/donors and remaining coverage.
+Finding dispositions live only in the register; implementation order lives only in
+implementation. The index is navigation, not another approval system or worker pack.
+
+Update the checkpoint and owning contract with the actual findings. Preserve evidence,
+qualifications and refuted claims. Do not infer completion from old chat summaries,
+a successful docs workflow, a search hit or a test that was merely read.
+
+[AGENTS.md](../../AGENTS.md) owns collaboration and verification practice. Coding
+workers need their compact assigned slice, not the audit archive. Older O/M/C/I
+programs and prototype specifications describe their revisions; they do not add
+requirements to the current target.
 
 ## Supporting documents
 
 | Document | Responsibility |
 | --- | --- |
-| [Audit register](audit-register.md) | Durable source-review coverage and resume point; not another implementation plan. |
-| [Configuration](configuration.md) | Editable settings, ownership, enabling and effects of changes. |
-| [Delivery](delivery.md) | Assignment, submission, independent review, correction and acceptance. |
+| [Audit register](audit-register.md) | Finding dispositions, inspected revisions and exact resume point. |
+| [Audit index](audit-index.md) | Direct evidence/source/target navigation and unclosed coverage. |
+| [Implementation status](../implementation-status.md) | Landed behavior and its qualification limits. |
+| [Configuration](configuration.md) | Editable policy/settings, ownership and effects of changes. |
+| [Delivery](delivery.md) | Assignment, capture, review, correction and acceptance. |
 | [Communication](../agent-communication-program.md) | Addressed messages supporting assigned work. |
-| [Module API](module-api.md) | Concrete request/result shapes for retained capabilities. |
-| [Modularity](modularity.md), [shared packages](shared-packages.md) | Existing protocol, process and package boundaries. |
-| [Donor map](donor-map.md) | Inspected upstream behavior, actual integrations and replacement limits. |
+| [Module API](module-api.md) | Retained semantic actions, delivery, result sources and recovery. |
+| [Launcher/Queue](../swarm-launcher-assignment-context.md) | Current-state selection, admission and resource lifetime. |
+| [Modularity](modularity.md), [shared packages](shared-packages.md) | Protocol, process and existing package boundaries. |
+| [Donor map](donor-map.md) | Useful mechanisms, anti-donors, selected routes and source limits. |
 | [Module installation](module-installation.md) | Current package/register/select commands and transition gaps. |
-| [Observability](observability.md) | Diagnostic depth, redaction and bounded views. |
-| [Source findings](refactoring.md), [implementation status](../implementation-status.md) | Why current code needs reduction; what source or runtime evidence exists. |
+| [Observability](observability.md) | Independent local Governor observation plus optional bounded diagnostics. |
+| [Source findings](refactoring.md) | Structural excess and deletion boundaries from earlier review. |
 
-Implementation owns changes to the target. Supporting documents provide detail
-for a retained responsibility; they cannot reintroduce a removed product engine,
-permanent compatibility path or separate execution authority.
+Supporting documents cannot reintroduce a removed product engine, permanent
+compatibility path, separate execution authority or routine human handoff in place of
+working automation.
