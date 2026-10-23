@@ -81,7 +81,7 @@ terminal disposition, rather than just changing the parent Operation's state.
 | Workspace preparation in flight or outcome unknown | Stop later admissions; retain the workspace hold and complete/join exact readback. Do not repeat Git preparation blindly. |
 | Rootless Open rejected before sending, no independent service/process effect | Retire the exact opening binding/lane claim and dispose its unused reservation through the same no-effect path. |
 | Open/input may have executed, or native process/service is observed/unknown | Keep attributable ownership; bounded native/process readback or supported exact cancellation, never infer no effect from Rejected. |
-| Exact owned resource departure established | Retire its remaining claim; release workspace only when its other writers/checks/producers are resolved. |
+| Exact owned resource departure established | Dispose only that resource claim; other native/workspace/output obligations are checked separately. |
 
 Cancel versus send/start is a transaction/CAS race. A winner before the effect boundary
 prevents that effect. A late cancellation cannot retroactively erase it. Preserve the
@@ -93,10 +93,50 @@ unrelated success-shaped receipt. Record attributable disposition with the exist
 Operation/resource rows. Retrying that disposition is idempotent; unknown effects stay
 held. Never require routine manual SQL, a new cleanup daemon or a second proof ledger.
 
-Workspace authority release does not delete a worktree or its unpublished changes.
-Task acceptance/release, native shutdown, root retirement and output-source release are
-different events. Connection detach from an externally owned shared service does not
-prove the native work or service departed.
+### Scoped shutdown and retirement
+
+`Shutdown` names a supported owned resource. Current `external_attach` closes only the
+adapter's connection; `owned_sdk_transport` releases only its SDK transport. Neither
+means Task accepted, native Goal stopped, children finished or process family departed.
+External shared services are never adopted or killed to make local cleanup succeed.
+
+Authorize cleanup from current actor/object scope and exact retained custody, including
+an eligible Draining/Reconciling binding. New-work Ready/quota gates are not cleanup
+permissions. Do not set Ready, replay Open or create a session to make a stop/read pass.
+An unknown or unsupported resource scope remains an addressed decision for Governor,
+not a blanket kill or a routine human task.
+
+Keep desired control attachment separate from observed native occupancy in the existing
+binding/Operation owner. On explicit successful detach, the historical Open alone must
+not request productive reattachment. Preserve native identity, active Goal/children,
+unknown effects, result delivery and passive observation. Bounded completion/readback
+may still require an adapter; that is not new execution. Later productive attachment
+requires an authorized policy action, not automatic resurrection from retained history.
+
+Enabled retirement policy follows the same current-state loop:
+
+```text
+selected drain/detach/stop intent -> exact adapter/resource action
+-> record its real disposition -> inspect remaining native/process/output obligations
+-> retire the resolved binding claim -> release eligible workspace authority
+```
+
+Use `runtime` settlement, `module_demand`, existing process/service observations and
+`workspace_lifecycle` as owners. A service-departed row or module-family exit is one
+input, not a universal release receipt. Recompute disposition after relevant facts and
+restart; short Store transitions converge idempotently. Unknown work retains its exact
+hold while unrelated work proceeds. No new teardown service, workflow or proof family.
+
+Reuse the historical cleanup pattern in `launcher_owned_service::departure_source`:
+resolve the admitted resource from original Operation/Attempt/lease, not current Task
+revision or changed route. Current authority to act and immutable execution provenance
+remain separate. Never rewrite original ownership or fabricate terminal model results
+from OS exit. Physical departure, required output capture and Task acceptance differ.
+
+Workspace release removes only its authority, not the worktree or unpublished changes.
+When native activity really remains after transport detach, retain its resource hold;
+when all relevant obligations are resolved, the ordinary disposition must retire the
+binding rather than leave its mere existence as a permanent workspace/root blocker.
 
 ## 5. Root budgets count current allocations
 
@@ -198,9 +238,11 @@ ACK, code-scope approval, mandatory MCP readiness or label-publication workflow 
 - Cancellation of verified-held unbound launch releases authority without removing files; in-flight Git remains fenced until readback.
 - Pre-send Open rejection retires only a proven unused binding; post-spawn failure retains ownership.
 - Fresh same-source facts supersede stale copies without clearing independent quota windows.
-- Held/disabled new work does not block authorized results, readback and exact stop/reply controls.
+- Held/disabled new work does not block authorized results, readback and exact stop/reply controls, including eligible non-Ready cleanup.
+- Explicit detach removes productive attachment demand, not native Goal/child facts or incomplete output obligations.
+- Exact resource departure converges through binding retirement to eligible workspace release; an active shared service or unresolved writer is never released by association.
 - Overlapping writers are blocked before effects; review reads a frozen candidate.
 - Direct and automatic launch share handlers without mandatory preview/proof packets or routine human repair.
 
-These are target cases, not executed results. Shutdown/departure, route-edit continuity,
-revocation and live concurrency remain explicit audit boundaries.
+These are target cases, not executed results. Post-binding cancellation, route-edit
+continuity, revocation, crash-only departure and live concurrency remain audit boundaries.

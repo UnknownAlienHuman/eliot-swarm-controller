@@ -7,28 +7,29 @@ queue. [Implementation](implementation.md) owns changes;
 
 ## Resume here
 
-- Pass: **2026-10-23 / cancellation, resource disposal and read/control admission**.
-- Inspected head: **`c0d1b91f15636982f977768474f7246b97308d61`**. Its comparison with
-  `a0bc1dcb` changes only audit-register/launcher documentation. Earlier runtime
-  findings remain open; this comparison is not a reread of every source.
+- Pass: **2026-10-23 / scoped shutdown, adapter demand and resource retirement**.
+- Inspected head: **`c2b998b079fe8517c592192c18d6ecbfb6b26aae`**. Its difference from
+  `c0d1b91` is documentation only. The preceding interrupted pass already recorded
+  AR-041–AR-044; this pass continues rather than repeating it.
 - Overall audit: **incomplete**; no measured completeness percentage.
-- Traced next-command selection/guards/quota hold, direct Open reservation, generic
-  cancellation, held-workspace commit and later admission, workspace release,
-  owned-service pre-start cancellation, current root policy and native/IPC disconnect.
-- Added **AR-041–AR-044**; extended AR-039. Read/control quota bypass and the exact
-  pre-spawn cancellation fence are preserved. Cancellation/rejection must also dispose
-  attributable no-effect reservations, not merely change an Operation.
-- Owning target: [launcher/queue](../swarm-launcher-assignment-context.md).
-- **Next exact chain:** successful `agent.shutdown` / native close -> exact resource
-  departure -> binding retirement -> root-count and workspace release. Trace externally
-  attached services separately from owned processes, active children and native Goals.
-  Then inspect launch cancellation after binding/Open attachment, route-edit budget
-  continuity and the complete direct-call transaction/concurrency path. Never infer
-  native death from socket close or a terminal Task.
-- AR-044 confirms the predicate after lowering a limit, not an executed live reload.
-  AR-042 covers a verified-held unbound lease, not every cancellation.
-- Documentation only. No runtime change, Clippy, tests, benchmark, installed harness
-  or independent verifier ran. External donors/SDKs were not freshly qualified.
+- New rows **AR-045–AR-047** trace Shutdown admission/effect fencing, Codex transport
+  release, Store settlement/disconnect, module demand and its supervisor consumer,
+  owned-service departure and independent workspace holds.
+- Owning target updated: [launcher/queue](../swarm-launcher-assignment-context.md).
+  An explicit control detach, native-work completion and resource retirement are
+  different facts. Do not clear a root to stop adapter demand or restore Ready merely
+  to make cleanup callable.
+- **Next exact chain:** cancellation after a launch has attached its Attempt/Open
+  binding -> child cancellation/late outcome -> owned-service disposition -> binding
+  retirement -> workspace release. Then route-edit budget continuity and the complete
+  direct-call transaction/concurrency path. Trace the ordinary finalizer before
+  claiming that a guarded historical record can never be released.
+- Still unqualified: actual shutdown/restart cycles; native Goal/child quiescence after
+  external detach; crash without clean-stop receipts; successor stop authority;
+  post-shutdown historical capture. No duplicate model execution or respawn loop is
+  claimed from the demand predicate alone.
+- Documentation only. No runtime change, Clippy, tests, benchmark, installed harness,
+  external donor requalification or independent verifier ran.
 
 On resume compare changed source and recheck callers/consumers. A search hit, read test
 or docs commit is neither executed qualification nor a runtime repair.
@@ -37,7 +38,8 @@ or docs commit is neither executed qualification nor a runtime repair.
 
 **Source-confirmed** means a named path supports the consequence, not live reproduction.
 **Preserve** identifies useful behavior. **Partial** names an untraced boundary. Earlier
-rows remain inherited evidence unless explicitly reread.
+rows remain inherited evidence unless explicitly reread. Open findings close only with
+connected runtime evidence, not with a proposed replacement.
 
 ## Findings and coverage
 
@@ -59,7 +61,7 @@ rows remain inherited evidence unless explicitly reread.
 | AR-014 | Release preserves capture | **Open.** Release cancels queued Result together with non-check Operations. | Cancellation by effect semantics. |
 | AR-015 | Restart credential | **Preserve.** Stable binding credential; no implicit rotation. | Live restart/revocation. |
 | AR-016 | Old-boot first delivery | **Open.** Unseen old-boot terminal fails current-boot validation; committed identical outcome may replay-ACK. | Execution origin separate from delivery actor. |
-| AR-017 | Recovery-fenced capture | **Open; predicate reread.** Recovery filters Result before completion-only exception. | Exact completion/readback without native readiness. |
+| AR-017 | Recovery-fenced capture | **Open.** Recovery filters Result before completion-only exception. | Exact completion/readback without native readiness. |
 | AR-018 | Supervisor recovery | **Scope correction.** Intake/process recovery is not native-byte import. | Import stays with adapter/Store. |
 | AR-019 | Inconclusive lookup completion | **Open.** Antigravity labels completed inconclusive Reconcile itself Unknown. | Applied lookup `resolved:false`; target stays unknown. |
 | AR-020 | Terminal versus release | **Boundary.** Late terminal may update unreleased old Attempt; terminal does not prove capture. | Preserve output obligation and producer fences. |
@@ -81,141 +83,113 @@ rows remain inherited evidence unless explicitly reread.
 | AR-036 | History-dependent capacity | **Open.** Global historical census/ledger verification precedes current root count. | Indexed current claims, no full-history admission scan. |
 | AR-037 | Native-default Antigravity | **Open.** Root identity requires optional `modelId`; root policy can block an empty route. | Budget identity independent of optional model. |
 | AR-038 | WorkDispatch saturation | **Open.** 128 pending subjects stop intake of later eligible Task facts. | Fair current-state scan, delete copied pending list. |
-| AR-039 | Stale provider precedence | **Open; lifecycle narrowed.** Stale matching row outranks fresh Available. Eliot link loss retains rows; delivered native account/closed snapshot invalidates its own source. | Same-source supersession; retain independent quota constraints. |
+| AR-039 | Stale provider precedence | **Open.** Stale matching row outranks fresh Available. Eliot link loss retains rows; accepted native account/closed snapshot invalidates its own source. | Same-source supersession, independent quota constraints and remaining lifecycle cases. |
 | AR-040 | Root dedup/admission/scan | **Preserve.** Parent/Open/Dispatch/service share a claim; transaction handoff and stable scan exist. | Full direct concurrency and route-edit matrix. |
-| AR-041 | Reads/control under quota hold | **Preserve plus earlier gate.** Result/Refresh/strict Reconcile and stop/reply controls bypass the starts-only quota predicate. Recovery/ready/scope gates still apply. | AR-017; shutdown in reconciling/draining states. |
-| AR-042 | Cancel held unbound launch | **Open defect.** Generic Cancelled parent cannot satisfy workspace sweep's Settled no-effect contract; current verified-held unbound lease can stay fenced. | Stage-aware cancellation; read back in-flight workspace effects. |
-| AR-043 | Pre-send Open rejection | **Open defect.** Guards reject unsent Open without retiring rootless opening binding; cancellation then refuses non-Queued target. | Known-no-effect rejection/cancellation must converge with resource disposal. |
-| AR-044 | Lowered root limit and reuse | **Source-confirmed policy boundary.** Same-root input uses `other_claims >= limit`; lowering below live total can hold zero-root-growth continuation. | Separate root delta from input/quota/drain policy; live reload unqualified. |
+| AR-041 | Reads/control under quota hold | **Preserve plus earlier gates.** Reads/strict Reconcile and stop/reply controls bypass starts-only quota. | Recovery/ready/scope barriers; AR-017 and AR-045. |
+| AR-042 | Cancel held unbound launch | **Open.** Cancelled parent fails workspace sweep's Settled no-effect contract; verified-held unbound lease can stay fenced. | Stage-aware cancellation and in-flight workspace readback. |
+| AR-043 | Pre-send Open rejection | **Open.** Guard rejects unsent Open without retiring rootless opening binding; cancel refuses non-Queued target. | Known-no-effect disposition through existing resource owners. |
+| AR-044 | Lowered root limit/reuse | **Open policy mismatch.** `other_claims >= limit` can hold zero-root-growth continuation after limit reduction. | Separate root delta from input/quota/drain policy; live reload unqualified. |
+| AR-045 | Shutdown when execution is not Ready | **Source-confirmed open barrier.** Admission and pre-effect validator require Ready; recovery queue independently excludes Shutdown. | Authorize exact resource cleanup by custody/scope, not new-work readiness. |
+| AR-046 | Explicit detach versus adapter demand | **Source-confirmed open integration gap.** Applied transport shutdown leaves native identity retained; demand still anchors attachment to settled Open and holds its lease. | Separate desired attachment from native occupancy and output obligations; no respawn-loop claim. |
+| AR-047 | Departure and binding/workspace disposal | **Preserve plus partial handoff.** Historical service departure reader survives stale Task/owner; its writer changes service row only. Unreleased binding independently holds workspace/root. | Connect ordinary retirement after all relevant facts; neither auto-release on socket close nor delete guards. |
 
 ## Current pass evidence
 
-Sources below refer to the inspected head. Only named portions are covered.
+Sources below were read at the inspected head. Named portions, not whole-file audits.
 
-### AR-041 — preserve the real read/control bypass
+### AR-045 — cleanup is gated by execution readiness
 
-`store/runtime.rs::next_internal` (roughly 1263–1840) prioritizes control and permits
-readback around unresolved ordinary mutations. Strict selected-module Reconcile is
-read-only. Result, Refresh and strict Reconcile are not `starts_native_work`; neither
-are steer, Goal pause/clear and reply controls. Only starts enter the later route/quota
-predicate. A held start remains queued with a due time, before the sending CAS.
+`store/runtime.rs::validate_agent_shutdown_request` checks the exact binding/generation
+and closed resource scope, then rejects every state except `ready`. Both
+`user_command_with_actor` and the `next_internal` guard call it. Before that guard,
+`next_internal` selects only Recover/Reconcile when `recovery_required` is true.
+Thus an admitted Shutdown can also become undispatchable after a state transition.
+Its control priority and quota bypass do not override these earlier fences.
 
-Tracking a read in the old capacity ledger does not prove it allocates a root. Earlier
-fences still matter: recovery filters Result before its completion exception (AR-017);
-readiness/authority/shutdown checks are independent. Connect the needed positive paths
-rather than removing every guard.
+Use current actor/object rights and exact resource custody for cleanup. Do not mark a
+failed session Ready or replay Open merely to release its transport. Conversely, a
+non-ready state does not authorize an unknown process kill. Keep the native scope's
+real supported stop/detach semantics and preserve uncertain effects for readback.
 
-### AR-042 — cancellation and workspace release do not converge
+### AR-046 — a saved root is not a request to reconnect forever
 
-- `Store::reconcile_launches_once` in `store/mod.rs` (about 1260–1490) commits verified
-  held workspace before a fresh transaction admits the Attempt/Open.
-- `launcher::launch_after_workspace_held` can leave that parent queued on route Hold
-  before attaching an Attempt/binding. A later pass reuses the held lease.
-- `operations::cancel` (about 3850–4005) accepts a queued parent and writes Cancelled
-  with `{reason,cancelled_by}`. It has no unbound-launch lease disposition; only the
-  agent.open branch closes an opening binding.
-- `workspace_lifecycle::candidates` selects a current unbound held lease for closed
-  launch cleanup only for a Settled parent with native effect not attempted.
-  `closed_launch_has_no_native_effect` separately requires Settled plus the exact
-  domain launch result. Generic cancellation satisfies neither check.
-- Root counting selects unbound launches only while Queued/Unknown: cancellation drops
-  that root reservation, not the held workspace authority.
+`swarm-contracts::module_command` explicitly limits Shutdown to `external_attach` or
+`owned_sdk_transport`. Neither claims native turn, Task or process-family completion.
+Codex `shutdown_operation` persists intent, closes its own WebSocket, sets
+`native_retired` and returns `owned_resource_released` only after its close condition.
+Unknown close also retires its local transport; it is not replayed as a fresh effect.
 
-Thus cancelling a verified-held, current, unbound launch waiting for admission can leave
-its workspace authority retained. This is not every cancellation or a live reproduction.
-Later invalidation to stale does not make Cancelled satisfy the release helper.
+The traced Store outcome path settles that Operation but has no shutdown-specific
+binding disposition. `runtime::disconnected` then retains root/scope and moves a
+ready/opening binding to Reconciling. That conservative unexpected-disconnect behavior
+must remain; it is not a complete implementation of intentional retirement.
 
-Use the existing launch/workspace owner in cancellation. When preparation completed and
-no child/native/service effect or unresolved resource remains, release that exact
-reservation/lease authority in the cancellation transaction. Preserve files and history.
-If Git/process work crossed its effect boundary, hold it for exact readback. Queued
-parent does not mean no Git work started. No directory deletion, routine manual SQL or
-new cleanup daemon.
+`module_demand::operation_candidates` separately selects settled/unknown original Open
+for every unreleased binding with a native root/scope, even without unresolved input.
+`scope_readback` reports retained native identity whenever either native coordinate is
+present, irrespective of a proven module-family departure. In the consumer,
+`StandaloneSupervisor::reconcile_demands` keeps seen demand; it drops a stale held lease
+only when both native identity and pending Operations are absent. An explicit transport
+Shutdown does not remove this attachment demand in the traced chain.
 
-### AR-043 — no-effect rejection needs resource disposition
+This does not prove duplicate input, repeated process spawn or that the external root
+has stopped. Its native Goal/children may still be working. Separate desired control
+attachment from observed native occupancy using the existing binding/Operation owner.
+After selected detach, old Open alone cannot request a productive reattachment; saved
+output/readback and passive observation retain their own bounded obligations. A new
+attachment needs an authorized policy action, not erased history or another supervisor.
 
-`operations::reserve_open_route` (about 2940–3050) creates a rootless opening binding
-and ties it to Open in a transaction. Another Open on its unreleased lane is refused.
+### AR-047 — retain historical cleanup; connect the last disposition
 
-Before `queued -> sending`, `runtime::next_internal` can reject that Open after caller
-revocation, disabling new work or making the route Unavailable. Those traced branches
-commit the rejected Operation without retiring its binding or synchronizing the old
-capacity entry. Local cancellation then refuses the non-Queued target; its special
-rootless-opening cleanup is unreachable. Root counting retains an unreleased claim or
-reports unknown when its historical ledger no longer agrees.
+`launcher_owned_service::departure_source` reconstructs the exact admitted service,
+parent/Open, original Attempt and lease from retained provenance. It deliberately does
+not require a current Task, current manager or still-held lease. This is a useful donor
+for historical cleanup, not a reason to invent another authority registry.
 
-This is a missing transition in those paths, not proof that all administrative recovery
-is absent. Route known-no-effect rejection and safe cancellation through one existing
-resource disposition. Inspect independent owned-service starts/children before closing
-anything. Native Rejected may follow spawn: `outcome_with_artifacts` correctly keeps
-that ownership/identity. Do not apply a generic Rejected-implies-free rule.
+`Store::reconcile_owned_opencode_departures_once` builds read-only departure evidence,
+CASes `persist_departure`, increments a count and returns. That CAS changes only
+`owned_service_starts` to `service_departed`; it does not close binding or settle native
+inputs. The native reader expects exact process/clean-stop evidence. Process exit,
+transport close and successful model work remain different facts.
 
-### AR-044 — root allocation and new input are different questions
+`workspace_lifecycle::workspace_resource_use` independently holds the exact unreleased
+binding, unresolved Operations, CheckRun resources, producers and owned-service rows.
+A service-departed row removes the service hold, not the binding hold. The inherited
+root-count path likewise counts unreleased bindings independently of service state.
+Do not turn the service transition into an unconditional workspace release: a shared
+service, another writer, unknown input or uncaptured process-local output may remain.
 
-`runtime::binding_route_admission` preserves native route/workspace identity and overlays
-only current enablement/root policy. Keep that protection against silent retargeting.
+The target joins these facts in the existing disposition path. When actual resource
+obligations are resolved, retire the binding claim and let workspace lifecycle release
+only its own authority, preserving files and results. Native outcomes are never invented
+from OS exit. The complete finalizer/administrative caller matrix and crash without
+clean-stop receipts remain open; this pass does not assert every resource is unreleasable.
 
-Same-root counting excludes its own claim, but provider admission still requires other
-claims < limit. Three live roots with a new limit of two therefore fail each same-root
-check (two other claims). `next_internal` applies this to Dispatch/next-turn Send, not
-only new roots. This is the confirmed predicate; live config reload was not executed.
+## Source coverage for this pass
 
-Target root-limit reduction prevents positive root growth. Reuse with zero root growth
-still obeys new-input, quota, Task and explicit drain policy. An intentional pause of
-new turns must be explicit, not hidden in root arithmetic. Do not kill sessions or
-hide unresolved claims to make the count fit.
-
-### AR-039 follow-up — distinguish native invalidation from Eliot link loss
-
-`runtime::disconnected` (about 3745–3820) marks its exact Eliot link disconnected and
-sent/accepted Operations unknown; it does not invalidate provider rows. Permission
-source freshness requires that connection to be connected, so its retained row can
-become stale.
-
-`provider_conditions::observe_usage` (385–535), in contrast, calls `invalidate_all`
-when an accepted native snapshot reports account/updated or connection/closed. This
-is source-binding scoped. A fresh binding updates its own rows, not the old binding's
-copy. That establishes a path to the audited stale-rank-2 versus Available-rank-1
-conflict for matching shared resources; an already-delivered native invalidation is
-not that case.
-
-Keep exact account/auth attribution and independent buckets. Neither deleting all
-negative facts on IPC loss nor selecting the globally newest timestamp repairs it.
-Full release/revocation/reboot/account-change combinations remain unqualified.
-
-## Useful disposal mechanisms to retain
-
-`operations::fail_reserved_owned_service_start` CASes the existing start row only before
-its process boundary; Unknown/observed starts refuse release, departed/no-effect ones
-can proceed. `prepare_owned_service_attempt_release` uses it for linked queued work.
-Preserve that race boundary, not all duplicate proof encodings. The complete coordinator
-process path was not reread here.
-
-`workspace_lifecycle::workspace_resource_use` retains holds for unresolved effects,
-checks, producers, exact unreleased binding and owned service. Attempt release is not
-native departure. Connect real disposition to these owners instead of deleting fences
-or freeing resources by age.
-
-## Inspected sources
-
-| Source | Boundary read |
+| Source | Read boundary |
 | --- | --- |
-| `store/runtime.rs` | queue selection, starts/guard/hold/rejection, sending CAS, route overlay, Open outcome branches, disconnect/hello. |
-| `store/operations.rs` | Open reservation, owned-service pre-start cancellation, linked release and generic cancel. |
-| `store/mod.rs::reconcile_launches_once` | held-workspace commit before final admission; external I/O and lifecycle invocation. |
-| `store/workspace_lifecycle.rs` | candidate SQL, closed-launch release test, transitions and resource holds. |
-| `store/capacity.rs::root_claims_for_route` | unreleased binding/unbound launch selection and same-root exclusions. |
-| `store/provider_conditions.rs` | root gate, source identity, native invalidation and retained condition entry. |
+| `store/runtime.rs` | Shutdown validator and call sites; recovery queue predicate; Open/Dispatch/Recover outcome branches, generic settlement and exact-link disconnect. |
+| `swarm-contracts/src/module_command.rs` | Shutdown scopes and explicit non-guarantees; command/demand vocabulary. |
+| `swarm-adapter-codex/src/lib.rs` | `shutdown_operation`, connection-close condition, saved intent and intent-only unknown recovery. |
+| `store/module_demand.rs` | pending/native-root candidate queries, scope readback, managed-owner family-departure predicate and pending projection entry. |
+| `swarm-supervisor/src/standalone.rs` | demand/readback consumer, held-lease removal, registry obligations and outer loop exit. |
+| `store/launcher_owned_service.rs` | start/readback ownership, bounded departure loop, historical source, departure proof validation and CAS. |
+| `store/workspace_lifecycle.rs` | release transitions, closed-launch boundary and all `workspace_resource_use` holds. |
+| `store/operations.rs` | owned-service pre-start fence, linked Operation cancellation and rootless binding closure. |
+| `runtime/opencode_v2/owned_service.rs` | exact helper custody, graceful close and retained read-only handle; recovered handle does not acquire original helper's stop authority. |
 
-## Remaining coverage
+The last row is a custody boundary, not a fresh audit of the whole native departure
+reader. External SDK behavior, live OS process trees and native Goals were not executed.
 
-Next: shutdown/close/binding retirement, then route edits and full concurrency.
-Workspace/process custody, Goals/scheduling, review/acceptance, permissions, migrations,
-IPC fairness, external writes and observation remain open tracks. Historical capture
-across revocation, source discovery/indexes and installed restart/Windows/load are not
-closed by this pass.
+## Next work and retained evidence
 
-Prior detailed evidence and donor references remain in the
-[preceding register](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c0d1b91f15636982f977768474f7246b97308d61/docs/agent-operations/audit-register.md)
-and its linked passes. All earlier dispositions remain above. Docs do not close runtime
-findings.
+Continue the post-binding cancellation chain named above, then route edits and direct
+admission races. Follow actual callers and triggers before proposing another cleanup
+worker. Goals/scheduling, review/acceptance, full permissions, migrations, IPC fairness,
+external effects and independent observation still have open boundaries. Historical
+capture across revocation, query indexes and installed/Windows/load remain unqualified.
+
+Earlier detailed traces and donor references remain in the
+[preceding register](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c2b998b079fe8517c592192c18d6ecbfb6b26aae/docs/agent-operations/audit-register.md)
+and its linked passes. All AR-001–AR-044 dispositions are retained above.
