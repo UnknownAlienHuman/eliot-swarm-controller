@@ -50,7 +50,11 @@ soaked = false
 role_qualified = false
 upstream_checked = "2026-10-23"
 upstream_source_refs = ["https://github.com/meta-models/muse-code-sdk/tree/a7c10c5dd3f66be412077d29f9d11111af70317b", "https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/turn-start/", "https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/view-page/", "https://meta-models.github.io/muse-code-sdk/next/generated/msp/methods/item-readoutput/"]
-source_limit = "The reviewed schema/source revision and @muse-code/sdk lock are both 1.3.0. Official rolling /next docs were checked as a current API reference, not proof that the locked artifact supports every documented field. Native Muse version is not established by the npm lock. Preserve prior 1.3.0 qualification evidence as inherited."
+native_goal_source_revision = "09d67eca616b7b02a2d060271123c1fedbdb8fb7 (Goal source inspected at upstream revision on 2026-10-23; separate from reviewed/locked 1.3.0 revision a7c10c5dd3f66be412077d29f9d11111af70317b)"
+native_goal_source_refs = ["https://github.com/meta-models/muse-code-sdk/blob/09d67eca616b7b02a2d060271123c1fedbdb8fb7/rust/clients/sdk-rs/src/msp/method/goal.rs"]
+current_adapter_support = "modules/muse/settings.mjs maps agent.goal set/edit/pause/resume/clear to native goal/<action>; bridge.13 journals/submits and reads goal changes. Inspected upstream Goal source says idle set/edit/resume may wake a fresh goal turn; busy turnId is admission-time routing only, not delivery; pause/clear never wake."
+native_goal_qualification_limit = "Native Muse binary/runtime version remains unknown; SDK 1.3.0 lock and reviewed schema do not qualify the later main source's exact Goal contract or live wake/continuation behavior."
+source_limit = "The reviewed schema/source revision and @muse-code/sdk lock are both 1.3.0. Rolling /next docs checked for other methods do not qualify every field on 1.3.0. Goal source inspected at upstream revision 09d67ec is a distinct newer contract, not proof that the locked artifact or installed native Muse runtime supports each behavior. Native Muse version is not established by the npm lock. Preserve prior 1.3.0 qualification evidence as inherited."
 qualification_evidence_status = "inherited_1.3.0_source_and_fixture_evidence_only; no live_qualification"
 
 [[donors]]
@@ -124,6 +128,10 @@ upstream_report_ref = "https://github.com/openai/codex/issues/32254"
 upstream_report_status = "Open proposal checked 2026-10-23; requests durable idempotency for clientUserMessageId. It is not runtime proof or a guarantee implemented by the pinned source."
 upstream_source_revision = "2b21129c6b8120e63f9ac510fe99e8b02ef43292"
 source_limit = "clientUserMessageId supports correlation with persisted user items; it is not a durable idempotency key. expectedTurnId is scoped to active-turn steering. No locked SDK revision establishes the separately installed native Codex binary version."
+native_goal_source_revision = "970111f6cb62cc02fe36a82ea7d71b37a2889c97 (Goal sources inspected at upstream revision on 2026-10-23; distinct from the retained turn.rs review above)"
+native_goal_source_refs = ["https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/request_processors/thread_goal_processor.rs", "https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/ext/goal/src/extension.rs", "https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/v2/thread.rs"]
+current_adapter_support = "crates/swarm-adapter-codex advertises agent.goal unsupported. Map the inspected native thread/goal/set|get|clear (paused/active status) and native continuation as a target capability only; GoalProgression currently selects ordinary agent.send next_turn for Codex."
+native_goal_qualification_limit = "Upstream source review only. The current installed Codex service version, Goals feature enablement, model-provider policy and live native Goal behavior are unknown/unqualified. Do not claim native Goal support for the current Rust adapter."
 
 [[donors]]
 id = "rmcp"
@@ -377,6 +385,10 @@ installed_pin = "Current native service version is unknown here and must be runt
 upstream_checked = "2026-10-23"
 upstream_update_note = "Metadata refresh only; no new OpenCode source review or native installation qualification."
 upstream_source_refs = ["https://opencode.ai/v2/docs/api", "https://opencode.ai/v2/openapi.json", "https://github.com/anomalyco/opencode/tree/930c0c8b6a3c41ceb73b9372f878b5a1186b4d4e"]
+native_goal_source_revision = "none established; OpenCode has no native Goal API in the inherited reviewed contract"
+native_goal_source_refs = ["crates/swarm-kernel-host/src/runtime/opencode_v2/goal.rs", "crates/swarm-kernel-host/src/store/automation_goal_progression.rs"]
+current_adapter_support = "Eliot runtime stores eliot.goal as a controller instruction entry and activates it through the direct wrapper's ordinary prompt admission. Automatic GoalProgression's generated agent.goal caller misses the agent.send-only actor guard in runtime::next_internal, hits absent client registration, and commits the Operation as rejected without selecting a native command (docs/agent-operations/audit-register.md#ar-051). This does not establish working automatic continuation and is separate from the direct wrapper."
+native_goal_qualification_limit = "No native OpenCode Goal API or native Goal qualification is recorded. Installed service/API qualification remains separate from this controller-owned prompt wrapper."
 execution = "The prospective standalone adapter's endpoint wiring is local implementation evidence; its older selected projection rejects result reads without assistant parent identity. Select and qualify the actual native service contract before standalone cutover."
 source_limit = "Do not infer external service version or endpoint support from modules/opencode package-lock.json. Existing V2 docs/source review do not prove a particular installed server contract."
 qualification = "Standalone target has no installed-native qualification in this entry. Historical built-in R6 evidence (docs/qualification-2026-10-03.md) records OpenCode 2.0.7 under Bun 1.4.0 on Windows for its exact artifact; it does not establish the current installation or qualify standalone cutover."

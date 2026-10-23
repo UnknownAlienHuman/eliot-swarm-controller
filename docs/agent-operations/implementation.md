@@ -321,6 +321,31 @@ candidate/review or accepted-candidate/target; scheduled messages use occurrence
 A new request ID cannot bypass these domain checks. Lost wakes trigger a bounded
 rescan; capacity/429/reset changes wake the same loop. Keep unrelated work running.
 
+The [Goal/schedule source trace](audit-register.md#trace-2026-10-23-goal-policy)
+names the current connected failures and preserved boundaries. In
+`automation_goal_progression::{prepare,require_current_for_dispatch,reconcile_entry}`,
+`goals::progression_target` and `runtime::{user_command_with_actor,next_internal}`,
+replace vendor-specific Goal continuation with the ordinary attributed Send path.
+Do not register the technical requester as a client to repair OpenCode's actor error.
+Admission must reach command selection, native outcome and the same original
+source-Operation result capture; a queued-Operation fixture is insufficient.
+
+Implement [Goal policy](configuration.md#goal-message-and-native-goal) in that path:
+phase-gate generic messages during submitted/review/correction work, reserve finite
+occurrence/no-progress budgets, and coalesce one Governor decision on exhaustion.
+Preserve capture/check/review/accept and the one correction Send. An entry disable,
+transfer or settings edit alone does not invalidate admitted input; actual revoked
+rights or a stale subject still fences an unsent effect. Retry unclaimed ownership
+blockers from current facts after transfer without rewinding history.
+
+Keep exact source-event deduplication and atomic occurrence/Operation admission.
+Preserve `scheduler::calendar::{generation_digest,occurrence_id,latest_due}` semantics
+through the shared loop: action-only edits, re-enable, transfer and restart do not
+replay a consumed tick; catch-up remains latest-only. Delete old Goal cursors, global
+slot/proof copies, native-goal predecessor coupling, transfer relocators and duplicate
+loop only when their retained identity/behavior is carried by the ordinary owners.
+The current calendar path is CheckRun-only; it is not general Goal scheduling.
+
 For a native question/approval, first apply configured vendor permissions/rules, then
 route the unresolved addressed request to the Governor agent. Known policy may answer
 automatically; a choice requiring model judgment is one Governor task. Do not deny
@@ -456,6 +481,12 @@ use ordinary Governor Reply; never simulate an unavailable native feature.
 Retain Rust app-server adapter and external app-server. Use one connection owner,
 SessionRecord, per-effect records, exact StoreDelivery and latest observation. Use
 thread, `clientUserMessageId`, turn and `expectedTurnId`; map native Goal directly.
+The current Rust adapter advertises `agent.goal` unsupported. Use the pinned
+[native Goal source](donor-map.md#native-goal-and-eliot-goal) to implement
+`thread/goal/set|get|clear`, mapping pause/resume through status only when the selected
+installed server's feature/provider capabilities support it. Keep native continuation
+inside Codex; Eliot messages remain independently bounded ordinary Send. A native
+Goal ACK/status does not complete an Eliot Task.
 Delete full checkpoint, raw event mirror, tombstones, Goal proofs, Python executor and
 profile ladders.
 
@@ -473,6 +504,11 @@ NativeEffectRecord, exact StoreDelivery and latest Observation; preserve explici
 Operation-derived command IDs, targeted readback, native Goal/result/usage and
 module-owner custody.
 
+Keep native Goal's five verbs and distinguish admission ACK from execution; an
+optional native turn ID is not a delivery promise. The newer pinned upstream Goal
+contract in the donor map does not qualify the locked SDK 1.3.0 or installed runtime.
+Select/qualify the actual capability before relying on new wake/continuation behavior.
+
 Disposition custom-Rust work, then delete `crates/swarm-adapter-muse`, Cargo member,
 disabled descriptor, custom MSP wire/schema and Rust-only fixtures. Official Rust SDK
 is future only when its command-ID seam allows net deletion.
@@ -488,6 +524,10 @@ reply/cancel/background/restart readback; unsupported controls fail before I/O.
 Internalize MCP setup/readiness. Switch route/package, freeze built-in new work,
 disposition old work, then delete host `runtime/opencode_v2`, legacy demand/worker
 slot, native MCP/owned-service paths and built-in fixtures.
+
+The built-in `eliot.goal` instruction/prompt wrapper is controller behavior, not a
+native Goal API. Eliot Goal messages use ordinary Send; preserve admitted old wrapper
+effects/readback through the finite cutover without recreating a fake native Goal.
 
 Shrink persistence to SessionRecord, NativeEffectRecord, StoreDelivery and
 ObservationCheckpoint. No universal journal/reference graph/tombstones.

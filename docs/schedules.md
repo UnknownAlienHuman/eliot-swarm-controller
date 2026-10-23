@@ -87,6 +87,15 @@ current due-index owner; it preserves the original manager provenance, cursor,
 pending work and historical Attempt owner. A different manager's own entry
 cannot gain access to that Attempt merely by selecting it in its calendar.
 
+The calendar generation is defined by expression, timezone and anchor; changing
+only the selected CheckRun action does not create a new recurrence or reset its
+cursor. `include_existing` applies at the activation cut, but never replays an
+occurrence already considered in that generation, including after an action
+edit or re-enable. Transfer preserves that logical identity and cursor, and the
+Store-backed occurrence records and cursor survive host restart. These are the
+current manager-owned CheckRun semantics; they do not describe the broader
+target automation actions listed above.
+
 ## Operator interval registry
 
 The existing `[[schedules]]` TOML entries remain available for fixed-time and

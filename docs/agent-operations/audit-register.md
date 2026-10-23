@@ -8,36 +8,41 @@ queue. [Implementation](implementation.md) owns changes;
 
 ## Resume here
 
-- Checkpoint: **2026-10-23 / attached-binding retirement, route edits and common launch admission**.
-- Inspected repository head: **`b2519aa1b70706eeb8a77f76df01e7c4de65c787`**.
-  Earlier interrupted passes are retained: `c2b998b` contains AR-041–AR-044,
-  `3c4c859` contains AR-045–AR-047, and `b2519aa` indexes them.
-- Last connected pass: cancellation/late Open → Attempt/service disposition →
-  binding-release writer inventory → periodic workspace sweep; route identity/edit
-  accounting; direct and WorkDispatch admission through claim/Open reservation.
-  New evidence is [AR-048–050](#trace-2026-10-23-retirement-admission).
+- Checkpoint: **2026-10-23 / Goal policy through native selection and terminal consumer;
+  disable, transfer, candidate phase, finite continuation and calendar identity**.
+- Inspected repository head: **`73ba7009bbc5c5515fe4c5f85743066e944106ef`**.
+  That checkpoint contains AR-048–050 and direct links to earlier evidence; the
+  [index](audit-index.md#evidence-checkpoints) retains every inspected revision.
+- Last connected pass: `automation::apply` → Goal activation/reconciliation → ordinary
+  mutation/on-behalf link → `runtime::next_internal` → Codex Send / built-in OpenCode
+  selection → terminal evidence consumer. Checked current native Goal mappings and
+  upstream contracts separately; traced calendar CheckRun occurrence continuity.
+  New evidence is [AR-051–058](#trace-2026-10-23-goal-policy).
 - Runtime baseline: **`c92120ed70ca7e625440a8a19517c481e73b13c9`**, 2026-10-21.
-  The compared interval through the inspected head contains **17 documentation-only
+  The compared interval through the inspected head contains **18 documentation-only
   commits**. This establishes unchanged source, not exhaustive source coverage.
-- Overall audit: **incomplete**. There are **50 entries**, including defects, preserved
+- Overall audit: **incomplete**. There are **58 entries**, including defects, preserved
   mechanisms and partial boundaries; no measured completeness percentage.
-- The missing attached-binding finalizer is now source-confirmed. Route-edit counting
-  differs from the target; existing pre-effect revalidation is preserved, so this pass
-  does **not** claim oversubscription. Common transactional claim/Open admission is
-  confirmed. None of these findings is a runtime repair.
-- **Next exact chain:** `automation::apply` / enabled Goal policy →
-  `automation_goal_progression::reconcile_entry` → `admit_goal_progression_operation`
-  → `runtime::next_internal` → selected adapter → terminal/result consumer.
-  Trace disable/transfer/restart, same-event deduplication, independent native Goal,
-  budgets and no-progress behavior. Compare scheduled CheckRun occurrence admission
-  separately; its existence does not implement general Goal-message scheduling.
+- OpenCode automatic continuation is rejected before native dispatch by the actor
+  guard. Codex's policy revision/enable check can reject admitted input. Generic Goal
+  continuation lacks candidate-phase and finite total/no-progress gates; transfer
+  carries an ownership-conflict cursor past an unclaimed event. Preserve terminal
+  identity/atomic deduplication and calendar continuity. No runtime repair is claimed.
+- **Next exact chain:** `submissions::finish` / current candidate →
+  `reviews::{reserve_assign,replacement_class,reserve_submit}` → automatic disposition
+  → `task.request_changes` / correction Send → corrected submission → common
+  acceptance gate. Check frozen per-requirement evidence, all findings, stale candidate,
+  inconclusive/missing reviewer, same-Attempt retry and bounded no-progress. Include
+  disabled policy, transfer and restart at each admitted boundary; do not resume the
+  old review/repair workflow as the target design.
 - Source/target entry points: [index](audit-index.md#source-and-target-map),
-  [configuration](configuration.md), implementation E and the named source owners.
-- Still unqualified: actual concurrent launch/shutdown/restart; native Goal/child
-  quiescence after detach; crash without clean-stop receipts; successor stop authority;
-  post-shutdown historical capture. No duplicate execution or respawn loop is claimed.
+  [configuration](configuration.md), [delivery](delivery.md), implementation E/G and
+  the named source owners.
+- Still unqualified: installed Goal/native turns, two real drivers sharing a session,
+  live disable/transfer/restart interleavings, crash/power-loss and complete automatic
+  result capture/review/acceptance. Earlier retirement/concurrency gaps remain open.
 - Documentation only. No runtime change, Clippy, tests, benchmark or installed-harness
-  qualification ran. Official donor APIs/release metadata were read on this date;
+  qualification ran. Exact official Codex/Muse Goal sources were read on this date;
   [donor map](donor-map.md) separates those reads from locked/installed versions.
 
 On resume compare changed source with the verified head, then reopen only affected
@@ -106,6 +111,14 @@ runtime evidence. Current dispositions below override older broader claims; the
 | <a id="ar-048"></a>AR-048 | Attached binding never reaches ordinary retirement | **Source-confirmed open.** Only rootless pre-native Open cancellation writes binding release. Attempt/service completion and periodic sweep do not retire an attached binding. | Existing Store disposition must retire the exact resolved binding, then let the sweep release an eligible lease; preserve results and unresolved native work. |
 | <a id="ar-049"></a>AR-049 | Budget continuity across route edits | **Source-confirmed target mismatch; bounded claim.** Model/artifact changes split root identity; whole-route digest changes exclude old pending launch claims. Limit-only edits preserve bound-root identity. | Stable admitted budget scope. Stale-plan/current-capacity revalidation already fences launch effects; no oversubscription demonstrated. |
 | <a id="ar-050"></a>AR-050 | Direct/automatic claim and Open transaction | **Preserve.** Both actors converge on the same launcher; after external workspace preparation, an Immediate transaction rechecks facts and commits claim/Open/binding association. | Preserve reservation continuity when removing proof manifests. Actual concurrent/restart/native execution remains unqualified. |
+| <a id="ar-051"></a>AR-051 | OpenCode automatic Goal actor | **Source-confirmed open.** Generated `agent.goal` uses the technical requester, but the runtime actor branch handles only `agent.send`; missing client registration causes committed rejection before native command. | Ordinary attributed Send across capable adapters; do not create a synthetic Manager credential. Admission-only fixture does not cover dispatch. |
+| <a id="ar-052"></a>AR-052 | Disable/edit after Goal admission | **Source-confirmed target mismatch.** Codex's pre-send guard requires enabled policy at its original revision; disable/edit/transfer can reject an already-admitted queued Send. | Separate future-admission policy from immutable admitted intent; retain actual rights, Task/Attempt/phase and binding fences. |
+| <a id="ar-053"></a>AR-053 | Goal input during review/correction | **Source-confirmed eligibility gap.** Open/unaccepted Task and unreleased Attempt suffice even when Attempt is `submitted` or `needs_correction`. | Pause generic Goal Sends at those phases; preserve capture/check/review/accept and the one findings-bearing correction Send. No live race or candidate mutation proved. |
+| <a id="ar-054"></a>AR-054 | Finite Goal continuation | **Source-confirmed target gap.** Settings contain only `goal_id`; per-pass caps and one-use EventRef do not bound successive valid terminal events. | Finite occurrence/no-progress budget, honest usage and one Governor decision; no fresh-ID or transfer reset. No observed infinite native run claimed. |
+| <a id="ar-055"></a>AR-055 | Unclaimed Goal event after transfer | **Source-confirmed open.** Ownership conflict leaves no global slot but advances the entry cursor; relocation carries it unchanged to the authorized successor. | Re-evaluate current unclaimed subject after rights/owner change without global history rewind or replay of claimed work. |
+| <a id="ar-056"></a>AR-056 | Terminal source and continuation deduplication | **Preserve.** Exact native source evidence, original Task/Attempt/binding and single-use EventRef at Store admission; ordinary continuation/link/slot/cursor commit together. | Admission does not guarantee native dispatch success. Keep atomic identity while deleting proof/cursor copies; result capture/acceptance gaps AR-006/022 remain open. |
+| <a id="ar-057"></a>AR-057 | Calendar occurrence across edits/restart | **Preserve within CheckRun scope.** Generation excludes action/owner/revision; considered occurrence survives re-enable, action edit, transfer and Store reload; catch-up is latest-only. | Carry these semantics to one loop; existing separate scheduler/automation loops do not implement general Goal messages. Source review, not executed restart. |
+| <a id="ar-058"></a>AR-058 | Native Goal capability versus controller wrapper | **Capability boundary.** Current Codex Rust lacks `agent.goal`; Muse Node maps native verbs; built-in OpenCode wraps instructions/prompt. Newer native upstream sources are not installed support. | Capability-based mapping, independent ordinary Eliot messages, native admission distinct from completion; pinned donor contracts and runtime qualification. |
 
 ## Prior connected source trace: AR-045–AR-047
 
@@ -291,12 +304,197 @@ claim/Open handoff. It must not hold SQLite across external workspace/native wor
 | `store/capacity.rs` | Root route comparison, whole-route launch matching, census/deduplication. |
 | `store/launcher.rs`, `store/automation_work_dispatch.rs` | Direct/automatic launch, current admission, workspace-plan revalidation and claim/Open continuation. |
 
+<a id="trace-2026-10-23-goal-policy"></a>
+
+## Source trace at 73ba700: AR-051–AR-058
+
+Inspected on 2026-10-23 at `73ba7009bbc5c5515fe4c5f85743066e944106ef`.
+Source conclusions below were independently cross-checked; no native failure case,
+restart, fixture, Clippy or test was executed. The target changes live in
+[configuration](configuration.md#goal-message-and-native-goal), implementation E/N/P/Q
+and [Module API](module-api.md#harness-goal-and-eliot-goal).
+
+### AR-051 — OpenCode continuation loses its represented actor before dispatch
+
+`automation_goal_progression::prepare` chooses `agent.send` for the selected current
+Codex contract and `agent.goal` with `action:"continue"` for built-in OpenCode.
+`admit_goal_progression_operation` / `MutationAuthority::GoalProgression` admits the
+ordinary Operation with caller `eliot-internal-automation-v1` and retains its exact
+on-behalf link. That technical ID deliberately has no client registration or credential.
+
+The running OpenCode driver calls `runtime::next_with_config` → `next_internal`.
+Its technical-actor branch is gated on `method == "agent.send"`; generated
+`agent.goal` does not reconstruct Goal authority. The ordinary caller lookup then
+fails with `UNAUTHORIZED` / `original caller no longer registered`. This lookup is
+inside the guard closure: the guard handler commits `queued` → `rejected` and returns
+`command:null`. It does **not** leave that Operation queued or enter the driver's
+selector-error retry branch. No native command is selected on this path.
+
+The retained O9 transfer fixture checks queued admission, caller and on-behalf link,
+not this dispatch boundary. The correction belongs in the common ordinary Send path
+with represented Manager authority; registering a privileged fake client would hide
+the integration error and create a second authority. Existing direct OpenCode Goal
+wrapper behavior is separate from this automatic failure.
+
+### AR-052 — future-admission policy is checked again as admitted intent
+
+For Codex continuation, `next_internal` calls
+`automation_goal_progression::require_current_for_dispatch`, which reconstructs the
+original admission and calls `require_current_admission` at Dispatch stage. It requires
+the old owner's entry to remain enabled/Goal-ready at the exact admitted automation
+revision. A pure disable or settings edit between admission and native selection
+therefore rejects queued input; transfer also leaves the former entry disabled.
+This contradicts the target's disable/transfer semantics even when the represented
+Manager still has the exact Task/Attempt rights.
+
+That function also checks real current authority, Task/Goal revision, objective,
+Attempt/binding and native/source identity. Retain those effect fences. The Dispatch
+stage already preserves an admitted Codex artifact selection when route selection
+changes; apply the same separation to immutable intent versus future policy. This is
+not permission to send after actual revocation or stale Task/candidate scope. Sent
+effects remain ordinary readback/result obligations; the finding concerns queued input.
+
+### AR-053 — unaccepted does not mean ready for another generic prompt
+
+`submissions::finish` sets a successful current Attempt to `submitted`, retaining the
+open Task and unreleased Attempt. `request_changes_core` sets `needs_correction`.
+`goals::readback_value` correctly reports completion only after exact Task acceptance.
+However, `progression_target` treats any current open/unreleased bound assignment with
+pending completion as active, without checking Attempt phase. `target_for`,
+`require_current_admission` and `runtime::user_command_with_actor`'s GoalProgression
+branch do not add that phase check. The repair branch separately requires
+`needs_correction`.
+
+A valid terminal observation can therefore be consumed after submission or a
+correction decision and remain eligible for generic continuation. Codex's adapter
+checks native idle/input identity, not Store candidate phase. This establishes an
+eligibility gap; it does not prove a live race, mutation of an immutable candidate or
+duplicate correction execution. Pause generic Goal input at review/correction phases
+and retain the positive path through capture/check/review/accept or one exact
+findings-bearing correction Send. Do not block all commands on a submitted Attempt.
+
+### AR-054 — a bounded pass is not a bounded Goal
+
+`GoalProgressionSettings` contains only `goal_id`. The progression `State` stores
+cursor/activation/source-gap/recent fields, without total occurrence, turn, elapsed,
+cost or no-progress accounting. `event_slot_id` changes for each new native input and
+terminal EventRef. Thus successive valid completed turns can each admit a new Codex
+continuation while the shared Goal remains pending. Entry/event/page bounds only cap
+one pump pass. The separate one-shot reminder's enabled state is intentionally absent
+from progression eligibility.
+
+Real existing stops include disabled new-work execution, policy/authority changes,
+stale scope and unavailable binding. They do not bound a repeated valid continuation
+with unchanged assignment and no acceptance. No infinite run was executed or claimed.
+Implement the finite occurrence/no-progress contract in the existing entry/Goal and
+linked Operations; progress needs relevant candidate/evidence/finding facts. A new
+event/request ID, transfer or host restart is not budget renewal. Native Goal's own
+limits remain native and separate from Eliot message consumption.
+
+### AR-055 — transfer preserves a cursor that skipped its still-unclaimed subject
+
+In `reconcile_entry`, an ownership/scope conflict deliberately does not write the
+global terminal slot: another authorized entry may still claim that event. Both the
+prepare-error and admission-conflict paths nevertheless advance the per-entry cursor
+past the observation. `relocate_state` copies that cursor to the successor, changing
+only owner/revision/time; `automation_transfer::transfer` calls it without reactivation.
+`event_page` then selects only observations after the retained cursor.
+
+For an entry that encountered `GOAL_MANAGER_SCOPE_CONFLICT` and is then transferred
+to a now-authorized Manager, the same entry does not revisit that unclaimed event.
+Another authorized entry or explicit reactivation may recover it; this is not global
+event destruction. Target current-state reconsideration must preserve that distinction:
+retry the still-current unclaimed subject after rights/owner changes, keep claimed
+Operation provenance immutable, and avoid a full historical rewind or new retry queue.
+
+### AR-056 — preserve source identity and atomic admission; keep completion distinct
+
+`runtime::codex_goal_terminal_evidence` requires an Applied completed turn, verified
+input/turn identity and matching retained EventRef, Operation, Task/Attempt and binding.
+It accepts exact Dispatch or Goal-Send admission; arbitrary Send is not currently
+eligible. `outcome_with_artifacts` stores the receipt/native references and matching
+`goal.terminal.evidence` observation in one transaction, rejecting conflicting replay.
+Built-in OpenCode's `execution_reads::{terminal_evidence,record}` binds its observation
+to synchronized durable input-execution proof and the same original work identity.
+
+`verified_terminal` requires a settled eligible source Operation, validates retained
+native proof and treats unresolved source evidence separately from rejected/cancelled
+input. `event_slot_id` includes binding/generation, native session/input and terminal
+EventRef ID/sequence/digest. Existing slot suppresses a duplicate even under another
+entry/owner. Successful ordinary mutation, on-behalf link, slot and cursor commit in
+the same reconciliation transaction. Preserve these source/atomicity properties when
+deleting duplicate Goal proof and cursor machinery.
+
+Single-use means at most one continuation Operation admitted for that EventRef,
+regardless of its later native dispatch outcome. In AR-051 the slot remains claimed
+after the Operation is rejected; another entry cannot silently retry that same event.
+It is not an exactly-once native-execution or successful-continuation guarantee.
+
+This proves only the selected source code's native-terminal/deduplication boundary.
+Codex explicitly reports `task_completion:"unknown"`; neither producer captures the
+assistant result or accepts the Task. Shared Goal completion reads exact Store
+acceptance. The Dispatch-only normalized result and missing automatic capture/readback
+gaps remain [AR-006](#ar-006) / [AR-022](#ar-022), including after attributable Send.
+
+### AR-057 — preserve the existing calendar's stable occurrence semantics
+
+`scheduler::calendar::generation_digest` uses expression, timezone and anchor.
+`occurrence_id` uses logical origin/project/automation, that generation and intended
+UTC due time, excluding current owner, action and revision. `latest_due` coalesces to
+the newest unconsidered occurrence. `automation_cron::configure_activation` can change
+the activation cut but keeps the generation's considered cursor; `include_existing`
+does not replay it. Disabling removes the due index, not admitted Operations; changing
+back to a prior calendar preserves its cursor. Transfer preserves logical origin and
+cursor while updating the due-index executor. These records are Store-backed.
+
+The operator interval path similarly selects its latest slot, and global new-work
+disable holds due work rather than replaying a backlog on resume. The scheduler has
+startup/change/safety wakes; `host::supervise_automation` is still a separate loop.
+Preserve these semantics in the target single host loop. Current actions are
+CheckRun-only, not arbitrary Goal/Send scheduling. Existing transfer/restart fixtures
+were read as source, not executed; real clock, DST and crash behavior remain separately
+qualified for their actual library/runtime versions.
+
+### AR-058 — use the native contract without advertising unimplemented support
+
+Current Codex Rust `Checkpoint::next_observation` marks `agent.goal` unsupported;
+the controller's GoalProgression uses ordinary Codex Send. The inspected upstream
+Codex source at `970111f6cb62cc02fe36a82ea7d71b37a2889c97` exposes native
+`thread/goal/set|get|clear`, feature/provider gates and native idle continuation.
+Mapping that API is target implementation, not a feature established by Eliot's route.
+
+Muse Node `settings.mjs::goalCommand` / `bridge.mjs` maps native set/edit/pause/resume/clear
+with Operation-derived command identity and admission settlement. Newer SDK source at
+`09d67eca616b7b02a2d060271123c1fedbdb8fb7` states admission-only ACK and limits the
+meaning of a returned turn ID. It does not qualify Eliot's SDK 1.3.0 lock or the native
+binary. Built-in OpenCode `runtime/opencode_v2/goal.rs` owns an `eliot.goal` instruction
+entry and prompt activation, explicitly without a native Goal API. Its old wrapper
+must not become the common meaning of native Goal.
+
+Exact upstream links and version limits live in the
+[donor map](donor-map.md#native-goal-and-eliot-goal) and existing donor TOML records.
+Reuse native continuation where the selected installed capability supports it, while
+keeping independent bounded Eliot messages, Task acceptance and original attribution.
+Do not add another executor, proof wrapper or synthetic native capability.
+
+| Inspected owner | Exact read boundary |
+| --- | --- |
+| `store/automation.rs`, `automation/config.rs` | Policy apply/activation calls, Goal settings and enabled-action predicates. |
+| `store/automation_goal_progression.rs` | Activation, source verification, target/prepare, admission/effect revalidation, slot identity, cursor/conflict handling and transfer relocation. |
+| `store/mod.rs`, `automation/authorization.rs` | Immediate reconciliation/admission, technical requester, represented actor and Operation link; production client-registration inventory. |
+| `store/runtime.rs`, `store/opencode.rs` | Queue selection/guard error commit, Goal/repair actor checks, native driver entry, Codex terminal production and outcome transaction. |
+| `store/opencode/execution_reads.rs`, `runtime/opencode_v2/goal.rs` | Durable terminal proof/observation and direct controller instruction/prompt wrapper. |
+| `store/goals.rs`, `store/submissions.rs` | Exact acceptance readback, current progression target, submitted and needs-correction transitions; not the full review/acceptance trace. |
+| `store/automation_transfer.rs`, `store/automation_cron.rs`, `scheduler/calendar.rs`, `scheduler.rs`, `host.rs` | Cursor relocation, calendar generation/occurrence/catch-up, due-index activation and current distinct loops. |
+| Codex `src/lib.rs`, Muse `settings.mjs` / `bridge.mjs`; pinned official Goal files | Current advertised/native Goal mapping and selected upstream contract; no native installation/upgrade. |
+
 ## Next work and retained evidence
 
-Resume the Goal/automation chain named above. The launch/finalizer source search is no
-longer the next untraced task; AR-048/049 remain open implementation work and AR-050 is
-preserved behavior. Installed concurrency, restart and actual native closure remain
-separate unexecuted qualification.
+Resume the candidate/review/correction/acceptance chain named above. Goal selection,
+terminal evidence and calendar identity now have a connected source trace; their open
+defects are implementation work, not reasons to repeat the same source pass. The full
+independent native/Eliot Goal combination, automatic capture and installed restart
+remain unqualified. Existing AR-048/049 and earlier runtime findings remain open.
 
 [Coverage still open](audit-index.md#coverage-still-open) names the other areas;
 [evidence checkpoints](audit-index.md#evidence-checkpoints) links prior detailed traces.

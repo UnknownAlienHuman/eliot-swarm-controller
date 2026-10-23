@@ -106,6 +106,21 @@ due time, Store changes and a slow safety wake, then queries current state. Stor
 atomically claims an occurrence and admits ordinary Operations. Replaying the same
 occurrence returns its existing Operation.
 
+Occurrence identity uses the stable entry and intended trigger occurrence, not the
+current owner, configuration revision or wake time. For a calendar, retain its
+expression/timezone/anchor generation and intended UTC due instant. An action-only
+edit, re-enable, transfer or restart cannot replay an already-considered occurrence;
+`include_existing` may select only an unconsidered occurrence. Changing back to an old
+calendar generation retains its consumed occurrences. Preserve the useful current
+[CheckRun semantics](../schedules.md), without inheriting its owner-copy machinery.
+
+Terminal-driven Goal continuation also retains the exact source input/terminal-event
+identity across entries: a new entry or request ID cannot claim the same continuation
+twice. A temporary authority/capacity blocker does not consume an unadmitted action;
+a later current-state pass rechecks it after rights, ownership or capacity changes.
+Do not rewind the entire event history or replay an already-admitted input to recover
+that blocked subject.
+
 Do not create a process, credential, poller, cursor family or private pending queue per
 action/entry. A lost wake causes a bounded rescan. Downtime coalesces missed ticks
 according to selected policy rather than replaying stale model prompts.
@@ -221,8 +236,8 @@ A's review.
 
 ### Goal message and native Goal
 
-Harness Goal is adapter-native and default where supported. `goal_message` is an
-independent ordinary message action:
+Harness Goal is adapter-native and default where the selected adapter exposes the
+real capability. `goal_message` is an independent ordinary message action:
 
 ```text
 selected event/due occurrence
@@ -230,15 +245,56 @@ selected event/due occurrence
 -> one agent.send Operation
 ```
 
-Goal policy owns message/template, trigger/cadence, cooldown, optional max occurrences,
-turn/elapsed/cost/no-progress budgets, completion evidence and stop/rotation behavior.
-Defaults do not invent an unlimited continuation loop. A later occurrence may repeat
-text intentionally; the same occurrence never repeats. Disabling Eliot messages does
-not pause native Goal, and pausing native Goal does not disable Eliot messages.
+Use the represented Manager's ordinary Send authority on any selected adapter that
+supports the requested delivery timing. Do not branch on vendor names or require a
+native Goal record/proof as permission to send an Eliot message. Preserve the original
+Task/revision/Attempt, source Operation and binding; the technical requester is not a
+registered Manager or an independent capability grant.
+
+Check the work phase at admission and again before unsent native input:
+
+| Current subject | Automatic next action |
+| --- | --- |
+| Current working assignment, eligible occurrence, no unresolved conflicting input/request | Admit at most one bounded Goal Send. |
+| Candidate submitted or awaiting its review/check disposition | Pause generic Goal Sends; continue result capture/readback, required checks, review and acceptance. |
+| Current `needs_correction` | `return_changes` or its resume path owns one findings-bearing correction Send for the exact candidate/review. Generic Goal Sends cannot compete with or bypass that correction identity. |
+| Accepted, superseded or released assignment | No new task-linked Goal input; retain historical result and effect readback. |
+| Uncertain input, pending question/permission or incompatible native activity | Read back or answer through the proper action; do not use Goal Send as retry or Reply. |
+
+Goal policy selects message/template, trigger/cadence, cooldown and stop/rotation
+behavior. Enabling recurring `goal_message` requires a positive finite
+`max_occurrences` and `max_no_progress_rounds`; optional elapsed/native-turn/cost limits
+may stop it earlier. Missing bounds reject configuration rather than mean unlimited.
+The admission transaction reserves the occurrence against that budget once; identical
+retry does not spend twice. A new request ID, entry edit, transfer or restart does not
+reset consumption for the same Goal/Task revision/Attempt. An explicit attributable
+policy change may authorize additional remaining budget, retaining prior consumption;
+it cannot reset counters or refill them automatically on a wake.
+
+Progress is a relevant candidate change, new requirement-linked result/check evidence,
+or disposition of an actionable finding. An unchanged candidate can gain useful
+evidence; a fresh ID, another terminal event or unrelated edit cannot reset no-progress.
+Evaluate a settled round after its required capture/readback so missing evidence is
+not mistaken for an empty result. Use existing Goal/entry settings and linked
+Operations/evidence for this accounting, not a new workflow journal. Unknown native
+usage is not zero; a requested native-turn/cost bound needs the selected source's
+capability and current facts. A finite occurrence cap still bounds Eliot messages.
+These limits do not stop a simultaneously active native Goal. Do not present an Eliot
+message cap as a bound on autonomous native turns or total shared-session spend; those
+controls need the native Goal's own supported budget/stop policy.
+
+On exhaustion or the no-progress bound, stop further Goal admissions and coalesce one
+addressed Governor decision with the exact subject, evidence and choices to revise,
+renew, rotate or stop. Capture, review, acceptance and unrelated work remain eligible.
+A later authorized occurrence may intentionally repeat text; the same occurrence
+never repeats. Disabling Eliot messages does not pause native Goal, and pausing native
+Goal does not disable Eliot messages or replenish their budget.
 
 Governor may combine native Goal and Eliot messages with different objectives. It
 pauses/clears native Goal only through the adapter's real capability and exact session.
-No controller “continue” command is rebranded as a vendor Goal.
+Native Goal ACK/status is not a terminal turn or Task acceptance. No controller
+“continue” command is rebranded as a vendor Goal. See the pinned
+[native capability comparison](donor-map.md#native-goal-and-eliot-goal).
 
 ## 7. Script policy
 
@@ -255,6 +311,13 @@ re-running admitted effects.
 
 Transfer changes owner/revision of the same `entry_id`. Due occurrences and child
 Operations keep original admitting identity; future actions recheck current rights.
+
+| Change | Effect on existing work |
+| --- | --- |
+| Disable or edit entry settings | Stop/change future admissions. A queued Operation keeps its admitted request and attribution; entry revision mismatch alone does not reject it. |
+| Transfer entry | Future admissions use the successor's current rights. Existing Operations keep their original represented actor; no retroactive reattribution or replay. Recheck unclaimed blocked subjects under the successor's rights. |
+| Actual grant revocation, Task revision/release, changed candidate phase or binding scope | Revalidate the exact unsent action and reject/supersede it when no longer authorized or eligible. Policy disable is not an authority revocation. |
+| Input already sent, accepted or uncertain | Preserve its ordinary lifecycle and exact readback/result obligations. Changing policy cannot prove cancellation or authorize replay. |
 
 Remove disabled former-owner copies, successor chains, ancestry walks and journal
 relocators. A→B→A preserves one entry rather than colliding with historical copies.
@@ -283,6 +346,14 @@ while several steps have no ordinary common action and depend on separate consum
 Current Goal progression has only `goal_id` settings and admits one continuation per
 terminal event through its own cursor/slot/proof machinery.
 
+The [connected source trace](audit-register.md#trace-2026-10-23-goal-policy) records
+specific gaps: OpenCode's generated `agent.goal` is rejected at the runtime actor
+guard; Codex rechecks enabled/exact policy revision after admission; submitted and
+correction Attempts lack a generic-Goal phase fence; finite total/no-progress policy
+is absent; ownership-conflict cursor advancement can hide an unclaimed event after
+transfer. Terminal deduplication and calendar occurrence continuity are useful
+existing behavior, not evidence that these gaps are fixed.
+
 Migrate one connected action at a time. Once callers use the target action, remove old
 enum value, schemas, policy, Store state, fixtures and worker demand in the same slice.
 
@@ -297,8 +368,12 @@ enum value, schemas, policy, Store state, fixtures and worker demand in the same
 - only configured route fallbacks are used;
 - native policy handles known requests and exact unresolved requests reach Governor;
 - native/Eliot Goals work alone/together with selected budgets and no infinite default;
+- a submitted candidate pauses generic Goal input while capture/check/review/accept
+  continue; correction admits one findings-bearing Send for its exact subject;
 - no-progress leads to bounded Governor decision; safe rotation drains/checkpoints;
 - correction returns all findings once; candidate-specific evidence gates acceptance;
 - disable/transfer preserve in-flight and occurrence identity;
+- disable/edit alone do not reject admitted input; real revocation/stale subject still
+  fences unsent input; transfer retries an unclaimed blocker without replaying history;
 - no standalone scheduler, WorkDispatch queue, repair workflow, Goal cursor workflow
   or GitHub projection workflow remains after its migration.

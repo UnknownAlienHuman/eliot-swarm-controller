@@ -16,12 +16,12 @@ adapter has binding-scoped credentials, never Manager authority over Tasks.
 | --- | --- | --- |
 | `agent.open` | `Open` | Open, resume or attach selected native session; no silent replacement. |
 | `task.dispatch` | `Dispatch` | First controller-owned logical input of an Attempt. |
-| `agent.send` | `Send(next_turn | steer)` | Follow-up input with declared timing/target semantics. |
+| `agent.send` | `Send(next_turn \| steer)` | Follow-up input with declared timing/target semantics. |
 | `agent.reply` | `Reply` | Answer one exact pending question/form/permission. |
 | `agent.configure` | `Configure` | Apply supported model/mode/effort/options; report effective values. |
 | `agent.goal` | `Goal` | Native set/edit/pause/resume/clear where supported. |
 | `agent.background` | `Background` | Background eligible native work. |
-| `agent.cancel` | `Cancel(turn | queued_input)` | Cancel exact native scope; unsent Store work uses `operation.cancel`. |
+| `agent.cancel` | `Cancel(turn \| queued_input)` | Cancel exact native scope; unsent Store work uses `operation.cancel`. |
 | `agent.recover` | `Recover` | Resume known session after supported checks, never replay input. |
 | `agent.refresh` | `Refresh` | Explicit safe readback, not a prerequisite for local state. |
 | `agent.result` | `Result` | Read attributable output through bounded normalized pages. |
@@ -270,6 +270,21 @@ Eliot Goal independently sends ordinary messages on selected events/due occurren
 Both may run together. One occurrence deduplicates its input; a later occurrence may
 repeat text. Pausing/clearing one does not pause the other or cancel admitted input.
 Neither accepts a Task.
+
+Advertise the actual installed capability and supported verbs. Upstream Goal support
+does not establish support in an Eliot adapter: current Codex Rust advertises
+`agent.goal` unsupported, Muse Node maps native verbs, and built-in OpenCode implements
+an Eliot instruction/prompt wrapper. The pinned
+[donor comparison](donor-map.md#native-goal-and-eliot-goal) separates these facts from
+target work and native qualification.
+
+An Eliot Goal message needs ordinary Send capability and exact Manager/Task/Attempt
+authority; it does not need a native Goal record. The
+[policy owner](configuration.md#goal-message-and-native-goal) checks candidate phase,
+finite budgets and no-progress. Pausing generic Goal messages for submitted/review or
+correction work does not pause native Goal or block result capture, checks, review,
+acceptance or the single findings-bearing correction Send. Native Goal admission,
+native turn completion, captured output and accepted Task are distinct observations.
 
 ## Local observation and account state
 

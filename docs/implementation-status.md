@@ -5,23 +5,24 @@
 **SOURCE_AUDIT_INCOMPLETE / TARGET_DOCUMENTS_WORKING_DRAFT / RUNTIME_REFACTOR_IN_PROGRESS.**
 
 Repository inspected on **2026-10-23** at
-`b2519aa1b70706eeb8a77f76df01e7c4de65c787`. The latest runtime change is
+`73ba7009bbc5c5515fe4c5f85743066e944106ef`. The latest runtime change is
 `c92120ed70ca7e625440a8a19517c481e73b13c9` (2026-10-21). Comparing those revisions
-shows **17 documentation-only commits**. This update also changes documentation only.
+shows **18 documentation-only commits**. This update also changes documentation only.
 
-The previous checkpoint indexed AR-001–047. This pass continued its unfinished source
-chain and added AR-048–050: missing attached-binding retirement, route-edit accounting,
-and preserved common transactional launch admission. It also reconciled old/current
-entrypoints, extended the requirement map and checked selected official donor APIs and
-release metadata. No runtime defect is marked repaired.
+The previous checkpoint indexed AR-001–050. This pass continued the Goal policy chain
+through admission, runtime selection and terminal evidence; it added AR-051–058 and
+checked calendar occurrence continuity plus exact official Codex/Muse Goal sources.
+The target now states phase-gated ordinary messages, finite budgets, disable/transfer
+semantics and capability limits that a coding agent can implement and verify. No
+runtime defect is marked repaired.
 
-- [Resume point and 50 finding records](agent-operations/audit-register.md#resume-here).
+- [Resume point and 58 finding records](agent-operations/audit-register.md#resume-here).
 - [Evidence/source index](agent-operations/audit-index.md): exact traces and remaining coverage.
 - [Document index](agent-operations/README.md): current contracts versus historical evidence.
 - [Implementation](agent-operations/implementation.md): the only work order.
 - [Donor register](agent-operations/donor-map.md): what to reuse, source links and version limits.
 
-The records include defects, preserved mechanisms and partial boundaries, not 50 bugs
+The records include defects, preserved mechanisms and partial boundaries, not 58 bugs
 or a measured audit percentage. Historical requirement mapping is selected, not an
 exhaustive reread of all archives. The private Claude-script ZIP was not re-executed.
 
@@ -70,6 +71,8 @@ uncaptured bodies remain at risk in current code.
 | Result/continuation/restart, AR-001–035 | Exact selected caller/Store/adapter traces, useful assembly/grants, cross-route delivery and source-cost findings | Every command/installed contract, first historical capture across revocation, live restart/power-loss. |
 | Queue/root/provider, AR-036–044, 049–050 | History-dependent admission, pending saturation, native-default mismatch, stale precedence and route-edit accounting; common claim/Open transaction preserved | Installed restart/concurrency and corrected budget continuity. No over-admission demonstrated. |
 | Shutdown/resource retirement, AR-045–048 | Non-ready shutdown barrier, intentional-detach/demand mismatch and missing attached-binding finalizer confirmed through the running sweep | Implementation of eventual retirement; actual detach/Goal/child and crash-only behavior. |
+| Goal policy/admission/transfer, AR-051–056 | OpenCode actor rejection before dispatch; Codex policy-edit rejection of queued input; submitted/correction eligibility, missing finite bounds and unclaimed-event cursor gap. Exact terminal identity/atomic deduplication preserved | Ordinary Send replacement, phase/budget fixes and installed disable/transfer/restart. Native terminal still does not prove result capture or acceptance. |
+| Calendar/native Goals, AR-057–058 | Current CheckRun occurrence continuity and latest-only catch-up; current native mappings separated from pinned upstream Goal contracts | General automation loop, Codex native Goal mapping and selected installed-native qualification. Muse's SDK lock does not identify its native binary. |
 | Other implementation areas | Inherited structural and selected source reviews | Remaining chains listed in the audit index; no whole-project completion claim. |
 
 No AR entry is closed merely because its target documentation was corrected. Preserve
@@ -90,10 +93,10 @@ target, not runtime-complete; current gaps remain explicit.
 | Exactly one initial input — v18 §4; `single-initial-dispatch.json` | [Assignment](task-policy.md#6-assignment-and-initial-input); `operations`, `Attempt.start_owner` | Preserve existing controller/native-manager guard. Follow-up Send is separate. |
 | One native control owner — v18 §4; `native-owner-collision.json` | [Native ownership](agent-operations/module-api.md#capabilities-hello-and-native-owner); binding/native owner | Retained; no exclusivity claim against unrelated external clients. |
 | Complete agent-managed work cycle — v18 §§10, 12; script review | [Delivery](agent-operations/delivery.md#1-one-connected-cycle); existing Store domain handlers | Separate workflows and automatic capture/readback gaps remain. |
-| Independent native and Eliot Goals — later owner clarification; script review | [Goal policy](agent-operations/configuration.md#goal-message-and-native-goal); adapter + ordinary Send | Retained; old exclusive-driver rule superseded. Goal progression still needs reduction. |
-| Bounded continuation/progress/rotation — script review | [Route/session policy](agent-operations/configuration.md#5-route-dependency-session-and-permission-policy); launcher/automation | No infinite or age-only default; complete target not implemented. |
+| Independent native and Eliot Goals — later owner clarification; script review | [Goal policy](agent-operations/configuration.md#goal-message-and-native-goal); adapter + ordinary Send | Retained; old exclusive-driver rule superseded. AR-051/058 distinguish failed OpenCode automatic input and unimplemented Codex native mapping from real native Goal. |
+| Bounded continuation/progress/rotation — script review | [Goal limits](agent-operations/configuration.md#goal-message-and-native-goal), [route/session policy](agent-operations/configuration.md#5-route-dependency-session-and-permission-policy); launcher/automation | Finite occurrence/no-progress contract specified; current Goal settings lack these bounds (AR-054). Phase guard gap AR-053; no age-only default. |
 | Exact permission/question answers — v18 §§6–8; script review | [Semantic Reply](agent-operations/module-api.md#semantic-actions); pending-request adapter + Governor | Retained; capability-specific. Neither first-option/blanket-deny nor Send-as-Reply. |
-| Scheduled work, same-occurrence dedupe, missed-tick policy — v18 §10; `schedule-catchup.json` | [Triggers](agent-operations/configuration.md#4-trigger-and-loop); existing schedule/Operation owners | Current [CheckRun scheduling](schedules.md) does not establish the broader target loop. |
+| Scheduled work, same-occurrence dedupe, missed-tick policy — v18 §10; `schedule-catchup.json` | [Triggers](agent-operations/configuration.md#4-trigger-and-loop); existing schedule/Operation owners | Preserve current CheckRun generation/occurrence continuity and latest-only catch-up (AR-057); general Goal/action loop remains target work. |
 | Corrections/unfinished work before new work without starvation — script review | [Queue](swarm-launcher-assignment-context.md#2-queue-is-a-projection); launcher | WorkDispatch copied state and 128-subject intake barrier remain. |
 | Preparatory work with honest dependencies — `dependency-revalidation.json` | [Dependencies](task-policy.md#4-dependencies-start-policy-versus-acceptance-truth); claim/acceptance | `hold` or explicit preparatory mode; current claim gates every dependency. |
 | Explicit route/model/effort/fallback — v18 §9 | [Route policy](agent-operations/configuration.md#5-route-dependency-session-and-permission-policy); launcher | Retained; no silent substitution. AR-049 records edit-accounting gap. |
@@ -111,7 +114,7 @@ target, not runtime-complete; current gaps remain explicit.
 | Required script controls under ordinary rights — script review | [Script policy](agent-operations/configuration.md#7-script-policy); `swarm-scripts` + worker | Current returned-action enum covers message/notification/task-create only. |
 | Peer questions without council platform — v18 §§10, 16 | [Communication](agent-communication-program.md); mailbox/GM | Keep recipients and object grants; coordination/global-timeline machinery remains. |
 | GitHub collection/import/write and acceptance distinct — v18 §13 | [Publication](agent-operations/delivery.md#10-acceptance-and-publication); GitHub owners + Forge | Duplicate writers/projection workflows remain; policy automation retained. |
-| Handover keeps work and historical recipients — owner decisions §5 | [Communication](agent-communication-program.md); client/GM/mailbox owners | Stable client and historical owner stay; normalization/cleanup gaps remain. |
+| Handover keeps work and historical recipients — owner decisions §5 | [Communication](agent-communication-program.md), [policy transfer](agent-operations/configuration.md#8-transfer-and-disable); client/GM/mailbox/automation owners | Stable client and historical owner stay; AR-052/055 distinguish admitted intent from a still-unclaimed blocked Goal subject. Normalization/cleanup gaps remain. |
 | Restart cannot kill unrelated PID or duplicate owner — v18 §§8, 15 | [Process custody](agent-operations/implementation.md#d--process-custody); `swarm-process` | PID/birth/image/Job checks retained; full race matrix unqualified. |
 | Independent module update; install is not execution — v18 §§3, 15 | [Installation](agent-operations/module-installation.md), [modularity](agent-operations/modularity.md); installer/supervisor | Selected current route only; no automatic transfer of live bindings. |
 | One fixed remote identity/profile — v18 §§2, 15 | [Gateway](agent-operations/implementation.md#v--small-single-tenant-gateway); `swarm-gateway` | Target explicit; secret loading/compatibility launcher still need source work. |
@@ -137,8 +140,9 @@ missing a live machine does not excuse leaving source paths untraced.
 
 ## Next work
 
-**Audit:** the cancellation/finalizer search and direct/automatic admission transaction
-are source-traced. Resume the Goal-policy/occurrence/disable/transfer chain in
+**Audit:** the selected Goal-policy/terminal/disable/transfer and calendar occurrence
+chains are source-traced. Resume candidate submission → reviewer assignment/replacement
+→ all-findings correction → corrected submission → acceptance in
 [audit-register](agent-operations/audit-register.md#resume-here). The
 [audit index](agent-operations/audit-index.md) keeps other untraced boundaries visible.
 

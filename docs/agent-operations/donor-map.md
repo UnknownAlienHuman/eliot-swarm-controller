@@ -42,6 +42,27 @@ CLI/service version, which remains unknown unless an actual launch reports it. C
 | [ACPX](https://github.com/openclaw/acpx) | Optional ACP owner/queue/watch and session continuity; reviewed source is [v0.19.3](https://github.com/openclaw/acpx/tree/v0.19.3) at `ee6090df63afa9d6f7fc1c091e1961e50f2f1476`. | No code installed. v0.19.4 (`8e396609238086dee6a407fdb3b3ac46dbdedd70`) was a resolved candidate whose source review remains owed. Latest release metadata checked: v0.20.0 (2026-10-20), not reviewed here. | `crates/swarm-adapter-command` owns selected ACP backend. ACPX is conditional for a real consumer; its queue/watch is not a general replay key or another Store. |
 | [Waku](https://github.com/egoist/waku) | External-service ownership, one sequential worker, reconnect distinct from process exit, terminal from execution outcome; historical source [`v0.1.20`](https://github.com/egoist/waku/tree/10bcd728c9b2f07d664cfece3c8c870d3418ddd2). | Pattern only, no import. Current upstream main checked 2026-10-23 at [`10bcd72`](https://github.com/egoist/waku/commit/10bcd728c9b2f07d664cfece3c8c870d3418ddd2); GPL-3.0-only. | `crates/swarm-adapter-opencode`: semantics only; do not vendor/link Waku or import its desktop product. Reject same-ID fresh-session fallback and ignored settings failures. |
 
+### Native Goal and Eliot Goal
+
+The native interfaces are execution controls; Eliot Goal remains a scoped
+Task/Attempt objective. Eliot Goal completion reads the exact Store Task
+acceptance record; neither a native Goal nor Eliot Goal itself grants acceptance.
+They may be enabled together.
+`goal_message` is a normal attributable `agent.send`; it remains separate from a
+native Goal and is not a required continuation wrapper.
+
+| Harness | Current upstream Goal capability and limit | Eliot implementation status |
+| --- | --- | --- |
+| Codex app-server | Upstream source inspected at [`970111f`](https://github.com/openai/codex/tree/970111f6cb62cc02fe36a82ea7d71b37a2889c97): use [`thread/goal/set\|get\|clear`](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/request_processors/thread_goal_processor.rs), with `status=active\|paused` for resume/pause. Active goals may inject into a running turn or start an idle turn; the native Goal extension continues an active goal when its thread becomes idle and restores its runtime on resume ([`extension.rs`](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/ext/goal/src/extension.rs)). This requires the Goals feature and an allowed model provider; protocol statuses also include blocked, usage-limited, budget-limited and complete ([`thread.rs`](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/v2/thread.rs)). | The current Rust adapter marks `agent.goal` unsupported (`crates/swarm-adapter-codex/src/lib.rs`). Mapping this API is a target capability, not current support or installed-runtime qualification. Native Codex version is not established by a package lock. |
+| Muse | Upstream SDK source inspected at [`09d67ec`](https://github.com/meta-models/muse-code-sdk/commit/09d67eca616b7b02a2d060271123c1fedbdb8fb7): [`goal.rs`](https://github.com/meta-models/muse-code-sdk/blob/09d67eca616b7b02a2d060271123c1fedbdb8fb7/rust/clients/sdk-rs/src/msp/method/goal.rs) describes `goal/set\|edit\|pause\|resume\|clear`. Set/edit need a nonempty trimmed objective and command ID; idle set/edit/resume may wake a fresh goal turn, while busy calls' optional `turnId` names only the admission-time turn and promises no delivery. Pause/clear never name or wake a turn. | `modules/muse/settings.mjs` maps all five operations; bridge.13 journals and submits them natively. The lock is SDK 1.3.0; newer upstream source does not prove the installed Muse runtime supports its full contract. Native Muse version and live Goal behavior remain unqualified. |
+| OpenCode | No native Goal API is established by the reviewed service contract. | `crates/swarm-kernel-host/src/runtime/opencode_v2/goal.rs` stores Eliot's `eliot.goal` instruction entry and activates it with one ordinary prompt admission. Automatic GoalProgression's intended single continuation is blocked: its generated `agent.goal` caller misses the `agent.send`-only actor guard in `runtime::next_internal`, reaches absent client registration, and commits the Operation as rejected without selecting a native command ([AR-051](audit-register.md#ar-051)). This is separate from the direct wrapper; neither path grants Task acceptance. |
+
+Reuse native Goal's own objective state, pause/resume, and native continuation when
+the selected adapter exposes and qualifies those controls. Keep Eliot's exact
+Task/Attempt scope, ordinary `goal_message`, and acceptance checks independent;
+do not duplicate native turn-by-turn progression as an Eliot proof/cursor wrapper
+or default to unbounded repeated sends.
+
 To refresh this register, inspect the Eliot lock/manifest and adapter call sites, then
 the canonical upstream release/source at an exact commit. Record the date, release tag
 and full commit separately; distinguish a rolling docs page from a tagged schema, a
@@ -118,8 +139,10 @@ Goal in the selected implementation; Eliot Goal remains ordinary input.
 ### Codex
 
 Keep one Rust app-server owner and exact pre-IPC page persistence/restart replay. Saved
-page retry is already separate from a new history read. Keep user/thread/turn identity
-and native Goal; replace the full checkpoint/tombstones with lifetime-specific records.
+page retry is already separate from a new history read. Keep user/thread/turn identity.
+The current Rust adapter rejects `agent.goal`; native Codex Goal mapping is a target
+capability only (see [Native Goal and Eliot Goal](#native-goal-and-eliot-goal)). Replace
+the full checkpoint/tombstones with lifetime-specific records.
 
 The reader currently verifies current root/model/workspace before reading historical
 output. Separate immutable source identity from active execution only through an exact
