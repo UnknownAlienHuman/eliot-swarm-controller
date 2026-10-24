@@ -45,7 +45,7 @@ Merged work immediately preceding this checkpoint:
 | --- | --- | --- |
 | Duplicate host CLI/MCP launcher removed | `25a8e3b`, recorded net −1,206 Rust lines | Most runtime duplication remains. |
 | Active Antigravity coordinate aligned on v6 | `cba98b7` | No installed native-turn qualification. |
-| Terminal receipt decoupled from Store observation | `eeea355`, recorded net −265 production Rust lines | Dispatch proof and crash-unsafe delivery remain. |
+| Terminal receipt decoupled from Store observation | `eeea355`, recorded net −265 production Rust lines | Crash-unsafe delivery remains; A1b removed the dispatch proof gate. |
 | One dispatch producer across SUCCESS/ERROR/CANCELED | `c92120e`; historical run `39579583956`, job `119153571930` | Scoped regression/Clippy only; no crash/installed/load proof. |
 | Disconnected GitHub PR/projection modules removed | `98b350e`, net −250 Rust lines; run `40087522775` passed scoped Ubuntu/Windows gates | No PR-source feature or remote observation was added. |
 | Antigravity dispatch refresh/proof gate removed | `3c7a84f`, net −305 production Rust and −20 qualification-glue lines; run `40131522836`, job `120984044559` | A2 durable delivery, old-boot completion and installed/crash qualification remain. |
@@ -53,7 +53,7 @@ Merged work immediately preceding this checkpoint:
 ```text
 A0   LANDED                   active v6 coordinate
 A1a  LANDED / SCOPED PASS     terminal decoupling + producer lifecycle
-A1b  LANDED / SCOPED PASS      refresh/proof gate removed; current fences retained
+A1b  LANDED / SCOPED PASS     refresh/proof gate removed; current fences retained
 A2   NEXT / NOT IMPLEMENTED   durable outcome/body/page delivery and successor completion
 A3   NOT IMPLEMENTED          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime
