@@ -15,11 +15,12 @@ immutable snapshots below retain earlier detailed evidence.
 5. Record a deletion only after the previous consumer, data disposition and positive
    path are identified.
 
-Current checkpoint: IPC/MCP source inspected at
-`053f1e0fb15b3d40c00918f4a25ec8f9e4969e02` on 2026-10-24. PR #189 is merged at that
-commit. Its exact head `3c0525349b3600834a217e52b2229cf8c6eb0d46`, workflow run
-`40088525487`, completed successfully; it changed documentation only. No runtime IPC,
-Store migration, concurrent-load or installed-product qualification is implied.
+Current checkpoint: local observation source inspected at
+`c73c36c72d2c86cf710fa69e39ab07e2052c1f5e` on 2026-10-24. PR #190 is merged at that
+commit. Its exact head `a93ab20ec334471e1df5565b5a92eb44c868f366`, workflow run
+`40090027947`, passed changed-path and Markdown validation; the final diff was
+documentation-only. J0 remains selected but not landed. No live fleet/process/Git/
+remote or installed-product qualification is implied.
 
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints
@@ -46,10 +47,11 @@ Store migration, concurrent-load or installed-product qualification is implied.
 | AR-089–099 | [`e42c464`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e42c464d58db770cc5490f46f391843f9fec8df2/docs/agent-operations/audit-current.md#trace-2026-10-24-github-sources) | GitHub collection, mutable pagination, Task import/work pool and remote observation. |
 | AR-100–114 | [`e99c06b`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e99c06bb490fe630eec70337ce5137a26e145d84/docs/agent-operations/audit-current.md#trace-2026-10-24-mailbox-coordination) | Mailbox identity/storage, GM continuity, coordination deletion and disconnected GitHub cleanup. |
 | AR-115–126 | [`053f1e0`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/053f1e0fb15b3d40c00918f4a25ec8f9e4969e02/docs/agent-operations/audit-current.md#trace-2026-10-24-store-evolution) | Store bootstrap, numeric version, downgrade fence, extension verification, readers and finite v1 migration. |
-| [AR-127–141](audit-current.md#findings-ar-127141) | [Current trace](audit-current.md#trace-2026-10-24-ipc-mcp) | Multiplexed IPC, MCP slot lock, subscriptions, exact Tasks reads, writer occupancy and WAL routing. |
+| AR-127–141 | [`c73c36c`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c73c36c72d2c86cf710fa69e39ab07e2052c1f5e/docs/agent-operations/audit-current.md#trace-2026-10-24-ipc-mcp) | Multiplexed IPC, MCP slot lock, subscriptions, exact Tasks reads, writer occupancy and WAL routing. |
+| [AR-142–159](audit-current.md#findings-ar-142159) | [Current trace](audit-current.md#trace-2026-10-24-governor-observation) | Binding-rooted discovery, provider/process/worktree/remote sources, joined Governor view and deletion boundaries. |
 
-There are 141 entries. Some preserve correct behavior, narrow an earlier claim or
-record a transition boundary; they are not 141 defects or a completion percentage.
+There are 159 entries. Some preserve correct behavior, narrow an earlier claim or
+record a transition boundary; they are not 159 defects or a completion percentage.
 
 ## Source and target map
 
@@ -61,14 +63,14 @@ record a transition boundary; they are not 141 defects or a completion percentag
 | Review/correction/acceptance, 059–064 | `store/{submissions,reviews,review_disposition,acceptance}` | [Delivery](delivery.md), implementation G |
 | Fixed source/CheckRun, 065–070 | `store/checks`, `checks/{source,worker,standalone_host}`, `swarm-checks` | [CheckRunner](../check-runner.md), implementation K |
 | ScriptRun/actions, 071–078 | `store/scripts`, `scripts/runner`, `swarm-script-worker`, `swarm-scripts`, automation intake/dispatch | [ScriptRunner](../script-runner.md), implementation K |
-| Forge/GitHub effects, 079–088 | `store/forge`, `swarm-forge-worker`, `store/{github_effects,github_pr_effects,automation_publication,automation_github_projection}` | [External effects](external-effects.md), implementation K/U |
-| GitHub collection/import, 089–099 | `github/{client,observer,work_pool}`, `store/github`, `automation_work_dispatch`, `tasks`, migration 006 | [GitHub sources](github-sources.md), implementation U0–U2/U5 |
-| Mailbox/coordination, 100–113 | `store/{mailbox,object_reads,gm,coordination_threads,coordination,code_scopes,integration,concilium,coordination_watch}` plus coordination wire modules | [Agent communication](../agent-communication-program.md), implementation S/T |
+| Forge/GitHub effects, 079–088 | `store/forge`, `swarm-forge-worker`, GitHub effect/automation owners | [External effects](external-effects.md), implementation K/U |
+| GitHub collection/import, 089–099 | `github/{client,observer,work_pool}`, `store/github`, WorkDispatch, Tasks | [GitHub sources](github-sources.md), implementation U0–U2/U5 |
+| Mailbox/coordination, 100–113 | mailbox/object reads/GM and coordination products/public surfaces | [Agent communication](../agent-communication-program.md), implementation S/T |
 | Disconnected GitHub cleanup, 114 | removed `github/{pulls,projection}.rs` and pull-origin helper | implementation U/R; no replacement product claimed |
-| Store evolution, 115–126 | `swarm-store`, `store/mod.rs`, migrations 001–015, special event-schema installers, Doctor/status reader | [Store evolution](store-evolution.md), implementation I |
-| IPC/MCP, 127–141 | `swarm-client::{client,multiplex}`, host `ipc`, `swarm-mcp::{mod,subscriptions}`, Store attention/timeline/status reader | [IPC/MCP](ipc-mcp.md), implementation H/J |
-| Observation next | module observations, provider readers, process metrics, workspace/Git and remote collectors | [Observability](observability.md), implementation R |
-| Gateway | `swarm-gateway` and compatibility launcher | [Gateway](../gateway.md), implementation V |
+| Store evolution, 115–126 | `swarm-store`, Store bootstrap/migrations, special verifiers, Doctor/status reader | [Store evolution](store-evolution.md), implementation I |
+| IPC/MCP, 127–141 | `swarm-client`, host IPC, MCP facade/subscriptions and Store hot reads | [IPC/MCP](ipc-mcp.md), implementation H/J |
+| Governor observation, 142–159 | module observations/runtime catalog/provider conditions/supervisor/process metrics/workspace lifecycle/Forge reports | [Observability](observability.md), implementation R |
+| Gateway next | `swarm-gateway`, secret loading, fixed MCP profile and compatibility launcher | [Gateway](../gateway.md), implementation V |
 
 ## Coverage still open
 
@@ -83,7 +85,7 @@ record a transition boundary; they are not 141 defects or a completion percentag
 | J IPC/MCP | J0 runtime lock release, exact pending-input read, bounded report production, one pump, WAL routing, disconnect/load qualification. |
 | K effects | Script action lifecycle/cancel; Check executor cut; Forge process-hold disposition; one GitHub API owner and automatic unknown readback. |
 | U GitHub | Stable collector cut, aggregate coverage, explicit import, live-work conflict, work-pool deletion, connected PR source and independent remote-ref view. |
-| R observation | Independent provider/process/Git/remote collectors, unmatched subjects, source gaps and one joined view. |
+| R observation | Source registry, provider/process/Git/remote collectors, unmatched subjects, joined WAL projection, one read model and old-surface deletion. |
 | S/T mailbox/deletion | Recipient rows, concrete unresolved-state migration and vertical removal of coordination products/public surfaces. |
 | V gateway | Private secret loading, session limits, disconnect and launcher deletion. |
 | Installed/native/Windows/load | Separate executed qualification; source evidence is not a substitute. |
