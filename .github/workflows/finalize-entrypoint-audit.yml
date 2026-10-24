@@ -1,0 +1,36 @@
+name: Finalize entrypoint audit registers
+
+on:
+  push:
+    branches:
+      - docs/agent-ready-audit-20261024
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: docs/agent-ready-audit-20261024
+      - name: Update active audit registers
+        run: python tools/ci/finalize-entrypoint-audit.py
+      - name: Refresh generated inventories
+        run: |
+          python tools/ci/source_surface_inventory.py
+          python tools/ci/documentation_readiness_audit.py
+      - name: Publish checkpoint and remove one-shot tooling
+        shell: bash
+        run: |
+          rm .github/workflows/finalize-entrypoint-audit.yml
+          rm tools/ci/finalize-entrypoint-audit.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "audit: checkpoint entrypoint and public surfaces"
+          git push origin HEAD:docs/agent-ready-audit-20261024
