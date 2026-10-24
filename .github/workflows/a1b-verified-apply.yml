@@ -59,6 +59,11 @@ jobs:
               p.write_text(updated, encoding='utf-8')
 
           controller = 'modules/antigravity-rust/src/controller.rs'
+          replace_once(
+              controller,
+              '    stream::{Phase, StreamState, TerminalDisposition, Turn},\n',
+              '    stream::{StreamState, TerminalDisposition, Turn},\n',
+          )
           regex_once(
               controller,
               r'''(?P<block>\s*object\.insert\(\n\s*"model_readback_state"\.to_owned\(\),\n\s*json!\(self\.model_readback_state\),\n\s*\);\n)(?=\s*\})''',
@@ -118,19 +123,30 @@ jobs:
               $agProgression.trace.dispatched_poll -eq 1 -and $null -eq $agProgression.stop)
           ''',
           )
-          PY
 
-          if rg -n \
-            'AntigravityDispatchSessionProof|ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND|ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND|require_current_session_proof|session_proof_digest|STALE_ANTIGRAVITY_DISPATCH_PROOF|sessionRefreshAttempted|native_session_refresh' \
-            crates modules tools; then
-            echo 'retired Antigravity proof contract remains' >&2
-            exit 1
-          fi
-          if rg -n 'antigravity_dispatch_session_proof' crates modules tools \
-            -g '!modules/antigravity-rust/tests/sequential_retention.rs'; then
-            echo 'retired Antigravity proof payload remains outside its negative test' >&2
-            exit 1
-          fi
+          roots = [Path('crates'), Path('modules'), Path('tools')]
+          forbidden = (
+              'AntigravityDispatchSessionProof',
+              'ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND',
+              'ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND',
+              'require_current_session_proof',
+              'session_proof_digest',
+              'STALE_ANTIGRAVITY_DISPATCH_PROOF',
+              'sessionRefreshAttempted',
+              'native_session_refresh',
+          )
+          allowed_payload_path = Path('modules/antigravity-rust/tests/sequential_retention.rs')
+          for root in roots:
+              for path in root.rglob('*'):
+                  if not path.is_file() or path.suffix not in {'.rs', '.ps1', '.toml', '.json'}:
+                      continue
+                  data = path.read_text(encoding='utf-8', errors='ignore')
+                  for term in forbidden:
+                      if term in data:
+                          raise SystemExit(f'retired A1b term {term!r} remains in {path}')
+                  if path != allowed_payload_path and 'antigravity_dispatch_session_proof' in data:
+                      raise SystemExit(f'retired proof payload remains in {path}')
+          PY
 
       - name: Format affected Rust
         run: cargo fmt --all
