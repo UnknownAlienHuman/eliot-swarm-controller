@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "inspected_head": "ddc400a16eba371365aedebd8618a81503fd4f27",
+  "inspected_head": "ac3e411a6bb4c8c2ba14062baa7192df6cd6b668",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive",
@@ -8,11 +8,11 @@
     "most Markdown files are not mechanically classified as active or historical"
   ],
   "counts": {
-    "markdown_files": 153,
+    "markdown_files": 154,
     "docs_root_files": 41,
     "active": 20,
     "historical_or_snapshot": 8,
-    "supporting_or_unclassified": 125,
+    "supporting_or_unclassified": 126,
     "broken_local_links": 10,
     "oversized_25k_or_more": 15
   },
@@ -813,6 +813,20 @@
       "lines": 117,
       "headings": 7,
       "classification": "active",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/source-audit-coverage.md",
+      "bytes": 8200,
+      "lines": 72,
+      "headings": 5,
+      "classification": "supporting-or-unclassified",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,

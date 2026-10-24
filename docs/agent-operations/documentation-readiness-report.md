@@ -1,6 +1,6 @@
 # Documentation readiness audit
 
-Inspected repository head: `ddc400a16eba371365aedebd8618a81503fd4f27`.
+Inspected repository head: `ac3e411a6bb4c8c2ba14062baa7192df6cd6b668`.
 
 ## Verdict: NOT READY
 
@@ -14,11 +14,11 @@ This verdict concerns whether an implementation agent can safely treat the docum
 
 | Measure | Count |
 | --- | ---: |
-| Markdown files | 153 |
+| Markdown files | 154 |
 | Files directly under `docs/` | 41 |
 | Explicit active entry points/contracts | 20 |
 | Recognizable historical/snapshot files | 8 |
-| Supporting or unclassified files | 125 |
+| Supporting or unclassified files | 126 |
 | Broken repository-local Markdown links | 10 |
 | Documents at least 25 KiB | 15 |
 
