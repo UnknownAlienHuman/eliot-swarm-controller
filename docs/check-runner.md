@@ -90,6 +90,31 @@ Before final reservation the host resolves and freezes:
 The final Immediate transaction rechecks the source facts. A changed candidate,
 profile, tool, environment, baseline or scope invalidates the prepared plan.
 
+### Cargo scope and effective inputs
+
+At Attempt claim, Store freezes the currently valid accepted candidate for the same
+project as baseline. Missing or unproven baseline widens the check; it is never treated
+as an empty diff.
+
+For `cargo_json`, the resolver runs bounded offline/locked metadata against the captured
+source. It maps local path dependencies by exact captured manifest. Missing, ambiguous
+or external path dependencies, untrusted Cargo configuration, unknown `include`,
+graph changes, shared lock/toolchain/configuration changes or unmapped changed paths
+widen to the whole workspace and disable reuse. A narrow plan records selected/excluded
+packages, changed paths, graph identity, required targets and every widening/gap reason.
+
+A bare required target name that matches several captured workspace targets is
+ambiguous and cannot pass narrow coverage. Parsed artifacts count only when package ID,
+manifest, target kind and source path match the captured planned target.
+
+Built-in path/tool variables and explicitly classified fingerprint environment values
+are represented by value digest. Other configured environment values remain opaque and
+disable reuse. Runtime executable/environment identity is checked again before spawn.
+
+An explicit uppercase `CARGO_TARGET_DIR` may point to an existing absolute,
+non-reparse directory. Profiles sharing it must use the same resource lease. Ambient
+target directories and command-line `--target-dir` are rejected.
+
 ## 4. One command, one process owner
 
 The command does not start when `check.run` is merely queued.
@@ -132,6 +157,11 @@ command again.
   departure of both prospective worker and group.
 - Damaged or ambiguous custody remains held and visible.
 
+Before worker identity is published, the worker has not received Go and cannot have
+started the command. A persisted launch receipt plus proven process/group departure may
+therefore settle that exact launch as incomplete. Missing launch identity remains held;
+absence of a file, process or lock is not proof.
+
 Unrelated resources continue. No replacement writer starts automatically.
 
 ## 6. Passing evidence
@@ -162,7 +192,7 @@ process receipt, stdout/stderr/result artifacts and resource release. A passed r
 Reuse is opt-in (`reproducible=true`) and disabled whenever an effective input is
 opaque, mutable, unversioned or incompletely discovered. Cargo reuse additionally
 requires a versioned build-environment identity covering external tools not discovered
-individually.
+individually, such as linkers, wrappers, rustdoc and code generators.
 
 A reusable source must be one original passed CheckRun:
 
@@ -224,7 +254,32 @@ Target cut:
 
 Do not add an executor profile ladder or a compatibility service.
 
-## 10. Construction and qualification
+## 10. Configure and invoke
+
+Start from the repository examples:
+
+- [`config/checks.example.toml`](../config/checks.example.toml)
+- [`config/task-checked.example.json`](../config/task-checked.example.json)
+- [`config/source-capture.example.json`](../config/source-capture.example.json)
+- [`config/check-run.example.json`](../config/check-run.example.json)
+
+The examples are repository-specific. Keep checks disabled until the trusted profile,
+targets, resource and executor pin are correct.
+
+```powershell
+swarm --request-id capture-1 source capture --file capture.json
+# Read operation.get and retain result.candidate_ref.
+swarm --request-id submit-1 task submit --file submission.json
+swarm --request-id check-1 check run --file check.json
+swarm check get CHECK_ID
+```
+
+Submission and CheckRun may occur in either order when both reference the same immutable
+candidate. Read the original Operation and artifacts for the final machine report and
+output references. Passing a check never accepts the Task, publishes code or closes an
+Issue.
+
+## 11. Construction and qualification
 
 During implementation run formatting and minimal affected warnings-denied Clippy/build.
 A vertical slice closes only with connected cases for:
@@ -241,3 +296,16 @@ A vertical slice closes only with connected cases for:
 
 Installed Windows/Linux process behavior, power loss, native toolchains, escaped
 descendants and load remain separate qualification.
+
+## External contracts
+
+These sources define platform/tool behavior, not product qualification:
+
+- [Cargo JSON messages](https://doc.rust-lang.org/cargo/reference/external-tools.html)
+- [Git batch objects](https://git-scm.com/docs/git-cat-file)
+- [Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+- [Job membership](https://learn.microsoft.com/windows/win32/api/jobapi/nf-jobapi-isprocessinjob)
+- [Job process list](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_process_id_list)
+- [Windows kernel-object namespaces](https://learn.microsoft.com/en-us/windows/win32/termserv/kernel-object-namespaces)
+- [Linux `pidfd_open`](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)
+- [Linux `pidfd_send_signal`](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html)
