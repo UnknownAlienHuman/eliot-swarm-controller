@@ -135,12 +135,10 @@ impl Controller {
             .filter(|delivery| delivery.method() == OUTCOME_METHOD)
             .map(|delivery| delivery.params().clone())
             .collect::<VecDeque<_>>();
-        if outcomes.len() > MAX_PENDING_RECEIPTS {
-            return Err(swarm_contracts::error::Error::new(
-                "MODULE_OUTCOME_OUTBOX_FULL",
-                "retained module outcome count exceeds its active bound",
-            ));
-        }
+        // A prior process may have retained more outcomes than the live
+        // admission window before it failed. Startup must drain that bounded
+        // durable set rather than fail forever. `may_request_next` keeps new
+        // commands closed until the active queue falls below its normal bound.
         let mut controller = Self::new(
             boot_id,
             native_scope_key,
@@ -1053,7 +1051,7 @@ impl Controller {
             .pending_receipts
             .iter()
             .any(|entry| entry["operation_id"].as_str() == Some(outcome.operation_id.as_str()));
-        if !replacing && self.pending_receipts.len() == MAX_PENDING_RECEIPTS {
+        if !replacing && self.pending_receipts.len() >= MAX_PENDING_RECEIPTS {
             return Err(swarm_contracts::error::Error::new(
                 "MODULE_OUTCOME_OUTBOX_FULL",
                 "acknowledge pending manager receipts before admitting another operation",
