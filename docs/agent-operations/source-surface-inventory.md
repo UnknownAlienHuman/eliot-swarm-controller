@@ -1,7 +1,6 @@
 # Entrypoint and public-surface source inventory
 
-Inventory branch head: `3eb20d09b1446a44539d142c0980ffe2777e6568`.
-Live `origin/main` basis: `797ea93f1cfcaad8c8dde2629d666e64efb131c2`.
+Latest commit touching an inspected source file: `e8416d6e7faf26a1b4466800b0befb7f497b1a4d`.
 Combined inspected-cluster source SHA-256: `c55118a3580219f5fd1f4a90082eb51da3bc718e9d8516fac648007859d3d9f7`.
 
 This file records syntax-level facts only. It does not prove authorization, runtime behavior, absence of hidden consumers or qualification.

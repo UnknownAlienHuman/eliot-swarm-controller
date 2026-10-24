@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "inspected_head": "be1129d23905c40e0e8822b8ca20a1ccf4f6c530",
+  "inspected_head": "83b1b513331f3917cc794460417cf11a6fc36ac5",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
@@ -803,8 +803,8 @@
     },
     {
       "path": "docs/agent-operations/source-surface-inventory.md",
-      "bytes": 4473,
-      "lines": 92,
+      "bytes": 4429,
+      "lines": 91,
       "headings": 9,
       "classification": "supporting-reference",
       "status_markers": {
