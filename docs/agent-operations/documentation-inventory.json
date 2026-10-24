@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "inspected_head": "1d7fc248057a1975b1d2bc0d23d7eb4fd1015758",
+  "inspected_head": "23a748103c106c6da7a4b8b34accbcdc8c947eed",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive",
@@ -8,12 +8,12 @@
     "most Markdown files are not mechanically classified as active or historical"
   ],
   "counts": {
-    "markdown_files": 151,
+    "markdown_files": 152,
     "docs_root_files": 41,
     "active": 20,
     "historical_or_snapshot": 8,
-    "supporting_or_unclassified": 123,
-    "broken_local_links": 11,
+    "supporting_or_unclassified": 124,
+    "broken_local_links": 10,
     "oversized_25k_or_more": 15
   },
   "missing_entrypoints": [],
@@ -25,11 +25,6 @@
     "docs/implementation-status.md"
   ],
   "broken_links": [
-    {
-      "source": "docs/agent-operations/documentation-map.md",
-      "target": "task-packet-template.md",
-      "resolved": "docs/agent-operations/task-packet-template.md"
-    },
     {
       "source": "docs/legacy-swarm-transition.md",
       "target": "../src/model.rs",
@@ -618,8 +613,8 @@
     },
     {
       "path": "docs/agent-operations/documentation-readiness-report.md",
-      "bytes": 4727,
-      "lines": 82,
+      "bytes": 4866,
+      "lines": 83,
       "headings": 8,
       "classification": "supporting-or-unclassified",
       "status_markers": {
@@ -818,6 +813,20 @@
       "lines": 372,
       "headings": 26,
       "classification": "active",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/task-packet-template.md",
+      "bytes": 3627,
+      "lines": 107,
+      "headings": 13,
+      "classification": "supporting-or-unclassified",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
