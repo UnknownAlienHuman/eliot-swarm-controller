@@ -1,6 +1,6 @@
 # Documentation readiness audit
 
-Inspected repository head: `87d4c531aafbb024eb5def90338e2f9d3e2b2d51`.
+Inspected repository head: `1d7fc248057a1975b1d2bc0d23d7eb4fd1015758`.
 
 ## Verdict: NOT READY
 
@@ -14,12 +14,12 @@ This verdict concerns whether an implementation agent can safely treat the docum
 
 | Measure | Count |
 | --- | ---: |
-| Markdown files | 149 |
+| Markdown files | 151 |
 | Files directly under `docs/` | 41 |
 | Explicit active entry points/contracts | 20 |
 | Recognizable historical/snapshot files | 8 |
-| Supporting or unclassified files | 121 |
-| Broken repository-local Markdown links | 10 |
+| Supporting or unclassified files | 123 |
+| Broken repository-local Markdown links | 11 |
 | Documents at least 25 KiB | 15 |
 
 ## Explicit incompleteness evidence
@@ -31,6 +31,7 @@ This verdict concerns whether an implementation agent can safely treat the docum
 
 ## Broken local links
 
+- `docs/agent-operations/documentation-map.md` → `task-packet-template.md` (resolved as `docs/agent-operations/task-packet-template.md`)
 - `docs/legacy-swarm-transition.md` → `../src/model.rs` (resolved as `src/model.rs`)
 - `docs/legacy-swarm-transition.md` → `../src/runtime/mod.rs` (resolved as `src/runtime/mod.rs`)
 - `docs/legacy-swarm-transition.md` → `../src/mcp.rs` (resolved as `src/mcp.rs`)
