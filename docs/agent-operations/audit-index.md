@@ -13,9 +13,9 @@ Navigation for continuing source research. Finding dispositions live only in the
 4. Follow the named exact chain and update the existing AR register.
 
 Source for the current checkpoint was inspected at
-`8d8a44652d110f29031b2ddfdf6db98a5fc7001f` on 2026-10-23. The comparison from runtime
-commit `c92120ed70ca7e625440a8a19517c481e73b13c9` is 21 documentation-only commits.
-The AR-071–078 trace was published in `62874c87ecc12af1544e1a6318bf78b5d687426a`.
+`38db378c559dd0d95cd60db26702ffa73a954258` on 2026-10-23. The comparison from runtime
+commit `c92120ed70ca7e625440a8a19517c481e73b13c9` is 22 documentation-only commits.
+The AR-079–087 trace was published in `2a97dd919453d9748a0034570086c00c6568b4ca`.
 No runtime repair or executed qualification is implied.
 
 ## Evidence checkpoints
@@ -40,8 +40,9 @@ The active register overrides older wording when a later pass narrows or refutes
 | [AR-059–064](audit-register.md#ar-059) | [`5b6b5be`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/5b6b5bee92123ce7d3252054c939fb18619b790f/docs/agent-operations/audit-register.md#trace-2026-10-23-review-acceptance) | Reviewer replacement, correction, pending fairness, dependency isolation and acceptance provenance. |
 | [AR-065–070](audit-register.md#ar-065) | [`8d8a446`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/8d8a44652d110f29031b2ddfdf6db98a5fc7001f/docs/agent-operations/audit-register.md#trace-2026-10-23-checkrun) | Fixed source, CheckRun custody/recovery, parser evidence, cache and executor consolidation. |
 | [AR-071–078](audit-register.md#ar-071) | [`62874c8`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/62874c87ecc12af1544e1a6318bf78b5d687426a/docs/agent-operations/audit-register.md#trace-2026-10-23-scriptrun) | ScriptRun custody/recovery, indexed actions, public readback, cancellation and automation transfer. |
+| [AR-079–087](audit-register.md#ar-079) | [`2a97dd9`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/2a97dd919453d9748a0034570086c00c6568b4ca/docs/agent-operations/audit-register.md#trace-2026-10-23-forge-github-effects) | Forge push/custody/readback, GitHub API owner split, automatic unknown recovery and publication/projection excess. |
 
-There are 78 entries. Some preserve correct behavior or narrow a prior claim.
+There are 87 entries. Some preserve correct behavior or narrow a prior claim.
 
 ## Source and target map
 
@@ -60,7 +61,8 @@ by the checkpoint.
 | Review/correction/acceptance, 011, 052, 059–064 | [submissions](../../crates/swarm-kernel-host/src/store/submissions.rs), [reviews](../../crates/swarm-kernel-host/src/store/reviews.rs), [review disposition](../../crates/swarm-kernel-host/src/store/review_disposition.rs), [acceptance](../../crates/swarm-kernel-host/src/store/acceptance.rs) | [Task policy](../task-policy.md), [Delivery](delivery.md), implementation G |
 | Fixed source/CheckRun/cache, 065–070 | [Store checks](../../crates/swarm-kernel-host/src/store/checks.rs), [source](../../crates/swarm-kernel-host/src/checks/source.rs), [worker](../../crates/swarm-kernel-host/src/checks/worker.rs), [standalone host](../../crates/swarm-kernel-host/src/checks/standalone_host.rs), [executor](../../crates/swarm-checks/src/lib.rs) | [CheckRunner](../check-runner.md), implementation K |
 | ScriptRun/actions, 071–078 | [Store scripts](../../crates/swarm-kernel-host/src/store/scripts.rs), [runner](../../crates/swarm-kernel-host/src/scripts/runner.rs), [worker](../../crates/swarm-script-worker/src/main.rs), [wire](../../crates/swarm-scripts/src/lib.rs), [automation intake](../../crates/swarm-kernel-host/src/store/automation_intake.rs) | [ScriptRunner](../script-runner.md), [Configuration](configuration.md), implementation K |
-| Forge/GitHub next chain | [Forge](../../crates/swarm-kernel-host/src/store/forge.rs), [Forge worker](../../crates/swarm-forge-worker/src/main.rs), [GitHub Store](../../crates/swarm-kernel-host/src/store/github.rs), [labels](../../crates/swarm-kernel-host/src/store/github_effects.rs), [PR metadata](../../crates/swarm-kernel-host/src/store/github_pr_effects.rs) | implementation K/U |
+| Forge/GitHub effects, 079–087 | [Forge](../../crates/swarm-kernel-host/src/store/forge.rs), [Forge worker](../../crates/swarm-forge-worker/src/main.rs), [GitHub client](../../crates/swarm-kernel-host/src/github/client.rs), [labels](../../crates/swarm-kernel-host/src/store/github_effects.rs), [PR metadata](../../crates/swarm-kernel-host/src/store/github_pr_effects.rs), [publication](../../crates/swarm-kernel-host/src/store/automation_publication.rs), [projection](../../crates/swarm-kernel-host/src/store/automation_github_projection.rs) | implementation K/U |
+| GitHub source/import next chain | [GitHub Store](../../crates/swarm-kernel-host/src/store/github.rs), [observer](../../crates/swarm-kernel-host/src/github/observer.rs), [client](../../crates/swarm-kernel-host/src/github/client.rs), [automation intake](../../crates/swarm-kernel-host/src/store/automation_intake.rs) | implementation U/R |
 | Observation | [module observations](../../crates/swarm-kernel-host/src/store/module_observations.rs), [process metrics](../../crates/swarm-observer/src/process_metrics.rs), [workspace](../../crates/swarm-kernel-host/src/store/workspace.rs) | [Observability](observability.md), implementation R |
 | Mailbox/deletion | [mailbox](../../crates/swarm-kernel-host/src/store/mailbox.rs), [coordination](../../crates/swarm-kernel-host/src/store/coordination.rs) and sibling products | [Communication](../agent-communication-program.md), implementation S/T |
 | Gateway | [gateway](../../crates/swarm-gateway/src/gateway.rs), [config](../../crates/swarm-gateway/src/config.rs) | [Gateway](../gateway.md), implementation V |
@@ -78,7 +80,8 @@ This is a research index, not another implementation queue.
 | H: permissions/API | Exhaustive method/role/object/revision matrix and deletion of public internal/vendor surfaces. |
 | I: Store | Reader/writer pairs, numeric migrations, partial migration and corruption behavior. |
 | J: IPC/MCP | Disconnect/replay boundary, slow consumers, fairness and writer occupancy. |
-| K: effects | Script action indexing/readback/cancellation; Check standalone cut; then Forge/GitHub one-owner write/readback chain. |
+| K: effects | Script action indexing/readback/cancellation; Check standalone cut; Forge remote-Git custody is useful, while GitHub REST writes need one owner, pinned custody and automatic exact readback. |
+| U: GitHub | Separate collector, import and effect owners; remove work-pool/projection lifecycle; complete pagination/source-revision, Task-import and independent remote-ref traces. |
 | R: observation | Independent provider/process/Git/remote collectors, unmatched subjects, gaps and one joined read model. |
 | S/T: deletion/mailbox | Recipient-indexed mailbox transition and concrete disposition before deleting coordination products. |
 | V: gateway | Private secret loading, single-principal session limits, disconnect and compatibility launcher deletion. |
