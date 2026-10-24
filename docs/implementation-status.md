@@ -10,11 +10,11 @@ Source was inspected on **2026-10-23** at
 `c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **22 intervening
 commits are documentation-only**; documentation progress is not runtime progress.
 
-The active source register now contains **87 entries**. The latest pass traces Forge
-publication, worker/process custody, exact remote-ref readback, managed labels, PR
-metadata, automatic publication/projection, restart, transfer and ambiguous-write
-settlement. It does not mark a runtime defect repaired and it does not claim live
-Git/GitHub or installed-platform qualification.
+The active source register now contains **95 entries**. The latest pass traces GitHub
+Issue collection, page/cursor semantics, source facts, Task mutation/import, work-pool
+selection, WorkDispatch intake, PR-source reachability and remote-ref observation. It
+does not mark a runtime defect repaired and it does not claim live Git/GitHub or
+installed-platform qualification.
 
 - [Resume point and findings](agent-operations/audit-register.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
@@ -24,8 +24,8 @@ Git/GitHub or installed-platform qualification.
 - [ScriptRunner contract](script-runner.md)
 - [Donor register](agent-operations/donor-map.md)
 
-The 87 records include preserved behavior, scope corrections and partial boundaries,
-not 87 bugs or a completion percentage.
+The 95 records include preserved behavior, scope corrections and partial boundaries,
+not 95 bugs or a completion percentage.
 
 ## Landed runtime changes
 
@@ -59,7 +59,8 @@ inspect later owners; it does not change implementation order.
 | Fixed source and checks, AR-065–070 | Exact immutable source, Store-Go-before-command, process custody, parser coverage, strict cache lineage and acceptance revalidation exist. | Automatic recovery of interrupted `source.capture`, standalone-only new CheckRuns and live OS/toolchain/load qualification. |
 | Scripts, AR-071–078 | Script execution is one-shot, restart reconciles the retained family, parent completion and current child admissions are atomic, and automation lifecycle/transfer sources are exact. | Per-action identity/readback/retry, broader closed action vocabulary, pre-admission executor validation and exact mid-run cancellation. |
 | Forge/GitHub effects, AR-079–087 | Forge remote-Git publication has strong write-before-effect, exact target/force-with-lease/readback and retained worker custody. PR reconciliation demonstrates immutable post-write completion authority. | GitHub REST writers are split; direct `GhCli` lacks retained custody; automatic label unknown recovery and post-write settlement are wrong; PR metadata lacks an automatic caller; publication/projection copy workflow state. |
-| Other areas | Structural and selected source reviews remain indexed. | GitHub collection/import, Store migration, IPC/MCP, observation, mailbox/deletion and gateway completion. |
+| GitHub source/import, AR-088–095 | Repository/Issue identity, bounded reads, exact GET retry, chained fact revisions and explicit gaps are useful. | Page cursor is unstable; collection mutates Tasks; pool selection does not gate dispatch; generated Tasks cannot be accepted; no autonomous collector, connected PR source or independent remote-ref view. |
+| Other areas | Structural and selected source reviews remain indexed. | Store migration, IPC/MCP, joined observation, mailbox/coordination deletion and gateway completion. |
 
 ## CheckRunner status
 
@@ -141,6 +142,37 @@ The GitHub REST side is not implementation-ready:
 6. publication and label projection retain copied cursor/pending/retry/drain lifecycle;
 7. PR metadata remains a manual Manager tool with no enabled-policy caller.
 
+## GitHub collection and import status
+
+The current reader preserves several useful facts:
+
+- repository identity is re-read and matched by immutable numeric ID;
+- Issue identity uses repository ID + Issue ID, not mutable number/name;
+- bounded page windows and response limits are explicit;
+- identical facts dedupe while A→B→A remains a distinct chained transition;
+- failed/partial reads preserve gaps; comments and deletion inference are not faked;
+- an exact GET may be repeated after `outcome_unknown` without repeating a mutation.
+
+The ownership model is not implementation-ready:
+
+1. `next_page` advances through `updated desc`; it is not a stable high-water and a
+   later window cannot prove coverage from page one;
+2. `persist_snapshot` writes source facts and invokes `task.create`/`task.revise` in the
+   same transaction, so collection also owns product planning;
+3. `github.work_pool.apply` runs after Tasks exist, and WorkDispatch ignores pool
+   selection; closed Issues can still become open dispatchable Tasks;
+4. generated TaskSpec contains no acceptance policy, reduces requirements to the title,
+   omits selected comments and conflicts with later Manager enrichment;
+5. polling is an Operator-only Operation/lease workflow with no configured independent
+   collector or automatic restart continuation;
+6. PR rows are filtered from Issue collection; the typed PR helper has no connected
+   source caller;
+7. exact remote refs are observed only inside publication/reconciliation.
+
+Implementation U must commit source facts first, admit explicit selected import through
+ordinary Task commands, and keep GitHub API writes separate. Implementation R must add
+an independent remote-ref source.
+
 ## Required behavior to preserve
 
 | Behavior | Target owner | Current gap |
@@ -155,8 +187,9 @@ The GitHub REST side is not implementation-ready:
 | Required machine evidence is process/coverage/byte-backed | CheckRunner + acceptance | Standalone-only cut and live qualification. |
 | Script execution and returned actions never replay together | ScriptRunner + indexed child Operations | Action index/readback/retry and cancellation gaps AR-071–078. |
 | Harness Goal and Eliot messages are independent | Native adapter Goal + ordinary Send | Current progression machinery and route gaps. |
-| Governor sees unmatched native/process/worktree facts | Independent collectors + joined view | Binding-rooted partial views remain. |
-| Direct peer collaboration survives council deletion | One recipient-indexed mailbox | Coordination platform still exists. |
+| Governor sees unmatched native/process/worktree facts | Independent collectors + joined view | Binding-rooted partial views and publication-only remote facts remain. |
+| External collection does not silently change working requirements | Source collector + explicit `source_import` Task command | GitHub poll currently creates/revises Tasks and bypasses pool selection, AR-088–095. |
+| Direct peer collaboration survives council deletion | One recipient-indexed mailbox | Coordination platform still exists; next audit chain. |
 | External writes have one effect owner | Forge for remote Git; one GitHub API owner for REST writes | Forge is strong; REST owner split, direct `GhCli` custody and automatic unknown-readback gaps remain AR-081–087. |
 | Handover preserves authors/owners/recipients/history | Stable identities + designation epoch | Mailbox normalization and cleanup gaps. |
 | Restart never kills an unrelated PID | PID + birth/image/group/Job custody | Full platform race matrix unqualified. |
@@ -183,11 +216,11 @@ end-to-end cycle. Most of it remains unexecuted.
 
 ## Next work
 
-**Audit:** follow the GitHub source/import chain named in
-[audit-register](agent-operations/audit-register.md#resume-here): source pagination and
-revision identity, Issue/PR facts, Task mutation/work-pool coupling, automation import
-and independent remote-ref observation. Prove collection, import and writes have
-separate owners and that routine import does not fall back to a human.
+**Audit:** follow the mailbox/coordination chain named in
+[audit-register](agent-operations/audit-register.md#resume-here): current message
+identity/storage, recipient reads/cursors, reply/cancel, automatic wake/resume, GM
+handover and every coordination product caller/deletion boundary. Preserve direct peer
+work and historical recipients; do not replace deleted machinery with human relay.
 
 **Runtime:** implement Antigravity A1b–A3 first. Use existing owners, remove replaced
 paths in the same slice, and run format plus minimal affected warnings-denied Clippy/
