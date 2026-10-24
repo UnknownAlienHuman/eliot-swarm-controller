@@ -7,33 +7,32 @@ continuation point; [implementation](implementation.md) owns source changes,
 
 ## Resume here
 
-- Checkpoint: **2026-10-23 / Forge and GitHub remote effects, recovery and ownership**.
+- Checkpoint: **2026-10-23 / GitHub source collection, import and remote observation**.
 - Source inspected at **`38db378c559dd0d95cd60db26702ffa73a954258`**.
   Runtime source is still **`c92120ed70ca7e625440a8a19517c481e73b13c9`**
   from 2026-10-21; the intervening **22 commits are documentation-only**.
 - Last connected chain:
-  `store/forge::{reserve,next,ready,finish,reconcile}` → `swarm-forge-worker`
-  push/readback → `store/github_effects` managed labels →
-  `store/github_pr_effects` PR metadata → automation publication/projection →
-  restart, transfer and ambiguous-write settlement.
-  New evidence is [AR-079–087](#trace-2026-10-23-forge-github-effects).
-- Overall audit: **incomplete, 87 entries**. Entries include defects, preserved
-  mechanisms, scope corrections and partial boundaries; they are not 87 bugs or a
+  `store/github` source setup/poll/lease/snapshot → `github::observer` bounded page
+  windows → `github::work_pool` Issue identity/Task projection → ordinary
+  `task.create`/`task.revise` and WorkDispatch intake → PR helper reachability →
+  remote-ref observation. New evidence is
+  [AR-088–095](#trace-2026-10-23-github-source-import).
+- Overall audit: **incomplete, 95 entries**. Entries include defects, preserved
+  mechanisms, scope corrections and partial boundaries; they are not 95 bugs or a
   measured completion percentage.
-- Preserved in this pass: one admitted Forge Operation before external I/O; exact
-  accepted-candidate/ref/commit/tree identity; force-with-lease; exact remote-ref
-  readback; bounded per-target serialization; retained native-worker custody; and PR
-  reconciliation that records an already-authorized GET without rechecking current GM.
-- Open in this pass: GitHub API writes have two execution owners; direct `GhCli`
-  writes lack pinned executable/process-family custody; automatic label recovery
-  ignores `outcome_unknown`; post-write label completion is incorrectly coupled to
-  current automation/source/candidate state; publication/projection keep copied
-  workflow state; PR metadata has no automatic policy caller.
-- **Next exact chain:** `store/github` source poll/observer/work-pool mutation →
-  GitHub Issue/PR pagination and source revisions → Task creation/revision/import →
-  automation intake → independent remote-ref observation. Prove collection cannot
-  mutate Tasks in the same ownership path and that enabled import uses one ordinary
-  Task command without copied work-pool lifecycle.
+- Preserved in this pass: immutable repository and Issue IDs, bounded reads, explicit
+  partial coverage, identical-state dedupe, chained state transitions, safe GET retry,
+  failure gaps and explicit comments/deletion limitations.
+- Open in this pass: the page-number cursor is not a stable high-water; collection
+  creates/revises Tasks in the same transaction; work-pool selection does not gate
+  dispatch; generated Tasks cannot pass acceptance and omit selected comments; polling
+  is an Operator workflow rather than a configured collector; PR source observation is
+  unconnected; remote refs exist only inside publication/reconciliation.
+- **Next exact chain:** `store/mailbox.rs` → `object_reads::timeline` message reads →
+  send/reply/cancel identity and cursor recovery → `gm.rs` handover/resync → current
+  callers of coordination participant/thread/watch/contract/integration/Concilium/
+  code-scope. Establish the exact unresolved-message transition and positive automatic
+  wake/resume path before deleting the coordination platform.
 - Runtime implementation order remains **A1b–A3, then B–V**. The source audit does not
   reorder implementation.
 - Still unqualified: live Git/GitHub/Windows/Linux behavior, power loss, installed
@@ -144,6 +143,14 @@ the [index](audit-index.md#evidence-checkpoints) links the detailed snapshots.
 | <a id="ar-085"></a>AR-085 | PR description reconciliation | **Preserve; use as internal donor.** Production PATCH uses a pinned native worker and retained family custody. A separate readback Operation verifies exact repository/PR/head/base/publication and, after the authorized GET, records the observation without rechecking current GM rights. | Move the PATCH into the selected GitHub API owner while retaining this immutable-target and post-readback settlement pattern. |
 | <a id="ar-086"></a>AR-086 | Publication/projection workflow copies | **Source-confirmed structural excess.** Publication and label projection each retain global/per-entry cursors, activation/catch-up state, recent records, pending/retry lists or an effect-drain cursor around already durable acceptance facts and Operations. | Replace with bounded current-state selection in the one host loop; keep occurrence/effect identity, exact slots and Forge/GitHub readback, not copied workflow lifecycle. |
 | <a id="ar-087"></a>AR-087 | Automatic PR metadata path | **Source-confirmed missing caller.** `github.pull_request.update_description` is exposed as a manual Manager tool and tested as manual; publication automation reserves Forge push and label projection reserves managed labels, but no enabled policy action admits the PR metadata Operation. | When selected by policy, admit the same ordinary PR metadata Operation after exact publication; do not create another PR workflow or make routine metadata a human-only step. |
+| <a id="ar-088"></a>AR-088 | GitHub Issue pagination and high-water | **Source-confirmed open.** A persisted numeric page advances through a mutable `updated desc` list. New updates can move rows ahead of the cursor; an eight-page window is not a stable repository snapshot, and a later window starting after page one cannot establish `complete_from_page_one`. | Start from page one, use stable source revision/high-water semantics and explicit continuation/partial coverage; never infer absence/deletion from a moving page number. |
+| <a id="ar-089"></a>AR-089 | Collection and Task mutation ownership | **Source-confirmed open.** `persist_snapshot` commits Issue facts and invokes ordinary `task.create`/`task.revise` in the same transaction for every returned Issue. The Operator poll path therefore also owns product planning and can revise beneath an active Manager Attempt. | Commit source facts first; selected Manager/policy import admits a separate ordinary Task mutation with exact source revision/conflict handling. |
+| <a id="ar-090"></a>AR-090 | Work-pool selection versus dispatch | **Source-confirmed open.** Tasks and WorkDispatch facts exist before `github.work_pool.apply`; WorkDispatch never reads pool selection. `state=all` also maps closed Issues to open Eliot Tasks. Selection currently gates label projection, not queue admission. | Import only selected facts into ordinary Tasks, remove the copied work pool, and preserve Issue state as explicit import policy rather than hidden queue behavior. |
+| <a id="ar-091"></a>AR-091 | Generated GitHub Task completeness | **Source-confirmed open.** Auto Task has no acceptance policy, one requirement equal to the Issue title, body only as a source entry and comments as an unfetched gap. Acceptance cannot succeed; Manager enrichment causes later source updates to conflict with the poll-owned spec digest. | Import policy must construct a complete current Task spec/evidence plan from selected body/comments/docs and own future revisions separately from collection. |
+| <a id="ar-092"></a>AR-092 | GitHub source collector lifecycle | **Source-confirmed open.** Setup/poll are Operator-only Operations with a lease and exact caller-bound resume; no automation step or independent configured collector exists. Safe GET retry is useful, but routine collection requires explicit poll calls and queued cancellation is refused. | One bounded configured collector owns source epoch/cursor/freshness/gaps and recomputes after restart without a workflow Operation or per-poll lease. |
+| <a id="ar-093"></a>AR-093 | Stable Issue facts | **Preserve.** Repository ID is rechecked; stable repository/Issue IDs form origin identity; timestamps alone do not revise Tasks; state transitions chain previous event plus new digest; failed/partial reads preserve explicit gaps; comments and deletion inference are honestly marked missing. | Retain these identities and gap semantics in the separated collector/import design. |
+| <a id="ar-094"></a>AR-094 | Pull-request source path | **Source-confirmed unconnected boundary.** The Issues collector deliberately filters PR rows. `github/pulls.rs` provides exact read-only PR identity/head/base projection, but no caller or Store source path was found. | Add a PR collector/import only for selected product needs, or remove the dead helper; do not claim PR coverage from the Issue poll. |
+| <a id="ar-095"></a>AR-095 | Independent remote-ref observation | **Source-confirmed open.** Exact `ls-remote` exists only inside Forge publication/reconciliation and produces publication observations. No independent source-scoped remote ref/head/time/error cache serves Governor reads. | Add a bounded remote-ref collector independent of publication; local tracking refs are not fresh remote facts. |
 
 ## Evidence checkpoints
 
@@ -168,121 +175,103 @@ register. Use the current disposition above when an older snapshot is broader.
 | AR-059–064 | [`5b6b5be`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/5b6b5bee92123ce7d3252054c939fb18619b790f/docs/agent-operations/audit-register.md#trace-2026-10-23-review-acceptance) |
 | AR-065–070 | [`8d8a446`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/8d8a44652d110f29031b2ddfdf6db98a5fc7001f/docs/agent-operations/audit-register.md#trace-2026-10-23-checkrun) |
 | AR-071–078 | [`62874c8`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/62874c87ecc12af1544e1a6318bf78b5d687426a/docs/agent-operations/audit-register.md#trace-2026-10-23-scriptrun) |
-| AR-079–087 | [Current source trace](#trace-2026-10-23-forge-github-effects) |
+| AR-079–087 | [`2a97dd9`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/2a97dd919453d9748a0034570086c00c6568b4ca/docs/agent-operations/audit-register.md#trace-2026-10-23-forge-github-effects) |
+| AR-088–095 | [Current source trace](#trace-2026-10-23-github-source-import) |
 
-<a id="trace-2026-10-23-forge-github-effects"></a>
-## Source trace at 38db378: Forge and GitHub remote effects
+<a id="trace-2026-10-23-github-source-import"></a>
+## Source trace at 38db378: GitHub source collection and import
 
 Inspected 2026-10-23. Paths are relative to the repository root. This is a connected
-source read, not a live GitHub/Git execution or platform qualification.
+source read, not a live GitHub execution or API-consistency qualification.
 
-### AR-079–080 — Forge already owns the correct remote-Git effect shape
+### AR-088 — a moving page number is not a durable source cursor
 
-`store/forge::reserve` admits one exact accepted-candidate publication. The retained
-intent includes project, Task/Attempt, candidate/submission, commit/tree, canonical
-repository, target ref, expected old target and create/update policy. Direct and
-automation callers converge on this owner. Before external I/O, `begin` and
-`dispatch_authorized` recheck the exact Operation, current accepted candidate, policy,
-slot and prepared executable identity, then move only that Operation through the
-durable effect boundary.
+`GhCli::issue_page` reads `/issues` with `state=all`, `sort=updated`, `direction=desc`,
+50 rows per page. `observer::read_issue_snapshot` reads at most eight pages starting at
+`github_sources.next_page`, and `persist_snapshot` stores the next numeric page for a
+later poll. Repository ID is revalidated and conflicting duplicate Issue IDs inside one
+window reject, but the ordering itself remains mutable between windows.
 
-`swarm-forge-worker` performs one bounded push with exact force-with-lease semantics,
-then reads the exact remote ref. The Store settles Applied only when that readback
-equals the retained candidate commit. A transport/CLI failure does not authorize a
-second push. `Store::supervise_forge_once` reconciles unknown work before dispatching
-new work; separate rotating cursors and one oldest Operation per target keep dispatch
-and readback bounded without letting one repository monopolize every pass.
+A newly updated Issue can move from a later page to the front while the collector keeps
+advancing. A read that reaches the end from page nine also cannot prove coverage from
+page one. Current code reports this honestly through `complete_from_page_one`, but the
+persisted page is still not a stable high-water and can delay or miss states under
+continuous churn. The target collector must start bounded scans from a stable source
+boundary and retain explicit continuation/partial coverage rather than treating page N
+as durable progress.
 
-Worker executable/plan/owner/result files and process-family receipts are retained.
-Restart never starts another writer for the same Operation. An unresolved or
-uninspectable family holds that repository instead of guessing it is free. Preserve
-this conservative isolation and exact readback. Simplification should remove proof and
-workflow copies, not the write-before-effect, force-with-lease, target lane, custody or
-readback guarantees.
+### AR-089–091 — polling currently owns product planning
 
-### AR-081–082 — GitHub API mutations have two owners and one weak process boundary
+`persist_snapshot` opens one Immediate transaction, writes source facts and immediately
+calls `task.create` or `task.revise` through the ordinary mutation owner. It then writes
+`github_work_pool_members` and source coverage before committing. Collection is
+therefore not facts-first: the Operator poll also creates or revises product Tasks and
+can revise beneath another Manager's live Attempt while preserving the old Attempt
+snapshot.
 
-Managed Issue labels call `github::client::GhCli` directly from kernel-host.
-PR title/body updates prepare `github_pr_description` work and execute the PATCH inside
-`swarm-forge-worker`. Remote Git push is a distinct Forge phase, which is appropriate;
-the two REST mutations are not. They currently have different executable selection,
-process custody, timeout and recovery implementations.
+Selection does not repair this boundary. `github.work_pool.apply` changes only
+`selected`/`selection_order` after Tasks already exist. WorkDispatch consumes ordinary
+Task create/revise/claim observations and does not read the GitHub pool. Because the
+source query uses `state=all`, a closed historical Issue is still projected into an
+open Eliot Task; GitHub Issue state is not part of the generated TaskSpec.
 
-`github::client::run_gh_api` spawns bare `gh`, uses a direct child with
-`kill_on_drop(true)`, bounds stdout and timeout, and performs no Rust retry. Those are
-useful local bounds, but no admitted executable digest, PID/birth/group/Job, private
-owner record or successor process custody survives. Host startup can mark a retained
-`sending` label/PR Operation `outcome_unknown`, but it cannot establish what happened
-to the dropped direct `gh` family. Move both REST effects to one selected GitHub API
-owner; keep Forge for remote Git only.
+The generated spec is also not sufficient for delivery. It has no acceptance policy,
+one requirement equal to the Issue title, the Issue body only as a selected source and
+all comments as an explicit unfetched gap. `task.accept` therefore cannot succeed.
+When a Manager enriches that Task, the next source update sees a different local spec
+digest and records `task_spec_conflict` instead of revising the enriched Task. Separate
+collection from a selected `source_import` action which constructs the complete current
+Task specification and owns later revisions.
 
-### AR-083–084 — automated label readback is not autonomous and can reject truth
+### AR-092–093 — keep read safety, remove the poll workflow
 
-Host recovery converts a `sending` managed-label Operation to `outcome_unknown`.
-`automation_github_projection::reconcile_effects_once` selects only `queued`
-Operations. `github_effects::call_automatic` explicitly refuses `outcome_unknown` and
-points to the retained Manager reconciliation path. Therefore enabled automation does
-not complete its own ambiguous write after restart even though the domain has an exact
-read-only reconciliation method.
+Source setup and poll require the local Operator. A poll retains its own Operation and
+lease, moves to `sending` before network I/O and can repeat the exact GET after
+`outcome_unknown`; failures preserve an explicit gap. Queued generic cancellation is
+refused because the lease remains. No configured collector or automation action issues
+routine polls.
 
-The problem continues after the write in the same call.
-`validate_automatic_readback` and `persist_automatic_effect` invoke
-`GithubProjectionContext::require_current`, revalidate the current accepted candidate,
-registered source revision and current effect slot. If policy is disabled/edited, GM
-epoch changes without the exact transfer continuation, or the source revision changes
-after the write, an exact desired-state GET is stored as
-`observed_but_unsettled`/`outcome_unknown`. Current authority is required before a new
-write; it must not erase completion authority for an already admitted immutable effect.
+The safety mechanisms are useful: immutable repository/Issue identity, bounded pages,
+identical-state dedupe, transition-event chaining, exact GET retry and explicit
+comments/deletion gaps. They should become source-reader state (`epoch`, stable cursor,
+freshness, coverage, gap), not a workflow Operation requiring the same Operator request
+to advance collection.
 
-### AR-085 — PR reconciliation contains the better completion pattern
+### AR-094–095 — PR and remote observations are not product sources
 
-Production PR PATCH uses the pinned native worker and records its process-family result.
-An ambiguous original Operation is reconciled by a separate readback Operation bound to
-the exact publication, repository, PR ID/number, published head, target/base refs and
-requested title/body digest. After the authorized GET,
-`resolve_reconcile_target_after_readback` intentionally rechecks immutable target and
-slot facts without rechecking current GM rights; `persist_reconcile_readback` can then
-settle the original unknown Operation. This is the internal donor for managed-label
-completion after the REST writer is consolidated.
+The Issues endpoint filters pull-request rows. `github/pulls.rs` can read an exact PR
+and project repository/PR IDs, head/base, merge state and source revision, but source
+search found no caller or Store collector. It is a useful typed helper, not evidence
+that PR source collection exists.
 
-### AR-086–087 — copied workflow state remains, while PR metadata stays manual
+Likewise, exact remote `ls-remote` runs only inside Forge publication/reconciliation and
+records publication facts. There is no independent remote-ref source with observation
+time, freshness and error for Governor reads. Implement PR import only when selected by
+product policy and add remote-ref collection independently of publication.
 
-`automation_publication` retains a global cursor, activation/catch-up state, a
-per-entry pending/retry list and recent records around durable acceptance facts and
-Forge Operations. `automation_github_projection` retains another global cursor,
-per-entry projection state/recent list and a separate effect-drain cursor around
-durable acceptance facts, effect slots and managed-label Operations. These are the
-workflow copies implementation E/U already intends to remove; exact occurrence and
-effect identity remain necessary.
-
-`github.pull_request.update_description` is exposed and tested as a manual
-Manager-scoped tool. Publication automation reserves Forge push; GitHub projection
-reserves labels. No enabled policy consumer admits the same ordinary PR metadata
-Operation. When policy selects that effect, it must use the existing exact
-publication-bound command and the common GitHub API owner, not a third PR workflow.
-
-## Inspected source boundaries for AR-079–087
+## Inspected source boundaries for AR-088–095
 
 | Source | Read boundary |
 | --- | --- |
-| `crates/swarm-kernel-host/src/store/forge.rs` | Admission/slot identity, begin/authorization, target lanes, dispatch/reconcile cursors, finish, process-tree hold and restart readback. |
-| `crates/swarm-forge-worker/src/main.rs` | Push force-with-lease/readback and `github_pr_description` PATCH worker. |
-| `crates/swarm-kernel-host/src/store/github_effects.rs` | Direct/automatic label admission, one write, readback, unknown recovery and settlement fences. |
-| `crates/swarm-kernel-host/src/store/github_pr_effects.rs` | Worker-backed PATCH, retained target, exact reconciliation and post-GET settlement. |
-| `crates/swarm-kernel-host/src/github/client.rs` | `GhCli` REST transport, executable spawn, timeout, response bounds and no-retry behavior. |
-| `crates/swarm-kernel-host/src/automation/authorization.rs` | Retained GitHub projection context, current/transfer authority and source-revision checks. |
-| `crates/swarm-kernel-host/src/store/automation_publication.rs` | Acceptance cursor, pending/retry state and Forge reservation. |
-| `crates/swarm-kernel-host/src/store/automation_github_projection.rs` | Acceptance/projection state, queued-only effect drain and transfer relocation. |
-| `crates/swarm-kernel-host/src/store/mod.rs` | Host-start conversion of interrupted GitHub writes and automation/Forge supervision order. |
+| `crates/swarm-kernel-host/src/store/github.rs` | Source setup/poll admission, lease/retry/cancel, snapshot persistence, Task mapping, pool selection and coverage readback. |
+| `crates/swarm-kernel-host/src/github/client.rs` | Issue endpoint ordering/page bounds, PR filtering and repository/Issue validation. |
+| `crates/swarm-kernel-host/src/github/observer.rs` | Bounded window, repository ID revalidation and intra-window duplicate conflict. |
+| `crates/swarm-kernel-host/src/github/work_pool.rs` | Stable origin/fact/transition identity and generated TaskSpec. |
+| `crates/swarm-kernel-host/src/github/pulls.rs` | Exact PR projection helper and absence of connected callers. |
+| `crates/swarm-kernel-host/src/store/tasks.rs` | Ordinary Task create/revise authority, open state and live-Attempt-preserving revision. |
+| `crates/swarm-kernel-host/src/store/automation_work_dispatch.rs` | Consumption of ordinary Task facts without GitHub pool selection. |
+| `crates/swarm-kernel-host/migrations/006_github.sql` | Persisted page/poll workflow, Issue facts, pool and lease ownership. |
+| `crates/swarm-kernel-host/src/store/forge.rs` and `swarm-forge-worker` | Publication-only remote-ref readback. |
+| `docs/owner-decisions.md` | Historical source truth: body plus selected comments/docs, not generated brief, forms the work specification. |
 
-Selected paths and symbols, not whole-file certification. External GitHub semantics,
-installed `gh`, real remotes, process trees and power loss were not executed.
+Selected paths and symbols, not whole-file certification. GitHub pagination races,
+actual repository churn, credentials, rate limits and remote-ref freshness were not
+executed.
 
 ## Next work
 
-Continue the GitHub source/import chain named in Resume here. Separate collection,
-policy import and writes in the evidence before changing the target. Trace pagination,
-high-water/source revision, Issue versus PR identity, Task mutation/work-pool coupling,
-restart/transfer and remote-ref observation. Preserve bounded reads and immutable source
-identity; do not keep collection as a Task/effect workflow or replace routine import
-with operator steps.
+Continue the mailbox/coordination chain named in Resume here. Preserve direct addressed
+communication, assignment/reviewer access and automatic attention while proving which
+current message rows, IDs, cursors and historical recipients must migrate. Delete only
+after the normalized mailbox and positive wake/resume path replace global timeline
+scans and coordination products.
