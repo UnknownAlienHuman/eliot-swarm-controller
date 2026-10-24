@@ -2,8 +2,9 @@
 
 Navigation for source research. [Current audit](audit-current.md) owns the active resume
 point and newest findings. The frozen [AR-001–078 register](audit-register.md) and the
-immutable snapshots below retain earlier detailed evidence. [Implementation](implementation.md)
-owns source changes; [status](../implementation-status.md) owns landed behavior.
+immutable snapshots below retain earlier detailed evidence.
+[Implementation](implementation.md) owns source changes;
+[status](../implementation-status.md) owns landed behavior.
 
 ## Start after an interruption
 
@@ -11,11 +12,13 @@ owns source changes; [status](../implementation-status.md) owns landed behavior.
 2. Compare its inspected head with live `main`.
 3. Reopen changed callers/consumers only.
 4. Continue the named exact chain and update the current register plus owning contract.
+5. Record a deletion only after the previous consumer and positive path are identified.
 
 Current checkpoint: source inspected at
-`b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b` on 2026-10-24. Runtime source remains
-`c92120ed70ca7e625440a8a19517c481e73b13c9`; the 23 intervening commits are
-documentation-only. No runtime repair or executed qualification is implied.
+`e42c464d58db770cc5490f46f391843f9fec8df2` on 2026-10-24. The current branch also
+contains runtime cleanup `98b350e614fa660fe1d8c53b6063bdac94d80f68`, deleting the
+disconnected GitHub PR/projection modules from AR-098. Minimal affected CI/Clippy is
+tracked in PR #188; no installed or broad-product qualification is implied.
 
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints
@@ -39,10 +42,11 @@ documentation-only. No runtime repair or executed qualification is implied.
 | AR-065–070 | [`8d8a446`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/8d8a44652d110f29031b2ddfdf6db98a5fc7001f/docs/agent-operations/audit-register.md#trace-2026-10-23-checkrun) | Fixed source, CheckRun custody, parser evidence, cache and executor cut. |
 | AR-071–078 | [`38db378`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/38db378c559dd0d95cd60db26702ffa73a954258/docs/agent-operations/audit-register.md#trace-2026-10-23-scriptrun) | ScriptRun custody/recovery, actions, readback, cancellation and transfer. |
 | AR-079–088 | [`b7a5fe1`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b/docs/agent-operations/audit-current.md#trace-2026-10-24-forge-github-effects) | Forge lease/readback, GitHub label/PR ownership and automation recovery. |
-| [AR-089–099](audit-current.md#findings-ar-089099) | [Current trace](audit-current.md#trace-2026-10-24-github-sources) | GitHub collection, mutable pagination, Task import/work pool and remote observation. |
+| AR-089–099 | [`e42c464`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e42c464d58db770cc5490f46f391843f9fec8df2/docs/agent-operations/audit-current.md#trace-2026-10-24-github-sources) | GitHub collection, mutable pagination, Task import/work pool and remote observation. |
+| [AR-100–114](audit-current.md#findings-ar-100114) | [Current trace](audit-current.md#trace-2026-10-24-mailbox-coordination) | Mailbox identity/storage, GM continuity, coordination-product deletion and first disconnected-code cut. |
 
-There are 99 entries. Some preserve correct behavior or narrow an earlier claim; they
-are not 99 defects or a completion percentage.
+There are 114 entries. Some preserve correct behavior, narrow an earlier claim or
+record a transition boundary; they are not 114 defects or a completion percentage.
 
 ## Source and target map
 
@@ -50,14 +54,16 @@ are not 99 defects or a completion percentage.
 | --- | --- | --- |
 | Antigravity/result recovery, 001–035 | `runtime/warm_stream`, Antigravity controller, normalized result, result/object-scope owners and selected adapters | [Module API](module-api.md), implementation A/M–Q |
 | Queue/provider/resources, 036–050 | `store/{capacity,provider_conditions,launcher,operations,workspace_lifecycle,module_demand}` | [Launcher/Queue](../swarm-launcher-assignment-context.md), implementation B–D |
-| Goal/scheduling, 051–058 | `automation_goal_progression`, `scheduler/calendar`, runtime and adapter Goal mappings | [Configuration](configuration.md), implementation E/N/P/Q |
+| Goal/scheduling, 051–058 | `automation_goal_progression`, scheduler/calendar, runtime and adapter Goal mappings | [Configuration](configuration.md), implementation E/N/P/Q |
 | Review/correction/acceptance, 059–064 | `store/{submissions,reviews,review_disposition,acceptance}` | [Delivery](delivery.md), implementation G |
 | Fixed source/CheckRun, 065–070 | `store/checks`, `checks/{source,worker,standalone_host}`, `swarm-checks` | [CheckRunner](../check-runner.md), implementation K |
 | ScriptRun/actions, 071–078 | `store/scripts`, `scripts/runner`, `swarm-script-worker`, `swarm-scripts`, automation intake/dispatch | [ScriptRunner](../script-runner.md), implementation K |
 | Forge/GitHub effects, 079–088 | `store/forge`, `swarm-forge-worker`, `store/{github_effects,github_pr_effects,automation_publication,automation_github_projection}` | [External effects](external-effects.md), implementation K/U |
-| GitHub collection/import, 089–099 | `github/{client,observer,work_pool,pulls,projection}`, `store/github`, `automation_work_dispatch`, `tasks`, migration 006 | [GitHub sources](github-sources.md), implementation U0–U2/U5 |
+| GitHub collection/import, 089–099 | `github/{client,observer,work_pool}`, `store/github`, `automation_work_dispatch`, `tasks`, migration 006 | [GitHub sources](github-sources.md), implementation U0–U2/U5 |
+| Mailbox/coordination, 100–113 | `store/{mailbox,object_reads,gm,coordination_threads,coordination,code_scopes,integration,concilium,coordination_watch}` plus coordination wire modules | [Agent communication](../agent-communication-program.md), implementation S/T |
+| Disconnected GitHub cleanup, 114 | removed `github/{pulls,projection}.rs` and pull-origin helper | implementation U/R; no replacement product claimed |
+| Store bootstrap/migrations next | `store/mod.rs`, embedded `migrations/*.sql`, `doctor.rs`, `swarm-store` connection/readers | implementation I |
 | Observation | module observations, process metrics, workspace/Git and remote collectors | [Observability](observability.md), implementation R |
-| Mailbox/deletion next chain | `store/mailbox`, object timeline/reads, GM handover and coordination products | [Communication](../agent-communication-program.md), implementation S/T |
 | Gateway | `swarm-gateway` and compatibility launcher | [Gateway](../gateway.md), implementation V |
 
 ## Coverage still open
@@ -69,12 +75,12 @@ are not 99 defects or a completion percentage.
 | E scheduler/Goals | One ordinary loop, finite no-progress/usage budgets, native/Eliot combination and restart. |
 | F–G Task/review | TaskPacket, automatic replacement, finite correction, subject isolation and common review/finding provenance. |
 | H permissions/API | Complete method/role/object/revision matrix and deletion of internal/vendor public surfaces. |
-| I Store | Reader/writer pairs, numeric migrations, partial migration and corruption behavior. |
-| J IPC/MCP | Disconnect/readback, slow consumers, fairness and writer occupancy. |
+| I Store | Numeric migration authority, reader/writer pairs, partial migration, corruption and restart behavior. |
+| J IPC/MCP | Disconnect/readback, slow consumers, fairness, multiplexing and writer occupancy. |
 | K effects | Script action lifecycle/cancel; Check executor cut; Forge process-hold disposition; one GitHub API owner and automatic unknown readback. |
 | U GitHub | Stable collector cut, aggregate coverage, explicit import, live-work conflict, work-pool deletion, connected PR source and independent remote-ref view. |
 | R observation | Independent provider/process/Git/remote collectors, unmatched subjects, source gaps and one joined view. |
-| S/T mailbox/deletion | Recipient-indexed mailbox and concrete transition before coordination deletion. |
+| S/T mailbox/deletion | Recipient rows, concrete unresolved-state migration and vertical removal of coordination products/public surfaces. |
 | V gateway | Private secret loading, session limits, disconnect and launcher deletion. |
 | Installed/native/Windows/load | Separate executed qualification; source evidence is not a substitute. |
 
@@ -93,4 +99,5 @@ are not 99 defects or a completion percentage.
 
 Keep AR IDs stable. Record inspected revision, exact symbols, preserved behavior,
 uncertainty and the next chain. Update the owning target contract in the same change.
-Do not create an Issue, workflow or worker per finding.
+A code deletion records its commit and verification boundary; a passing source check is
+not installed qualification.

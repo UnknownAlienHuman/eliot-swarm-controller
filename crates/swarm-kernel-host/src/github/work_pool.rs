@@ -16,11 +16,6 @@ pub fn task_origin_key(host: &str, repository_id: i64, issue_id: i64) -> String 
     format!("github:{host}:{repository_id}:issue:{issue_id}")
 }
 
-/// Separate identity namespace for read-only pull request observations.
-pub fn task_origin_key_for_pull(host: &str, repository_id: i64, pull_id: i64) -> String {
-    format!("github:{host}:{repository_id}:pull:{pull_id}")
-}
-
 pub fn source_revision(issue: &IssueReadback) -> Result<String> {
     let content = json!({
         "title": issue.title,

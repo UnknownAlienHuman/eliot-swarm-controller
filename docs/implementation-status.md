@@ -6,24 +6,33 @@
 RUNTIME REFACTOR IN PROGRESS.**
 
 Source was inspected on **2026-10-24** at
-`b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b`. The latest runtime change remains
-`c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **23 intervening
-commits are documentation-only**; documentation progress is not runtime progress.
+`e42c464d58db770cc5490f46f391843f9fec8df2`. The active audit contains
+**114 entries**. AR-100–114 trace direct mailbox identity/storage, GM handover,
+Participant access, Thread/cards/contracts/code scope/integration/Concilium/watch and
+their public MCP/CLI surfaces.
 
-The active audit contains **99 entries**. AR-089–099 trace GitHub source setup/poll,
-mutable pagination, coverage, poll-time Task creation/revision, work-pool selection,
-Issue semantics, disconnected PR/projection helpers and remote-ref observation.
-No runtime defect is marked repaired and no installed GitHub behavior is qualified.
+The current branch also contains the first new production-code reduction after the
+previous audit-only sequence:
+
+- `98b350e614fa660fe1d8c53b6063bdac94d80f68` removes disconnected
+  `github/pulls.rs`, `github/projection.rs`, their module declarations and the sole
+  pull-origin helper: **net −250 Rust lines**;
+- the deletion closes the disconnected-code portion of AR-098 only;
+- it does not implement PR collection, GitHub remote observation or any replacement
+  workflow;
+- minimal affected format/compile/Clippy is tracked in PR #188. This document does not
+  claim a pass until the workflow has completed.
 
 - [Current resume point and findings](agent-operations/audit-current.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
 - [Architecture](agent-operations/architecture.md)
 - [Single implementation program](agent-operations/implementation.md)
+- [Agent communication target](agent-communication-program.md)
 - [GitHub-source contract](agent-operations/github-sources.md)
 - [External-effects contract](agent-operations/external-effects.md)
 - [Donor register](agent-operations/donor-map.md)
 
-## Landed runtime changes
+## Runtime changes
 
 | Change | Evidence | Remaining limit |
 | --- | --- | --- |
@@ -31,6 +40,7 @@ No runtime defect is marked repaired and no installed GitHub behavior is qualifi
 | Active Antigravity coordinate aligned on v6 | `cba98b7` | No installed native-turn qualification. |
 | Terminal receipt decoupled from Store observation | `eeea355`, recorded net −265 production Rust lines | Dispatch proof and crash-unsafe delivery remain. |
 | One dispatch producer across SUCCESS/ERROR/CANCELED | `c92120e`; historical run `39579583956`, job `119153571930` | Scoped regression/Clippy only; no crash/installed/load proof. |
+| Disconnected GitHub PR/projection modules removed | branch commit `98b350e`, net −250 Rust lines | Minimal CI pending at this checkpoint; no PR-source feature added. |
 
 ```text
 A0   LANDED                   active v6 coordinate
@@ -39,10 +49,11 @@ A1b  NOT IMPLEMENTED          remove dispatch proof/refresh prerequisite
 A2   NOT IMPLEMENTED          durable outcome/body/page delivery and successor completion
 A3   NOT IMPLEMENTED          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime
+U/R  SMALL CLEANUP LANDED      disconnected GitHub PR/projection source removed
 ```
 
-Runtime implementation still starts with **A1b–A3**. Audit order does not change the
-implementation order.
+Runtime implementation still starts with **A1b–A3**. Audit order and opportunistic dead
+code deletion do not change the implementation order.
 
 ## Source-inspection result
 
@@ -54,126 +65,97 @@ implementation order.
 | Review/correction/acceptance, AR-059–064 | Replacement, all-findings feedback, same-Attempt resubmission and frozen evidence gate exist. | Automatic replacement, finite correction, subject fairness and common review/finding provenance. |
 | CheckRun, AR-065–070 | Immutable source, Store-Go, process custody, parser coverage, cache lineage and acceptance revalidation exist. | Automatic interrupted source capture and standalone-only executor cut. |
 | ScriptRun, AR-071–078 | One-shot interpreter, same-family restart and atomic parent/child admission exist. | Per-action identity/readback/retry, action vocabulary, executor precheck and mid-run cancellation. |
-| External effects, AR-079–088 | Forge freezes exact candidate/ref intent, uses ancestry plus expected-ref lease, records `sending` before one write and settles by readback; label/PR slots and readbacks are strict. | Sticky manual process hold, duplicate PR PATCH owner, mutable-source recovery dependency, manual unknown reconciliation and duplicate automation engines. |
-| GitHub sources/import, AR-089–099 | Repository ID, exact request identity, safe GET retry, explicit partial coverage and local-divergence conflict are useful. | Poll-time Task authority, unstable pagination, non-convergent coverage, ineffective work-pool selection, incomplete Issue semantics, dead PR/projection paths and missing remote view. |
-| Other areas | Structural and selected source reviews remain indexed. | Store migration, IPC/MCP, observation, mailbox/deletion and gateway completion. |
+| External effects, AR-079–088 | Forge freezes exact candidate/ref intent, records `sending` before one write and settles by exact readback; label/PR slots are strict. | Sticky process hold, duplicate PR PATCH owner, mutable-source recovery dependency, manual unknown reconciliation and duplicate automation engines. |
+| GitHub sources/import, AR-089–099 | Repository ID, safe GET retry, explicit partial coverage and local-divergence conflict are useful. | Stable pagination/cut, aggregate coverage, explicit import, live-work conflict, work-pool deletion and remote view. Disconnected PR/projection helpers are now removed. |
+| Mailbox/coordination, AR-100–114 | Exact sender/recipient/scope checks, non-destructive reads, scoped Participant/reviewer access and GM epoch handover are useful. | Recipient mailbox rows; finite migration; participant-grant relocation; deletion of Thread/cards/contracts/code-scope/integration/Concilium/watch and every public/storage surface. |
+| Other areas | Structural and selected source reviews remain indexed. | Store migration, IPC/MCP, observation and gateway completion. |
+
+## Mailbox and coordination status
+
+### Preserve
+
+- One authenticated sender and one exact recipient.
+- Immutable Operation admission and caller-owned request idempotency.
+- Exact Task/Attempt/candidate/reviewer disclosure boundaries.
+- Non-destructive reads and recovery after a lost notification.
+- Reply/cancel relation to one exact prior message with deadline/digest checks where
+  configured.
+- Stable client identity across reconnect.
+- GM handover changes designation/epoch only and never rewrites historical recipients,
+  owners, authors or reviewers.
+- Current Task/Attempt/native attention is a separate projection for the successor GM.
+
+### Repair
+
+1. Replace Operation ID + `cmsg-*` + delivery ID with one message identity: the admitted
+   Operation ID.
+2. Insert recipient-indexed mailbox rows atomically with `message.send`; page them by a
+   recipient sequence rather than global Observation cursor.
+3. Keep Task feedback, Check completion and other attention in their owning projections,
+   not as mailbox message kinds.
+4. Preserve exact scoped grants, but migrate launch/reviewer access away from the
+   duplicate coordination participant directory before deleting it.
+5. Reduce Thread to optional grouping only if a current consumer remains. Remove
+   reasonability forms, speech acts, proposal/objection/ratification states and
+   authority implications.
+6. Delete work/contract cards, structured consult directory, contract negotiation,
+   `code.scope.*`, integration cells/ACKs, Concilium and coordination watches after
+   callers use mailbox, Task/source, workspace lease, review/check and ordinary
+   subscription/automation owners.
+7. Remove catalog, method policy, CLI, MCP profiles/subscriptions, Store routes,
+   indexes/backfills, fixtures and compatibility aliases in the same vertical slice.
+8. Migrate only concrete unresolved mail/thread/grant state. Completed Operations remain
+   readable history and do not keep executable translators alive.
 
 ## GitHub source/import status
 
 ### Preserve
 
-- Source setup and every poll verify the immutable repository ID.
-- A poll request/lease is exact; restarting an uncertain GET does not repeat a mutation.
-- Failed reads remain explicit failures/partial coverage and are never treated as an
-  empty source.
-- A changed duplicate Issue inside one bounded page window rejects the unstable
-  snapshot instead of silently choosing one version.
-- Task origin uses immutable repository and Issue IDs rather than mutable names/numbers.
-- If the local Task diverged from the last imported source spec, refresh reports a
-  conflict instead of overwriting local intent.
+- Immutable repository-ID verification.
+- Exact source request identity and safe retry of read-only GET after uncertainty.
+- Explicit stale/partial/failure coverage rather than treating failure as an empty
+  source.
+- Immutable Issue origin keys and local Task divergence conflict.
 
 ### Repair
 
-1. Decouple source setup/collection from Forge publication configuration and local
-   Operator-only calls.
-2. Replace persisted numeric pages over `updated desc` with a stable cursor/high-water
-   or overlapping refresh plus periodic complete reconciliation.
-3. Make coverage aggregate across bounded passes; a source with more than 400 rows or
-   any comments must be able to converge after required data is captured.
-4. Stop creating/revising Tasks inside the collector transaction. Add explicit direct/
-   policy `source_import` against exact source revisions.
-5. Never revise a Task beneath an unreleased Attempt. Surface one bounded import
-   conflict/decision while preserving the frozen old Attempt.
-6. Remove `github_work_pool_members` and `github.work_pool.*`: selection is currently
-   not consulted by WorkDispatch, so unselected open Tasks can launch.
-7. Define explicit close/reopen/comment/PR import policy. A closed Issue must not leave
-   an unintended open dispatchable Task.
-8. Retain only current facts and source revisions referenced by imports/effects; remove
-   unused append-only fact chains.
-9. Connect or delete the currently unconsumed PR/projection helpers.
-10. Add independent remote repository/ref/head freshness/error observation.
+1. Separate source configuration/collection from Forge publication and local Operator
+   calls.
+2. Replace numeric pages over mutable `updated desc` with a stable cut or overlap plus
+   periodic full reconciliation.
+3. Make coverage converge across bounded passes, including selected comments/PR fields.
+4. Commit source facts only during collection; direct/policy `source_import` owns Task
+   create/revise.
+5. Never revise beneath live work automatically.
+6. Delete duplicate work-pool selection and use the ordinary queue after import.
+7. Add independent remote-ref observation without granting push authority.
+8. Keep the newly deleted PR/projection modules absent until an exact current consumer
+   and end-to-end path exist.
 
-See [GitHub sources](agent-operations/github-sources.md) for the connected target.
+## Source audit versus runtime qualification
 
-## External-effects status
+A completed source audit needs a named revision and evidence for each retained action:
+caller → parse → exact authority → Store transition → effect/readback → consumer,
+including cancellation, late result, restart, handover and partial writes. It also
+needs historical requirement mapping and a concrete replacement/disposition for each
+deletion. This remains incomplete globally.
 
-### Preserve
-
-- Forge admission binds the exact accepted candidate, commit/tree, canonical repository,
-  target ref and expected old/missing ref.
-- The worker proves expected predecessor ancestry and pushes once with
-  `--force-with-lease=<target>:<expected>`.
-- Store commits `sending` before worker authorization or GitHub mutation.
-- Restart and ambiguous outcomes are readback-only; no fresh request ID authorizes a
-  second write.
-- Managed-label and PR readback validate immutable repository/resource identity.
-- Exact resource slots prevent overlapping unknown effects.
-
-### Repair
-
-- Add an exact-evidence disposition for Forge's sticky process-tree hold.
-- Move PR description PATCH out of `swarm-forge-worker` into the GitHub API owner.
-- Automate bounded readback of unknown label/PR effects through ordinary Operations.
-- Retain immutable effect targets independently of source/work-pool rows.
-- Delete publication/projection cursor/pending/quarantine engines after ordinary owners
-  and the host current-state loop are connected.
-
-See [External effects](agent-operations/external-effects.md).
-
-<a id="required-behavior-to-preserve"></a>
-## Required behavior to preserve
-
-| Behavior | Target owner | Current gap |
-| --- | --- | --- |
-| Durable Manager reconnect never restarts work | Task/Attempt/Operation + native/external readback | Adapter/effect automatic recovery gaps. |
-| Native-manager and controller initial starts never both send | `Attempt.start_owner` | Preserve through TaskPacket/dispatch reduction. |
-| Unknown native/external writes are never guessed-retried | Original Operation + exact readback | Several domains still require manual readback. |
-| Complete attributable output survives control failure | StoreDelivery + source lifetime | A2 and cross-route result gaps. |
-| One Manager owns one mutable worktree/Git index | Workspace lease + Manager Git ownership | `code.scope.*` and retirement integration remain. |
-| Corrections return all findings and may resubmit same Attempt | Submission/review owners | Delivery classification and finite progress remain. |
-| Acceptance proves frozen requirements for exact candidate | Common evidence gate | Assigned-review/finding provenance remains open. |
-| Machine evidence is process/coverage/byte-backed | CheckRunner + acceptance | Standalone-only cut and live qualification. |
-| Script and admitted children never replay together | ScriptRunner + indexed child Operations | Action index/readback/retry and cancellation. |
-| Source collection cannot silently change product intent | Source records + explicit import | Current poll creates/revises Tasks and can revise beneath live work. |
-| Unimported external facts cannot launch | Explicit import + ordinary queue | Work-pool selection is not a WorkDispatch gate. |
-| Remote mutation has one owner and one write | Forge or GitHub API effect owner | PR PATCH split and automation/readback duplication. |
-| Harness Goal and Eliot messages are independent | Native Goal + ordinary Send | Progression machinery and route gaps. |
-| Governor sees unmatched native/process/worktree/remote facts | Independent collectors + joined view | Binding-rooted partial views and no independent remote ref. |
-| Direct peer collaboration survives council deletion | Recipient-indexed mailbox | Coordination platform still exists. |
-| Handover preserves authors/owners/recipients/history | Stable identities + designation epoch | Mailbox and effect-successor gaps. |
-| Restart never kills an unrelated PID | PID + birth/image/group/Job custody | Full platform race matrix unqualified. |
-
-Deleting old machinery requires a connected positive path in the same slice. A manual
-operator procedure, new workflow engine or permanent compatibility facade is not a
-replacement.
-
-## Audit versus qualification
-
-A source trace needs a named revision and the connected path:
-
-```text
-caller -> parse -> exact authority -> durable Store transition
--> external/native effect -> readback/recovery -> consumer
-```
-
-It includes cancellation, restart, transfer, late result and partial write where
-applicable. Source inspection does not prove installed behavior.
-
-Executed qualification remains separate: real providers, Git/GitHub service behavior,
-Windows/Linux custody, migrations/corruption, IPC fairness/load and the autonomous
-end-to-end cycle. Most remains unexecuted.
+Executed qualification is separate: privilege/migration/corruption cases, installed
+provider contracts, Windows custody, fairness/load and autonomous end-to-end work. Most
+of that remains unexecuted. Source inspection cannot substitute for it, and a CI compile
+does not qualify native providers or a migrated database.
 
 ## Next work
 
-**Audit:** follow the mailbox/coordination chain in
-[current audit](agent-operations/audit-current.md#resume-here): durable send/read/reply/
-cancel, global timeline scans, GM handover/resync and every coordination product/MCP
-consumer. Preserve direct collaboration and historical recipients while proving the
-finite deletion boundary.
+**Audit:** continue the Store bootstrap/migration chain named in
+[audit-current](agent-operations/audit-current.md#resume-here): embedded base/extension
+SQL, startup verification, Doctor readback, writer/WAL reader ownership and
+partial-migration/corruption behavior. Record useful guards versus source-text schema
+ceremony before implementation I.
 
-**Runtime:** implement Antigravity A1b–A3 first. Use existing owners, remove replaced
-paths in the same slice, and run format plus minimal affected warnings-denied Clippy/
-build during construction. Broader connected and installed tests follow usable
-vertical paths.
+**Runtime:** finish PR #188 verification for the bounded GitHub deletion. The main
+implementation still begins with Antigravity A1b–A3: remove the refresh/proof
+prerequisite, persist exact delivery/body/page records and retain only real actions.
 
-This checkpoint changes documentation only.
+During construction run rustfmt plus minimal affected warnings-denied compile/Clippy.
+Broad and installed/live tests remain product-stage qualification.

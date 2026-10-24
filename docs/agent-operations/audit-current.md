@@ -1,200 +1,249 @@
 # Current audit register
 
 This is the active continuation register. AR-001–078 remain in the
-[historical register](audit-register.md). AR-079–088 and their full Forge/GitHub-effects
-trace are frozen at
-[`b7a5fe1`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b/docs/agent-operations/audit-current.md).
+[historical register](audit-register.md). AR-079–088 are frozen at
+[`b7a5fe1`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b/docs/agent-operations/audit-current.md),
+and AR-089–099 are frozen at
+[`e42c464`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e42c464d58db770cc5490f46f391843f9fec8df2/docs/agent-operations/audit-current.md).
 [Audit index](audit-index.md) maps every range to immutable evidence;
-[implementation](implementation.md) owns source changes; and
-[status](../implementation-status.md) owns landed behavior.
+[implementation](implementation.md) owns source changes;
+[agent communication](../agent-communication-program.md) owns the retained product
+boundary; and [status](../implementation-status.md) owns landed behavior.
 
 ## Resume here
 
-- Checkpoint: **2026-10-24 / GitHub collection, Task import and remote observation**.
-- Source inspected at **`b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b`**.
-  Runtime source is still **`c92120ed70ca7e625440a8a19517c481e73b13c9`**
-  from 2026-10-21; the **23 intervening commits are documentation-only**.
+- Checkpoint: **2026-10-24 / mailbox, GM continuity and coordination-product deletion**.
+- Source inspected at **`e42c464d58db770cc5490f46f391843f9fec8df2`**.
+  The branch also contains the bounded runtime cleanup
+  **`98b350e614fa660fe1d8c53b6063bdac94d80f68`**, which deletes disconnected GitHub
+  PR/projection source modules identified by AR-098.
 - Connected chain:
-  `github::{client,observer,work_pool,pulls,projection}` →
-  `store/github` setup/poll/lease/page/fact commit →
-  poll-time `task.create/task.revise` and `github_work_pool_members` →
-  WorkDispatch source consumption and GitHub effect authorization →
-  remote-ref observation boundary.
-- Overall audit: **incomplete, 99 entries**. AR-089–099 are recorded below; prior
+  `store/mailbox.rs` → `store/object_reads.rs::timeline(message.read)` →
+  `store/gm.rs` handover/resync →
+  `coordination/{thread,contract,code_scope,integration,watch,concilium}` and their
+  Store owners → method policy, MCP catalog/profiles/subscriptions and CLI.
+- Overall audit: **incomplete, 114 entries**. AR-100–114 are recorded below; prior
   dispositions remain in immutable checkpoints.
-- Preserved in this pass: immutable repository-ID checks; exact request identity; safe
-  GET retry; explicit partial/failure coverage; one-window duplicate instability
-  rejection; immutable Issue origin keys; local Task divergence conflict instead of
-  overwrite.
-- Open in this pass: source setup/poll is Operator-only and coupled to Forge config;
-  mutable numeric pagination is not a stable cut; common sources cannot reach complete;
-  collection creates/revises Tasks in the same transaction; work-pool selection is not
-  an admission gate; Issue state/comments are not imported correctly; unused fact/PR/
-  projection paths remain; independent remote-ref collection is absent.
-- **Next exact chain:** `store/mailbox.rs` →
-  `store/object_reads.rs::{timeline,message.read}` → `store/gm.rs` handover/resync →
-  `coordination/{thread,watch,contract,integration,concilium,code_scope}` callers →
-  MCP catalog/profile/subscription entries. Preserve direct addressed collaboration and
-  historical recipients while proving which coordination products can be deleted.
+- Preserved in this pass: addressed sender/recipient attribution; immutable Operation
+  admission; non-destructive reads; exact reply/cancel target checks; scoped
+  Participant/reviewer access; GM epoch handover without rewriting historical owners or
+  recipients; bounded continuation and explicit coverage gaps.
+- Open in this pass: one logical message has three identities; mailbox reads scan the
+  global Observation timeline and mix unrelated products; Thread, contract,
+  code-scope, integration, Concilium and watch each own a separate advisory lifecycle;
+  the duplicate participant registry is still required by launch and review access;
+  public policy/catalog/profile/subscription/CLI surfaces encode every product.
+- **Next exact chain:** Store bootstrap and migration authority:
+  `store/mod.rs` embedded `migrations/001_core.sql` plus extension SQL → startup/open and
+  schema verification → `doctor.rs` readback → writer/WAL reader ownership → partial
+  migration, crash and corruption behavior. Prove which schema guards are useful and
+  replace source-text/digest compatibility with `application_id`, numeric
+  `user_version`, ordered transactional migrations and bounded postconditions.
 - Runtime implementation order remains **A1b–A3, then B–V**. Source-audit order does
   not reorder implementation.
-- Still unqualified: live GitHub pagination under concurrent updates, API rate limits,
-  account behavior, source scale, remote-ref collection, migrations and autonomous
-  end-to-end import/dispatch.
-- Documentation only. No runtime code, Clippy, test, benchmark or installed-system
-  qualification changed in this checkpoint.
+- Still unqualified: migration of concrete unresolved mailbox/coordination state,
+  installed clients, live handover during native work, slow MCP subscribers, crash or
+  power loss, scale/fairness and the autonomous end-to-end work cycle.
+- The GitHub cleanup is production Rust deletion. It changes no external behavior and
+  starts no replacement product. Minimal affected format/compile/Clippy evidence is
+  tracked in PR #188; no broad or live-provider qualification is claimed here.
 
 On resume, compare live `main` with the inspected head, reopen only changed owners and
-consumers, then continue the named chain. A documentation commit never closes a runtime
-finding.
+consumers, then continue the named Store chain. A documentation change never closes a
+runtime finding.
 
-<a id="findings-ar-089099"></a>
-## Findings AR-089–099
+<a id="findings-ar-100114"></a>
+## Findings AR-100–114
 
 | ID | Requirement / path | Disposition | Remaining boundary |
 | --- | --- | --- | --- |
-| <a id="ar-089"></a>AR-089 | Source setup and authority | **Open coupling.** Setup and poll require local Operator; setup also requires an existing Forge project mapping. Read-only collection is therefore coupled to publication configuration and cannot be enabled by scoped Manager policy. | Separate source identity/policy from Forge and permit bounded configured collection without routine operator calls. |
-| <a id="ar-090"></a>AR-090 | Poll workflow and recovery | **Preserve plus open.** The exact GET request/lease moves `queued → sending`; `outcome_unknown` can safely repeat the read. No host collector resumes it, and queued cancellation is explicitly unsupported. | Replace per-pass Operation/lease workflow with collector epoch/cursor/current-state recovery while keeping exact safe-read semantics. |
-| <a id="ar-091"></a>AR-091 | Mutable pagination cut | **Open.** Issues are read by numeric page sorted `updated desc`; `next_page` persists across separate polls. Items can move into already-scanned pages, so one cycle can delay/miss them and cannot represent an atomic complete cut. | Stable server cursor/high-water or overlap plus periodic full reconciliation with documented ordering/deletion semantics. |
-| <a id="ar-092"></a>AR-092 | Coverage convergence | **Open.** One poll reads at most 8×50 raw rows. `complete_from_page_one` cannot become true for larger sources, and any stored Issue with comments keeps the source partial because comments are never selected. | Aggregate multi-pass cycle coverage and selected comment/PR coverage; explicit gaps must be resolvable, not permanent normal state. |
-| <a id="ar-093"></a>AR-093 | Collection versus Task authority | **Open ownership violation.** `persist_snapshot` commits source facts, creates/revises Tasks, adds work-pool rows and settles the poll in one writer transaction. | Collector commits source facts only; explicit direct/policy `source_import` performs ordinary Task mutations separately. |
-| <a id="ar-094"></a>AR-094 | Source change under live work | **Open.** When the local Task still equals the last imported spec, poll invokes ordinary `task.revise`, including beneath another Manager's unreleased Attempt. The frozen old Attempt remains and can block the new revision. | Hold/import conflict or attributable Governor decision; never revise beneath live work automatically. Preserve local-divergence conflict. |
-| <a id="ar-095"></a>AR-095 | Work-pool selection | **Open product mismatch.** Poll creates ordinary open Tasks before selection. WorkDispatch consumes general `task.create/revise/claim` facts and does not read `github_work_pool_members`; unselected GitHub work can launch. Apply cannot select zero tasks and preview ignores selection order. | Import is the selection boundary; imported Tasks use the ordinary queue. Delete duplicate work-pool selected/order state. |
-| <a id="ar-096"></a>AR-096 | Issue state and comments | **Open semantic gap.** Task projection uses title/body but not Issue state. Close/reopen can add a source fact without revising the Task, leaving a closed Issue's Task open. Comments remain only a count/gap and labels are absent. | Explicit import policy for close/reopen; required comments/fields are captured with revisions or block import. |
-| <a id="ar-097"></a>AR-097 | Source fact history | **Open excess.** `github_issue_facts` retains chained A→B→A transitions indefinitely; selected source search found no runtime reader besides writes/schema. | Keep current facts and only immutable revisions referenced by admitted imports/effects; remove unused universal event history. |
-| <a id="ar-098"></a>AR-098 | PR/projection source paths | **Open disconnected code.** Issues collection filters PRs, while `pulls::read_pull_request` and `projection::{Check,Summary,Label}Projection` have no current consumers outside their defining files. | Connect one exact current source/projection consumer or delete the paths during U/R migration. |
-| <a id="ar-099"></a>AR-099 | Independent remote-ref observation | **Open.** Remote-ref reads exist only inside Forge publication/reconciliation. There is no independent repository/ref/head/time/error source for Governor state. | Add a small remote-ref collector independent of publication; it grants no push authority. |
+| <a id="ar-100"></a>AR-100 | One durable message identity | **Open.** `message.send` retains Operation ID, generated `cmsg-*` message ID and a distinct delivery ID. Legacy coordination methods add further identity forms. | Use the admitted Operation ID as message identity; reply/cancel reference it directly. Migrate concrete unresolved mail only. |
+| <a id="ar-101"></a>AR-101 | Recipient mailbox storage/read | **Open ownership violation.** `message.read` is the global Observation timeline in mailbox mode. It filters JSON recipient fields and mixes direct/coordination messages with Task feedback and Check completion. | Recipient-indexed mailbox rows and a recipient cursor committed atomically with the Operation; feedback/check attention remain their own projections. |
+| <a id="ar-102"></a>AR-102 | Reply/cancel correctness | **Preserve semantics, delete machinery.** Exact sender/recipient, scope, deadline, digest and prior-cancel checks are useful. Current lookup scans settled Operation JSON through typed/legacy identity unions and corruption sentinels. | Retain exact authorization and immutable reply/cancel relations on normalized rows; remove JSON expression indexes and legacy identity scans after finite migration. |
+| <a id="ar-103"></a>AR-103 | GM continuity | **Preserve.** Handover changes designation/epoch only, does not rewrite Attempt owners or historical recipients, and labels watermarks as resync hints rather than acknowledgements. | Compute mailbox watermarks from recipient rows; successor reads current attention separately. Keep former recipients/authors immutable. |
+| <a id="ar-104"></a>AR-104 | Thread scope | **Open product excess.** The current Thread is not a tiny grouping primitive: it owns mandatory reasonability forms, speech acts, proposal links, objections, ratification references, resolution states, supersession and multiple indexes. | Keep only bounded grouping if a current consumer still needs it; grouping grants no authority and owns no negotiation lifecycle. |
+| <a id="ar-105"></a>AR-105 | Participant identity and scoped access | **Migration boundary.** The coordination participant registry duplicates base identity/directory state, but current launch registration, native streams and assigned-reviewer paths still depend on its exact Task/Attempt grants. | Move required assignment/reviewer grants to the retained application authority before deleting the duplicate directory. Never widen participants to Manager rights. |
+| <a id="ar-106"></a>AR-106 | Work/contract cards and consultation | **Open duplication.** Cards, sparse relevance indexes and structured consult vocabulary implement a second discovery/directory product over facts already owned by Task/source/assignment/mailbox. | Consultation becomes one addressed message with evidence references; source and assignment projections remain authoritative. |
+| <a id="ar-107"></a>AR-107 | Contract proposal/ratification | **Open duplicate authority.** Proposal revisions, counterproposals, objections, support, withdrawal, affected-scope snapshots and ratify/reject decisions form a parallel product-decision workflow. | Authoritative interface/product decisions are Task/source revisions plus connected producer/consumer verification; review and acceptance stay in their existing domains. |
+| <a id="ar-108"></a>AR-108 | `code.scope.*` | **Open advisory duplicate.** Source explicitly states the records do not lock files, inspect Git, start work or release an Attempt. They nevertheless own revisions, active/task indexes, overlap classification and contract-decision dependencies. | Task path scope plus Attempt workspace lease is write admission. Remove advisory scope product and its contract coupling after current data disposition. |
+| <a id="ar-109"></a>AR-109 | Integration cells and ACK | **Open duplicate agreement product.** Cells aggregate offers, requirements, carriers, comparisons, assumptions, coverage, member/card digests and ACKs while explicitly changing no Task, assignment, workspace or acceptance state. | Interface compatibility becomes source/Task revision plus exact connected checks. No generic integration ACK lifecycle remains. |
+| <a id="ar-110"></a>AR-110 | Concilium | **Open separate workflow.** Concilium owns proposals, previews, blind rounds, slots, packets, positions, manager results and task/scope/viewer indexes. Current consumers are its direct Store/CLI/MCP/test surfaces, not ordinary Task review/acceptance. | Preserve independent review/research as ordinary assignments and mailbox communication; delete the council workflow, not peer collaboration. |
+| <a id="ar-111"></a>AR-111 | Coordination watches | **Open duplicate scheduler.** Watches own active/list/subject/notice indexes, reconcile cursor, revisit queue/turn, quarantine and one-shot notice delivery. | Replace with current-state subscriptions or explicit automation conditions; one host loop owns due work and mailbox wake. |
+| <a id="ar-112"></a>AR-112 | Public surface fan-out | **Open cut boundary.** Every coordination product is repeated in method policy, MCP catalog/profile/subscription categories, CLI parsing, Store routing, read authorization and fixtures. | Delete a product vertically: callers, schemas, policy, MCP/CLI, subscriptions, storage, backfills and fixtures in the same slice. |
+| <a id="ar-113"></a>AR-113 | Finite transition | **Boundary.** Completed Operations are useful history but do not justify executable translators. Concrete unresolved messages, open threads and active grants must be enumerated before deletion. | Normalize only live required mail/thread state; finish/export/dispose other work explicitly, then remove old producers/readers/indexes together. |
+| <a id="ar-114"></a>AR-114 | Disconnected GitHub PR/projection source | **Landed branch cleanup.** Search found no consumers of `github/pulls.rs`, `github/projection.rs` or the pull-origin helper. Commit `98b350e` removes two files, module declarations and the sole helper: net −250 Rust lines. | Minimal affected compile/Clippy must pass. This does not implement PR collection or remote observation; those remain explicit future work. |
 
-<a id="trace-2026-10-24-github-sources"></a>
-## Source trace at b7a5fe1: GitHub sources and import
+<a id="trace-2026-10-24-mailbox-coordination"></a>
+## Source trace at e42c464: mailbox and coordination
 
-Inspected 2026-10-24. This is source evidence, not a live GitHub collection/import or
-scale qualification.
+Inspected 2026-10-24. This is selected source evidence, not a migrated database or live
+multi-agent qualification.
 
-### AR-089–090 — a read-only source is implemented as an Operator workflow
+### AR-100–102 — the mailbox is an Operation/Observation projection, not a mailbox
 
-`github.source.setup` first verifies the repository through the installed `gh` account,
-then requires the local Operator and an existing Forge project whose canonical
-repository matches the source. `github.source.poll` also requires the exact Operator
-caller. Managers/current GM can inspect sources and select mapped work, but cannot run
-routine collection.
+`store/mailbox.rs` validates one `message.send` request, creates the immutable Operation,
+then settles it with a generated `cmsg-*` `message_id` and a different `delivery_id`.
+The Operation ID remains the actual admission receipt. Reply/cancel accepts several
+identity shapes: typed message, typed cancellation target, Operation identity, legacy
+delivery identity and legacy Operation identity. Lookup uses JSON extraction from
+settled `operations.result_json`; migration 015 adds expression indexes over those JSON
+fields. Additional conflict scans detect duplicate/corrupt identities.
 
-Each poll is an ordinary Operation plus one `github_poll_leases` row. Before GET it
-moves to `sending`; after restart `outcome_unknown` can move back to `sending` and issue
-the exact GET again. Preserve that read retry: it is not a mutation replay. However,
-there is no collector loop that resumes the source. A queued poll cannot be cancelled
-through the ordinary Operation path because cancellation is explicitly rejected while
-the source lease exists. A lost caller can therefore leave collection waiting for a
-manual exact resume/read.
+The useful behavior is narrower than this machinery:
 
-Target collection uses a configured source owner with collector epoch/cursor/freshness,
-not a user Operation per page window. Setup must not require publication configuration.
+- the admitted request is immutable and idempotent by caller/request ID;
+- sender and recipient are exact authenticated principals;
+- task/attempt scope is revalidated;
+- reply names one prior message and optional digest;
+- cancel cannot silently cross sender/recipient/scope or cancel twice;
+- reading does not delete evidence.
 
-### AR-091–092 — page numbers do not define a stable or completable snapshot
+Retain those checks on one normalized row keyed by the message Operation ID. A
+transport/display delivery identifier is not a second durable business identity.
 
-The client calls `/issues?state=all&sort=updated&direction=desc&per_page=50&page=N`.
-The source persists `next_page`; one poll reads at most eight pages. Duplicate IDs that
-change inside one bounded window correctly reject the snapshot, but there is no
-protection against an Issue moving from an unscanned later page to an already-scanned
-earlier page between polls. It can be absent from the rest of that cycle and appear only
-when a later cycle restarts at page one. Reaching the end therefore does not establish
-one atomic repository cut.
+`message.read` calls `object_reads::timeline` with `mailbox_only=true`. Candidate SQL
+walks global `observations`, extracts `payload_json.recipient`, and includes
+`message.send`, `coordination.message.send`, `task.feedback` and `check.completed`.
+The same signed head continuation, global cut, authorization digest and bounded timeline
+scan used by subscriptions is therefore also the mailbox. Feedback and Check attention
+are useful, but they are not directed mail and should not determine mailbox identity or
+cursor continuity.
 
-Coverage is `complete` only when a single pass starts at page one, reaches the end, has
-no mapping conflicts and no stored Issue with comments. A source with more than 400 raw
-Issues can never meet `complete_from_page_one`; every pass that reaches the end began on
-a later page. Any Issue with `comments > 0` also keeps the source partial indefinitely,
-because comments are represented as an unresolved gap and never fetched.
+Target row shape:
 
-Keep explicit gaps, but make coverage aggregate over a stable/reconciled cycle and give
-required comments a real capture policy.
+```text
+message Operation ID
+sender / recipient
+optional Task / Attempt / tiny thread
+kind
+bounded inline body or artifact reference
+reply target / cancellation target
+recipient sequence
+created/admitted time
+```
 
-### AR-093–094 — collection currently owns Task revision
+`message.send` inserts the row in the Operation transaction. `message.read` keyset-pages
+recipient rows. Reply/cancel records an exact relation. Store events only wake the
+client; a lost notification is recovered from the mailbox table without another send.
 
-`persist_snapshot` validates source identity, inserts immutable fact rows, projects a
-TaskSpec, calls ordinary `task.create` or `task.revise`, writes current Issue mapping and
-work-pool rows, updates source coverage and settles the poll in one immediate writer
-transaction. One read can therefore hold the writer while creating/revising hundreds of
-Task Operations.
+### AR-103 — GM handover already has the right semantic boundary
 
-The mapping has one useful fence: if the local Task spec differs from the last imported
-spec digest, source refresh reports `local_task_spec_changed` instead of overwriting it.
-Preserve that conflict.
+`gm.rs` separates stable client role from current GM designation/epoch. Handover never
+adopts another Manager's Attempt, restarts native work, cancels an admitted effect or
+rewrites historical mailbox recipients. Its resync checkpoint includes a global report
+watermark, previous/successor recipient watermarks, a bounded attention snapshot and
+explicit `watermarks_are_acknowledgements=false` /
+`historical_mail_reassigned=false` facts.
 
-When the Task still equals the last imported spec, changed title/body invokes
-`task.revise`. The Operator is allowed to revise beneath another Manager's live Attempt.
-`tasks::revise` advances the Task revision and resets acceptance while explicitly
-preserving the existing Attempt and its frozen snapshot. New work for the updated
-revision can then be blocked by the unreleased old Attempt; late old output remains
-historical. A background GET must not make that product/work disposition implicitly.
+Preserve that law. Replace only the current Observation-derived mailbox watermark with
+the normalized recipient sequence. The successor reads current Task/Attempt/native
+attention because it is current GM; it does not become the recipient or author of old
+mail.
 
-Split collection from import. A source change under live work becomes one bounded
-conflict/decision with exact old/new revisions, not an automatic revision.
+### AR-104–106 — direct collaboration is buried inside a coordination platform
 
-### AR-095 — selected work is not what WorkDispatch selects
+The retained Thread wire requires reasonability fields, participant reasons, topic
+classification, related scopes, ten speech acts, reply deadlines, evidence references,
+proposal links and manager ratification references. Store owns current/active/task/actor
+and duplicate-fingerprint indexes plus resolve/withdraw/supersede state. That is a
+negotiation product, not merely message grouping.
 
-Every mapped Issue creates an ordinary open Task and a `task.create` observation before
-`github.work_pool.apply`. WorkDispatch accepts all committed `task.create`,
-`task.revise` and `task.claim` facts and has no dependency on the GitHub work-pool table.
-Repository-wide source search found work-pool selection consumers in preview/apply,
-GitHub effect targeting and automation authorization, not queue/launch admission.
-Therefore an unselected GitHub Task can be admitted by ordinary WorkDispatch.
+The broader coordination Store also registers a parallel Participant directory and
+publishes work/contract cards. Consult locates peers through card indexes and asks one
+structured question. These mechanisms grant no actual Task/workspace authority, but
+they add their own freshness, index backfill, sparse search, corruption and pagination
+lifecycles.
 
-`github.work_pool.apply` also requires 1..200 Task IDs, so it cannot express an empty
-selection, and preview orders by Task ID rather than retained selection order. The work
-pool is neither a reliable queue nor a clean import boundary. Select source facts by
-admitting `source_import`; once a Task exists, use the ordinary queue.
+Do not delete the current registry first: launcher-created Participants, native stream
+readers and assigned reviewers still use its scoped grants. First move the required
+Task/Attempt/candidate access to the retained object/grant owner. Then delete duplicate
+participant directory/card/index state while retaining bounded peer messages and exact
+assigned-reviewer access.
 
-### AR-096–098 — source semantics and retained code are incomplete
+### AR-107–110 — advisory state became four more products
 
-`fact_digest` includes Issue state, comment count and URL, but `task_spec` includes only
-its title and body. A close/reopen transition can create a new source fact while the
-projected Task spec remains identical, so no revision or closure occurs and the Task
-stays open. Comments produce only a gap entry; labels are not part of the intake model.
-This is honest partial data, but it is not sufficient for automatic implementation
-work.
+Contract proposal/response/decision code owns immutable proposal revisions, objections,
+support, withdrawals, complete affected-scope snapshots and ratify/reject decisions.
+`code.scope.*` supplies those snapshots, although its own source states it neither locks
+files nor controls Git/work. Integration cells independently collect contract-card
+offers/requirements/carriers, comparisons, assumptions and ACKs while explicitly
+changing no authoritative Task/workspace/acceptance state. Concilium adds a separate
+proposal/preview/open/round/slot/position/close workflow.
 
-The append-only `github_issue_facts` transition chain has no selected runtime reader;
-current Issue rows plus Task mutation Operations own the active state/history needed by
-current consumers. Retain referenced source revisions, not an unused universal mirror.
+These products contain useful facts, but their authority is elsewhere:
 
-The Issues endpoint filters out PRs. `github/pulls.rs` implements exact PR readback, and
-`github/projection.rs` defines candidate-bound DTOs, but selected source search found no
-current callers outside those files. They are not a connected PR collector, Governor
-view or publication path. Connect the required typed path or delete it; do not cite
-source-file existence as implemented behavior.
+| Useful fact | Retained owner |
+| --- | --- |
+| Question/answer/consultation | Addressed mailbox message |
+| Requested product/interface change | Task or selected source revision |
+| Implementation write boundary | Task path scope + workspace lease |
+| Candidate finding and verdict | Review subsystem |
+| Connected producer/consumer compatibility | Check/evidence attached to exact candidate/revision |
+| Final Task completion | Candidate-specific acceptance gate |
+| Independent research/review | Ordinary assigned Task/review, not council rounds |
 
-### AR-099 — remote truth appears only during publication
+Keeping all four does not make those facts more authoritative; it multiplies copied
+state, cursors, hashes, indexes and recovery paths.
 
-Exact remote-ref readback exists in Forge and is correctly used to settle an ambiguous
-push. No independent collector records repository/ref/head, source time, freshness and
-error when publication is absent. Local tracking refs cannot substitute for current
-remote state. Add one small read-only source and join it into Governor observation;
-publication remains an optional effect.
+### AR-111–112 — watch and frontend state multiply the same lifecycle again
+
+Coordination watch is a full Store workflow: record/active/list/subject/notice indexes,
+reconcile cursor, revisit records and turn, owner notices and quarantine. The host tick
+reconciles it separately, and coordination inbox projection merges its notices with
+messages. Retained subscriptions and the target single automation loop already own
+wake/current-state behavior.
+
+The deletion cannot stop in Store. Concilium and coordination categories also appear in
+MCP profile requirements and subscription resync, while every method is repeated in the
+public catalog, method policy, CLI parser, Store dispatch/authorization and fixtures.
+A compatibility facade would leave the same product cost under different names.
+
+### AR-113 — transition is finite, not universal compatibility
+
+Before the cut, enumerate:
+
+1. unresolved directed messages needed by current work;
+2. open Threads whose grouping is still needed;
+3. active participant/reviewer grants used by launch or current review;
+4. pending watch/Concilium/contract/integration decisions requiring explicit
+   finish/export/disposition.
+
+Migrate required mail to normalized rows with original sender, recipient, scope, reply
+relation and admitted time. Keep a tiny thread only for an actual grouping consumer.
+Completed historical Operations remain readable through existing history. They do not
+keep old mutation handlers, JSON identity indexes or an executable translation layer.
+
+### AR-114 — first confirmed deletion from the GitHub-source audit
+
+Repository search at `e42c464` found `github/pulls.rs::read_pull_request`,
+`PullRequestObservation`, `github/projection.rs::{CheckProjection,SummaryProjection,
+LabelProjection}` and `work_pool::task_origin_key_for_pull` only in their defining
+files. GitHub PR effect code uses the lower-level client types directly and does not use
+these helpers. Commit `98b350e` therefore removes the two disconnected modules and the
+sole helper without replacing them or claiming PR-source support.
 
 ## Inspected source boundaries
 
 | Source | Read boundary |
 | --- | --- |
-| `store/github.rs` | Source setup/read/poll, lease, failure/commit, fact retention, Task mapping/revision and work-pool selection. |
-| `github/client.rs` | `gh api` bounds, repository identity, mutable Issue pagination, PR/label reads and writes. |
-| `github/observer.rs` | Bounded page-window assembly and within-window instability check. |
-| `github/work_pool.rs` | Immutable origin keys, fact/source revisions and title/body Task projection. |
-| `github/protocol.rs` | Public setup/poll/work-pool/effect request shapes and selection bounds. |
-| `migrations/006_github.sql` | Source/current/fact/work-pool/lease lifetimes and indexes. |
-| `automation/work_dispatch.rs`, `store/automation_work_dispatch.rs` | General Task-fact admission independent of GitHub selection. |
-| `store/tasks.rs` | Task create/revise rights, live-Attempt revision and frozen Attempt preservation. |
-| `github/pulls.rs`, `github/projection.rs` | Typed but disconnected PR/projection helpers. |
-| Forge/effect source search | Remote-ref reads only inside publication/readback; no independent collector. |
+| `store/mailbox.rs`, migration 015 | Direct message admission, identity unions, reply/cancel lookup and JSON indexes. |
+| `store/object_reads.rs` | Global timeline, mailbox candidate SQL, signed head continuation and object-grant projection. |
+| `store/gm.rs` | Designation/epoch, handover, recipient watermarks and attention resync. |
+| `coordination/thread.rs`, `store/coordination_threads.rs` | Thread wire, roster, message state, resolution, retained reads and contract decision seam. |
+| `coordination/mod.rs`, `store/coordination.rs` | Participant registry, cards, consult, inbox and legacy index backfill. |
+| `coordination/contract.rs`, `store/code_scopes.rs` | Proposal/response/ratification and advisory scope revisions/conflicts. |
+| `store/integration.rs` | Integration cell contributions, comparison state and ACK lifecycle. |
+| `store/concilium.rs` | Proposal, packet, round, slot, position and manager-result workflow. |
+| `coordination/watch.rs`, `store/coordination_watch.rs` | Watch request shapes, indexes, notices, reconciliation, revisit and quarantine. |
+| `swarm-contracts`, `swarm-mcp`, `swarm-cli`, Store router | Repeated policy/catalog/profile/subscription/CLI exposure. |
+| `github/{pulls,projection,work_pool,mod}.rs` | Disconnected PR/projection code removed by `98b350e`. |
 
-Selected paths, not whole-project certification. Live API movement, rate limiting,
-repository deletion/transfer, comments, large sources and remote-ref freshness were not
-executed.
+Selected paths, not whole-project certification. Concrete migration inventory, live
+multi-client reconnection, damaged-database behavior and scale were not executed.
 
 ## Next work
 
-Continue the mailbox/coordination chain named in [Resume here](#resume-here). The next
-pass must preserve one addressed durable message path, reconnect cursor, exact
-reply/cancel and historical recipients while deleting duplicate cards/contracts/
-Concilium/code-scope authority. Do not replace direct agent collaboration with a human
-relay or another workflow platform.
+Continue the Store bootstrap/migration chain named in [Resume here](#resume-here).
+Preserve one durable authority, transactional domain receipts, WAL reads and honest
+corruption handling while deleting source-text schema compatibility and unnecessary
+reference-database ceremony. Do not create another migration framework or ORM.
