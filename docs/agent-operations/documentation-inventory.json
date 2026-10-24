@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "inspected_head": "8f9fdd3b016d6578de6ec4be45ee3095f7810759",
+  "inspected_head": "b23635656a0d38359f7a9dbad849e259624c01ea",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
@@ -789,7 +789,7 @@
     },
     {
       "path": "docs/agent-operations/source-audit-coverage.md",
-      "bytes": 8200,
+      "bytes": 9004,
       "lines": 72,
       "headings": 5,
       "classification": "current-contract",
