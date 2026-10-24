@@ -1,13 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use swarm_contracts::{
     error::Result,
-    runtime::{
-        ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND, AntigravityDispatchSessionProof, EffectOutcome,
-        RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt,
-    },
+    runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt},
     task_prompt::TASK_PROMPT_CONTRACT_REVISION,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -15,7 +11,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::{
     launch::selected_model_id,
     module_receipt,
-    stream::{Phase, StreamState, TerminalDisposition, Turn},
+    stream::{StreamState, TerminalDisposition, Turn},
     wire::{OperationIdentity, encode_user_line, normalized_dispatch_admission, prompt_for},
 };
 
@@ -238,8 +234,8 @@ impl Controller {
                 // was passed and the installed harness default applies.
                 // init.model is reported as observed when present and never
                 // guessed, so the effective model stays unknown unless the
-                // native stream observed it. A v2 dispatch proof can attest
-                // session identity without claiming verified model selection.
+                // native stream observed it. Store retains this Open evidence;
+                // Dispatch does not require a second refresh or proof packet.
                 self.model_readback_state = Some("native_default");
             }
         }
@@ -593,13 +589,10 @@ impl Controller {
                         "Antigravity exposes no exact native history readback for this root",
                     ));
                 }
-                let snapshot = self.stream.snapshot();
-                let dispatch_session_proof = self.dispatch_session_proof(&identity);
                 json!({
                     "completion_condition": "current_process_native_observation",
                     "target": target,
-                    "snapshot": snapshot,
-                    "antigravity_dispatch_session_proof": dispatch_session_proof,
+                    "snapshot": self.stream.snapshot(),
                 })
             }
             "agent.reconcile" => {
@@ -678,59 +671,6 @@ impl Controller {
         };
         self.record_outcome(&outcome, &identity.method, &identity.module_receipt)?;
         Ok(outcome)
-    }
-
-    fn dispatch_session_proof(
-        &self,
-        identity: &OperationIdentity,
-    ) -> Option<AntigravityDispatchSessionProof> {
-        let init = self.stream.init.as_ref()?;
-        let native_root_id = self.native_root_id.as_deref()?;
-        // Model selection is independent of session/Task identity. A native
-        // default has no requested model and may have no model observation;
-        // v2 preserves those unknowns without claiming verified selection.
-        let requested_model_id = self.requested_model_id.as_deref();
-        let observed_model_id = init.model.as_deref();
-        if requested_model_id.is_some() && observed_model_id.is_none() {
-            return None;
-        }
-        let model_readback_state = self.model_readback_state?;
-        let stream_phase = match self.stream.phase {
-            Phase::AwaitingInit => "awaiting_init",
-            Phase::Ready => "ready",
-            Phase::InitFailed => "init_failed",
-            Phase::StreamEnded => "stream_ended",
-            Phase::StreamFailed => "stream_failed",
-        };
-        Some(AntigravityDispatchSessionProof {
-            schema_version: if requested_model_id.is_some() { 1 } else { 2 },
-            kind: if requested_model_id.is_some() {
-                ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND
-            } else {
-                swarm_contracts::runtime::ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND
-            }
-            .to_owned(),
-            refresh_operation_id: identity.operation_id.clone(),
-            binding_id: self.binding_id.clone(),
-            binding_generation: self.generation,
-            worker_boot_id: self.boot_id.clone(),
-            native_root_id: native_root_id.to_owned(),
-            native_scope_key_sha256: format!(
-                "{:x}",
-                Sha256::digest(self.native_scope_key.as_bytes())
-            ),
-            conversation_id: init.conversation_id.clone(),
-            requested_model_id: requested_model_id.map(str::to_owned),
-            observed_model_id: observed_model_id.map(str::to_owned),
-            model_readback_state: model_readback_state.to_owned(),
-            stream_phase: stream_phase.to_owned(),
-            native_events_seen: self.stream.native_events_seen,
-            result_ordinal: self.stream.result_ordinal,
-            gap_count: self.stream.gaps,
-            turn_pending: self.pending.is_some() || self.pending_open.is_some(),
-            stream_error_code: self.stream.stream_error_code.map(str::to_owned),
-            stream_exit_code: self.stream.exit_code,
-        })
     }
 
     fn read_unknown(

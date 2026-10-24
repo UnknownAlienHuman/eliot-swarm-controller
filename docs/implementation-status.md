@@ -5,12 +5,12 @@
 **SOURCE_AUDIT_INCOMPLETE / TARGET DOCUMENTS WORKING DRAFT /
 RUNTIME REFACTOR IN PROGRESS.**
 
-Source was inspected on **2026-10-24** at
-`b61c0bd76fc3c16f8e28c262f7607ace2426469b`. The active audit contains
-**170 entries**. AR-160–170 close the named remote-gateway source chain: fixed process
-identity/profile, secret-file loading, HTTP/Host/Origin/bearer/body boundaries, RMCP
-session cleanup versus admission capacity, timeout/disconnect semantics, the
-kernel-host compatibility launcher and missing connected qualification.
+Runtime slice was inspected and reduced on **2026-10-24** at
+`3c7a84ffc6d1e349fe989e4beaa62b03ed4e21bb`. The active source audit remains
+**incomplete at 170 entries**; AR-160–170 are frozen at the preceding gateway
+checkpoint `0a228cd`. A1b is the first new runtime slice after that audit: it removes
+the mandatory Antigravity dispatch refresh/session-proof chain while preserving
+current Store binding/Open and adapter command fences.
 
 Merged work immediately preceding this checkpoint:
 
@@ -24,6 +24,8 @@ Merged work immediately preceding this checkpoint:
   documentation only. J0 remains selected but not landed.
 - PR #191 at `b61c0bd`: AR-142–159 plus the Governor-observation contract;
   documentation only. No R0–R6 collector/runtime implementation is claimed.
+- PR #192 at `0a228cd`: AR-160–170 plus gateway target/dependency documentation;
+  documentation only. No V0–V3 gateway runtime implementation is claimed.
 
 - [Current resume point and findings](agent-operations/audit-current.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
@@ -43,15 +45,16 @@ Merged work immediately preceding this checkpoint:
 | --- | --- | --- |
 | Duplicate host CLI/MCP launcher removed | `25a8e3b`, recorded net −1,206 Rust lines | Most runtime duplication remains. |
 | Active Antigravity coordinate aligned on v6 | `cba98b7` | No installed native-turn qualification. |
-| Terminal receipt decoupled from Store observation | `eeea355`, recorded net −265 production Rust lines | Dispatch proof and crash-unsafe delivery remain. |
+| Terminal receipt decoupled from Store observation | `eeea355`, recorded net −265 production Rust lines | Crash-unsafe delivery remains; A1b removed the dispatch proof gate. |
 | One dispatch producer across SUCCESS/ERROR/CANCELED | `c92120e`; historical run `39579583956`, job `119153571930` | Scoped regression/Clippy only; no crash/installed/load proof. |
 | Disconnected GitHub PR/projection modules removed | `98b350e`, net −250 Rust lines; run `40087522775` passed scoped Ubuntu/Windows gates | No PR-source feature or remote observation was added. |
+| Antigravity dispatch refresh/proof gate removed | `3c7a84f`, net −305 production Rust and −20 qualification-glue lines; run `40131522836`, job `120984044559` | A2 durable delivery, old-boot completion and installed/crash qualification remain. |
 
 ```text
 A0   LANDED                   active v6 coordinate
 A1a  LANDED / SCOPED PASS     terminal decoupling + producer lifecycle
-A1b  NEXT / NOT IMPLEMENTED   remove dispatch proof/refresh prerequisite
-A2   NOT IMPLEMENTED          durable outcome/body/page delivery and successor completion
+A1b  LANDED / SCOPED PASS     refresh/proof gate removed; current fences retained
+A2   NEXT / NOT IMPLEMENTED   durable outcome/body/page delivery and successor completion
 A3   NOT IMPLEMENTED          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime
 U/R  SMALL CLEANUP LANDED      disconnected GitHub PR/projection source removed
@@ -60,14 +63,14 @@ R0–R6 TARGET ONLY              source-owned joined Governor observation
 V0–V3 TARGET ONLY              secret/session/origin/standalone gateway cut
 ```
 
-The next exact implementation slice is **A1b**. J0 is a bounded independent frontend
+The next exact implementation slice is **A2**. J0 is a bounded independent frontend
 fix; R0–R6 and V0–V3 remain later connected programs and do not reorder A.
 
 ## Source-inspection result
 
 | Area | Source-confirmed behavior | Open boundary |
 | --- | --- | --- |
-| Results/recovery, AR-001–035 | Exact selected result identity, assembly/grants and several useful delivery mechanisms. | Durable Antigravity delivery, first historical capture, continuation and live crash/power-loss. |
+| Results/recovery, AR-001–035 | Exact selected result identity, assembly/grants and several useful delivery mechanisms; A1b removed the duplicate Antigravity refresh/proof admission gate. | A2 durable Antigravity delivery, first historical capture, continuation and live crash/power-loss. |
 | Queue/provider/resources, AR-036–050 | Root dedup and common claim/Open transaction are useful. | Stable budget identity, cancellation and attached-binding retirement. |
 | Goals/automation, AR-051–058 | Exact terminal/occurrence identity exists. | Actor/phase/transfer bugs, finite budgets and one ordinary loop. |
 | Review/correction/acceptance, AR-059–064 | Replacement, all-findings feedback, same-Attempt resubmission and frozen evidence gate exist. | Automatic replacement, finite correction, subject fairness and common review/finding provenance. |
@@ -80,6 +83,21 @@ fix; R0–R6 and V0–V3 remain later connected programs and do not reorder A.
 | IPC/MCP, AR-127–141 | Client/server multiplexing, no-replay unknown outcome, live Store authorization, tool/pump isolation and bounded lag semantics are useful. | MCP outer-lock removal, exact pending-input read, bounded attention, one pump, WAL read routing and concurrent/load qualification. |
 | Observation, AR-142–159 | Binding/boot fences, typed provider evidence, process birth/membership checks, conservative workspace release and passive semantics are useful. | Independent source collectors, unmatched subjects, live Git/remote facts, joined WAL projection, split disclosure and old-surface deletion. |
 | Gateway, AR-160–170 | Fixed credential/profile, loopback/path/auth/body checks, no-replay IPC, timeout-as-unknown and RMCP worker cleanup are useful. | Absolute private secrets, credential cap, configured edge Origins, separate connection/session limits, explicit idle policy, standalone cutover and connected qualification. |
+
+## Antigravity A1b status
+
+A1b removes `AntigravityDispatchSessionProof`, its runtime DTO/constants, adapter
+producer, latest-refresh Store query, binding/snapshot proof validator, mandatory
+qualification refresh and assignment/lease/session digest packet. Dispatch now reads
+the existing successful Open evidence and revalidates current Task/Attempt, route,
+binding generation, boot/root, model and workspace authority. The adapter still rejects
+foreign binding/root commands before native I/O. `agent.refresh` remains available as
+readback and grants no dispatch right.
+
+Run `40131522836`, job `120984044559`, passed affected rustfmt and warnings-denied
+Clippy. No integration tests or installed/native qualification were run. A2 remains
+open: all outcome/body/page delivery is still process-memory-backed and cannot yet be
+completed safely by a successor boot.
 
 ## Gateway status
 
@@ -168,15 +186,15 @@ inspection and a successful compile cannot substitute for those results.
 
 ## Next work
 
-**Runtime A1b:** remove the redundant Antigravity dispatch refresh/proof/digest
-prerequisite through the exact chain named in
-[audit-current](agent-operations/audit-current.md#resume-here). Preserve current
-binding/generation/boot/session/model/workspace checks and no-replay semantics. Delete
-producer, validator, qualification gate, schema/profile and installer requirements in
-the same connected slice.
+**Runtime A2:** retain complete Antigravity outcome/body/page Store-delivery parameters
+in private atomic files before treating them as locally retained. Same-boot reconnect
+may resend identical bytes; after verified prior-owner departure, an authorized
+successor may deliver the original Operation with immutable origin boot/source identity.
+Never persist or replay native prompt intent. Missing/partial capture remains visible
+unknown and must not complete a newer Attempt.
 
-**Subsequent A2–A3:** durable outcome/body/page delivery with successor completion, then
-real typed actions and one active Antigravity route.
+**Subsequent A3:** keep only real typed actions and one active Antigravity route; remove
+placeholder controls and concrete retired Node work after finite disposition.
 
 Selected independent future slices remain J0 from
 [IPC/MCP](agent-operations/ipc-mcp.md), R0–R6 from

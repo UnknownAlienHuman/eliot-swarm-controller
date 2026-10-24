@@ -313,7 +313,7 @@ pub(super) fn validate_before_effect(
     if model::canonical(&packet)? != model::canonical(&current)? {
         return Err(Error::new(
             "STALE_LAUNCH_DISPATCH_PACKET",
-            "launch plan, Task assignment, or C8 capability changed before native input",
+            "launch plan, Task assignment, or native dispatch capability changed before native input",
         ));
     }
     Ok(Some(packet))
@@ -632,8 +632,8 @@ fn stale_scope_predicate(predicate: &str) -> Error {
 }
 
 /// Revalidate the complete current Store tuple before accepting an
-/// Antigravity session proof, including when this capability helper is called
-/// directly for a readback. `None` means the initial unstarted stage; `Some`
+/// Antigravity dispatch, including when this capability helper is called
+/// directly for readback. `None` means the initial unstarted stage; `Some`
 /// must identify the exact queued child and its retained ancestry.
 fn require_current_antigravity_scope(
     db: &Connection,
@@ -732,7 +732,8 @@ pub(super) fn current_dispatch_capability_readback(
 
 /// Select the current native capability from the trusted route retained by the
 /// launch binding. OpenCode keeps its existing C8 verifier; Antigravity uses
-/// only its same-process session/turn proof and cannot claim MCP readback.
+/// current Store binding and successful Open evidence without another
+/// refresh/proof Operation and cannot claim MCP readback.
 pub(super) fn require_current_dispatch_capability(
     db: &Connection,
     config: &Config,
@@ -784,7 +785,8 @@ pub(super) fn require_current_dispatch_capability(
     )?
     .ok_or_else(antigravity_capability::unavailable)?;
     antigravity_capability::validate_retained_descriptor(&identity)?;
-    antigravity_capability::require_current_session_proof(db, &binding)
+    antigravity_capability::validate_current_session(&binding)?;
+    Ok(Value::Null)
 }
 
 fn build_current_packet(
@@ -795,8 +797,13 @@ fn build_current_packet(
     binding: &Value,
     proof: &Value,
 ) -> Result<Value> {
-    if antigravity_capability::is_session_proof(proof) {
-        return build_packet(parent, attempt, binding, proof, "");
+    let route_alias = launch_manifest_route_alias(&parent.manifest)?;
+    let route = config.route(route_alias)?;
+    if route.runtime == "antigravity"
+        && route.module_artifact_id == antigravity_capability::ANTIGRAVITY_ARTIFACT_ID
+    {
+        antigravity_capability::validate_current_session(binding)?;
+        return antigravity_capability::build_packet(parent, attempt, binding);
     }
     let owned = super::opencode::owned_service_for_binding(
         db,
@@ -815,9 +822,6 @@ fn build_packet(
     proof: &Value,
     owned_service_id: &str,
 ) -> Result<Value> {
-    if antigravity_capability::is_session_proof(proof) {
-        return antigravity_capability::build_packet(parent, attempt, binding, proof);
-    }
     let capability_identity_digest =
         validate_capability_proof(parent, attempt, binding, proof, owned_service_id)?;
     let route_alias = launch_manifest_route_alias(&parent.manifest)?;

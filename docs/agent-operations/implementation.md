@@ -172,10 +172,16 @@ existing dispatch producer across terminal SUCCESS/ERROR/CANCELED. Repair run
 passed the connected terminal regression and Store Clippy before publishing that
 commit. This is not installed-harness or crash-recovery qualification.
 
-**A1b:** delete `AntigravityDispatchSessionProof`, refresh producer, latest-refresh
-lookup, binding/snapshot proof validator, assignment/lease/session digests and
-mandatory refresh-before-dispatch. Store already owns assignment, Attempt,
-binding/boot, workspace lease and Operation.
+**A1b — landed, scoped Clippy passed:** `3c7a84f` deletes
+`AntigravityDispatchSessionProof`, refresh proof production, latest-refresh lookup,
+binding/snapshot proof validation, assignment/lease/session digests and the mandatory
+refresh-before-dispatch qualification step. Store now revalidates its existing
+Task/Attempt, binding/generation, route, current boot/root, successful Open model
+evidence and workspace authority directly; the adapter retains command-time
+binding/root checks and `agent.refresh` remains a standalone read action. Run
+`40131522836`, job `120984044559`, passed affected rustfmt and warnings-denied Clippy.
+No integration, installed harness, crash or load qualification is claimed. Net change:
+−305 production Rust lines, −20 qualification-glue lines and +3 test lines.
 
 **A2:** retain complete terminal bytes and final outcome/result parameters with
 Operation, original binding/generation and origin boot in private atomic files before

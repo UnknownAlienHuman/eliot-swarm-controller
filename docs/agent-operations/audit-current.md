@@ -9,7 +9,8 @@ checkpoints:
 - AR-100–114 at [`e99c06b`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e99c06bb490fe630eec70337ce5137a26e145d84/docs/agent-operations/audit-current.md);
 - AR-115–126 at [`053f1e0`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/053f1e0fb15b3d40c00918f4a25ec8f9e4969e02/docs/agent-operations/audit-current.md);
 - AR-127–141 at [`c73c36c`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c73c36c72d2c86cf710fa69e39ab07e2052c1f5e/docs/agent-operations/audit-current.md);
-- AR-142–159 at [`b61c0bd`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b61c0bd76fc3c16f8e28c262f7607ace2426469b/docs/agent-operations/audit-current.md).
+- AR-142–159 at [`b61c0bd`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b61c0bd76fc3c16f8e28c262f7607ace2426469b/docs/agent-operations/audit-current.md);
+- AR-160–170 at [`0a228cd`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/0a228cd3a2fde9f38be136485b53b88c7e0e5c84/docs/agent-operations/audit-current.md).
 
 [Audit index](audit-index.md) maps every range to immutable evidence;
 [implementation](implementation.md) owns source changes;
@@ -19,50 +20,43 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
 
 ## Resume here
 
-- Checkpoint: **2026-10-24 / remote single-tenant MCP gateway**.
-- Source inspected at **`b61c0bd76fc3c16f8e28c262f7607ace2426469b`**.
-  The gateway/runtime source in this chain is unchanged from the prior runtime baseline;
-  this checkpoint changes documentation only.
+- Checkpoint: **2026-10-24 / Antigravity A1b runtime reduction**.
+- Runtime source changed from gateway-audit head
+  `0a228cd3a2fde9f38be136485b53b88c7e0e5c84` to
+  **`3c7a84ffc6d1e349fe989e4beaa62b03ed4e21bb`**.
 - Connected chain:
-  `crates/swarm-gateway::{main,config,gateway}` → secret path resolution/loading →
-  fixed profile/client validation → bearer/path/query/Host/Origin/body checks →
-  RMCP 3.5.0 `StreamableHttpService` and `LocalSessionManager` → per-session
-  `swarm-mcp::profiled_facade` and IPC/readback → request timeout/shutdown →
-  `swarm-kernel-host gateway` sibling launcher → build-policy compatibility checks.
-- Overall audit: **incomplete, 170 entries**. AR-160–170 are recorded below; prior
-  dispositions remain in immutable checkpoints.
-- Preserved in this pass: loopback-only bind; exact path/no query; fixed restricted
-  profile bound to the credential client ID; duplicate Authorization rejection;
-  constant-work bearer comparison; RMCP Host/Origin/body/cancellation mechanisms;
-  bounded TCP connections; no silent IPC replay; timeout/disconnect leaving admitted
-  Store work intact; RMCP worker-driven session removal and finite default idle/init
-  cleanup.
-- Open in this pass: relative secret paths; unbounded/following credential read;
-  non-private/non-regular secret acceptance; missing credential token upper bound;
-  hard-coded rather than configured edge Origins and connection count; no active MCP
-  session cap; dependency defaults substituted for product policy; SSE lifetime outside
-  request timeout; duplicated kernel-host launcher retained by build checks; no connected
-  gateway security/capacity/restart qualification.
-- **Next exact chain — implementation A1b:**
-  `store/launcher_dispatch/antigravity_capability::{validate_retained_descriptor,
-  require_current_session_proof,build_packet}` → launch/dispatch admission and current
-  workspace/binding checks → adapter
-  `controller::{read_command,dispatch_session_proof}` → qualification's mandatory
-  `agent.refresh` readiness gate → descriptor/installer/package schema requirements.
-  Remove the redundant refresh/proof/digest prerequisite while preserving actual
-  binding/generation/boot/session/model/workspace fences and without replaying input.
-- Runtime implementation order remains **A1b–A3, then B–V**. This completed source
-  chain does not claim a whole-project exhaustive audit or reorder implementation.
-- Still unqualified: secret ACL/mode checks on Windows/Unix; browser/tunnel Origin and
-  Host behavior; connection/session exhaustion; slow/chunked body; timeout after Store
-  commit; disconnect/restart/shutdown; standalone packaging/cutover; installed gateway
-  behavior.
-- Documentation only. No runtime code, rustfmt, Clippy, test, benchmark or installed
-  system qualification changed in this checkpoint.
+  `launcher_dispatch::require_current_antigravity_scope` → retained descriptor and
+  current binding/Open validation → immutable launch-dispatch packet → adapter
+  `Controller::complete_open/read_command` → qualification readiness. The mandatory
+  `agent.refresh` Operation, `AntigravityDispatchSessionProof`, latest-refresh query,
+  snapshot validator and assignment/lease/session digest packet are removed.
+- Overall source audit remains **incomplete, 170 entries**. A1b is an implementation
+  checkpoint, not another finding range or a whole-project completion claim.
+- Preserved: exact Task/Attempt/current-revision and launch-parent checks; binding
+  generation and current route; current boot/root/connection/recovery fences;
+  explicit-model readback or honest native-default unknown; workspace authority;
+  adapter command-time binding/root checks; no replay after uncertain input.
+- `agent.refresh` remains a real optional current-process readback action. It no longer
+  authorizes Dispatch or emits a duplicate proof packet.
+- Verification: run
+  [40131522836](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/40131522836),
+  job `120984044559`, passed affected rustfmt and warnings-denied Clippy. No tests,
+  native/provider calls, installed harness, crash, restart or load qualification ran.
+- Recorded change: **−305 production Rust lines, −20 qualification-glue lines, +3 test
+  lines**.
+- **Next exact chain — implementation A2:** adapter
+  `Controller::{record_outcome,pending_receipts,completed_turns}` and normalized result
+  pages → `HostSession::request_saved/flush_reports` → exact `module.outcome` /
+  `module.result` ACK and replay → private atomic retained outcome/body/page files →
+  verified prior-owner departure and successor delivery for the original Operation.
+  Preserve origin boot and source identity; never put native prompt intent in the
+  delivery spool or replay input.
+- Runtime implementation order is now **A2–A3, then B–V**.
+- Still unqualified: crash before/after durable capture, power loss, old-boot delivery,
+  source-pressure behavior, installed Antigravity, live restart and scale.
 
-On resume, compare live `main` with the inspected head, reopen changed owners/consumers
-only, then execute the named A1b vertical slice. A source read or documentation commit
-is not a runtime repair.
+On resume, compare live `main` with `3c7a84f`, reopen only changed A2 owners/consumers,
+and continue the named delivery chain. Do not recreate the deleted refresh/proof gate.
 
 <a id="findings-ar-160170"></a>
 ## Findings AR-160–170
