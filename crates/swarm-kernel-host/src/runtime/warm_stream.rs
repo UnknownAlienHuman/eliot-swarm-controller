@@ -22,6 +22,9 @@ pub struct OutcomeContext<'a> {
     pub binding: &'a Value,
     pub operation: &'a Value,
     pub outcome: &'a RuntimeOutcome,
+    /// Supplied only after Store validates an exact admitted reconcile link and
+    /// the binding's proven previous-owner departure transition.
+    pub allowed_origin_boot_id: Option<&'a str>,
 }
 
 pub fn is_route(route: &Value) -> bool {
@@ -40,6 +43,7 @@ pub fn validate_outcome(context: OutcomeContext<'_>) -> Result<Option<Value>> {
         binding,
         operation,
         outcome,
+        allowed_origin_boot_id,
     } = context;
 
     if !is_route(&binding["route"]) {
@@ -102,10 +106,13 @@ pub fn validate_outcome(context: OutcomeContext<'_>) -> Result<Option<Value>> {
         ));
     }
 
+    let origin_boot_id = required_text(&receipt["bridge_boot_id"], "origin bridge boot_id")?;
+    let accepted_boot = origin_boot_id == active_boot_id
+        || allowed_origin_boot_id.is_some_and(|allowed| allowed == origin_boot_id);
     if outcome.details["completion_condition"] != COMPLETION_CONDITION
         || receipt["input_operation_id"] != operation_id
         || receipt["native_conversation_id"] != native_conversation_id
-        || receipt["bridge_boot_id"] != active_boot_id
+        || !accepted_boot
         || receipt["result_ordinal"]
             .as_u64()
             .is_none_or(|ordinal| ordinal == 0)
@@ -145,7 +152,7 @@ pub fn validate_outcome(context: OutcomeContext<'_>) -> Result<Option<Value>> {
             "kind":"antigravity_warm_result",
             "input_operation_id":operation_id,
             "native_conversation_id":native_conversation_id,
-            "bridge_boot_id":active_boot_id,
+            "bridge_boot_id":origin_boot_id,
             "result_ordinal":receipt["result_ordinal"],
             "response_sha256":receipt["response_sha256"],
             "status":receipt["status"]
@@ -229,6 +236,7 @@ mod tests {
             binding: &binding,
             operation: &operation,
             outcome: &outcome,
+            allowed_origin_boot_id: None,
         })
         .unwrap()
         .unwrap();
@@ -253,6 +261,7 @@ mod tests {
                 binding: &binding,
                 operation: &operation,
                 outcome: &outcome,
+                allowed_origin_boot_id: None,
             })
             .unwrap()
             .unwrap();
@@ -265,6 +274,7 @@ mod tests {
                 binding: &binding,
                 operation: &operation,
                 outcome: &outcome,
+                allowed_origin_boot_id: None,
             })
             .is_err()
         );
@@ -279,6 +289,7 @@ mod tests {
                 binding: &binding,
                 operation: &operation,
                 outcome: &outcome,
+                allowed_origin_boot_id: None,
             })
             .is_err()
         );
@@ -290,6 +301,36 @@ mod tests {
                 binding: &binding,
                 operation: &operation,
                 outcome: &outcome,
+                allowed_origin_boot_id: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prior_boot_requires_store_validated_reconcile_origin() {
+        let (mut binding, operation, mut outcome) = fixture("SUCCESS", EffectOutcome::Applied);
+        binding["observation"]["bridge_boot_id"] = json!("boot-2");
+        binding["observation"]["previous_bridge_boot_id"] = json!("boot-1");
+        binding["observation"]["recovery_required"] = json!(true);
+        binding["state"] = json!("reconciling");
+        outcome.details["reconcile_operation_id"] = json!("reconcile-1");
+        let producer = validate_outcome(OutcomeContext {
+            binding: &binding,
+            operation: &operation,
+            outcome: &outcome,
+            allowed_origin_boot_id: Some("boot-1"),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(producer["local_execution_ref"]["bridge_boot_id"], "boot-1");
+
+        assert!(
+            validate_outcome(OutcomeContext {
+                binding: &binding,
+                operation: &operation,
+                outcome: &outcome,
+                allowed_origin_boot_id: None,
             })
             .is_err()
         );
@@ -304,6 +345,7 @@ mod tests {
                 binding: &binding,
                 operation: &operation,
                 outcome: &outcome,
+                allowed_origin_boot_id: None,
             })
             .unwrap()
             .is_some()
@@ -319,6 +361,7 @@ mod tests {
                 binding: &binding,
                 operation: &operation,
                 outcome: &outcome,
+                allowed_origin_boot_id: None,
             })
             .unwrap()
             .is_none()

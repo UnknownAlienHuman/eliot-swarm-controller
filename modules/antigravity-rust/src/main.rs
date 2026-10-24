@@ -25,6 +25,7 @@ use swarm_antigravity_adapter::{
     },
     result_page,
     stderr::{self, StderrSummary},
+    store_delivery::{OUTCOME_METHOD, RESULT_METHOD},
     stream::NativeLineReader,
     wire::ARTIFACT_ID,
 };
@@ -49,11 +50,12 @@ async fn run() -> Result<()> {
     let owner = CandidateManagedOwner::from_environment()?;
     let (config, credential) = AdapterConfig::read(&config_path)?;
     let boot_id = owner.boot_id().to_owned();
+    let delivery_state_dir = owner.state_dir().to_path_buf();
     let native_scope_key = native_scope_key()?;
 
     let mut host = HostSession::new(config, credential, owner, boot_id, native_scope_key);
     let initial_hello = host.connect_and_hello(None, false).await?;
-    let mut controller = controller_from_hello(&host, &initial_hello)?;
+    let mut controller = controller_from_hello(&host, &initial_hello, &delivery_state_dir)?;
     let spawner = OwnedNativeSpawner::new(initial_hello.managed_owner);
     let mut native: Option<NativeSession> = None;
     let mut native_started = false;
@@ -331,8 +333,14 @@ async fn run() -> Result<()> {
                 };
                 match params {
                     Ok(params) => {
+                        let delivery = controller.retain_result_delivery(params)?;
                         let response = match host
-                            .request_saved("module.result", params, &controller, native_live)
+                            .request_saved(
+                                delivery.method(),
+                                delivery.params().clone(),
+                                &controller,
+                                native_live,
+                            )
                             .await
                         {
                             Ok(response) => response,
@@ -342,6 +350,7 @@ async fn run() -> Result<()> {
                                 else {
                                     return Err(error);
                                 };
+                                controller.discard_store_delivery(&delivery)?;
                                 controller.reject_command(&command, diagnostic_code)?;
                                 dirty = true;
                                 flush_reports(&mut host, &mut controller, &mut dirty, native_live)
@@ -349,7 +358,9 @@ async fn run() -> Result<()> {
                                 continue;
                             }
                         };
-                        if response["recorded"] != true {
+                        if response["recorded"] == true {
+                            controller.acknowledge_store_delivery(&delivery)?;
+                        } else {
                             controller.reject_command(&command, "MODULE_RESULT_ACK_INVALID")?;
                             dirty = true;
                             flush_reports(&mut host, &mut controller, &mut dirty, native_live)
@@ -436,7 +447,11 @@ fn result_ack_diagnostic(code: &str) -> Option<&'static str> {
     }
 }
 
-fn controller_from_hello(host: &HostSession, hello: &VerifiedModuleHello) -> Result<Controller> {
+fn controller_from_hello(
+    host: &HostSession,
+    hello: &VerifiedModuleHello,
+    delivery_state_dir: &std::path::Path,
+) -> Result<Controller> {
     let binding_id = hello
         .response
         .get("binding_id")
@@ -470,14 +485,15 @@ fn controller_from_hello(host: &HostSession, hello: &VerifiedModuleHello) -> Res
         swarm_antigravity_adapter::contract::normalized_dispatch_enabled(
             &swarm_antigravity_adapter::contract::claim()?,
         );
-    Ok(Controller::new(
+    Controller::with_delivery(
         host.boot_id.clone(),
         host.native_scope_key.clone(),
         binding_id.to_owned(),
         generation,
         native_root_id,
         normalized_dispatch_enabled,
-    ))
+        delivery_state_dir,
+    )
 }
 
 fn config_argument() -> Result<PathBuf> {
@@ -789,25 +805,56 @@ async fn flush_reports(
     dirty: &mut bool,
     native_live: bool,
 ) -> Result<()> {
-    for value in controller.pending_receipts() {
-        let operation_id = value
-            .get("operation_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Error::new("MODULE_OUTCOME_INVALID", "retained Operation ID is missing")
-            })?
-            .to_owned();
-        let response = host
-            .request_saved("module.outcome", value, controller, native_live)
-            .await?;
-        if response["recorded"] != true && response["superseded"] != true {
+    controller.ensure_delivery_healthy()?;
+    let mut deferred_cross_boot_outcome = false;
+    for delivery in controller.pending_store_deliveries()? {
+        if delivery.method() == RESULT_METHOD && deferred_cross_boot_outcome {
+            continue;
+        }
+        let response = match host
+            .request_saved(
+                delivery.method(),
+                delivery.params().clone(),
+                controller,
+                native_live,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error)
+                if delivery.method() == OUTCOME_METHOD
+                    && error.code == "NATIVE_IDENTITY_MISMATCH"
+                    && delivery.origin_boot_id() != controller.boot_id()
+                    && !delivery.reconcile_linked() =>
+            {
+                // The exact prior-boot bytes may already have committed; Store
+                // replay ACK would have succeeded above. Otherwise retain them
+                // until an admitted agent.reconcile links this original
+                // Operation to the proven owner transition.
+                deferred_cross_boot_outcome = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let acknowledged = match delivery.method() {
+            OUTCOME_METHOD => response["recorded"] == true || response["superseded"] == true,
+            RESULT_METHOD => response["recorded"] == true,
+            _ => false,
+        };
+        if !acknowledged {
             return Err(Error::new(
-                "MODULE_OUTCOME_ACK_INVALID",
-                "manager did not acknowledge the exact saved Operation receipt",
+                if delivery.method() == OUTCOME_METHOD {
+                    "MODULE_OUTCOME_ACK_INVALID"
+                } else {
+                    "MODULE_RESULT_ACK_INVALID"
+                },
+                "manager did not acknowledge the exact saved Store delivery",
             ));
         }
-        controller.acknowledge_outcome(&operation_id);
-        *dirty = true;
+        controller.acknowledge_store_delivery(&delivery)?;
+        if delivery.method() == OUTCOME_METHOD {
+            *dirty = true;
+        }
     }
 
     if *dirty {
@@ -1048,7 +1095,7 @@ impl NativeSession {
                             match event {
                                 Some(event) => if trust_stream {
                                     consume_native_event(controller, event);
-                                    let _ = controller.settle_terminal();
+                                    let _ = controller.settle_terminal_durable()?;
                                 },
                                 None => event_stream_open = false,
                             }
@@ -1076,7 +1123,7 @@ impl NativeSession {
                 event = self.events.recv() => match event {
                     Some(event) => if trust_stream {
                         consume_native_event(controller, event);
-                        let _ = controller.settle_terminal();
+                        let _ = controller.settle_terminal_durable()?;
                     },
                     None => break,
                 },
@@ -1174,7 +1221,7 @@ async fn wait_for_terminal(
                 Some(event) => {
                     consume_native_event(controller, event);
                     *dirty = true;
-                    if controller.settle_terminal().is_some() {
+                    if controller.settle_terminal_durable()?.is_some() {
                         return Ok(TurnProgress::Settled);
                     }
                 }
@@ -1211,7 +1258,7 @@ async fn drain_ready_native(
                 }
                 while let Some(event) = native.next_event().await? {
                     consume_native_event(controller, event);
-                    let _ = controller.settle_terminal();
+                    let _ = controller.settle_terminal_durable()?;
                     *dirty = true;
                 }
                 controller.child_exited(native.exit_code());

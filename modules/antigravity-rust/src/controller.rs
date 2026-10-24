@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use swarm_contracts::{
     error::Result,
     runtime::{EffectOutcome, RuntimeCommand, RuntimeOutcome, TaskDispatchAdmissionReceipt},
@@ -11,6 +11,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::{
     launch::selected_model_id,
     module_receipt,
+    store_delivery::{
+        OUTCOME_METHOD, RESULT_METHOD, StoreDelivery, StoreDeliverySpool, outcome_origin_boot,
+    },
     stream::{StreamState, TerminalDisposition, Turn},
     wire::{OperationIdentity, encode_user_line, normalized_dispatch_admission, prompt_for},
 };
@@ -77,6 +80,8 @@ pub struct Controller {
     stream: StreamState,
     completed_turns: BTreeMap<String, CompletedTurn>,
     pending_receipts: VecDeque<serde_json::Value>,
+    delivery_spool: Option<StoreDeliverySpool>,
+    retention_failure: Option<String>,
     journal: VecDeque<serde_json::Value>,
     observation_sequence: u64,
     pending_observation: Option<PendingObservation>,
@@ -106,10 +111,51 @@ impl Controller {
             stream: StreamState::new(0),
             completed_turns: BTreeMap::new(),
             pending_receipts: VecDeque::new(),
+            delivery_spool: None,
+            retention_failure: None,
             journal: VecDeque::new(),
             observation_sequence: 0,
             pending_observation: None,
         }
+    }
+
+    pub fn with_delivery(
+        boot_id: String,
+        native_scope_key: String,
+        binding_id: String,
+        generation: i64,
+        native_root_id: Option<String>,
+        normalized_dispatch_enabled: bool,
+        state_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let spool = StoreDeliverySpool::open(state_dir, &binding_id, generation, &boot_id)?;
+        let retained = spool.load_deliveries()?;
+        let outcomes = retained
+            .iter()
+            .filter(|delivery| delivery.method() == OUTCOME_METHOD)
+            .map(|delivery| delivery.params().clone())
+            .collect::<VecDeque<_>>();
+        if outcomes.len() > MAX_PENDING_RECEIPTS {
+            return Err(swarm_contracts::error::Error::new(
+                "MODULE_OUTCOME_OUTBOX_FULL",
+                "retained module outcome count exceeds its active bound",
+            ));
+        }
+        let mut controller = Self::new(
+            boot_id,
+            native_scope_key,
+            binding_id,
+            generation,
+            native_root_id,
+            normalized_dispatch_enabled,
+        );
+        controller.pending_receipts = outcomes;
+        controller.delivery_spool = Some(spool);
+        Ok(controller)
+    }
+
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
     }
 
     pub fn stream(&self) -> &StreamState {
@@ -324,7 +370,7 @@ impl Controller {
                 "model_verification": self.model_readback_state,
             }),
         };
-        let _ = self.record_outcome(&outcome, "agent.open", &identity.module_receipt);
+        self.record_outcome_or_mark(&outcome, "agent.open", &identity.module_receipt);
         Some(outcome)
     }
 
@@ -341,7 +387,7 @@ impl Controller {
             native_input_id: None,
             details: json!({ "diagnostic_code": code }),
         };
-        let _ = self.record_outcome(&outcome, "agent.open", &identity.module_receipt);
+        self.record_outcome_or_mark(&outcome, "agent.open", &identity.module_receipt);
         Some(outcome)
     }
 
@@ -420,11 +466,22 @@ impl Controller {
         PromptWrite::Written
     }
 
-    /// A result settles only the single in-flight prompt, for the same native
-    /// conversation and an explicitly terminal status with response digest.
+    /// Compatibility helper for source tests without a durable delivery root.
     pub fn settle_terminal(&mut self) -> Option<RuntimeOutcome> {
+        self.settle_terminal_inner().ok().flatten()
+    }
+
+    /// Production terminal settlement. Complete retained bytes and the exact
+    /// Store outcome are made durable before the pending prompt is released.
+    pub fn settle_terminal_durable(&mut self) -> Result<Option<RuntimeOutcome>> {
+        self.settle_terminal_inner()
+    }
+
+    fn settle_terminal_inner(&mut self) -> Result<Option<RuntimeOutcome>> {
         let (identity, conversation_id, result_ordinal_before, dispatch_admission) = {
-            let pending = self.pending.as_ref()?;
+            let Some(pending) = self.pending.as_ref() else {
+                return Ok(None);
+            };
             (
                 pending.identity.clone(),
                 pending.conversation_id.clone(),
@@ -432,20 +489,29 @@ impl Controller {
                 pending.dispatch_admission.clone(),
             )
         };
-        let (turn, disposition) = self
+        let Some((turn, disposition)) = self
             .stream
-            .terminal_for_after_foreign(&conversation_id, result_ordinal_before)?;
+            .terminal_for_after_foreign(&conversation_id, result_ordinal_before)
+        else {
+            return Ok(None);
+        };
         let turn = turn.clone();
         // The stream predicate proves that this is the first own result after
         // the prompt baseline and that every earlier global ordinal was an
         // explicitly identified foreign conversation. Keep the generation
         // fence below: a retained result from another stream cannot settle it.
-        let stream_generation = self.pending.as_ref()?.stream_generation;
+        let Some(stream_generation) = self
+            .pending
+            .as_ref()
+            .map(|pending| pending.stream_generation)
+        else {
+            return Ok(None);
+        };
         if stream_generation != self.stream.stream_generation {
-            return None;
+            return Ok(None);
         }
         if turn.response_sha256.is_none() {
-            return self.pending_unknown("NATIVE_RESULT_FINGERPRINT_UNAVAILABLE");
+            return Ok(self.pending_unknown("NATIVE_RESULT_FINGERPRINT_UNAVAILABLE"));
         }
         let outcome = terminal_outcome(
             &identity,
@@ -456,11 +522,27 @@ impl Controller {
             disposition,
             dispatch_admission.as_ref(),
         );
+        if let Some(spool) = self.delivery_spool.as_ref()
+            && let Ok(body) = self.stream.retained_response_for(
+                turn.result_ordinal,
+                &conversation_id,
+                stream_generation,
+            )
+        {
+            spool.save_body(
+                &identity.operation_id,
+                &self.boot_id,
+                &identity.module_receipt,
+                &conversation_id,
+                turn.result_ordinal,
+                &body,
+            )?;
+        }
+        self.record_outcome(&outcome, &identity.method, &identity.module_receipt)?;
         self.pending = None;
         self.pending_observation = None;
-        let _ = self.record_outcome(&outcome, &identity.method, &identity.module_receipt);
         self.remember_completed_turn(&identity, &conversation_id, &turn);
-        Some(outcome)
+        Ok(Some(outcome))
     }
 
     pub fn stream_ended(&mut self) -> Option<RuntimeOutcome> {
@@ -504,6 +586,13 @@ impl Controller {
         operation_id: &str,
         origin: &swarm_contracts::runtime::NormalizedResultOriginContext,
     ) -> std::result::Result<crate::stream::RetainedResponseBody, &'static str> {
+        if let Some(spool) = self.delivery_spool.as_ref() {
+            match spool.read_body(operation_id, origin) {
+                Ok(Some(body)) => return Ok(body),
+                Ok(None) => {}
+                Err(_) => return Err("NATIVE_RESULT_BODY_ORIGIN_MISMATCH"),
+            }
+        }
         let completed = self
             .completed_turns
             .get(operation_id)
@@ -609,6 +698,7 @@ impl Controller {
                     .pending_receipts
                     .iter()
                     .find(|entry| entry["operation_id"].as_str() == Some(target))
+                    .cloned()
                 {
                     let saved_identity = saved["details"]["module_receipt"].clone();
                     if saved_identity != serde_json::to_value(&target_receipt)? {
@@ -617,6 +707,7 @@ impl Controller {
                             "pending target receipt differs from the exact Store target identity",
                         ));
                     }
+                    self.link_pending_outcome_for_reconcile(target, &identity.operation_id)?;
                 } else {
                     let target_outcome = RuntimeOutcome {
                         operation_id: target.to_owned(),
@@ -692,7 +783,7 @@ impl Controller {
                 "message": message,
             }),
         };
-        let _ = self.record_outcome(&outcome, &identity.method, &identity.module_receipt);
+        self.record_outcome_or_mark(&outcome, &identity.method, &identity.module_receipt);
         outcome
     }
 
@@ -717,6 +808,96 @@ impl Controller {
 
     pub fn pending_receipts(&self) -> Vec<serde_json::Value> {
         self.pending_receipts.iter().cloned().collect()
+    }
+
+    pub fn pending_store_deliveries(&self) -> Result<Vec<StoreDelivery>> {
+        if let Some(spool) = self.delivery_spool.as_ref() {
+            return spool.load_deliveries();
+        }
+        self.pending_receipts
+            .iter()
+            .cloned()
+            .map(|params| {
+                StoreDelivery::memory_outcome(
+                    params,
+                    &self.binding_id,
+                    self.generation,
+                    &self.boot_id,
+                )
+            })
+            .collect()
+    }
+
+    pub fn retain_result_delivery(&self, params: Value) -> Result<StoreDelivery> {
+        if let Some(spool) = self.delivery_spool.as_ref() {
+            return spool.save_delivery(RESULT_METHOD, params, &self.boot_id);
+        }
+        StoreDelivery::new_for_current(
+            RESULT_METHOD,
+            params,
+            &self.binding_id,
+            self.generation,
+            &self.boot_id,
+        )
+    }
+
+    pub fn acknowledge_store_delivery(&mut self, delivery: &StoreDelivery) -> Result<()> {
+        if let Some(spool) = self.delivery_spool.as_ref() {
+            let _ = spool.acknowledge(delivery)?;
+        }
+        if delivery.method() == OUTCOME_METHOD {
+            self.pending_receipts.retain(|value| {
+                value["operation_id"].as_str() != Some(delivery.operation_id())
+                    || value != delivery.params()
+            });
+        }
+        Ok(())
+    }
+
+    pub fn discard_store_delivery(&mut self, delivery: &StoreDelivery) -> Result<()> {
+        self.acknowledge_store_delivery(delivery)
+    }
+
+    pub fn ensure_delivery_healthy(&self) -> Result<()> {
+        if let Some(code) = self.retention_failure.as_deref() {
+            return Err(swarm_contracts::error::Error::new(
+                "MODULE_DELIVERY_RETENTION_FAILED",
+                format!("exact Store delivery retention failed: {code}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn link_pending_outcome_for_reconcile(
+        &mut self,
+        target_operation_id: &str,
+        reconcile_operation_id: &str,
+    ) -> Result<()> {
+        let Some(index) = self
+            .pending_receipts
+            .iter()
+            .position(|value| value["operation_id"].as_str() == Some(target_operation_id))
+        else {
+            return Err(swarm_contracts::error::Error::new(
+                "NATIVE_HISTORY_UNAVAILABLE",
+                "retained target outcome is unavailable",
+            ));
+        };
+        let mut params = self.pending_receipts[index].clone();
+        params["details"]["reconcile_operation_id"] = json!(reconcile_operation_id);
+        if let Some(spool) = self.delivery_spool.as_ref() {
+            let existing = spool
+                .load_delivery(OUTCOME_METHOD, target_operation_id)?
+                .ok_or_else(|| {
+                    swarm_contracts::error::Error::new(
+                        "NATIVE_HISTORY_UNAVAILABLE",
+                        "durable target outcome is unavailable",
+                    )
+                })?;
+            spool.save_delivery(OUTCOME_METHOD, params.clone(), existing.origin_boot_id())?;
+        }
+        self.pending_receipts[index] = params;
+        Ok(())
     }
 
     /// Record a deterministic rejection for a manager-admitted but unsupported
@@ -848,7 +1029,7 @@ impl Controller {
             native_input_id: None,
             details: json!({ "diagnostic_code": diagnostic_code }),
         };
-        let _ = self.record_outcome(
+        self.record_outcome_or_mark(
             &outcome,
             &pending.identity.method,
             &pending.identity.module_receipt,
@@ -868,14 +1049,22 @@ impl Controller {
                 "adapter could not retain its bounded operation receipt",
             )
         })?;
-        self.pending_receipts
-            .retain(|entry| entry["operation_id"].as_str() != Some(outcome.operation_id.as_str()));
-        if self.pending_receipts.len() == MAX_PENDING_RECEIPTS {
+        let replacing = self
+            .pending_receipts
+            .iter()
+            .any(|entry| entry["operation_id"].as_str() == Some(outcome.operation_id.as_str()));
+        if !replacing && self.pending_receipts.len() == MAX_PENDING_RECEIPTS {
             return Err(swarm_contracts::error::Error::new(
                 "MODULE_OUTCOME_OUTBOX_FULL",
                 "acknowledge pending manager receipts before admitting another operation",
             ));
         }
+        if let Some(spool) = self.delivery_spool.as_ref() {
+            let origin_boot = outcome_origin_boot(&value, &self.boot_id);
+            spool.save_delivery(OUTCOME_METHOD, value.clone(), &origin_boot)?;
+        }
+        self.pending_receipts
+            .retain(|entry| entry["operation_id"].as_str() != Some(outcome.operation_id.as_str()));
         self.pending_receipts.push_back(value);
         let summary = json!({
             "operation_id": outcome.operation_id,
@@ -896,6 +1085,17 @@ impl Controller {
         }
         self.journal.push_back(summary);
         Ok(())
+    }
+
+    fn record_outcome_or_mark(
+        &mut self,
+        outcome: &RuntimeOutcome,
+        method: &str,
+        receipt: &swarm_contracts::runtime::ModuleReceiptIdentity,
+    ) {
+        if let Err(error) = self.record_outcome(outcome, method, receipt) {
+            self.retention_failure = Some(error.code);
+        }
     }
 
     fn native_scope_key_if_root_known(&self) -> Option<String> {

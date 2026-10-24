@@ -19,6 +19,7 @@ pub struct CandidateManagedOwner {
     token: String,
     boot_id: String,
     adapter_image: Value,
+    state_dir: PathBuf,
 }
 
 impl CandidateManagedOwner {
@@ -47,10 +48,10 @@ impl CandidateManagedOwner {
         // and checks Windows Job/Linux process-group membership; it does not
         // treat the owner PID as the adapter or prove family departure.
         let proof = verify_current_adapter(&canonical_owner)?;
-        Self::from_verified_worker(proof)
+        Self::from_verified_worker(proof, canonical_state)
     }
 
-    fn from_verified_worker(proof: VerifiedModuleWorker) -> Result<Self> {
+    fn from_verified_worker(proof: VerifiedModuleWorker, state_dir: PathBuf) -> Result<Self> {
         let token = validate_owner_record(&proof.owner_record)?.to_owned();
         if !valid_owner_token(&proof.boot_id) {
             return Err(Error::invalid("MANAGED_MODULE_OWNER_IDENTITY_INVALID"));
@@ -60,6 +61,7 @@ impl CandidateManagedOwner {
             token,
             boot_id: proof.boot_id,
             adapter_image: proof.process_image_identity,
+            state_dir,
         })
     }
 
@@ -69,6 +71,7 @@ impl CandidateManagedOwner {
             token: self.token.clone(),
             boot_id: self.boot_id.clone(),
             adapter_image: self.adapter_image.clone(),
+            state_dir: self.state_dir.clone(),
         }
     }
 
@@ -87,6 +90,10 @@ impl CandidateManagedOwner {
 
     pub fn adapter_image(&self) -> &Value {
         &self.adapter_image
+    }
+
+    pub fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
     }
 }
 

@@ -3103,6 +3103,18 @@ pub(super) fn outcome_with_artifacts(
         return Ok(json!({"recorded":true,"replayed":true,"state":o["state"]}));
     }
     validate_registered_module_recovery_link(&tx, &id, generation, &b, &o, &r)?;
+    let recovered_delivery_origin_boot = if r.details["reconcile_operation_id"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty())
+        && b["state"] == "reconciling"
+        && b["observation"]["recovery_required"] == true
+    {
+        let previous = b["observation"]["previous_bridge_boot_id"].as_str();
+        let current = b["observation"]["bridge_boot_id"].as_str();
+        previous.filter(|previous| current.is_some_and(|current| current != *previous))
+    } else {
+        None
+    };
 
     if crate::runtime::batch::is_legacy_command_route(&b["route"]) {
         return Err(Error::new(
@@ -3220,6 +3232,7 @@ pub(super) fn outcome_with_artifacts(
                 binding: &b,
                 operation: &o,
                 outcome: &r,
+                allowed_origin_boot_id: recovered_delivery_origin_boot,
             },
         )?
     } else {

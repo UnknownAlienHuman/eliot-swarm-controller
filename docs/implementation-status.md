@@ -54,7 +54,8 @@ Merged work immediately preceding this checkpoint:
 A0   LANDED                   active v6 coordinate
 A1a  LANDED / SCOPED PASS     terminal decoupling + producer lifecycle
 A1b  LANDED / SCOPED PASS     refresh/proof gate removed; current fences retained
-A2   NEXT / NOT IMPLEMENTED   durable outcome/body/page delivery and successor completion
+A2a  IMPLEMENTED / CHECKING    private outcome/body/page retention + reconciled old boot
+A2b  NEXT / NOT IMPLEMENTED   Store coverage ACK, source release and crash matrix
 A3   NOT IMPLEMENTED          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime
 U/R  SMALL CLEANUP LANDED      disconnected GitHub PR/projection source removed
@@ -186,11 +187,10 @@ inspection and a successful compile cannot substitute for those results.
 
 ## Next work
 
-**Runtime A2:** retain complete Antigravity outcome/body/page Store-delivery parameters
-in private atomic files before treating them as locally retained. Same-boot reconnect
-may resend identical bytes; after verified prior-owner departure, an authorized
-successor may deliver the original Operation with immutable origin boot/source identity.
-Never persist or replay native prompt intent. Missing/partial capture remains visible
+**Runtime A2b:** complete Store-authoritative aggregate result coverage and source
+release, then close the crash/ACK-loss/replacement matrix around the A2a private
+outcome/body/page retention path. Preserve immutable origin boot/source identity and
+never persist or replay native prompt intent. Missing/partial capture remains visible
 unknown and must not complete a newer Attempt.
 
 **Subsequent A3:** keep only real typed actions and one active Antigravity route; remove

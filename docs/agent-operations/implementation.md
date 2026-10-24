@@ -183,10 +183,18 @@ binding/root checks and `agent.refresh` remains a standalone read action. Run
 No integration, installed harness, crash or load qualification is claimed. Net change:
 −305 production Rust lines, −20 qualification-glue lines and +3 test lines.
 
-**A2:** retain complete terminal bytes and final outcome/result parameters with
-Operation, original binding/generation and origin boot in private atomic files before
-acknowledging local retention. Same-boot IPC reconnect resends unchanged parameters;
-delete only after Store ACK. Observations use one replaceable checkpoint per source.
+**A2a — implemented in this branch, qualification pending:** retain exact
+`module.outcome`, selected terminal body and `module.result` parameters with Operation,
+original binding/generation and origin boot in private atomic module-state files before
+IPC. Startup reloads the bounded delivery set. Exact ACK removes only matching bytes;
+a newer outcome under the same Operation is not deleted by an older ACK. A prior-boot
+outcome can settle only through an exact admitted `agent.reconcile` after Store verifies
+`previous_bridge_boot_id -> bridge_boot_id` and prior-owner departure. Native prompt
+intent is never persisted or replayed.
+
+**A2b:** make Store ACK own aggregate result-page coverage/next missing range, release
+local body only after complete coverage, and close pressure/crash/ACK-loss/replacement
+cases with connected tests. Observations use one replaceable checkpoint per source.
 
 A process restart is not an IPC reconnect. After existing custody checks fence the
 previous delivery owner, the authorized successor uses the existing reconciliation

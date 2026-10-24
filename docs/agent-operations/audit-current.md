@@ -44,14 +44,16 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
   native/provider calls, installed harness, crash, restart or load qualification ran.
 - Recorded change: **−305 production Rust lines, −20 qualification-glue lines, +3 test
   lines**.
-- **Next exact chain — implementation A2:** adapter
-  `Controller::{record_outcome,pending_receipts,completed_turns}` and normalized result
-  pages → `HostSession::request_saved/flush_reports` → exact `module.outcome` /
-  `module.result` ACK and replay → private atomic retained outcome/body/page files →
-  verified prior-owner departure and successor delivery for the original Operation.
-  Preserve origin boot and source identity; never put native prompt intent in the
-  delivery spool or replay input.
-- Runtime implementation order is now **A2–A3, then B–V**.
+- **Current implementation slice — A2a:** exact `module.outcome`, selected response
+  body and `module.result` params are retained in private atomic module-state files
+  before IPC. Startup reloads deliveries; exact ACK removes only matching bytes. A
+  prior-boot outcome may settle only after Store validates its exact admitted
+  `agent.reconcile` link and proven previous-owner transition. Native prompt intent is
+  never stored or replayed.
+- **Next exact chain — A2b:** Store-authoritative aggregate page coverage/next-missing
+  ACK, safe local body release, pressure/readback behavior and connected restart tests
+  across crash-before-write, crash-after-write, ACK loss and several replacements.
+- Runtime implementation order is now **A2b–A3, then B–V**.
 - Still unqualified: crash before/after durable capture, power loss, old-boot delivery,
   source-pressure behavior, installed Antigravity, live restart and scale.
 
