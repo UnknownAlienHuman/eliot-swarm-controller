@@ -1,0 +1,35 @@
+name: Apply A1b registry checkpoint
+
+on:
+  push:
+    branches:
+      - runtime/antigravity-a1b-20261024
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runtime/antigravity-a1b-20261024
+          fetch-depth: 0
+      - name: Apply registry update
+        run: python3 tools/ci/apply_a1b_docs.py
+      - name: Validate and commit
+        shell: bash
+        run: |
+          git diff --check
+          test -z "$(git diff --name-only | grep -v '^docs/' || true)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/agent-operations/audit-current.md \
+            docs/agent-operations/audit-index.md \
+            docs/implementation-status.md \
+            docs/agent-operations/implementation.md \
+            docs/agent-operations/module-installation.md
+          git commit -m "docs: record Antigravity A1b landing"
+          git push origin HEAD:runtime/antigravity-a1b-20261024
