@@ -1,12 +1,12 @@
 {
   "schema_version": 2,
-  "inspected_head": "6e0d8d46cca7845bfa1c86e7375299f1b92aabfb",
+  "inspected_head": "8f9fdd3b016d6578de6ec4be45ee3095f7810759",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
   ],
   "counts": {
-    "markdown_files": 155,
+    "markdown_files": 156,
     "docs_root_files": 41,
     "audit-evidence": 42,
     "current-contract": 27,
@@ -16,7 +16,7 @@
     "historical-snapshot": 7,
     "module-guide": 16,
     "qualification-evidence": 9,
-    "supporting-reference": 49,
+    "supporting-reference": 50,
     "broken_local_links": 0,
     "oversized_25k_or_more": 15
   },
@@ -491,6 +491,20 @@
         "audit_incomplete_phrase": false,
         "not_exhaustive": false,
         "resume_here": true
+      }
+    },
+    {
+      "path": "docs/agent-operations/audit-entrypoints-public-surfaces-20261024.md",
+      "bytes": 9177,
+      "lines": 159,
+      "headings": 10,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
       }
     },
     {
