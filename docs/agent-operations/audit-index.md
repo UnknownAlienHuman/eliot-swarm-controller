@@ -25,6 +25,16 @@ substitute. Assign implementation only through an exact
 [task packet](task-packet-template.md) constrained by
 [failure prevention](failure-prevention-register.md).
 
+## Package coverage checkpoints
+
+| Checkpoint | Inspected source | Status / subject |
+| --- | --- | --- |
+| [CP-001–006](audit-entrypoints-public-surfaces-20261024.md) | `main` `797ea93`; cluster SHA-256 `c55118a3580219f5fd1f4a90082eb51da3bc718e9d8516fac648007859d3d9f7` | Root compatibility, 33-command CLI, one-dependent kernel, Bus roles and telemetry boundary. Partial; exact cross-boundary chains remain open. |
+
+The generated [surface inventory](source-surface-inventory.md) is syntax/dependency
+evidence, not semantic or runtime qualification. CP IDs are package-coverage findings,
+not additions to the stable AR-001–170 failure register.
+
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints
 

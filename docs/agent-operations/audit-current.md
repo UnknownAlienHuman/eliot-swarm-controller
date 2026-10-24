@@ -25,11 +25,12 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
 - **Last completed source-audit range:** AR-160–170, frozen at
   `0a228cd3a2fde9f38be136485b53b88c7e0e5c84`. A1b is a later implementation
   checkpoint, not a new audit range and not evidence that unchanged packages were read.
-- **Whole-project source audit:** incomplete. The package inventory in
-  [source-audit coverage](source-audit-coverage.md) records broad partial coverage for
-  `swarm-kernel-host`, partial coverage for several adapters/effect owners, and
-  untraced package boundaries including `swarm-cli`, `swarm-kernel`, `swarm-bus` and
-  `swarm-telemetry`.
+- **Whole-project source audit:** incomplete. The first previously untraced package
+  cluster now has a reproducible [surface inventory](source-surface-inventory.md) and
+  reviewed [CP-001–006 checkpoint](audit-entrypoints-public-surfaces-20261024.md).
+  Root compatibility, CLI, kernel, bus and telemetry are still `partial source trace`:
+  their exact cross-boundary chains and dispositions listed in
+  [source-audit coverage](source-audit-coverage.md) remain open.
 - **Documentation readiness:** the 2026-10-24 structural audit found stale authority,
   broken links and unclassified evidence. The current repair adds one
   [authority map](documentation-map.md), one [task-packet format](task-packet-template.md)
@@ -43,10 +44,11 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
 - **Unmerged implementation branch:** `impl/antigravity-a2-delivery-20261024` is an
   experiment/PR candidate only. Do not describe A2a as landed on `main` or use its
   documentation as the whole-project audit checkpoint.
-- **Next exact audit sequence:** (1) root entrypoints plus `swarm-cli`, `swarm-kernel`,
-  `swarm-bus`, `swarm-telemetry`; (2) shared contracts/client/process and every current
-  consumer; (3) file-level Store/migrations/read models; (4) one adapter at a time;
-  (5) effects/observation; (6) tooling, installers, descriptors, tests and evidence.
+- **Next exact audit sequence:** finish CP-001–006 by comparing CLI methods with
+  host policy/catalog, tracing the root compatibility cut, classifying every public
+  `swarm-kernel` function, tracing bus cursor/action recovery and telemetry persistence.
+  Then continue (2) shared contracts/client/process, (3) Store/migrations/read models,
+  (4) adapters, (5) effects/observation and (6) tooling/installers/qualification.
   Update this register, the [audit index](audit-index.md),
   [source-audit coverage](source-audit-coverage.md) and
   [failure prevention](failure-prevention-register.md) after each cluster.
@@ -57,6 +59,22 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
 Do not continue implementation A2 as an audit substitute. Compare each selected audit
 cluster with live `main`, trace caller → authority → state/effect → readback → consumer,
 and record every uninspected boundary rather than treating it as clean.
+
+<a id="checkpoint-entrypoints-public-surfaces"></a>
+## Package coverage checkpoint CP-001–006
+
+At merged source `797ea93`, all Rust files in root entrypoints, `swarm-cli`,
+`swarm-kernel`, `swarm-bus` and `swarm-telemetry` were inventoried and their immediate
+Cargo/token consumers inspected. The reviewed checkpoint is
+[Entrypoints and public surfaces](audit-entrypoints-public-surfaces-20261024.md).
+
+Confirmed: the root facade/wrapper is an active compatibility cut; the CLI is a large
+IPC/delegation surface rather than a Store owner; `swarm-kernel` has one production
+package dependent; Bus routing, ScriptRun reconciliation and standalone execution are
+distinct stages; telemetry is diagnostic-only at the inspected boundary. No duplicate
+Script interpreter, Store authority in the CLI/kernel package, or business authority in
+telemetry was established. Exact method-policy, retirement, per-function, bus recovery
+and telemetry persistence chains remain open, so the cluster is not closed.
 
 <a id="findings-ar-160170"></a>
 ## Findings AR-160–170

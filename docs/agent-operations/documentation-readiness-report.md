@@ -1,6 +1,6 @@
 # Documentation readiness audit
 
-Inspected repository head: `7c37dd815d5756daf89d460736aa1277b3a35a89`.
+Inspected repository head: `be1129d23905c40e0e8822b8ca20a1ccf4f6c530`.
 
 ## Verdict: NOT READY
 

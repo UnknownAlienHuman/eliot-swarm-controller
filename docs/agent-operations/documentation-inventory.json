@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "inspected_head": "7c37dd815d5756daf89d460736aa1277b3a35a89",
+  "inspected_head": "be1129d23905c40e0e8822b8ca20a1ccf4f6c530",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
@@ -481,9 +481,9 @@
     },
     {
       "path": "docs/agent-operations/audit-current.md",
-      "bytes": 14380,
-      "lines": 162,
-      "headings": 10,
+      "bytes": 15584,
+      "lines": 180,
+      "headings": 11,
       "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
@@ -509,9 +509,9 @@
     },
     {
       "path": "docs/agent-operations/audit-index.md",
-      "bytes": 13602,
-      "lines": 115,
-      "headings": 7,
+      "bytes": 14253,
+      "lines": 125,
+      "headings": 8,
       "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
