@@ -1,156 +1,158 @@
-# Forge publication first slice
+# Forge publication — current source contract and transition
 
-Issue #10 adds one narrow operation: publish the exact Git commit retained by
-the currently accepted source-snapshot candidate to one configured branch ref.
-It does not create or merge pull requests, choose a repository from request
-data, or change Task acceptance.
+This document describes the current Forge path. The compact target, including GitHub
+metadata writes and automatic successor readback, is
+[External effects](agent-operations/external-effects.md). Implementation order remains
+in [agent operations](agent-operations/implementation.md#k--selected-effect-owners);
+source findings are in [AR-079–088](agent-operations/audit-current.md#findings-ar-079088).
 
-## Local configuration
+## Responsibility
 
-Publication is disabled by default. The operator enables it in the controller
-configuration and maps each Task `project_id` to one local checkout, one
-canonical repository identity, one remote alias, one accepted policy revision
-and an allowlist of exact branch refs. Relative paths resolve against the
-configuration file's directory; enabled paths must resolve to existing local
-Git and repository paths. The request cannot override those values.
+Forge publishes one already accepted candidate commit to one configured remote branch.
+It does not accept Tasks, merge pull requests, edit GitHub metadata, import Issues or
+own a generic publication workflow.
 
-```toml
-[forge]
-enabled = true
-git_executable = "C:/Program Files/Git/cmd/git.exe"
-timeout_seconds = 120
-max_output_bytes = 32768
-
-[forge.projects."project-id"]
-canonical_repository = "github.com/owner/repository"
-repository_path = "C:/repositories/repository"
-remote_name = "origin"
-policy_revision = "owner-policy-v1"
-target_refs = ["refs/heads/main"]
+```text
+accepted candidate
+-> durable forge.publish Operation
+-> exact target/expected-ref slot
+-> `sending`
+-> one lease-bound push
+-> exact remote-ref readback
 ```
 
-The configured push URL must resolve to exactly one credential-free
-`host/owner/repository` identity matching `canonical_repository`. HTTPS,
-`ssh://git@...` and `git@host:...` URLs are supported. Credentials stay in
-the operator's existing native Git credential setup; neither URLs nor raw Git
-stderr are stored in Operations, observations, or returned diagnostics.
+Acceptance and publication remain separate facts. A published ref never accepts a
+Task; an accepted candidate is not automatically public unless enabled policy admits
+the publication Operation.
 
-## Request and identity checks
+## Admission
 
-`forge.publish_ref` requires a caller-owned `client_request_id`, `attempt_id`,
-Task revision, `submission_ref`, applied `accepted_operation_id`, exact
-`candidate_ref`, expected policy revision, allowlisted target ref, and exactly
-one of `expected_old_ref` or `expected_create=true`. A force field is rejected.
-The caller must be the local operator or current GM. At admission and again
-immediately before the write, the controller verifies that the Task is still
-accepted at that revision, the accepted operation and submission name the
-same Attempt and candidate, the Attempt snapshot names the configured policy,
-and the candidate is a complete `source_snapshot` with the retained commit and
-tree identity. The immutable intent also records the GM epoch at admission
-(zero before any GM designation). Queued work is rechecked against that epoch
-before it can start and again after read-only remote preflight, immediately
-before the push. An epoch change settles the never-sent Operation as
-`stale_gm_epoch`; only the local operator may cancel that stale Operation in
-v1. `sending` and `outcome_unknown` work remains readback-only across handover.
+The retained publication intent freezes:
 
-The durable Operation records the canonical repository, candidate artifact
-digest, full commit and tree IDs, configured remote alias and target ref,
-expected old value or create intent, `force=false`, and policy revision before
-any network write. The request contains no local path, Git executable, remote
-URL, credential, or arbitrary command.
+- project and canonical repository;
+- exact Attempt, Task revision, submission and acceptance Operation;
+- candidate reference, digest, commit and tree;
+- selected remote and target branch;
+- expected old commit or explicit create intent;
+- project publication-policy revision;
+- admitting GM epoch and original request identity;
+- `force=false`.
 
-An explicitly selected `publication` automation consumes applied
-`task.acceptance` observations. Its entry owner must be the current GM, and
-its settings select the exact allowlisted target and expected-old/create
-intent. The typed context records the real manager, technical requester,
-entry revision and immutable acceptance cause; it does not create a manager
-credential. Admission, worker start and the write boundary recheck current
-authority, acceptance, candidate and local Forge policy. See the
-[configuration contract](agent-operations/configuration.md) for the optional
-settings and explicit `include_existing` activation choice.
+Admission validates the accepted candidate and reserves one exact effect slot. Identical
+intent can reuse the original Operation. A conflicting unresolved effect cannot replace
+its slot by changing request ID.
 
-Manual and automatic requests share the exact repository/candidate/commit/tree/
-target/expected-old-or-create slot. A duplicate links to the retained winner
-without another push. Sending, unknown and applied outcomes continue to own
-that slot. Proven no-effect cancellation, stale epoch, pre-write failure or
-completed Git rejection releases it for a new request under current rights;
-the old operation remains in history and is neither adopted nor replayed.
+Before external I/O, the final transaction rechecks current authority or explicit
+transfer continuation, accepted candidate, project policy, execution mode and slot,
+then changes the Operation to `sending`. No push is authorized from a queued row.
 
-## Effect and recovery
+## Worker boundary
 
-`forge.publish_ref` ends at durable admission: a new intent returns a queued
-Operation receipt, while an exact duplicate returns a settled coalesced
-receipt naming its retained winner. Admission notifies the Store change signal. It
-does not run Git in the request/IPC future. The host-owned supervisor polls;
-each pass reads earlier uncertain work first, then starts queued work only
-while `host.mode.new_work` is enabled. Host shutdown awaits the supervisor
-task; the Git work is not detached from the lifecycle owner.
+`swarm-forge-worker` receives one private plan and owner token. It joins the owned
+process group, publishes exact process identity and waits for a matching authorization
+receipt. The worker verifies the selected Git executable/image, repository, remote
+endpoint and unsafe Git configuration before mutation.
 
-The worker verifies the retained manifest and that the configured checkout
-contains the exact accepted commit and tree. It checks the configured remote,
-rejects mirror mode, push options, custom SSH/server commands and remote
-helpers, then reads the exact target ref. Only an exact match to the expected
-old object (or absence for an explicit create) permits one ordinary,
-non-force Git push of the full commit to the one full ref. Hooks that could
-alter the push are skipped; tags and submodule pushes are disabled. Output is
-bounded, prompts are disabled, and a finite timeout is applied.
+The worker owns no Task or acceptance state. Store owns the Operation and decides
+whether the plan may cross the write boundary.
 
-On Windows, each native Git process is assigned to a dedicated [Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
-at process creation with the documented [`PROC_THREAD_ATTRIBUTE_JOB_LIST`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
-attribute and `KILL_ON_JOB_CLOSE`. Descendants inherit that job. The child receives only its
-stdin/stdout/stderr handles; the environment block is copied from the current
-Unicode environment, sanitized for Git overrides, and sorted with Windows
-ordinal case-insensitive comparison. Output is polled from anonymous pipes,
-so no reader thread can remain blocked on a descendant's inherited pipe. On a
-timeout the complete job is terminated; after Git exits, any remaining job
-members are also terminated and the active-process count is polled to zero
-under a finite cleanup deadline before a successful return. A post-spawn error
-gets one additional bounded terminate-and-query attempt. If that later query
-proves the job empty after an earlier termination deadline, the runner reports
-`FORGE_GIT_TREE_CLEANUP_DELAYED`; the Store may then use its ordinary exact-ref
-readback rules. If neither query proves the job empty, the runner returns
-`FORGE_GIT_TREE_TERMINATION`, which makes the Store hold further publication
-for that repository. This error means only that the runner could not prove its
-local Job Object empty; it does not mean an external write was attempted. The
-durable `publication_may_have_started` marker is recorded separately at the
-write boundary, so validation or remote-preflight failures retain `false`. The
-hold remains sticky and requires manual operator intervention; ref readback
-cannot settle that operation as applied or clear the hold.
-Drop performs one final best-effort termination and polls
-for at most two seconds, then closes the final Job handle so
-`KILL_ON_JOB_CLOSE` applies. Cleanup waiting is bounded by at most two
-ten-second active-process polls plus that two-second Drop poll, in addition to
-the configured command timeout. If Windows cannot atomically assign the job
-or establish the bounded pipes, process creation fails closed. This path
-requires the Windows job-list process creation attribute (Windows 10 / Windows
-Server 2016 or newer).
+## Ref precondition and push
 
-After the push runner proves its process tree empty, the controller reads the
-exact ref. A matching candidate commit is recorded as applied even if Git's
-response was lost. A completed Git rejection with the expected ref still
-present is recorded as failed. Timeout, unreadable readback, or any other ref
-value remains `outcome_unknown`. Each supervisor pass performs only exact
-remote readback for `sending` and `outcome_unknown`; it never repeats those
-pushes. A `process_tree_unconfirmed` hold may record later readback, but a
-matching candidate does not settle the operation or clear the sticky hold.
-Ordinary `outcome_unknown` work with confirmed process-tree cleanup can settle
-from an exact matching readback. A durable `queued`
-Operation has not crossed the write boundary. If shutdown occurs before the
-supervisor moves it to `sending`, a later pass may start it once after
-rechecking current operator/GM authority, accepted candidate, policy mapping,
-execution mode, and local source identity. If it has reached `sending`,
-recovery is readback-only even after GM handover. A later readback proves
-success only when it sees the exact candidate commit. A different or missing
-ref does not prove that an interrupted push can never finish, so the Operation
-remains unknown for operator resolution.
+The current implementation has an expected-ref guard; it is not an unguarded ordinary
+push.
 
-Remote readback cannot provide an atomic compare-and-swap with the Git push
-protocol used here. A third party can move the ref after the preflight read and
-before the ordinary push; Git's non-force fast-forward rule still prevents
-rewinding a ref, but it does not bind the push to the exact expected-old value.
-The implementation therefore fails closed on any value observed before the
-write and documents the remaining race instead of claiming atomic CAS.
+1. Resolve and validate the configured push endpoint.
+2. Read the target ref from that endpoint.
+3. Require the exact expected old commit, or absence for creation.
+4. When updating an existing ref, run
+   `merge-base --is-ancestor <expected> <candidate>`.
+5. Issue one direct-argv push with:
 
-Publication and acceptance are separate facts. A failed or unresolved
-publication does not revoke acceptance, and this operation does not perform
-bookkeeping, cleanup, pull-request creation, or merging.
+```text
+git push --porcelain --no-verify --no-follow-tags --recurse-submodules=no
+  --receive-pack=git-receive-pack
+  --force-with-lease=<target-ref>:<expected-old-or-empty>
+  <validated-endpoint> <candidate-commit>:<target-ref>
+```
+
+`force=false` means Eliot rejects a candidate that is not fast-forward from the expected
+predecessor. `--force-with-lease` supplies the receive-time expected-ref check; it does
+not authorize arbitrary history rewrite.
+
+A nonzero push exit can be classified as a known failure only with bounded exact
+rejection evidence and/or readback showing the expected ref remains. Otherwise the
+outcome stays unknown.
+
+## Readback and recovery
+
+The worker reads the exact remote ref after the push. Store settles Applied only when it
+observes the candidate commit at the target. A timeout, lost response, unreadable
+process result or failed readback never causes another push.
+
+After restart, `sending` work becomes `outcome_unknown`. The successor executes a
+readback-only plan after the original worker family is proved departed. It preserves the
+original Operation, candidate, expected-ref intent and authorship.
+
+Remote ref state and process departure are different facts. Observing the candidate
+cannot prove that a timed-out child process is gone.
+
+## Process-tree hold
+
+If the worker family cannot be proved empty, Forge records
+`process_tree_unconfirmed=true` and blocks later pushes for the canonical repository.
+The hold is intentionally sticky; successful ref readback or elapsed time does not clear
+it.
+
+Current source exposes this as manual operator intervention. Target behavior adds a
+narrow administrative disposition backed by exact retained job/owner/PID-birth/image/
+group departure evidence. That disposition releases only the process hold. It does not
+fabricate a push result or permit a second write.
+
+## Automation boundary
+
+Current `automation_publication` owns activation/catch-up watermarks, per-entry state,
+pending retries, quarantine and recent summaries before reserving Forge work. Those are
+transitional copies, not publication truth.
+
+Target automation queries current accepted candidates and policy, then admits the same
+ordinary Forge Operation as a direct Manager. Forge alone owns the effect slot,
+`queued/sending/unknown` lifecycle and readback. Disable/edit/transfer affects future
+admission and cannot abandon or repeat an admitted publication.
+
+## GitHub metadata is not Forge
+
+Current `swarm-forge-worker` also contains a `github_pr_description` PATCH plan. That is
+a confirmed ownership violation: PR title/body is a GitHub API mutation, not remote Git
+publication. Move it to the single GitHub API effect owner together with managed labels.
+After the cut, Forge worker contains push/readback only.
+
+## Finite transition
+
+1. Inventory queued/sending/unknown Forge and PR-description worker Operations.
+2. Preserve exact worker/process and remote-ref readback for every unsettled Forge push.
+3. Add automatic bounded successor readback for unknown publication Operations.
+4. Move PR PATCH to the GitHub API owner and disposition concrete old worker jobs.
+5. Switch publication policy to the one host current-state loop.
+6. Delete publication cursor/pending/quarantine state and GitHub PATCH worker plan,
+   validation, fixtures and configuration together.
+7. Keep completed Operation history readable without retaining an executor fallback.
+
+## Verification boundary
+
+Required connected cases:
+
+- identical publication intent returns one Operation; conflicting slot is rejected;
+- candidate/authority/policy change before `sending` performs no push;
+- expected predecessor ancestry and force-with-lease are both exercised;
+- create fails safely when the target appears concurrently;
+- lost push response and host restart perform readback only;
+- exact candidate readback settles the original Operation;
+- process-tree uncertainty blocks only the repository and cannot be cleared by time or
+  ref state;
+- exact process departure can release the hold without changing publication outcome;
+- GM handover permits authorized successor readback without changing authorship;
+- PR PATCH is absent from Forge worker after migration;
+- enabled policy publishes without a routine human step;
+- unrelated repositories continue while one repository is held unknown.
+
+Current source inspection is not live Git/server/process qualification.
