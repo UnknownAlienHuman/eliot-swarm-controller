@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "inspected_head": "7bae67203799bf06686e7580618e280a8facc0a4",
+  "inspected_head": "fc7a6a974e63dc2a6d41b194b0934cb06f79767d",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
@@ -565,8 +565,8 @@
     },
     {
       "path": "docs/agent-operations/documentation-readiness-report.md",
-      "bytes": 4727,
-      "lines": 82,
+      "bytes": 3864,
+      "lines": 79,
       "headings": 8,
       "classification": "generated-audit",
       "status_markers": {
