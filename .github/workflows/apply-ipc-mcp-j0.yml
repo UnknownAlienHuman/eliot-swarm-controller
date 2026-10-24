@@ -1,0 +1,48 @@
+name: Apply IPC MCP J0 patch
+
+on:
+  push:
+    branches: [audit/ipc-mcp-hot-reads-20261024]
+    paths:
+      - 'tools/ci/apply-ipc-mcp-j0.py'
+      - '.github/workflows/apply-ipc-mcp-j0.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: audit/ipc-mcp-hot-reads-20261024
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
+      - name: Apply exact source patch
+        shell: bash
+        run: python tools/ci/apply-ipc-mcp-j0.py
+      - name: Format
+        shell: bash
+        run: cargo fmt --all -- --check
+      - name: Compile affected package
+        shell: bash
+        run: cargo check --locked --package swarm-mcp --all-targets
+      - name: Minimal warnings-denied Clippy
+        shell: bash
+        run: cargo clippy --locked --package swarm-mcp --all-targets -- -D warnings
+      - name: Commit patched source
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/swarm-mcp/src/mcp/mod.rs
+          git diff --cached --quiet && { echo 'patch produced no source change'; exit 1; }
+          git commit -m 'fix(mcp): release connection lock before RPC'
+          git push origin HEAD:audit/ipc-mcp-hot-reads-20261024
