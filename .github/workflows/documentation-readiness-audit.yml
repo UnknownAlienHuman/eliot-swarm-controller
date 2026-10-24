@@ -19,6 +19,8 @@ jobs:
           ref: docs/agent-ready-audit-20261024
       - name: Apply finite authority corrections
         run: python tools/ci/apply_documentation_authority_corrections.py
+      - name: Inventory first incomplete source cluster
+        run: python tools/ci/source_surface_inventory.py
       - name: Generate documentation inventory
         run: python tools/ci/documentation_readiness_audit.py
       - name: Verify correction script is idempotent
