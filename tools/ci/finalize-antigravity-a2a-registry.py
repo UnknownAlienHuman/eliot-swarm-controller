@@ -33,8 +33,8 @@ replace_once(
 
 replace_once(
     "docs/agent-operations/audit-current.md",
-    "  delivery spool or replay input.\n- **Next exact chain — A2b:**",
-    "  delivery spool or replay input. Runs `40135475910` / job `120995970779` and "
+    "  never stored or replayed.\n- **Next exact chain — A2b:**",
+    "  never stored or replayed. Runs `40135475910` / job `120995970779` and "
     "`40135726768` / job `120996711166` passed affected rustfmt and warnings-denied "
     "Clippy; no runtime/installed/crash qualification is claimed.\n- **Next exact chain — A2b:**",
 )
