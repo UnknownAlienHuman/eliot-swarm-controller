@@ -1,0 +1,198 @@
+name: Apply explicit Antigravity A1b patch
+
+on:
+  push:
+    branches:
+      - runtime/antigravity-a1b-20261024
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runtime/antigravity-a1b-20261024
+          fetch-depth: 0
+
+      - name: Apply checked source patch
+        shell: bash
+        run: |
+          git show 69c20a8f1b3a9b5a39b9946abb3ab0cfe50fd55c:.github/workflows/a1b-branch-apply.yml > /tmp/a1b-original.yml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lines = Path('/tmp/a1b-original.yml').read_text(encoding='utf-8').splitlines()
+          start = next(i for i, line in enumerate(lines) if "python3 - <<'PY'" in line) + 1
+          end = next(i for i in range(start, len(lines)) if lines[i].strip() == 'PY')
+          script = []
+          for line in lines[start:end]:
+              script.append(line[10:] if line.startswith('          ') else line)
+          source = '\n'.join(script) + '\n'
+          for retired_test_only_term in (
+              '    "antigravity_dispatch_session_proof",\n',
+              '    "native_session_refresh",\n',
+          ):
+              if source.count(retired_test_only_term) != 1:
+                  raise SystemExit(f'missing expected validator term: {retired_test_only_term!r}')
+              source = source.replace(retired_test_only_term, '', 1)
+          Path('/tmp/apply_a1b.py').write_text(source, encoding='utf-8')
+          PY
+          python3 /tmp/apply_a1b.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(path, old, new):
+              text = Path(path).read_text(encoding='utf-8')
+              if text.count(old) != 1:
+                  raise SystemExit(f'{path}: expected one literal match, found {text.count(old)}')
+              Path(path).write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          def regex_once(path, pattern, replacement):
+              text = Path(path).read_text(encoding='utf-8')
+              updated, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one regex match, found {count}: {pattern}')
+              Path(path).write_text(updated, encoding='utf-8')
+
+          controller = 'modules/antigravity-rust/src/controller.rs'
+          replace_once(
+              controller,
+              '''            object.insert(
+                  "model_readback_state".to_owned(),
+                  json!(self.model_readback_state),
+              );
+          ''',
+              '''            object.insert(
+                  "model_readback_state".to_owned(),
+                  json!(self.model_readback_state),
+              );
+              object.insert(
+                  "turn_pending".to_owned(),
+                  json!(self.pending.is_some() || self.pending_open.is_some()),
+              );
+          ''',
+          )
+
+          capability = 'crates/swarm-kernel-host/src/store/launcher_dispatch/antigravity_capability.rs'
+          replace_once(
+              capability,
+              '''        || !native["exit_code"].is_null()
+                  || !model_matches
+          ''',
+              '''        || !native["exit_code"].is_null()
+                  || native["turn_pending"] != false
+                  || !model_matches
+          ''',
+          )
+          replace_once(
+              capability,
+              '''                        "exit_code":null,
+                              "boot_id":BOOT_ID,
+          ''',
+              '''                        "exit_code":null,
+                              "turn_pending":false,
+                              "boot_id":BOOT_ID,
+          ''',
+          )
+          replace_once(
+              capability,
+              '''        for mutation in ["boot", "model", "phase", "gap", "recovery", "connection"] {
+          ''',
+              '''        for mutation in ["boot", "model", "phase", "gap", "turn", "recovery", "connection"] {
+          ''',
+          )
+          replace_once(
+              capability,
+              '''                "gap" => binding["observation"]["native"]["gaps"] = json!(1),
+                          "recovery" => binding["observation"]["recovery_required"] = json!(true),
+          ''',
+              '''                "gap" => binding["observation"]["native"]["gaps"] = json!(1),
+                          "turn" => binding["observation"]["native"]["turn_pending"] = json!(true),
+                          "recovery" => binding["observation"]["recovery_required"] = json!(true),
+          ''',
+          )
+
+          readiness = 'tools/qualification/Test-LaunchDispatchReadiness.ps1'
+          replace_once(
+              readiness,
+              '''function Invoke-ReadinessCase {
+              param([object[]] $Samples, [string] $Adapter = 'OpenCode', [AllowNull()][string] $RefreshErrorCode = $null,
+                  [AllowNull()] $OpenFailure = $null, [string] $OpenScopeDamage = '')
+          ''',
+              '''function Invoke-ReadinessCase {
+              param([object[]] $Samples, [AllowNull()] $OpenFailure = $null, [string] $OpenScopeDamage = '')
+          ''',
+          )
+          replace_once(
+              readiness,
+              '''    $trace = [ordered]@{ polls = 0; dispatches = 0; refreshes = 0; refresh_scope = $null; dispatched_poll = $null; current_parent = $null }
+          ''',
+              '''    $trace = [ordered]@{ polls = 0; dispatches = 0; dispatched_poll = $null; current_parent = $null }
+          ''',
+          )
+          regex_once(
+              readiness,
+              r'''\n        if \(\$Method -eq 'agent\.refresh'\) \{.*?\n        \}\n        if \(\$Method -eq 'task\.dispatch'\)''',
+              "\n        if ($Method -eq 'task.dispatch')",
+          )
+          replace_once(readiness, "    function New-RequestId { return 'session-refresh-fixture' }\n", '')
+          replace_once(
+              readiness,
+              "Assert-Case 'OpenCode never requests AG session refresh' ($progression.trace.refreshes -eq 0)\n",
+              '',
+          )
+          regex_once(
+              readiness,
+              r'''\n\$agProgression = .*?(?=\n\$legacyCard = New-Parent)''',
+              '''
+          $agProgression = Invoke-ReadinessCase -Samples @((New-Parent))
+          Assert-Case 'AG current Store capability dispatches without refresh' ($agProgression.trace.dispatches -eq 1 -and
+              $agProgression.trace.dispatched_poll -eq 1 -and $null -eq $agProgression.stop)
+          ''',
+          )
+          PY
+
+          if rg -n \
+            'AntigravityDispatchSessionProof|ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND|ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND|require_current_session_proof|session_proof_digest|STALE_ANTIGRAVITY_DISPATCH_PROOF|sessionRefreshAttempted|native_session_refresh' \
+            crates modules tools; then
+            echo 'retired Antigravity proof contract remains' >&2
+            exit 1
+          fi
+          if rg -n 'antigravity_dispatch_session_proof' crates modules tools \
+            -g '!modules/antigravity-rust/tests/sequential_retention.rs'; then
+            echo 'retired Antigravity proof payload remains outside the negative test' >&2
+            exit 1
+          fi
+
+      - name: Format affected Rust
+        run: cargo fmt --all
+
+      - name: Minimal affected Clippy
+        run: >-
+          cargo clippy --locked
+          -p swarm-contracts
+          -p swarm-antigravity-adapter
+          -p swarm-kernel-host
+          --all-targets -- -D warnings
+
+      - name: Commit verified source slice
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/swarm-contracts/src/runtime.rs \
+            crates/swarm-kernel-host/src/store/launcher_dispatch.rs \
+            crates/swarm-kernel-host/src/store/launcher_dispatch/antigravity_capability.rs \
+            modules/antigravity-rust/src/controller.rs \
+            modules/antigravity-rust/tests/sequential_retention.rs \
+            tools/qualification/New-NativeQualification.ps1 \
+            tools/qualification/Test-LaunchDispatchReadiness.ps1
+          git diff --cached --check
+          git commit -m "refactor(antigravity): remove dispatch refresh proof"
+          git push origin HEAD:runtime/antigravity-a1b-20261024
