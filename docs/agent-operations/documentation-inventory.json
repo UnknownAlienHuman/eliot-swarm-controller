@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "inspected_head": "e1aee0ad28015670ed15fcade7b63361eb2327ca",
+  "inspected_head": "d962286059b44b2d0d8891456ed66bd27faca143",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive",
@@ -291,8 +291,8 @@
   "documents": [
     {
       "path": "AGENTS.md",
-      "bytes": 7426,
-      "lines": 145,
+      "bytes": 8570,
+      "lines": 161,
       "headings": 8,
       "classification": "active",
       "status_markers": {
@@ -300,7 +300,7 @@
         "working_draft": false,
         "audit_incomplete_phrase": false,
         "not_exhaustive": false,
-        "resume_here": false
+        "resume_here": true
       }
     },
     {
