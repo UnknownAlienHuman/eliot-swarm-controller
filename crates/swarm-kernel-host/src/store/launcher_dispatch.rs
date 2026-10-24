@@ -784,7 +784,8 @@ pub(super) fn require_current_dispatch_capability(
     )?
     .ok_or_else(antigravity_capability::unavailable)?;
     antigravity_capability::validate_retained_descriptor(&identity)?;
-    antigravity_capability::require_current_session_proof(db, &binding)
+    antigravity_capability::validate_current_session(&binding)?;
+    Ok(Value::Null)
 }
 
 fn build_current_packet(
@@ -795,8 +796,13 @@ fn build_current_packet(
     binding: &Value,
     proof: &Value,
 ) -> Result<Value> {
-    if antigravity_capability::is_session_proof(proof) {
-        return build_packet(parent, attempt, binding, proof, "");
+    let route_alias = launch_manifest_route_alias(&parent.manifest)?;
+    let route = config.route(route_alias)?;
+    if route.runtime == "antigravity"
+        && route.module_artifact_id == antigravity_capability::ANTIGRAVITY_ARTIFACT_ID
+    {
+        antigravity_capability::validate_current_session(binding)?;
+        return antigravity_capability::build_packet(parent, attempt, binding);
     }
     let owned = super::opencode::owned_service_for_binding(
         db,
@@ -815,9 +821,6 @@ fn build_packet(
     proof: &Value,
     owned_service_id: &str,
 ) -> Result<Value> {
-    if antigravity_capability::is_session_proof(proof) {
-        return antigravity_capability::build_packet(parent, attempt, binding, proof);
-    }
     let capability_identity_digest =
         validate_capability_proof(parent, attempt, binding, proof, owned_service_id)?;
     let route_alias = launch_manifest_route_alias(&parent.manifest)?;
