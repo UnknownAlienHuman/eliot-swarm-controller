@@ -4,9 +4,11 @@ Observation is core product behavior. The Governor must be able to determine who
 working, where, on what, through which native session/process/worktree and what is
 waiting, uncertain or broken without calling a provider harness or starting a model.
 
-[Implementation](implementation.md) owns source changes. This document defines the
-required boundary and records the current source audit through `cefd74e` on
-2026-10-20.
+[Implementation R](implementation.md#r--local-governor-observation) owns source
+changes; [current audit AR-142–159](audit-current.md#findings-ar-142159) records source
+evidence; [status](../implementation-status.md) records landed behavior. The current
+source trace was inspected at `c73c36c72d2c86cf710fa69e39ab07e2052c1f5e` on
+2026-10-24. This document defines the target and does not claim that R0–R6 are landed.
 
 ## 1. Three data classes
 
@@ -17,8 +19,8 @@ required boundary and records the current source audit through `cefd74e` on
 | Current Governor view | A read-only join of retained business facts and independently collected native/process/worktree/provider facts, with source time, freshness, coverage and gaps. |
 
 Do not duplicate transcripts, Task state or workflow state in an observer. Silence,
-idle, disconnect, stale data, confirmed exit and completion are different states.
-None is inferred from age alone.
+idle, disconnect, stale data, confirmed exit and completion are different states. None
+is inferred from age alone.
 
 ## 2. Current source audit
 
@@ -34,92 +36,93 @@ binding.
 
 `store/module_observations.rs::live_reads` narrows further: it reads only ready,
 unreleased bindings linked to one unreleased Attempt owned by the requesting Manager,
-for the current open Task revision and configured route alias. `reads_for_manager`
-then selects the newest matching generation per route.
+for the current open Task revision and configured route alias, with no competing
+unreleased Attempt for the same Task. `reads_for_manager` then selects the newest
+matching generation per route alias.
 
 Consequences:
 
 - unmatched native sessions are invisible;
 - surviving processes without a current Eliot binding are invisible;
+- older or transferred sessions can disappear behind the newest route generation;
 - a shared provider service is represented through whichever binding supplied the
   selected row, rather than once as a source;
 - losing or transferring a Task can remove native evidence from the route catalog even
   when the native session/process remains alive.
 
-Assignment is a relation applied to discovered subjects. It cannot be the discovery
-root.
+The current fence is useful for transcript/private-state disclosure. It is not a valid
+discovery root. Assignment is a relation applied to discovered subjects.
 
 ### 2.2 Process facts are outside Store observation
 
-`swarm-observer::process_metrics` is an explicit one-shot CLI path. It accepts at most
-eight caller-selected identities, performs no Store join and reports that its cut is
+`swarm-observer::process_metrics` is an explicit one-shot path. It accepts at most eight
+caller-selected identities, performs no Store join and reports that its cut is
 independent of Store state. Actual metric collection is Windows-only.
 
-The sample path revalidates process image/membership around each read and the host path
-recomputes executable image identity. This is useful qualification machinery, not a
-fleet collector. It also repeats package/image work that should be installation or
-custody evidence, not a per-sample metric cost.
+The sample path revalidates PID birth/image identity and module-owner membership around
+each read. This is useful custody/qualification machinery, not a fleet collector. It
+also repeats package/image work that should be installation or launch evidence rather
+than ordinary sample cost.
 
-`module_supervisor_observation::public_projection` exposes helper phase, boot, error
-and unresolved Operation IDs, but drops PID, OS birth identity, group/Job identity and
-actual liveness sample. Therefore `agent.state` cannot join the supervisor lifecycle
-with the concrete process it describes.
+`module_supervisor_observation` retains lifecycle phase, boot, errors and unresolved
+Operation IDs. Its public binding projection does not provide the concrete PID, OS
+birth identity, process group/Job relation and current liveness sample required to
+identify the process. Supervisor status is not process identity.
 
 ### 2.3 Workspace projection is admission evidence, not live Git state
 
-A held workspace lease retains assigned repository handle, baseline, branch,
-worktree handle and the clean-state evidence captured during preparation.
-`get_lease_view` simply rereads those durable fields. `workspace_lifecycle` is
-explicitly database-only and never inspects the filesystem or worktree.
+A held workspace lease retains assigned repository handle, baseline, branch, worktree
+handle, scope and clean-state evidence captured during preparation.
+`workspace_lifecycle` is explicitly database-only and never inspects the filesystem or
+worktree.
 
 Current projections therefore do not answer:
 
-- actual checkout branch or detached/unborn state;
+- actual repository identity at the path;
+- actual checkout branch, detached or unborn state;
 - current HEAD;
 - tracked/untracked changes;
 - upstream and push target;
-- whether the worktree path still identifies the expected repository;
 - when each Git fact was observed.
 
-The assigned branch/baseline remains valuable authority. It must be displayed next to,
-not substituted for, current Git observation.
+Assigned branch/baseline/scope remains valuable authority. Display it beside, never as
+a substitute for, current Git observation.
 
 ### 2.4 Remote repository state exists only inside effects
 
-Exact remote-ref readback exists in Forge and is correctly used to classify an
-uncertain push without replay. It runs inside publication/reconciliation work. There
-is no independent bounded remote repository/ref cache for a worktree that has not
-published.
+Exact remote-ref readback exists in Forge and correctly classifies an uncertain push
+without replay. It runs inside publication/reconciliation work. There is no independent
+bounded remote repository/ref cache for a worktree that has not published.
 
-Consequently the current system cannot show the last observed remote head, source time
-or read error independently of a publication Operation. Local tracking refs do not
-repair this gap.
+The current system therefore cannot show last observed remote head, source time or read
+error independently of a publication Operation. Local tracking refs are not fresh
+remote facts.
 
-### 2.5 Provider usage and availability are workflow ledgers
+### 2.5 Provider usage and availability are binding-owned
 
 `native_usage` is retained inside one binding observation and read by
-binding/generation. Its public result explicitly reports account overlap as unknown.
-The parser hard-codes current Codex/Muse artifact families.
+binding/generation. `provider_conditions` retains useful typed condition, source
+sequence/evidence, epoch and explicit invalidation, but durable rows still carry route,
+binding/generation and native scope and are consumed directly by route admission.
 
-`provider_conditions` stores source coordinates, but its durable rows still carry the
-source binding/generation and are used directly by route admission. Availability,
-usage, account/service identity and binding lifecycle are therefore entangled. A stale
-source binding can hold later route admission even when the underlying account/service
-is shared.
+Availability, usage, account/service identity and binding lifecycle are therefore
+entangled. A shared source can be copied across bindings, and a stale producer binding
+can remain applicable beside a fresher observation.
 
 Target provider observations are source-scoped facts first. Admission derives a
-decision from a current source fact; it does not own another lifecycle database.
+decision from current applicable source facts; it does not own another lifecycle
+database. Independent buckets/windows remain separate constraints.
 
 ### 2.6 Diagnostics and reports are parallel surfaces
 
-`swarm-observer` explicitly has no global subscriber or host service. Store readback is
-one-shot; local file following polls only while its CLI command is active. It is an
-optional diagnostic recorder, not the required collector.
+`swarm-observer` has no global subscriber or required host collector. Process sampling
+is caller selected; local file following polls only while its CLI command is active.
+Optional diagnostics are not the required product observation path.
 
 `report.attention`, `report.capacity`, `report.delta`, `agent.state`, `agent.family`,
-runtime catalog and process metrics each assemble different partial projections. MCP
-and observers can page or poll them, but no single retained current-state join owns
-the answer. A frontend cannot safely repair this by reducing native events itself.
+runtime catalog, provider conditions, workspace lease views, process metrics and Forge
+readback each assemble a different partial projection. No single retained current-state
+join owns the answer. A frontend cannot safely repair this by reducing native events.
 
 ## 3. Required Governor view
 
@@ -133,11 +136,11 @@ A bounded page answers which facts are known and which source failed.
 | Process | Module/native/shared-service process, PID, OS birth identity, image identity, group/Job relation, liveness/exit, observed time and collection error. A shared process is counted once. |
 | Workspace | Trusted repository, worktree, assigned branch/baseline/write scope plus observed repository identity, actual branch/HEAD/dirty state, upstream and push target. |
 | Remote | Repository/ref/head, observation time, method, freshness and error. Publication is optional. |
-| Provider | Local JSON/JSONL/SQLite source reference, native IDs, epoch/cursor/offset, observed time, usage/availability and collection gap. |
+| Provider | Local provider store/service reference, native IDs, epoch/cursor/offset, observed time, usage/availability and collection gap. |
 | Coverage | Per-source collector health, last successful/attempted read, truncation/overflow and whether more subjects may exist. |
 
-The same source/session/process/worktree may relate to several Operations over time.
-The join preserves those relations rather than copying the subject once per Operation.
+The same source/session/process/worktree may relate to several Operations over time. The
+join preserves those relations rather than copying the subject once per Operation.
 
 ## 4. Target records
 
@@ -157,7 +160,8 @@ gap/error?
 ```
 
 A source ID is stable for the actual native store/service/process/worktree/ref. It is
-not an artifact version or binding ID.
+not an artifact version, route alias or binding ID. Host-private locators are not copied
+into broad public views.
 
 ### NativeSubject
 
@@ -178,7 +182,7 @@ Adapters own vendor parsing. Store never learns vendor method matrices.
 ```text
 source_id
 pid + OS birth identity
-image/path identity
+image identity
 parent/group/Job/shared-service relation
 alive | exited | unknown
 cpu/memory/io sample?
@@ -186,7 +190,7 @@ observed_at
 ```
 
 Package bytes are verified at installation/launch. Ordinary samples do not hash the
-entire executable again.
+entire executable again. Control authority still requires exact custody evidence.
 
 ### WorktreeSubject
 
@@ -202,6 +206,21 @@ observed_at
 Absolute paths remain host-private. Public views expose opaque handles and authorized
 relative facts.
 
+### RemoteRefSubject
+
+```text
+source_id
+repository identity
+remote name / ref identity
+head object id or explicit absent
+observed_at
+method
+freshness
+error/gap
+```
+
+Remote observation grants no push/publication authority.
+
 ### AssignmentEdge
 
 ```text
@@ -213,30 +232,54 @@ native/process/worktree subject
 relation kind + observed/admitted time
 ```
 
-An absent edge means unassigned, not invisible.
+An absent edge means unassigned, not invisible. Reassignment/replacement changes edges,
+not subject identity.
 
 ## 5. Collection ownership
 
 Collect once per source, independent of viewer count.
 
-- Selected adapter: provider-native events and local provider JSON/JSONL/SQLite.
-- Host process collector: OS process identity/liveness and bounded metrics.
-- Host Git collector: local repository/worktree facts.
-- Remote-ref collector: bounded exact remote repository/ref readback with cache.
-- Store: source registry, normalized current facts, assignment edges and authorized
-  joined projections.
+| Source | Collector owner | Does not own |
+| --- | --- | --- |
+| Provider store/service | Selected adapter/provider-local reader | Task assignment, acceptance or generic telemetry history |
+| OS process | One host process collector | Native completion inference or package installation |
+| Local worktree | One host Git collector | Workspace write admission or automatic cleanup |
+| Remote ref | One bounded read-only remote collector | Push/publication intent |
+| Current joined state | Store current-source/subject/edge tables | Provider calls, filesystem/network reads or another workflow lifecycle |
 
-A lost control connection does not disable provider-local readers. A failed collector
-preserves the last fact as stale and records a coverage gap. Host restart changes the
-collector epoch and invalidates old connection freshness; surviving native processes
-remain visible.
+A lost Eliot control connection does not disable a provider-local reader. A failed
+collector preserves the last fact as stale and records a coverage gap. Host restart
+changes the collector epoch and invalidates old connection freshness; surviving native
+processes remain visible after rediscovery.
 
 Bound bytes, rows, subjects and elapsed work. Per-pass limits retain a continuation and
-explicit partial coverage; they do not silently discard later subjects. Coalesce
-change hints with periodic local rechecks. Ordinary viewer reads make no provider,
-model, filesystem or network call.
+explicit partial coverage; they do not silently discard later subjects. Coalesce change
+hints with periodic local rechecks. Ordinary viewer reads make no provider, model,
+filesystem or network call.
 
-## 6. Implementation sequence R0–R6
+## 6. Authorization
+
+Authorize these separately:
+
+```text
+source inventory/existence
+subject current state
+assignment/Task relation
+transcript/result bytes
+host-private locator/path
+control action
+```
+
+A Governor may know that an unmatched session/process exists without receiving its
+prompt, output, environment or private path. A participant/reviewer may read its exact
+assigned content without gaining fleet administration. Observation never grants
+control.
+
+Keep current binding/object grants for private native content until their consumers move
+to explicit subject/content grants. Do not widen access merely to make the joined view
+easier to implement.
+
+## 7. Implementation sequence R0–R6
 
 ```text
 R0  Source registry
@@ -275,10 +318,26 @@ R6  Delete replaced paths
     remote status and parallel observer/report reducers after their consumers move.
 ```
 
-Do not create a universal event broker, telemetry warehouse, ORM, transcript mirror or
-one process per source.
+Do not create a universal entity graph, event broker, telemetry warehouse, ORM,
+transcript mirror or one process per source.
 
-## 7. Diagnostic logging
+## 8. Slice completion rules
+
+Each R slice names:
+
+- exact existing source/caller and new current consumer;
+- stable identity and freshness/coverage semantics;
+- authorization split;
+- collection bounds and failure behavior;
+- old product method/storage/config/fixtures removed with cutover;
+- minimal affected format/Clippy/build;
+- one connected positive case plus explicit unqualified live boundaries.
+
+R0 alone is not progress if no collector or joined reader uses it. A new collector is
+not complete while the old binding/report consumer remains authoritative. Shared tables
+must be the smallest indexed representation needed by current consumers.
+
+## 9. Diagnostic logging
 
 Diagnostic logging remains optional and independent of required observation.
 
@@ -286,16 +345,16 @@ Levels are `off/error/warn/info/debug/trace`; metadata is default. Selected loca
 module-supervisor records may include bounded `redacted_text`. Trace never silently
 enables prompts, tool arguments, environments, credentials or raw native frames.
 
-The existing recorder keeps bounded records/bytes/segments/retention and explicit
-loss counters. A broken optional sink cannot block control or business receipts.
-Redact complete bounded logical records before persistence/fanout; split chunks need a
+The existing recorder keeps bounded records/bytes/segments/retention and explicit loss
+counters. A broken optional sink cannot block control or business receipts. Redact
+complete bounded logical records before persistence/fanout; split chunks need a
 buffered boundary. Protocol stdout stays separate.
 
 Manager `logging.get/set` may alter only its authorized scoped diagnostic policy and
-cannot broaden operator restrictions. Policy reload starts no native session and is
-not a fleet revision/ACK protocol.
+cannot broaden operator restrictions. Policy reload starts no native session and is not
+a fleet revision/ACK protocol.
 
-## 8. Failure semantics
+## 10. Failure semantics
 
 Keep these states distinct:
 
@@ -316,17 +375,13 @@ accept or replay work.
 Provider-local history may classify an uncertain native input only when the adapter's
 native contract supplies exact identity/readback. It never accepts a Task.
 
-## 9. Authorization and verification
-
-Authorize source inventory, subject details, Task relations, transcript/results and
-private paths separately. A Governor may know that an unmatched session exists without
-receiving its prompt or output.
+## 11. Connected verification
 
 Minimum connected proofs:
 
 - a session/process without a binding is visible as unassigned;
 - assignment and replacement update edges without deleting the subject;
-- one shared provider process/account is counted once;
+- one shared provider process/account/service is counted once;
 - host restart marks old collector epochs stale and rediscovers surviving subjects;
 - a partial/failed scan never claims absent subjects are gone;
 - current branch/HEAD/dirty can differ from assigned branch/baseline and both display;
@@ -334,8 +389,11 @@ Minimum connected proofs:
 - ordinary reads make no provider/model/filesystem/network call;
 - viewer count does not multiply collection;
 - slow subscriber gets a cursor gap and fresh snapshot, not silent loss;
-- PID reuse never grants control or kills an unrelated process.
+- inventory permission reveals no transcript/result/private path;
+- PID reuse never grants control or kills an unrelated process;
+- removed binding/report/process/remote products leave no active method, storage,
+  profile/subscription, CLI or fallback reader.
 
-Runtime implementation starts only after the retained schemas/queries name the actual
+Runtime implementation starts only after retained schemas/queries name the actual
 owners above. Documentation or synthetic fixtures alone do not qualify live Windows,
-provider restart or scale behavior.
+Linux, provider restart, Git/remote behavior or scale.
