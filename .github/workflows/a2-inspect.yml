@@ -1,0 +1,67 @@
+name: Antigravity A2 boundary inspection
+
+on:
+  push:
+    branches:
+      - impl/antigravity-a2-delivery-20261024
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: impl/antigravity-a2-delivery-20261024
+      - name: Print exact A2 source windows
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          targets = {
+              'crates/swarm-kernel-host/src/store/runtime.rs': [
+                  'pub(super) fn outcome(', 'fn outcome_with_artifacts(',
+                  'pub(super) fn result(', 'fn result_with_artifacts(',
+                  'bridge_boot_id', 'previous_owner_departed', 'old_boot',
+              ],
+              'crates/swarm-process/src/permissions.rs': [
+                  'pub fn remove_private_acknowledged',
+                  'pub fn remove_private_durable',
+              ],
+              'modules/antigravity-rust/src/main.rs': [
+                  'async fn run()', 'async fn flush_reports(',
+                  'async fn request_saved(', '"agent.result" =>',
+                  'fn controller_from_hello(',
+              ],
+              'modules/antigravity-rust/src/controller.rs': [
+                  'pub struct Controller', 'pub fn settle_terminal(',
+                  'fn remember_completed_turn(', 'fn record_outcome(',
+                  'pub fn acknowledge_outcome(',
+              ],
+              'modules/antigravity-rust/src/stream.rs': [
+                  'fn apply_result(', 'pub fn retained_response_for(',
+                  'pub fn terminal_for_after_foreign(',
+              ],
+          }
+          for name, needles in targets.items():
+              lines = Path(name).read_text(encoding='utf-8').splitlines()
+              print(f'===== {name} ({len(lines)} lines) =====')
+              emitted = set()
+              for needle in needles:
+                  hits = [i for i, line in enumerate(lines) if needle in line]
+                  print(f'--- {needle}: {[i+1 for i in hits]}')
+                  for i in hits:
+                      start = max(0, i - 24)
+                      end = min(len(lines), i + 95)
+                      key = (start, end)
+                      if key in emitted:
+                          continue
+                      emitted.add(key)
+                      print(f'@@ {start+1}:{end} @@')
+                      for n in range(start, end):
+                          print(f'{n+1:06d} {lines[n]}')
+          PY
