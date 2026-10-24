@@ -6,10 +6,10 @@
 RUNTIME REFACTOR IN PROGRESS.**
 
 Source was inspected on **2026-10-24** at
-`053f1e0fb15b3d40c00918f4a25ec8f9e4969e02`. The active audit contains
-**141 entries**. AR-127–141 trace authenticated multiplexed IPC, host concurrent intake,
-MCP connection slots, reconnect races, subscription polling/lag, MCP Tasks pending-input
-reads, attention/timeline cost, Store writer occupancy and WAL-reader boundaries.
+`c73c36c72d2c86cf710fa69e39ab07e2052c1f5e`. The active audit contains
+**159 entries**. AR-142–159 trace binding-rooted discovery, provider source ownership,
+process identity/liveness, workspace authority versus live Git, remote-ref observation,
+the joined Governor view, disclosure boundaries and deletion of replaced surfaces.
 
 Merged work immediately preceding this checkpoint:
 
@@ -18,15 +18,19 @@ Merged work immediately preceding this checkpoint:
   `40087522775` passed scoped Ubuntu/Windows compile and changed-line Clippy.
 - PR #189 at `053f1e0`: AR-115–126 plus the numeric Store-evolution contract; exact
   head `3c05253`, run `40088525487` completed successfully; documentation only.
+- PR #190 at `c73c36c`: AR-127–141 plus the IPC/MCP contract; exact head
+  `a93ab20`, run `40090027947` passed changed-path and Markdown validation;
+  documentation only. J0 remains selected but not landed.
 
 - [Current resume point and findings](agent-operations/audit-current.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
 - [Architecture](agent-operations/architecture.md)
 - [Single implementation program](agent-operations/implementation.md)
+- [Observability target](agent-operations/observability.md)
 - [IPC/MCP target](agent-operations/ipc-mcp.md)
 - [Store evolution target](agent-operations/store-evolution.md)
 - [Agent communication target](agent-communication-program.md)
-- [Observability target](agent-operations/observability.md)
+- [Gateway target](gateway.md)
 - [Donor register](agent-operations/donor-map.md)
 
 ## Runtime changes
@@ -48,6 +52,7 @@ A3   NOT IMPLEMENTED          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime
 U/R  SMALL CLEANUP LANDED      disconnected GitHub PR/projection source removed
 J0   SELECTED / NOT LANDED     release MCP slot lock before shared RPC
+R0–R6 TARGET ONLY              source-owned joined Governor observation
 ```
 
 Runtime implementation still starts with **A1b–A3**. J0 is a bounded independent
@@ -68,89 +73,93 @@ frontend fix and does not reorder the main migration.
 | Mailbox/coordination, AR-100–113 | Exact sender/recipient/scope checks, scoped grants and GM epoch handover are useful. | Recipient rows; finite migration; grant relocation; deletion of coordination products/public/storage surfaces. |
 | Store, AR-115–126 | Single-writer ownership, pre-query timeout, pre-WAL identity, immediate transaction, rollback and query-only WAL reader are useful. | Numeric v2 implementation, v1 bridge, semantic postconditions, reader/Doctor cutover and deletion migrations. |
 | IPC/MCP, AR-127–141 | Client/server multiplexing, no-replay unknown outcome, live Store authorization, tool/pump isolation and bounded lag semantics are useful. | MCP outer-lock removal, exact pending-input read, bounded attention, one pump, WAL read routing and concurrent/load qualification. |
-| Remaining | Structural and selected source reviews remain indexed. | Joined local observation and gateway completion. |
+| Observation, AR-142–159 | Binding/boot fences, typed provider evidence, process birth/membership checks, conservative workspace release and passive semantics are useful. | Independent source collectors, unmatched subjects, live Git/remote facts, joined WAL projection, split disclosure and old-surface deletion. |
+| Remaining | Structural and selected source reviews remain indexed. | Gateway completion and untraced residual chains. |
 
-## IPC and MCP status
+## Governor observation status
 
 ### Preserve
 
-- One physical authentication before any application frame.
-- Shared Client clones with one pending map and exact out-of-order correlation.
-- Bounded in-flight requests and pre-submit capacity refusal.
-- No replay after possible write; all unresolved calls become `OUTCOME_UNKNOWN` on
-  transport damage.
-- Concurrent host intake and draining of already accepted Store calls after disconnect.
-- Separate tool and subscription-pump links.
-- Current Store authorization rather than profile/session grant caching.
-- Caller-known mutation request IDs for restricted profiles.
-- Bounded subscriber item/byte queues and explicit lag range/count.
-- Original mutation success when optional MCP Task projection fails.
-- Queued-only ordinary `operation.cancel` for MCP Tasks cancellation.
+- Binding/generation/boot/observation identity fences for private native evidence.
+- Explicit unknown/stale/partial/unavailable gaps rather than fabricated zero/current
+  values.
+- Typed provider condition source sequence/evidence and invalidation semantics.
+- PID birth/image and module-owner membership checks for custody/control.
+- Workspace lease as assignment/write authority with conservative release.
+- Exact remote-ref readback after an ambiguous push.
+- Passive observation: no Task acceptance, reassignment, prompt retry, provider restart
+  or process kill from a status read.
 
 ### Repair
 
-1. Clone the current Client under the connection-slot mutex, release the mutex before
-   `request_shared`, and generation-safely clear only a disconnected slot after a
-   transport-class failure.
-2. Add focused concurrent/out-of-order/application-error/disconnect/late-old-failure
-   cases for the facade.
-3. Replace `tasks/get` global `report.attention` paging with one exact
-   Operation/binding-generation pending-input read.
-4. Make report page limits bound Store production work, not only response slicing.
-5. Replace per-subscription pollers with one session delta/wake pump and independent
-   bounded subscriber queues.
-6. Remove Concilium/coordination subscription categories with those products.
-7. Move selected pure bounded exact reads from the writer queue to a retained
-   query-only WAL reader owner while keeping authorization singular/current.
-8. Keep Store history and exact reads as replay authority; add no frontend database,
-   retry queue or durable event log.
+1. Discover native/process/worktree/remote subjects from stable source owners, not only
+   ready bindings linked to the current Manager's Task.
+2. Retain assignment as an edge from a discovered subject to binding/Operation/Attempt/
+   Task; absent edge means unassigned, not invisible.
+3. Promote provider account/service/store identity to a source lifecycle independent of
+   the binding that supplied one observation; preserve independent quota windows.
+4. Replace caller-selected one-shot process metrics with one host collector that
+   discovers/refreshes known processes and stores PID+birth/image/group/Job/liveness.
+5. Display assigned workspace branch/baseline/scope beside independently collected
+   repository identity, actual branch/HEAD/dirty/upstream/push target and observed time.
+6. Add a read-only remote-ref collector independent of Forge publication/push authority.
+7. Join SourceRecord/current subjects/assignment edges in one short WAL snapshot with
+   source epoch, cursor, last attempt/success, freshness, coverage and gaps.
+8. Split inventory existence/state permission from Task relation, transcript/result and
+   host-private path disclosure.
+9. Move all consumers, then remove binding-only runtime catalogs, duplicated provider
+   lifecycle, process-metrics product CLI, static lease-as-live claims,
+   publication-only remote status and parallel report reducers.
+10. Keep collection independent of viewer count and optional diagnostic logging.
 
-J0 is selected but **not yet landed**. This status must not be read as an executed
-concurrent MCP fix.
+No R0–R6 runtime implementation or live collector qualification is claimed in this
+checkpoint.
+
+## IPC and MCP status
+
+Preserve authenticated shared Client correlation, no-replay `OUTCOME_UNKNOWN`,
+concurrent host intake, separate tool/pump links, live Store authorization and bounded
+explicit lag. Repair the MCP outer lock, exact pending-input reads, bounded report
+production, one pump and selective WAL read routing through
+[IPC/MCP](agent-operations/ipc-mcp.md). J0 is **not landed**.
 
 ## Store status
 
 Preserve DataRoot lock, one writer, pre-query busy timeout, pre-WAL identity validation,
 `BEGIN IMMEDIATE`, rollback, no fallible postcommit validation, existing-only recovery
-and committed WAL reads.
-
-Repair permanent version 1 plus SHA markers through the finite numeric v1→v2 program in
-[Store evolution](agent-operations/store-evolution.md), including future-version
-rejection, semantic postconditions, exact-current readers and product deletion
-migrations.
+and committed WAL reads. Repair permanent version 1 plus SHA markers through
+[Store evolution](agent-operations/store-evolution.md).
 
 ## Mailbox and coordination status
 
 Preserve exact sender/recipient/scope, immutable Operation admission, scoped worker/
-reviewer access and GM handover without historical identity rewriting.
-
-Repair through recipient rows keyed by Operation ID, grant migration and vertical
-removal of Thread negotiation, cards/consult, contracts, `code.scope.*`, integration,
-Concilium and watches with MCP/CLI/storage/migrations.
+reviewer access and GM handover without historical identity rewriting. Repair through
+recipient rows, grant migration and vertical deletion of duplicate coordination
+products/public/storage surfaces.
 
 ## Source audit versus runtime qualification
 
 A completed source audit needs a named revision and evidence for every retained action:
 caller → parse → exact authority → Store transition → effect/readback → consumer,
-including cancellation, late result, restart, handover, migration, partial writes and
-slow consumers. It also needs historical requirement mapping and concrete data/code
-disposition for each deletion. This remains incomplete globally.
+including cancellation, late result, restart, handover, migration, partial writes,
+source gaps and slow consumers. It also needs historical requirement mapping and
+concrete data/code disposition for each deletion. This remains incomplete globally.
 
-Executed qualification is separate: concurrent MCP/load, privilege/migration/corruption
-cases, installed provider contracts, Windows custody, fairness and autonomous
-end-to-end work. Source inspection and a successful compile cannot substitute for those
-results.
+Executed qualification is separate: provider/process/Git collectors, host restart,
+Windows/Linux custody, PID reuse, migration/corruption, concurrent MCP/load, fairness
+and autonomous end-to-end work. Source inspection and a successful compile cannot
+substitute for those results.
 
 ## Next work
 
-**Audit:** continue the local Governor observation chain named in
-[audit-current](agent-operations/audit-current.md#resume-here): provider-local subjects,
-process identity/liveness, live worktree/Git/remote facts, unmatched subjects and one
-joined view with explicit source coverage.
+**Audit:** continue the remote gateway chain named in
+[audit-current](agent-operations/audit-current.md#resume-here): secret loading,
+loopback/Host/Origin/auth/body/session bounds, fixed identity/profile, timeout-as-unknown,
+compatibility launcher and disconnect behavior.
 
-**Runtime:** the main program still begins with Antigravity A1b–A3. The selected
-independent IPC slice is J0 from [IPC/MCP](agent-operations/ipc-mcp.md): release the MCP
-connection lock around the shared RPC without changing no-replay semantics.
+**Runtime:** the main program still begins with Antigravity A1b–A3. Selected independent
+slices remain J0 from [IPC/MCP](agent-operations/ipc-mcp.md) and R0–R6 from
+[Observability](agent-operations/observability.md); neither is landed here.
 
 During construction run rustfmt plus minimal affected warnings-denied compile/Clippy.
 Focused connected cases close each slice; broad installed/live/migration/load
