@@ -15,12 +15,15 @@ immutable snapshots below retain earlier detailed evidence.
 5. Record a deletion only after the previous consumer, data disposition and positive
    path are identified.
 
-Current checkpoint: Antigravity A1b runtime slice at
-`3c7a84ffc6d1e349fe989e4beaa62b03ed4e21bb` on 2026-10-24. The refresh/session-proof
-admission gate and repeated assignment/lease/session digests are removed while current
-Store binding/Open and adapter command fences remain. Run `40131522836`, job
-`120984044559`, passed affected rustfmt and warnings-denied Clippy. No test,
-installed-provider, crash/restart or load qualification is implied. Continue with A2.
+Current merged source basis: `main` at
+`797ea93f1cfcaad8c8dde2629d666e64efb131c2` (PR #194, Antigravity A1b). The last
+completed **source-audit** range remains AR-160–170 at `0a228cd`; A1b is a later
+implementation checkpoint, not proof that other packages were inspected. The
+repository-wide audit remains incomplete. Continue the package/domain sequence in
+[source-audit coverage](source-audit-coverage.md), not implementation A2 as an audit
+substitute. Assign implementation only through an exact
+[task packet](task-packet-template.md) constrained by
+[failure prevention](failure-prevention-register.md).
 
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints

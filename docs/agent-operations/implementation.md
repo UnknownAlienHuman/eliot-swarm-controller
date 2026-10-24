@@ -1,12 +1,20 @@
 # Eliot Swarm Controller — implementation
 
-This is the single implementation program for the
-[architecture](architecture.md). The 2026-10-21 preservation pass compared
-`c92120ed70ca7e625440a8a19517c481e73b13c9` with the pre-refactor specification,
-October 6 audit, master audit v26 and retained Claude-script review. This is a
-focused requirements/contract review, not an exhaustive reread of every source file.
-[Findings](refactoring.md) explain the current excess;
-[status](../implementation-status.md) separates landed code from plans.
+This is the strategic dependency order and source-owner map for the
+[architecture](architecture.md). It is **not a self-contained worker prompt** and does
+not prove that every current source file was audited. The 2026-10-21 preservation pass
+compared `c92120ed70ca7e625440a8a19517c481e73b13c9` with selected pre-refactor
+specification, audit and Claude-script evidence; it was a focused requirements review,
+not an exhaustive source reread. The repository-wide audit remains incomplete; see
+[source-audit coverage](source-audit-coverage.md), [current audit](audit-current.md),
+[documentation readiness](documentation-readiness-report.md) and
+[status](../implementation-status.md).
+
+A coding agent receives one approved [task packet](task-packet-template.md) for one
+exact revision. The packet cites the applicable
+[failure-prevention entries](failure-prevention-register.md), current symbols,
+positive path, deletions/data disposition and focused acceptance evidence. Do not send
+this entire A–V roadmap as an assignment.
 
 Do not start another horizontal framework migration. Complete one vertical
 caller-to-result path, delete its replaced path, then use a second current caller to

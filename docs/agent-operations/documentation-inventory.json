@@ -1,88 +1,40 @@
 {
-  "schema_version": 1,
-  "inspected_head": "365fcac491b83b2b680655f602a9ff79d282b7a3",
+  "schema_version": 2,
+  "inspected_head": "7bae67203799bf06686e7580618e280a8facc0a4",
   "verdict": "NOT READY",
   "reasons": [
-    "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive",
-    "repository-local Markdown links are broken",
-    "most Markdown files are not mechanically classified as active or historical"
+    "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
   ],
   "counts": {
     "markdown_files": 154,
     "docs_root_files": 41,
-    "active": 20,
-    "historical_or_snapshot": 8,
-    "supporting_or_unclassified": 126,
-    "broken_local_links": 10,
+    "audit-evidence": 42,
+    "current-contract": 27,
+    "current-status": 1,
+    "entrypoint": 3,
+    "generated-audit": 1,
+    "historical-snapshot": 7,
+    "module-guide": 16,
+    "qualification-evidence": 9,
+    "supporting-reference": 48,
+    "broken_local_links": 0,
     "oversized_25k_or_more": 15
   },
-  "missing_entrypoints": [],
-  "missing_active_contracts": [],
+  "missing_required_documents": [],
   "explicit_incomplete_documents": [
-    "docs/agent-operations/audit-current.md",
+    "docs/agent-operations/audit-index.md",
     "docs/agent-operations/implementation.md",
     "docs/agent-operations/refactoring.md",
     "docs/implementation-status.md"
   ],
-  "broken_links": [
-    {
-      "source": "docs/legacy-swarm-transition.md",
-      "target": "../src/model.rs",
-      "resolved": "src/model.rs"
-    },
-    {
-      "source": "docs/legacy-swarm-transition.md",
-      "target": "../src/runtime/mod.rs",
-      "resolved": "src/runtime/mod.rs"
-    },
-    {
-      "source": "docs/legacy-swarm-transition.md",
-      "target": "../src/mcp.rs",
-      "resolved": "src/mcp.rs"
-    },
-    {
-      "source": "docs/legacy-swarm-transition.md",
-      "target": "../src/store/mod.rs",
-      "resolved": "src/store/mod.rs"
-    },
-    {
-      "source": "docs/legacy-swarm-transition.md",
-      "target": "../src/artifacts.rs",
-      "resolved": "src/artifacts.rs"
-    },
-    {
-      "source": "docs/mcp-tool-catalog-sources.md",
-      "target": "../src/mcp.rs",
-      "resolved": "src/mcp.rs"
-    },
-    {
-      "source": "docs/mcp-tool-catalog-sources.md",
-      "target": "../src/mcp/profiles.rs",
-      "resolved": "src/mcp/profiles.rs"
-    },
-    {
-      "source": "docs/mcp-tool-catalog-sources.md",
-      "target": "../src/mcp/profiles_tests.rs",
-      "resolved": "src/mcp/profiles_tests.rs"
-    },
-    {
-      "source": "docs/mcp-tool-catalog-sources.md",
-      "target": "../src/config.rs",
-      "resolved": "src/config.rs"
-    },
-    {
-      "source": "docs/remediation/2026-10-09/EXECUTION-MAP.md",
-      "target": "../2026-10-07/README.md",
-      "resolved": "docs/remediation/2026-10-07/README.md"
-    }
-  ],
+  "broken_links": [],
   "oversized_documents": [
     {
       "path": "docs/agent_swarm.implementation-v6.md",
       "bytes": 91087,
       "lines": 464,
       "headings": 27,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -96,7 +48,7 @@
       "bytes": 80179,
       "lines": 562,
       "headings": 9,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -110,7 +62,7 @@
       "bytes": 79824,
       "lines": 419,
       "headings": 24,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -124,7 +76,7 @@
       "bytes": 72125,
       "lines": 1141,
       "headings": 106,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -138,7 +90,7 @@
       "bytes": 64819,
       "lines": 384,
       "headings": 26,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -152,7 +104,7 @@
       "bytes": 45912,
       "lines": 291,
       "headings": 21,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -166,7 +118,7 @@
       "bytes": 44128,
       "lines": 401,
       "headings": 22,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -177,24 +129,24 @@
     },
     {
       "path": "docs/agent-operations/implementation.md",
-      "bytes": 43477,
-      "lines": 796,
+      "bytes": 44005,
+      "lines": 804,
       "headings": 31,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
-        "audit_incomplete_phrase": false,
+        "audit_incomplete_phrase": true,
         "not_exhaustive": true,
         "resume_here": false
       }
     },
     {
       "path": "docs/lessons-learned.md",
-      "bytes": 40589,
+      "bytes": 40975,
       "lines": 137,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -208,7 +160,7 @@
       "bytes": 38969,
       "lines": 477,
       "headings": 30,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -222,7 +174,7 @@
       "bytes": 38029,
       "lines": 769,
       "headings": 48,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -236,7 +188,7 @@
       "bytes": 32964,
       "lines": 838,
       "headings": 70,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -250,7 +202,7 @@
       "bytes": 29248,
       "lines": 157,
       "headings": 12,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -264,7 +216,7 @@
       "bytes": 28601,
       "lines": 904,
       "headings": 57,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -278,7 +230,7 @@
       "bytes": 25621,
       "lines": 463,
       "headings": 16,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -294,7 +246,7 @@
       "bytes": 8570,
       "lines": 161,
       "headings": 8,
-      "classification": "active",
+      "classification": "entrypoint",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -305,16 +257,16 @@
     },
     {
       "path": "README.md",
-      "bytes": 10217,
-      "lines": 159,
+      "bytes": 10608,
+      "lines": 164,
       "headings": 10,
-      "classification": "active",
+      "classification": "entrypoint",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
         "audit_incomplete_phrase": false,
         "not_exhaustive": false,
-        "resume_here": false
+        "resume_here": true
       }
     },
     {
@@ -322,7 +274,7 @@
       "bytes": 7185,
       "lines": 48,
       "headings": 9,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -336,7 +288,7 @@
       "bytes": 8269,
       "lines": 52,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -350,7 +302,7 @@
       "bytes": 3800,
       "lines": 62,
       "headings": 2,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -364,7 +316,7 @@
       "bytes": 3081,
       "lines": 76,
       "headings": 6,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -378,7 +330,7 @@
       "bytes": 3246,
       "lines": 57,
       "headings": 3,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -392,7 +344,7 @@
       "bytes": 8547,
       "lines": 219,
       "headings": 12,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -406,7 +358,7 @@
       "bytes": 3972,
       "lines": 81,
       "headings": 6,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -420,7 +372,7 @@
       "bytes": 337,
       "lines": 6,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -434,7 +386,7 @@
       "bytes": 2531,
       "lines": 40,
       "headings": 2,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -448,7 +400,7 @@
       "bytes": 12797,
       "lines": 209,
       "headings": 26,
-      "classification": "supporting-or-unclassified",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -462,7 +414,7 @@
       "bytes": 13601,
       "lines": 288,
       "headings": 30,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -476,7 +428,7 @@
       "bytes": 8700,
       "lines": 251,
       "headings": 25,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -490,7 +442,7 @@
       "bytes": 17501,
       "lines": 381,
       "headings": 24,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -501,10 +453,10 @@
     },
     {
       "path": "docs/agent-operations/README.md",
-      "bytes": 6168,
-      "lines": 92,
+      "bytes": 6389,
+      "lines": 94,
       "headings": 6,
-      "classification": "active",
+      "classification": "entrypoint",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -518,7 +470,7 @@
       "bytes": 6144,
       "lines": 124,
       "headings": 17,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -529,24 +481,10 @@
     },
     {
       "path": "docs/agent-operations/audit-current.md",
-      "bytes": 14309,
+      "bytes": 14380,
       "lines": 162,
       "headings": 10,
-      "classification": "active",
-      "status_markers": {
-        "source_audit_incomplete": false,
-        "working_draft": false,
-        "audit_incomplete_phrase": true,
-        "not_exhaustive": false,
-        "resume_here": true
-      }
-    },
-    {
-      "path": "docs/agent-operations/audit-index.md",
-      "bytes": 13456,
-      "lines": 112,
-      "headings": 7,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -556,11 +494,25 @@
       }
     },
     {
+      "path": "docs/agent-operations/audit-index.md",
+      "bytes": 13602,
+      "lines": 115,
+      "headings": 7,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": true,
+        "not_exhaustive": false,
+        "resume_here": true
+      }
+    },
+    {
       "path": "docs/agent-operations/audit-register.md",
       "bytes": 44128,
       "lines": 401,
       "headings": 22,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -574,7 +526,7 @@
       "bytes": 25621,
       "lines": 463,
       "headings": 16,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -588,7 +540,7 @@
       "bytes": 17277,
       "lines": 355,
       "headings": 19,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -602,7 +554,7 @@
       "bytes": 4178,
       "lines": 91,
       "headings": 11,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -616,7 +568,7 @@
       "bytes": 4727,
       "lines": 82,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "generated-audit",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -630,7 +582,7 @@
       "bytes": 23325,
       "lines": 265,
       "headings": 26,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -644,7 +596,7 @@
       "bytes": 9205,
       "lines": 208,
       "headings": 13,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -658,7 +610,7 @@
       "bytes": 14513,
       "lines": 81,
       "headings": 6,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -672,7 +624,7 @@
       "bytes": 4215,
       "lines": 40,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -686,7 +638,7 @@
       "bytes": 10727,
       "lines": 250,
       "headings": 13,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -697,14 +649,14 @@
     },
     {
       "path": "docs/agent-operations/implementation.md",
-      "bytes": 43477,
-      "lines": 796,
+      "bytes": 44005,
+      "lines": 804,
       "headings": 31,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
-        "audit_incomplete_phrase": false,
+        "audit_incomplete_phrase": true,
         "not_exhaustive": true,
         "resume_here": false
       }
@@ -714,7 +666,7 @@
       "bytes": 14226,
       "lines": 350,
       "headings": 26,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -728,7 +680,7 @@
       "bytes": 12908,
       "lines": 194,
       "headings": 13,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -742,7 +694,7 @@
       "bytes": 12922,
       "lines": 244,
       "headings": 10,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -756,7 +708,7 @@
       "bytes": 17995,
       "lines": 321,
       "headings": 19,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -770,7 +722,7 @@
       "bytes": 10156,
       "lines": 236,
       "headings": 10,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -784,7 +736,7 @@
       "bytes": 17269,
       "lines": 400,
       "headings": 24,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -798,7 +750,7 @@
       "bytes": 18170,
       "lines": 340,
       "headings": 34,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -812,7 +764,7 @@
       "bytes": 7780,
       "lines": 117,
       "headings": 7,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -826,7 +778,7 @@
       "bytes": 8200,
       "lines": 72,
       "headings": 5,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -840,7 +792,7 @@
       "bytes": 14449,
       "lines": 372,
       "headings": 26,
-      "classification": "active",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -854,7 +806,7 @@
       "bytes": 3627,
       "lines": 107,
       "headings": 13,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -868,7 +820,7 @@
       "bytes": 91087,
       "lines": 464,
       "headings": 27,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -882,7 +834,7 @@
       "bytes": 79824,
       "lines": 419,
       "headings": 24,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -896,7 +848,7 @@
       "bytes": 64819,
       "lines": 384,
       "headings": 26,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -910,7 +862,7 @@
       "bytes": 5943,
       "lines": 58,
       "headings": 3,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -924,7 +876,7 @@
       "bytes": 12447,
       "lines": 52,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -938,7 +890,7 @@
       "bytes": 13252,
       "lines": 312,
       "headings": 18,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -952,7 +904,7 @@
       "bytes": 3775,
       "lines": 14,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -966,7 +918,7 @@
       "bytes": 2624,
       "lines": 18,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -980,7 +932,7 @@
       "bytes": 38029,
       "lines": 769,
       "headings": 48,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -994,7 +946,7 @@
       "bytes": 72125,
       "lines": 1141,
       "headings": 106,
-      "classification": "historical-or-snapshot",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1008,7 +960,7 @@
       "bytes": 3990,
       "lines": 44,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1022,7 +974,7 @@
       "bytes": 7189,
       "lines": 159,
       "headings": 11,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1036,7 +988,7 @@
       "bytes": 11266,
       "lines": 241,
       "headings": 15,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1050,7 +1002,7 @@
       "bytes": 32964,
       "lines": 838,
       "headings": 70,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1064,7 +1016,7 @@
       "bytes": 8483,
       "lines": 153,
       "headings": 3,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1078,7 +1030,7 @@
       "bytes": 2704,
       "lines": 47,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1092,7 +1044,7 @@
       "bytes": 6743,
       "lines": 114,
       "headings": 5,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1106,7 +1058,7 @@
       "bytes": 14848,
       "lines": 343,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1120,7 +1072,7 @@
       "bytes": 17399,
       "lines": 223,
       "headings": 2,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1131,10 +1083,10 @@
     },
     {
       "path": "docs/implementation-status.md",
-      "bytes": 14134,
-      "lines": 207,
+      "bytes": 14987,
+      "lines": 219,
       "headings": 14,
-      "classification": "active",
+      "classification": "current-status",
       "status_markers": {
         "source_audit_incomplete": true,
         "working_draft": true,
@@ -1148,7 +1100,7 @@
       "bytes": 3124,
       "lines": 16,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1159,10 +1111,10 @@
     },
     {
       "path": "docs/legacy-swarm-transition.md",
-      "bytes": 10116,
-      "lines": 46,
+      "bytes": 10522,
+      "lines": 51,
       "headings": 5,
-      "classification": "supporting-or-unclassified",
+      "classification": "historical-snapshot",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1173,10 +1125,10 @@
     },
     {
       "path": "docs/lessons-learned.md",
-      "bytes": 40589,
+      "bytes": 40975,
       "lines": 137,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1190,7 +1142,7 @@
       "bytes": 13747,
       "lines": 119,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1204,7 +1156,7 @@
       "bytes": 24268,
       "lines": 195,
       "headings": 16,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1218,7 +1170,7 @@
       "bytes": 15216,
       "lines": 112,
       "headings": 10,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1232,7 +1184,7 @@
       "bytes": 17419,
       "lines": 139,
       "headings": 10,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1246,7 +1198,7 @@
       "bytes": 13396,
       "lines": 115,
       "headings": 9,
-      "classification": "supporting-or-unclassified",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1260,7 +1212,7 @@
       "bytes": 9347,
       "lines": 90,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1274,7 +1226,7 @@
       "bytes": 17252,
       "lines": 240,
       "headings": 16,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1288,7 +1240,7 @@
       "bytes": 7580,
       "lines": 178,
       "headings": 9,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1302,7 +1254,7 @@
       "bytes": 28601,
       "lines": 904,
       "headings": 57,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1313,10 +1265,10 @@
     },
     {
       "path": "docs/mcp-tool-catalog-sources.md",
-      "bytes": 16924,
-      "lines": 433,
+      "bytes": 17507,
+      "lines": 439,
       "headings": 40,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1330,7 +1282,7 @@
       "bytes": 17893,
       "lines": 266,
       "headings": 29,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1344,7 +1296,7 @@
       "bytes": 2517,
       "lines": 40,
       "headings": 2,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1358,7 +1310,7 @@
       "bytes": 2686,
       "lines": 46,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1372,7 +1324,7 @@
       "bytes": 2536,
       "lines": 49,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1386,7 +1338,7 @@
       "bytes": 2212,
       "lines": 44,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1400,7 +1352,7 @@
       "bytes": 10798,
       "lines": 180,
       "headings": 7,
-      "classification": "supporting-or-unclassified",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1414,7 +1366,7 @@
       "bytes": 5508,
       "lines": 81,
       "headings": 7,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1428,7 +1380,7 @@
       "bytes": 4613,
       "lines": 55,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1442,7 +1394,7 @@
       "bytes": 4340,
       "lines": 78,
       "headings": 7,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1456,7 +1408,7 @@
       "bytes": 2761,
       "lines": 55,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1470,7 +1422,7 @@
       "bytes": 3714,
       "lines": 101,
       "headings": 6,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1484,7 +1436,7 @@
       "bytes": 5382,
       "lines": 42,
       "headings": 5,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1498,7 +1450,7 @@
       "bytes": 19820,
       "lines": 278,
       "headings": 29,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1512,7 +1464,7 @@
       "bytes": 38969,
       "lines": 477,
       "headings": 30,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1526,7 +1478,7 @@
       "bytes": 8825,
       "lines": 211,
       "headings": 14,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1540,7 +1492,7 @@
       "bytes": 80179,
       "lines": 562,
       "headings": 9,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1551,10 +1503,10 @@
     },
     {
       "path": "docs/remediation/2026-10-09/EXECUTION-MAP.md",
-      "bytes": 22761,
+      "bytes": 22759,
       "lines": 205,
       "headings": 21,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1568,7 +1520,7 @@
       "bytes": 23038,
       "lines": 85,
       "headings": 5,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1582,7 +1534,7 @@
       "bytes": 5447,
       "lines": 43,
       "headings": 3,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1596,7 +1548,7 @@
       "bytes": 939,
       "lines": 16,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1610,7 +1562,7 @@
       "bytes": 10066,
       "lines": 99,
       "headings": 5,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1624,7 +1576,7 @@
       "bytes": 11415,
       "lines": 194,
       "headings": 13,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1638,7 +1590,7 @@
       "bytes": 2056,
       "lines": 34,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1652,7 +1604,7 @@
       "bytes": 2193,
       "lines": 36,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1666,7 +1618,7 @@
       "bytes": 1422,
       "lines": 24,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1680,7 +1632,7 @@
       "bytes": 7312,
       "lines": 74,
       "headings": 5,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1694,7 +1646,7 @@
       "bytes": 1689,
       "lines": 30,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1708,7 +1660,7 @@
       "bytes": 3168,
       "lines": 52,
       "headings": 2,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1722,7 +1674,7 @@
       "bytes": 1636,
       "lines": 27,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1736,7 +1688,7 @@
       "bytes": 2314,
       "lines": 34,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1750,7 +1702,7 @@
       "bytes": 2911,
       "lines": 45,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1764,7 +1716,7 @@
       "bytes": 1765,
       "lines": 31,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1778,7 +1730,7 @@
       "bytes": 1855,
       "lines": 34,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1792,7 +1744,7 @@
       "bytes": 3815,
       "lines": 60,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1806,7 +1758,7 @@
       "bytes": 2123,
       "lines": 37,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1820,7 +1772,7 @@
       "bytes": 2921,
       "lines": 50,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1834,7 +1786,7 @@
       "bytes": 3003,
       "lines": 51,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1848,7 +1800,7 @@
       "bytes": 8952,
       "lines": 149,
       "headings": 3,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1862,7 +1814,7 @@
       "bytes": 2784,
       "lines": 44,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1876,7 +1828,7 @@
       "bytes": 2255,
       "lines": 42,
       "headings": 2,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1890,7 +1842,7 @@
       "bytes": 4194,
       "lines": 73,
       "headings": 2,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1904,7 +1856,7 @@
       "bytes": 3308,
       "lines": 31,
       "headings": 3,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1918,7 +1870,7 @@
       "bytes": 19458,
       "lines": 95,
       "headings": 11,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1932,7 +1884,7 @@
       "bytes": 24199,
       "lines": 84,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1946,7 +1898,7 @@
       "bytes": 443,
       "lines": 10,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1960,7 +1912,7 @@
       "bytes": 6147,
       "lines": 105,
       "headings": 6,
-      "classification": "historical-or-snapshot",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1974,7 +1926,7 @@
       "bytes": 9638,
       "lines": 149,
       "headings": 7,
-      "classification": "historical-or-snapshot",
+      "classification": "qualification-evidence",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -1988,7 +1940,7 @@
       "bytes": 29248,
       "lines": 157,
       "headings": 12,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2002,7 +1954,7 @@
       "bytes": 7162,
       "lines": 147,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2016,7 +1968,7 @@
       "bytes": 10021,
       "lines": 235,
       "headings": 13,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2030,7 +1982,7 @@
       "bytes": 17261,
       "lines": 273,
       "headings": 12,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2044,7 +1996,7 @@
       "bytes": 11682,
       "lines": 238,
       "headings": 13,
-      "classification": "supporting-or-unclassified",
+      "classification": "current-contract",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2058,7 +2010,7 @@
       "bytes": 5677,
       "lines": 28,
       "headings": 3,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2072,7 +2024,7 @@
       "bytes": 12346,
       "lines": 182,
       "headings": 7,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2086,7 +2038,7 @@
       "bytes": 4842,
       "lines": 80,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2100,7 +2052,7 @@
       "bytes": 12218,
       "lines": 60,
       "headings": 5,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2114,7 +2066,7 @@
       "bytes": 2201,
       "lines": 44,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2128,7 +2080,7 @@
       "bytes": 15321,
       "lines": 99,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2142,7 +2094,7 @@
       "bytes": 4713,
       "lines": 38,
       "headings": 6,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2156,7 +2108,7 @@
       "bytes": 4956,
       "lines": 80,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2170,7 +2122,7 @@
       "bytes": 3894,
       "lines": 61,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2184,7 +2136,7 @@
       "bytes": 9387,
       "lines": 162,
       "headings": 7,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2198,7 +2150,7 @@
       "bytes": 2283,
       "lines": 39,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2212,7 +2164,7 @@
       "bytes": 1910,
       "lines": 76,
       "headings": 6,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2226,7 +2178,7 @@
       "bytes": 2492,
       "lines": 39,
       "headings": 1,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2240,7 +2192,7 @@
       "bytes": 17198,
       "lines": 421,
       "headings": 22,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2254,7 +2206,7 @@
       "bytes": 6728,
       "lines": 170,
       "headings": 17,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2268,7 +2220,7 @@
       "bytes": 4255,
       "lines": 172,
       "headings": 10,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2282,7 +2234,7 @@
       "bytes": 3069,
       "lines": 98,
       "headings": 6,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2296,7 +2248,7 @@
       "bytes": 5380,
       "lines": 33,
       "headings": 3,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2310,7 +2262,7 @@
       "bytes": 3017,
       "lines": 18,
       "headings": 3,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2324,7 +2276,7 @@
       "bytes": 6194,
       "lines": 166,
       "headings": 10,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2338,7 +2290,7 @@
       "bytes": 3678,
       "lines": 60,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2352,7 +2304,7 @@
       "bytes": 45912,
       "lines": 291,
       "headings": 21,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2366,7 +2318,7 @@
       "bytes": 7860,
       "lines": 119,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2380,7 +2332,7 @@
       "bytes": 18645,
       "lines": 315,
       "headings": 11,
-      "classification": "supporting-or-unclassified",
+      "classification": "module-guide",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2394,7 +2346,7 @@
       "bytes": 16069,
       "lines": 314,
       "headings": 17,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2408,7 +2360,7 @@
       "bytes": 6517,
       "lines": 47,
       "headings": 4,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2422,7 +2374,7 @@
       "bytes": 7545,
       "lines": 154,
       "headings": 2,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
@@ -2436,7 +2388,7 @@
       "bytes": 3526,
       "lines": 66,
       "headings": 8,
-      "classification": "supporting-or-unclassified",
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,

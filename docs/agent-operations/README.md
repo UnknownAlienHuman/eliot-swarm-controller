@@ -51,6 +51,7 @@ infer a runtime repair from documentation, a search hit or a test that was only 
 | [Current audit](audit-current.md) | Active source findings, exact resume point and untraced boundaries. |
 | [Audit index](audit-index.md) | Immutable evidence checkpoints and source/target navigation. |
 | [Failure prevention](failure-prevention-register.md) | AR/PF invariants, implementation owner and closure evidence. |
+| [Source-audit coverage](source-audit-coverage.md) | Package/non-workspace coverage, untraced boundaries and next audit sequence. |
 | [Task packet](task-packet-template.md) | Exact assignment format for one implementation slice. |
 | [Delivery](delivery.md) | Assignment, capture, review, correction, acceptance and publication cycle. |
 | [Configuration](configuration.md) | Manager policy and the target current-state loop. |
@@ -81,6 +82,7 @@ infer a runtime repair from documentation, a search hit or a test that was only 
 | How does Store schema compatibility work? | [Store evolution](store-evolution.md) |
 | How do frontend concurrency and subscriptions work? | [IPC/MCP](ipc-mcp.md) |
 | Where did source research stop? | [Current audit](audit-current.md#resume-here) |
+| Which packages remain untraced? | [Source-audit coverage](source-audit-coverage.md) |
 | What evidence supports a finding? | [Audit index](audit-index.md#evidence-checkpoints) |
 | What can be reused or must be requalified? | [Donor map](donor-map.md) and [donor inventory](../agent_swarm.donors-20260929.toml) |
 | Why did an old design exist? | Historical/evidence documents classified by the authority map; never resume them as current work orders. |

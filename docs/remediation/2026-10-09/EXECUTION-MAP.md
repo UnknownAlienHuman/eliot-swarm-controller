@@ -20,7 +20,7 @@ On this base: **37 open PRs, all documentation-only; 8 open Issues.** No open PR
 
 Already merged, DO NOT reimplement: #75 SQLite bootstrap; #77 changed-line Clippy; #80 host events; #81/#82/#85 scheduler and launcher retry; #83 crash-repairable state marker; #86 request IDs; #87 live MCP authorization; #88 native command closed set; #89–#91 provenance/Task/dispatch receipts; #92 catalog context; #93 OpenCode paging; #94–#98 code-scope and participant context; #100 proposal revision validation; #101 watch deadline; #102 worktree policy; #103 role-specific watch indexes; #104 mailbox delivery identity and typed digest.
 
-**Canonical instructions:** [owner decisions](../../owner-decisions.md), [modularity](../../agent-operations/modularity.md), [old readiness index](../2026-10-07/README.md) (historical only), [donor registry](../../agent_swarm.donors-20260929.toml). A full unabridged audit v26 and updated v27 accompany this map outside the repository.
+**Canonical instructions:** [owner decisions](../../owner-decisions.md), [modularity](../../agent-operations/modularity.md), [older remediation evidence](../2026-10-07/) (historical only), [donor registry](../../agent_swarm.donors-20260929.toml). A full unabridged audit v26 and updated v27 accompany this map outside the repository.
 
 Work boundaries:
 

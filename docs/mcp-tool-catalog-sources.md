@@ -1,6 +1,11 @@
 # ELIOT MCP Catalog and Launcher — Source Map
 ## Official protocol guidance, donor source patterns and user-reported failures
 
+**Status: supporting-reference / audit evidence tied to its recorded revision.**
+Current authority is the [documentation map](agent-operations/documentation-map.md),
+[IPC/MCP contract](agent-operations/ipc-mcp.md) and an approved
+[task packet](agent-operations/task-packet-template.md). **Not worker instructions.**
+
 **Revision:** 1 — 2026-10-03  
 **Companions:** [MCP Tool Catalog and Deferred Loading](mcp-tool-catalog-and-loading.md), [Swarm Launcher and Assignment Context](swarm-launcher-assignment-context.md)  
 **Purpose:** preserve evidence behind the role surfaces, tool groups, deferred loading, launcher packet and capability checks. This file is evidence, not product authority.
@@ -29,10 +34,11 @@ Rules:
 
 ### Sources
 
-- SOURCE: [`src/mcp.rs`](../src/mcp.rs)
-- SOURCE: [`src/mcp/profiles.rs`](../src/mcp/profiles.rs)
-- SOURCE: [`src/mcp/profiles_tests.rs`](../src/mcp/profiles_tests.rs)
-- SOURCE: [`src/config.rs`](../src/config.rs)
+- SOURCE: [`crates/swarm-mcp/src/mcp/mod.rs`](../crates/swarm-mcp/src/mcp/mod.rs)
+- SOURCE: [`crates/swarm-mcp/src/mcp/profiles.rs`](../crates/swarm-mcp/src/mcp/profiles.rs)
+- SOURCE: [`crates/swarm-mcp/src/mcp/frontend_contract_tests.rs`](../crates/swarm-mcp/src/mcp/frontend_contract_tests.rs)
+- SOURCE: [`crates/swarm-mcp/src/config.rs`](../crates/swarm-mcp/src/config.rs)
+- SOURCE: [`crates/swarm-contracts/src/mcp_frontend.rs`](../crates/swarm-contracts/src/mcp_frontend.rs)
 - SOURCE/DOC: [`docs/mcp-profiles.md`](mcp-profiles.md)
 - SOURCE/DOC: [`docs/legacy-swarm-transition.md`](legacy-swarm-transition.md)
 

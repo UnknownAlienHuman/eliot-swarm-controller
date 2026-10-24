@@ -20,43 +20,43 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
 
 ## Resume here
 
-- Checkpoint: **2026-10-24 / Antigravity A1b runtime reduction**.
-- Runtime source changed from gateway-audit head
-  `0a228cd3a2fde9f38be136485b53b88c7e0e5c84` to
-  **`3c7a84ffc6d1e349fe989e4beaa62b03ed4e21bb`**.
-- Connected chain:
-  `launcher_dispatch::require_current_antigravity_scope` → retained descriptor and
-  current binding/Open validation → immutable launch-dispatch packet → adapter
-  `Controller::complete_open/read_command` → qualification readiness. The mandatory
-  `agent.refresh` Operation, `AntigravityDispatchSessionProof`, latest-refresh query,
-  snapshot validator and assignment/lease/session digest packet are removed.
-- Overall source audit remains **incomplete, 170 entries**. A1b is an implementation
-  checkpoint, not another finding range or a whole-project completion claim.
-- Preserved: exact Task/Attempt/current-revision and launch-parent checks; binding
-  generation and current route; current boot/root/connection/recovery fences;
-  explicit-model readback or honest native-default unknown; workspace authority;
-  adapter command-time binding/root checks; no replay after uncertain input.
-- `agent.refresh` remains a real optional current-process readback action. It no longer
-  authorizes Dispatch or emits a duplicate proof packet.
-- Verification: run
-  [40131522836](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/40131522836),
-  job `120984044559`, passed affected rustfmt and warnings-denied Clippy. No tests,
-  native/provider calls, installed harness, crash, restart or load qualification ran.
-- Recorded change: **−305 production Rust lines, −20 qualification-glue lines, +3 test
-  lines**.
-- **Next exact chain — implementation A2:** adapter
-  `Controller::{record_outcome,pending_receipts,completed_turns}` and normalized result
-  pages → `HostSession::request_saved/flush_reports` → exact `module.outcome` /
-  `module.result` ACK and replay → private atomic retained outcome/body/page files →
-  verified prior-owner departure and successor delivery for the original Operation.
-  Preserve origin boot and source identity; never put native prompt intent in the
-  delivery spool or replay input.
-- Runtime implementation order is now **A2–A3, then B–V**.
-- Still unqualified: crash before/after durable capture, power loss, old-boot delivery,
-  source-pressure behavior, installed Antigravity, live restart and scale.
+- **Live merged source basis:** `main` at
+  `797ea93f1cfcaad8c8dde2629d666e64efb131c2` (PR #194, Antigravity A1b).
+- **Last completed source-audit range:** AR-160–170, frozen at
+  `0a228cd3a2fde9f38be136485b53b88c7e0e5c84`. A1b is a later implementation
+  checkpoint, not a new audit range and not evidence that unchanged packages were read.
+- **Whole-project source audit:** incomplete. The package inventory in
+  [source-audit coverage](source-audit-coverage.md) records broad partial coverage for
+  `swarm-kernel-host`, partial coverage for several adapters/effect owners, and
+  untraced package boundaries including `swarm-cli`, `swarm-kernel`, `swarm-bus` and
+  `swarm-telemetry`.
+- **Documentation readiness:** the 2026-10-24 structural audit found stale authority,
+  broken links and unclassified evidence. The current repair adds one
+  [authority map](documentation-map.md), one [task-packet format](task-packet-template.md)
+  and one [failure-prevention register](failure-prevention-register.md); this improves
+  assignment safety but does not complete source review.
+- **Preserve from A1b:** exact Task/Attempt/current-revision and launch-parent checks;
+  binding generation and current route; boot/root/connection/recovery fences; model
+  readback honesty; workspace authority; adapter command-time binding/root checks; no
+  replay after uncertain input. `agent.refresh` remains optional readback and is not a
+  dispatch permission.
+- **Unmerged implementation branch:** `impl/antigravity-a2-delivery-20261024` is an
+  experiment/PR candidate only. Do not describe A2a as landed on `main` or use its
+  documentation as the whole-project audit checkpoint.
+- **Next exact audit sequence:** (1) root entrypoints plus `swarm-cli`, `swarm-kernel`,
+  `swarm-bus`, `swarm-telemetry`; (2) shared contracts/client/process and every current
+  consumer; (3) file-level Store/migrations/read models; (4) one adapter at a time;
+  (5) effects/observation; (6) tooling, installers, descriptors, tests and evidence.
+  Update this register, the [audit index](audit-index.md),
+  [source-audit coverage](source-audit-coverage.md) and
+  [failure prevention](failure-prevention-register.md) after each cluster.
+- **Qualification remains separate:** source reading and compiler gates do not prove
+  provider, installed harness, crash/restart, migration, security, Windows/Linux,
+  concurrency or load behavior.
 
-On resume, compare live `main` with `3c7a84f`, reopen only changed A2 owners/consumers,
-and continue the named delivery chain. Do not recreate the deleted refresh/proof gate.
+Do not continue implementation A2 as an audit substitute. Compare each selected audit
+cluster with live `main`, trace caller → authority → state/effect → readback → consumer,
+and record every uninspected boundary rather than treating it as clean.
 
 <a id="findings-ar-160170"></a>
 ## Findings AR-160–170

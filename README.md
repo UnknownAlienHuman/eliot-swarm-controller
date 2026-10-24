@@ -32,11 +32,14 @@ owns source changes and deletion order. Historical evidence
 applies to its recorded revision; a fixture pass is not native qualification.
 V3 is the required refactoring target, not a description of a completed rewrite.
 
-Start documentation work at the [current document index](docs/agent-operations/README.md),
-resume the [source audit](docs/agent-operations/audit-register.md#resume-here), and use
-the [donor register](docs/agent-operations/donor-map.md) for upstream links and the
-mechanism to reuse. Old programs/specifications are dated evidence, not additional
-implementation queues.
+Start at the [documentation authority map](docs/agent-operations/documentation-map.md)
+and [current document index](docs/agent-operations/README.md). Resume source research
+at [current audit / Resume here](docs/agent-operations/audit-current.md#resume-here),
+not the frozen historical register. Coding agents receive one approved
+[task packet](docs/agent-operations/task-packet-template.md) constrained by the
+[failure-prevention register](docs/agent-operations/failure-prevention-register.md).
+Old programs/specifications are dated evidence, never additional implementation
+queues.
 
 ## Build and run
 
@@ -138,11 +141,13 @@ Original pages remain retained; provenance is paginated. Export streams over one
 ## Evidence and development
 
 Keep the short [architecture](docs/agent-operations/architecture.md) in the lead
-developer's context. Use [implementation](docs/agent-operations/implementation.md)
-for the single work order, source owners and donor choices, then read the assigned
-source and contract. [AGENTS.md](AGENTS.md) owns collaboration practice;
-[source findings](docs/agent-operations/refactoring.md) explain excess and
-[implementation status](docs/implementation-status.md) records evidence.
+developer's context. [Implementation](docs/agent-operations/implementation.md) is the
+strategic order/source map, not a worker prompt. Use one exact
+[task packet](docs/agent-operations/task-packet-template.md), then read only its named
+contract and current source. [AGENTS.md](AGENTS.md) owns collaboration practice;
+[source-audit coverage](docs/agent-operations/source-audit-coverage.md) records
+untraced packages, [source findings](docs/agent-operations/refactoring.md) explain
+excess and [implementation status](docs/implementation-status.md) records evidence.
 
 One manager integrates one worktree. Complete the connected source path, then run
 scoped formatting and minimal strict Clippy with actual reverse dependencies.

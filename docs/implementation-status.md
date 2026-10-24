@@ -5,6 +5,15 @@
 **SOURCE_AUDIT_INCOMPLETE / TARGET DOCUMENTS WORKING DRAFT /
 RUNTIME REFACTOR IN PROGRESS.**
 
+**Documentation readiness: NOT READY for whole-project autonomous implementation.**
+The current entry path, task-packet format and AR/PF prevention map are being repaired,
+but package-level [source-audit coverage](agent-operations/source-audit-coverage.md)
+still contains untraced surfaces. The generated
+[readiness report](agent-operations/documentation-readiness-report.md) checks
+classification and links; it does not prove source completeness. Agents may implement
+only an owner-approved narrow packet at an exact revision. A branch or PR is not
+landed behavior, and an implementation slice must not replace the outstanding audit.
+
 Runtime slice was inspected and reduced on **2026-10-24** at
 `3c7a84ffc6d1e349fe989e4beaa62b03ed4e21bb`. The active source audit remains
 **incomplete at 170 entries**; AR-160–170 are frozen at the preceding gateway
@@ -63,8 +72,11 @@ R0–R6 TARGET ONLY              source-owned joined Governor observation
 V0–V3 TARGET ONLY              secret/session/origin/standalone gateway cut
 ```
 
-The next exact implementation slice is **A2**. J0 is a bounded independent frontend
-fix; R0–R6 and V0–V3 remain later connected programs and do not reorder A.
+When the owner resumes implementation, the next selected runtime slice remains
+**A2**. It is not the next source-audit action and must not be used as a substitute for
+finishing the package/domain coverage recorded in
+[source-audit coverage](agent-operations/source-audit-coverage.md). J0 is a bounded
+independent frontend fix; R0–R6 and V0–V3 remain later connected programs.
 
 ## Source-inspection result
 
