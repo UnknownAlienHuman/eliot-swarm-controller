@@ -36,6 +36,7 @@ a search hit or a test that was only read.
 | [Module API](module-api.md) | Semantic harness actions, result delivery and recovery. |
 | [Launcher/Queue](../swarm-launcher-assignment-context.md) | Selection, admission and resource lifetime. |
 | [Store evolution](store-evolution.md) | Numeric schema identity, finite v1 bridge, bounded postconditions and product-storage retirement. |
+| [IPC/MCP](ipc-mcp.md) | Multiplexed transport, connection slots, exact Tasks reads, one wake pump and WAL read routing. |
 | [GitHub sources](github-sources.md) | Read-only collection, explicit Task import and independent remote observation. |
 | [External effects](external-effects.md) | One owner per remote Git/GitHub mutation and exact readback. |
 | [CheckRunner](../check-runner.md) | Immutable source, process evidence, cache and acceptance handoff. |
@@ -54,11 +55,13 @@ a search hit or a test that was only read.
 | What must the product do? | [Architecture](architecture.md), [delivery](delivery.md) |
 | What should be implemented next? | [Implementation runtime order](implementation.md#5-runtime-order) |
 | How does Store schema compatibility work? | [Store evolution](store-evolution.md) |
+| How do frontend concurrency and subscriptions work? | [IPC/MCP](ipc-mcp.md) |
 | Where did source research stop? | [Current audit](audit-current.md#resume-here) |
 | What evidence supports a finding? | [Audit index](audit-index.md#evidence-checkpoints) |
 | What can be reused or must be requalified? | [Donor map](donor-map.md) and [donor inventory](../agent_swarm.donors-20260929.toml) |
 | Why did an old design exist? | Historical program/specification files; never resume them as current work orders. |
 
 Update the owning contract and current register in the same change. Supporting documents
-cannot reintroduce a duplicate workflow engine, compatibility facade, separate execution
-authority or routine human handoff in place of connected automation.
+cannot reintroduce a duplicate workflow engine, compatibility facade, frontend state
+store, separate execution authority or routine human handoff in place of connected
+automation.
