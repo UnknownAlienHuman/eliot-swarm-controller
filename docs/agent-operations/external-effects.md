@@ -2,7 +2,8 @@
 
 This is the implementation contract for remote Git and GitHub API mutations.
 [Implementation K/U](implementation.md#k--selected-effect-owners) owns code order;
-[current audit](audit-current.md#findings-ar-079088) records source evidence;
+[audit index](audit-index.md#evidence-checkpoints) links source evidence;
+[GitHub sources](github-sources.md) owns collection/import; and
 [status](../implementation-status.md) records landed behavior.
 
 ## Product law
@@ -149,9 +150,11 @@ policy import -> explicit Task create/revise
 accepted candidate -> explicit external-effect Operation
 ```
 
-Collection must not mutate Tasks in the same transaction. Import must not write GitHub.
-Effect recovery must not require the source row to remain selected in a work pool.
-Remote-ref observation runs independently of publication and records source time/error.
+[GitHub sources](github-sources.md) defines collector cuts, coverage, explicit import
+and independent remote observation. Collection must not mutate Tasks in the same
+transaction. Import must not write GitHub. Effect recovery must not require a source
+row or work-pool selection to survive. Remote-ref observation runs independently of
+publication and records source time/error.
 
 ## Automation
 
