@@ -481,9 +481,9 @@
     },
     {
       "path": "docs/agent-operations/audit-current.md",
-      "bytes": 15584,
-      "lines": 180,
-      "headings": 11,
+      "bytes": 14380,
+      "lines": 162,
+      "headings": 10,
       "classification": "audit-evidence",
       "status_markers": {
         "source_audit_incomplete": false,

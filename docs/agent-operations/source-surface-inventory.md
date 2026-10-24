@@ -1,6 +1,6 @@
 # Entrypoint and public-surface source inventory
 
-Inventory branch head: `be1129d23905c40e0e8822b8ca20a1ccf4f6c530`.
+Inventory branch head: `3eb20d09b1446a44539d142c0980ffe2777e6568`.
 Live `origin/main` basis: `797ea93f1cfcaad8c8dde2629d666e64efb131c2`.
 Combined inspected-cluster source SHA-256: `c55118a3580219f5fd1f4a90082eb51da3bc718e9d8516fac648007859d3d9f7`.
 
