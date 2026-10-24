@@ -19,10 +19,10 @@ Start at [current audit / Resume here](audit-current.md#resume-here). It names t
 inspected head, latest connected trace and next chain. Compare live `main` first; reopen
 only changed owners and consumers.
 
-The original [AR-001–078 register](audit-register.md) is retained as historical evidence.
-[Audit index](audit-index.md) maps every range to immutable snapshots and current target
-owners. Do not infer a runtime repair from documentation, a search hit or a test that
-was only read.
+The original [AR-001–078 register](audit-register.md) and later immutable checkpoints
+are retained as historical evidence. [Audit index](audit-index.md) maps every range to
+its snapshot and current target owner. Do not infer a runtime repair from documentation,
+a search hit or a test that was only read.
 
 ## Current contracts
 
@@ -35,6 +35,7 @@ was only read.
 | [Configuration](configuration.md) | Manager policy and the target current-state loop. |
 | [Module API](module-api.md) | Semantic harness actions, result delivery and recovery. |
 | [Launcher/Queue](../swarm-launcher-assignment-context.md) | Selection, admission and resource lifetime. |
+| [GitHub sources](github-sources.md) | Read-only collection, explicit Task import and independent remote observation. |
 | [External effects](external-effects.md) | One owner per remote Git/GitHub mutation and exact readback. |
 | [CheckRunner](../check-runner.md) | Immutable source, process evidence, cache and acceptance handoff. |
 | [ScriptRunner](../script-runner.md) | One script execution, indexed typed actions and child Operations. |

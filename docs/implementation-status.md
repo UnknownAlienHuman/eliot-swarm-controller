@@ -6,18 +6,20 @@
 RUNTIME REFACTOR IN PROGRESS.**
 
 Source was inspected on **2026-10-24** at
-`38db378c559dd0d95cd60db26702ffa73a954258`. The latest runtime change remains
-`c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **22 intervening
+`b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b`. The latest runtime change remains
+`c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **23 intervening
 commits are documentation-only**; documentation progress is not runtime progress.
 
-The active audit contains **88 entries**. AR-079–088 trace Forge publication, expected-ref
-lease/readback, worker custody, managed labels, PR metadata and their automation paths.
-No runtime defect is marked repaired and no installed Git/GitHub behavior is qualified.
+The active audit contains **99 entries**. AR-089–099 trace GitHub source setup/poll,
+mutable pagination, coverage, poll-time Task creation/revision, work-pool selection,
+Issue semantics, disconnected PR/projection helpers and remote-ref observation.
+No runtime defect is marked repaired and no installed GitHub behavior is qualified.
 
 - [Current resume point and findings](agent-operations/audit-current.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
 - [Architecture](agent-operations/architecture.md)
 - [Single implementation program](agent-operations/implementation.md)
+- [GitHub-source contract](agent-operations/github-sources.md)
 - [External-effects contract](agent-operations/external-effects.md)
 - [Donor register](agent-operations/donor-map.md)
 
@@ -53,7 +55,45 @@ implementation order.
 | CheckRun, AR-065–070 | Immutable source, Store-Go, process custody, parser coverage, cache lineage and acceptance revalidation exist. | Automatic interrupted source capture and standalone-only executor cut. |
 | ScriptRun, AR-071–078 | One-shot interpreter, same-family restart and atomic parent/child admission exist. | Per-action identity/readback/retry, action vocabulary, executor precheck and mid-run cancellation. |
 | External effects, AR-079–088 | Forge freezes exact candidate/ref intent, uses ancestry plus expected-ref lease, records `sending` before one write and settles by readback; label/PR slots and readbacks are strict. | Sticky manual process hold, duplicate PR PATCH owner, mutable-source recovery dependency, manual unknown reconciliation and duplicate automation engines. |
-| Other areas | Structural and selected source reviews remain indexed. | Store migration, IPC/MCP, observation, mailbox/deletion, GitHub collection/import and gateway completion. |
+| GitHub sources/import, AR-089–099 | Repository ID, exact request identity, safe GET retry, explicit partial coverage and local-divergence conflict are useful. | Poll-time Task authority, unstable pagination, non-convergent coverage, ineffective work-pool selection, incomplete Issue semantics, dead PR/projection paths and missing remote view. |
+| Other areas | Structural and selected source reviews remain indexed. | Store migration, IPC/MCP, observation, mailbox/deletion and gateway completion. |
+
+## GitHub source/import status
+
+### Preserve
+
+- Source setup and every poll verify the immutable repository ID.
+- A poll request/lease is exact; restarting an uncertain GET does not repeat a mutation.
+- Failed reads remain explicit failures/partial coverage and are never treated as an
+  empty source.
+- A changed duplicate Issue inside one bounded page window rejects the unstable
+  snapshot instead of silently choosing one version.
+- Task origin uses immutable repository and Issue IDs rather than mutable names/numbers.
+- If the local Task diverged from the last imported source spec, refresh reports a
+  conflict instead of overwriting local intent.
+
+### Repair
+
+1. Decouple source setup/collection from Forge publication configuration and local
+   Operator-only calls.
+2. Replace persisted numeric pages over `updated desc` with a stable cursor/high-water
+   or overlapping refresh plus periodic complete reconciliation.
+3. Make coverage aggregate across bounded passes; a source with more than 400 rows or
+   any comments must be able to converge after required data is captured.
+4. Stop creating/revising Tasks inside the collector transaction. Add explicit direct/
+   policy `source_import` against exact source revisions.
+5. Never revise a Task beneath an unreleased Attempt. Surface one bounded import
+   conflict/decision while preserving the frozen old Attempt.
+6. Remove `github_work_pool_members` and `github.work_pool.*`: selection is currently
+   not consulted by WorkDispatch, so unselected open Tasks can launch.
+7. Define explicit close/reopen/comment/PR import policy. A closed Issue must not leave
+   an unintended open dispatchable Task.
+8. Retain only current facts and source revisions referenced by imports/effects; remove
+   unused append-only fact chains.
+9. Connect or delete the currently unconsumed PR/projection helpers.
+10. Add independent remote repository/ref/head freshness/error observation.
+
+See [GitHub sources](agent-operations/github-sources.md) for the connected target.
 
 ## External-effects status
 
@@ -66,27 +106,19 @@ implementation order.
 - Store commits `sending` before worker authorization or GitHub mutation.
 - Restart and ambiguous outcomes are readback-only; no fresh request ID authorizes a
   second write.
-- Managed-label readback validates immutable repository and Issue IDs.
-- PR readback validates immutable repository/PR IDs, open state, same-repository
-  head/base, exact branches and published head SHA.
+- Managed-label and PR readback validate immutable repository/resource identity.
 - Exact resource slots prevent overlapping unknown effects.
 
 ### Repair
 
-1. Replace Forge's permanent manual process-tree hold with a narrow exact-evidence
-   administrative disposition. Ref state or time alone must never clear it.
-2. Move PR description PATCH out of `swarm-forge-worker`; Forge owns remote Git only,
-   one GitHub API owner owns labels and PR metadata.
-3. Let the host current-state loop admit ordinary readback Operations for unknown label
-   and PR effects. Current automatic projection handles queued work only.
-4. Retain immutable external targets independently of `github_sources`, Issue/Task
-   mappings and work-pool selection so collector/import cleanup cannot erase recovery.
-5. Remove publication/projection activation cursors, copied pending/quarantine state and
-   effect-drain cursor after direct and automatic calls converge on ordinary owners.
-6. Separate GitHub collection, Task import and writes; add independent remote-ref
-   observation.
+- Add an exact-evidence disposition for Forge's sticky process-tree hold.
+- Move PR description PATCH out of `swarm-forge-worker` into the GitHub API owner.
+- Automate bounded readback of unknown label/PR effects through ordinary Operations.
+- Retain immutable effect targets independently of source/work-pool rows.
+- Delete publication/projection cursor/pending/quarantine engines after ordinary owners
+  and the host current-state loop are connected.
 
-See [External effects](agent-operations/external-effects.md) for the connected target.
+See [External effects](agent-operations/external-effects.md).
 
 <a id="required-behavior-to-preserve"></a>
 ## Required behavior to preserve
@@ -102,9 +134,11 @@ See [External effects](agent-operations/external-effects.md) for the connected t
 | Acceptance proves frozen requirements for exact candidate | Common evidence gate | Assigned-review/finding provenance remains open. |
 | Machine evidence is process/coverage/byte-backed | CheckRunner + acceptance | Standalone-only cut and live qualification. |
 | Script and admitted children never replay together | ScriptRunner + indexed child Operations | Action index/readback/retry and cancellation. |
+| Source collection cannot silently change product intent | Source records + explicit import | Current poll creates/revises Tasks and can revise beneath live work. |
+| Unimported external facts cannot launch | Explicit import + ordinary queue | Work-pool selection is not a WorkDispatch gate. |
 | Remote mutation has one owner and one write | Forge or GitHub API effect owner | PR PATCH split and automation/readback duplication. |
 | Harness Goal and Eliot messages are independent | Native Goal + ordinary Send | Progression machinery and route gaps. |
-| Governor sees unmatched native/process/worktree facts | Independent collectors + joined view | Binding-rooted partial views. |
+| Governor sees unmatched native/process/worktree/remote facts | Independent collectors + joined view | Binding-rooted partial views and no independent remote ref. |
 | Direct peer collaboration survives council deletion | Recipient-indexed mailbox | Coordination platform still exists. |
 | Handover preserves authors/owners/recipients/history | Stable identities + designation epoch | Mailbox and effect-successor gaps. |
 | Restart never kills an unrelated PID | PID + birth/image/group/Job custody | Full platform race matrix unqualified. |
@@ -131,11 +165,11 @@ end-to-end cycle. Most remains unexecuted.
 
 ## Next work
 
-**Audit:** follow the GitHub collection/import chain in
-[current audit](agent-operations/audit-current.md#resume-here): source paging/facts,
-Task mutation/work-pool selection, import consumers and independent remote observation.
-Prove collection, import and writes have different owners and that source changes do
-not erase effect recovery identity.
+**Audit:** follow the mailbox/coordination chain in
+[current audit](agent-operations/audit-current.md#resume-here): durable send/read/reply/
+cancel, global timeline scans, GM handover/resync and every coordination product/MCP
+consumer. Preserve direct collaboration and historical recipients while proving the
+finite deletion boundary.
 
 **Runtime:** implement Antigravity A1b–A3 first. Use existing owners, remove replaced
 paths in the same slice, and run format plus minimal affected warnings-denied Clippy/

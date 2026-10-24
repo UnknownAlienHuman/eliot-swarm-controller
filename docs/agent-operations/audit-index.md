@@ -13,8 +13,8 @@ owns source changes; [status](../implementation-status.md) owns landed behavior.
 4. Continue the named exact chain and update the current register plus owning contract.
 
 Current checkpoint: source inspected at
-`38db378c559dd0d95cd60db26702ffa73a954258` on 2026-10-24. Runtime source remains
-`c92120ed70ca7e625440a8a19517c481e73b13c9`; the 22 intervening commits are
+`b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b` on 2026-10-24. Runtime source remains
+`c92120ed70ca7e625440a8a19517c481e73b13c9`; the 23 intervening commits are
 documentation-only. No runtime repair or executed qualification is implied.
 
 <a id="evidence-checkpoints"></a>
@@ -38,10 +38,11 @@ documentation-only. No runtime repair or executed qualification is implied.
 | AR-059–064 | [`5b6b5be`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/5b6b5bee92123ce7d3252054c939fb18619b790f/docs/agent-operations/audit-register.md#trace-2026-10-23-review-acceptance) | Review replacement, correction, fairness and acceptance provenance. |
 | AR-065–070 | [`8d8a446`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/8d8a44652d110f29031b2ddfdf6db98a5fc7001f/docs/agent-operations/audit-register.md#trace-2026-10-23-checkrun) | Fixed source, CheckRun custody, parser evidence, cache and executor cut. |
 | AR-071–078 | [`38db378`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/38db378c559dd0d95cd60db26702ffa73a954258/docs/agent-operations/audit-register.md#trace-2026-10-23-scriptrun) | ScriptRun custody/recovery, actions, readback, cancellation and transfer. |
-| [AR-079–088](audit-current.md#findings-ar-079088) | [Current trace](audit-current.md#trace-2026-10-24-forge-github-effects) | Forge lease/readback, GitHub label/PR ownership and automation recovery. |
+| AR-079–088 | [`b7a5fe1`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b/docs/agent-operations/audit-current.md#trace-2026-10-24-forge-github-effects) | Forge lease/readback, GitHub label/PR ownership and automation recovery. |
+| [AR-089–099](audit-current.md#findings-ar-089099) | [Current trace](audit-current.md#trace-2026-10-24-github-sources) | GitHub collection, mutable pagination, Task import/work pool and remote observation. |
 
-There are 88 entries. Some preserve correct behavior or narrow an earlier claim; they
-are not 88 defects or a completion percentage.
+There are 99 entries. Some preserve correct behavior or narrow an earlier claim; they
+are not 99 defects or a completion percentage.
 
 ## Source and target map
 
@@ -54,9 +55,9 @@ are not 88 defects or a completion percentage.
 | Fixed source/CheckRun, 065–070 | `store/checks`, `checks/{source,worker,standalone_host}`, `swarm-checks` | [CheckRunner](../check-runner.md), implementation K |
 | ScriptRun/actions, 071–078 | `store/scripts`, `scripts/runner`, `swarm-script-worker`, `swarm-scripts`, automation intake/dispatch | [ScriptRunner](../script-runner.md), implementation K |
 | Forge/GitHub effects, 079–088 | `store/forge`, `swarm-forge-worker`, `store/{github_effects,github_pr_effects,automation_publication,automation_github_projection}` | [External effects](external-effects.md), implementation K/U |
-| GitHub collection/import next chain | `github/{client,observer,pulls}`, `store/github` and work-pool/import consumers | implementation U0–U2/U5 |
+| GitHub collection/import, 089–099 | `github/{client,observer,work_pool,pulls,projection}`, `store/github`, `automation_work_dispatch`, `tasks`, migration 006 | [GitHub sources](github-sources.md), implementation U0–U2/U5 |
 | Observation | module observations, process metrics, workspace/Git and remote collectors | [Observability](observability.md), implementation R |
-| Mailbox/deletion | mailbox and coordination products | [Communication](../agent-communication-program.md), implementation S/T |
+| Mailbox/deletion next chain | `store/mailbox`, object timeline/reads, GM handover and coordination products | [Communication](../agent-communication-program.md), implementation S/T |
 | Gateway | `swarm-gateway` and compatibility launcher | [Gateway](../gateway.md), implementation V |
 
 ## Coverage still open
@@ -70,7 +71,8 @@ are not 88 defects or a completion percentage.
 | H permissions/API | Complete method/role/object/revision matrix and deletion of internal/vendor public surfaces. |
 | I Store | Reader/writer pairs, numeric migrations, partial migration and corruption behavior. |
 | J IPC/MCP | Disconnect/readback, slow consumers, fairness and writer occupancy. |
-| K/U effects | Script action lifecycle/cancel; Check executor cut; Forge process-hold disposition; one GitHub API owner; automatic unknown readback; collector/import separation. |
+| K effects | Script action lifecycle/cancel; Check executor cut; Forge process-hold disposition; one GitHub API owner and automatic unknown readback. |
+| U GitHub | Stable collector cut, aggregate coverage, explicit import, live-work conflict, work-pool deletion, connected PR source and independent remote-ref view. |
 | R observation | Independent provider/process/Git/remote collectors, unmatched subjects, source gaps and one joined view. |
 | S/T mailbox/deletion | Recipient-indexed mailbox and concrete transition before coordination deletion. |
 | V gateway | Private secret loading, session limits, disconnect and launcher deletion. |

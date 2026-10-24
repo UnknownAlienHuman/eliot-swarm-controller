@@ -1,43 +1,46 @@
 # Current audit register
 
-This is the active continuation register. The full AR-001–078 evidence remains frozen
-in the [2026-10-23 register snapshot](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/38db378c559dd0d95cd60db26702ffa73a954258/docs/agent-operations/audit-register.md).
+This is the active continuation register. AR-001–078 remain in the
+[historical register](audit-register.md). AR-079–088 and their full Forge/GitHub-effects
+trace are frozen at
+[`b7a5fe1`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b/docs/agent-operations/audit-current.md).
 [Audit index](audit-index.md) maps every range to immutable evidence;
 [implementation](implementation.md) owns source changes; and
 [status](../implementation-status.md) owns landed behavior.
 
 ## Resume here
 
-- Checkpoint: **2026-10-24 / Forge and GitHub external-effect ownership**.
-- Source inspected at **`38db378c559dd0d95cd60db26702ffa73a954258`**.
+- Checkpoint: **2026-10-24 / GitHub collection, Task import and remote observation**.
+- Source inspected at **`b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b`**.
   Runtime source is still **`c92120ed70ca7e625440a8a19517c481e73b13c9`**
-  from 2026-10-21; the **22 intervening commits are documentation-only**.
+  from 2026-10-21; the **23 intervening commits are documentation-only**.
 - Connected chain:
-  `store/forge::{reserve,begin,dispatch_authorized,reconcile}` →
-  `swarm-forge-worker` remote validation, ancestry, push and readback →
-  `store/github_effects` managed labels →
-  `store/github_pr_effects` PR description →
-  publication/GitHub-projection automation → restart, transfer and unknown effect.
-- Overall audit: **incomplete, 88 entries**. AR-001–078 retain their dispositions in
-  the frozen register; AR-079–088 are recorded below.
-- Preserved in this pass: exact accepted-candidate publication intent; durable
-  `sending` before remote mutation; expected-ref lease plus fast-forward guard; one
-  write attempt; exact remote identity/readback; worker process custody; label and PR
-  resource slots; no write replay after uncertainty.
-- Open in this pass: Forge's sticky process-tree hold has no ordinary evidence-driven
-  release; PR PATCH is still executed by the Forge worker; managed-label and PR unknown
-  effects require explicit Manager/Operator reconciliation; recovery still depends on
-  mutable GitHub source/work-pool rows; publication and projection retain duplicate
-  cursor/pending/quarantine engines.
-- **Next exact chain:** `github::{client,observer,pulls}` →
-  `store/github` poll/lease/page/fact commit → Task mutation and
-  `github_work_pool_members` selection → automation import/projection consumers →
-  independent remote observation. Separate collection, Task import and writes; prove
-  that source refresh/remap cannot erase recovery authority for an admitted effect.
+  `github::{client,observer,work_pool,pulls,projection}` →
+  `store/github` setup/poll/lease/page/fact commit →
+  poll-time `task.create/task.revise` and `github_work_pool_members` →
+  WorkDispatch source consumption and GitHub effect authorization →
+  remote-ref observation boundary.
+- Overall audit: **incomplete, 99 entries**. AR-089–099 are recorded below; prior
+  dispositions remain in immutable checkpoints.
+- Preserved in this pass: immutable repository-ID checks; exact request identity; safe
+  GET retry; explicit partial/failure coverage; one-window duplicate instability
+  rejection; immutable Issue origin keys; local Task divergence conflict instead of
+  overwrite.
+- Open in this pass: source setup/poll is Operator-only and coupled to Forge config;
+  mutable numeric pagination is not a stable cut; common sources cannot reach complete;
+  collection creates/revises Tasks in the same transaction; work-pool selection is not
+  an admission gate; Issue state/comments are not imported correctly; unused fact/PR/
+  projection paths remain; independent remote-ref collection is absent.
+- **Next exact chain:** `store/mailbox.rs` →
+  `store/object_reads.rs::{timeline,message.read}` → `store/gm.rs` handover/resync →
+  `coordination/{thread,watch,contract,integration,concilium,code_scope}` callers →
+  MCP catalog/profile/subscription entries. Preserve direct addressed collaboration and
+  historical recipients while proving which coordination products can be deleted.
 - Runtime implementation order remains **A1b–A3, then B–V**. Source-audit order does
   not reorder implementation.
-- Still unqualified: live Git server behavior, GitHub CLI/API behavior, Windows/Linux
-  process custody, power loss, load/fairness and the autonomous end-to-end work cycle.
+- Still unqualified: live GitHub pagination under concurrent updates, API rate limits,
+  account behavior, source scale, remote-ref collection, migrations and autonomous
+  end-to-end import/dispatch.
 - Documentation only. No runtime code, Clippy, test, benchmark or installed-system
   qualification changed in this checkpoint.
 
@@ -45,147 +48,153 @@ On resume, compare live `main` with the inspected head, reopen only changed owne
 consumers, then continue the named chain. A documentation commit never closes a runtime
 finding.
 
-<a id="findings-ar-079088"></a>
-## Findings AR-079–088
+<a id="findings-ar-089099"></a>
+## Findings AR-089–099
 
 | ID | Requirement / path | Disposition | Remaining boundary |
 | --- | --- | --- | --- |
-| <a id="ar-079"></a>AR-079 | Forge intent, slot and write boundary | **Preserve.** Admission freezes accepted candidate, commit/tree, target ref, expected old ref/create intent, project policy and actor. The exact slot is rechecked and the Operation becomes `sending` before authorization reaches the worker. | Keep one Operation and one remote-Git owner while deleting manifests and automation copies. |
-| <a id="ar-080"></a>AR-080 | Ref update concurrency | **Scope correction / preserve.** The worker verifies predecessor ancestry and pushes with `--force-with-lease=<target>:<expected>`; create uses an empty expected value. Older documentation describing an ordinary non-force push with no compare-and-swap guard is false. | Live server qualification, protected-branch behavior and exact error/readback classification. |
-| <a id="ar-081"></a>AR-081 | Forge restart and process-tree hold | **Preserve plus open.** `sending`/unknown work becomes readback-only and requires original worker-family departure. An unconfirmed process tree creates a sticky repository-wide manual hold that later matching ref readback cannot clear. | Add an exact evidence-driven administrative disposition; never clear by time, PID guess or successful ref readback alone. |
-| <a id="ar-082"></a>AR-082 | Publication automation ownership | **Open duplication.** Publication owns global/per-entry cursors, activation/catch-up, pending retries, quarantine and recent state around the already durable Forge Operation. | One current-state loop admits the ordinary publication Operation; preserve occurrence/cause identity and fair bounded scanning. |
-| <a id="ar-083"></a>AR-083 | Managed-label effect | **Preserve.** Store marks `sending`, performs at most one label mutation, then validates immutable repository/Issue IDs and exact desired state. Unknown recovery is readback-only. | Move execution under the selected GitHub API owner without weakening desired-state convergence. |
-| <a id="ar-084"></a>AR-084 | Automatic label recovery | **Open.** The automatic effect drain selects only `queued`; `outcome_unknown` returns `GITHUB_EFFECT_READBACK_REQUIRED` and needs a separate current-GM/Operator reconcile Operation. | Bounded automatic `reconcile_once` using the same ordinary readback command; unchanged uncertainty must coalesce, not require routine human work. |
-| <a id="ar-085"></a>AR-085 | Historical label target lifetime | **Open coupling.** Reconciliation re-resolves the admitted repository/Issue through current `github_sources`, `github_issue_items`, Task/work-pool mapping and the effect slot. Source remap/deletion can block readback of an otherwise fully retained effect. | Retain immutable effect target independent of collector/import lifecycle; current source facts may detect conflict but must not erase recovery identity. |
-| <a id="ar-086"></a>AR-086 | PR metadata effect owner | **Open duplication.** `github_pr_effects` owns admission and GitHub readback, but `swarm-forge-worker` also executes the `gh api ... PATCH` mutation. One binary therefore owns remote Git and a GitHub REST write. | Move PR PATCH to the single GitHub API effect owner; Forge remains remote Git only. |
-| <a id="ar-087"></a>AR-087 | PR recovery and historical target | **Preserve plus open.** Recovery requires exact worker-family departure, publication/Task/Attempt, repository/PR ID, open same-repository head/base, published head SHA, desired title/body and resource slot. It is still explicit-GM and requires a current `github_sources` repository mapping. | Automatic successor readback from retained immutable target, independent of source registry survival. |
-| <a id="ar-088"></a>AR-088 | GitHub projection lifecycle | **Open duplication.** GitHub projection owns activation watermarks, per-entry state, quarantine and a durable queued-effect drain cursor; unknown effects are intentionally excluded. | Delete the projection workflow after enabled policy queries current accepted/source facts and calls the same explicit effect owner as a direct agent. |
+| <a id="ar-089"></a>AR-089 | Source setup and authority | **Open coupling.** Setup and poll require local Operator; setup also requires an existing Forge project mapping. Read-only collection is therefore coupled to publication configuration and cannot be enabled by scoped Manager policy. | Separate source identity/policy from Forge and permit bounded configured collection without routine operator calls. |
+| <a id="ar-090"></a>AR-090 | Poll workflow and recovery | **Preserve plus open.** The exact GET request/lease moves `queued → sending`; `outcome_unknown` can safely repeat the read. No host collector resumes it, and queued cancellation is explicitly unsupported. | Replace per-pass Operation/lease workflow with collector epoch/cursor/current-state recovery while keeping exact safe-read semantics. |
+| <a id="ar-091"></a>AR-091 | Mutable pagination cut | **Open.** Issues are read by numeric page sorted `updated desc`; `next_page` persists across separate polls. Items can move into already-scanned pages, so one cycle can delay/miss them and cannot represent an atomic complete cut. | Stable server cursor/high-water or overlap plus periodic full reconciliation with documented ordering/deletion semantics. |
+| <a id="ar-092"></a>AR-092 | Coverage convergence | **Open.** One poll reads at most 8×50 raw rows. `complete_from_page_one` cannot become true for larger sources, and any stored Issue with comments keeps the source partial because comments are never selected. | Aggregate multi-pass cycle coverage and selected comment/PR coverage; explicit gaps must be resolvable, not permanent normal state. |
+| <a id="ar-093"></a>AR-093 | Collection versus Task authority | **Open ownership violation.** `persist_snapshot` commits source facts, creates/revises Tasks, adds work-pool rows and settles the poll in one writer transaction. | Collector commits source facts only; explicit direct/policy `source_import` performs ordinary Task mutations separately. |
+| <a id="ar-094"></a>AR-094 | Source change under live work | **Open.** When the local Task still equals the last imported spec, poll invokes ordinary `task.revise`, including beneath another Manager's unreleased Attempt. The frozen old Attempt remains and can block the new revision. | Hold/import conflict or attributable Governor decision; never revise beneath live work automatically. Preserve local-divergence conflict. |
+| <a id="ar-095"></a>AR-095 | Work-pool selection | **Open product mismatch.** Poll creates ordinary open Tasks before selection. WorkDispatch consumes general `task.create/revise/claim` facts and does not read `github_work_pool_members`; unselected GitHub work can launch. Apply cannot select zero tasks and preview ignores selection order. | Import is the selection boundary; imported Tasks use the ordinary queue. Delete duplicate work-pool selected/order state. |
+| <a id="ar-096"></a>AR-096 | Issue state and comments | **Open semantic gap.** Task projection uses title/body but not Issue state. Close/reopen can add a source fact without revising the Task, leaving a closed Issue's Task open. Comments remain only a count/gap and labels are absent. | Explicit import policy for close/reopen; required comments/fields are captured with revisions or block import. |
+| <a id="ar-097"></a>AR-097 | Source fact history | **Open excess.** `github_issue_facts` retains chained A→B→A transitions indefinitely; selected source search found no runtime reader besides writes/schema. | Keep current facts and only immutable revisions referenced by admitted imports/effects; remove unused universal event history. |
+| <a id="ar-098"></a>AR-098 | PR/projection source paths | **Open disconnected code.** Issues collection filters PRs, while `pulls::read_pull_request` and `projection::{Check,Summary,Label}Projection` have no current consumers outside their defining files. | Connect one exact current source/projection consumer or delete the paths during U/R migration. |
+| <a id="ar-099"></a>AR-099 | Independent remote-ref observation | **Open.** Remote-ref reads exist only inside Forge publication/reconciliation. There is no independent repository/ref/head/time/error source for Governor state. | Add a small remote-ref collector independent of publication; it grants no push authority. |
 
-<a id="trace-2026-10-24-forge-github-effects"></a>
-## Source trace at 38db378: Forge and GitHub effects
+<a id="trace-2026-10-24-github-sources"></a>
+## Source trace at b7a5fe1: GitHub sources and import
 
-Inspected 2026-10-24. This is source evidence, not a live push, GitHub mutation or
-process qualification.
+Inspected 2026-10-24. This is source evidence, not a live GitHub collection/import or
+scale qualification.
 
-### AR-079–080 — Forge already has the critical ref guard
+### AR-089–090 — a read-only source is implemented as an Operator workflow
 
-Forge admission resolves the exact accepted Task/Attempt/submission/candidate and
-acceptance Operation, freezes the commit/tree, repository, target ref, expected old ref
-or create intent, policy revision and GM epoch, and reserves one semantic slot. Before
-external I/O, the final transaction rechecks current authority or the explicit transfer
-continuation, exact slot, selected project policy and accepted candidate, then changes
-the Operation to `sending`.
+`github.source.setup` first verifies the repository through the installed `gh` account,
+then requires the local Operator and an existing Forge project whose canonical
+repository matches the source. `github.source.poll` also requires the exact Operator
+caller. Managers/current GM can inspect sources and select mapped work, but cannot run
+routine collection.
 
-The worker validates the configured push endpoint and remote safety settings, reads the
-remote ref, and rejects a changed predecessor before push. For an existing target it
-runs `merge-base --is-ancestor <expected> <candidate>`. The push uses a direct argv with
-`--force-with-lease=<target>:<expected>` and the exact candidate refspec. For creation,
-the expected value is empty, requiring the target not to exist. Exact post-push remote
-readback is still required for settlement.
+Each poll is an ordinary Operation plus one `github_poll_leases` row. Before GET it
+moves to `sending`; after restart `outcome_unknown` can move back to `sending` and issue
+the exact GET again. Preserve that read retry: it is not a mutation replay. However,
+there is no collector loop that resumes the source. A queued poll cannot be cancelled
+through the ordinary Operation path because cancellation is explicitly rejected while
+the source lease exists. A lost caller can therefore leave collection waiting for a
+manual exact resume/read.
 
-This corrects the old Forge document: the implementation is not an unguarded ordinary
-push. Preserve the expected-ref lease and ancestry check while simplifying proof
-packets. A readback showing the candidate proves final remote state, not which actor
-performed an identical concurrent update; that distinction does not authorize another
-write.
+Target collection uses a configured source owner with collector epoch/cursor/freshness,
+not a user Operation per page window. Setup must not require publication configuration.
 
-### AR-081 — uncertainty is safe but can become permanently manual
+### AR-091–092 — page numbers do not define a stable or completable snapshot
 
-The worker starts only after private plan, process-group owner and matching authorization
-are retained. A timeout, transport/process ambiguity or unreadable result never causes
-a second push. Restart converts admitted work to exact readback-only execution and
-requires the original worker family to be gone.
+The client calls `/issues?state=all&sort=updated&direction=desc&per_page=50&page=N`.
+The source persists `next_page`; one poll reads at most eight pages. Duplicate IDs that
+change inside one bounded window correctly reject the snapshot, but there is no
+protection against an Issue moving from an unscanned later page to an already-scanned
+earlier page between polls. It can be absent from the rest of that cycle and appear only
+when a later cycle restarts at page one. Reaching the end therefore does not establish
+one atomic repository cut.
 
-If family emptiness cannot be proved, the result records
-`process_tree_unconfirmed=true`. `require_no_process_tree_hold` then blocks every later
-Forge push for the repository. The hold is deliberately sticky even when later remote
-readback shows the candidate, because ref state does not prove process departure. This
-is safe, but the only documented resolution is manual operator intervention. Add a
-narrow administrative disposition backed by exact process-custody evidence; do not
-weaken the hold or clear it from elapsed time.
+Coverage is `complete` only when a single pass starts at page one, reaches the end, has
+no mapping conflicts and no stored Issue with comments. A source with more than 400 raw
+Issues can never meet `complete_from_page_one`; every pass that reaches the end began on
+a later page. Any Issue with `comments > 0` also keeps the source partial indefinitely,
+because comments are represented as an unresolved gap and never fetched.
 
-### AR-082 — publication reserves an Operation through another workflow engine
+Keep explicit gaps, but make coverage aggregate over a stable/reconciled cycle and give
+required comments a real capture policy.
 
-`automation_publication` consumes acceptance observations, maintains a global cursor,
-per-entry activation/catch-up state, pending retries, quarantine and recent summaries,
-then reserves the ordinary Forge Operation. Those copies do not execute Git and are not
-its recovery authority.
+### AR-093–094 — collection currently owns Task revision
 
-The target host loop should query current accepted candidates and publication policy,
-atomically admit the same Forge Operation and let Forge own effect/readback state. Keep
-the acceptance occurrence and exact effect slot as domain identity; delete copied
-pending/cursor lifecycle only after the positive automatic path is connected.
+`persist_snapshot` validates source identity, inserts immutable fact rows, projects a
+TaskSpec, calls ordinary `task.create` or `task.revise`, writes current Issue mapping and
+work-pool rows, updates source coverage and settles the poll in one immediate writer
+transaction. One read can therefore hold the writer while creating/revising hundreds of
+Task Operations.
 
-### AR-083–085 — label writes are disciplined but recovery is not autonomous
+The mapping has one useful fence: if the local Task spec differs from the last imported
+spec digest, source refresh reports `local_task_spec_changed` instead of overwriting it.
+Preserve that conflict.
 
-The managed-label owner retains the exact source/Task/Issue/label desired state. A fresh
-call first performs an exact repository/Issue read. If mutation is needed, `begin_write`
-commits `sending`; the API is called once; a second exact read settles or leaves the
-Operation unknown. An unknown call performs no write.
+When the Task still equals the last imported spec, changed title/body invokes
+`task.revise`. The Operator is allowed to revise beneath another Manager's live Attempt.
+`tasks::revise` advances the Task revision and resets acceptance while explicitly
+preserving the existing Attempt and its frozen snapshot. New work for the updated
+revision can then be blocked by the unreleased old Attempt; late old output remains
+historical. A background GET must not make that product/work disposition implicitly.
 
-Direct and automated queued paths use the same resource slot and desired-state
-semantics. However, the automated drain pages only queued Operations. Its unknown branch
-returns `GITHUB_EFFECT_READBACK_REQUIRED`; a current GM or Operator must admit
-`github.effect.reconcile_managed_label`. That readback can settle the original without
-rewriting it, but routine correctness is no longer automatic.
+Split collection from import. A source change under live work becomes one bounded
+conflict/decision with exact old/new revisions, not an automatic revision.
 
-The retained result and receipt contain repository/Issue numbers and IDs, source
-revision and desired label. Nevertheless recovery reconstructs the target through
-current source, Issue mapping, Task/work-pool rows and slot. Collector/import cleanup or
-remap can therefore remove the ability to read an admitted external effect. Recovery
-must use the immutable admitted target; current source rows are additional conflict
-facts, not the owner of historical identity.
+### AR-095 — selected work is not what WorkDispatch selects
 
-### AR-086–087 — PR PATCH is in the wrong worker
+Every mapped Issue creates an ordinary open Task and a `task.create` observation before
+`github.work_pool.apply`. WorkDispatch accepts all committed `task.create`,
+`task.revise` and `task.claim` facts and has no dependency on the GitHub work-pool table.
+Repository-wide source search found work-pool selection consumers in preview/apply,
+GitHub effect targeting and automation authorization, not queue/launch admission.
+Therefore an unselected GitHub Task can be admitted by ordinary WorkDispatch.
 
-`github_pr_effects` correctly binds an update to one applied Forge publication and the
-exact Task/Attempt, repository/PR ID, target/base branch, published head SHA and desired
-title/body. It reserves a repository/PR slot, commits `sending`, and requires exact PR
-readback. Unknown reconciliation verifies worker-family departure and never repeats the
-PATCH.
+`github.work_pool.apply` also requires 1..200 Task IDs, so it cannot express an empty
+selection, and preview orders by Task ID rather than retained selection order. The work
+pool is neither a reliable queue nor a clean import boundary. Select source facts by
+admitting `source_import`; once a Task exists, use the ordinary queue.
 
-The mutation itself is still delegated to `swarm-forge-worker` as a
-`github_pr_description` / `PatchOnce` plan. That worker hashes and launches `gh`, writes
-the JSON body once and reports only an unknown write outcome; Store then uses the
-GitHub API owner for readback. This splits one GitHub API domain across Forge and
-GitHub owners. Move the PATCH into the GitHub API effect worker and leave Forge with
-remote Git push/readback only.
+### AR-096–098 — source semantics and retained code are incomplete
 
-PR recovery retains more immutable publication context than the label path, but still
-requires a current `github_sources` row for the repository and a current GM/Operator
-reconcile call. Preserve all exact PR identity fences while making successor readback a
-bounded host correctness duty.
+`fact_digest` includes Issue state, comment count and URL, but `task_spec` includes only
+its title and body. A close/reopen transition can create a new source fact while the
+projected Task spec remains identical, so no revision or closure occurs and the Task
+stays open. Comments produce only a gap entry; labels are not part of the intake model.
+This is honest partial data, but it is not sufficient for automatic implementation
+work.
 
-### AR-088 — projection is admission policy, not effect recovery
+The append-only `github_issue_facts` transition chain has no selected runtime reader;
+current Issue rows plus Task mutation Operations own the active state/history needed by
+current consumers. Retain referenced source revisions, not an unused universal mirror.
 
-`automation_github_projection` has its own global/per-entry watermarks, recent state,
-quarantine and queued-effect drain cursor. It explicitly excludes unknown Operations
-from its drain and forwards only queued work to `call_automatic`.
+The Issues endpoint filters out PRs. `github/pulls.rs` implements exact PR readback, and
+`github/projection.rs` defines candidate-bound DTOs, but selected source search found no
+current callers outside those files. They are not a connected PR collector, Governor
+view or publication path. Connect the required typed path or delete it; do not cite
+source-file existence as implemented behavior.
 
-Replace this with the one host current-state loop. Enabled policy may admit the same
-managed-label/PR Operation as a direct Manager, but the effect owner alone controls
-`queued → sending → settled|rejected|outcome_unknown` and exact readback. Disabling or
-transferring policy changes future admissions; it neither repeats nor abandons an
-already admitted write.
+### AR-099 — remote truth appears only during publication
+
+Exact remote-ref readback exists in Forge and is correctly used to settle an ambiguous
+push. No independent collector records repository/ref/head, source time, freshness and
+error when publication is absent. Local tracking refs cannot substitute for current
+remote state. Add one small read-only source and join it into Governor observation;
+publication remains an optional effect.
 
 ## Inspected source boundaries
 
 | Source | Read boundary |
 | --- | --- |
-| `store/forge.rs` | Direct/on-behalf reserve, effect slot, final authority/accepted-candidate recheck, `sending`, worker authorization, finish, restart/reconcile and process-tree hold. |
-| `swarm-forge-worker/src/main.rs` | Plan/authorization, remote validation, ancestry, force-with-lease push, exact readback, PR PATCH, bounded process/output and result envelope. |
-| `store/github_effects.rs` | Direct/automatic label admission, semantic slot, one write, exact readback, unknown result and explicit reconcile. |
-| `store/github_pr_effects.rs` | Publication-bound PR target, native worker custody, one PATCH, exact PR readback and explicit reconciliation. |
-| `store/automation_publication.rs` | Acceptance cursor, activation/catch-up, pending retry/quarantine and Forge reservation. |
-| `store/automation_github_projection.rs` | Acceptance projection, per-entry state, queued-only effect drain and transfer relocation. |
-| `docs/forge-publication.md` | Current contract claims compared with source; stale non-force/no-CAS text corrected by this checkpoint. |
+| `store/github.rs` | Source setup/read/poll, lease, failure/commit, fact retention, Task mapping/revision and work-pool selection. |
+| `github/client.rs` | `gh api` bounds, repository identity, mutable Issue pagination, PR/label reads and writes. |
+| `github/observer.rs` | Bounded page-window assembly and within-window instability check. |
+| `github/work_pool.rs` | Immutable origin keys, fact/source revisions and title/body Task projection. |
+| `github/protocol.rs` | Public setup/poll/work-pool/effect request shapes and selection bounds. |
+| `migrations/006_github.sql` | Source/current/fact/work-pool/lease lifetimes and indexes. |
+| `automation/work_dispatch.rs`, `store/automation_work_dispatch.rs` | General Task-fact admission independent of GitHub selection. |
+| `store/tasks.rs` | Task create/revise rights, live-Attempt revision and frozen Attempt preservation. |
+| `github/pulls.rs`, `github/projection.rs` | Typed but disconnected PR/projection helpers. |
+| Forge/effect source search | Remote-ref reads only inside publication/readback; no independent collector. |
 
-Selected paths, not whole-file certification. Git server, GitHub service, credentials,
-branch protection, network failure and platform process trees were not executed.
+Selected paths, not whole-project certification. Live API movement, rate limiting,
+repository deletion/transfer, comments, large sources and remote-ref freshness were not
+executed.
 
 ## Next work
 
-Continue the GitHub collection/import chain named in [Resume here](#resume-here). The
-next pass must distinguish immutable source facts from Task import and from external
-mutation, then connect an independent remote-ref view. Do not create another poll or
-projection workflow.
+Continue the mailbox/coordination chain named in [Resume here](#resume-here). The next
+pass must preserve one addressed durable message path, reconnect cursor, exact
+reply/cancel and historical recipients while deleting duplicate cards/contracts/
+Concilium/code-scope authority. Do not replace direct agent collaboration with a human
+relay or another workflow platform.
