@@ -5,12 +5,13 @@
 **SOURCE_AUDIT_INCOMPLETE / TARGET DOCUMENTS WORKING DRAFT /
 RUNTIME REFACTOR IN PROGRESS.**
 
-Source was inspected on **2026-10-24** at
-`b61c0bd76fc3c16f8e28c262f7607ace2426469b`. The active audit contains
-**170 entries**. AR-160–170 close the named remote-gateway source chain: fixed process
-identity/profile, secret-file loading, HTTP/Host/Origin/bearer/body boundaries, RMCP
-session cleanup versus admission capacity, timeout/disconnect semantics, the
-kernel-host compatibility launcher and missing connected qualification.
+Source was implemented on **2026-10-24** at
+`7408e77e958aa4e8c7244c7c058eec0935bfa72c`, based on main `0a228cd3a2fde9f38be136485b53b88c7e0e5c84`. The active audit contains
+**170 entries**. Antigravity A1b is now landed: dispatch no longer requires a separate
+`agent.refresh` Operation or copied session-proof packet. Run `40126583064` passed the
+retired-symbol scan, rustfmt and minimal warnings-denied production Clippy. The next
+runtime slice is A2; no tests or installed/crash qualification are claimed.
+
 
 Merged work immediately preceding this checkpoint:
 
@@ -45,13 +46,14 @@ Merged work immediately preceding this checkpoint:
 | Active Antigravity coordinate aligned on v6 | `cba98b7` | No installed native-turn qualification. |
 | Terminal receipt decoupled from Store observation | `eeea355`, recorded net −265 production Rust lines | Dispatch proof and crash-unsafe delivery remain. |
 | One dispatch producer across SUCCESS/ERROR/CANCELED | `c92120e`; historical run `39579583956`, job `119153571930` | Scoped regression/Clippy only; no crash/installed/load proof. |
+| Antigravity dispatch proof removed | `7408e77`; run `40126583064`; net −271 production Rust and −37 qualification PowerShell lines | Production Clippy passed; no tests, installed provider, disconnect/crash or A2 delivery proof. |
 | Disconnected GitHub PR/projection modules removed | `98b350e`, net −250 Rust lines; run `40087522775` passed scoped Ubuntu/Windows gates | No PR-source feature or remote observation was added. |
 
 ```text
 A0   LANDED                   active v6 coordinate
 A1a  LANDED / SCOPED PASS     terminal decoupling + producer lifecycle
-A1b  NEXT / NOT IMPLEMENTED   remove dispatch proof/refresh prerequisite
-A2   NOT IMPLEMENTED          durable outcome/body/page delivery and successor completion
+A1b  LANDED / SCOPED PASS     current Store binding capability; no refresh proof
+A2   NEXT / NOT IMPLEMENTED   durable outcome/body/page delivery and successor completion
 A3   NOT IMPLEMENTED          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime
 U/R  SMALL CLEANUP LANDED      disconnected GitHub PR/projection source removed
@@ -60,7 +62,7 @@ R0–R6 TARGET ONLY              source-owned joined Governor observation
 V0–V3 TARGET ONLY              secret/session/origin/standalone gateway cut
 ```
 
-The next exact implementation slice is **A1b**. J0 is a bounded independent frontend
+The next exact implementation slice is **A2**. J0 is a bounded independent frontend
 fix; R0–R6 and V0–V3 remain later connected programs and do not reorder A.
 
 ## Source-inspection result
@@ -168,21 +170,27 @@ inspection and a successful compile cannot substitute for those results.
 
 ## Next work
 
-**Runtime A1b:** remove the redundant Antigravity dispatch refresh/proof/digest
-prerequisite through the exact chain named in
-[audit-current](agent-operations/audit-current.md#resume-here). Preserve current
-binding/generation/boot/session/model/workspace checks and no-replay semantics. Delete
-producer, validator, qualification gate, schema/profile and installer requirements in
-the same connected slice.
+**Runtime A2:** persist complete already-formed Antigravity outcome/result delivery
+parameters and retained response bytes atomically before acknowledging local retention.
+Same-boot IPC reconnect must resend identical parameters; authorized successor delivery
+must preserve original Operation/binding/origin boot after custody proves the previous
+owner departed. Store deduplicates exact receipt/page identity. No native prompt intent
+enters the spool and no uncertain prompt is replayed.
 
-**Subsequent A2–A3:** durable outcome/body/page delivery with successor completion, then
-real typed actions and one active Antigravity route.
+Exact source chain: `Controller::record_outcome/pending_receipts/completed_turns` →
+`main::flush_reports/request_saved` → `result_page` → adapter restart/hello recovery →
+Store `module.outcome/module.result` origin and old-boot completion checks. Record file
+lifetime, pressure, partial-write, ACK-loss, supersession and missing-byte behavior.
+
+**Then A3:** retain only real Open, Dispatch, Send(next_turn), Refresh, Result,
+Reconcile and owned-resource release; remove placeholders and retired Node routes after
+finite work disposition.
 
 Selected independent future slices remain J0 from
 [IPC/MCP](agent-operations/ipc-mcp.md), R0–R6 from
 [Observability](agent-operations/observability.md) and V0–V3 from
-[Gateway](gateway.md). None is landed here.
+[Gateway](gateway.md). None is landed by A1b.
 
-During construction run rustfmt plus minimal affected warnings-denied compile/Clippy.
-Focused connected cases close each slice; broad installed/live/migration/load
-qualification remains product-stage work.
+During construction run rustfmt plus minimal affected warnings-denied production
+Clippy. Focused connected cases close each vertical path when the product slice is
+ready; broad installed/live/migration/load qualification remains product-stage work.

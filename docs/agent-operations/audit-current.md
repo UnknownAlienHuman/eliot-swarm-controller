@@ -19,50 +19,71 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
 
 ## Resume here
 
-- Checkpoint: **2026-10-24 / remote single-tenant MCP gateway**.
-- Source inspected at **`b61c0bd76fc3c16f8e28c262f7607ace2426469b`**.
-  The gateway/runtime source in this chain is unchanged from the prior runtime baseline;
-  this checkpoint changes documentation only.
+- Checkpoint: **2026-10-24 / Antigravity A1b runtime cut**.
+- Runtime implementation commit: **`7408e77e958aa4e8c7244c7c058eec0935bfa72c`**, based on main
+  **`0a228cd3a2fde9f38be136485b53b88c7e0e5c84`**. The source commit removes the mandatory Antigravity
+  refresh/session-proof prerequisite before dispatch.
 - Connected chain:
-  `crates/swarm-gateway::{main,config,gateway}` → secret path resolution/loading →
-  fixed profile/client validation → bearer/path/query/Host/Origin/body checks →
-  RMCP 3.5.0 `StreamableHttpService` and `LocalSessionManager` → per-session
-  `swarm-mcp::profiled_facade` and IPC/readback → request timeout/shutdown →
-  `swarm-kernel-host gateway` sibling launcher → build-policy compatibility checks.
-- Overall audit: **incomplete, 170 entries**. AR-160–170 are recorded below; prior
-  dispositions remain in immutable checkpoints.
-- Preserved in this pass: loopback-only bind; exact path/no query; fixed restricted
-  profile bound to the credential client ID; duplicate Authorization rejection;
-  constant-work bearer comparison; RMCP Host/Origin/body/cancellation mechanisms;
-  bounded TCP connections; no silent IPC replay; timeout/disconnect leaving admitted
-  Store work intact; RMCP worker-driven session removal and finite default idle/init
-  cleanup.
-- Open in this pass: relative secret paths; unbounded/following credential read;
-  non-private/non-regular secret acceptance; missing credential token upper bound;
-  hard-coded rather than configured edge Origins and connection count; no active MCP
-  session cap; dependency defaults substituted for product policy; SSE lifetime outside
-  request timeout; duplicated kernel-host launcher retained by build checks; no connected
-  gateway security/capacity/restart qualification.
-- **Next exact chain — implementation A1b:**
-  `store/launcher_dispatch/antigravity_capability::{validate_retained_descriptor,
-  require_current_session_proof,build_packet}` → launch/dispatch admission and current
-  workspace/binding checks → adapter
-  `controller::{read_command,dispatch_session_proof}` → qualification's mandatory
-  `agent.refresh` readiness gate → descriptor/installer/package schema requirements.
-  Remove the redundant refresh/proof/digest prerequisite while preserving actual
-  binding/generation/boot/session/model/workspace fences and without replaying input.
-- Runtime implementation order remains **A1b–A3, then B–V**. This completed source
-  chain does not claim a whole-project exhaustive audit or reorder implementation.
-- Still unqualified: secret ACL/mode checks on Windows/Unix; browser/tunnel Origin and
-  Host behavior; connection/session exhaustion; slow/chunked body; timeout after Store
-  commit; disconnect/restart/shutdown; standalone packaging/cutover; installed gateway
-  behavior.
-- Documentation only. No runtime code, rustfmt, Clippy, test, benchmark or installed
-  system qualification changed in this checkpoint.
+  `swarm-contracts::runtime::AntigravityDispatchSessionProof` →
+  `launcher_dispatch/antigravity_capability` latest-refresh lookup and packet proof →
+  adapter `controller::dispatch_session_proof` → qualification's mandatory
+  `agent.refresh` readiness call and focused readiness fixture.
+- Overall audit remains **incomplete, 170 entries**. A1b closes an implementation
+  item; it does not create a new finding ID or imply whole-project completion.
+- Landed in A1b: dispatch capability now derives from current Store-owned
+  binding/generation, opening evidence, adapter boot/root/scope, native observation,
+  model readback and explicit `turn_pending=false`; no `agent.refresh` Operation or
+  copied assignment/lease/session proof is required. The adapter still exposes the
+  real semantic Refresh action for explicit readback.
+- Deleted with the old path: proof constants/type/validator, latest-refresh SQL,
+  refresh-generated proof payload, assignment/lease/session proof digests and the
+  mandatory qualification refresh. Net change: **−271 production Rust lines**,
+  **−37 qualification PowerShell lines** and **+6 Rust test lines**.
+- Verification: run
+  [`40126583064`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/40126583064)
+  passed exact retired-symbol scanning, `cargo fmt --all` and warnings-denied
+  production Clippy for `swarm-contracts`, `swarm-antigravity-adapter` and
+  `swarm-kernel-host`. No test suite was run.
+- Preserved fences: exact Task/Attempt/binding/route/actor scope, binding generation,
+  ready/unreleased/connected state, recovery exclusion, current bridge/open/native boot,
+  root/scope equality, explicit-model verification or honest native-default unknown,
+  native stream health and no pending Open/turn.
+- **Next exact chain — implementation A2:** adapter
+  `Controller::{record_outcome,pending_receipts,completed_turns}` and retained response
+  bodies → `main::flush_reports/request_saved` → `result_page` → process restart/hello
+  custody and startup recovery → Store `module.outcome/module.result` old-origin
+  validation and exact ACK/replay. Persist already-formed outcome/page bytes atomically,
+  recover them under the original Operation/binding/origin boot and never persist or
+  replay native prompt intent.
+- Runtime implementation order is now **A2, A3, then B–V**.
+- Still unqualified: focused PowerShell readiness execution, installed Antigravity,
+  Windows custody, crash/power loss, same-boot disconnect, successor delivery, result
+  source pressure and autonomous end-to-end work.
+- This checkpoint includes runtime source plus documentation. It does not claim tests,
+  installed-system qualification or A2 behavior.
 
-On resume, compare live `main` with the inspected head, reopen changed owners/consumers
-only, then execute the named A1b vertical slice. A source read or documentation commit
-is not a runtime repair.
+On resume, compare live `main` with `7408e77e958aa4e8c7244c7c058eec0935bfa72c`, reopen changed A2 owners/consumers
+only, and continue the named chain. A passing production Clippy is not crash or
+installed qualification.
+
+## Runtime checkpoint A1b
+
+A1b landed at
+[`7408e77`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/7408e77e958aa4e8c7244c7c058eec0935bfa72c).
+It replaces the refresh-selected proof packet with one compact capability identity
+recomputed from current Store binding/opening/observation facts. The immutable launch
+packet still carries a digest for ancestry, but no longer copies Task assignment,
+workspace lease or session proof structures.
+
+The adapter observation now exposes `turn_pending` directly, so dispatch fails closed
+when Open or a turn remains unresolved. Explicit model selection still requires exact
+requested/observed/verified equality; native-default mode preserves an unknown model
+unless the native init observed one. The semantic `agent.refresh` command remains
+available for explicit current-state readback and is no longer a dispatch prerequisite.
+
+Verification run `40126583064` passed formatting and warnings-denied production Clippy.
+The focused readiness script was updated but not executed, and no installed provider,
+restart, crash or result-delivery behavior was qualified. A2 remains open.
 
 <a id="findings-ar-160170"></a>
 ## Findings AR-160–170

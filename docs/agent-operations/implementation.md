@@ -172,10 +172,21 @@ existing dispatch producer across terminal SUCCESS/ERROR/CANCELED. Repair run
 passed the connected terminal regression and Store Clippy before publishing that
 commit. This is not installed-harness or crash-recovery qualification.
 
-**A1b:** delete `AntigravityDispatchSessionProof`, refresh producer, latest-refresh
-lookup, binding/snapshot proof validator, assignment/lease/session digests and
-mandatory refresh-before-dispatch. Store already owns assignment, Attempt,
-binding/boot, workspace lease and Operation.
+**A1b — landed, scoped production Clippy passed:** commit
+[`7408e77`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/7408e77e958aa4e8c7244c7c058eec0935bfa72c)
+deletes `AntigravityDispatchSessionProof`, latest-refresh SQL, the adapter proof
+producer, copied assignment/lease/session proof digests and mandatory
+refresh-before-dispatch qualification. Dispatch capability is recomputed from current
+Store Task/Attempt/binding scope plus binding generation, connected/recovery state,
+opening/current boot, root/scope, native stream health, model readback and
+`turn_pending=false`. Semantic Refresh remains available for explicit readback.
+
+Run
+[`40126583064`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/40126583064)
+passed retired-symbol scanning, `cargo fmt --all` and warnings-denied production Clippy
+for `swarm-contracts`, `swarm-antigravity-adapter` and `swarm-kernel-host`. Net change:
+−271 production Rust, −37 qualification PowerShell and +6 Rust test lines. No test suite,
+installed harness, disconnect/crash or delivery qualification is claimed.
 
 **A2:** retain complete terminal bytes and final outcome/result parameters with
 Operation, original binding/generation and origin boot in private atomic files before

@@ -15,11 +15,14 @@ immutable snapshots below retain earlier detailed evidence.
 5. Record a deletion only after the previous consumer, data disposition and positive
    path are identified.
 
-Current checkpoint: remote gateway source inspected at
-`b61c0bd76fc3c16f8e28c262f7607ace2426469b` on 2026-10-24. The source audit records
-AR-160–170 and moves the exact continuation to Antigravity implementation A1b. The
-checkpoint is documentation-only: it does not claim a gateway build, test, listener,
-secret-permission check, Store mutation or installed-product qualification.
+Current checkpoint: Antigravity A1b implemented at
+`7408e77e958aa4e8c7244c7c058eec0935bfa72c` on 2026-10-24. Run
+[`40126583064`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/40126583064)
+passed exact retired-symbol scanning, formatting and warnings-denied production Clippy
+for the affected packages. The audit still has 170 entries; A1b is an implementation
+checkpoint, not a new finding or installed qualification. The exact continuation is A2
+outcome/body/page durability and authorized successor delivery.
+
 
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints
@@ -53,6 +56,12 @@ secret-permission check, Store mutation or installed-product qualification.
 There are 170 entries. Some preserve correct behavior, narrow an earlier claim or
 record a transition boundary; they are not 170 defects or a completion percentage.
 
+## Landed runtime checkpoints
+
+| Slice | Source evidence | Verification | Remaining boundary |
+| --- | --- | --- | --- |
+| Antigravity A1b | [`7408e77`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/commit/7408e77e958aa4e8c7244c7c058eec0935bfa72c): removed refresh-selected proof type/SQL/payload/digests and mandatory qualification refresh; current Store binding/open/native observation owns dispatch capability. | Run [`40126583064`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/actions/runs/40126583064): retired-symbol scan, rustfmt and warnings-denied production Clippy for contracts/adapter/kernel host. | No tests or installed/crash qualification; A2 durable StoreDelivery and successor completion are next. |
+
 ## Source and target map
 
 | Responsibility / AR | Current source entry points | Target contract |
@@ -76,7 +85,7 @@ record a transition boundary; they are not 170 defects or a completion percentag
 
 | Area | Remaining connected boundary |
 | --- | --- |
-| A, M–Q adapters | Durable StoreDelivery, first historical capture, continuation sources and installed restart/version qualification. A1b is the next exact implementation slice. |
+| A, M–Q adapters | A1b landed. A2 durable StoreDelivery, first historical capture and authorized successor completion are next; continuation sources and installed restart/version qualification remain open. |
 | B–D launch/resources | Attached-binding retirement, cancellation disposition, stable route-budget identity and live custody races. |
 | E scheduler/Goals | One ordinary loop, finite no-progress/usage budgets, native/Eliot combination and restart. |
 | F–G Task/review | TaskPacket, automatic replacement, finite correction, subject isolation and common review/finding provenance. |
