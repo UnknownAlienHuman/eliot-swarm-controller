@@ -6,14 +6,15 @@
 RUNTIME_REFACTOR IN PROGRESS.**
 
 Source was inspected on **2026-10-23** at
-`8d8a44652d110f29031b2ddfdf6db98a5fc7001f`. The latest runtime change remains
-`c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **21 intervening
+`38db378c559dd0d95cd60db26702ffa73a954258`. The latest runtime change remains
+`c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **22 intervening
 commits are documentation-only**; documentation progress is not runtime progress.
 
-The active source register now contains **78 entries**. The latest pass traces ScriptRun
-admission, standalone process custody, restart, typed returned actions, child Operation
-admission/readback, cancellation and automation transfer. It does not mark a runtime
-defect repaired and it does not claim installed-platform qualification.
+The active source register now contains **87 entries**. The latest pass traces Forge
+publication, worker/process custody, exact remote-ref readback, managed labels, PR
+metadata, automatic publication/projection, restart, transfer and ambiguous-write
+settlement. It does not mark a runtime defect repaired and it does not claim live
+Git/GitHub or installed-platform qualification.
 
 - [Resume point and findings](agent-operations/audit-register.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
@@ -23,8 +24,8 @@ defect repaired and it does not claim installed-platform qualification.
 - [ScriptRunner contract](script-runner.md)
 - [Donor register](agent-operations/donor-map.md)
 
-The 78 records include preserved behavior, scope corrections and partial boundaries,
-not 78 bugs or a completion percentage.
+The 87 records include preserved behavior, scope corrections and partial boundaries,
+not 87 bugs or a completion percentage.
 
 ## Landed runtime changes
 
@@ -57,7 +58,8 @@ inspect later owners; it does not change implementation order.
 | Review/correction/acceptance, AR-059–064 | Direct replacement, all-findings feedback, same-Attempt resubmission and the frozen candidate/check/byte gate exist. | Automatic replacement, finite correction budget, fair subject isolation and common assigned-review/finding provenance. |
 | Fixed source and checks, AR-065–070 | Exact immutable source, Store-Go-before-command, process custody, parser coverage, strict cache lineage and acceptance revalidation exist. | Automatic recovery of interrupted `source.capture`, standalone-only new CheckRuns and live OS/toolchain/load qualification. |
 | Scripts, AR-071–078 | Script execution is one-shot, restart reconciles the retained family, parent completion and current child admissions are atomic, and automation lifecycle/transfer sources are exact. | Per-action identity/readback/retry, broader closed action vocabulary, pre-admission executor validation and exact mid-run cancellation. |
-| Other areas | Structural and selected source reviews remain indexed. | Forge/GitHub effects, Store migration, IPC/MCP, observation, mailbox/deletion and gateway completion. |
+| Forge/GitHub effects, AR-079–087 | Forge remote-Git publication has strong write-before-effect, exact target/force-with-lease/readback and retained worker custody. PR reconciliation demonstrates immutable post-write completion authority. | GitHub REST writers are split; direct `GhCli` lacks retained custody; automatic label unknown recovery and post-write settlement are wrong; PR metadata lacks an automatic caller; publication/projection copy workflow state. |
+| Other areas | Structural and selected source reviews remain indexed. | GitHub collection/import, Store migration, IPC/MCP, observation, mailbox/deletion and gateway completion. |
 
 ## CheckRunner status
 
@@ -113,6 +115,32 @@ Current action handling is not implementation-ready:
 
 See [ScriptRunner](script-runner.md) for the retained boundary and finite cut.
 
+## Forge and GitHub effects status
+
+The remote-Git publication path has useful effect discipline:
+
+- `forge.publish_ref` freezes the exact accepted candidate, commit/tree, repository,
+  target ref, expected old target and create/update policy before external I/O;
+- one target lane and retained native-worker custody prevent parallel/replayed pushes;
+- the worker uses exact force-with-lease semantics and exact remote-ref readback;
+- transport/CLI failure never authorizes another push;
+- restart moves uncertain execution to readback-only and processes reconciliation before
+  new publication dispatch.
+
+The GitHub REST side is not implementation-ready:
+
+1. labels execute through direct kernel-host `GhCli`, while PR title/body PATCH executes
+   inside `swarm-forge-worker`; they do not have one API effect owner;
+2. direct `GhCli` resolves bare `gh` and retains no executable/process-family custody;
+3. host restart turns automatic label writes unknown, but the automatic drain handles
+   only queued Operations and does not perform exact successor readback;
+4. after a label write, disable/edit/transfer/source revision changes can prevent an
+   exact observed desired state from settling the original Operation;
+5. PR reconciliation has the correct immutable post-GET settlement pattern and should
+   be retained when the API writer is consolidated;
+6. publication and label projection retain copied cursor/pending/retry/drain lifecycle;
+7. PR metadata remains a manual Manager tool with no enabled-policy caller.
+
 ## Required behavior to preserve
 
 | Behavior | Target owner | Current gap |
@@ -129,7 +157,7 @@ See [ScriptRunner](script-runner.md) for the retained boundary and finite cut.
 | Harness Goal and Eliot messages are independent | Native adapter Goal + ordinary Send | Current progression machinery and route gaps. |
 | Governor sees unmatched native/process/worktree facts | Independent collectors + joined view | Binding-rooted partial views remain. |
 | Direct peer collaboration survives council deletion | One recipient-indexed mailbox | Coordination platform still exists. |
-| External writes have one effect owner | GitHub/Forge domain owner | Duplicate writers/projection remain. |
+| External writes have one effect owner | Forge for remote Git; one GitHub API owner for REST writes | Forge is strong; REST owner split, direct `GhCli` custody and automatic unknown-readback gaps remain AR-081–087. |
 | Handover preserves authors/owners/recipients/history | Stable identities + designation epoch | Mailbox normalization and cleanup gaps. |
 | Restart never kills an unrelated PID | PID + birth/image/group/Job custody | Full platform race matrix unqualified. |
 
@@ -155,10 +183,11 @@ end-to-end cycle. Most of it remains unexecuted.
 
 ## Next work
 
-**Audit:** follow the Forge/GitHub effect chain named in
-[audit-register](agent-operations/audit-register.md#resume-here): remote push/readback,
-managed labels, PR metadata and publication automation. Prove one effect owner and exact
-successor readback after an ambiguous write.
+**Audit:** follow the GitHub source/import chain named in
+[audit-register](agent-operations/audit-register.md#resume-here): source pagination and
+revision identity, Issue/PR facts, Task mutation/work-pool coupling, automation import
+and independent remote-ref observation. Prove collection, import and writes have
+separate owners and that routine import does not fall back to a human.
 
 **Runtime:** implement Antigravity A1b–A3 first. Use existing owners, remove replaced
 paths in the same slice, and run format plus minimal affected warnings-denied Clippy/
