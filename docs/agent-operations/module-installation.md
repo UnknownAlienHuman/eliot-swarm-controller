@@ -49,7 +49,7 @@ not echo the whole descriptor back to itself.
 
 | Runtime | Selected target | Transition boundary |
 | --- | --- | --- |
-| Antigravity | Rust adapter, active coordinate v6 | Finish A1b–A3: remove dispatch proof, add durable Store delivery, keep real actions only; then retire remaining Node profiles. |
+| Antigravity | Rust adapter, active coordinate v6 | A1b removed the dispatch refresh/proof gate. Finish A2–A3: add durable Store delivery, keep real actions only, then retire remaining Node profiles. |
 | OpenCode | standalone `swarm-adapter-opencode` against one exact live-qualified current native contract | Freeze built-in new work, disposition concrete old bindings, delete host `runtime/opencode_v2`, legacy worker/MCP/service paths and universal journal machinery. |
 | Codex | Rust app-server adapter over the current external app-server | Delete Python writable route, profile ladders, full checkpoint/event mirror and Goal proof machinery after finite disposition. |
 | Muse | **Node bridge `.13` over the official low-level SDK** | This is the only new-work route during refactor. Finish/export concrete custom-Rust work, then remove `swarm-adapter-muse`, disabled descriptor, custom MSP wire/schema and Rust-only fixtures. Do not keep both or add the official Rust SDK as a third executor. |
@@ -196,7 +196,7 @@ Remove from qualification as each migrated route permits:
 - checkout/compiler/toolchain/cache equality;
 - exact artifact capability/schema arrays duplicated from Rust;
 - mandatory launch-preview digest;
-- Antigravity refresh/proof prerequisite;
+- Antigravity refresh/proof prerequisite — removed in A1b;
 - provider catalog response-body hashes as authority;
 - legacy frontend/resource compatibility inventory;
 - incident-specific workflow modes once a lasting regression test exists.

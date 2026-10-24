@@ -234,8 +234,8 @@ impl Controller {
                 // was passed and the installed harness default applies.
                 // init.model is reported as observed when present and never
                 // guessed, so the effective model stays unknown unless the
-                // native stream observed it. A v2 dispatch proof can attest
-                // session identity without claiming verified model selection.
+                // native stream observed it. Store retains this Open evidence;
+                // Dispatch does not require a second refresh or proof packet.
                 self.model_readback_state = Some("native_default");
             }
         }

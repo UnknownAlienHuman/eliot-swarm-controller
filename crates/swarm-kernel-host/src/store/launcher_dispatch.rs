@@ -313,7 +313,7 @@ pub(super) fn validate_before_effect(
     if model::canonical(&packet)? != model::canonical(&current)? {
         return Err(Error::new(
             "STALE_LAUNCH_DISPATCH_PACKET",
-            "launch plan, Task assignment, or C8 capability changed before native input",
+            "launch plan, Task assignment, or native dispatch capability changed before native input",
         ));
     }
     Ok(Some(packet))
@@ -632,8 +632,8 @@ fn stale_scope_predicate(predicate: &str) -> Error {
 }
 
 /// Revalidate the complete current Store tuple before accepting an
-/// Antigravity session proof, including when this capability helper is called
-/// directly for a readback. `None` means the initial unstarted stage; `Some`
+/// Antigravity dispatch, including when this capability helper is called
+/// directly for readback. `None` means the initial unstarted stage; `Some`
 /// must identify the exact queued child and its retained ancestry.
 fn require_current_antigravity_scope(
     db: &Connection,
@@ -732,7 +732,8 @@ pub(super) fn current_dispatch_capability_readback(
 
 /// Select the current native capability from the trusted route retained by the
 /// launch binding. OpenCode keeps its existing C8 verifier; Antigravity uses
-/// only its same-process session/turn proof and cannot claim MCP readback.
+/// current Store binding and successful Open evidence without another
+/// refresh/proof Operation and cannot claim MCP readback.
 pub(super) fn require_current_dispatch_capability(
     db: &Connection,
     config: &Config,

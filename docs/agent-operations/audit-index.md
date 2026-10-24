@@ -15,11 +15,12 @@ immutable snapshots below retain earlier detailed evidence.
 5. Record a deletion only after the previous consumer, data disposition and positive
    path are identified.
 
-Current checkpoint: remote gateway source inspected at
-`b61c0bd76fc3c16f8e28c262f7607ace2426469b` on 2026-10-24. The source audit records
-AR-160–170 and moves the exact continuation to Antigravity implementation A1b. The
-checkpoint is documentation-only: it does not claim a gateway build, test, listener,
-secret-permission check, Store mutation or installed-product qualification.
+Current checkpoint: Antigravity A1b runtime slice at
+`3c7a84ffc6d1e349fe989e4beaa62b03ed4e21bb` on 2026-10-24. The refresh/session-proof
+admission gate and repeated assignment/lease/session digests are removed while current
+Store binding/Open and adapter command fences remain. Run `40131522836`, job
+`120984044559`, passed affected rustfmt and warnings-denied Clippy. No test,
+installed-provider, crash/restart or load qualification is implied. Continue with A2.
 
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints
@@ -48,7 +49,7 @@ secret-permission check, Store mutation or installed-product qualification.
 | AR-115–126 | [`053f1e0`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/053f1e0fb15b3d40c00918f4a25ec8f9e4969e02/docs/agent-operations/audit-current.md#trace-2026-10-24-store-evolution) | Store bootstrap, numeric version, downgrade fence, extension verification, readers and finite v1 migration. |
 | AR-127–141 | [`c73c36c`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c73c36c72d2c86cf710fa69e39ab07e2052c1f5e/docs/agent-operations/audit-current.md#trace-2026-10-24-ipc-mcp) | Multiplexed IPC, MCP slot lock, subscriptions, exact Tasks reads, writer occupancy and WAL routing. |
 | AR-142–159 | [`b61c0bd`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b61c0bd76fc3c16f8e28c262f7607ace2426469b/docs/agent-operations/audit-current.md#trace-2026-10-24-governor-observation) | Binding-rooted discovery, provider/process/worktree/remote sources, joined Governor view and deletion boundaries. |
-| [AR-160–170](audit-current.md#findings-ar-160170) | [Current gateway trace](audit-current.md#trace-2026-10-24-gateway) | Fixed principal, secret loading, HTTP/Origin boundary, connection/session capacity, unknown outcome and launcher cutover. |
+| AR-160–170 | [`0a228cd`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/0a228cd3a2fde9f38be136485b53b88c7e0e5c84/docs/agent-operations/audit-current.md#trace-2026-10-24-gateway) | Fixed principal, secret loading, HTTP/Origin boundary, connection/session capacity, unknown outcome and launcher cutover. |
 
 There are 170 entries. Some preserve correct behavior, narrow an earlier claim or
 record a transition boundary; they are not 170 defects or a completion percentage.
@@ -76,7 +77,7 @@ record a transition boundary; they are not 170 defects or a completion percentag
 
 | Area | Remaining connected boundary |
 | --- | --- |
-| A, M–Q adapters | Durable StoreDelivery, first historical capture, continuation sources and installed restart/version qualification. A1b is the next exact implementation slice. |
+| A, M–Q adapters | A1b refresh/proof removal is landed with scoped Clippy. Next: A2 durable StoreDelivery, first historical capture, continuation sources and installed restart/version qualification. |
 | B–D launch/resources | Attached-binding retirement, cancellation disposition, stable route-budget identity and live custody races. |
 | E scheduler/Goals | One ordinary loop, finite no-progress/usage budgets, native/Eliot combination and restart. |
 | F–G Task/review | TaskPacket, automatic replacement, finite correction, subject isolation and common review/finding provenance. |

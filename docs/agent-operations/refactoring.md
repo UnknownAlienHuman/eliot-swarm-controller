@@ -43,10 +43,13 @@ model fallback and independent lane daemons are rejected heuristics.
 - `c92120e`: one dispatch producer is updated across SUCCESS/ERROR/CANCELED. Run
   `39579583956`, job `119153571930`, passed the connected terminal regression and
   minimal Store Clippy before publishing it.
+- `3c7a84f`: A1b removes the Antigravity refresh/session-proof admission gate and its
+  repeated assignment/lease/session digests; run `40131522836`, job `120984044559`,
+  passed affected rustfmt and warnings-denied Clippy. Recorded net change is −305
+  production Rust lines, −20 qualification-glue lines and +3 test lines.
 
-Still open: Antigravity dispatch proof/refresh gate, crash-unsafe in-memory delivery
-and extra command/profile surface. Installed harness/crash/scale behavior is
-unqualified.
+Still open: crash-unsafe in-memory delivery and extra command/profile surface.
+Installed harness/crash/scale behavior is unqualified.
 
 ## 3. Repeated causes of growth
 
