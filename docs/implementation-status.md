@@ -54,7 +54,7 @@ Merged work immediately preceding this checkpoint:
 A0   LANDED                   active v6 coordinate
 A1a  LANDED / SCOPED PASS     terminal decoupling + producer lifecycle
 A1b  LANDED / SCOPED PASS     refresh/proof gate removed; current fences retained
-A2a  IMPLEMENTED / CHECKING    private outcome/body/page retention + reconciled old boot
+A2a  PR READY / SCOPED PASS    private outcome/body/page retention + reconciled old boot
 A2b  NEXT / NOT IMPLEMENTED   Store coverage ACK, source release and crash matrix
 A3   NOT IMPLEMENTED          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime

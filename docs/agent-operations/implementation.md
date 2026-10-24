@@ -183,14 +183,14 @@ binding/root checks and `agent.refresh` remains a standalone read action. Run
 No integration, installed harness, crash or load qualification is claimed. Net change:
 −305 production Rust lines, −20 qualification-glue lines and +3 test lines.
 
-**A2a — implemented in this branch, qualification pending:** retain exact
+**A2a — implemented in the PR branch, scoped Clippy passed:** retain exact
 `module.outcome`, selected terminal body and `module.result` parameters with Operation,
 original binding/generation and origin boot in private atomic module-state files before
 IPC. Startup reloads the bounded delivery set. Exact ACK removes only matching bytes;
 a newer outcome under the same Operation is not deleted by an older ACK. A prior-boot
 outcome can settle only through an exact admitted `agent.reconcile` after Store verifies
 `previous_bridge_boot_id -> bridge_boot_id` and prior-owner departure. Native prompt
-intent is never persisted or replayed.
+intent is never persisted or replayed. Runs `40135475910` (job `120995970779`) and `40135726768` (job `120996711166`) passed affected rustfmt and warnings-denied Clippy. No provider, installed-harness, restart/crash or load qualification is claimed.
 
 **A2b:** make Store ACK own aggregate result-page coverage/next missing range, release
 local body only after complete coverage, and close pressure/crash/ACK-loss/replacement

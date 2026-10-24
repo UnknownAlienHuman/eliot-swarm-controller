@@ -49,7 +49,7 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
   before IPC. Startup reloads deliveries; exact ACK removes only matching bytes. A
   prior-boot outcome may settle only after Store validates its exact admitted
   `agent.reconcile` link and proven previous-owner transition. Native prompt intent is
-  never stored or replayed.
+  never stored or replayed. Runs `40135475910` / job `120995970779` and `40135726768` / job `120996711166` passed affected rustfmt and warnings-denied Clippy; no runtime/installed/crash qualification is claimed.
 - **Next exact chain — A2b:** Store-authoritative aggregate page coverage/next-missing
   ACK, safe local body release, pressure/readback behavior and connected restart tests
   across crash-before-write, crash-after-write, ACK loss and several replacements.

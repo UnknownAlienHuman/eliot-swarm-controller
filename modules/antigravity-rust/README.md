@@ -8,7 +8,7 @@ The binary is `swarm-antigravity`; the current source descriptor is `eliot-antig
 module state directory. It stores no prompt intent. A prior-boot outcome remains held
 until exact Store reconciliation proves the owner transition; normal IPC reconnect
 retries identical bytes. Store-authoritative aggregate page coverage and local source
-release remain A2b. Installed/native qualification remains pending.
+release remain A2b. Runs `40135475910` / job `120995970779` and `40135726768` / job `120996711166` passed affected rustfmt and warnings-denied Clippy; installed/native qualification remains pending.
 
 ## Identity, admission, and rights
 
