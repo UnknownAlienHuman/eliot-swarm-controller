@@ -35,6 +35,7 @@ a search hit or a test that was only read.
 | [Configuration](configuration.md) | Manager policy and the target current-state loop. |
 | [Module API](module-api.md) | Semantic harness actions, result delivery and recovery. |
 | [Launcher/Queue](../swarm-launcher-assignment-context.md) | Selection, admission and resource lifetime. |
+| [Store evolution](store-evolution.md) | Numeric schema identity, finite v1 bridge, bounded postconditions and product-storage retirement. |
 | [GitHub sources](github-sources.md) | Read-only collection, explicit Task import and independent remote observation. |
 | [External effects](external-effects.md) | One owner per remote Git/GitHub mutation and exact readback. |
 | [CheckRunner](../check-runner.md) | Immutable source, process evidence, cache and acceptance handoff. |
@@ -52,6 +53,7 @@ a search hit or a test that was only read.
 | --- | --- |
 | What must the product do? | [Architecture](architecture.md), [delivery](delivery.md) |
 | What should be implemented next? | [Implementation runtime order](implementation.md#5-runtime-order) |
+| How does Store schema compatibility work? | [Store evolution](store-evolution.md) |
 | Where did source research stop? | [Current audit](audit-current.md#resume-here) |
 | What evidence supports a finding? | [Audit index](audit-index.md#evidence-checkpoints) |
 | What can be reused or must be requalified? | [Donor map](donor-map.md) and [donor inventory](../agent_swarm.donors-20260929.toml) |

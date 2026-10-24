@@ -12,13 +12,15 @@ immutable snapshots below retain earlier detailed evidence.
 2. Compare its inspected head with live `main`.
 3. Reopen changed callers/consumers only.
 4. Continue the named exact chain and update the current register plus owning contract.
-5. Record a deletion only after the previous consumer and positive path are identified.
+5. Record a deletion only after the previous consumer, data disposition and positive
+   path are identified.
 
-Current checkpoint: source inspected at
-`e42c464d58db770cc5490f46f391843f9fec8df2` on 2026-10-24. The current branch also
-contains runtime cleanup `98b350e614fa660fe1d8c53b6063bdac94d80f68`, deleting the
-disconnected GitHub PR/projection modules from AR-098. Minimal affected CI/Clippy is
-tracked in PR #188; no installed or broad-product qualification is implied.
+Current checkpoint: Store source inspected at
+`e99c06bb490fe630eec70337ce5137a26e145d84` on 2026-10-24. PR #188 is merged at that
+commit. Its exact head `0a5a099f197b392401b7569879ad453fc2f102e4`, workflow run
+`40087522775`, passed format, all-target compile and changed-line Clippy on Ubuntu and
+Windows plus selected IPC/Muse/Command boundaries. No installed or broad-product
+qualification is implied.
 
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints
@@ -43,10 +45,11 @@ tracked in PR #188; no installed or broad-product qualification is implied.
 | AR-071–078 | [`38db378`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/38db378c559dd0d95cd60db26702ffa73a954258/docs/agent-operations/audit-register.md#trace-2026-10-23-scriptrun) | ScriptRun custody/recovery, actions, readback, cancellation and transfer. |
 | AR-079–088 | [`b7a5fe1`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b7a5fe164a50cbefe2ca315c8f3a7f209d1c0d9b/docs/agent-operations/audit-current.md#trace-2026-10-24-forge-github-effects) | Forge lease/readback, GitHub label/PR ownership and automation recovery. |
 | AR-089–099 | [`e42c464`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e42c464d58db770cc5490f46f391843f9fec8df2/docs/agent-operations/audit-current.md#trace-2026-10-24-github-sources) | GitHub collection, mutable pagination, Task import/work pool and remote observation. |
-| [AR-100–114](audit-current.md#findings-ar-100114) | [Current trace](audit-current.md#trace-2026-10-24-mailbox-coordination) | Mailbox identity/storage, GM continuity, coordination-product deletion and first disconnected-code cut. |
+| AR-100–114 | [`e99c06b`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e99c06bb490fe630eec70337ce5137a26e145d84/docs/agent-operations/audit-current.md#trace-2026-10-24-mailbox-coordination) | Mailbox identity/storage, GM continuity, coordination deletion and disconnected GitHub cleanup. |
+| [AR-115–126](audit-current.md#findings-ar-115126) | [Current trace](audit-current.md#trace-2026-10-24-store-evolution) | Store bootstrap, numeric version, downgrade fence, extension verification, readers and finite v1 migration. |
 
-There are 114 entries. Some preserve correct behavior, narrow an earlier claim or
-record a transition boundary; they are not 114 defects or a completion percentage.
+There are 126 entries. Some preserve correct behavior, narrow an earlier claim or
+record a transition boundary; they are not 126 defects or a completion percentage.
 
 ## Source and target map
 
@@ -62,7 +65,8 @@ record a transition boundary; they are not 114 defects or a completion percentag
 | GitHub collection/import, 089–099 | `github/{client,observer,work_pool}`, `store/github`, `automation_work_dispatch`, `tasks`, migration 006 | [GitHub sources](github-sources.md), implementation U0–U2/U5 |
 | Mailbox/coordination, 100–113 | `store/{mailbox,object_reads,gm,coordination_threads,coordination,code_scopes,integration,concilium,coordination_watch}` plus coordination wire modules | [Agent communication](../agent-communication-program.md), implementation S/T |
 | Disconnected GitHub cleanup, 114 | removed `github/{pulls,projection}.rs` and pull-origin helper | implementation U/R; no replacement product claimed |
-| Store bootstrap/migrations next | `store/mod.rs`, embedded `migrations/*.sql`, `doctor.rs`, `swarm-store` connection/readers | implementation I |
+| Store evolution, 115–126 | `swarm-store`, `store/mod.rs`, migrations 001–015, special event-schema installers, Doctor/status reader | [Store evolution](store-evolution.md), implementation I |
+| IPC/MCP next | `swarm-client`, `swarm-mcp`, Store call/read router, subscriptions and hot views | implementation H/J |
 | Observation | module observations, process metrics, workspace/Git and remote collectors | [Observability](observability.md), implementation R |
 | Gateway | `swarm-gateway` and compatibility launcher | [Gateway](../gateway.md), implementation V |
 
@@ -75,7 +79,7 @@ record a transition boundary; they are not 114 defects or a completion percentag
 | E scheduler/Goals | One ordinary loop, finite no-progress/usage budgets, native/Eliot combination and restart. |
 | F–G Task/review | TaskPacket, automatic replacement, finite correction, subject isolation and common review/finding provenance. |
 | H permissions/API | Complete method/role/object/revision matrix and deletion of internal/vendor public surfaces. |
-| I Store | Numeric migration authority, reader/writer pairs, partial migration, corruption and restart behavior. |
+| I Store | Numeric migration implementation, v1 bridge, reader/Doctor cutover, product deletion migrations, corruption and power-loss qualification. |
 | J IPC/MCP | Disconnect/readback, slow consumers, fairness, multiplexing and writer occupancy. |
 | K effects | Script action lifecycle/cancel; Check executor cut; Forge process-hold disposition; one GitHub API owner and automatic unknown readback. |
 | U GitHub | Stable collector cut, aggregate coverage, explicit import, live-work conflict, work-pool deletion, connected PR source and independent remote-ref view. |

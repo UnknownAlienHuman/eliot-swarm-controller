@@ -6,27 +6,26 @@
 RUNTIME REFACTOR IN PROGRESS.**
 
 Source was inspected on **2026-10-24** at
-`e42c464d58db770cc5490f46f391843f9fec8df2`. The active audit contains
-**114 entries**. AR-100–114 trace direct mailbox identity/storage, GM handover,
-Participant access, Thread/cards/contracts/code scope/integration/Concilium/watch and
-their public MCP/CLI surfaces.
+`e99c06bb490fe630eec70337ce5137a26e145d84`. The active audit contains
+**126 entries**. AR-115–126 trace Store open ordering, numeric schema authority,
+downgrade/future-version fencing, extension verification, reader/Doctor behavior,
+product-storage retirement and the finite legacy-v1 transition.
 
-The current branch also contains the first new production-code reduction after the
-previous audit-only sequence:
+PR #188 is merged at `e99c06b`:
 
-- `98b350e614fa660fe1d8c53b6063bdac94d80f68` removes disconnected
-  `github/pulls.rs`, `github/projection.rs`, their module declarations and the sole
-  pull-origin helper: **net −250 Rust lines**;
-- the deletion closes the disconnected-code portion of AR-098 only;
-- it does not implement PR collection, GitHub remote observation or any replacement
-  workflow;
-- minimal affected format/compile/Clippy is tracked in PR #188. This document does not
-  claim a pass until the workflow has completed.
+- production cleanup `98b350e614fa660fe1d8c53b6063bdac94d80f68`
+  removed disconnected GitHub PR/projection source: **net −250 Rust lines**;
+- exact head `0a5a099f197b392401b7569879ad453fc2f102e4`;
+- workflow run `40087522775` passed changed-path classification, documentation and
+  rustfmt validation, all-target compile and changed-line Clippy on Ubuntu and Windows,
+  plus selected IPC/native stream and Muse/Command boundaries;
+- broad tests and installed/native qualification were not run.
 
 - [Current resume point and findings](agent-operations/audit-current.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
 - [Architecture](agent-operations/architecture.md)
 - [Single implementation program](agent-operations/implementation.md)
+- [Store evolution target](agent-operations/store-evolution.md)
 - [Agent communication target](agent-communication-program.md)
 - [GitHub-source contract](agent-operations/github-sources.md)
 - [External-effects contract](agent-operations/external-effects.md)
@@ -40,7 +39,7 @@ previous audit-only sequence:
 | Active Antigravity coordinate aligned on v6 | `cba98b7` | No installed native-turn qualification. |
 | Terminal receipt decoupled from Store observation | `eeea355`, recorded net −265 production Rust lines | Dispatch proof and crash-unsafe delivery remain. |
 | One dispatch producer across SUCCESS/ERROR/CANCELED | `c92120e`; historical run `39579583956`, job `119153571930` | Scoped regression/Clippy only; no crash/installed/load proof. |
-| Disconnected GitHub PR/projection modules removed | branch commit `98b350e`, net −250 Rust lines | Minimal CI pending at this checkpoint; no PR-source feature added. |
+| Disconnected GitHub PR/projection modules removed | `98b350e`, net −250 Rust lines; run `40087522775` passed Ubuntu/Windows scoped gates | No PR-source feature or remote observation was added. |
 
 ```text
 A0   LANDED                   active v6 coordinate
@@ -52,8 +51,8 @@ B–V  TARGET WORK              largely unreduced current runtime
 U/R  SMALL CLEANUP LANDED      disconnected GitHub PR/projection source removed
 ```
 
-Runtime implementation still starts with **A1b–A3**. Audit order and opportunistic dead
-code deletion do not change the implementation order.
+Runtime implementation still starts with **A1b–A3**. Audit order and bounded dead-code
+removal do not change the implementation order.
 
 ## Source-inspection result
 
@@ -65,97 +64,96 @@ code deletion do not change the implementation order.
 | Review/correction/acceptance, AR-059–064 | Replacement, all-findings feedback, same-Attempt resubmission and frozen evidence gate exist. | Automatic replacement, finite correction, subject fairness and common review/finding provenance. |
 | CheckRun, AR-065–070 | Immutable source, Store-Go, process custody, parser coverage, cache lineage and acceptance revalidation exist. | Automatic interrupted source capture and standalone-only executor cut. |
 | ScriptRun, AR-071–078 | One-shot interpreter, same-family restart and atomic parent/child admission exist. | Per-action identity/readback/retry, action vocabulary, executor precheck and mid-run cancellation. |
-| External effects, AR-079–088 | Forge freezes exact candidate/ref intent, records `sending` before one write and settles by exact readback; label/PR slots are strict. | Sticky process hold, duplicate PR PATCH owner, mutable-source recovery dependency, manual unknown reconciliation and duplicate automation engines. |
-| GitHub sources/import, AR-089–099 | Repository ID, safe GET retry, explicit partial coverage and local-divergence conflict are useful. | Stable pagination/cut, aggregate coverage, explicit import, live-work conflict, work-pool deletion and remote view. Disconnected PR/projection helpers are now removed. |
-| Mailbox/coordination, AR-100–114 | Exact sender/recipient/scope checks, non-destructive reads, scoped Participant/reviewer access and GM epoch handover are useful. | Recipient mailbox rows; finite migration; participant-grant relocation; deletion of Thread/cards/contracts/code-scope/integration/Concilium/watch and every public/storage surface. |
-| Other areas | Structural and selected source reviews remain indexed. | Store migration, IPC/MCP, observation and gateway completion. |
+| External effects, AR-079–088 | Forge and GitHub effects retain exact intent, one write boundary and readback. | Sticky process hold, duplicate PR PATCH owner, mutable-source recovery, manual unknown reconciliation and duplicate automation engines. |
+| GitHub sources/import, AR-089–099/114 | Repository ID, safe GET retry, explicit gaps and local-divergence conflict are useful; disconnected PR/projection code is removed. | Stable source cut, aggregate coverage, explicit import, live-work conflict, work-pool deletion and remote view. |
+| Mailbox/coordination, AR-100–113 | Exact sender/recipient/scope checks, non-destructive reads, scoped Participant/reviewer access and GM epoch handover are useful. | Recipient mailbox rows; finite migration; grant relocation; deletion of Thread/cards/contracts/code-scope/integration/Concilium/watch and all public/storage surfaces. |
+| Store, AR-115–126 | Single-writer ownership, pre-query timeout, pre-WAL identity, immediate transaction, rollback and query-only WAL reader are useful. | Numeric v2 implementation, finite v1 bridge, downgrade fence, semantic postconditions, reader/Doctor cutover and deletion migrations. |
+| Other areas | Structural and selected source reviews remain indexed. | IPC/MCP, observation and gateway completion. |
+
+## Store status
+
+### Preserve
+
+- DataRoot lock and one durable writer.
+- Caller busy timeout before the first SQLite query.
+- Application identity inspection before persistent WAL configuration.
+- `foreign_keys=ON`, WAL and FULL only after the database is accepted.
+- One `BEGIN IMMEDIATE` transaction for bootstrap/migration/callback/postconditions.
+- Rollback on initialization, migration or precommit verification error.
+- No fallible validation after commit.
+- Existing-only recovery open.
+- Read-only/query-only status connection after writer readiness.
+- Committed WAL snapshots visible while the writer holds an uncommitted transaction.
+
+### Repair
+
+1. Replace permanent `user_version=1` plus extension SHA markers with one complete
+   numeric application version.
+2. Consolidate current legacy physical state through a finite `1 → 2` bridge; create new
+   databases directly at v2.
+3. Reject future versions and foreign/nonempty untagged databases before WAL or any
+   persistent mutation.
+4. Remove exact base-SQL text digest as compatibility authority after the bridge.
+5. Replace generic marker trust and special reference-DB/DDL-token implementations with
+   migration-specific bounded semantic postconditions.
+6. Keep domain migrations in kernel Store; keep connection/transaction mechanics in
+   `swarm-store`.
+7. Require exact current version for read-only and recovery connections; neither path
+   migrates.
+8. Make Doctor report application/current version, migration state and bounded gaps
+   instead of the base SQL digest.
+9. Attach a data-disposition and numeric removal migration to every product deletion.
+10. Remove legacy digest/marker/reference machinery after all supported v1 databases
+    have one connected bridge.
 
 ## Mailbox and coordination status
 
-### Preserve
+Preserve one authenticated sender/recipient, immutable Operation admission, exact
+Task/Attempt/candidate/reviewer access, non-destructive reads, exact reply/cancel
+relations and GM handover without historical identity rewriting.
 
-- One authenticated sender and one exact recipient.
-- Immutable Operation admission and caller-owned request idempotency.
-- Exact Task/Attempt/candidate/reviewer disclosure boundaries.
-- Non-destructive reads and recovery after a lost notification.
-- Reply/cancel relation to one exact prior message with deadline/digest checks where
-  configured.
-- Stable client identity across reconnect.
-- GM handover changes designation/epoch only and never rewrites historical recipients,
-  owners, authors or reviewers.
-- Current Task/Attempt/native attention is a separate projection for the successor GM.
-
-### Repair
-
-1. Replace Operation ID + `cmsg-*` + delivery ID with one message identity: the admitted
-   Operation ID.
-2. Insert recipient-indexed mailbox rows atomically with `message.send`; page them by a
-   recipient sequence rather than global Observation cursor.
-3. Keep Task feedback, Check completion and other attention in their owning projections,
-   not as mailbox message kinds.
-4. Preserve exact scoped grants, but migrate launch/reviewer access away from the
-   duplicate coordination participant directory before deleting it.
-5. Reduce Thread to optional grouping only if a current consumer remains. Remove
-   reasonability forms, speech acts, proposal/objection/ratification states and
-   authority implications.
-6. Delete work/contract cards, structured consult directory, contract negotiation,
-   `code.scope.*`, integration cells/ACKs, Concilium and coordination watches after
-   callers use mailbox, Task/source, workspace lease, review/check and ordinary
-   subscription/automation owners.
-7. Remove catalog, method policy, CLI, MCP profiles/subscriptions, Store routes,
-   indexes/backfills, fixtures and compatibility aliases in the same vertical slice.
-8. Migrate only concrete unresolved mail/thread/grant state. Completed Operations remain
-   readable history and do not keep executable translators alive.
+Repair by normalizing recipient rows keyed by Operation ID; separating feedback/check
+attention; moving assignment/reviewer grants before deleting the duplicate Participant
+directory; reducing Thread to optional grouping; and deleting cards, consult,
+contracts, `code.scope.*`, integration cells, Concilium and watches vertically with
+MCP/CLI/storage/migrations.
 
 ## GitHub source/import status
 
-### Preserve
+Preserve immutable repository identity, exact safe GET retry, explicit coverage gaps,
+immutable Issue origin and local Task divergence conflict.
 
-- Immutable repository-ID verification.
-- Exact source request identity and safe retry of read-only GET after uncertainty.
-- Explicit stale/partial/failure coverage rather than treating failure as an empty
-  source.
-- Immutable Issue origin keys and local Task divergence conflict.
-
-### Repair
-
-1. Separate source configuration/collection from Forge publication and local Operator
-   calls.
-2. Replace numeric pages over mutable `updated desc` with a stable cut or overlap plus
-   periodic full reconciliation.
-3. Make coverage converge across bounded passes, including selected comments/PR fields.
-4. Commit source facts only during collection; direct/policy `source_import` owns Task
-   create/revise.
-5. Never revise beneath live work automatically.
-6. Delete duplicate work-pool selection and use the ordinary queue after import.
-7. Add independent remote-ref observation without granting push authority.
-8. Keep the newly deleted PR/projection modules absent until an exact current consumer
-   and end-to-end path exist.
+Repair stable pagination/cut and aggregate coverage; separate collection from explicit
+`source_import`; never revise beneath live work; delete duplicate work-pool selection;
+add independent remote-ref observation; and keep disconnected PR/projection code absent
+until a real end-to-end consumer exists.
 
 ## Source audit versus runtime qualification
 
-A completed source audit needs a named revision and evidence for each retained action:
+A completed source audit needs a named revision and evidence for every retained action:
 caller → parse → exact authority → Store transition → effect/readback → consumer,
-including cancellation, late result, restart, handover and partial writes. It also
-needs historical requirement mapping and a concrete replacement/disposition for each
-deletion. This remains incomplete globally.
+including cancellation, late result, restart, handover, migration and partial writes.
+It also needs historical requirement mapping and a concrete data/code disposition for
+each deletion. This remains incomplete globally.
 
 Executed qualification is separate: privilege/migration/corruption cases, installed
 provider contracts, Windows custody, fairness/load and autonomous end-to-end work. Most
-of that remains unexecuted. Source inspection cannot substitute for it, and a CI compile
-does not qualify native providers or a migrated database.
+of that remains unexecuted. Source inspection and a successful compile cannot substitute
+for migrated-database or provider qualification.
 
 ## Next work
 
-**Audit:** continue the Store bootstrap/migration chain named in
-[audit-current](agent-operations/audit-current.md#resume-here): embedded base/extension
-SQL, startup verification, Doctor readback, writer/WAL reader ownership and
-partial-migration/corruption behavior. Record useful guards versus source-text schema
-ceremony before implementation I.
+**Audit:** continue the IPC/MCP chain named in
+[audit-current](agent-operations/audit-current.md#resume-here): client multiplexing,
+frontend connection locking, Store routing, subscription queues, exact hot reads,
+disconnect and slow-consumer behavior.
 
-**Runtime:** finish PR #188 verification for the bounded GitHub deletion. The main
-implementation still begins with Antigravity A1b–A3: remove the refresh/proof
-prerequisite, persist exact delivery/body/page records and retain only real actions.
+**Runtime:** implementation still begins with Antigravity A1b–A3: remove the
+refresh/proof prerequisite, persist exact delivery/body/page records and retain only
+real actions. Store implementation I uses
+[the numeric migration program](agent-operations/store-evolution.md), beginning with
+numeric mechanics and the finite v1 bridge.
 
 During construction run rustfmt plus minimal affected warnings-denied compile/Clippy.
-Broad and installed/live tests remain product-stage qualification.
+Focused connected cases close each vertical path; broad installed/live/corruption/load
+qualification remains product-stage work.
