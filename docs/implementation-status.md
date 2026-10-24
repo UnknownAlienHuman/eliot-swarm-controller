@@ -6,24 +6,25 @@
 RUNTIME_REFACTOR IN PROGRESS.**
 
 Source was inspected on **2026-10-23** at
-`5b6b5bee92123ce7d3252054c939fb18619b790f`. The latest runtime change remains
-`c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **20 intervening
+`8d8a44652d110f29031b2ddfdf6db98a5fc7001f`. The latest runtime change remains
+`c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **21 intervening
 commits are documentation-only**; documentation progress is not runtime progress.
 
-The active source register now contains **70 entries**. The latest pass closes the
-source trace for fixed source, CheckRun execution/recovery, parser coverage, cache reuse
-and the acceptance handoff. It does not mark a runtime defect repaired and it does not
-claim installed-platform qualification.
+The active source register now contains **78 entries**. The latest pass traces ScriptRun
+admission, standalone process custody, restart, typed returned actions, child Operation
+admission/readback, cancellation and automation transfer. It does not mark a runtime
+defect repaired and it does not claim installed-platform qualification.
 
 - [Resume point and findings](agent-operations/audit-register.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
 - [Architecture](agent-operations/architecture.md)
 - [Single implementation program](agent-operations/implementation.md)
 - [CheckRunner contract](check-runner.md)
+- [ScriptRunner contract](script-runner.md)
 - [Donor register](agent-operations/donor-map.md)
 
-The 70 records include preserved behavior, scope corrections and partial boundaries,
-not 70 bugs or a completion percentage.
+The 78 records include preserved behavior, scope corrections and partial boundaries,
+not 78 bugs or a completion percentage.
 
 ## Landed runtime changes
 
@@ -55,7 +56,8 @@ inspect later owners; it does not change implementation order.
 | Goals/automation, AR-051–058 | Exact terminal/occurrence identity is useful; actor, phase, transfer and finite-budget gaps are concrete; native Goal support differs by route. | Ordinary bounded Goal messages, one loop, installed native mappings and restart. |
 | Review/correction/acceptance, AR-059–064 | Direct replacement, all-findings feedback, same-Attempt resubmission and the frozen candidate/check/byte gate exist. | Automatic replacement, finite correction budget, fair subject isolation and common assigned-review/finding provenance. |
 | Fixed source and checks, AR-065–070 | Exact immutable source, Store-Go-before-command, process custody, parser coverage, strict cache lineage and acceptance revalidation exist. | Automatic recovery of interrupted `source.capture`, standalone-only new CheckRuns and live OS/toolchain/load qualification. |
-| Other areas | Structural and selected source reviews remain indexed. | Script/Forge/GitHub effects, Store migration, IPC/MCP, observation, mailbox/deletion and gateway completion. |
+| Scripts, AR-071–078 | Script execution is one-shot, restart reconciles the retained family, parent completion and current child admissions are atomic, and automation lifecycle/transfer sources are exact. | Per-action identity/readback/retry, broader closed action vocabulary, pre-admission executor validation and exact mid-run cancellation. |
+| Other areas | Structural and selected source reviews remain indexed. | Forge/GitHub effects, Store migration, IPC/MCP, observation, mailbox/deletion and gateway completion. |
 
 ## CheckRunner status
 
@@ -79,6 +81,38 @@ Two implementation gaps remain:
    routes to standalone `swarm-checks`. Both validate equivalent evidence, but the
    duplicate executor must be removed under implementation K.
 
+## ScriptRunner status
+
+The interpreter execution path already has useful effect discipline:
+
+- immutable script revision, interpreter, invocation and represented Manager are
+  rechecked before final reservation;
+- standalone worker publishes exact process identity and cannot start before Store
+  issues its token-bound `Allow`;
+- restart reconciles the same process family and never launches a replacement script;
+- result/stdout/stderr, parent terminal state and current typed child admissions commit
+  together;
+- identical terminal replay admits no second child;
+- automation consumes exact bounded lifecycle projections and revalidates pending
+  trigger intents after transfer/edit.
+
+Current action handling is not implementation-ready:
+
+1. child request identity hashes `(parent Operation, ScriptRun, effect kind)`, so two
+   valid same-type actions collide instead of using `(ScriptRun, action_index)`;
+2. rejected actions have no indexed lifecycle or exact retry path; rerunning the parent
+   would risk duplicating actions that already applied;
+3. `script.describe` advertises `operation.get`, but public `script.run` readback returns
+   `result_status=not_projected`, hiding Store action outcomes and child Operation IDs;
+4. the closed effect set is limited to Task creation and mailbox messages, not exact
+   native Send/Reply/Configure/Goal where a real consumer requires them;
+5. a missing executor pin creates a durable run which later fails before start instead
+   of rejecting admission; the compatibility launcher remains;
+6. queued cancellation is exact and starts no worker, but no public token-addressed
+   mid-run ScriptRun cancellation path was found.
+
+See [ScriptRunner](script-runner.md) for the retained boundary and finite cut.
+
 ## Required behavior to preserve
 
 | Behavior | Target owner | Current gap |
@@ -91,6 +125,7 @@ Two implementation gaps remain:
 | Corrections return all findings and may resubmit same Attempt | Submission/review owners | Delivery classification and finite progress remain. |
 | Acceptance proves frozen requirements for exact candidate | Common evidence gate | Direct review/finding provenance AR-064. |
 | Required machine evidence is process/coverage/byte-backed | CheckRunner + acceptance | Standalone-only cut and live qualification. |
+| Script execution and returned actions never replay together | ScriptRunner + indexed child Operations | Action index/readback/retry and cancellation gaps AR-071–078. |
 | Harness Goal and Eliot messages are independent | Native adapter Goal + ordinary Send | Current progression machinery and route gaps. |
 | Governor sees unmatched native/process/worktree facts | Independent collectors + joined view | Binding-rooted partial views remain. |
 | Direct peer collaboration survives council deletion | One recipient-indexed mailbox | Coordination platform still exists. |
@@ -120,10 +155,10 @@ end-to-end cycle. Most of it remains unexecuted.
 
 ## Next work
 
-**Audit:** follow the ScriptRun chain named in
-[audit-register](agent-operations/audit-register.md#resume-here), including every typed
-returned action, cancellation, transfer and restart. Then continue remote Git/GitHub
-effect ownership.
+**Audit:** follow the Forge/GitHub effect chain named in
+[audit-register](agent-operations/audit-register.md#resume-here): remote push/readback,
+managed labels, PR metadata and publication automation. Prove one effect owner and exact
+successor readback after an ambiguous write.
 
 **Runtime:** implement Antigravity A1b–A3 first. Use existing owners, remove replaced
 paths in the same slice, and run format plus minimal affected warnings-denied Clippy/
