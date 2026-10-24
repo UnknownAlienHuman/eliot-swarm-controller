@@ -2,35 +2,56 @@
 
 The V3 target is a compact controller for native-agent work. Implementation is partial;
 [status](../implementation-status.md) separates landed code, source evidence and
-unexecuted qualification.
+unexecuted qualification. The whole-project source audit and documentation-readiness
+gate are **not complete**.
 
 ## Read in this order
 
-1. [Architecture](architecture.md): product purpose and non-negotiable boundaries.
-2. [Implementation](implementation.md): the single implementation order and owners.
-3. The contract for the assigned slice and its current source.
+1. [Documentation authority map](documentation-map.md): what is current, evidence or historical.
+2. [Architecture](architecture.md): product purpose and non-negotiable boundaries.
+3. [Failure-prevention register](failure-prevention-register.md): prior failures and mandatory gates.
+4. One approved [task packet](task-packet-template.md) for the assigned exact source revision.
+5. The domain contract and current source named by that packet.
 
-Coding agents receive one narrow slice. They do not receive the whole audit archive.
+[Implementation](implementation.md) is the strategic dependency/order map. It is not a
+self-contained worker assignment. Coding agents receive one narrow slice and do not
+receive the whole audit archive or repository-wide A–V roadmap.
 [AGENTS.md](../../AGENTS.md) owns collaboration and verification practice.
+
+## Current readiness
+
+The generated [documentation readiness report](documentation-readiness-report.md)
+and [machine inventory](documentation-inventory.json) check local links, explicit
+incompleteness markers and classification. They do not prove source or runtime
+correctness.
+
+Until the report and [implementation status](../implementation-status.md) both record a
+completed whole-project source audit, agents may implement only explicitly approved
+slices with exact current symbols and acceptance evidence. No document may describe
+unmerged code as landed.
 
 ## Resume research after an interruption
 
 Start at [current audit / Resume here](audit-current.md#resume-here). It names the exact
-inspected head, latest connected trace and next chain. Compare live `main` first; reopen
-only changed owners and consumers.
+inspected source basis, latest connected trace and next audit chain. Compare live
+`main` first; reopen changed owners and consumers. Do not replace the audit task with an
+implementation slice.
 
 The original [AR-001–078 register](audit-register.md) and later immutable checkpoints
-are retained as historical evidence. [Audit index](audit-index.md) maps every range to
-its snapshot and current target owner. Do not infer a runtime repair from documentation,
-a search hit or a test that was only read.
+are retained as evidence. [Audit index](audit-index.md) maps every AR range to its
+snapshot and target owner. The [failure-prevention register](failure-prevention-register.md)
+then maps every range to a current invariant and required closure evidence. Do not
+infer a runtime repair from documentation, a search hit or a test that was only read.
 
 ## Current contracts
 
 | Document | Responsibility |
 | --- | --- |
 | [Implementation status](../implementation-status.md) | Landed behavior, source-audit state and qualification limits. |
-| [Current audit](audit-current.md) | Active findings, exact resume point and latest source trace. |
+| [Current audit](audit-current.md) | Active source findings, exact resume point and untraced boundaries. |
 | [Audit index](audit-index.md) | Immutable evidence checkpoints and source/target navigation. |
+| [Failure prevention](failure-prevention-register.md) | AR/PF invariants, implementation owner and closure evidence. |
+| [Task packet](task-packet-template.md) | Exact assignment format for one implementation slice. |
 | [Delivery](delivery.md) | Assignment, capture, review, correction, acceptance and publication cycle. |
 | [Configuration](configuration.md) | Manager policy and the target current-state loop. |
 | [Module API](module-api.md) | Semantic harness actions, result delivery and recovery. |
@@ -52,16 +73,19 @@ a search hit or a test that was only read.
 
 | Question | Read |
 | --- | --- |
+| What may an agent treat as current? | [Documentation authority map](documentation-map.md) |
 | What must the product do? | [Architecture](architecture.md), [delivery](delivery.md) |
-| What should be implemented next? | [Implementation runtime order](implementation.md#5-runtime-order) |
+| What is the strategic order? | [Implementation runtime order](implementation.md#5-runtime-order) |
+| What may this worker change now? | Its approved [task packet](task-packet-template.md) |
+| Which previous failures constrain this slice? | [Failure prevention](failure-prevention-register.md) |
 | How does Store schema compatibility work? | [Store evolution](store-evolution.md) |
 | How do frontend concurrency and subscriptions work? | [IPC/MCP](ipc-mcp.md) |
 | Where did source research stop? | [Current audit](audit-current.md#resume-here) |
 | What evidence supports a finding? | [Audit index](audit-index.md#evidence-checkpoints) |
 | What can be reused or must be requalified? | [Donor map](donor-map.md) and [donor inventory](../agent_swarm.donors-20260929.toml) |
-| Why did an old design exist? | Historical program/specification files; never resume them as current work orders. |
+| Why did an old design exist? | Historical/evidence documents classified by the authority map; never resume them as current work orders. |
 
-Update the owning contract and current register in the same change. Supporting documents
-cannot reintroduce a duplicate workflow engine, compatibility facade, frontend state
-store, separate execution authority or routine human handoff in place of connected
-automation.
+Update the owning contract, task packet, status and affected audit/prevention entries in
+the same change. Supporting documents cannot reintroduce a duplicate workflow engine,
+compatibility facade, frontend state store, separate execution authority or routine
+human handoff in place of connected automation.
