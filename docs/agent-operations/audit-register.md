@@ -7,38 +7,38 @@ continuation point; [implementation](implementation.md) owns source changes,
 
 ## Resume here
 
-- Checkpoint: **2026-10-23 / ScriptRun execution, typed actions and recovery**.
-- Source inspected at **`8d8a44652d110f29031b2ddfdf6db98a5fc7001f`**.
+- Checkpoint: **2026-10-23 / Forge and GitHub remote effects, recovery and ownership**.
+- Source inspected at **`38db378c559dd0d95cd60db26702ffa73a954258`**.
   Runtime source is still **`c92120ed70ca7e625440a8a19517c481e73b13c9`**
-  from 2026-10-21; the intervening **21 commits are documentation-only**.
+  from 2026-10-21; the intervening **22 commits are documentation-only**.
 - Last connected chain:
-  `store/scripts` admission/pending/start/finish → `scripts::runner` and
-  `swarm-script-worker` → `swarm-scripts` result/effect validation → child Store
-  mutations → `operation.get`/script registry readback → queued cancellation →
-  automation lifecycle intake and transfer revalidation.
-  New evidence is [AR-071–078](#trace-2026-10-23-scriptrun).
-- Overall audit: **incomplete, 78 entries**. Entries include defects, preserved
-  mechanisms, scope corrections and partial boundaries; they are not 78 bugs or a
-  measured completion percentage.
-- Preserved in this pass: immutable script revision/invocation; Store Allow before
-  interpreter execution; exact process-family recovery without replay; atomic parent
-  terminal plus current child admissions; exact bounded lifecycle occurrence and
-  transfer-time revalidation.
-- Open in this pass: same-type returned actions collide because identity omits
-  `action_index`; rejected actions have no durable independent lifecycle/retry; public
-  parent readback hides action results/child Operation IDs; the action vocabulary is
-  too narrow; executor selection is checked after durable admission; exact public
-  mid-run cancellation is absent.
-- **Next exact chain:** `store/forge::{reserve,next,ready,finish,reconcile}` →
-  `swarm-forge-worker` remote push/readback → `store/github_effects` managed labels →
+  `store/forge::{reserve,next,ready,finish,reconcile}` → `swarm-forge-worker`
+  push/readback → `store/github_effects` managed labels →
   `store/github_pr_effects` PR metadata → automation publication/projection →
-  restart/transfer/unknown write. Prove one effect owner per remote mutation and exact
-  successor readback without repeating a write.
+  restart, transfer and ambiguous-write settlement.
+  New evidence is [AR-079–087](#trace-2026-10-23-forge-github-effects).
+- Overall audit: **incomplete, 87 entries**. Entries include defects, preserved
+  mechanisms, scope corrections and partial boundaries; they are not 87 bugs or a
+  measured completion percentage.
+- Preserved in this pass: one admitted Forge Operation before external I/O; exact
+  accepted-candidate/ref/commit/tree identity; force-with-lease; exact remote-ref
+  readback; bounded per-target serialization; retained native-worker custody; and PR
+  reconciliation that records an already-authorized GET without rechecking current GM.
+- Open in this pass: GitHub API writes have two execution owners; direct `GhCli`
+  writes lack pinned executable/process-family custody; automatic label recovery
+  ignores `outcome_unknown`; post-write label completion is incorrectly coupled to
+  current automation/source/candidate state; publication/projection keep copied
+  workflow state; PR metadata has no automatic policy caller.
+- **Next exact chain:** `store/github` source poll/observer/work-pool mutation →
+  GitHub Issue/PR pagination and source revisions → Task creation/revision/import →
+  automation intake → independent remote-ref observation. Prove collection cannot
+  mutate Tasks in the same ownership path and that enabled import uses one ordinary
+  Task command without copied work-pool lifecycle.
 - Runtime implementation order remains **A1b–A3, then B–V**. The source audit does not
   reorder implementation.
-- Still unqualified: live Windows/Linux process behavior, power loss, installed
-  providers, load/fairness, the autonomous end-to-end work cycle and every boundary
-  listed in the index.
+- Still unqualified: live Git/GitHub/Windows/Linux behavior, power loss, installed
+  credentials/accounts, load/fairness, the autonomous end-to-end work cycle and every
+  boundary listed in the index.
 - Documentation only. No runtime code, Clippy, test, benchmark or installed-harness
   qualification changed in this checkpoint.
 
@@ -135,6 +135,15 @@ the [index](audit-index.md#evidence-checkpoints) links the detailed snapshots.
 | <a id="ar-076"></a>AR-076 | Script executor selection | **Source-confirmed transition gap.** Missing executor pin is accepted into a durable queued run, then deterministically fails before start as `SCRIPT_EXECUTOR_UNSELECTED`. A compatibility launcher remains but delegates to standalone worker. | Reject before run admission, select standalone for all new work, disposition history and delete compatibility path. |
 | <a id="ar-077"></a>AR-077 | Automation ScriptRun occurrence and transfer | **Preserve boundary.** Lifecycle triggers require exact observation/Operation/run/result/timestamp readback. Pending intent carries the original occurrence across transfer/edit and revalidates current Manager, script, source and optional Task scope before admission. | Preserve this identity while replacing copied cursor/journal machinery with the one loop. |
 | <a id="ar-078"></a>AR-078 | ScriptRun cancellation | **Partial.** Queued ordinary cancellation atomically prevents start, marks the run terminal-before-start and emits one exact lifecycle event. Generic cancellation refuses in-flight work; no public token-addressed mid-run ScriptRun cancellation was found. | Persist exact cancellation intent, signal only the owned family, retain partial output and settle after proven departure; timeout is not cancellation. |
+| <a id="ar-079"></a>AR-079 | Forge publication identity and readback | **Preserve.** One retained `forge.publish_ref` binds the accepted candidate, commit/tree, exact repository/ref, expected old target and create/update policy before worker authorization. Push uses exact force-with-lease semantics and settles only from exact remote-ref readback. | Keep this write-before-effect and readback boundary while deleting manifest/proof duplication; live provider/Git qualification remains separate. |
+| <a id="ar-080"></a>AR-080 | Forge worker custody and restart | **Preserve plus boundary.** Per-target serialization, retained executable/plan/owner/result files, process-family custody and fair dispatch/reconcile cursors prevent a second push. Restart converts uncertain execution to readback-only and never launches another writer. | Damaged or uninspectable custody can hold the repository; preserve conservative isolation, but routine recoverable holds must continue through the ordinary reconciler rather than a manual release path. |
+| <a id="ar-081"></a>AR-081 | GitHub API effect ownership | **Source-confirmed open split.** Managed labels execute through kernel-host `GhCli`, while PR title/body PATCH executes inside `swarm-forge-worker`; remote Git push is another Forge phase. The two GitHub API writes have different executable, custody and recovery owners. | Keep remote Git in Forge; move label and PR metadata writes to one GitHub API effect owner with one exact readback contract and no fallback writer. |
+| <a id="ar-082"></a>AR-082 | Direct `GhCli` executable and process custody | **Source-confirmed open.** `github::client::run_gh_api` resolves bare `gh` at spawn time, uses a direct child with `kill_on_drop`, and retains no executable digest, PID/birth/group/Job or successor custody. A write may have happened before cancellation/restart, while only Operation state survives. | Admit a pinned installed GitHub writer, retain its exact process family through departure, and recover only by the original target readback; never repeat the API mutation. |
+| <a id="ar-083"></a>AR-083 | Automatic managed-label unknown recovery | **Source-confirmed open.** Host restart marks `sending` label writes `outcome_unknown`, but `automation_github_projection::reconcile_effects_once` selects only `queued`; `call_automatic` refuses unknown work and requires the Manager-only reconciliation path. | The one current-state loop must admit or resume exact readback for automated unknown effects under retained on-behalf authority, without replaying `set_label` or requiring routine human action. |
+| <a id="ar-084"></a>AR-084 | Post-write label completion authority | **Source-confirmed open.** After `sending`, both automatic readback and settlement re-run `GithubProjectionContext::require_current`, current accepted-candidate checks, source revision and current slot. Disable/edit/transfer/source refresh can therefore turn an exact observed desired state into `observed_but_unsettled`/`outcome_unknown`. | Separate pre-write authority from completion authority. After the effect boundary, immutable Operation/target/slot identity plus authorized readback must settle the original effect despite later policy or source changes. |
+| <a id="ar-085"></a>AR-085 | PR description reconciliation | **Preserve; use as internal donor.** Production PATCH uses a pinned native worker and retained family custody. A separate readback Operation verifies exact repository/PR/head/base/publication and, after the authorized GET, records the observation without rechecking current GM rights. | Move the PATCH into the selected GitHub API owner while retaining this immutable-target and post-readback settlement pattern. |
+| <a id="ar-086"></a>AR-086 | Publication/projection workflow copies | **Source-confirmed structural excess.** Publication and label projection each retain global/per-entry cursors, activation/catch-up state, recent records, pending/retry lists or an effect-drain cursor around already durable acceptance facts and Operations. | Replace with bounded current-state selection in the one host loop; keep occurrence/effect identity, exact slots and Forge/GitHub readback, not copied workflow lifecycle. |
+| <a id="ar-087"></a>AR-087 | Automatic PR metadata path | **Source-confirmed missing caller.** `github.pull_request.update_description` is exposed as a manual Manager tool and tested as manual; publication automation reserves Forge push and label projection reserves managed labels, but no enabled policy action admits the PR metadata Operation. | When selected by policy, admit the same ordinary PR metadata Operation after exact publication; do not create another PR workflow or make routine metadata a human-only step. |
 
 ## Evidence checkpoints
 
@@ -158,243 +167,122 @@ register. Use the current disposition above when an older snapshot is broader.
 | AR-051–058 | [`4af640e`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/4af640ea6edc190d58a7320674c85cbc5bd3c6b3/docs/agent-operations/audit-register.md#trace-2026-10-23-goal-policy) |
 | AR-059–064 | [`5b6b5be`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/5b6b5bee92123ce7d3252054c939fb18619b790f/docs/agent-operations/audit-register.md#trace-2026-10-23-review-acceptance) |
 | AR-065–070 | [`8d8a446`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/8d8a44652d110f29031b2ddfdf6db98a5fc7001f/docs/agent-operations/audit-register.md#trace-2026-10-23-checkrun) |
-| AR-071–078 | [Current source trace](#trace-2026-10-23-scriptrun) |
+| AR-071–078 | [`62874c8`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/62874c87ecc12af1544e1a6318bf78b5d687426a/docs/agent-operations/audit-register.md#trace-2026-10-23-scriptrun) |
+| AR-079–087 | [Current source trace](#trace-2026-10-23-forge-github-effects) |
 
-<a id="trace-2026-10-23-checkrun"></a>
-## Source trace at 5b6b5be: fixed source, CheckRun and cache
+<a id="trace-2026-10-23-forge-github-effects"></a>
+## Source trace at 38db378: Forge and GitHub remote effects
 
-Inspected 2026-10-23. Paths are relative to `crates/swarm-kernel-host/src` unless
-qualified. This is a connected source read, not an executed CheckRun.
+Inspected 2026-10-23. Paths are relative to the repository root. This is a connected
+source read, not a live GitHub/Git execution or platform qualification.
 
-### AR-065–066 — fixed-source identity is strong; automatic recovery is missing
+### AR-079–080 — Forge already owns the correct remote-Git effect shape
 
-`store/checks::reserve_source` freezes the Operation, caller, Task/revision/Attempt,
-absolute repository, exact commit and workspace-lease authority. `begin_source`
-rechecks current scope in an Immediate transaction and moves only the exact queued or
-unknown Operation to `sending`. `finish_source` validates the sealed admission and
-deterministic `source-<operation digest>` artifact, but intentionally no longer
-requires the Task/Attempt to remain current. An already-started capture can therefore
-finish historically instead of being discarded by a later revision or release.
+`store/forge::reserve` admits one exact accepted-candidate publication. The retained
+intent includes project, Task/Attempt, candidate/submission, commit/tree, canonical
+repository, target ref, expected old target and create/update policy. Direct and
+automation callers converge on this owner. Before external I/O, `begin` and
+`dispatch_authorized` recheck the exact Operation, current accepted candidate, policy,
+slot and prepared executable identity, then move only that Operation through the
+durable effect boundary.
 
-`checks/source` reads one exact commit/tree through bounded Git object operations. It
-records every accepted regular file's path, mode, blob identity, length and digest,
-rejects unsupported or ambiguous entries, publishes immutable bytes and verifies the
-whole manifest again before Store settlement. It does not fetch, checkout, stage,
-execute hooks or include uncommitted edits.
+`swarm-forge-worker` performs one bounded push with exact force-with-lease semantics,
+then reads the exact remote ref. The Store settles Applied only when that readback
+equals the retained candidate commit. A transport/CLI failure does not authorize a
+second push. `Store::supervise_forge_once` reconciles unknown work before dispatching
+new work; separate rotating cursors and one oldest Operation per target keep dispatch
+and readback bounded without letting one repository monopolize every pass.
 
-On host startup, every `sending`/`native_accepted` Operation becomes
-`outcome_unknown`. `Store::capture_source` is the only production executor found: it
-performs reserve → begin → off-DB Git/file work → finish in the requesting call.
-`begin_source` permits the same exact unknown Operation to repeat this read-only,
-deterministic capture, but no scheduler/recovery owner selects it automatically.
-Do not add a source workflow. Reuse the original Operation/admission and either settle
-the already published deterministic artifact or rerun the exact commit read under a
-bounded current-state reconciler.
+Worker executable/plan/owner/result files and process-family receipts are retained.
+Restart never starts another writer for the same Operation. An unresolved or
+uninspectable family holds that repository instead of guessing it is free. Preserve
+this conservative isolation and exact readback. Simplification should remove proof and
+workflow copies, not the write-before-effect, force-with-lease, target lane, custody or
+readback guarantees.
 
-### AR-067 — one command, one admitted owner, no replay
+### AR-081–082 — GitHub API mutations have two owners and one weak process boundary
 
-Check admission resolves the trusted profile, candidate/baseline, executable and
-toolchain bytes, effective argv/environment, dependency scope and parser targets before
-the final Immediate reservation. A changed fact invalidates the prepared plan.
+Managed Issue labels call `github::client::GhCli` directly from kernel-host.
+PR title/body updates prepare `github_pr_description` work and execute the PATCH inside
+`swarm-forge-worker`. Remote Git push is a distinct Forge phase, which is appropriate;
+the two REST mutations are not. They currently have different executable selection,
+process custody, timeout and recovery implementations.
 
-Both current executors use `swarm_checks::execute_with_plan`. The worker enters its
-owned Job/process group and publishes exact process identity before reading the Store
-Go file. Missing or uncertain Go never starts the command. Execution uses direct argv,
-`env_clear`, the admitted working directory and bounded output files. Cancellation is
-token/CheckRun-addressed. Host restart changes `running` to `reconciling`; recovery
-reads retained launch/worker/terminal/completion facts, observes exact family departure,
-and never launches a replacement command.
+`github::client::run_gh_api` spawns bare `gh`, uses a direct child with
+`kill_on_drop(true)`, bounds stdout and timeout, and performs no Rust retry. Those are
+useful local bounds, but no admitted executable digest, PID/birth/group/Job, private
+owner record or successor process custody survives. Host startup can mark a retained
+`sending` label/PR Operation `outcome_unknown`, but it cannot establish what happened
+to the dropped direct `gh` family. Move both REST effects to one selected GitHub API
+owner; keep Forge for remote Git only.
 
-Unknown or live process ownership holds only that target resource. Resource release
-requires confirmed group emptiness or exact retained departure proof; elapsed time,
-a free lock or a signal request is insufficient.
+### AR-083–084 — automated label readback is not autonomous and can reject truth
 
-### AR-068 — a pass is more than exit zero
+Host recovery converts a `sending` managed-label Operation to `outcome_unknown`.
+`automation_github_projection::reconcile_effects_once` selects only `queued`
+Operations. `github_effects::call_automatic` explicitly refuses `outcome_unknown` and
+points to the retained Manager reconciliation path. Therefore enabled automation does
+not complete its own ambiguous write after restart even though the domain has an exact
+read-only reconciliation method.
 
-`checks/worker::validate_passed_coverage` rejects any gap. `ExitCode` requires the exact
-`process_exit` coverage. `CargoJson` additionally requires the complete expected target
-set, unique captured package/manifest/source/kind identities, matching emitted
-artifacts, `build_finished=true` and zero parser errors.
+The problem continues after the write in the same call.
+`validate_automatic_readback` and `persist_automatic_effect` invoke
+`GithubProjectionContext::require_current`, revalidate the current accepted candidate,
+registered source revision and current effect slot. If policy is disabled/edited, GM
+epoch changes without the exact transfer continuation, or the source revision changes
+after the write, an exact desired-state GET is stored as
+`observed_but_unsettled`/`outcome_unknown`. Current authority is required before a new
+write; it must not erase completion authority for an already admitted immutable effect.
 
-Completion verifies source bytes again, all result/output artifacts, profile identity,
-input fingerprint, scope plan, process receipt and resource release. A passed row must
-have exit code zero and `source_checkout_verified=true`.
+### AR-085 — PR reconciliation contains the better completion pattern
 
-`store/acceptance::evidence` repeats the exact required profile/revision and parser
-coverage checks, verifies the settled applied CheckRun Operation and loads every result
-and output artifact into the byte manifest. This extends AR-063: the common acceptance
-gate is backed by a strongly validated producer. It does not resolve AR-064's missing
-common assigned-review/finding provenance.
+Production PR PATCH uses the pinned native worker and records its process-family result.
+An ambiguous original Operation is reconciled by a separate readback Operation bound to
+the exact publication, repository, PR ID/number, published head, target/base refs and
+requested title/body digest. After the authorized GET,
+`resolve_reconcile_target_after_readback` intentionally rechecks immutable target and
+slot facts without rechecking current GM rights; `persist_reconcile_readback` can then
+settle the original unknown Operation. This is the internal donor for managed-label
+completion after the REST writer is consolidated.
 
-### AR-069 — reuse follows the original process, not the cached row
+### AR-086–087 — copied workflow state remains, while PR metadata stays manual
 
-A cache candidate must be one original passed row: no `cached_from`, exit zero, released
-resource, reusable profile, reproducible/versioned inputs, exact cache key, resolved
-inputs, scope plan, coverage, process receipt, result and output bytes. Its source
-candidate must still be the same accepted candidate for the project.
+`automation_publication` retains a global cursor, activation/catch-up state, a
+per-entry pending/retry list and recent records around durable acceptance facts and
+Forge Operations. `automation_github_projection` retains another global cursor,
+per-entry projection state/recent list and a separate effect-drain cursor around
+durable acceptance facts, effect slots and managed-label Operations. These are the
+workflow copies implementation E/U already intends to remove; exact occurrence and
+effect identity remain necessary.
 
-After off-DB byte verification, the final admission transaction reruns the cache
-identity check before creating the derivative row. The derivative has no process or
-exit code of its own by design. Acceptance follows `cached_from_check_id` back to the
-original row, rejects chains, revalidates the original Operation/process/coverage/
-outputs and compares current accepted-source provenance with the frozen cache receipt.
-Therefore `exit_code=null` on the derivative is not an acceptance shortcut.
+`github.pull_request.update_description` is exposed and tested as a manual
+Manager-scoped tool. Publication automation reserves Forge push; GitHub projection
+reserves labels. No enabled policy consumer admits the same ordinary PR metadata
+Operation. When policy selects that effect, it must use the existing exact
+publication-bound command and the common GitHub API owner, not a third PR workflow.
 
-### AR-070 — the duplicate executor is transitional, not evidence authority
-
-`CheckConfig.executor` is optional. With no pin, new CheckRuns still spawn the
-kernel-host worker. With a verified absolute executable/SHA/artifact/version pin,
-`standalone_host` launches `swarm-checks` and never falls back. Both routes share the
-same resolved plan, Store-Go control, process-group executor and completion validators.
-
-Implementation K already selects standalone `swarm-checks` for new work. Migration must
-first select it everywhere and disposition concrete old runs, then remove the in-host
-worker, fallback configuration, fixtures and dependency edges. Do not keep both merely
-because their evidence is equivalent.
-
-## Inspected source boundaries for AR-065–070
-
-| Source | Read boundary |
-| --- | --- |
-| `store/checks.rs` | Source reserve/begin/finish; CheckRun plan/reservation; pending selection; Go/cancel; completion/recovery; cache selection and final recheck. |
-| `checks/source.rs` | Git object resolution, manifest/path rules, artifact publication and full byte verification. |
-| `checks/worker.rs` | Resolved work, Store control adapter, coverage parser, completion validation, release/recovery. |
-| `checks/standalone_host.rs` | Executor pin verification, one-use plan materialization and standalone execution receipt. |
-| `swarm-checks/src/lib.rs` | Process-group entry, Store-Go gate, direct command execution, bounded capture, cancellation and family departure. |
-| `checks/model.rs` | Profile and executor configuration, trusted environment/tool constraints and request shape. |
-| `store/acceptance.rs`, `swarm-kernel/acceptance.rs` | Exact profile/check/cache lineage, artifact manifest and begin/finish revalidation. |
-| `store/mod.rs` | Host-interruption transition and synchronous source-capture caller. |
-
-<a id="trace-2026-10-23-scriptrun"></a>
-## Source trace at 8d8a446: ScriptRun, actions and automation
-
-Inspected 2026-10-23. This is a connected source read, not an executed ScriptRun or
-platform qualification.
-
-### AR-071 — effect kind is not action identity
-
-`ScriptResult` permits a bounded ordered vector of effect requests. The grant set is
-unique by effect kind, but several result entries may legitimately use one granted
-kind. `script_effect_request_id`, however, hashes only parent Operation, run ID and
-effect kind. After the first child consumes that request identity, a second same-kind
-entry is rejected as a conflict. The parent settles `effects_incomplete` even though
-both result entries validated.
-
-Carry `action_index` from the validated ordered result through cause, request identity,
-public readback and child link. Bind the index to effect kind and canonical payload
-digest. Do not infer identity from text or generate a fresh request ID on retry.
-
-### AR-072 — worker custody prevents script replay
-
-Registration freezes bundle/interpreter identity, schema and effect grants. Final
-ScriptRun reservation rechecks active revision, invocation and represented Manager in
-an Immediate transaction. The standalone worker enters the owned process group,
-publishes exact worker identity and waits for Store's first-writer-wins start decision.
-Only exact `Allow` materializes the one-use plan and starts the interpreter.
-
-The bounded executor uses direct argv, cleared environment, fixed input/result/output
-limits and a five-minute maximum duration. Restart changes active rows to recovery.
-Recovery examines the same worker/start/terminal/completion/process family; it may
-publish one retained completion or settle proven departure as incomplete, but never
-spawns a replacement interpreter.
-
-### AR-073 — current child admissions are atomic; effects stay child-owned
-
-`finish` validates the exact run, worker, revision, bundle, Task/Attempt scope, result
-schema and granted effects. It registers result/stdout/stderr, applies current Store
-actions, writes the parent terminal result and lifecycle observation in one Immediate
-transaction. A Store error rolls everything back. Replaying an identical completion
-sees the terminal parent and does not admit children again.
-
-Current children are Store-local Task/message mutations. Preserve the transaction when
-adding a retained typed action, but perform native/network/Git I/O only through the
-ordinary admitted child Operation after commit. Parent completion means the action was
-admitted or rejected; it never means an external child effect completed.
-
-### AR-074 — no independent action disposition or usable parent readback
-
-An action rejected by current authority/state is represented only inside private
-parent `result_json.controller_effects`; no child Operation or indexed action row
-exists. There is no exact way to retry that one original action after a relevant state
-change. Rerunning the script could duplicate siblings that already applied.
-
-The script registry tells clients to read `operation.get`, but the public operation
-projection deliberately returns `result_status=not_projected` for `script.run`. The
-Manager cannot see Store-applied/rejected action status or child Operation IDs through
-the advertised read path.
-
-Use one bounded ActionRecord per result index. Public parent readback exposes safe
-ordered status and child ID. The child Operation/domain remains authoritative for its
-own effect. Retry only the same unadmitted action; never rerun the script or recreate an
-admitted child.
-
-### AR-075–076 — closed vocabulary and executor cut
-
-Current wire effects are Task creation, Manager notification and Task-owner mailbox
-message. The last action calls `message.send`; it is not native `agent.send`. This does
-not supply script-controlled Reply, Configure, Goal or Send required by selected future
-consumers. Add only narrow typed variants that call existing ordinary Store handlers.
-Do not add generic method names or arbitrary JSON passthrough.
-
-New work copies optional `Config.scripts.executor` into its retained work. If absent,
-the queued run is later failed before start as `SCRIPT_EXECUTOR_UNSELECTED`; no
-interpreter runs, but a durable run was needlessly admitted. The old `ScriptWorker`
-entry remains a compatibility wrapper around the standalone worker rather than a second
-productive executor. Reject missing pin before reservation, select standalone for new
-work, then delete the wrapper and obsolete config/tests after concrete history is
-disposed.
-
-### AR-077 — lifecycle and transfer facts are exact
-
-Automation intake accepts a ScriptRun event only after joining exact source stream,
-observation, Operation, run, terminal result, timestamps and bounded state. It projects
-only occurrence/status/run identity, never raw script content.
-
-Pending ScriptRun trigger intent carries the original occurrence through entry transfer
-or edit. Before admission it rechecks the current Manager registration, entry/project,
-script owner and active revision, source and optional Task/Attempt. Invalid intent is
-held or quarantined rather than silently redirected. An admitted run retains its
-original represented Manager; returned actions still recheck current rights/subject
-before child admission.
-
-Preserve this separation while deleting per-product cursors/journals into the single
-current-state loop. Transfer does not rewrite the parent or child authorship.
-
-### AR-078 — cancellation is complete only before start
-
-Generic `operation.cancel` accepts the queued ScriptRun only. In the same transaction,
-`record_operation_cancelled_tx` changes its retained run from queued to terminal failed
-before start and writes one exact `script.cancelled` lifecycle event. No worker has
-received Allow.
-
-Once the Operation is in flight, generic cancellation refuses it. No public exact
-ScriptRun cancellation command was found. The execution timeout eventually bounds the
-process but does not express attributable cancellation. A retained cancellation action
-must persist intent, address the run/token, signal only the proven owned family, keep
-partial output and settle after actual departure.
-
-## Inspected source boundaries for AR-071–078
+## Inspected source boundaries for AR-079–087
 
 | Source | Read boundary |
 | --- | --- |
-| `store/scripts.rs` | Registry/run admission; pending fairness; start decision; terminal/recovery; returned effects; cancellation and action links. |
-| `scripts/runner.rs`, `swarm-script-worker` | Executor pin, private receipt/invocation, process-group start, one-use Allow and compatibility wrapper. |
-| `swarm-scripts/{protocol,schema,result}.rs` | Closed effect vocabulary, grants, result vector validation and process/control DTOs. |
-| `scripts/registry.rs` | Public script/run inventory and advertised current-state read method. |
-| `store/operations.rs` | Queued-only ordinary cancellation and public operation projection. |
-| `store/automation_intake.rs` | Exact ScriptRun lifecycle/terminal projection. |
-| `store/automation_dispatch.rs` | Pending occurrence, transfer relocation and current-authority/source revalidation. |
-| `automation/authorization.rs`, `config.rs` | Represented Manager/effect admission and executor configuration. |
+| `crates/swarm-kernel-host/src/store/forge.rs` | Admission/slot identity, begin/authorization, target lanes, dispatch/reconcile cursors, finish, process-tree hold and restart readback. |
+| `crates/swarm-forge-worker/src/main.rs` | Push force-with-lease/readback and `github_pr_description` PATCH worker. |
+| `crates/swarm-kernel-host/src/store/github_effects.rs` | Direct/automatic label admission, one write, readback, unknown recovery and settlement fences. |
+| `crates/swarm-kernel-host/src/store/github_pr_effects.rs` | Worker-backed PATCH, retained target, exact reconciliation and post-GET settlement. |
+| `crates/swarm-kernel-host/src/github/client.rs` | `GhCli` REST transport, executable spawn, timeout, response bounds and no-retry behavior. |
+| `crates/swarm-kernel-host/src/automation/authorization.rs` | Retained GitHub projection context, current/transfer authority and source-revision checks. |
+| `crates/swarm-kernel-host/src/store/automation_publication.rs` | Acceptance cursor, pending/retry state and Forge reservation. |
+| `crates/swarm-kernel-host/src/store/automation_github_projection.rs` | Acceptance/projection state, queued-only effect drain and transfer relocation. |
+| `crates/swarm-kernel-host/src/store/mod.rs` | Host-start conversion of interrupted GitHub writes and automation/Forge supervision order. |
 
-Selected paths, not whole-file certification. Interpreter/platform behavior and power
-loss were not executed.
+Selected paths and symbols, not whole-file certification. External GitHub semantics,
+installed `gh`, real remotes, process trees and power loss were not executed.
 
 ## Next work
 
-Continue the Forge/GitHub effect chain named in [Resume here](#resume-here). Distinguish
-remote Git publication from GitHub API metadata, and collection/import from writes.
-Every unknown write needs one retained owner and exact readback; a fresh request ID is
-not recovery.
-
-The [audit index](audit-index.md#coverage-still-open) owns remaining coverage.
-Documentation updates close no runtime finding.
+Continue the GitHub source/import chain named in Resume here. Separate collection,
+policy import and writes in the evidence before changing the target. Trace pagination,
+high-water/source revision, Issue versus PR identity, Task mutation/work-pool coupling,
+restart/transfer and remote-ref observation. Preserve bounded reads and immutable source
+identity; do not keep collection as a Task/effect workflow or replace routine import
+with operator steps.
