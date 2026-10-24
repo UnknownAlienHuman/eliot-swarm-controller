@@ -1,0 +1,32 @@
+name: Documentation readiness audit
+
+on:
+  push:
+    branches:
+      - docs/agent-ready-audit-20261024
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: docs/agent-ready-audit-20261024
+      - name: Generate documentation inventory
+        run: python tools/ci/documentation_readiness_audit.py
+      - name: Publish audit evidence
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add docs/agent-operations/documentation-readiness-report.md docs/agent-operations/documentation-inventory.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "docs: record documentation readiness inventory"
+          git push origin HEAD:docs/agent-ready-audit-20261024
