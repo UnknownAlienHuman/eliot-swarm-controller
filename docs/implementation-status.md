@@ -2,159 +2,132 @@
 
 ## Current state
 
-**SOURCE_AUDIT_INCOMPLETE / TARGET_DOCUMENTS_WORKING_DRAFT / RUNTIME_REFACTOR_IN_PROGRESS.**
+**SOURCE_AUDIT_INCOMPLETE / TARGET_DOCUMENTS_WORKING DRAFT /
+RUNTIME_REFACTOR IN PROGRESS.**
 
-Repository inspected on **2026-10-23** at
-`4af640ea6edc190d58a7320674c85cbc5bd3c6b3`. The latest runtime change is
-`c92120ed70ca7e625440a8a19517c481e73b13c9` (2026-10-21). Comparing those revisions
-shows **19 documentation-only commits**. This update also changes documentation only.
+Source was inspected on **2026-10-23** at
+`5b6b5bee92123ce7d3252054c939fb18619b790f`. The latest runtime change remains
+`c92120ed70ca7e625440a8a19517c481e73b13c9` from 2026-10-21. The **20 intervening
+commits are documentation-only**; documentation progress is not runtime progress.
 
-The previous checkpoint reached AR-058. This pass traced submission → assigned review
-→ all-findings correction → same-Attempt resubmission → acceptance and recovery. It
-adds AR-059–064, preserves AR-011 and extends AR-052 to queued repair input. The target
-now gives concrete automatic replacement, finite correction, blocker isolation and
-shared required-review checks while preserving the working frozen-evidence/byte gate.
-No runtime defect is marked repaired. Earlier long traces are linked at immutable
-commits rather than copied into every version of the active register.
+The active source register now contains **70 entries**. The latest pass closes the
+source trace for fixed source, CheckRun execution/recovery, parser coverage, cache reuse
+and the acceptance handoff. It does not mark a runtime defect repaired and it does not
+claim installed-platform qualification.
 
-- [Resume point and 64 finding records](agent-operations/audit-register.md#resume-here).
-- [Evidence/source index](agent-operations/audit-index.md): exact traces and remaining coverage.
-- [Document index](agent-operations/README.md): current contracts versus historical evidence.
-- [Implementation](agent-operations/implementation.md): the only work order.
-- [Donor register](agent-operations/donor-map.md): what to reuse, source links and version limits.
+- [Resume point and findings](agent-operations/audit-register.md#resume-here)
+- [Evidence/source index](agent-operations/audit-index.md)
+- [Architecture](agent-operations/architecture.md)
+- [Single implementation program](agent-operations/implementation.md)
+- [CheckRunner contract](check-runner.md)
+- [Donor register](agent-operations/donor-map.md)
 
-The records include defects, preserved mechanisms and partial boundaries, not 64 bugs
-or a measured audit percentage. Historical requirement mapping is selected, not an
-exhaustive reread of all archives. The private Claude-script ZIP was not re-executed.
-
-### GitHub work at the inspected checkpoint
-
-No open PRs were returned. The following open Issues are evidence/remaining work, not
-an alternative to the implementation order:
-
-| Issues | Retained scope |
-| --- | --- |
-| [#1](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/1), [#3](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/3), [#4](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/4), [#5](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/5) | OpenCodex composition; OpenCode restart; family discovery; Muse native/Windows evidence. |
-| [#140](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/140), [#159](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/159) | Antigravity and Claude/Command retained native/custody qualification. |
-| [#11](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/11), [#153](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/153) | Quiet-machine load evidence and the historical main audit. |
-
-Issue text can reference an old artifact or closed PR. Reopen the source named in this
-status before coding; do not revive that branch or infer current qualification from it.
+The 70 records include preserved behavior, scope corrections and partial boundaries,
+not 70 bugs or a completion percentage.
 
 ## Landed runtime changes
 
-| Change | Retained evidence | Remaining limit |
+| Change | Evidence | Remaining limit |
 | --- | --- | --- |
 | Duplicate host CLI/MCP launcher removed | `25a8e3b`, recorded net −1,206 Rust lines | Most runtime duplication remains. |
-| Active Antigravity route aligned on v6 | `cba98b7` | Not installed native-turn qualification. |
-| Terminal receipt decoupled from required observation | `eeea355`, recorded net −265 production Rust lines for that commit | Dispatch proof and crash-unsafe delivery remain. |
-| One dispatch producer across SUCCESS/ERROR/CANCELED | `c92120e`; historical run `39579583956`, job `119153571930`, connected regression and minimal Store Clippy | Scoped patched-runner evidence; not rerun by this checkpoint and not crash/installed/scale proof. |
+| Active Antigravity coordinate aligned on v6 | `cba98b7` | No installed native-turn qualification. |
+| Terminal receipt decoupled from Store observation | `eeea355`, recorded net −265 production Rust lines | Dispatch proof and crash-unsafe delivery remain. |
+| One dispatch producer across SUCCESS/ERROR/CANCELED | `c92120e`; historical run `39579583956`, job `119153571930` | Scoped regression/Clippy only; no crash/installed/load proof. |
 
 ```text
-A0   LANDED                  active v6 coordinate
+A0   LANDED                   active v6 coordinate
 A1a  LANDED / SCOPED PASS     terminal decoupling + producer lifecycle
 A1b  NOT IMPLEMENTED          remove dispatch proof/refresh prerequisite
 A2   NOT IMPLEMENTED          durable outcome/body/page delivery and successor completion
 A3   NOT IMPLEMENTED          real typed actions and one active route
-B–V  TARGET WORK             largely unreduced current runtime; see implementation
+B–V  TARGET WORK              largely unreduced current runtime
 ```
 
-A2 must connect adapter capture, ordinary Store settlement, exact page delivery,
-historical completion authority and complete-source retention. A file spool alone
-cannot repair queue/boot/release barriers. No native prompt is replayed and old output
-keeps its original Operation/Attempt/boot. Unacknowledged Antigravity receipts and
-uncaptured bodies remain at risk in current code.
+Runtime implementation still starts with **A1b–A3**. The audit sequence is allowed to
+inspect later owners; it does not change implementation order.
 
-## What the recent audit established
+## What source inspection has established
 
-| Boundary | Recorded result | Not yet established |
+| Area | Source-confirmed result | Still open |
 | --- | --- | --- |
-| Result/continuation/restart, AR-001–035 | Exact selected caller/Store/adapter traces, useful assembly/grants, cross-route delivery and source-cost findings | Every command/installed contract, first historical capture across revocation, live restart/power-loss. |
-| Queue/root/provider, AR-036–044, 049–050 | History-dependent admission, pending saturation, native-default mismatch, stale precedence and route-edit accounting; common claim/Open transaction preserved | Installed restart/concurrency and corrected budget continuity. No over-admission demonstrated. |
-| Shutdown/resource retirement, AR-045–048 | Non-ready shutdown barrier, intentional-detach/demand mismatch and missing attached-binding finalizer confirmed through the running sweep | Implementation of eventual retirement; actual detach/Goal/child and crash-only behavior. |
-| Goal policy/admission/transfer, AR-051–056 | OpenCode actor rejection before dispatch; Codex policy-edit rejection of queued input; submitted/correction eligibility, missing finite bounds and unclaimed-event cursor gap. Exact terminal identity/atomic deduplication preserved | Ordinary Send replacement, phase/budget fixes and installed disable/transfer/restart. Native terminal still does not prove result capture or acceptance. |
-| Calendar/native Goals, AR-057–058 | Current CheckRun occurrence continuity and latest-only catch-up; current native mappings separated from pinned upstream Goal contracts | General automation loop, Codex native Goal mapping and selected installed-native qualification. Muse's SDK lock does not identify its native binary. |
-| Submission/review/correction, AR-011/052, 059–061 | All-findings feedback and same-Attempt immutable resubmission preserved; direct replacement exists but automatic caller cannot use it. Correction rounds lack a finite bound; 64 pending results can block later work for one entry; queued repair also rechecks policy revision | Automatic replacement/finite progress/fair selection, admitted-intent fix and actual correction output capture. No infinite loop or live starvation measured. |
-| Acceptance/dependency recovery, AR-062–064 | Common frozen-plan/candidate/check/byte gate and late-check retry preserved. Revoked dependency pin aborts review pass and skips queued verification on that call. Direct acceptance lacks automatic assigned-review/finding checks | Per-subject replan, independent verification progress and required review provenance in the common gate. CheckRun producer/cache and live execution remain unqualified. |
-| Other implementation areas | Inherited structural and selected source reviews | Remaining chains listed in the audit index; no whole-project completion claim. |
+| Results/recovery, AR-001–035 | Exact selected result identity, assembly/grants and several retained delivery mechanisms; cross-route loss/recovery gaps are named. | Durable Antigravity delivery, first historical capture, complete cross-route continuation and live crash/power-loss. |
+| Queue/provider/resources, AR-036–050 | Existing root dedup and common claim/Open transaction are useful; history scans, stale precedence, cancellation and retirement gaps are concrete. | Corrected budget identity, attached-binding finalizer, installed concurrency/restart. |
+| Goals/automation, AR-051–058 | Exact terminal/occurrence identity is useful; actor, phase, transfer and finite-budget gaps are concrete; native Goal support differs by route. | Ordinary bounded Goal messages, one loop, installed native mappings and restart. |
+| Review/correction/acceptance, AR-059–064 | Direct replacement, all-findings feedback, same-Attempt resubmission and the frozen candidate/check/byte gate exist. | Automatic replacement, finite correction budget, fair subject isolation and common assigned-review/finding provenance. |
+| Fixed source and checks, AR-065–070 | Exact immutable source, Store-Go-before-command, process custody, parser coverage, strict cache lineage and acceptance revalidation exist. | Automatic recovery of interrupted `source.capture`, standalone-only new CheckRuns and live OS/toolchain/load qualification. |
+| Other areas | Structural and selected source reviews remain indexed. | Script/Forge/GitHub effects, Store migration, IPC/MCP, observation, mailbox/deletion and gateway completion. |
 
-No AR entry is closed merely because its target documentation was corrected. Preserve
-refuted/narrowed conclusions: committed old-boot outcomes can replay-ACK; root records
-already deduplicate; removing source identity checks cannot recover missing bytes.
+## CheckRunner status
 
-## Historical behavior preservation matrix
+The CheckRun producer is not an acceptance bypass:
 
-Sources: [v18 specification](agent_swarm.md), its [reference examples](agent_swarm.spec-v18/README.md),
-[owner decisions](owner-decisions.md), and [Claude-script review](remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md).
-Section/example names below locate historical intent. Current owner decisions and the
-linked target contract govern implementation. “Retained” means represented in that
-target, not runtime-complete; current gaps remain explicit.
+- source capture binds exact commit/tree/blob/mode and revalidates manifest/bytes;
+- CheckRun freezes trusted profile/tool/environment/scope inputs;
+- command execution starts only after Store verifies exact worker identity and issues Go;
+- restart reconciles one retained process family and never reruns the command;
+- pass requires parser-specific complete coverage, source verification, output artifacts,
+  exit zero and proven resource release;
+- cache reuse follows one original direct process result and forbids cache chains;
+- acceptance rechecks the original Operation/process/coverage/artifacts before and after
+  off-DB byte verification.
 
-| Required behavior / historical locator | Target contract and source owner | Disposition / current gap |
+Two implementation gaps remain:
+
+1. `source.capture` has no automatic successor/current-state reconciler after a host
+   interruption; exact caller retry can repeat the deterministic read.
+2. `checks.executor=None` still routes new work through the in-host worker, while a pin
+   routes to standalone `swarm-checks`. Both validate equivalent evidence, but the
+   duplicate executor must be removed under implementation K.
+
+## Required behavior to preserve
+
+| Behavior | Target owner | Current gap |
 | --- | --- | --- |
-| Common commands; native model/tool loops — v18 §§1, 3 | [Module API](agent-operations/module-api.md#semantic-actions); `swarm-contracts`, selected adapter | Retained; vendor-method and executor duplication remains. |
-| Exactly one initial input — v18 §4; `single-initial-dispatch.json` | [Assignment](task-policy.md#6-assignment-and-initial-input); `operations`, `Attempt.start_owner` | Preserve existing controller/native-manager guard. Follow-up Send is separate. |
-| One native control owner — v18 §4; `native-owner-collision.json` | [Native ownership](agent-operations/module-api.md#capabilities-hello-and-native-owner); binding/native owner | Retained; no exclusivity claim against unrelated external clients. |
-| Complete agent-managed work cycle — v18 §§10, 12; script review | [Delivery](agent-operations/delivery.md#1-one-connected-cycle); existing Store domain handlers | Separate workflows and automatic capture/readback gaps remain. |
-| Independent native and Eliot Goals — later owner clarification; script review | [Goal policy](agent-operations/configuration.md#goal-message-and-native-goal); adapter + ordinary Send | Retained; old exclusive-driver rule superseded. AR-051/058 distinguish failed OpenCode automatic input and unimplemented Codex native mapping from real native Goal. |
-| Bounded continuation/progress/rotation — script review | [Goal limits](agent-operations/configuration.md#goal-message-and-native-goal), [route/session policy](agent-operations/configuration.md#5-route-dependency-session-and-permission-policy); launcher/automation | Finite occurrence/no-progress contract specified; current Goal settings lack these bounds (AR-054). Phase guard gap AR-053; no age-only default. |
-| Exact permission/question answers — v18 §§6–8; script review | [Semantic Reply](agent-operations/module-api.md#semantic-actions); pending-request adapter + Governor | Retained; capability-specific. Neither first-option/blanket-deny nor Send-as-Reply. |
-| Scheduled work, same-occurrence dedupe, missed-tick policy — v18 §10; `schedule-catchup.json` | [Triggers](agent-operations/configuration.md#4-trigger-and-loop); existing schedule/Operation owners | Preserve current CheckRun generation/occurrence continuity and latest-only catch-up (AR-057); general Goal/action loop remains target work. |
-| Corrections/unfinished work before new work without starvation — script review | [Queue](swarm-launcher-assignment-context.md#2-queue-is-a-projection); launcher | WorkDispatch copied state and 128-subject intake barrier remain. |
-| Preparatory work with honest dependencies — `dependency-revalidation.json` | [Dependencies](task-policy.md#4-dependencies-start-policy-versus-acceptance-truth); claim/acceptance | `hold` or explicit preparatory mode; current claim gates every dependency. |
-| Explicit route/model/effort/fallback — v18 §9 | [Route policy](agent-operations/configuration.md#5-route-dependency-session-and-permission-policy); launcher | Retained; no silent substitution. AR-049 records edit-accounting gap. |
-| Reuse/drain/retire actual resources — v18 §§4, 8; script review | [Launcher lifecycle](swarm-launcher-assignment-context.md#scoped-shutdown-and-retirement); runtime/workspace | Attached-binding finalizer absent, AR-048. Closing a link is not native death. |
-| All findings together, missing reviewer replaceable — script review | [Correction](agent-operations/delivery.md#9-review-correction-and-resubmission); reviews/submissions | All-findings package/direct replacement preserved. Automatic replacement absent (AR-059), finite rounds absent (AR-060); RepairDispatch/no-effect and policy-edit gaps remain. |
-| Every requirement and exact candidate verified — v18 §§11–12; R10/R11 | [Evidence](task-policy.md#3-requirements-and-evidence); reviews/checks/acceptance | Common frozen-plan/check/byte gate preserved (AR-063); assigned-review/finding validation is not shared by direct acceptance (AR-064). Revoked-pin isolation remains AR-062. |
-| Compact TaskPacket with real criteria — v18 R10; script review | [TaskPacket](task-policy.md#taskpacket); `task_prompt`, Task/Attempt owners | Prompt proof/hash envelope remains; do not delete executable criteria. |
-| Quota, activity, connection and capacity separate — v18 §§8–9, 14 | [Provider facts](swarm-launcher-assignment-context.md#6-provider-conditions-and-non-work-commands); provider_conditions/capacity | Stale-copy precedence and history-dependent ledgers remain. |
-| Passive joined observation, unmatched subjects and gaps — v18 §8; script review | [Observability](agent-operations/observability.md); adapter/OS/Git/remote collectors | Joined fleet is target work; no empty-fleet inference from a failed source. |
-| Background, cancel, detach and child completion differ — v18 §§4, 8 | [Module actions](agent-operations/module-api.md#semantic-actions); selected adapter | Retained only where native capability supports exact semantics. |
-| Uncertain native/external effects never blindly replay — v18 §§7, 13 | [Readback](agent-operations/delivery.md#8-readback-of-uncertain-effects); selected effect owner | Automatic readback gaps remain; unknown fences exact resource only. |
-| Complete attributable results survive failure — v18 §§7, 13; retention example | [Capture](agent-operations/delivery.md#7-complete-result-capture); results/artifacts + adapter | A2 and cross-route source/continuation/successor-delivery gaps remain. |
-| One manager/worktree, disjoint writers, frozen review — owner policy; v18 §11 | [Workspace](swarm-launcher-assignment-context.md#7-workspace-and-assignment); lease + manager Git owner | Retained; old main-only and separate code-scope machinery superseded. |
-| Exact checks with scoped resource ownership — v18 §11; check-resource example | [CheckRunner](check-runner.md); Store checks + selected worker | Preserve implemented ownership; cache/native/load proof is separate. |
-| Required script controls under ordinary rights — script review | [Script policy](agent-operations/configuration.md#7-script-policy); `swarm-scripts` + worker | Current returned-action enum covers message/notification/task-create only. |
-| Peer questions without council platform — v18 §§10, 16 | [Communication](agent-communication-program.md); mailbox/GM | Keep recipients and object grants; coordination/global-timeline machinery remains. |
-| GitHub collection/import/write and acceptance distinct — v18 §13 | [Publication](agent-operations/delivery.md#10-acceptance-and-publication); GitHub owners + Forge | Duplicate writers/projection workflows remain; policy automation retained. |
-| Handover keeps work and historical recipients — owner decisions §5 | [Communication](agent-communication-program.md), [policy transfer](agent-operations/configuration.md#8-transfer-and-disable); client/GM/mailbox/automation owners | Stable client and historical owner stay; AR-052/055 distinguish admitted intent from a still-unclaimed blocked Goal subject. Normalization/cleanup gaps remain. |
-| Restart cannot kill unrelated PID or duplicate owner — v18 §§8, 15 | [Process custody](agent-operations/implementation.md#d--process-custody); `swarm-process` | PID/birth/image/Job checks retained; full race matrix unqualified. |
-| Independent module update; install is not execution — v18 §§3, 15 | [Installation](agent-operations/module-installation.md), [modularity](agent-operations/modularity.md); installer/supervisor | Selected current route only; no automatic transfer of live bindings. |
-| One fixed remote identity/profile — v18 §§2, 15 | [Gateway](agent-operations/implementation.md#v--small-single-tenant-gateway); `swarm-gateway` | Target explicit; secret loading/compatibility launcher still need source work. |
+| Same durable Manager reconnect does not restart work | Task/Attempt/Operation + native readback | Adapter delivery/recovery gaps. |
+| Native-manager and controller initial starts never both send | `Attempt.start_owner` | Preserve through TaskPacket/dispatch reduction. |
+| Unknown native/external writes are never guessed-retried | Original Operation + exact readback | Several domains still lack automatic readback. |
+| Complete attributable output survives control failure | StoreDelivery + source lifetime | A2 and cross-route result gaps. |
+| One Manager owns one mutable worktree/Git index | Workspace lease + Manager Git ownership | `code.scope.*` and retirement integration remain. |
+| Corrections return all findings and may resubmit same Attempt | Submission/review owners | Delivery classification and finite progress remain. |
+| Acceptance proves frozen requirements for exact candidate | Common evidence gate | Direct review/finding provenance AR-064. |
+| Required machine evidence is process/coverage/byte-backed | CheckRunner + acceptance | Standalone-only cut and live qualification. |
+| Harness Goal and Eliot messages are independent | Native adapter Goal + ordinary Send | Current progression machinery and route gaps. |
+| Governor sees unmatched native/process/worktree facts | Independent collectors + joined view | Binding-rooted partial views remain. |
+| Direct peer collaboration survives council deletion | One recipient-indexed mailbox | Coordination platform still exists. |
+| External writes have one effect owner | GitHub/Forge domain owner | Duplicate writers/projection remain. |
+| Handover preserves authors/owners/recipients/history | Stable identities + designation epoch | Mailbox normalization and cleanup gaps. |
+| Restart never kills an unrelated PID | PID + birth/image/group/Job custody | Full platform race matrix unqualified. |
 
-Old work orders, mandatory main-only checkout, exclusive Goal driver, age-based kill,
-proof hashes as authority and routine human approval are not preserved requirements.
-Their useful behavior is assigned above to existing owners. Removing machinery must
-connect that positive path in the same slice. This selected map does not certify every
-historical field, test or script.
+Deleting old machinery requires a connected positive path in the same slice. A manual
+operator procedure, another workflow engine or a permanent compatibility facade is not
+a replacement.
 
-## Source audit versus runtime qualification
+## Audit versus qualification
 
-A completed source audit needs a named revision and evidence for retained actions:
-caller → parse → exact authority → Store transition → effect/readback → consumer,
-including cancellation, late result, restart, handover and partial writes. It also
-needs historical requirement mapping, agreement between active contracts and concrete
-replacement/disposition for each deletion. These remain incomplete globally.
+A source trace needs a named revision and a connected path:
 
-Executed qualification is a separate record: privilege/migration/corruption cases,
-installed provider contracts, Windows custody, fairness/load and autonomous end-to-end
-work. Most of that remains unexecuted. Source inspection cannot substitute for it, and
-missing a live machine does not excuse leaving source paths untraced.
+```text
+caller -> parse -> exact authority -> Store transition
+-> external/native effect -> readback/recovery -> consumer
+```
+
+It must include cancellation, restart, late result, transfer and partial writes where
+applicable. Source inspection does not prove installed behavior.
+
+Executed qualification remains separate: real providers, Windows/Linux custody,
+toolchain behavior, migrations/corruption, IPC fairness/load and the autonomous
+end-to-end cycle. Most of it remains unexecuted.
 
 ## Next work
 
-**Audit:** the selected submission/review/correction/acceptance chain is now traced in
-source, including direct/automatic differences and dependency invalidation. Continue
-frozen source → CheckRun worker/process → completion/parser coverage → cache reuse →
-acceptance in
-[audit-register](agent-operations/audit-register.md#resume-here). The
-[audit index](agent-operations/audit-index.md) keeps other untraced boundaries visible.
+**Audit:** follow the ScriptRun chain named in
+[audit-register](agent-operations/audit-register.md#resume-here), including every typed
+returned action, cancellation, transfer and restart. Then continue remote Git/GitHub
+effect ownership.
 
-**Runtime:** implementation still starts with the unfinished Antigravity A1b–A3 path;
-B–V remain the single subsequent order. Use existing owners, remove replaced machinery
-and keep ordinary automation connected. During construction run minimal affected
-format/Clippy/build; connected and installed/load checks follow the usable path.
+**Runtime:** implement Antigravity A1b–A3 first. Use existing owners, remove replaced
+paths in the same slice, and run format plus minimal affected warnings-denied Clippy/
+build during construction. Broader connected and installed tests follow usable
+vertical paths.
 
-This checkpoint changes documentation only: production Rust/JS/glue and tests are
-unchanged. Content, local links/anchors and TOML syntax are checked separately from
-runtime qualification; no new Clippy/test/benchmark or installed-runtime pass is claimed.
+This checkpoint changes documentation only.
