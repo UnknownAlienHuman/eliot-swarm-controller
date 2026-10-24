@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "inspected_head": "d962286059b44b2d0d8891456ed66bd27faca143",
+  "inspected_head": "ddc400a16eba371365aedebd8618a81503fd4f27",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive",
@@ -501,9 +501,9 @@
     },
     {
       "path": "docs/agent-operations/README.md",
-      "bytes": 4390,
-      "lines": 68,
-      "headings": 5,
+      "bytes": 6168,
+      "lines": 92,
+      "headings": 6,
       "classification": "active",
       "status_markers": {
         "source_audit_incomplete": false,
