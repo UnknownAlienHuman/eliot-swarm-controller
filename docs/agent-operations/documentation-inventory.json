@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "inspected_head": "ac3e411a6bb4c8c2ba14062baa7192df6cd6b668",
+  "inspected_head": "365fcac491b83b2b680655f602a9ff79d282b7a3",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive",
