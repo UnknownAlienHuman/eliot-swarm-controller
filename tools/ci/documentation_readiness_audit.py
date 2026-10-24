@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Generate a factual documentation-readiness inventory.
+"""Generate a reproducible documentation-readiness inventory.
 
-This does not judge source correctness. It checks whether repository instructions
-honestly claim completion, whether entry-point links resolve, and whether an agent can
-locate one current work order without reading the historical archive.
+The audit checks navigation, local links, authority classification and explicit
+completeness claims. It does not substitute for source or runtime qualification.
 """
 
 from __future__ import annotations
@@ -11,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote
@@ -21,19 +21,14 @@ INVENTORY = ROOT / "docs/agent-operations/documentation-inventory.json"
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
-SHA_RE = re.compile(r"(?<![0-9a-f])([0-9a-f]{7,40})(?![0-9a-f])")
 
-ENTRYPOINTS = [
+ENTRYPOINTS = {
     "AGENTS.md",
     "README.md",
     "docs/agent-operations/README.md",
-    "docs/agent-operations/architecture.md",
-    "docs/agent-operations/implementation.md",
-    "docs/agent-operations/audit-current.md",
-    "docs/implementation-status.md",
-]
-
-ACTIVE_CONTRACTS = [
+}
+CURRENT_STATUS = {"docs/implementation-status.md"}
+CURRENT_CONTRACTS = {
     "docs/agent-operations/architecture.md",
     "docs/agent-operations/implementation.md",
     "docs/agent-operations/delivery.md",
@@ -49,14 +44,36 @@ ACTIVE_CONTRACTS = [
     "docs/agent-operations/shared-packages.md",
     "docs/agent-operations/donor-map.md",
     "docs/agent-operations/refactoring.md",
-]
-
-HISTORICAL_PATTERNS = (
-    "restart-checkpoint-",
-    "master-audit",
-    "audit-v",
-    "agent_swarm.",
-    "documentation-program",
+    "docs/agent-operations/documentation-map.md",
+    "docs/agent-operations/task-packet-template.md",
+    "docs/agent-operations/failure-prevention-register.md",
+    "docs/agent-operations/source-audit-coverage.md",
+    "docs/swarm-launcher-assignment-context.md",
+    "docs/check-runner.md",
+    "docs/script-runner.md",
+    "docs/agent-communication-program.md",
+    "docs/gateway.md",
+    "docs/mcp-canonical-surfaces-and-topologies.md",
+    "docs/mcp-tool-catalog-and-loading.md",
+    "docs/task-policy.md",
+}
+AUDIT_EVIDENCE_EXACT = {
+    "docs/agent-operations/audit-current.md",
+    "docs/agent-operations/audit-index.md",
+    "docs/agent-operations/audit-register.md",
+    "docs/lessons-learned.md",
+}
+GENERATED_AUDIT = {
+    "docs/agent-operations/documentation-readiness-report.md",
+}
+HISTORICAL_PREFIXES = (
+    "docs/agent_swarm",
+    "docs/documentation-program",
+    "docs/legacy-",
+)
+QUALIFICATION_PREFIXES = (
+    "docs/qualification-",
+    "docs/restart-checkpoint-",
 )
 
 
@@ -73,21 +90,17 @@ def rel(path: Path) -> str:
 
 def markdown_files() -> list[Path]:
     excluded = {"target", ".git", "node_modules", "vendor"}
-    files: list[Path] = []
-    for path in ROOT.rglob("*.md"):
-        if any(part in excluded for part in path.parts):
-            continue
-        files.append(path)
-    return sorted(files)
+    return sorted(
+        path
+        for path in ROOT.rglob("*.md")
+        if not any(part in excluded for part in path.parts)
+    )
 
 
 def clean_target(raw: str) -> str | None:
     target = raw.strip().strip("<>")
     if not target or target.startswith(("#", "http://", "https://", "mailto:")):
         return None
-    # Markdown titles are outside the path. The repository uses no quoted local
-    # file names in active entry points, so the first whitespace-delimited token
-    # is the path when a title is present.
     target = target.split()[0]
     target = unquote(target.split("#", 1)[0].split("?", 1)[0])
     return target or None
@@ -95,6 +108,7 @@ def clean_target(raw: str) -> str | None:
 
 def broken_links(files: list[Path]) -> list[BrokenLink]:
     broken: list[BrokenLink] = []
+    root = ROOT.resolve()
     for path in files:
         text = path.read_text(encoding="utf-8")
         for raw in LINK_RE.findall(text):
@@ -103,7 +117,7 @@ def broken_links(files: list[Path]) -> list[BrokenLink]:
                 continue
             resolved = (path.parent / target).resolve()
             try:
-                resolved.relative_to(ROOT.resolve())
+                resolved.relative_to(root)
             except ValueError:
                 broken.append(BrokenLink(rel(path), raw, str(resolved)))
                 continue
@@ -128,12 +142,28 @@ def status_markers(path: Path) -> dict[str, bool]:
 
 def classify(path: Path) -> str:
     name = rel(path)
-    if name in ENTRYPOINTS or name in ACTIVE_CONTRACTS:
-        return "active"
-    lowered = name.lower()
-    if any(pattern in lowered for pattern in HISTORICAL_PATTERNS):
-        return "historical-or-snapshot"
-    return "supporting-or-unclassified"
+    lower = name.lower()
+    if name in ENTRYPOINTS:
+        return "entrypoint"
+    if name in CURRENT_STATUS:
+        return "current-status"
+    if name in CURRENT_CONTRACTS:
+        return "current-contract"
+    if name in GENERATED_AUDIT:
+        return "generated-audit"
+    if name in AUDIT_EVIDENCE_EXACT or name.startswith("docs/remediation/"):
+        return "audit-evidence"
+    if name.startswith(QUALIFICATION_PREFIXES) or "qualification" in lower or "-evidence" in lower:
+        return "qualification-evidence"
+    if name.startswith(HISTORICAL_PREFIXES) or "master-audit" in lower or "audit-v" in lower:
+        return "historical-snapshot"
+    if (name.startswith("modules/") or name.startswith("crates/")) and name.endswith("/README.md"):
+        return "module-guide"
+    if lower.endswith("-sources.md") or "donor" in lower or name.startswith("docs/local-models/"):
+        return "supporting-reference"
+    # The authority map deliberately defines all remaining documents as supporting
+    # until an owning current contract classifies them more narrowly.
+    return "supporting-reference"
 
 
 def main() -> None:
@@ -160,48 +190,49 @@ def main() -> None:
         or item["status_markers"]["audit_incomplete_phrase"]
         or item["status_markers"]["not_exhaustive"]
     ]
-    missing_entrypoints = [path for path in ENTRYPOINTS if not (ROOT / path).exists()]
-    missing_contracts = [path for path in ACTIVE_CONTRACTS if not (ROOT / path).exists()]
+    required = sorted(ENTRYPOINTS | CURRENT_STATUS | CURRENT_CONTRACTS)
+    missing_required = [path for path in required if not (ROOT / path).exists()]
     oversized = sorted(
         (item for item in records if item["bytes"] >= 25_000),
         key=lambda item: item["bytes"],
         reverse=True,
     )
-    root_docs = [item for item in records if item["path"].startswith("docs/") and item["path"].count("/") == 1]
-    active = [item for item in records if item["classification"] == "active"]
-    historical = [item for item in records if item["classification"] == "historical-or-snapshot"]
-    unclassified = [item for item in records if item["classification"] == "supporting-or-unclassified"]
+    root_docs = [
+        item
+        for item in records
+        if item["path"].startswith("docs/") and item["path"].count("/") == 1
+    ]
+    counts = Counter(item["classification"] for item in records)
 
     head = os.environ.get("GITHUB_SHA", "unknown")
-    verdict = "NOT READY"
-    reasons = []
+    reasons: list[str] = []
     if explicit_incomplete:
-        reasons.append("current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive")
+        reasons.append(
+            "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
+        )
     if broken:
         reasons.append("repository-local Markdown links are broken")
-    if missing_entrypoints or missing_contracts:
-        reasons.append("required current entry points/contracts are missing")
-    if len(unclassified) > len(active):
-        reasons.append("most Markdown files are not mechanically classified as active or historical")
-    if not reasons:
-        verdict = "STRUCTURALLY READY; SOURCE COMPLETENESS STILL REQUIRES HUMAN EVIDENCE REVIEW"
+    if missing_required:
+        reasons.append("required entry points/contracts are missing")
+    verdict = (
+        "NOT READY"
+        if reasons
+        else "STRUCTURALLY READY; SOURCE COMPLETENESS STILL REQUIRES EVIDENCE REVIEW"
+    )
 
     inventory = {
-        "schema_version": 1,
+        "schema_version": 2,
         "inspected_head": head,
         "verdict": verdict,
         "reasons": reasons,
         "counts": {
             "markdown_files": len(records),
             "docs_root_files": len(root_docs),
-            "active": len(active),
-            "historical_or_snapshot": len(historical),
-            "supporting_or_unclassified": len(unclassified),
+            **dict(sorted(counts.items())),
             "broken_local_links": len(broken),
             "oversized_25k_or_more": len(oversized),
         },
-        "missing_entrypoints": missing_entrypoints,
-        "missing_active_contracts": missing_contracts,
+        "missing_required_documents": missing_required,
         "explicit_incomplete_documents": explicit_incomplete,
         "broken_links": [item.__dict__ for item in broken],
         "oversized_documents": oversized,
@@ -220,7 +251,7 @@ def main() -> None:
     if reasons:
         lines.extend(f"- {reason}." for reason in reasons)
     else:
-        lines.append("- Entry points, active contracts and local links are structurally coherent.")
+        lines.append("- Entry points, authority classes and local links are structurally coherent.")
     lines.extend(
         [
             "",
@@ -232,11 +263,16 @@ def main() -> None:
             "| --- | ---: |",
             f"| Markdown files | {len(records)} |",
             f"| Files directly under `docs/` | {len(root_docs)} |",
-            f"| Explicit active entry points/contracts | {len(active)} |",
-            f"| Recognizable historical/snapshot files | {len(historical)} |",
-            f"| Supporting or unclassified files | {len(unclassified)} |",
+        ]
+    )
+    for category, count in sorted(counts.items()):
+        lines.append(f"| `{category}` | {count} |")
+    lines.extend(
+        [
             f"| Broken repository-local Markdown links | {len(broken)} |",
             f"| Documents at least 25 KiB | {len(oversized)} |",
+            "",
+            "Classification follows [`documentation-map.md`](documentation-map.md). `supporting-reference` is an explicit non-authoritative class, not an unreviewed worker instruction.",
             "",
             "## Explicit incompleteness evidence",
             "",
@@ -256,7 +292,15 @@ def main() -> None:
     else:
         lines.append("- None detected.")
 
-    lines.extend(["", "## Largest documentation surfaces", "", "| File | Bytes | Lines | Classification |", "| --- | ---: | ---: | --- |"])
+    lines.extend(
+        [
+            "",
+            "## Largest documentation surfaces",
+            "",
+            "| File | Bytes | Lines | Classification |",
+            "| --- | ---: | ---: | --- |",
+        ]
+    )
     for item in oversized[:30]:
         lines.append(
             f"| `{item['path']}` | {item['bytes']} | {item['lines']} | {item['classification']} |"
@@ -267,19 +311,19 @@ def main() -> None:
             "",
             "## Required closure before a whole-project implementation claim",
             "",
-            "1. Finish the source audit at a named revision and record every inspected domain, not only the latest runtime slice.",
+            "1. Finish the source audit at a named revision and record every package/domain and non-workspace surface, not only the latest runtime slice.",
             "2. Map every confirmed historical failure to one current invariant, source owner, implementation slice and executable acceptance case; unresolved items stay explicitly open.",
-            "3. Freeze one compact agent entry path and classify every other document as active contract, evidence, historical snapshot or archive.",
-            "4. Replace repository-wide A–V prose as worker input with generated narrow task packets naming exact current symbols, deletions, positive behavior, uncertainty and minimum checks.",
+            "3. Keep one compact agent entry path; every other document remains a classified contract, status, evidence, module guide, historical snapshot or supporting reference.",
+            "4. Assign work through narrow task packets naming exact current symbols, deletions/data disposition, positive behavior, uncertainty and minimum checks.",
             "5. Reconcile current status, audit resume point, implementation order and branch/PR state in one commit; no document may call unmerged code landed.",
-            "6. Run the documentation audit and link check after every source-of-truth change.",
+            "6. Run this audit after every source-of-truth documentation change.",
             "",
             "## What this audit does not prove",
             "",
             "- It does not prove that all code was read.",
             "- It does not prove that historical requirements are complete.",
             "- It does not prove runtime, crash, restart, provider, migration, security or load behavior.",
-            "- It does not authorize implementation from an unclassified or historical document.",
+            "- It does not authorize implementation from evidence, historical snapshots or supporting references.",
             "",
             "Machine-readable inventory: [`documentation-inventory.json`](documentation-inventory.json).",
             "",
