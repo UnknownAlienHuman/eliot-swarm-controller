@@ -15,12 +15,11 @@ immutable snapshots below retain earlier detailed evidence.
 5. Record a deletion only after the previous consumer, data disposition and positive
    path are identified.
 
-Current checkpoint: local observation source inspected at
-`c73c36c72d2c86cf710fa69e39ab07e2052c1f5e` on 2026-10-24. PR #190 is merged at that
-commit. Its exact head `a93ab20ec334471e1df5565b5a92eb44c868f366`, workflow run
-`40090027947`, passed changed-path and Markdown validation; the final diff was
-documentation-only. J0 remains selected but not landed. No live fleet/process/Git/
-remote or installed-product qualification is implied.
+Current checkpoint: remote gateway source inspected at
+`b61c0bd76fc3c16f8e28c262f7607ace2426469b` on 2026-10-24. The source audit records
+AR-160–170 and moves the exact continuation to Antigravity implementation A1b. The
+checkpoint is documentation-only: it does not claim a gateway build, test, listener,
+secret-permission check, Store mutation or installed-product qualification.
 
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints
@@ -48,10 +47,11 @@ remote or installed-product qualification is implied.
 | AR-100–114 | [`e99c06b`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/e99c06bb490fe630eec70337ce5137a26e145d84/docs/agent-operations/audit-current.md#trace-2026-10-24-mailbox-coordination) | Mailbox identity/storage, GM continuity, coordination deletion and disconnected GitHub cleanup. |
 | AR-115–126 | [`053f1e0`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/053f1e0fb15b3d40c00918f4a25ec8f9e4969e02/docs/agent-operations/audit-current.md#trace-2026-10-24-store-evolution) | Store bootstrap, numeric version, downgrade fence, extension verification, readers and finite v1 migration. |
 | AR-127–141 | [`c73c36c`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c73c36c72d2c86cf710fa69e39ab07e2052c1f5e/docs/agent-operations/audit-current.md#trace-2026-10-24-ipc-mcp) | Multiplexed IPC, MCP slot lock, subscriptions, exact Tasks reads, writer occupancy and WAL routing. |
-| [AR-142–159](audit-current.md#findings-ar-142159) | [Current trace](audit-current.md#trace-2026-10-24-governor-observation) | Binding-rooted discovery, provider/process/worktree/remote sources, joined Governor view and deletion boundaries. |
+| AR-142–159 | [`b61c0bd`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/b61c0bd76fc3c16f8e28c262f7607ace2426469b/docs/agent-operations/audit-current.md#trace-2026-10-24-governor-observation) | Binding-rooted discovery, provider/process/worktree/remote sources, joined Governor view and deletion boundaries. |
+| [AR-160–170](audit-current.md#findings-ar-160170) | [Current gateway trace](audit-current.md#trace-2026-10-24-gateway) | Fixed principal, secret loading, HTTP/Origin boundary, connection/session capacity, unknown outcome and launcher cutover. |
 
-There are 159 entries. Some preserve correct behavior, narrow an earlier claim or
-record a transition boundary; they are not 159 defects or a completion percentage.
+There are 170 entries. Some preserve correct behavior, narrow an earlier claim or
+record a transition boundary; they are not 170 defects or a completion percentage.
 
 ## Source and target map
 
@@ -70,13 +70,13 @@ record a transition boundary; they are not 159 defects or a completion percentag
 | Store evolution, 115–126 | `swarm-store`, Store bootstrap/migrations, special verifiers, Doctor/status reader | [Store evolution](store-evolution.md), implementation I |
 | IPC/MCP, 127–141 | `swarm-client`, host IPC, MCP facade/subscriptions and Store hot reads | [IPC/MCP](ipc-mcp.md), implementation H/J |
 | Governor observation, 142–159 | module observations/runtime catalog/provider conditions/supervisor/process metrics/workspace lifecycle/Forge reports | [Observability](observability.md), implementation R |
-| Gateway next | `swarm-gateway`, secret loading, fixed MCP profile and compatibility launcher | [Gateway](../gateway.md), implementation V |
+| Gateway, 160–170 | `swarm-gateway`, secret loading, RMCP session manager, fixed MCP profile and kernel-host launcher | [Gateway](../gateway.md), [gateway dependencies](gateway-dependency-register.md), implementation V |
 
 ## Coverage still open
 
 | Area | Remaining connected boundary |
 | --- | --- |
-| A, M–Q adapters | Durable StoreDelivery, first historical capture, continuation sources and installed restart/version qualification. |
+| A, M–Q adapters | Durable StoreDelivery, first historical capture, continuation sources and installed restart/version qualification. A1b is the next exact implementation slice. |
 | B–D launch/resources | Attached-binding retirement, cancellation disposition, stable route-budget identity and live custody races. |
 | E scheduler/Goals | One ordinary loop, finite no-progress/usage budgets, native/Eliot combination and restart. |
 | F–G Task/review | TaskPacket, automatic replacement, finite correction, subject isolation and common review/finding provenance. |
@@ -87,7 +87,7 @@ record a transition boundary; they are not 159 defects or a completion percentag
 | U GitHub | Stable collector cut, aggregate coverage, explicit import, live-work conflict, work-pool deletion, connected PR source and independent remote-ref view. |
 | R observation | Source registry, provider/process/Git/remote collectors, unmatched subjects, joined WAL projection, one read model and old-surface deletion. |
 | S/T mailbox/deletion | Recipient rows, concrete unresolved-state migration and vertical removal of coordination products/public surfaces. |
-| V gateway | Private secret loading, session limits, disconnect and launcher deletion. |
+| V gateway | Absolute private secret reader, explicit edge Origin policy, bounded connections/sessions, timeout/readback qualification and launcher deletion. |
 | Installed/native/Windows/load | Separate executed qualification; source evidence is not a substitute. |
 
 ## Historical requirements and donors
@@ -97,7 +97,8 @@ record a transition boundary; they are not 159 defects or a completion percentag
 - [Remediation audit](../remediation/2026-10-09/CURRENT-AUDIT.md) and
   [Claude-script donor review](../remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md)
   remain tied to their named revisions.
-- [Donor map](donor-map.md) owns current reuse/version decisions.
+- [Donor map](donor-map.md) owns general reuse/version decisions.
+- [Gateway dependency register](gateway-dependency-register.md) owns exact RMCP/private-file/MCP-facade limits for V.
 - [Refactoring findings](refactoring.md) owns structural deletion boundaries, not
   finding dispositions.
 

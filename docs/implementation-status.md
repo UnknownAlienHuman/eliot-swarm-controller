@@ -2,14 +2,15 @@
 
 ## Current state
 
-**SOURCE_AUDIT_INCOMPLETE / TARGET_DOCUMENTS WORKING DRAFT /
+**SOURCE_AUDIT_INCOMPLETE / TARGET DOCUMENTS WORKING DRAFT /
 RUNTIME REFACTOR IN PROGRESS.**
 
 Source was inspected on **2026-10-24** at
-`c73c36c72d2c86cf710fa69e39ab07e2052c1f5e`. The active audit contains
-**159 entries**. AR-142–159 trace binding-rooted discovery, provider source ownership,
-process identity/liveness, workspace authority versus live Git, remote-ref observation,
-the joined Governor view, disclosure boundaries and deletion of replaced surfaces.
+`b61c0bd76fc3c16f8e28c262f7607ace2426469b`. The active audit contains
+**170 entries**. AR-160–170 close the named remote-gateway source chain: fixed process
+identity/profile, secret-file loading, HTTP/Host/Origin/bearer/body boundaries, RMCP
+session cleanup versus admission capacity, timeout/disconnect semantics, the
+kernel-host compatibility launcher and missing connected qualification.
 
 Merged work immediately preceding this checkpoint:
 
@@ -21,17 +22,20 @@ Merged work immediately preceding this checkpoint:
 - PR #190 at `c73c36c`: AR-127–141 plus the IPC/MCP contract; exact head
   `a93ab20`, run `40090027947` passed changed-path and Markdown validation;
   documentation only. J0 remains selected but not landed.
+- PR #191 at `b61c0bd`: AR-142–159 plus the Governor-observation contract;
+  documentation only. No R0–R6 collector/runtime implementation is claimed.
 
 - [Current resume point and findings](agent-operations/audit-current.md#resume-here)
 - [Evidence/source index](agent-operations/audit-index.md)
 - [Architecture](agent-operations/architecture.md)
 - [Single implementation program](agent-operations/implementation.md)
+- [Gateway target](gateway.md)
+- [Gateway dependency register](agent-operations/gateway-dependency-register.md)
 - [Observability target](agent-operations/observability.md)
 - [IPC/MCP target](agent-operations/ipc-mcp.md)
 - [Store evolution target](agent-operations/store-evolution.md)
 - [Agent communication target](agent-communication-program.md)
-- [Gateway target](gateway.md)
-- [Donor register](agent-operations/donor-map.md)
+- [General donor register](agent-operations/donor-map.md)
 
 ## Runtime changes
 
@@ -46,17 +50,18 @@ Merged work immediately preceding this checkpoint:
 ```text
 A0   LANDED                   active v6 coordinate
 A1a  LANDED / SCOPED PASS     terminal decoupling + producer lifecycle
-A1b  NOT IMPLEMENTED          remove dispatch proof/refresh prerequisite
+A1b  NEXT / NOT IMPLEMENTED   remove dispatch proof/refresh prerequisite
 A2   NOT IMPLEMENTED          durable outcome/body/page delivery and successor completion
 A3   NOT IMPLEMENTED          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime
 U/R  SMALL CLEANUP LANDED      disconnected GitHub PR/projection source removed
 J0   SELECTED / NOT LANDED     release MCP slot lock before shared RPC
 R0–R6 TARGET ONLY              source-owned joined Governor observation
+V0–V3 TARGET ONLY              secret/session/origin/standalone gateway cut
 ```
 
-Runtime implementation still starts with **A1b–A3**. J0 is a bounded independent
-frontend fix and does not reorder the main migration.
+The next exact implementation slice is **A1b**. J0 is a bounded independent frontend
+fix; R0–R6 and V0–V3 remain later connected programs and do not reorder A.
 
 ## Source-inspection result
 
@@ -74,46 +79,57 @@ frontend fix and does not reorder the main migration.
 | Store, AR-115–126 | Single-writer ownership, pre-query timeout, pre-WAL identity, immediate transaction, rollback and query-only WAL reader are useful. | Numeric v2 implementation, v1 bridge, semantic postconditions, reader/Doctor cutover and deletion migrations. |
 | IPC/MCP, AR-127–141 | Client/server multiplexing, no-replay unknown outcome, live Store authorization, tool/pump isolation and bounded lag semantics are useful. | MCP outer-lock removal, exact pending-input read, bounded attention, one pump, WAL read routing and concurrent/load qualification. |
 | Observation, AR-142–159 | Binding/boot fences, typed provider evidence, process birth/membership checks, conservative workspace release and passive semantics are useful. | Independent source collectors, unmatched subjects, live Git/remote facts, joined WAL projection, split disclosure and old-surface deletion. |
-| Remaining | Structural and selected source reviews remain indexed. | Gateway completion and untraced residual chains. |
+| Gateway, AR-160–170 | Fixed credential/profile, loopback/path/auth/body checks, no-replay IPC, timeout-as-unknown and RMCP worker cleanup are useful. | Absolute private secrets, credential cap, configured edge Origins, separate connection/session limits, explicit idle policy, standalone cutover and connected qualification. |
 
-## Governor observation status
+## Gateway status
 
 ### Preserve
 
-- Binding/generation/boot/observation identity fences for private native evidence.
-- Explicit unknown/stale/partial/unavailable gaps rather than fabricated zero/current
-  values.
-- Typed provider condition source sequence/evidence and invalidation semantics.
-- PID birth/image and module-owner membership checks for custody/control.
-- Workspace lease as assignment/write authority with conservative release.
-- Exact remote-ref readback after an ambiguous push.
-- Passive observation: no Task acceptance, reassignment, prompt retry, provider restart
-  or process kill from a status read.
+- One process maps to one configured Eliot credential and restricted MCP profile.
+- Profile `expected_client_id` is checked before listener bind; Full is rejected.
+- Loopback-only listener, exact `/mcp`, no query and one Authorization header.
+- Constant-work bearer comparison after bounded header parsing.
+- RMCP Host validation, present-Origin validation, streamed body cap and cancellation.
+- Existing bounded TCP connection admission.
+- `swarm-mcp` drops a failed IPC link and never silently retries the request.
+- Timeout/disconnect/shutdown leave admitted Store Operations authoritative.
+- RMCP 3.5.0 removes sessions after worker termination and has finite default
+  initialize/idle/cache lifetimes.
 
 ### Repair
 
-1. Discover native/process/worktree/remote subjects from stable source owners, not only
-   ready bindings linked to the current Manager's Task.
-2. Retain assignment as an edge from a discovered subject to binding/Operation/Attempt/
-   Task; absent edge means unassigned, not invisible.
-3. Promote provider account/service/store identity to a source lifecycle independent of
-   the binding that supplied one observation; preserve independent quota windows.
-4. Replace caller-selected one-shot process metrics with one host collector that
-   discovers/refreshes known processes and stores PID+birth/image/group/Job/liveness.
-5. Display assigned workspace branch/baseline/scope beside independently collected
-   repository identity, actual branch/HEAD/dirty/upstream/push target and observed time.
-6. Add a read-only remote-ref collector independent of Forge publication/push authority.
-7. Join SourceRecord/current subjects/assignment edges in one short WAL snapshot with
-   source epoch, cursor, last attempt/success, freshness, coverage and gaps.
-8. Split inventory existence/state permission from Task relation, transcript/result and
-   host-private path disclosure.
-9. Move all consumers, then remove binding-only runtime catalogs, duplicated provider
-   lifecycle, process-metrics product CLI, static lease-as-live claims,
-   publication-only remote status and parallel report reducers.
-10. Keep collection independent of viewer count and optional diagnostic logging.
+1. Replace gateway-local `std::fs` secret readers with one shared absolute, no-follow,
+   bounded regular private-file reader based on `swarm-process::permissions`.
+2. Verify existing secret owner/ACL/mode; current shared exact-file helper does not
+   complete that check by itself.
+3. Cap credential file and token before allocation; retain closed JSON and bearer
+   32–512 ASCII-graphic checks.
+4. Configure exact allowed edge Origins while preserving rejection for every
+   nonmatching present Origin, including an empty list.
+5. Make connection count configurable and add an independent active MCP session limit.
+   Acquire before constructing a facade and release on failed initialize, DELETE,
+   worker terminal, idle timeout and shutdown.
+6. Pin gateway initialization/inactivity policy explicitly instead of relying on RMCP
+   defaults; keep dependency cleanup as an implementation mechanism, not product law.
+7. Keep request timeout separate from SSE/session lifetime and exercise slow/streaming
+   clients.
+8. Prove timeout after Store commit through original request/Operation readback without
+   replay.
+9. Remove `swarm-kernel-host gateway`, sibling launcher diagnostics, build-policy text
+   assertions and compatibility fixtures after standalone callers move.
+10. Add minimal affected rustfmt/Clippy/build and focused connected security/capacity/
+    readback cases before live tunnel/browser qualification.
 
-No R0–R6 runtime implementation or live collector qualification is claimed in this
+No V0–V3 runtime implementation or listener qualification is claimed by this
 checkpoint.
+
+## Governor observation status
+
+Preserve binding/generation/boot/observation fences, explicit gaps, typed provider
+sequence/evidence, PID birth/membership checks, workspace authority, exact Forge remote
+readback and passive semantics. Repair through source-owned provider/process/Git/remote
+collectors, assignment edges, joined WAL projection, split disclosure and deletion of
+old parallel views. No R0–R6 runtime implementation is claimed.
 
 ## IPC and MCP status
 
@@ -145,21 +161,27 @@ including cancellation, late result, restart, handover, migration, partial write
 source gaps and slow consumers. It also needs historical requirement mapping and
 concrete data/code disposition for each deletion. This remains incomplete globally.
 
-Executed qualification is separate: provider/process/Git collectors, host restart,
-Windows/Linux custody, PID reuse, migration/corruption, concurrent MCP/load, fairness
-and autonomous end-to-end work. Source inspection and a successful compile cannot
-substitute for those results.
+Executed qualification is separate: providers, gateway edge/tunnel, secret ACLs,
+process/Git collectors, host restart, Windows/Linux custody, PID reuse, migration/
+corruption, concurrent MCP/load, fairness and autonomous end-to-end work. Source
+inspection and a successful compile cannot substitute for those results.
 
 ## Next work
 
-**Audit:** continue the remote gateway chain named in
-[audit-current](agent-operations/audit-current.md#resume-here): secret loading,
-loopback/Host/Origin/auth/body/session bounds, fixed identity/profile, timeout-as-unknown,
-compatibility launcher and disconnect behavior.
+**Runtime A1b:** remove the redundant Antigravity dispatch refresh/proof/digest
+prerequisite through the exact chain named in
+[audit-current](agent-operations/audit-current.md#resume-here). Preserve current
+binding/generation/boot/session/model/workspace checks and no-replay semantics. Delete
+producer, validator, qualification gate, schema/profile and installer requirements in
+the same connected slice.
 
-**Runtime:** the main program still begins with Antigravity A1b–A3. Selected independent
-slices remain J0 from [IPC/MCP](agent-operations/ipc-mcp.md) and R0–R6 from
-[Observability](agent-operations/observability.md); neither is landed here.
+**Subsequent A2–A3:** durable outcome/body/page delivery with successor completion, then
+real typed actions and one active Antigravity route.
+
+Selected independent future slices remain J0 from
+[IPC/MCP](agent-operations/ipc-mcp.md), R0–R6 from
+[Observability](agent-operations/observability.md) and V0–V3 from
+[Gateway](gateway.md). None is landed here.
 
 During construction run rustfmt plus minimal affected warnings-denied compile/Clippy.
 Focused connected cases close each slice; broad installed/live/migration/load
