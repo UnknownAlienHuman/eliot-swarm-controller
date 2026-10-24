@@ -632,7 +632,7 @@ fn stale_scope_predicate(predicate: &str) -> Error {
 }
 
 /// Revalidate the complete current Store tuple before accepting an
-/// Antigravity session proof, including when this capability helper is called
+/// Antigravity dispatch, including when this capability helper is called
 /// directly for a readback. `None` means the initial unstarted stage; `Some`
 /// must identify the exact queued child and its retained ancestry.
 fn require_current_antigravity_scope(
@@ -731,8 +731,8 @@ pub(super) fn current_dispatch_capability_readback(
 }
 
 /// Select the current native capability from the trusted route retained by the
-/// launch binding. OpenCode keeps its existing C8 verifier; Antigravity uses
-/// only its same-process session/turn proof and cannot claim MCP readback.
+/// launch binding. OpenCode keeps its existing C8 verifier; Antigravity uses current
+/// Store binding/open/observation facts and does not require a refresh proof.
 pub(super) fn require_current_dispatch_capability(
     db: &Connection,
     config: &Config,
@@ -784,7 +784,7 @@ pub(super) fn require_current_dispatch_capability(
     )?
     .ok_or_else(antigravity_capability::unavailable)?;
     antigravity_capability::validate_retained_descriptor(&identity)?;
-    antigravity_capability::require_current_session_proof(db, &binding)
+    antigravity_capability::current_capability(&binding)
 }
 
 fn build_current_packet(
@@ -795,7 +795,7 @@ fn build_current_packet(
     binding: &Value,
     proof: &Value,
 ) -> Result<Value> {
-    if antigravity_capability::is_session_proof(proof) {
+    if antigravity_capability::is_current_capability(proof) {
         return build_packet(parent, attempt, binding, proof, "");
     }
     let owned = super::opencode::owned_service_for_binding(
@@ -815,7 +815,7 @@ fn build_packet(
     proof: &Value,
     owned_service_id: &str,
 ) -> Result<Value> {
-    if antigravity_capability::is_session_proof(proof) {
+    if antigravity_capability::is_current_capability(proof) {
         return antigravity_capability::build_packet(parent, attempt, binding, proof);
     }
     let capability_identity_digest =

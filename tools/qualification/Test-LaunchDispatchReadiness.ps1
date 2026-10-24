@@ -49,8 +49,7 @@ function New-Parent {
 }
 
 function Invoke-ReadinessCase {
-    param([object[]] $Samples, [string] $Adapter = 'OpenCode', [AllowNull()][string] $RefreshErrorCode = $null,
-        [AllowNull()] $OpenFailure = $null, [string] $OpenScopeDamage = '')
+    param([object[]] $Samples, [AllowNull()] $OpenFailure = $null, [string] $OpenScopeDamage = '')
     $taskId = 'task-fixture'; $attemptId = 'attempt-fixture'; $parentOperationId = 'parent-fixture'
     $TimeoutSeconds = 30
     $launch = [pscustomobject]@{ error_code = $null }
@@ -72,7 +71,7 @@ function Invoke-ReadinessCase {
             artifact_version = $contract.version; binding_id = 'binding-fixture'; generation = 7
         } }
     }
-    $trace = [ordered]@{ polls = 0; dispatches = 0; refreshes = 0; refresh_scope = $null; dispatched_poll = $null; current_parent = $null }
+    $trace = [ordered]@{ polls = 0; dispatches = 0; dispatched_poll = $null; current_parent = $null }
     $script:Report = [ordered]@{ safe_facts = [ordered]@{} }
     $stages = [Collections.Generic.List[object]]::new()
     function Get-Operations {
@@ -89,10 +88,6 @@ function Invoke-ReadinessCase {
     }
     function Invoke-ManagerCall {
         param([string] $Method, $Params, [int] $TimeoutMilliseconds)
-        if ($Method -eq 'agent.refresh') {
-            $trace.refreshes++; $trace.refresh_scope = $Params
-            return [pscustomobject]@{ completed = ($null -eq $RefreshErrorCode); exit_code = $(if ($RefreshErrorCode) { 2 } else { 0 }); value = $null; error_code = $RefreshErrorCode }
-        }
         if ($Method -eq 'task.dispatch') {
             $trace.dispatches++; $trace.dispatched_poll = $trace.polls
             return [pscustomobject]@{ completed = $true; exit_code = 0; value = $null; error_code = $null }
@@ -106,7 +101,6 @@ function Invoke-ReadinessCase {
         return [pscustomobject]@{ completed = $true; exit_code = 0; value = $state; error_code = $null }
     }
     function Start-Sleep { param([int] $Milliseconds) }
-    function New-RequestId { return 'session-refresh-fixture' }
     function Add-Stage {
         param([string] $Name, [string] $Status, [string] $Code, $Facts)
         $stages.Add([ordered]@{ name = $Name; status = $Status; code = $Code; facts = $Facts })
@@ -136,21 +130,10 @@ Assert-Case 'ready hello waits for participant issuance' ($progression.trace.pol
 Assert-Case 'one dispatch on the exact phase' ($progression.trace.dispatches -eq 1 -and $null -eq $progression.stop)
 Assert-Case 'safe success phase retained' ($progression.facts.launch.launch_phase -ceq 'awaiting_native_mcp')
 Assert-Case 'safe success connection state retained' ($progression.facts.launch.native_dispatch_capability_state -ceq 'ready')
-Assert-Case 'OpenCode never requests AG session refresh' ($progression.trace.refreshes -eq 0)
 
-$agProgression = Invoke-ReadinessCase -Adapter 'Antigravity' -Samples @((New-Parent), (New-Parent))
-Assert-Case 'AG refresh precedes the sole dispatch' ($agProgression.trace.refreshes -eq 1 -and
-    $agProgression.trace.dispatches -eq 1 -and $agProgression.trace.dispatched_poll -eq 2)
-Assert-Case 'AG refresh uses only the exact binding generation' ($agProgression.trace.refresh_scope.binding_id -ceq 'binding-fixture' -and
-    $agProgression.trace.refresh_scope.generation -eq 7 -and $agProgression.trace.refresh_scope.client_request_id -ceq 'session-refresh-fixture')
-$agUnavailable = New-Parent
-$agUnavailable.native_dispatch_capability_readback.state = 'unavailable'
-$agUncertain = Invoke-ReadinessCase -Adapter 'Antigravity' -RefreshErrorCode 'NATIVE_OUTCOME_UNKNOWN' -Samples @($agUnavailable, $agUnavailable, (New-Parent))
-Assert-Case 'uncertain AG refresh is never replayed' ($agUncertain.trace.refreshes -eq 1 -and $agUncertain.trace.dispatches -eq 1 -and
-    $agUncertain.trace.dispatched_poll -eq 3 -and $agUncertain.facts.native_session_refresh.replayed -eq $false)
-$agBlocked = Invoke-ReadinessCase -Adapter 'Antigravity' -RefreshErrorCode 'NATIVE_OUTCOME_UNKNOWN' -Samples @($agUnavailable, $agUnavailable)
-Assert-Case 'unresolved AG session proof never dispatches' ($agBlocked.trace.refreshes -eq 1 -and $agBlocked.trace.dispatches -eq 0 -and
-    $agBlocked.stop -ceq 'LAUNCH_READY_READBACK_TIMEOUT')
+$agProgression = Invoke-ReadinessCase -Samples @((New-Parent))
+Assert-Case 'AG current Store capability dispatches without refresh' ($agProgression.trace.dispatches -eq 1 -and
+    $agProgression.trace.dispatched_poll -eq 1 -and $null -eq $agProgression.stop)
 
 $legacyCard = New-Parent
 $legacyCard.native_mcp_connection_readback = $legacyCard.native_dispatch_capability_readback

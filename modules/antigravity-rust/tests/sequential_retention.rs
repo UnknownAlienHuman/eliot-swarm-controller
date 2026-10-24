@@ -603,19 +603,23 @@ fn omitted_model_uses_native_default_with_unknown_effective() {
             assert_eq!(describe["model_requested"], json!(null));
             assert_eq!(describe["model_observed"], json!(null));
             assert_eq!(describe["model_verification"], "native_default");
-            // A native-default session carries no dispatch session proof: the
-            // effective model is unknown unless the stream observed it.
             let read = controller
                 .read_command(&refresh_command("op-refresh-default"))
                 .unwrap();
-            let proof: swarm_contracts::runtime::AntigravityDispatchSessionProof =
-                serde_json::from_value(read.details["antigravity_dispatch_session_proof"].clone())
-                    .expect("native-default session identity proof");
-            assert!(proof.validate().is_ok());
-            assert_eq!(proof.schema_version, 2);
-            assert_eq!(proof.model_readback_state, "native_default");
-            assert_eq!(proof.requested_model_id, None);
-            assert_eq!(proof.observed_model_id, None);
+            assert_eq!(
+                read.details["completion_condition"],
+                "current_process_native_observation"
+            );
+            assert_eq!(read.details["snapshot"]["init"]["model"], json!(null));
+            assert_eq!(
+                read.details["snapshot"]["model_readback_state"],
+                json!(null)
+            );
+            assert!(
+                read.details
+                    .get("antigravity_dispatch_session_proof")
+                    .is_none()
+            );
         },
     );
 }
@@ -634,10 +638,12 @@ fn explicit_model_override_requires_exact_readback() {
         let read = controller
             .read_command(&refresh_command("op-refresh-explicit"))
             .unwrap();
-        let proof = &read.details["antigravity_dispatch_session_proof"];
-        assert_eq!(proof["requested_model_id"], "gemini-3.8");
-        assert_eq!(proof["observed_model_id"], "gemini-3.8");
-        assert_eq!(proof["model_readback_state"], "verified");
+        assert_eq!(read.details["snapshot"]["init"]["model"], "gemini-3.8");
+        assert!(
+            read.details
+                .get("antigravity_dispatch_session_proof")
+                .is_none()
+        );
     });
 }
 #[test]

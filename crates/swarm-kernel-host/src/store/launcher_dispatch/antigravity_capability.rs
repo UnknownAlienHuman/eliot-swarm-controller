@@ -2,30 +2,19 @@ use crate::{
     error::{Error, Result},
     model,
 };
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use swarm_contracts::{
-    module_contract::{
-        runtime_command_schema, task_dispatch_admission_schema, task_dispatch_context_schema,
-        task_prompt_schema,
-    },
-    runtime::{
-        ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND, AntigravityDispatchSessionProof, EffectOutcome,
-        RuntimeOutcome,
-    },
+use swarm_contracts::module_contract::{
+    runtime_command_schema, task_dispatch_admission_schema, task_dispatch_context_schema,
+    task_prompt_schema,
 };
 
 use super::LaunchParent;
 
 pub(super) const ANTIGRAVITY_ARTIFACT_ID: &str = "eliot-antigravity.rust-headless.1";
-pub(super) const ANTIGRAVITY_PROOF_KIND: &str = ANTIGRAVITY_DISPATCH_SESSION_PROOF_KIND;
+const ANTIGRAVITY_CAPABILITY_KIND: &str = "antigravity_store_binding_v1";
 
-pub(super) fn is_session_proof(value: &Value) -> bool {
-    matches!(
-        value["kind"].as_str(),
-        Some(ANTIGRAVITY_PROOF_KIND)
-            | Some(swarm_contracts::runtime::ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND)
-    )
+pub(super) fn is_current_capability(value: &Value) -> bool {
+    value["kind"] == ANTIGRAVITY_CAPABILITY_KIND
 }
 
 pub(super) fn unavailable() -> Error {
@@ -35,10 +24,10 @@ pub(super) fn unavailable() -> Error {
     )
 }
 
-fn stale_proof() -> Error {
+fn stale_state() -> Error {
     Error::new(
-        "STALE_ANTIGRAVITY_DISPATCH_PROOF",
-        "the current Antigravity session proof does not match the retained binding",
+        "STALE_ANTIGRAVITY_DISPATCH_STATE",
+        "the current Antigravity binding state is not safe for dispatch",
     )
 }
 
@@ -56,7 +45,6 @@ pub(super) fn validate_retained_descriptor(
         || identity.artifact.version.as_str() != "6"
         || identity.protocol.major != 1
         || identity.protocol.minor != 0
-        || !has_capability("agent.refresh")
         || !has_capability("task.dispatch")
         || !identity.command_schemas.contains(&runtime_command_schema())
         || !identity.command_schemas.contains(&task_prompt_schema())
@@ -72,128 +60,113 @@ pub(super) fn validate_retained_descriptor(
     Ok(())
 }
 
-/// Read the latest refresh result for the exact live binding generation. A
-/// newer queued, unresolved, rejected, or malformed refresh suppresses older
-/// evidence; callers never fall back to an older successful snapshot.
-pub(super) fn require_current_session_proof(db: &Connection, binding: &Value) -> Result<Value> {
-    let binding_id = model::text(binding, "binding_id")?;
-    let generation = model::positive(binding, "generation")?;
-    let latest: Option<(String, String, Option<i64>, Option<String>)> = db
-        .query_row(
-            "SELECT operation_id,state,settled_at_ms,result_json \
-             FROM operations WHERE binding_id=?1 AND binding_generation=?2 \
-               AND method='agent.refresh' \
-             ORDER BY rowid DESC LIMIT 1",
-            params![binding_id, generation],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((operation_id, state, settled_at_ms, result_json)) = latest else {
-        return Err(stale_proof());
-    };
-    if state != "settled" || settled_at_ms.is_none_or(|time| time <= 0) {
-        return Err(stale_proof());
-    }
-    let result_json = result_json.ok_or_else(stale_proof)?;
-    let result: RuntimeOutcome = serde_json::from_str(&result_json).map_err(|_| stale_proof())?;
-    let proof: AntigravityDispatchSessionProof =
-        serde_json::from_value(result.details["antigravity_dispatch_session_proof"].clone())
-            .map_err(|_| stale_proof())?;
-    proof.validate().map_err(|_| stale_proof())?;
-    validate_proof_matches_binding(&proof, &result, binding, &operation_id)?;
-    Ok(serde_json::to_value(proof)?)
-}
+/// Resolve the current Antigravity dispatch identity from Store-owned
+/// binding/open/observation facts. This is not a second proof packet and
+/// requires no `agent.refresh` Operation.
+pub(super) fn current_capability(binding: &Value) -> Result<Value> {
+    let binding_id = model::text(binding, "binding_id").map_err(|_| stale_state())?;
+    let generation = model::positive(binding, "generation").map_err(|_| stale_state())?;
+    let root_id = model::text(binding, "native_root_id").map_err(|_| stale_state())?;
+    let scope_key = model::text(binding, "native_scope_key").map_err(|_| stale_state())?;
+    let observation = binding
+        .get("observation")
+        .filter(|value| value.is_object())
+        .ok_or_else(stale_state)?;
+    let opening = observation
+        .get("opening_evidence")
+        .filter(|value| value.is_object())
+        .ok_or_else(stale_state)?;
+    let describe = opening
+        .get("describe")
+        .filter(|value| value.is_object())
+        .ok_or_else(stale_state)?;
+    let native = observation
+        .get("native")
+        .filter(|value| value.is_object())
+        .ok_or_else(stale_state)?;
+    let init = native
+        .get("init")
+        .filter(|value| value.is_object())
+        .ok_or_else(stale_state)?;
+    let boot_id = model::text(observation, "bridge_boot_id").map_err(|_| stale_state())?;
+    let requested_model = binding["route"]["native_options"]
+        .get("modelId")
+        .and_then(Value::as_str);
+    let observed_model = describe.get("model_observed").and_then(Value::as_str);
+    let model_verification = describe
+        .get("model_verification")
+        .and_then(Value::as_str)
+        .ok_or_else(stale_state)?;
 
-fn validate_proof_matches_binding(
-    proof: &AntigravityDispatchSessionProof,
-    result: &RuntimeOutcome,
-    binding: &Value,
-    operation_id: &str,
-) -> Result<()> {
-    let binding_id = binding["binding_id"].as_str().ok_or_else(stale_proof)?;
-    let generation = binding["generation"].as_i64().ok_or_else(stale_proof)?;
-    let root_id = binding["native_root_id"].as_str().ok_or_else(stale_proof)?;
-    let scope_key = binding["native_scope_key"]
-        .as_str()
-        .ok_or_else(stale_proof)?;
-    let observation = &binding["observation"];
-    let opening = &observation["opening_evidence"];
-    let opening_description = &opening["describe"];
-    let snapshot = &result.details["snapshot"];
-    let init = &snapshot["init"];
+    let model_matches = match requested_model {
+        Some(requested) => {
+            !requested.is_empty()
+                && requested.len() <= 256
+                && describe["model_requested"].as_str() == Some(requested)
+                && observed_model == Some(requested)
+                && model_verification == "verified"
+                && init["model"].as_str() == Some(requested)
+                && native["requested_model_id"].as_str() == Some(requested)
+                && native["model_readback_state"] == "verified"
+        }
+        None => {
+            describe["model_requested"].is_null()
+                && observed_model.is_none_or(|model| !model.is_empty() && model.len() <= 256)
+                && model_verification == "native_default"
+                && init["model"].as_str() == observed_model
+                && native["requested_model_id"].is_null()
+                && native["model_readback_state"] == "native_default"
+        }
+    };
 
     if binding["state"] != "ready"
         || !binding["released_at_ms"].is_null()
         || observation["connection"] != "connected"
         || observation["recovery_required"] == true
-        || proof.refresh_operation_id != operation_id
-        || proof.binding_id != binding_id
-        || proof.binding_generation != generation
-        || Some(proof.worker_boot_id.as_str()) != observation["bridge_boot_id"].as_str()
-        || Some(proof.worker_boot_id.as_str()) != opening["bridge_boot_id"].as_str()
-        || proof.native_root_id != root_id
-        || proof.conversation_id != root_id
-        || proof.native_scope_key_sha256 != model::digest(scope_key.as_bytes())
-        || result.operation_id != operation_id
-        || result.outcome != EffectOutcome::Applied
-        || result.native_root_id.as_deref() != Some(root_id)
-        || result.native_scope_key.as_deref() != Some(scope_key)
-        || result.details["completion_condition"] != "current_process_native_observation"
-        || result.details["target"].as_str() != Some(root_id)
-        || opening["native_conversation_id"].as_str() != Some(root_id)
-        || opening_description["model_requested"].as_str() != proof.requested_model_id.as_deref()
-        || opening_description["model_observed"].as_str() != proof.observed_model_id.as_deref()
-        || opening_description["model_verification"].as_str()
-            != Some(proof.model_readback_state.as_str())
-        || (proof.requested_model_id.is_none()
-            && binding["route"]["native_options"].get("modelId").is_some())
-        || snapshot["phase"].as_str() != Some(proof.stream_phase.as_str())
-        || init["conversation_id"].as_str() != Some(proof.conversation_id.as_str())
-        || init["model"].as_str() != proof.observed_model_id.as_deref()
-        || snapshot["native_events_seen"].as_u64() != Some(proof.native_events_seen)
-        || snapshot["result_ordinal"].as_u64() != Some(proof.result_ordinal)
-        || snapshot["gaps"].as_u64() != Some(proof.gap_count)
-        || snapshot["stream_error_code"].as_str() != proof.stream_error_code.as_deref()
-        || snapshot["exit_code"].as_i64() != proof.stream_exit_code.map(i64::from)
+        || model::text(opening, "bridge_boot_id").map_err(|_| stale_state())? != boot_id
+        || model::text(opening, "native_conversation_id").map_err(|_| stale_state())? != root_id
+        || model::text(native, "boot_id").map_err(|_| stale_state())? != boot_id
+        || model::text(native, "native_root_id").map_err(|_| stale_state())? != root_id
+        || model::text(native, "native_scope_key").map_err(|_| stale_state())? != scope_key
+        || native["phase"] != "ready"
+        || model::text(init, "conversation_id").map_err(|_| stale_state())? != root_id
+        || native["native_events_seen"]
+            .as_u64()
+            .is_none_or(|events| events == 0)
+        || native["gaps"] != 0
+        || !native["stream_error_code"].is_null()
+        || !native["exit_code"].is_null()
+        || native["turn_pending"] != false
+        || !model_matches
     {
-        return Err(stale_proof());
+        return Err(stale_state());
     }
-    Ok(())
+
+    Ok(json!({
+        "kind":ANTIGRAVITY_CAPABILITY_KIND,
+        "binding_id":binding_id,
+        "binding_generation":generation,
+        "worker_boot_id":boot_id,
+        "native_root_id":root_id,
+        "native_scope_key_sha256":model::digest(scope_key.as_bytes()),
+        "model_requested":requested_model,
+        "model_observed":observed_model,
+        "model_verification":model_verification,
+    }))
 }
 
 pub(super) fn build_packet(
     parent: &LaunchParent,
     attempt: &Value,
     binding: &Value,
-    proof_value: &Value,
+    capability_value: &Value,
 ) -> Result<Value> {
-    let proof: AntigravityDispatchSessionProof =
-        serde_json::from_value(proof_value.clone()).map_err(|_| stale_proof())?;
-    proof.validate().map_err(|_| stale_proof())?;
-    validate_proof_binding_only(&proof, binding)?;
-
+    let current = current_capability(binding)?;
+    if model::canonical(&current)? != model::canonical(capability_value)? {
+        return Err(stale_state());
+    }
     let route_alias = super::launch_manifest_route_alias(&parent.manifest)?;
-    let assignment = json!({
-        "task_id":attempt["task_id"],
-        "task_revision":attempt["task_revision"],
-        "attempt_id":attempt["attempt_id"],
-        "binding_id":attempt["binding_id"],
-        "binding_generation":attempt["binding_generation"],
-        "native_session_id":parent.manifest["binding"]["native_root_id"],
-        "participant_id":parent.manifest["participant"]["client_id"],
-        "grant_revision":parent.manifest["participant"]["grant_revision"],
-    });
-    let assignment_digest = super::digest_value(&assignment)?;
-    let lease_authority_digest =
-        super::digest_value(&parent.manifest["workspace"]["lease_authority"])?;
-    let session_proof_digest = super::digest_value(proof_value)?;
-    let identity_digest = super::digest_value(&json!({
-        "launch_operation_id":parent.operation_id,
-        "plan_digest":parent.manifest["plan_digest"],
-        "assignment_digest":assignment_digest,
-        "lease_authority_digest":lease_authority_digest,
-        "session_proof_digest":session_proof_digest,
-    }))?;
+    let identity_digest = super::digest_value(&current)?;
     Ok(json!({
         "schema_version":1,
         "launch_operation_id":parent.operation_id,
@@ -207,49 +180,20 @@ pub(super) fn build_packet(
         "selection":{
             "route":route_alias,
             "provider":Value::Null,
-            "model":proof.observed_model_id,
+            "model":current["model_observed"],
             "variant":Value::Null
         },
         "purpose":parent.manifest["runtime"]["purpose"],
         "capability":{
-            "kind":proof.kind,
+            "kind":ANTIGRAVITY_CAPABILITY_KIND,
             "identity_digest":identity_digest,
-            "assignment_digest":assignment_digest,
-            "lease_authority_digest":lease_authority_digest,
-            "session_proof_digest":session_proof_digest,
-            "session_proof":proof
         }
     }))
-}
-
-fn validate_proof_binding_only(
-    proof: &AntigravityDispatchSessionProof,
-    binding: &Value,
-) -> Result<()> {
-    let binding_id = binding["binding_id"].as_str().ok_or_else(stale_proof)?;
-    let generation = binding["generation"].as_i64().ok_or_else(stale_proof)?;
-    let root_id = binding["native_root_id"].as_str().ok_or_else(stale_proof)?;
-    let scope_key = binding["native_scope_key"]
-        .as_str()
-        .ok_or_else(stale_proof)?;
-    if proof.binding_id != binding_id
-        || proof.binding_generation != generation
-        || proof.native_root_id != root_id
-        || proof.conversation_id != root_id
-        || proof.native_scope_key_sha256 != model::digest(scope_key.as_bytes())
-        || Some(proof.worker_boot_id.as_str()) != binding["observation"]["bridge_boot_id"].as_str()
-        || (proof.requested_model_id.is_none()
-            && binding["route"]["native_options"].get("modelId").is_some())
-    {
-        return Err(stale_proof());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
     const BINDING_ID: &str = "binding-antigravity";
     const GENERATION: i64 = 7;
@@ -258,31 +202,15 @@ mod tests {
     const SCOPE_KEY: &str = "native-scope-antigravity-7";
     const MODEL_ID: &str = "provider/model-v5";
 
-    fn session_proof_fixture() -> AntigravityDispatchSessionProof {
-        AntigravityDispatchSessionProof {
-            schema_version: 1,
-            kind: ANTIGRAVITY_PROOF_KIND.to_owned(),
-            refresh_operation_id: "refresh-current".to_owned(),
-            binding_id: BINDING_ID.to_owned(),
-            binding_generation: GENERATION,
-            worker_boot_id: BOOT_ID.to_owned(),
-            native_root_id: ROOT_ID.to_owned(),
-            native_scope_key_sha256: model::digest(SCOPE_KEY.as_bytes()),
-            conversation_id: ROOT_ID.to_owned(),
-            requested_model_id: Some(MODEL_ID.to_owned()),
-            observed_model_id: Some(MODEL_ID.to_owned()),
-            model_readback_state: "verified".to_owned(),
-            stream_phase: "ready".to_owned(),
-            native_events_seen: 1,
-            result_ordinal: 0,
-            gap_count: 0,
-            turn_pending: false,
-            stream_error_code: None,
-            stream_exit_code: None,
+    fn binding(model: Option<&str>) -> Value {
+        let (requested, observed, verification) = match model {
+            Some(model) => (json!(model), json!(model), json!("verified")),
+            None => (Value::Null, Value::Null, json!("native_default")),
+        };
+        let mut native_options = serde_json::Map::new();
+        if let Some(model) = model {
+            native_options.insert("modelId".to_owned(), json!(model));
         }
-    }
-
-    fn binding() -> Value {
         json!({
             "binding_id":BINDING_ID,
             "generation":GENERATION,
@@ -290,6 +218,12 @@ mod tests {
             "released_at_ms":null,
             "native_root_id":ROOT_ID,
             "native_scope_key":SCOPE_KEY,
+            "route":{
+                "alias":"antigravity-test",
+                "runtime":"antigravity",
+                "module_artifact_id":ANTIGRAVITY_ARTIFACT_ID,
+                "native_options":native_options,
+            },
             "observation":{
                 "connection":"connected",
                 "recovery_required":false,
@@ -298,185 +232,114 @@ mod tests {
                     "bridge_boot_id":BOOT_ID,
                     "native_conversation_id":ROOT_ID,
                     "describe":{
-                        "model_requested":MODEL_ID,
-                        "model_observed":MODEL_ID,
-                        "model_verification":"verified"
+                        "model_requested":requested,
+                        "model_observed":observed,
+                        "model_verification":verification,
                     }
+                },
+                "native":{
+                    "phase":"ready",
+                    "init":{"conversation_id":ROOT_ID,"model":observed},
+                    "native_events_seen":1,
+                    "gaps":0,
+                    "stream_error_code":null,
+                    "exit_code":null,
+                    "turn_pending":false,
+                    "boot_id":BOOT_ID,
+                    "native_root_id":ROOT_ID,
+                    "native_scope_key":SCOPE_KEY,
+                    "requested_model_id":requested,
+                    "model_readback_state":verification,
                 }
             }
         })
     }
 
-    fn refresh_result(proof: &AntigravityDispatchSessionProof) -> Value {
-        json!({
-            "operation_id":proof.refresh_operation_id,
-            "outcome":"applied",
-            "native_scope_key":SCOPE_KEY,
-            "native_root_id":ROOT_ID,
-            "turn_id":null,
-            "native_input_id":null,
-            "details":{
-                "completion_condition":"current_process_native_observation",
-                "target":ROOT_ID,
-                "snapshot":{
-                    "phase":"ready",
-                    "init":{"conversation_id":ROOT_ID,"model":MODEL_ID},
-                    "native_events_seen":proof.native_events_seen,
-                    "result_ordinal":proof.result_ordinal,
-                    "gaps":proof.gap_count,
-                    "stream_error_code":proof.stream_error_code,
-                    "exit_code":proof.stream_exit_code
+    fn parent() -> LaunchParent {
+        LaunchParent {
+            operation_id: "launch-antigravity".to_owned(),
+            state: "queued".to_owned(),
+            task_id: Some("task-antigravity".to_owned()),
+            attempt_id: Some("attempt-antigravity".to_owned()),
+            binding_id: Some(BINDING_ID.to_owned()),
+            binding_generation: Some(GENERATION),
+            effective_request_json: "{}".to_owned(),
+            effective: json!({}),
+            manifest: json!({
+                "plan_digest":model::digest(b"plan"),
+                "task":{
+                    "task_id":"task-antigravity",
+                    "observed_revision":1,
+                    "attempt_id":"attempt-antigravity",
                 },
-                "antigravity_dispatch_session_proof":proof
-            }
+                "runtime":{"route":{"alias":"antigravity-test"},"purpose":"implementation"},
+            }),
+        }
+    }
+
+    fn attempt() -> Value {
+        json!({
+            "task_id":"task-antigravity",
+            "task_revision":1,
+            "attempt_id":"attempt-antigravity",
+            "binding_id":BINDING_ID,
+            "binding_generation":GENERATION,
+            "task_snapshot":{"revision":1},
         })
     }
 
-    fn db_with_refresh(state: &str, created_at_ms: i64, result: Option<&Value>) -> Connection {
-        let db = Connection::open_in_memory().expect("in-memory Store fixture");
-        db.execute_batch(
-            "CREATE TABLE operations (
-                operation_id TEXT NOT NULL,
-                binding_id TEXT NOT NULL,
-                binding_generation INTEGER NOT NULL,
-                method TEXT NOT NULL,
-                state TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL,
-                settled_at_ms INTEGER,
-                result_json TEXT
-            );",
-        )
-        .expect("minimal operations schema");
-        db.execute(
-            "INSERT INTO operations(operation_id,binding_id,binding_generation,method,state,created_at_ms,settled_at_ms,result_json) \
-             VALUES('refresh-current',?1,?2,'agent.refresh',?3,?4,?5,?6)",
-            params![
-                BINDING_ID,
-                GENERATION,
-                state,
-                created_at_ms,
-                if state == "settled" { Some(created_at_ms + 1) } else { None },
-                result.map(serde_json::to_string).transpose().expect("serialize refresh result"),
-            ],
-        )
-        .expect("insert refresh operation");
-        db
+    #[test]
+    fn explicit_model_uses_store_binding_without_refresh_proof() {
+        let binding = binding(Some(MODEL_ID));
+        let capability = current_capability(&binding).unwrap();
+        assert_eq!(capability["kind"], ANTIGRAVITY_CAPABILITY_KIND);
+        assert_eq!(capability["worker_boot_id"], BOOT_ID);
+        assert_eq!(capability["model_observed"], MODEL_ID);
+        let packet = build_packet(&parent(), &attempt(), &binding, &capability).unwrap();
+        assert_eq!(packet["selection"]["model"], MODEL_ID);
+        assert_eq!(packet["capability"]["kind"], ANTIGRAVITY_CAPABILITY_KIND);
+        assert!(packet["capability"]["identity_digest"].as_str().is_some());
+        assert_eq!(packet["capability"].as_object().unwrap().len(), 2);
     }
 
     #[test]
-    fn current_settled_refresh_matches_live_binding_scope_and_open_evidence() {
-        let proof = session_proof_fixture();
-        let result = refresh_result(&proof);
-        let db = db_with_refresh("settled", 10, Some(&result));
-
-        let retained =
-            require_current_session_proof(&db, &binding()).expect("exact current refresh proof");
-
-        assert_eq!(retained["refresh_operation_id"], "refresh-current");
-        assert_eq!(
-            retained["native_scope_key_sha256"],
-            model::digest(SCOPE_KEY.as_bytes())
-        );
+    fn native_default_keeps_model_unknown_without_refresh_proof() {
+        let binding = binding(None);
+        let capability = current_capability(&binding).unwrap();
+        assert!(capability["model_requested"].is_null());
+        assert!(capability["model_observed"].is_null());
+        assert_eq!(capability["model_verification"], "native_default");
+        let packet = build_packet(&parent(), &attempt(), &binding, &capability).unwrap();
+        assert!(packet["selection"]["model"].is_null());
     }
 
     #[test]
-    fn newer_unsettled_refresh_suppresses_older_current_proof() {
-        let proof = session_proof_fixture();
-        let result = refresh_result(&proof);
-        let db = db_with_refresh("settled", 10, Some(&result));
-        db.execute(
-            "INSERT INTO operations(operation_id,binding_id,binding_generation,method,state,created_at_ms) \
-             VALUES('refresh-newer',?1,?2,'agent.refresh','queued',20)",
-            params![BINDING_ID, GENERATION],
-        )
-        .expect("insert newer refresh");
-
-        assert!(require_current_session_proof(&db, &binding()).is_err());
-    }
-
-    #[test]
-    fn native_default_session_proof_preserves_unknown_model_and_exact_binding() {
-        let mut proof = session_proof_fixture();
-        proof.schema_version = 2;
-        proof.kind = swarm_contracts::runtime::ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND.into();
-        proof.requested_model_id = None;
-        proof.observed_model_id = None;
-        proof.model_readback_state = "native_default".into();
-        assert!(proof.validate().is_ok());
-        let mut current_binding = binding();
-        current_binding["observation"]["opening_evidence"]["describe"] = json!({
-            "model_requested":null,"model_observed":null,"model_verification":"native_default"
-        });
-        let mut result = refresh_result(&proof);
-        result["details"]["snapshot"]["init"]["model"] = Value::Null;
-        let db = db_with_refresh("settled", 10, Some(&result));
-        let retained = require_current_session_proof(&db, &current_binding)
-            .expect("same current native-default session is dispatchable");
-        assert_eq!(retained["schema_version"], 2);
-        assert!(retained["requested_model_id"].is_null());
-        assert!(retained["observed_model_id"].is_null());
-        assert_eq!(retained["native_root_id"], ROOT_ID);
-
-        // Missing selection cannot relabel a route that actually requested a
-        // model. All boot/identity and current-refresh fences still apply.
-        current_binding["route"]["native_options"]["modelId"] = json!(MODEL_ID);
-        assert!(require_current_session_proof(&db, &current_binding).is_err());
-        current_binding["route"]["native_options"]
-            .as_object_mut()
-            .unwrap()
-            .remove("modelId");
-        current_binding["observation"]["bridge_boot_id"] = json!("another-boot");
-        assert!(require_current_session_proof(&db, &current_binding).is_err());
-        proof.turn_pending = true;
-        assert!(proof.validate().is_err());
-    }
-
-    #[test]
-    fn native_default_model_state_cannot_bypass_explicit_or_legacy_proof_contract() {
-        let mut proof = session_proof_fixture();
-        proof.requested_model_id = None;
-        proof.model_readback_state = "native_default".into();
-        assert!(
-            proof.validate().is_err(),
-            "v1 still requires explicit model verification"
-        );
-        proof.schema_version = 2;
-        assert!(
-            proof.validate().is_err(),
-            "schema and kind must identify the same contract"
-        );
-        proof.kind = swarm_contracts::runtime::ANTIGRAVITY_NATIVE_DEFAULT_SESSION_PROOF_KIND.into();
-        assert!(
-            proof.validate().is_ok(),
-            "an observed default may remain a fact"
-        );
-        proof.requested_model_id = Some(MODEL_ID.into());
-        assert!(
-            proof.validate().is_err(),
-            "explicit requests cannot use the default state"
-        );
-    }
-
-    #[test]
-    fn stale_boot_generation_and_pending_turn_are_rejected() {
-        let proof = session_proof_fixture();
-        let result = refresh_result(&proof);
-        let db = db_with_refresh("settled", 10, Some(&result));
-
-        let mut stale_binding = binding();
-        stale_binding["observation"]["bridge_boot_id"] = json!("another-boot");
-        assert!(require_current_session_proof(&db, &stale_binding).is_err());
-
-        let mut wrong_generation = session_proof_fixture();
-        wrong_generation.binding_generation += 1;
-        assert!(wrong_generation.validate().is_ok());
-        let mut malformed_result = refresh_result(&wrong_generation);
-        malformed_result["operation_id"] = json!(wrong_generation.refresh_operation_id);
-        let stale_db = db_with_refresh("settled", 10, Some(&malformed_result));
-        assert!(require_current_session_proof(&stale_db, &binding()).is_err());
-
-        let mut pending_turn = session_proof_fixture();
-        pending_turn.turn_pending = true;
-        assert!(pending_turn.validate().is_err());
+    fn changed_boot_model_or_native_health_fails_closed() {
+        for mutation in [
+            "boot",
+            "model",
+            "phase",
+            "gap",
+            "turn",
+            "recovery",
+            "connection",
+        ] {
+            let mut binding = binding(Some(MODEL_ID));
+            match mutation {
+                "boot" => binding["observation"]["bridge_boot_id"] = json!("other-boot"),
+                "model" => binding["observation"]["native"]["init"]["model"] = json!("other-model"),
+                "phase" => binding["observation"]["native"]["phase"] = json!("stream_ended"),
+                "gap" => binding["observation"]["native"]["gaps"] = json!(1),
+                "turn" => binding["observation"]["native"]["turn_pending"] = json!(true),
+                "recovery" => binding["observation"]["recovery_required"] = json!(true),
+                "connection" => binding["observation"]["connection"] = json!("disconnected"),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                current_capability(&binding).unwrap_err().code,
+                "STALE_ANTIGRAVITY_DISPATCH_STATE",
+                "{mutation}",
+            );
+        }
     }
 }

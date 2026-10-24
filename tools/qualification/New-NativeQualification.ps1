@@ -2660,7 +2660,6 @@ try {
     $launch = Invoke-ManagerCall -Method 'swarm.launch' -Params $launchParams -TimeoutMilliseconds 30000
     $parentOperationId = if ($launch.completed -and $launch.exit_code -eq 0 -and $null -ne $launch.value) { [string]$launch.value.operation_id } else { $null }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    $sessionRefreshAttempted = $false
     $readyProof = $null
     $launchReadbackFailure = $null
     $readinessFailureReason = 'operation_count_scope'
@@ -2844,25 +2843,6 @@ try {
         } else { $null }
         if (-not (Test-ReadinessDispatchPhase -Operation $parentOp -BindingId $bindingId -Generation $generation)) {
             $readinessFailureReason = 'launch_phase'
-            Start-Sleep -Milliseconds 750
-            continue
-        }
-        if ($Adapter -ceq 'Antigravity' -and -not $sessionRefreshAttempted) {
-            # Refresh the already-open exact session once. Lost response stays
-            # uncertain: only the Store's current proof can resolve readiness.
-            $sessionRefreshAttempted = $true
-            $refreshRequestId = New-RequestId
-            $refresh = Invoke-ManagerCall -Method 'agent.refresh' -Params ([ordered]@{
-                binding_id = $bindingId; generation = $generation; client_request_id = $refreshRequestId
-            }) -TimeoutMilliseconds 30000
-            $lastReadinessErrorCode = Get-SafeReadinessErrorCode $refresh.error_code
-            $script:Report.safe_facts.native_session_refresh = [ordered]@{
-                attempted = $true; calls = 1; replayed = $false
-                request_id = $refreshRequestId
-                operation_id = Get-SafeReadinessIdentifier (Get-OptionalField -Object $refresh.value -Name 'operation_id' -PreserveCollection)
-                response_error_code = $lastReadinessErrorCode
-            }
-            $readinessFailureReason = 'native_dispatch_capability'
             Start-Sleep -Milliseconds 750
             continue
         }
