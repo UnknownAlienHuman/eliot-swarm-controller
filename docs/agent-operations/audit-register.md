@@ -1,64 +1,54 @@
 # Audit register
 
-Durable source-audit resume point: inspected revision, exact paths, findings, preserved
-behavior and untraced boundaries. Not a runtime registry or second implementation
-queue. [Implementation](implementation.md) owns changes;
-[status](../implementation-status.md) records landed behavior.
-[Audit index](audit-index.md) provides direct evidence checkpoints and source/target links.
+Durable source-audit resume point. This file owns finding dispositions and the exact
+continuation point; [implementation](implementation.md) owns source changes,
+[status](../implementation-status.md) owns landed behavior, and
+[the audit index](audit-index.md) owns navigation to immutable evidence.
 
 ## Resume here
 
-- Checkpoint: **2026-10-23 / submission, reviewer replacement, all-findings correction,
-  same-Attempt resubmission and acceptance/recovery**.
-- Inspected repository head: **`4af640ea6edc190d58a7320674c85cbc5bd3c6b3`**.
-  The [index](audit-index.md#evidence-checkpoints) links earlier detailed evidence
-  directly; their current dispositions remain below.
-- Last connected pass: `submissions::{reserve,begin,finish}` →
-  `reviews::{reserve_assign,replacement_class,reserve_submit}` → review disposition →
-  `request_changes_core` / correction Send → resubmission → direct/automatic acceptance
-  reservation, off-DB verification and final transition. Follow-up reads distinguished
-  shared evidence checks from the direct caller's missing assigned-review gate.
-  New evidence is [AR-059–064](#trace-2026-10-23-review-acceptance), with AR-011 preserved
-  and AR-052 extended to queued repair input.
-- Runtime baseline: **`c92120ed70ca7e625440a8a19517c481e73b13c9`**, 2026-10-21.
-  The compared interval through the inspected head contains **19 documentation-only
-  commits**. Source is unchanged; this is not exhaustive source coverage.
-- Overall audit: **incomplete**. There are **64 entries**, including defects, preserved
-  mechanisms and partial boundaries; no measured completeness percentage.
-- Direct reviewer replacement, all-findings feedback, immutable submissions/reviews
-  and the common candidate/check/byte gate already work in the inspected source.
-  Automatic replacement and finite correction budgets are missing. Pending-result
-  saturation hides later work within an entry; revoked dependency pins can abort a
-  whole review-disposition pass. Direct acceptance does not share automatic
-  assigned-review/finding checks. No runtime repair or end-to-end completion is claimed.
-- **Next exact chain:** `store/checks::{reserve_source,begin_source,finish_source}` →
-  `checks::source` snapshot/bytes → `store/checks::{reserve,next,ready}` → selected
-  `swarm-checks` / `checks::worker` process → `completion` / `store/checks::finish` →
-  cache selection/revalidation → `acceptance::evidence`. Check exact frozen input,
-  tool/profile identity, parser coverage, cached evidence, process/resource release,
-  cancellation/restart and changes between off-DB verification and commit. Reading
-  acceptance's validators has not qualified the CheckRun producer or its cache.
-- Source/target entry points: [index](audit-index.md#source-and-target-map),
-  [Task policy](../task-policy.md), [delivery](delivery.md), [configuration](configuration.md)
-  and implementation G/K. Runtime order remains A1b–A3, then B–V.
-- Still unqualified: actual review/replacement/native correction/acceptance execution,
-  disable/transfer/restart interleavings, crash/power-loss, full CheckRun production,
-  installed independent native/Eliot Goals and the other indexed source boundaries.
-- Documentation only. No runtime change, Clippy, tests, benchmark or installed-harness
-  qualification ran. Prior exact official donor reads are retained with their original
-  version limits in the [donor map](donor-map.md); this pass did not refresh them.
+- Checkpoint: **2026-10-23 / fixed source, CheckRun execution, cache and acceptance handoff**.
+- Source inspected at **`5b6b5bee92123ce7d3252054c939fb18619b790f`**.
+  Runtime source is still **`c92120ed70ca7e625440a8a19517c481e73b13c9`**
+  from 2026-10-21; the intervening **20 commits are documentation-only**.
+- Last connected chain:
+  `store/checks::{reserve_source,begin_source,finish_source}` →
+  `checks::source` → `store/checks::{reserve,next,ready}` →
+  `swarm-checks` / legacy `checks::worker` → completion/recovery →
+  cache selection/revalidation → `acceptance::evidence`.
+  New evidence is [AR-065–070](#trace-2026-10-23-checkrun).
+- Overall audit: **incomplete, 70 entries**. Entries include defects, preserved
+  mechanisms, scope corrections and partial boundaries; they are not 70 bugs or a
+  measured completion percentage.
+- Preserved in this pass: exact immutable Git snapshots; Store-Go-before-command;
+  process-group custody; parser-specific coverage; byte/result/process revalidation;
+  direct-original-only cache lineage; two-phase acceptance revalidation.
+- Open in this pass: `source.capture` has no automatic successor/reconciliation owner
+  after host interruption, and new CheckRuns still have two executor implementations
+  selected by local configuration.
+- **Next exact chain:** `store/scripts::{reserve,next,ready,finish}` →
+  `scripts::runner` / `swarm-script-worker` → typed returned actions →
+  child Operation admission/readback → cancellation/restart/transfer →
+  automation consumers. Trace one exact ScriptRun through every returned action and
+  prove that restart cannot rerun either the script or an already admitted child.
+- Runtime implementation order remains **A1b–A3, then B–V**. The source audit does not
+  reorder implementation.
+- Still unqualified: live Windows/Linux process behavior, power loss, installed
+  providers, load/fairness, the autonomous end-to-end work cycle and every boundary
+  listed in the index.
+- Documentation only. No runtime code, Clippy, test, benchmark or installed-harness
+  qualification changed in this checkpoint.
 
-On resume compare changed source with the verified head, then reopen only affected
-callers/consumers. Preserve IDs, evidence and qualifications. A source read or docs
-commit is neither executed qualification nor a runtime repair.
+On resume, compare live `main` with the inspected source head, reopen only changed
+owners/consumers, and continue the named chain. A source read or docs commit is not a
+runtime repair.
 
 ## Evidence labels
 
-**Source-confirmed** means a named path supports the consequence, not live reproduction.
-**Preserve** identifies useful behavior. **Partial** names an untraced boundary. Earlier
-rows remain inherited unless explicitly reread. Open findings close only with connected
-runtime evidence. Current dispositions below override older broader claims; the
-[index](audit-index.md#evidence-checkpoints) links the detailed evidence directly.
+**Open** names a demonstrated gap. **Preserve** identifies working behavior that a
+refactor must retain. **Boundary** or **partial** records an incomplete trace.
+**Scope correction** narrows an earlier claim. Current rows override older wording;
+the [index](audit-index.md#evidence-checkpoints) links the detailed snapshots.
 
 ## Findings and coverage
 
@@ -126,223 +116,151 @@ runtime evidence. Current dispositions below override older broader claims; the
 | <a id="ar-060"></a>AR-060 | Finite correction/no-progress | **Source-confirmed target gap.** Same-Attempt new submissions/reviews can obtain fresh repair slots; exact-result dedupe and retry backoff do not bound rounds. | Reserve finite correction rounds, assess relevant settled evidence, preserve consumption and unresolved effects; no fresh-ID reset. No infinite run was executed. |
 | <a id="ar-061"></a>AR-061 | Review-result pending saturation | **Source-confirmed entry-local barrier.** At 64 pending results that entry stops before the next unqueued event, including potentially ready independent work. Other entries continue on normal capacity status. | Fair bounded current-state selection without copying another pending queue; keep unknown effects and late-check recovery. |
 | <a id="ar-062"></a>AR-062 | Revoked dependency pin in review consumer | **Source-confirmed cross-subject barrier.** Post-claim invalidation yields `DEPENDENCY_REVALIDATION_REQUIRED`; it rolls back the review-disposition pass and skips queued acceptance verification on that call. | Per-subject replan/reclaim with immutable old pin/candidate; unrelated work progresses. Reaccepting the prerequisite cannot repair the frozen revoked receipt. |
-| <a id="ar-063"></a>AR-063 | Frozen evidence and acceptance verification | **Preserve with scope limit.** Direct/automatic paths share candidate, V2 plan, exact checks/dependencies and off-DB byte verification with final revalidation. Late missing CheckRuns retry the retained pass. | Preserve these validators; producer/cache/installed execution remains unqualified. Shared evidence gate does not imply shared assigned-review provenance (AR-064). |
+| <a id="ar-063"></a>AR-063 | Frozen evidence and acceptance verification | **Preserve with scope limit.** Direct/automatic paths share candidate, V2 plan, exact checks/dependencies and off-DB byte verification with final revalidation. Late missing CheckRuns retry the retained pass. | Preserve these validators; assigned-review provenance remains open in AR-064. CheckRun producer/cache are qualified by AR-067–069 at source level only. |
 | <a id="ar-064"></a>AR-064 | Direct acceptance review/finding gate | **Source-confirmed target gap.** Direct caller supplies requirement-review arrays; common gate checks their coverage and feedback freshness, not retained assigned review or resolution of actionable findings. Automatic preflight adds those review restrictions. | Resolve required auditor provenance and finding disposition in the common gate; accepting agent supplies decision/reason, not substitute review evidence. |
+| <a id="ar-065"></a>AR-065 | Interrupted fixed-source capture | **Preserve plus open recovery gap.** Sealed admission lets an already-started exact capture finish after Task/Attempt change. Host restart converts `sending` to `outcome_unknown`; the same exact call may rebuild the deterministic snapshot, but no current-state owner automatically resumes or settles it. | One bounded reconciliation/retry path for the original Operation and admission; no branch replay, new workflow or silent abandonment. |
+| <a id="ar-066"></a>AR-066 | Immutable source snapshot | **Preserve.** Exact commit/tree/blob/mode, complete manifest/bytes and deterministic artifact identity are reverified. Symlinks, gitlinks, LFS pointers, case collisions and unsafe paths reject instead of disappearing. | Installed Git/platform and power-loss qualification; external build inputs remain explicit CheckProfile inputs. |
+| <a id="ar-067"></a>AR-067 | Check command custody and recovery | **Preserve.** Exact resolved plan/profile/tool/input identity is retained before launch; Store acknowledges the exact process owner before Go; cancellation/restart retain one process group and never replay the command. | Live Windows/Linux/process-escape/load qualification and damaged-custody cases. |
+| <a id="ar-068"></a>AR-068 | Parser coverage and process evidence | **Preserve.** A pass requires exit zero, source revalidation, complete parser-specific target identity/coverage, verified output artifacts and proven resource release. Acceptance reruns these checks for the exact required profile revision. | Only implemented parser families are covered; semantic requirement sufficiency still needs independent review where configured. |
+| <a id="ar-069"></a>AR-069 | Check result reuse | **Preserve with strict provenance.** Reuse points directly to one original passed process row, forbids cache chains, matches resolved inputs/scope/coverage/result bytes and revalidates that original source as the same currently accepted project candidate. A cached row's null exit code is never trusted alone. | Live revocation/concurrency/large-cache qualification; retain original process/output/source evidence until consumers finish. |
+| <a id="ar-070"></a>AR-070 | Two CheckRun executors | **Source-confirmed migration gap, not an evidence bypass.** `checks.executor=None` still sends new work through the kernel-host worker; a verified pin selects standalone `swarm-checks` with no fallback. Both converge on the same custody and completion validators. | Select standalone for all new work, disposition active legacy runs, then delete the hidden host executor/config/fixtures without weakening recovery. |
 
-## Earlier detailed traces
+## Evidence checkpoints
 
-Detailed older prose is retained in immutable Git snapshots instead of being recopied
-into every checkpoint. Stable AR IDs and current dispositions remain above; the
-[index](audit-index.md#evidence-checkpoints) links all earlier passes directly.
+Older detailed reasoning remains immutable instead of being recopied into the active
+register. Use the current disposition above when an older snapshot is broader.
 
-### Prior connected source trace: AR-045–AR-047
-
-[Detailed retirement/control trace at 3c4c859](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3c4c8599f1614460fe69d54d0b59715a26ada797/docs/agent-operations/audit-register.md),
-inspected at `c2b998b`: shutdown readiness, detach/demand and historical departure.
-
-<a id="trace-2026-10-23-retirement-admission"></a>
-
-### Source trace at b2519aa: AR-048–AR-050
-
-[Detailed trace at 73ba700](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/73ba7009bbc5c5515fe4c5f85743066e944106ef/docs/agent-operations/audit-register.md#trace-2026-10-23-retirement-admission):
-missing attached-binding finalizer, route-edit accounting and preserved common
-claim/Open transaction. No live oversubscription/concurrency claim.
-
-<a id="trace-2026-10-23-goal-policy"></a>
-
-### Source trace at 73ba700: AR-051–AR-058
-
-[Detailed trace at 4af640e](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/4af640ea6edc190d58a7320674c85cbc5bd3c6b3/docs/agent-operations/audit-register.md#trace-2026-10-23-goal-policy):
-Goal actor/disable/phase/budget/transfer, exact terminal identity, calendar continuity
-and current versus upstream native Goals. The AR-052 repair extension is below; it
-does not remove the distinct Goal transfer finding or qualify installed behavior.
-
-<a id="trace-2026-10-23-review-acceptance"></a>
-
-## Source trace at 4af640e: review, correction and acceptance
-
-Inspected 2026-10-23 at the head above, runtime `c92120e`. Paths are relative to
-`crates/swarm-kernel-host/src` unless qualified. These are connected source reads,
-including counterchecks of the direct/automatic paths, not executed fixtures or fixes.
-
-### AR-059 — direct replacement exists; the automatic caller stops after assignment
-
-`reviews::replacement_class` supports an unanswered slot without a verdict,
-`inconclusive` without a correction disposition, and `changes_requested` only after
-its exact ReturnForCorrection disposition. `reserve_assign` requires the expected
-current assignment and a different reviewer. A passing assignment cannot be replaced.
-`reserve_submit` retains one immutable result: identical semantic replay coalesces;
-different input conflicts. Late results require exact retained non-revoked reviewer
-scope and remain historical when the slot or candidate is no longer current.
-
-`automation_dispatch::attempt_review_assignment` is driven by an applied submission.
-It constructs `ReviewAssignRequest::for_automation` without a replacement ID;
-`reviews::reserve_assign` expressly forbids replacement for `ReviewActor::OnBehalf`.
-`recheck_pending` retries unassigned subjects but removes one after successful
-assignment. The host's startup/change/safety wake cannot replace an unanswered or
-inconclusive reviewer through this path. Existing direct classes are therefore
-preserved capability, not implemented automatic replacement.
-
-Target `review_once` must query current slots, use a configured response deadline or
-retained inconclusive result, recheck the expected assignment and select a distinct
-eligible reviewer. Bound replacement attempts and address one Governor decision if
-policy cannot continue. Do not introduce a reviewer daemon or treat silence as death.
-
-### AR-011 and AR-052 — keep all findings and resubmission; fix admitted-input policy
-
-`automation_disposition::consume_selected_disposition` builds one ordered package of
-all committed actionable findings. `submissions::request_changes_package_on_behalf` /
-`request_changes_core` commits feedback and `needs_correction`; its receipt explicitly
-says durable mailbox only, no native input sent and no repair started. If RepairDispatch
-is selected, the consumer verifies exact disposition/findings/feedback provenance and
-reserves a separate ordinary Send within the reconciliation transaction. Native input
-admission, terminal result, corrected submission and acceptance are separate facts.
-
-`submissions::{reserve,begin,finish}` retains the submitted document and candidate,
-verifies published provenance after file I/O, and applies it only if the exact revision,
-Attempt and prior submission are still current. Otherwise verified publication remains
-historical. `needs_correction` can submit again on the same unreleased Attempt. Even
-an unchanged artifact may get a new immutable submission and review slot; this is not
-permission to overwrite a review or count a new ID as progress.
-
-`RepairDispatchContext::require_current_for_effect` calls `require_current_action`
-when no current transfer continuation exists. It requires the original enabled entry
-revision and selected RepairDispatch step. Pure disable/edit after queue admission can
-therefore make `runtime::next_internal` commit `queued` → `rejected`, `command:null`.
-The retained semantic slot resolves to that Operation on re-enable; the current repair
-consumer classifies it as NoEffect/skipped rather than admitting another Send.
-There is an explicit exact transfer-continuation branch: do not copy Goal's broader
-transfer failure onto it. Preserve actual rights, candidate/phase/binding and unresolved
-effect fences while separating future policy from admitted intent. AR-010's broad
-Rejected/Cancelled classification remains a separate open issue.
-
-### AR-060 — correction identity does not bound correction rounds
-
-The production submission/review/disposition/repair chain has no visible correction
-round budget, repeated-content progress comparison or automatic no-progress Governor
-escalation. `semantic_slot_id` includes Task/revision/Attempt/submission/candidate and
-findings digest. It deduplicates one correction; a new submission/review can have a new
-slot. `submissions::finish` returns the same Attempt to `submitted`, not accepted.
-A succession of new changes-requested results has no finite stop in these owners.
-This is a source-bounded absence finding, not an observed endless native run.
-
-Reserve finite rounds at new correction admission, then assess progress from relevant
-settled candidate/check/review evidence. Preserve consumption across ID changes,
-policy edits, transfer and restart. Waiting and retrying the same readback are not
-another round. Exhaustion stops new input and coalesces one Governor-agent decision;
-it never discards unknown native effects or stops their capture/readback.
-
-### AR-061 — pending capacity blocks an entry's later ready result
-
-`review_disposition::reconcile_entry` rechecks bounded pending work first. At
-`MAX_PENDING_RESULTS = 64` it returns, or stops before the next unqueued event, without
-advancing that entry past the barrier. A later independent ready result for the same
-entry cannot enter until pending space opens. Normal capacity status persists and the
-outer loop continues other entries; this is not the domain-wide error in AR-062.
-
-`MAX_PENDING_RETRIES = 32` saturates the retry counter; it is not an abandonment bound.
-Unresolved work remains and backoff caps at 60 seconds. Preserve this retention,
-particularly exact unknown delivery and late-check recovery. Replace backlog-based
-eligibility with fair bounded queries over current domain facts, not dropping old
-records or adding a larger second queue.
-
-### AR-062 — a revoked frozen dependency escapes subject isolation
-
-`tasks::claim` resolves dependency acceptance receipts for a new Attempt and freezes
-them in its snapshot. `acceptance::invalidate` can later revoke such a prerequisite.
-With the dependent candidate's checks ready, `acceptance::validate_dependencies`
-rejects that pinned receipt with `DEPENDENCY_REVALIDATION_REQUIRED`. This differs
-from `DEPENDENCY_NOT_READY` at claim time and from a newer prerequisite revision:
-an otherwise valid explicitly pinned older decision remains valid.
-
-`review_disposition::consume_isolated` does not classify this condition locally;
-`classify_domain_error` treats it as fatal. `reconcile_automation_domain` rolls back
-the entire review-disposition transaction, including other progress/cursors in that
-pass. Canonical review results remain retained, but repeated passes can encounter the
-same blocker. `Store::reconcile_review_dispositions_once` calls the automatic acceptance
-verifier only after that pass succeeds, so already-queued unrelated acceptances are
-also not verified on the failed call. No live stall duration was measured.
-
-Treat revoked-pin recovery as a visible per-subject decision. Reaccepting the
-prerequisite under a new Operation cannot un-revoke or rewrite the dependent snapshot.
-Current recovery closes the dependent Attempt's effects, releases/reclaims after a
-valid prerequisite receipt exists, and creates the new Attempt's submission/review.
-Retain the old candidate/history; do not bypass evidence or silently migrate its pin.
-The target common loop must continue unrelated review and queued verification work.
-
-If invalidation occurs after `task.accept` reservation, `begin_on_behalf` / `finish_on_behalf`
-rerun the gate and settle failure. The review consumer retains that terminal receipt
-and removes the resolved pending cause; it does not replay the failed acceptance or
-automatically revisit that consumed pass after later evidence changes. Recovery needs
-an attributable fresh decision under valid current scope, not another request ID for
-an unresolved or still-invalid effect.
-
-### AR-063 — preserve the shared evidence/byte gate and late-check recovery
-
-Direct `acceptance::reserve` and automatic `reserve_on_behalf` converge on
-`reserve_with_actor` / `evidence`. These check current Task/revision/Attempt/submission/
-candidate, accepting actor independence from owner/submitter, exact feedback freshness,
-the frozen V2 plan, exact required review coverage, dependency pins, candidate digest/
-length and required CheckRun identities/profile revisions/parser coverage. The direct
-and on-behalf begin/finish pairs rerun the evidence gate around off-DB artifact-byte
-verification and compare the retained manifest before Task acceptance. Do not replace
-this with another acceptance engine or remove the frozen plan.
-
-`automation_acceptance` copies `requirement_reviews` from the exact retained assigned
-pass. Missing V2 review-required coverage is a capability gap, not fabricated evidence.
-Check-to-requirement mapping follows the frozen plan after exact profile-set validation.
-Historical V1 has no invented per-requirement mapping. The earlier blanket deletion
-wording for automatic evidence arrays was too broad and is corrected in implementation G.
-
-Before admission, missing required checks produce `required_checks_incomplete`.
-`review_disposition::is_unresolved` retains the exact event/assignment/result in pending
-state and retries it; a later passing exact CheckRun can unlock the same candidate.
-The pass is not lost merely because it arrived before checks. Artifact/source/cache
-production is the next chain, not established by reading these acceptance validators.
-Store checks structure/scope/bytes, while a reviewer must judge whether cited evidence
-actually proves the criterion. Neither an evidence array nor source inspection proves
-that semantic judgment or installed execution.
-
-### AR-064 — the common gate does not yet own assigned-review/finding provenance
-
-`AcceptActor::reviewer_id` is the direct caller or represented Manager, not the assigned
-auditor. Direct `task.accept` supplies `AcceptRequest.reviews`; parse requires unique
-requirement IDs and nonempty rationale/evidence strings, and `validate_coverage` requires
-the frozen review subset. The common `evidence` function does not resolve a retained
-assigned review, check configured reviewer count, scope those review citations to the
-assigned artifacts, or inspect unresolved findings. `expected_feedback_observation_id`
-only fences a change since the caller's selected cursor. Independence from the
-submission owner/submitter remains checked; this is not unauthenticated acceptance.
-
-Automatic preflight additionally requires a canonical assigned complete pass with no
-findings, independent reviewer/sponsor identities, current candidate applicability and
-no later feedback. It supports the primary slot with `required_reviewers == 1`; a larger
-count is an explicit capability gap. These checks are not automatically inherited by
-the direct path merely because both callers eventually use `acceptance::evidence`.
-
-Target direct and automatic decisions must resolve required review provenance and
-current finding dispositions through that common owner. Keep accepting decision actor,
-auditor and author distinct. An authorized decision may dispose a disputed finding
-under policy; a fresh cursor or caller-written replacement review array cannot do so.
-Reject unsupported review policies before work and preserve exact historical results.
-
-| Inspected owner | Exact read boundary |
+| Entries | Snapshot |
 | --- | --- |
-| `store/submissions.rs`, `submission.rs`, `store/tasks.rs` | Frozen claims/spec/dependency pins, submission reserve/begin/finish, stale publication, all-findings feedback and same-Attempt resubmission. |
-| `store/reviews.rs`, `review.rs`, selected `store/coordination.rs` scopes | Slot/candidate identity, replacement classes/CAS, immutable result, exact requirement coverage and non-revoked late-result scope. |
-| `store/automation_dispatch.rs` | Submission-driven assignment, pending retry/removal and automated request construction. |
-| `store/automation_disposition.rs`, `store/review_disposition.rs` | Exact committed result, all-findings package, subject savepoints, pending/backoff/capacity, fatal classifier and terminal acceptance disposition. |
-| `automation/repair.rs`, `store/automation_repair.rs`, `store/runtime.rs` | Linked repair Send, slot identity, current-policy/transfer pre-effect guards, committed rejection and readback classification. |
-| `store/automation_acceptance.rs`, `automation/acceptance.rs` | Assigned-pass preflight, late-check selection, retained review evidence, semantic request identity and failed/in-flight receipt handling. |
-| `store/acceptance.rs`, host/kernel `acceptance.rs`, `store/mod.rs` | Direct/on-behalf gate and differences, exact frozen evidence, byte-verification stages, invalidation and domain/verifier ordering. |
+| AR-001–005 | [`c3e331a`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c3e331a37ef58b3b98f7859bfb9e40935501e106/docs/agent-operations/audit-register.md) |
+| AR-006–008 | [`70b99db`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/70b99db3d8732d10a69d03d1dbe83afdd39a7229/docs/agent-operations/audit-register.md) |
+| AR-009–011 | [`1c61629`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/1c61629b49e8d6b9763dc7f5be32a0135509d7e3/docs/agent-operations/audit-register.md) |
+| AR-012–016 | [`ec01905`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ec0190526508af1daf0da3a1aae51ee425b6ab04/docs/agent-operations/audit-register.md) |
+| AR-017–019 and AR-016 correction | [`f5ccc41`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/f5ccc418ba401733d1f778619abeec5c0554416b/docs/agent-operations/audit-register.md) |
+| AR-020–024 | [`ac3389c`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/ac3389c013840b02a78dc310bcee481d24086402/docs/agent-operations/audit-register.md) |
+| AR-025–031 and AR-024 correction | [`9c47d88`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/9c47d88a09a543e9f0ea74228370833f14a6c619/docs/agent-operations/audit-register.md) |
+| AR-032–035 | [`a0bc1dc`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/a0bc1dcb69fa4a2d3dea1e51e3c5b0d148bde1bb/docs/agent-operations/audit-register.md) |
+| AR-036–040 | [`c0d1b91`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c0d1b91f15636982f977768474f7246b97308d61/docs/agent-operations/audit-register.md) |
+| AR-041–044 | [`c2b998b`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/c2b998b079fe8517c592192c18d6ecbfb6b26aae/docs/agent-operations/audit-register.md) |
+| AR-045–047 | [`3c4c859`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/3c4c8599f1614460fe69d54d0b59715a26ada797/docs/agent-operations/audit-register.md) |
+| AR-048–050 | [`73ba700`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/73ba7009bbc5c5515fe4c5f85743066e944106ef/docs/agent-operations/audit-register.md#trace-2026-10-23-retirement-admission) |
+| AR-051–058 | [`4af640e`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/4af640ea6edc190d58a7320674c85cbc5bd3c6b3/docs/agent-operations/audit-register.md#trace-2026-10-23-goal-policy) |
+| AR-059–064 | [`5b6b5be`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/5b6b5bee92123ce7d3252054c939fb18619b790f/docs/agent-operations/audit-register.md#trace-2026-10-23-review-acceptance) |
+| AR-065–070 | [Current source trace](#trace-2026-10-23-checkrun) |
 
-## Next work and retained evidence
+<a id="trace-2026-10-23-checkrun"></a>
+## Source trace at 5b6b5be: fixed source, CheckRun and cache
 
-Continue the CheckRun producer/cache chain named in Resume here. Review/correction/
-acceptance now have this selected connected source trace; their open defects belong
-to implementation, not another repetition of the same pass. Full corrected-result
-capture, installed review/native execution and live interleavings remain unqualified.
+Inspected 2026-10-23. Paths are relative to `crates/swarm-kernel-host/src` unless
+qualified. This is a connected source read, not an executed CheckRun.
 
-[Coverage still open](audit-index.md#coverage-still-open) names the other areas;
-[evidence checkpoints](audit-index.md#evidence-checkpoints) links prior detailed traces.
-Keep IDs and refuted/narrowed claims stable. A documentation commit repairs no runtime.
+### AR-065–066 — fixed-source identity is strong; automatic recovery is missing
+
+`store/checks::reserve_source` freezes the Operation, caller, Task/revision/Attempt,
+absolute repository, exact commit and workspace-lease authority. `begin_source`
+rechecks current scope in an Immediate transaction and moves only the exact queued or
+unknown Operation to `sending`. `finish_source` validates the sealed admission and
+deterministic `source-<operation digest>` artifact, but intentionally no longer
+requires the Task/Attempt to remain current. An already-started capture can therefore
+finish historically instead of being discarded by a later revision or release.
+
+`checks/source` reads one exact commit/tree through bounded Git object operations. It
+records every accepted regular file's path, mode, blob identity, length and digest,
+rejects unsupported or ambiguous entries, publishes immutable bytes and verifies the
+whole manifest again before Store settlement. It does not fetch, checkout, stage,
+execute hooks or include uncommitted edits.
+
+On host startup, every `sending`/`native_accepted` Operation becomes
+`outcome_unknown`. `Store::capture_source` is the only production executor found: it
+performs reserve → begin → off-DB Git/file work → finish in the requesting call.
+`begin_source` permits the same exact unknown Operation to repeat this read-only,
+deterministic capture, but no scheduler/recovery owner selects it automatically.
+Do not add a source workflow. Reuse the original Operation/admission and either settle
+the already published deterministic artifact or rerun the exact commit read under a
+bounded current-state reconciler.
+
+### AR-067 — one command, one admitted owner, no replay
+
+Check admission resolves the trusted profile, candidate/baseline, executable and
+toolchain bytes, effective argv/environment, dependency scope and parser targets before
+the final Immediate reservation. A changed fact invalidates the prepared plan.
+
+Both current executors use `swarm_checks::execute_with_plan`. The worker enters its
+owned Job/process group and publishes exact process identity before reading the Store
+Go file. Missing or uncertain Go never starts the command. Execution uses direct argv,
+`env_clear`, the admitted working directory and bounded output files. Cancellation is
+token/CheckRun-addressed. Host restart changes `running` to `reconciling`; recovery
+reads retained launch/worker/terminal/completion facts, observes exact family departure,
+and never launches a replacement command.
+
+Unknown or live process ownership holds only that target resource. Resource release
+requires confirmed group emptiness or exact retained departure proof; elapsed time,
+a free lock or a signal request is insufficient.
+
+### AR-068 — a pass is more than exit zero
+
+`checks/worker::validate_passed_coverage` rejects any gap. `ExitCode` requires the exact
+`process_exit` coverage. `CargoJson` additionally requires the complete expected target
+set, unique captured package/manifest/source/kind identities, matching emitted
+artifacts, `build_finished=true` and zero parser errors.
+
+Completion verifies source bytes again, all result/output artifacts, profile identity,
+input fingerprint, scope plan, process receipt and resource release. A passed row must
+have exit code zero and `source_checkout_verified=true`.
+
+`store/acceptance::evidence` repeats the exact required profile/revision and parser
+coverage checks, verifies the settled applied CheckRun Operation and loads every result
+and output artifact into the byte manifest. This extends AR-063: the common acceptance
+gate is backed by a strongly validated producer. It does not resolve AR-064's missing
+common assigned-review/finding provenance.
+
+### AR-069 — reuse follows the original process, not the cached row
+
+A cache candidate must be one original passed row: no `cached_from`, exit zero, released
+resource, reusable profile, reproducible/versioned inputs, exact cache key, resolved
+inputs, scope plan, coverage, process receipt, result and output bytes. Its source
+candidate must still be the same accepted candidate for the project.
+
+After off-DB byte verification, the final admission transaction reruns the cache
+identity check before creating the derivative row. The derivative has no process or
+exit code of its own by design. Acceptance follows `cached_from_check_id` back to the
+original row, rejects chains, revalidates the original Operation/process/coverage/
+outputs and compares current accepted-source provenance with the frozen cache receipt.
+Therefore `exit_code=null` on the derivative is not an acceptance shortcut.
+
+### AR-070 — the duplicate executor is transitional, not evidence authority
+
+`CheckConfig.executor` is optional. With no pin, new CheckRuns still spawn the
+kernel-host worker. With a verified absolute executable/SHA/artifact/version pin,
+`standalone_host` launches `swarm-checks` and never falls back. Both routes share the
+same resolved plan, Store-Go control, process-group executor and completion validators.
+
+Implementation K already selects standalone `swarm-checks` for new work. Migration must
+first select it everywhere and disposition concrete old runs, then remove the in-host
+worker, fallback configuration, fixtures and dependency edges. Do not keep both merely
+because their evidence is equivalent.
+
+## Inspected source boundaries
+
+| Source | Read boundary |
+| --- | --- |
+| `store/checks.rs` | Source reserve/begin/finish; CheckRun plan/reservation; pending selection; Go/cancel; completion/recovery; cache selection and final recheck. |
+| `checks/source.rs` | Git object resolution, manifest/path rules, artifact publication and full byte verification. |
+| `checks/worker.rs` | Resolved work, Store control adapter, coverage parser, completion validation, release/recovery. |
+| `checks/standalone_host.rs` | Executor pin verification, one-use plan materialization and standalone execution receipt. |
+| `swarm-checks/src/lib.rs` | Process-group entry, Store-Go gate, direct command execution, bounded capture, cancellation and family departure. |
+| `checks/model.rs` | Profile and executor configuration, trusted environment/tool constraints and request shape. |
+| `store/acceptance.rs`, `swarm-kernel/acceptance.rs` | Exact profile/check/cache lineage, artifact manifest and begin/finish revalidation. |
+| `store/mod.rs` | Host-interruption transition and synchronous source-capture caller. |
+
+Selected paths, not whole-file certification. Git/provider/OS behavior was not executed.
+
+## Next work
+
+Continue with the ScriptRun chain named in [Resume here](#resume-here). Preserve
+CheckRun's useful custody and evidence model, but do not copy its worker journal or
+proof vocabulary into scripts. One script execution and each returned typed child need
+separate, attributable, non-replayed effects.
+
+The [audit index](audit-index.md#coverage-still-open) owns remaining coverage.
+Documentation updates close no runtime finding.
