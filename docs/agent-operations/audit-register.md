@@ -7,30 +7,33 @@ continuation point; [implementation](implementation.md) owns source changes,
 
 ## Resume here
 
-- Checkpoint: **2026-10-23 / fixed source, CheckRun execution, cache and acceptance handoff**.
-- Source inspected at **`5b6b5bee92123ce7d3252054c939fb18619b790f`**.
+- Checkpoint: **2026-10-23 / ScriptRun execution, typed actions and recovery**.
+- Source inspected at **`8d8a44652d110f29031b2ddfdf6db98a5fc7001f`**.
   Runtime source is still **`c92120ed70ca7e625440a8a19517c481e73b13c9`**
-  from 2026-10-21; the intervening **20 commits are documentation-only**.
+  from 2026-10-21; the intervening **21 commits are documentation-only**.
 - Last connected chain:
-  `store/checks::{reserve_source,begin_source,finish_source}` →
-  `checks::source` → `store/checks::{reserve,next,ready}` →
-  `swarm-checks` / legacy `checks::worker` → completion/recovery →
-  cache selection/revalidation → `acceptance::evidence`.
-  New evidence is [AR-065–070](#trace-2026-10-23-checkrun).
-- Overall audit: **incomplete, 70 entries**. Entries include defects, preserved
-  mechanisms, scope corrections and partial boundaries; they are not 70 bugs or a
+  `store/scripts` admission/pending/start/finish → `scripts::runner` and
+  `swarm-script-worker` → `swarm-scripts` result/effect validation → child Store
+  mutations → `operation.get`/script registry readback → queued cancellation →
+  automation lifecycle intake and transfer revalidation.
+  New evidence is [AR-071–078](#trace-2026-10-23-scriptrun).
+- Overall audit: **incomplete, 78 entries**. Entries include defects, preserved
+  mechanisms, scope corrections and partial boundaries; they are not 78 bugs or a
   measured completion percentage.
-- Preserved in this pass: exact immutable Git snapshots; Store-Go-before-command;
-  process-group custody; parser-specific coverage; byte/result/process revalidation;
-  direct-original-only cache lineage; two-phase acceptance revalidation.
-- Open in this pass: `source.capture` has no automatic successor/reconciliation owner
-  after host interruption, and new CheckRuns still have two executor implementations
-  selected by local configuration.
-- **Next exact chain:** `store/scripts::{reserve,next,ready,finish}` →
-  `scripts::runner` / `swarm-script-worker` → typed returned actions →
-  child Operation admission/readback → cancellation/restart/transfer →
-  automation consumers. Trace one exact ScriptRun through every returned action and
-  prove that restart cannot rerun either the script or an already admitted child.
+- Preserved in this pass: immutable script revision/invocation; Store Allow before
+  interpreter execution; exact process-family recovery without replay; atomic parent
+  terminal plus current child admissions; exact bounded lifecycle occurrence and
+  transfer-time revalidation.
+- Open in this pass: same-type returned actions collide because identity omits
+  `action_index`; rejected actions have no durable independent lifecycle/retry; public
+  parent readback hides action results/child Operation IDs; the action vocabulary is
+  too narrow; executor selection is checked after durable admission; exact public
+  mid-run cancellation is absent.
+- **Next exact chain:** `store/forge::{reserve,next,ready,finish,reconcile}` →
+  `swarm-forge-worker` remote push/readback → `store/github_effects` managed labels →
+  `store/github_pr_effects` PR metadata → automation publication/projection →
+  restart/transfer/unknown write. Prove one effect owner per remote mutation and exact
+  successor readback without repeating a write.
 - Runtime implementation order remains **A1b–A3, then B–V**. The source audit does not
   reorder implementation.
 - Still unqualified: live Windows/Linux process behavior, power loss, installed
@@ -124,6 +127,14 @@ the [index](audit-index.md#evidence-checkpoints) links the detailed snapshots.
 | <a id="ar-068"></a>AR-068 | Parser coverage and process evidence | **Preserve.** A pass requires exit zero, source revalidation, complete parser-specific target identity/coverage, verified output artifacts and proven resource release. Acceptance reruns these checks for the exact required profile revision. | Only implemented parser families are covered; semantic requirement sufficiency still needs independent review where configured. |
 | <a id="ar-069"></a>AR-069 | Check result reuse | **Preserve with strict provenance.** Reuse points directly to one original passed process row, forbids cache chains, matches resolved inputs/scope/coverage/result bytes and revalidates that original source as the same currently accepted project candidate. A cached row's null exit code is never trusted alone. | Live revocation/concurrency/large-cache qualification; retain original process/output/source evidence until consumers finish. |
 | <a id="ar-070"></a>AR-070 | Two CheckRun executors | **Source-confirmed migration gap, not an evidence bypass.** `checks.executor=None` still sends new work through the kernel-host worker; a verified pin selects standalone `swarm-checks` with no fallback. Both converge on the same custody and completion validators. | Select standalone for all new work, disposition active legacy runs, then delete the hidden host executor/config/fixtures without weakening recovery. |
+| <a id="ar-071"></a>AR-071 | Returned action identity | **Source-confirmed open defect.** Child request identity uses parent Operation + run + effect kind; it omits result position/payload. Two valid same-kind actions collide, so the later action is rejected as `SCRIPT_EFFECT_REQUEST_CONFLICT`. | Stable `(ScriptRun, action_index)` plus request digest; identical replay returns the retained action, changed payload conflicts. |
+| <a id="ar-072"></a>AR-072 | Script execution/restart custody | **Preserve.** Immutable revision/invocation and represented Manager are rechecked; exact worker/process identity precedes Store Allow; restart reconciles the same family and never launches another interpreter. | Live platform/power-loss/process-escape/load qualification. |
+| <a id="ar-073"></a>AR-073 | Parent terminal and child admission | **Preserve with future-effect boundary.** Result artifacts, parent terminal and current Store child mutations commit atomically; identical terminal replay admits no second child. | Native/external returned actions must create ordinary child Operations; no external I/O inside parent completion. |
+| <a id="ar-074"></a>AR-074 | Per-action lifecycle and public readback | **Source-confirmed open.** Rejected actions exist only inside private parent result JSON; there is no indexed action record/retry. `script.describe` points to `operation.get`, but public `script.run` result is `not_projected`, hiding child Operation IDs and Store decisions. | Bounded ordered ActionRecords, ordinary child readback and retry only for the same unadmitted action. |
+| <a id="ar-075"></a>AR-075 | Returned action vocabulary | **Source-confirmed target gap.** Current effects are TaskCreate, ManagerNotification and Task-owner mailbox message. The latter is not native Send. | Add only current-consumer typed Send/Reply/Configure/Goal actions through existing handlers; no arbitrary method/JSON passthrough. |
+| <a id="ar-076"></a>AR-076 | Script executor selection | **Source-confirmed transition gap.** Missing executor pin is accepted into a durable queued run, then deterministically fails before start as `SCRIPT_EXECUTOR_UNSELECTED`. A compatibility launcher remains but delegates to standalone worker. | Reject before run admission, select standalone for all new work, disposition history and delete compatibility path. |
+| <a id="ar-077"></a>AR-077 | Automation ScriptRun occurrence and transfer | **Preserve boundary.** Lifecycle triggers require exact observation/Operation/run/result/timestamp readback. Pending intent carries the original occurrence across transfer/edit and revalidates current Manager, script, source and optional Task scope before admission. | Preserve this identity while replacing copied cursor/journal machinery with the one loop. |
+| <a id="ar-078"></a>AR-078 | ScriptRun cancellation | **Partial.** Queued ordinary cancellation atomically prevents start, marks the run terminal-before-start and emits one exact lifecycle event. Generic cancellation refuses in-flight work; no public token-addressed mid-run ScriptRun cancellation was found. | Persist exact cancellation intent, signal only the owned family, retain partial output and settle after proven departure; timeout is not cancellation. |
 
 ## Evidence checkpoints
 
@@ -146,7 +157,8 @@ register. Use the current disposition above when an older snapshot is broader.
 | AR-048–050 | [`73ba700`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/73ba7009bbc5c5515fe4c5f85743066e944106ef/docs/agent-operations/audit-register.md#trace-2026-10-23-retirement-admission) |
 | AR-051–058 | [`4af640e`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/4af640ea6edc190d58a7320674c85cbc5bd3c6b3/docs/agent-operations/audit-register.md#trace-2026-10-23-goal-policy) |
 | AR-059–064 | [`5b6b5be`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/5b6b5bee92123ce7d3252054c939fb18619b790f/docs/agent-operations/audit-register.md#trace-2026-10-23-review-acceptance) |
-| AR-065–070 | [Current source trace](#trace-2026-10-23-checkrun) |
+| AR-065–070 | [`8d8a446`](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/8d8a44652d110f29031b2ddfdf6db98a5fc7001f/docs/agent-operations/audit-register.md#trace-2026-10-23-checkrun) |
+| AR-071–078 | [Current source trace](#trace-2026-10-23-scriptrun) |
 
 <a id="trace-2026-10-23-checkrun"></a>
 ## Source trace at 5b6b5be: fixed source, CheckRun and cache
@@ -240,7 +252,7 @@ first select it everywhere and disposition concrete old runs, then remove the in
 worker, fallback configuration, fixtures and dependency edges. Do not keep both merely
 because their evidence is equivalent.
 
-## Inspected source boundaries
+## Inspected source boundaries for AR-065–070
 
 | Source | Read boundary |
 | --- | --- |
@@ -253,14 +265,136 @@ because their evidence is equivalent.
 | `store/acceptance.rs`, `swarm-kernel/acceptance.rs` | Exact profile/check/cache lineage, artifact manifest and begin/finish revalidation. |
 | `store/mod.rs` | Host-interruption transition and synchronous source-capture caller. |
 
-Selected paths, not whole-file certification. Git/provider/OS behavior was not executed.
+<a id="trace-2026-10-23-scriptrun"></a>
+## Source trace at 8d8a446: ScriptRun, actions and automation
+
+Inspected 2026-10-23. This is a connected source read, not an executed ScriptRun or
+platform qualification.
+
+### AR-071 — effect kind is not action identity
+
+`ScriptResult` permits a bounded ordered vector of effect requests. The grant set is
+unique by effect kind, but several result entries may legitimately use one granted
+kind. `script_effect_request_id`, however, hashes only parent Operation, run ID and
+effect kind. After the first child consumes that request identity, a second same-kind
+entry is rejected as a conflict. The parent settles `effects_incomplete` even though
+both result entries validated.
+
+Carry `action_index` from the validated ordered result through cause, request identity,
+public readback and child link. Bind the index to effect kind and canonical payload
+digest. Do not infer identity from text or generate a fresh request ID on retry.
+
+### AR-072 — worker custody prevents script replay
+
+Registration freezes bundle/interpreter identity, schema and effect grants. Final
+ScriptRun reservation rechecks active revision, invocation and represented Manager in
+an Immediate transaction. The standalone worker enters the owned process group,
+publishes exact worker identity and waits for Store's first-writer-wins start decision.
+Only exact `Allow` materializes the one-use plan and starts the interpreter.
+
+The bounded executor uses direct argv, cleared environment, fixed input/result/output
+limits and a five-minute maximum duration. Restart changes active rows to recovery.
+Recovery examines the same worker/start/terminal/completion/process family; it may
+publish one retained completion or settle proven departure as incomplete, but never
+spawns a replacement interpreter.
+
+### AR-073 — current child admissions are atomic; effects stay child-owned
+
+`finish` validates the exact run, worker, revision, bundle, Task/Attempt scope, result
+schema and granted effects. It registers result/stdout/stderr, applies current Store
+actions, writes the parent terminal result and lifecycle observation in one Immediate
+transaction. A Store error rolls everything back. Replaying an identical completion
+sees the terminal parent and does not admit children again.
+
+Current children are Store-local Task/message mutations. Preserve the transaction when
+adding a retained typed action, but perform native/network/Git I/O only through the
+ordinary admitted child Operation after commit. Parent completion means the action was
+admitted or rejected; it never means an external child effect completed.
+
+### AR-074 — no independent action disposition or usable parent readback
+
+An action rejected by current authority/state is represented only inside private
+parent `result_json.controller_effects`; no child Operation or indexed action row
+exists. There is no exact way to retry that one original action after a relevant state
+change. Rerunning the script could duplicate siblings that already applied.
+
+The script registry tells clients to read `operation.get`, but the public operation
+projection deliberately returns `result_status=not_projected` for `script.run`. The
+Manager cannot see Store-applied/rejected action status or child Operation IDs through
+the advertised read path.
+
+Use one bounded ActionRecord per result index. Public parent readback exposes safe
+ordered status and child ID. The child Operation/domain remains authoritative for its
+own effect. Retry only the same unadmitted action; never rerun the script or recreate an
+admitted child.
+
+### AR-075–076 — closed vocabulary and executor cut
+
+Current wire effects are Task creation, Manager notification and Task-owner mailbox
+message. The last action calls `message.send`; it is not native `agent.send`. This does
+not supply script-controlled Reply, Configure, Goal or Send required by selected future
+consumers. Add only narrow typed variants that call existing ordinary Store handlers.
+Do not add generic method names or arbitrary JSON passthrough.
+
+New work copies optional `Config.scripts.executor` into its retained work. If absent,
+the queued run is later failed before start as `SCRIPT_EXECUTOR_UNSELECTED`; no
+interpreter runs, but a durable run was needlessly admitted. The old `ScriptWorker`
+entry remains a compatibility wrapper around the standalone worker rather than a second
+productive executor. Reject missing pin before reservation, select standalone for new
+work, then delete the wrapper and obsolete config/tests after concrete history is
+disposed.
+
+### AR-077 — lifecycle and transfer facts are exact
+
+Automation intake accepts a ScriptRun event only after joining exact source stream,
+observation, Operation, run, terminal result, timestamps and bounded state. It projects
+only occurrence/status/run identity, never raw script content.
+
+Pending ScriptRun trigger intent carries the original occurrence through entry transfer
+or edit. Before admission it rechecks the current Manager registration, entry/project,
+script owner and active revision, source and optional Task/Attempt. Invalid intent is
+held or quarantined rather than silently redirected. An admitted run retains its
+original represented Manager; returned actions still recheck current rights/subject
+before child admission.
+
+Preserve this separation while deleting per-product cursors/journals into the single
+current-state loop. Transfer does not rewrite the parent or child authorship.
+
+### AR-078 — cancellation is complete only before start
+
+Generic `operation.cancel` accepts the queued ScriptRun only. In the same transaction,
+`record_operation_cancelled_tx` changes its retained run from queued to terminal failed
+before start and writes one exact `script.cancelled` lifecycle event. No worker has
+received Allow.
+
+Once the Operation is in flight, generic cancellation refuses it. No public exact
+ScriptRun cancellation command was found. The execution timeout eventually bounds the
+process but does not express attributable cancellation. A retained cancellation action
+must persist intent, address the run/token, signal only the proven owned family, keep
+partial output and settle after actual departure.
+
+## Inspected source boundaries for AR-071–078
+
+| Source | Read boundary |
+| --- | --- |
+| `store/scripts.rs` | Registry/run admission; pending fairness; start decision; terminal/recovery; returned effects; cancellation and action links. |
+| `scripts/runner.rs`, `swarm-script-worker` | Executor pin, private receipt/invocation, process-group start, one-use Allow and compatibility wrapper. |
+| `swarm-scripts/{protocol,schema,result}.rs` | Closed effect vocabulary, grants, result vector validation and process/control DTOs. |
+| `scripts/registry.rs` | Public script/run inventory and advertised current-state read method. |
+| `store/operations.rs` | Queued-only ordinary cancellation and public operation projection. |
+| `store/automation_intake.rs` | Exact ScriptRun lifecycle/terminal projection. |
+| `store/automation_dispatch.rs` | Pending occurrence, transfer relocation and current-authority/source revalidation. |
+| `automation/authorization.rs`, `config.rs` | Represented Manager/effect admission and executor configuration. |
+
+Selected paths, not whole-file certification. Interpreter/platform behavior and power
+loss were not executed.
 
 ## Next work
 
-Continue with the ScriptRun chain named in [Resume here](#resume-here). Preserve
-CheckRun's useful custody and evidence model, but do not copy its worker journal or
-proof vocabulary into scripts. One script execution and each returned typed child need
-separate, attributable, non-replayed effects.
+Continue the Forge/GitHub effect chain named in [Resume here](#resume-here). Distinguish
+remote Git publication from GitHub API metadata, and collection/import from writes.
+Every unknown write needs one retained owner and exact readback; a fresh request ID is
+not recovery.
 
 The [audit index](audit-index.md#coverage-still-open) owns remaining coverage.
 Documentation updates close no runtime finding.
