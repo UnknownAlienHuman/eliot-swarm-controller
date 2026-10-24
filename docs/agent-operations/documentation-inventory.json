@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "inspected_head": "23a748103c106c6da7a4b8b34accbcdc8c947eed",
+  "inspected_head": "e1aee0ad28015670ed15fcade7b63361eb2327ca",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive",
@@ -8,11 +8,11 @@
     "most Markdown files are not mechanically classified as active or historical"
   ],
   "counts": {
-    "markdown_files": 152,
+    "markdown_files": 153,
     "docs_root_files": 41,
     "active": 20,
     "historical_or_snapshot": 8,
-    "supporting_or_unclassified": 124,
+    "supporting_or_unclassified": 125,
     "broken_local_links": 10,
     "oversized_25k_or_more": 15
   },
@@ -613,8 +613,8 @@
     },
     {
       "path": "docs/agent-operations/documentation-readiness-report.md",
-      "bytes": 4866,
-      "lines": 83,
+      "bytes": 4727,
+      "lines": 82,
       "headings": 8,
       "classification": "supporting-or-unclassified",
       "status_markers": {
@@ -645,6 +645,20 @@
       "lines": 208,
       "headings": 13,
       "classification": "active",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/failure-prevention-register.md",
+      "bytes": 14513,
+      "lines": 81,
+      "headings": 6,
+      "classification": "supporting-or-unclassified",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,
