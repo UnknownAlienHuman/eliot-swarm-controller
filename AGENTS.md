@@ -1,19 +1,30 @@
 # Working on Eliot Swarm Controller
 
-Read the owner's current task and the short
-[architecture](docs/agent-operations/architecture.md) first. Use
-[implementation](docs/agent-operations/implementation.md) as the single work order
-and source-owner map. [Findings](docs/agent-operations/refactoring.md) explain current
-excess; [status](docs/implementation-status.md) separates implemented facts from
-plans. Historical specifications, audits and Claude scripts are evidence for the
-manager, not additional worker instructions. The owner's latest explicit decision
-wins.
+Read the owner's current task, the short
+[architecture](docs/agent-operations/architecture.md), and the
+[documentation authority map](docs/agent-operations/documentation-map.md) first.
+[Implementation](docs/agent-operations/implementation.md) is the strategic order and
+source-owner map, **not a self-contained worker prompt**. A coding worker receives one
+approved [task packet](docs/agent-operations/task-packet-template.md), or an explicit
+owner instruction containing the same fields, for one exact source revision.
+[Failure prevention](docs/agent-operations/failure-prevention-register.md) maps prior
+failures to retained invariants and acceptance gates. [Status](docs/implementation-status.md)
+separates implemented facts from plans and qualification. Historical specifications,
+audits, remediation plans and Claude scripts are evidence for the manager, never
+additional worker instructions. The owner's latest explicit decision wins.
 
-For audit tasks, read and update the [audit register](docs/agent-operations/audit-register.md#resume-here).
-Retain the inspected commit, actual paths/symbols, confirmed/refuted findings, untraced
-boundaries and next exact chain. After interruption compare source changes before
-continuing. A source review is not an executed check; neither is a completed fix.
-This is the audit checkpoint, not another implementation queue or worker context pack.
+The repository-wide source audit is currently incomplete. Do not claim that the whole
+project is ready for autonomous implementation merely because one slice has a design,
+source trace or passing compiler gate. The generated
+[documentation readiness audit](docs/agent-operations/documentation-readiness-report.md)
+records structural gaps; it does not replace source review.
+
+For audit tasks, read and update [current audit / Resume here](docs/agent-operations/audit-current.md#resume-here)
+and the [audit index](docs/agent-operations/audit-index.md). Retain the inspected
+commit, actual paths/symbols, confirmed/refuted findings, untraced boundaries and next
+exact chain. After interruption compare source changes before continuing. A source
+review is not an executed check; neither is a completed fix. The audit checkpoint is
+not another implementation queue or worker context pack.
 
 ## Start with the requested code
 
@@ -24,17 +35,22 @@ that scope.
 
 The manager gives each coding worker one compact slice:
 
+- exact base commit and disjoint write scope;
 - observable behavior and completion condition;
 - exact source owners and symbols;
+- applicable AR/PF failure-prevention IDs;
 - retained requirements and unsupported/uncertain cases;
-- old callers, config, fixtures and branches to delete;
+- old callers, config, fixtures, schemas and branches to delete;
 - one named donor/native mechanism when relevant;
 - minimal affected format/Clippy/build command;
+- focused connected acceptance evidence;
 - report: behavior, deletions, net owned-code change and unresolved facts.
 
 Do not send a worker the full Issue history, audit archive or repository-wide roadmap.
 Use current symbols and paths, not stale line numbers. Changed product meaning creates
-one current Task/Attempt revision or a new slice, not an addendum chain.
+one current Task/Attempt revision or a new slice, not an addendum chain. A confirmed
+finding omitted from the packet is a packet defect; an uncited historical note is not
+automatically a requirement.
 
 ## Preserve autonomous behavior
 
@@ -140,5 +156,5 @@ ready.
 
 A slice is complete only when new behavior is connected, the old path is absent,
 uncertain outcomes remain honest, routine automation has not been replaced by human
-work, and owning docs/status are updated. Report net production Rust, JS and glue
-separately from tests. Keep one implementation queue.
+work, and owning contract/status/audit/prevention records are updated. Report net
+production Rust, JS and glue separately from tests. Keep one implementation queue.
