@@ -1,12 +1,12 @@
 {
   "schema_version": 2,
-  "inspected_head": "fc7a6a974e63dc2a6d41b194b0934cb06f79767d",
+  "inspected_head": "6e0d8d46cca7845bfa1c86e7375299f1b92aabfb",
   "verdict": "NOT READY",
   "reasons": [
     "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
   ],
   "counts": {
-    "markdown_files": 154,
+    "markdown_files": 155,
     "docs_root_files": 41,
     "audit-evidence": 42,
     "current-contract": 27,
@@ -16,7 +16,7 @@
     "historical-snapshot": 7,
     "module-guide": 16,
     "qualification-evidence": 9,
-    "supporting-reference": 48,
+    "supporting-reference": 49,
     "broken_local_links": 0,
     "oversized_25k_or_more": 15
   },
@@ -779,6 +779,20 @@
       "lines": 72,
       "headings": 5,
       "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/source-surface-inventory.md",
+      "bytes": 4473,
+      "lines": 92,
+      "headings": 9,
+      "classification": "supporting-reference",
       "status_markers": {
         "source_audit_incomplete": false,
         "working_draft": false,

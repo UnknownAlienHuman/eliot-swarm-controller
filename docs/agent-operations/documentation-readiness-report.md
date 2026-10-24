@@ -1,6 +1,6 @@
 # Documentation readiness audit
 
-Inspected repository head: `fc7a6a974e63dc2a6d41b194b0934cb06f79767d`.
+Inspected repository head: `6e0d8d46cca7845bfa1c86e7375299f1b92aabfb`.
 
 ## Verdict: NOT READY
 
@@ -12,7 +12,7 @@ This verdict concerns whether an implementation agent can safely treat the docum
 
 | Measure | Count |
 | --- | ---: |
-| Markdown files | 154 |
+| Markdown files | 155 |
 | Files directly under `docs/` | 41 |
 | `audit-evidence` | 42 |
 | `current-contract` | 27 |
@@ -22,7 +22,7 @@ This verdict concerns whether an implementation agent can safely treat the docum
 | `historical-snapshot` | 7 |
 | `module-guide` | 16 |
 | `qualification-evidence` | 9 |
-| `supporting-reference` | 48 |
+| `supporting-reference` | 49 |
 | Broken repository-local Markdown links | 0 |
 | Documents at least 25 KiB | 15 |
 
