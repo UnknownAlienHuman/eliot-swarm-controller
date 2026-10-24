@@ -17,16 +17,26 @@ jobs:
         with:
           fetch-depth: 0
           ref: docs/agent-ready-audit-20261024
+      - name: Apply finite authority corrections
+        run: python tools/ci/apply_documentation_authority_corrections.py
       - name: Generate documentation inventory
         run: python tools/ci/documentation_readiness_audit.py
-      - name: Publish audit evidence
+      - name: Verify correction script is idempotent
+        shell: bash
+        run: |
+          before="$(git diff --binary)"
+          python tools/ci/apply_documentation_authority_corrections.py
+          after="$(git diff --binary)"
+          test "$before" = "$after"
+      - name: Publish documentation audit
         shell: bash
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add docs/agent-operations/documentation-readiness-report.md docs/agent-operations/documentation-inventory.json
+          git add -A
+          git diff --cached --check
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m "docs: record documentation readiness inventory"
+          git commit -m "docs: enforce current authority and audit readiness"
           git push origin HEAD:docs/agent-ready-audit-20261024
