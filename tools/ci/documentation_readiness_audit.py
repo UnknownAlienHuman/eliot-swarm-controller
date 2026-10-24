@@ -7,8 +7,8 @@ completeness claims. It does not substitute for source or runtime qualification.
 
 from __future__ import annotations
 
+import hashlib
 import json
-import os
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -18,6 +18,7 @@ from urllib.parse import unquote
 ROOT = Path(__file__).resolve().parents[2]
 REPORT = ROOT / "docs/agent-operations/documentation-readiness-report.md"
 INVENTORY = ROOT / "docs/agent-operations/documentation-inventory.json"
+GENERATOR = ROOT / "tools/ci/documentation_readiness_audit.py"
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
@@ -61,10 +62,11 @@ AUDIT_EVIDENCE_EXACT = {
     "docs/agent-operations/audit-current.md",
     "docs/agent-operations/audit-index.md",
     "docs/agent-operations/audit-register.md",
+    "docs/agent-operations/audit-entrypoints-public-surfaces-20261024.md",
     "docs/lessons-learned.md",
 }
 GENERATED_AUDIT = {
-    "docs/agent-operations/documentation-readiness-report.md",
+    "docs/agent-operations/source-surface-inventory.md",
 }
 HISTORICAL_PREFIXES = (
     "docs/agent_swarm",
@@ -93,8 +95,20 @@ def markdown_files() -> list[Path]:
     return sorted(
         path
         for path in ROOT.rglob("*.md")
-        if not any(part in excluded for part in path.parts)
+        if path != REPORT and not any(part in excluded for part in path.parts)
     )
+
+
+def input_digest(files: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in [*files, GENERATOR]:
+        encoded = rel(path).encode()
+        data = path.read_bytes()
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest()
 
 
 def clean_target(raw: str) -> str | None:
@@ -153,21 +167,35 @@ def classify(path: Path) -> str:
         return "generated-audit"
     if name in AUDIT_EVIDENCE_EXACT or name.startswith("docs/remediation/"):
         return "audit-evidence"
-    if name.startswith(QUALIFICATION_PREFIXES) or "qualification" in lower or "-evidence" in lower:
+    if (
+        name.startswith(QUALIFICATION_PREFIXES)
+        or "qualification" in lower
+        or "-evidence" in lower
+    ):
         return "qualification-evidence"
-    if name.startswith(HISTORICAL_PREFIXES) or "master-audit" in lower or "audit-v" in lower:
+    if (
+        name.startswith(HISTORICAL_PREFIXES)
+        or "master-audit" in lower
+        or "audit-v" in lower
+    ):
         return "historical-snapshot"
-    if (name.startswith("modules/") or name.startswith("crates/")) and name.endswith("/README.md"):
+    if (
+        (name.startswith("modules/") or name.startswith("crates/"))
+        and name.endswith("/README.md")
+    ):
         return "module-guide"
-    if lower.endswith("-sources.md") or "donor" in lower or name.startswith("docs/local-models/"):
+    if (
+        lower.endswith("-sources.md")
+        or "donor" in lower
+        or name.startswith("docs/local-models/")
+    ):
         return "supporting-reference"
-    # The authority map deliberately defines all remaining documents as supporting
-    # until an owning current contract classifies them more narrowly.
     return "supporting-reference"
 
 
 def main() -> None:
     files = markdown_files()
+    documentation_sha256 = input_digest(files)
     records = []
     for path in files:
         text = path.read_text(encoding="utf-8")
@@ -204,7 +232,6 @@ def main() -> None:
     ]
     counts = Counter(item["classification"] for item in records)
 
-    head = os.environ.get("GITHUB_SHA", "unknown")
     reasons: list[str] = []
     if explicit_incomplete:
         reasons.append(
@@ -221,12 +248,12 @@ def main() -> None:
     )
 
     inventory = {
-        "schema_version": 2,
-        "inspected_head": head,
+        "schema_version": 3,
+        "documentation_sha256": documentation_sha256,
         "verdict": verdict,
         "reasons": reasons,
         "counts": {
-            "markdown_files": len(records),
+            "markdown_inputs": len(records),
             "docs_root_files": len(root_docs),
             **dict(sorted(counts.items())),
             "broken_local_links": len(broken),
@@ -243,7 +270,7 @@ def main() -> None:
     lines = [
         "# Documentation readiness audit",
         "",
-        f"Inspected repository head: `{head}`.",
+        f"Documentation input SHA-256: `{documentation_sha256}`.",
         "",
         f"## Verdict: {verdict}",
         "",
@@ -251,7 +278,9 @@ def main() -> None:
     if reasons:
         lines.extend(f"- {reason}." for reason in reasons)
     else:
-        lines.append("- Entry points, authority classes and local links are structurally coherent.")
+        lines.append(
+            "- Entry points, authority classes and local links are structurally coherent."
+        )
     lines.extend(
         [
             "",
@@ -261,7 +290,7 @@ def main() -> None:
             "",
             "| Measure | Count |",
             "| --- | ---: |",
-            f"| Markdown files | {len(records)} |",
+            f"| Markdown inputs (generated report excluded) | {len(records)} |",
             f"| Files directly under `docs/` | {len(root_docs)} |",
         ]
     )
