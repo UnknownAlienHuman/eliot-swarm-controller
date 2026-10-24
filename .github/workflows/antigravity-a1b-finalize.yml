@@ -1,0 +1,39 @@
+name: Antigravity A1b registry finalizer
+
+on:
+  push:
+    branches:
+      - impl/antigravity-a1b-20261024
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: /tmp/eliot-a1b-finalize-target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: impl/antigravity-a1b-20261024
+      - name: Update code comments and durable registers
+        run: python tools/ci/finalize-antigravity-a1b.py
+      - name: Verify affected Rust formatting
+        run: >-
+          cargo fmt --check
+          --package swarm-antigravity-adapter
+          --package swarm-kernel-host
+      - name: Publish registry commit
+        shell: bash
+        run: |
+          rm .github/workflows/antigravity-a1b-finalize.yml
+          rm tools/ci/finalize-antigravity-a1b.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "docs: record Antigravity A1b runtime slice"
+          git push origin HEAD:impl/antigravity-a1b-20261024
