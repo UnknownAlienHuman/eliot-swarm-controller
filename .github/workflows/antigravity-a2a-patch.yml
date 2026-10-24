@@ -19,6 +19,8 @@ jobs:
         with:
           fetch-depth: 0
           ref: impl/antigravity-a2-delivery-20261024
+      - name: Repair one-shot patcher
+        run: python tools/ci/fix-antigravity-a2a-patcher.py
       - name: Apply A2a source patch
         run: python tools/ci/apply-antigravity-a2a.py
       - name: Format affected packages
@@ -37,6 +39,7 @@ jobs:
         run: |
           rm .github/workflows/antigravity-a2a-patch.yml
           rm tools/ci/apply-antigravity-a2a.py
+          rm tools/ci/fix-antigravity-a2a-patcher.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
