@@ -88,9 +88,19 @@ def source_digest(files: list[Path]) -> str:
     return digest.hexdigest()
 
 
+def latest_source_commit(files: list[Path]) -> str:
+    paths = [rel(path) for path in files]
+    return run_git("log", "-1", "--format=%H", "--", *paths)
+
+
 def package_manifests() -> dict[str, Path]:
     manifests: dict[str, Path] = {}
-    for manifest in [ROOT / "Cargo.toml", *sorted((ROOT / "crates").glob("*/Cargo.toml")), *sorted((ROOT / "modules").glob("*/Cargo.toml"))]:
+    candidates = [
+        ROOT / "Cargo.toml",
+        *sorted((ROOT / "crates").glob("*/Cargo.toml")),
+        *sorted((ROOT / "modules").glob("*/Cargo.toml")),
+    ]
+    for manifest in candidates:
         data = tomllib.loads(manifest.read_text(encoding="utf-8"))
         package = data.get("package", {})
         name = package.get("name")
@@ -103,7 +113,11 @@ def dependency_graph(manifests: dict[str, Path]) -> dict[str, list[str]]:
     dependents: dict[str, set[str]] = defaultdict(set)
     for consumer, manifest in manifests.items():
         data = tomllib.loads(manifest.read_text(encoding="utf-8"))
-        sections = [data.get("dependencies", {}), data.get("dev-dependencies", {}), data.get("build-dependencies", {})]
+        sections = [
+            data.get("dependencies", {}),
+            data.get("dev-dependencies", {}),
+            data.get("build-dependencies", {}),
+        ]
         target = data.get("target", {})
         if isinstance(target, dict):
             for target_config in target.values():
@@ -176,8 +190,14 @@ def exact_consumers(token: str, files: list[Path]) -> list[str]:
 def main() -> None:
     manifests = package_manifests()
     dependents = dependency_graph(manifests)
-    all_cluster_files = sorted({path for paths in CLUSTERS.values() for path in rust_files(paths)})
-    repository_rs = sorted(path for path in ROOT.rglob("*.rs") if ".git" not in path.parts and "target" not in path.parts)
+    all_cluster_files = sorted(
+        {path for paths in CLUSTERS.values() for path in rust_files(paths)}
+    )
+    repository_rs = sorted(
+        path
+        for path in ROOT.rglob("*.rs")
+        if ".git" not in path.parts and "target" not in path.parts
+    )
 
     records: dict[str, object] = {}
     for cluster, roots in CLUSTERS.items():
@@ -188,34 +208,43 @@ def main() -> None:
             "files": [file_record(path) for path in files],
             "file_count": len(files),
             "bytes": sum(path.stat().st_size for path in files),
-            "lines": sum(path.read_text(encoding="utf-8").count("\n") + 1 for path in files),
+            "lines": sum(
+                path.read_text(encoding="utf-8").count("\n") + 1 for path in files
+            ),
             "source_sha256": source_digest(files),
             "cargo_dependents": dependents.get(package, []),
             "method_literals": method_literals(files),
         }
 
-    cli_variants = command_variants(ROOT / "crates/swarm-cli/src/main.rs")
+    cli_main = ROOT / "crates/swarm-cli/src/main.rs"
+    cli_variants = command_variants(cli_main)
     facts = {
-        "root_lib_reexports_kernel_host": "pub use swarm_kernel_host::*" in (ROOT / "src/lib.rs").read_text(encoding="utf-8"),
-        "root_main_spawns_kernel_host_sibling": "swarm-kernel-host" in (ROOT / "src/main.rs").read_text(encoding="utf-8"),
-        "cli_delegates_host": "delegate_to_host" in (ROOT / "crates/swarm-cli/src/main.rs").read_text(encoding="utf-8"),
-        "cli_delegates_mcp": "delegate_to_mcp" in (ROOT / "crates/swarm-cli/src/main.rs").read_text(encoding="utf-8"),
+        "root_lib_reexports_kernel_host": "pub use swarm_kernel_host::*"
+        in (ROOT / "src/lib.rs").read_text(encoding="utf-8"),
+        "root_main_spawns_kernel_host_sibling": "swarm-kernel-host"
+        in (ROOT / "src/main.rs").read_text(encoding="utf-8"),
+        "cli_delegates_host": "delegate_to_host" in cli_main.read_text(encoding="utf-8"),
+        "cli_delegates_mcp": "delegate_to_mcp" in cli_main.read_text(encoding="utf-8"),
         "cli_command_variants": cli_variants,
         "cli_command_variant_count": len(cli_variants),
         "kernel_consumers": exact_consumers("swarm_kernel::", repository_rs),
         "bus_consumers": exact_consumers("swarm_bus::", repository_rs),
         "telemetry_consumers": exact_consumers("swarm_telemetry::", repository_rs),
-        "legacy_worker_coordinator_present": (ROOT / "crates/swarm-kernel-host/src/host/legacy_optional_workers.rs").exists(),
-        "legacy_worker_demand_present": (ROOT / "crates/swarm-kernel-host/src/store/legacy_worker_demand.rs").exists(),
-        "bus_dispatcher_binary_present": (ROOT / "crates/swarm-bus/src/bin/dispatcher.rs").exists(),
+        "legacy_worker_coordinator_present": (
+            ROOT / "crates/swarm-kernel-host/src/host/legacy_optional_workers.rs"
+        ).exists(),
+        "legacy_worker_demand_present": (
+            ROOT / "crates/swarm-kernel-host/src/store/legacy_worker_demand.rs"
+        ).exists(),
+        "bus_dispatcher_binary_present": (
+            ROOT / "crates/swarm-bus/src/bin/dispatcher.rs"
+        ).exists(),
     }
 
-    source_basis = run_git("rev-parse", "HEAD")
-    main_basis = run_git("rev-parse", "origin/main") if run_git("remote") else source_basis
+    touching_commit = latest_source_commit(all_cluster_files)
     inventory = {
-        "schema_version": 1,
-        "inventory_head": source_basis,
-        "main_source_basis": main_basis,
+        "schema_version": 2,
+        "latest_source_touching_commit": touching_commit,
         "cluster_source_sha256": source_digest(all_cluster_files),
         "clusters": records,
         "facts": facts,
@@ -225,8 +254,7 @@ def main() -> None:
     lines = [
         "# Entrypoint and public-surface source inventory",
         "",
-        f"Inventory branch head: `{source_basis}`.",
-        f"Live `origin/main` basis: `{main_basis}`.",
+        f"Latest commit touching an inspected source file: `{touching_commit}`.",
         f"Combined inspected-cluster source SHA-256: `{inventory['cluster_source_sha256']}`.",
         "",
         "This file records syntax-level facts only. It does not prove authorization, runtime behavior, absence of hidden consumers or qualification.",
@@ -284,7 +312,9 @@ def main() -> None:
     )
     for cluster, record in records.items():
         for item in record["files"]:
-            markers = ", ".join(f"{key}={value}" for key, value in item["marker_counts"].items()) or "none"
+            markers = ", ".join(
+                f"{key}={value}" for key, value in item["marker_counts"].items()
+            ) or "none"
             lines.append(
                 f"| `{cluster}` | `{item['path']}` | {item['lines']} | {len(item['public_items'])} | {markers} |"
             )
