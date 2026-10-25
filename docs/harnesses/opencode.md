@@ -26,6 +26,10 @@ implement only that one. The v2 paths v1 used: `GET /api/info` (version),
   drive sessions through repeated CLI invocations (v1: CLI recovery under load caused
   restart storms and lost writers).
 - Events: SSE `GET /event` (first event `server.connected`), `GET /global/event`.
+- One server can serve several directories: every session request carries the
+  agent's directory (the exact parameter per the installed schema), otherwise the
+  server falls back to its own cwd; `/global/event` mixes directories — drop events of
+  other directories, and an event without directory metadata is a gap.
 - OpenAPI: `GET /doc`.
 - A freshly started server may report a configured model as unavailable until its
   catalogue refresh finishes (2.0.7 published a bundled catalogue first): retry the
@@ -51,26 +55,24 @@ implement only that one. The v2 paths v1 used: `GET /api/info` (version),
 | `goal.*` | no native goal → Eliot Goal loop | |
 | `configure` | v1-style API: model/agent per prompt; v2 API: session setters `POST /api/session/{id}/model` and `/agent` (apply to following turns, confirm by reading the session back) | A model is `providerID` + a model id that may itself contain `/` (e.g. `kilo` + `stepfun/step-5-preview-free`): split at the first `/` only, never flatten. Availability comes from this server's model list, not the public catalogue. |
 
-Children: `GET /session/:id/children`.
-
 ## Observation
 
-- Message reads are paged: follow the cursor to the last page before treating a
-  message as the final result (v1 failed on sessions over 50 messages).
+- Live events from SSE; final text from message reads. Message reads are paged: follow
+  the cursor to the last page before treating a message as the final result (v1 failed
+  on sessions over 50 messages).
 - Activity comes from message/part updates; the session's update time does not move
   while tools run.
-- `GET /session/active` lists running sessions, not the family: a parent missing
-  from it may still have live children. Family = paginated `/session/:id/children`
-  (on versions without it, a paginated query by `parentID`).
-  The SSE stream is volatile: after a gap rebuild from message reads.
+- Children: paginated `GET /session/:id/children` (on versions without it, a paginated
+  query by `parentID`). `GET /session/active` lists running sessions, not the family:
+  a parent missing from it may still have live children.
+- The SSE stream is volatile: after a gap, rebuild from message reads.
 - The installed client registers its server in `$XDG_STATE_HOME/opencode/service.json`
   (default `~/.local/state/opencode/service.json`): `url`, `pid`, optional `version`,
-  `id` and local HTTP `password` — use it to attach to the owner's server.
-
-- SSE stream for live events; message reads for final text.
-- Data dir `~/.local/share/opencode` (`%USERPROFILE%\.local\share\opencode` on Windows)
-  with `opencode.db` (SQLite: projects, sessions, messages). Read-only access for
-  `discover`; never write; it is a live WAL database.
+  `id` and local HTTP `password` (never log it) — use it to attach to the owner's
+  server.
+- Data dir `~/.local/share/opencode` (`%USERPROFILE%\.local\share\opencode` on
+  Windows) with `opencode.db` (SQLite: projects, sessions, messages). Read-only access
+  for `discover`; never write; it is a live WAL database.
 
 ## Proxy
 

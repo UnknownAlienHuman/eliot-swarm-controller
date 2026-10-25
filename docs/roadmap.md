@@ -74,24 +74,29 @@ Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-p
       subscribe-from-seq with replay then live, lag → `events.lagged`. Test with a
       slow subscriber.
 - [ ] **L1.4 Daemon + IPC.** `eliot daemon [--foreground]`, `eliot daemon stop
-      [--drain]`, lock file, `daemon.json`, named pipe / Unix socket, JSON-RPC with
-      multiplexing, `daemon.status`, graceful shutdown.
+      [--drain | --force]` (drain = let running turns finish, admit nothing new;
+      without a flag it refuses while turns run), lock file, `daemon.json` with the PID +
+      start-time liveness check, named pipe / Unix socket, JSON-RPC with
+      multiplexing, `daemon.status`.
 - [ ] **L1.5 Config.** Load `config.toml` (global + project), profiles with defaults
       and `extends`, implicit profiles (`--harness H`), `[plugins.<name>]` sections;
-      unknown keys are errors. Proxies are parsed but used only in L2.6.
+      unknown keys are errors. Proxies are parsed but used only in L2.7.
 - [ ] **L1.6 Plugin host.** Spawn plugin processes, `initialize`, requests and
       notifications both ways, timeouts, restart with backoff, re-attach, `unknown` on
       lost replies, plugin exit on stdin EOF.
-- [ ] **L1.7 Router.** `command.submit` validation order (launch creates the agent;
-      others: exists → supported → allowed → state), persistence, per-agent ordered
-      dispatch (`interrupt`/`stop` skip the line), outcome recording, selectors,
-      idempotent command ids, profile `max_live` launch queue.
+- [ ] **L1.7 Router.** `command.submit` validation order (launch: preflight, then
+      create the agent; others: exists → supported → allowed → state), persistence,
+      per-agent ordered dispatch (`interrupt`/`stop` skip the line), Store-held queue
+      of sends to busy agents and `cancel`, outcome recording, selectors, idempotent
+      ids, `native_scope` uniqueness, `max_live` launch queue, restart turns
+      `dispatched` into `unknown`, owner `cmd resolve`.
 - [ ] **L1.8 Fake plugin.** `plugins/fake`, run as `eliot plugin fake`, implementing the
       [fake plugin spec](spec/plugin-protocol.md#fake-plugin).
 - [ ] **L1.9 CLI.** `daemon`, `status`, `launch`, `ls`, `show`, `watch`, `events`,
       `send` (incl. `--wait`), `steer`, `inject`, `interrupt`/`abort`, `stop`,
-      `resume`, `approve`, `deny`, `answer`, `wait`, `result`, `cmd show`; `--json`
-      everywhere; exit codes from [API](spec/api.md#exit-codes).
+      `resume`, `approve`, `deny`, `answer`, `configure`, `detach`, `wait`, `result`,
+      `cmd show|cancel|resolve`; `--json` and `--id` everywhere; exit codes from
+      [API](spec/api.md#exit-codes).
 - [ ] **L1.10 Conformance kit.** `eliot plugin-test <cmd>` runs the
       [suite](spec/plugin-protocol.md#conformance-kit) against a plugin; the fake
       plugin passes it.
@@ -119,8 +124,9 @@ dir and drive it only through the `eliot` binary:
    `resume A` → `agent.idle` with no `message.user` repeating an old prompt;
 6. kill the daemon, start it again → the same agents are listed with the states they
    had (live ones now `lost`, since their plugin died with the daemon);
-7. `send B '{"steps":[{"sleep_ms":500},{"say":"ok"}]}' --wait` prints `ok`;
-   `wait A B --for idle` returns 0;
+7. launch D; `send D '{"steps":[{"sleep_ms":500},{"say":"ok"}]}' --wait` prints `ok`;
+   while D sleeps in another turn, a second `send D x` is `queued` and runs after it;
+   `resume A`, then `wait A D --for idle` returns 0;
 8. with `[profiles.fake2] harness = "fake"`, `max_live = 2`, launching 3 agents leaves
    the third `created` until one of the first two stops;
 9. launch 1,000 fake agents in under 30 s with daemon RSS under 200 MB.
@@ -138,7 +144,7 @@ Specs: [Codex](harnesses/codex.md), [OpenCodex](harnesses/opencodex.md),
 - [ ] **L2.2 Codex plugin: launch and turns.** Start `codex app-server` (stdio),
       `initialize`, start thread, start turn, map notifications to events, final text,
       usage; tests replay the fixtures.
-- [ ] **L2.3 Control verbs.** `send` (queued while busy), `steer` (active turn id),
+- [ ] **L2.3 Control verbs.** `send`, `steer` (active turn id), `inject`,
       `interrupt`, `stop`, `resume`, `configure` (reports `applies`).
 - [ ] **L2.4 Approvals and questions.** Native requests → `approval.requested` /
       `question.asked`; `approve`/`deny`/`answer`. Host `decide` answers `ask` until
@@ -207,14 +213,15 @@ tests run in simulated time.
 
 - [ ] **L5.1 Rules engine.** TOML loading/reload, event triggers, matchers,
       placeholders, limits, loop guard, `rule.*` events, `eliot rule test`.
-- [ ] **L5.2 Timers.** `every`, `cron`, `at`, catch-up policy, persisted last fire.
+- [ ] **L5.2 Timers.** `every` (anchored slots), `cron` (DST rules), `at`, catch-up,
+      in-flight skip, firing keys committed with their commands.
 - [ ] **L5.3 Actions.** Agent actions, git actions (fetch/pull/push/worktree with
       readback), `msg.send`, `var.set`, `notify`, `emit`.
 - [ ] **L5.4 Scripts.** `run` action with the NDJSON contract; example scripts.
 - [ ] **L5.5 Approvals policy.** Approval rules incl. inline `decide`.
 - [ ] **L5.6 Goal loop.** Eliot mode and native-mode budgets, `no_progress`, parent
       notification, `goals` table.
-- [ ] **L5.7 Recipes.** `examples/` with the three [workflow recipes](spec/automation.md#workflow-recipes).
+- [ ] **L5.7 Recipes.** `examples/` with the [workflow recipes](spec/automation.md#workflow-recipes).
 
 **Exit test:** 24 h of simulated time with the fake plugin and a local Git remote: a
 rule firing every minute, a cron fetch, a goal reaching `done`, a goal hitting
@@ -229,7 +236,7 @@ Specs: [coordination](spec/coordination.md).
 - [ ] **L6.2 Shared vars.** Scopes, CAS, `watch`, `var.changed`.
 - [ ] **L6.3 Who + claims.** In-memory Git sets, history mapping, claim conflicts.
 - [ ] **L6.4 Hierarchy ops.** Tree selectors, `stop --tree`, parent notifications,
-      `max_depth`.
+      `max_depth`, `max_children_per_agent`, `max_tree_agents`.
 - [ ] **L6.5 MCP server.** `eliot mcp` for harnesses that prefer tools over shell. The
       tool set follows the caller's control: `self` gets inbox, msg, var, who, claim,
       ls; `tree`/`project` add launch, send, wait, result, steer, stop. One bridge per
@@ -251,16 +258,16 @@ messages; one runs `eliot who` and names the other; a claim conflict notifies bo
       every event — group commit is what makes the target reachable.)
 - [ ] **L7.2 Plugin sharding.** `instances = N` per plugin.
 - [ ] **L7.3 Retention.** Event pruning in batches; DB size stable in the load test.
-- [ ] **L7.4 Drain.** `eliot daemon stop --drain` stops new launches, rule and timer
-      firings; running turns finish; approvals, answers and results keep working.
+- [ ] **L7.4 Drain.** Extend L1.4's drain to rules, timers and the goal loop (no new
+      firings); approvals, answers and results keep working; test it under load.
 - [ ] **L7.5 Windows hardening.** Tests for the [process start rules](spec/monitoring.md#starting-processes):
       no console windows, Job assignment at creation, long inputs via files,
       `PATH`/`Path` merge, paths with spaces and non-ASCII characters.
 - [ ] **L7.6 Service mode.** Codex `app-server --listen unix://…` (or
       `ws://127.0.0.1:<port>` where unix sockets do not work) and `opencode serve` run
-      as Eliot services in their own
-      Job without kill-on-close; the plugin connects to them; a daemon restart
-      re-attaches and running turns continue. `eliot service list|stop`.
+      as Eliot services in their own Job without kill-on-close; the plugin connects to
+      them; a daemon restart re-attaches and running turns continue; `detach` becomes
+      possible for these sessions. `eliot service list|stop`.
 - [ ] **L7.7 Doctor.** `eliot doctor`: harness processes that belong to no live
       agent, services nobody uses, worktrees of stopped agents, data dir and DB size,
       stale sources. Reports and suggests commands; changes nothing by itself.

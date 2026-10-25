@@ -43,6 +43,8 @@ limits.max_depth = 8
 limits.max_children_per_agent = 20
 limits.max_tree_agents = 100
 automation.max_actions_per_minute = 120
+automation.max_parallel_checks = 2       # goal checks running at once
+automation.check_timeout = "10m"
 
 [process]
 scan_interval = "2s"
@@ -73,7 +75,9 @@ verbs = ["launch", "send", "steer", "inject", "interrupt", "stop", "resume",
 [profiles.codex]
 harness = "codex"
 model = "<model id>"                  # passed through to the harness as is
-effort = "high"
+effort = "high"                       # the harness's own value
+billing = "subscription"
+account = "main"
 permissions = "workspace-write"
 workspace_mode = "shared"             # "worktree" from L3.2
 labels = { role = "writer" }
@@ -118,14 +122,26 @@ Rules:
 - Unknown keys are an error at load time, with the file and line.
 - `eliot status` shows the effective merged config source for each profile.
 
+## Plugins
+
+| Key | Meaning |
+| --- | --- |
+| `cmd` | Command of an external plugin. Omitted for built-in plugins. |
+| `instances` | Plugin processes to run (default 1); agents are spread across them. |
+| anything else | Passed to the plugin as `plugin_config` (e.g. the fake plugin's `verbs`). |
+
+A second entry can reuse a plugin under another name
+(`[plugins.fake-narrow] cmd = ["eliot", "plugin", "fake"]`).
+
 ## Proxies
 
-A proxy entry describes a provider proxy (OpenCodex or any OpenAI/Anthropic-compatible
-gateway):
+A proxy entry describes a provider proxy (OpenCodex, any OpenAI/Anthropic-compatible
+gateway, or a [local model server](../harnesses/local-models.md)):
 
 | Key | Meaning |
 | --- | --- |
 | `attach` | Base URL of an already running proxy. Eliot checks `health` and never stops it. |
+| `max_live` | Optional cap on live agents across all profiles that use this proxy. |
 | `launch` | Command to start it. Eliot supervises it as a service: starts before the first agent that needs it, health-checks, restarts with backoff, stops when no agent uses it for `idle_stop` (default never). |
 | `health` | Path for the health check (HTTP 200 = up). |
 | `api_key_env` | Env var with the key the harness must send to the proxy. |

@@ -21,6 +21,9 @@ someone needs it ([defaults](../decisions.md#defaults)).
   [OpenCode plugin](opencode.md) with a different command.
 - v1: abort without an explicit scope could stop descendants; queued prompts are
   in-process and lost on restart.
+- Kilo sends titles, summaries, compaction and update checks to external services and
+  may fall back to Kilo Gateway: disable or explicitly allow those before attaching.
+  Observe over HTTP, never with `kilo run`.
 
 ## Zed
 

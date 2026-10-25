@@ -53,8 +53,7 @@ These rules apply to plugins, services, hook shims, scripts and git actions:
   as `pwsh.exe` by full path, not `powershell.exe`.
 - Long inputs (prompts, scripts) go through files or stdin, never argv (Windows
   command-line limit ~32 KiB).
-- Text files Eliot writes are UTF-8 without BOM with `
-` line endings; Git always
+- Text files Eliot writes are UTF-8 without BOM with LF line endings; Git always
   runs with `GIT_TERMINAL_PROMPT=0` and no editor.
 - Never edit a script or hook file that may be running; write a new file and switch.
 - Windows: a file cannot be replaced or deleted while any handle to it is open (also

@@ -15,7 +15,7 @@ This page is the map. Exact formats live in [spec/](spec/); build order lives in
  ┌───────────────────────── eliot daemon ─────────┼──────────────────────┐
  │                                                │                      │
  │  API ──► Router ──► Plugin host ──stdio JSON-RPC──► plugin processes ─┘
- │            │             ▲  (one process per harness kind, many agents)
+ │            │             ▲  (per harness kind; many agents per process if it can)
  │            ▼             │ events                                     │
  │   ┌────────────── Bus (in-memory fan-out + persisted log) ──────────┐ │
  │   └──▲────────▲────────▲──────────▲─────────────▲──────────▲───────┘ │
@@ -98,7 +98,7 @@ eliot steer a12 "use the v2 API"
  → CLI → IPC request command.submit {id, target: a12, verb: steer, args}
  → Router: a12 exists; plugin codex supports steer; caller may command a12; a12 is busy
  → Store: insert command (state=accepted) + event command.accepted       (one tx)
- → Plugin host → plugin: agent.command {agent_id, command_id, verb, args}
+ → Plugin host → plugin: agent.command {agent_id, command_id, verb, args}   (state=dispatched)
  → plugin → native: turn/steer {threadId, expectedTurnId, input}
  → plugin reply: {status: applied}  → Store: command applied + event      (one tx)
  → Bus fan-out → `eliot watch`, rules, ...
@@ -113,7 +113,7 @@ with `agent.snapshot` when it can.
 native notification (turn/completed)
  → plugin normalizes → event {agent_id, kind: turn.completed, data}
  → Daemon: reduce agent state (busy → idle), persist event + agent row      (one tx)
- → Bus fan-out → automation (rule "push after writer turn" fires → command git.push)
+ → Bus fan-out → automation (e.g. a rule on turn.completed fires → command notify)
                → goal loop (agent idle with active goal → check → continue / done)
                → subscribers
 ```
@@ -131,7 +131,7 @@ Scale comes from cheap bookkeeping, not from many processes:
 - Writes are batched (group commit). Ephemeral events (token deltas, CPU samples) are
   never written.
 - Every list API is paginated; every subscription is filtered on the daemon side.
-- Trees use `parent_id` and `root_id` indexes; tree operations never scan all agents.
+- Trees use the `parent` and `root` indexes; tree operations never scan all agents.
 
 Honest limit: a live native harness costs 100 MB–1 GB of RAM, so one machine runs
 tens to a few hundred **live** agents. Millions are supported as registered/historical

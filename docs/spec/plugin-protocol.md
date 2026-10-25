@@ -1,7 +1,8 @@
 # Plugin protocol
 
-A plugin is a process that speaks this protocol on stdin/stdout. One plugin process
-serves many agents of one harness kind.
+A plugin is a process that speaks this protocol on stdin/stdout. A plugin process
+serves agents of one harness kind — many of them if its native side keeps sessions
+independent (`features.multi_session`), otherwise one.
 
 - **Built-in plugins** are Rust library crates in `plugins/<name>/` that depend on
   `eliot-plugin`; the `eliot` binary links them and runs one as `eliot plugin <name>`.
@@ -27,12 +28,12 @@ serves many agents of one harness kind.
 | Method | Params | Result |
 | --- | --- | --- |
 | `initialize` | `protocol`, `plugin_config` (its `[plugins.<name>]` table), `data_dir` | `Manifest` (below) |
-| `agent.start` | `agent_id`, `profile` (resolved), `workspace?`, `prompt?`, `env` (Eliot vars to inject), `system_note` ([text](coordination.md#communication-guidance-for-agent-prompts)), `parent_native_ref?` | `{native_ref, pids: [Pid], effective: {model?, permissions?, system_note: native|prepended, endpoint?}}` |
-| `agent.attach` | `agent_id`, `native_ref`, `observe_only` | `{state, pids}` — after a plugin/daemon restart or for discovered sessions; error `not_found` if the session is gone. If a turn was running and its end is not confirmed, the state is `busy` (no `turn.completed` is invented) and the host repeats `agent.snapshot` until the native side settles it. |
+| `agent.start` | `agent_id`, `profile` (resolved), `workspace?`, `prompt?`, `env` (Eliot vars to inject), `system_note` ([text](coordination.md#communication-guidance-for-agent-prompts)), `parent_native_ref?` | `{native_scope, native_ref, pids: [Pid], effective: {model?, permissions?, system_note: native|prepended, endpoint?}}` |
+| `agent.attach` | `agent_id`, `native_scope`, `native_ref`, `observe_only` | `{state, pids}` — after a plugin/daemon restart or for discovered sessions; error `not_found` if the session is gone. If a turn was running and its end is not confirmed, the state is `busy` (no `turn.completed` is invented) and the host repeats `agent.snapshot` until the native side settles it. |
 | `agent.command` | `agent_id`, `command_id`, `verb`, `args` | `{status: applied|rejected|failed|unknown, applies?: now|next_tool|next_turn|next_session, detail?}` |
 | `agent.snapshot` | `agent_id`, `commands?: [command_id]` | `{state, pending: [Request], goal?, usage?, commands?: {id: applied|not_applied|unknown}}` |
 | `agent.stop` | `agent_id`, `force` | `{}` once the native session ended (or `force` killed it) |
-| `discover` | `{}` | `[{native_ref, workspace?, started_at?, title?, live}]` — native sessions on this machine |
+| `discover` | `{}` | `[{native_scope, native_ref, workspace?, started_at?, title?, live}]` — native sessions on this machine |
 | `shutdown` | `{}` | `{}`; plugin exits after replying |
 
 `Pid = {pid, start_time, role}`; `role` = `harness` | `server` | `tool` | `proxy`.

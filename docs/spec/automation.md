@@ -158,9 +158,9 @@ active Eliot goal:
    `cadence = on_idle`, also skip while the same agent has an active native goal: a
    native goal (Codex, Muse) continues by itself when the agent goes idle, and two
    drivers would stack turns. `cadence = every <dur>` still sends (queued until idle).
-2. Run `check` (if any) in the agent's workspace (timeout `check_timeout`, default
-   10 min; at most `automation.max_parallel_checks`, default 2, checks run at once on
-   the machine). Pass → `done`. With `marker:X`, done when the last `message.agent`
+2. Run `check` (if any) in the agent's workspace (timeout `automation.check_timeout`,
+   default 10 min; at most `automation.max_parallel_checks`, default 2, checks run at
+   once on the machine). Pass → `done`. With `marker:X`, done when the last `message.agent`
    contains `X`.
 3. If a budget is exhausted → `blocked` (`budget`). `max_cost_usd` counts only where
    the plugin reports cost (subscription routes often do not); `max_turns` always

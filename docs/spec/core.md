@@ -92,7 +92,8 @@ Profile { harness, extends?, cmd?: [string],      // cmd: binary for plugins tha
           workspace_mode [shared]: shared | worktree,
           control [self]: self | tree | project, git_identity [agent]: agent | inherit,
           system_note?: path, labels [{}], stall_after [5m], max_live? [unlimited],
-          billing?, account?, setup [[]] }        // setup: commands run in a new worktree (submodules, LFS)
+          billing?, account?, setup [[]],         // setup: commands run in a new worktree (submodules, LFS)
+          notify_parent [true] }                  // message the parent when this agent stops or its goal ends
 ```
 
 `max_live` caps live agents of this profile (provider quota and subscription limits
@@ -163,9 +164,9 @@ the core ignores them except for display and rule matching.
 | `git.commit` | P | `worktree`, `sha`, `author`, `subject`, `files` |
 | `git.ref` | P | `remote`, `ref`, `old`, `new` |
 | `fs.changed` | E | `worktree`, `paths` (debounced) |
-| `command.accepted` / `command.applied` / `command.rejected` / `command.failed` / `command.unknown` | P | `command`, `verb`, `reason?` |
+| `command.accepted` / `command.queued` / `command.dispatched` / `command.applied` / `command.rejected` / `command.failed` / `command.unknown` / `command.cancelled` / `command.resolved` | P | `command`, `verb`, `reason?` (`resolved`: `as`, `by`, `reason`) |
 | `rule.fired` / `rule.failed` / `rule.suppressed` | P | `rule`, `actions`, `reason?` |
-| `mail.sent` / `mail.delivered` / `mail.read` | P | `message`, `from`, `to` |
+| `mail.sent` / `mail.presented` / `mail.read` | P | `message`, `from`, `to` |
 | `var.changed` | P | `scope`, `key`, `version` |
 | `claim.added` / `claim.released` / `claim.conflict` | P | `glob`, `agents` |
 | `source.health` | P (on change) | `source`, `status: ok|slow|stale|error`, `last_ok`, `error?` |
@@ -191,7 +192,7 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
 | `goal.set` | `text`, `mode?: auto|native|eliot`, `check?`, `budget?`, `cadence?` | `native` = the harness's own goal; `eliot` = the Eliot Goal loop ([automation](automation.md#goal-loop)); `auto` (default) = native if supported, else eliot. One goal per mode; a native and an Eliot goal may run at the same time with different texts. | live |
 | `goal.pause` / `goal.resume` / `goal.clear` | `mode?` (default: every active mode) | | goal exists |
 | `cancel` | `command` | Withdraw a `queued` send that has not started (no native I/O). A started turn needs `interrupt`. | that command is `queued` |
-| `detach` | — | Stop controlling the agent but leave the native session running (its goal, children and turns continue). The agent becomes `observe_only`. | live |
+| `detach` | — | Stop controlling the agent but leave the native session running (its goal, children and turns continue). The agent becomes `observe_only`. | live; plugin declares it (only sessions that live outside Eliot's process tree, e.g. a service or an owner-run server) |
 | `compact` / `fork` / `background` | — | Native only (`background` moves the running foreground tool to the background where the harness supports it). | native support |
 
 - `check`: `marker:<TEXT>`, or an argv list run without a shell in the agent's
@@ -202,6 +203,10 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
   that does not report cost (`features.cost = false`) is rejected `unsupported`.
 - `steer` has no implicit fallback: `steer --or-send` sends when steering is
   impossible; without the flag the command is rejected.
+- Handled by the daemon, never sent to a plugin: `cancel`, and `goal.*` in `eliot`
+  mode. A plugin declares `goal.*` only for its native goal.
+- A queued `send` runs with the settings in effect when it is dispatched (a later
+  `configure` that already applied is in effect).
 
 ## Commands
 
@@ -236,9 +241,11 @@ state  = accepted → [queued →] dispatched → applied | rejected | failed | 
   readback after their process tree is proven gone, never by running them again.
 - Only readback or the owner's `eliot cmd resolve ID --as applied|failed --reason
   TEXT` clears `unknown`; time never does. The resolution is recorded as an event.
-- `launch` checks before creating the agent: the profile resolves, the harness binary
-  and workspace exist, the proxy (if any) is healthy. A failed check returns `invalid`
-  or `unavailable` and creates nothing.
+- `launch` checks before creating the agent: the profile resolves, the workspace
+  exists, the plugin is up and its manifest reports the harness available
+  (`harness_version` not null), the proxy (if any) is healthy, and the tree limits
+  allow it. A failed check returns `invalid`, `unavailable` or `not_allowed` and
+  creates nothing.
 - Selectors: `@children` | `@parent` | `@siblings` | `@tree:<agent>` |
   `@project[:<name>]` | `@label:<key>=<value>` | `@all`, resolved relative to the
   caller (for the owner, `@children` = top-level agents). A selector command is stored

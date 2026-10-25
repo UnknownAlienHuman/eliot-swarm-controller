@@ -70,8 +70,8 @@ eliot var list project/ [--json]
 eliot var watch project/api.*                → streams var.changed
 ```
 
-- Scopes: `project/` (default: caller's project), `tree/` (caller's root tree),
-  `global/`. Stored as `scope = "project:<name>"`, `"tree:<root id>"` or `"global"`;
+- Scopes: `project/` (caller's project; a key without a scope prefix means this),
+  `tree/` (caller's root tree), `global/`. Stored as `scope = "project:<name>"`, `"tree:<root id>"` or `"global"`;
   the owner must name the project (`project:<name>/key`) when it has no project.
 - Values are JSON or strings, ≤ 16 KiB. Each write bumps `version`;
   `--expect-version` makes it a compare-and-set (`bad_state` on mismatch), so two
@@ -96,7 +96,7 @@ own file-change events:
 | --- | --- | --- |
 | `edited` | the agent's `file.changed` events (native edit/write items and tools) for paths that are still dirty | this agent changed these files and they are not committed yet — the only per-agent signal when several agents share one checkout |
 | `dirty` | `git status` of a worktree used by exactly one live agent | uncommitted changes to matching paths right now |
-| `branch` | `git diff --name-only <base_ref>...HEAD` per agent worktree (`base_ref` unset → `origin/HEAD` if it exists, else skipped) | committed on the agent's branch, not yet in its base |
+| `branch` | the committed-but-unmerged set of the agent's worktree ([Git monitor](monitoring.md#git-monitor); `base_ref` unset → `origin/HEAD` if it exists, else skipped) | committed on the agent's branch and still different from its base |
 | `claim` | claims table | the agent announced it will work there |
 | `history` (with `--history N`) | `git log -N -- <pathspec>` in the repo | authored recently — provenance, never reported as the current owner |
 
@@ -160,7 +160,8 @@ CREATE TABLE claims (
 - Native subagents become `origin = native` children automatically.
 - Tree operations: `stop --tree A`, `send @tree:A`, `ls --tree A`, `watch @tree:A`.
 - Parent notifications: when a child reaches `stopped`, `failed`, `lost` or its goal
-  becomes `done`/`blocked`, a `queue` message goes to the parent (configurable).
+  becomes `done`/`blocked`, a `queue` message goes to the parent (profile
+  `notify_parent`, default on).
 - A manager that must react to its children waits inside its own turn with
   `eliot wait @children` or `eliot send <child> "<task>" --wait` — an idle model is
   not woken by a queued message, and `inject` reaches a busy agent only at its next

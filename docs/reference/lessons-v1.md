@@ -24,7 +24,7 @@ owner-machine reports, not re-run tests.
 
 | v1 mistake | v2 rule |
 | --- | --- |
-| Queues, lanes, dashboards, capacity and schedules each became their own state machine and database. | Views are queries over agents/events/commands. Only rules/timers keep small bookkeeping. |
+| Queues, lanes, dashboards, capacity and schedules each became their own state machine and database. | Views are queries over agents/events/commands. Besides those, only automation (timers, goals) and coordination (messages, vars, claims) keep small tables. |
 | Adapter persistence grew into universal journals, outboxes, tombstones and result paging (24 KiB pages, assembly, coverage). | Plugins keep native state natively; Eliot stores bounded final text plus a pointer to the native transcript. |
 | Version/provenance gates (expected versions, descriptor hashes) blocked work without preventing failures. | Versions are reported, never gates ([D-17](../decisions.md)). |
 | `rusqlite` with `preupdate_hook` required `libclang` for every build. | Use bundled SQLite without bindgen features. |

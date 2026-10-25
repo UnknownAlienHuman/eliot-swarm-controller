@@ -158,7 +158,7 @@ wire_api = "responses"            # the only accepted value; "chat" is rejected
 ## Scenarios
 
 `just record-codex` records these into `plugins/codex/fixtures/` (cheapest model, tiny
-prompts in a scratch repo): `turn` (launch + one turn), `send-busy`, `steer`,
+prompts in a scratch repo): `turn` (launch + one turn), `two-turns`, `steer`,
 `interrupt`, `approve-command`, `deny-command`, `approve-file`, `user-input`, `goal`
 (set, pause, resume, clear), `subagent`, `resume`, `bad-model` (error).
 

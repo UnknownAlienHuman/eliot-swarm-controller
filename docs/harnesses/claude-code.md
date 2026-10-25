@@ -41,7 +41,7 @@ The SDK is under Anthropic's commercial terms, not an open-source license.
 | Eliot verb | Claude Code | Notes |
 | --- | --- | --- |
 | `launch` | `query()` with streaming input, `cwd`, `model`, `permissionMode` | `native_ref` = session id from the init message. An unset `permissionMode` lets the SDK pick its own fallback, which differs from an explicit `default`; read the effective mode from the init message. |
-| `send` | push an `SDKUserMessage` into the input stream | Verify whether a message pushed mid-turn is queued for the next turn (expected) or merged. |
+| `send` | push an `SDKUserMessage` into the input stream | Arrives only when idle (Eliot queues). |
 | `steer` | text returned as `additionalContext` from the next `PostToolUse` hook | Lands after the current tool call; verify `additionalContext` on `PostToolUse` in L4.2. Report `applies: next_tool`; if the turn ends without another tool call, the text is delivered with the next turn. |
 | `inject` | `additionalContext` on `UserPromptSubmit` / `PostToolUse` hooks (≤ 10,000 chars) | |
 | `interrupt` | `Query.interrupt()` | Streaming mode only. |
@@ -57,7 +57,7 @@ The SDK is under Anthropic's commercial terms, not an open-source license.
 | Native | Eliot |
 | --- | --- |
 | system init message | `session.ready` (session id, model, tools, permission mode) |
-| assistant / user messages, `result` message | `message.agent`, `tool.started/completed`, `turn.completed` (+ cumulative usage) |
+| assistant / user messages | `message.agent`, `message.user`, `tool.started/completed` |
 | `stream_event` partials | `message.delta` (E) |
 | messages with `parent_tool_use_id`; `SubagentStart`/`SubagentStop` hooks (`agent_id`, `agent_type`, `agent_transcript_path`) | `child` registration and child events |
 | `PreToolUse`, `PermissionRequest`, `PermissionDenied` | `approval.requested` / `approval.resolved` |

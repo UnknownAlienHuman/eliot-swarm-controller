@@ -11,7 +11,7 @@ Copy and cut down; do not depend on v1 crates. Paths are as of `dc6f70aa`.
 | Mechanism | v1 path | Use in | Note |
 | --- | --- | --- | --- |
 | Windows Job objects, process birth/image identity, Unix groups | `crates/swarm-process/src/process_group.rs` | L3.1 | 1,555 lines; take identity + job + kill-tree only. |
-| Bounded child pipe capture | `crates/swarm-process/src/capture.rs` | L1.5, L5.4 | 64 MiB cap per stream. |
+| Bounded child pipe capture | `crates/swarm-process/src/capture.rs` | L1.6, L5.4 | 64 MiB cap per stream. |
 | Private files (0600 / Windows ACL), durable replace | `crates/swarm-process/src/permissions.rs` | L1.4 (`daemon.json`, lock) | Keep only what L1.4 needs. |
 | Named pipe with user-only ACL | `crates/swarm-kernel-host/src/platform/windows.rs` | L1.4 | 145 lines, small and direct. |
 | Line-framed multiplexed IPC with frame limits | `crates/swarm-client/src/multiplex.rs`, `client.rs` | L1.4 | Drop the authentication layer. |
@@ -30,7 +30,7 @@ module descriptors and provenance packaging.
 | --- | --- |
 | `tokio`, `serde`, `serde_json`, `thiserror`, `anyhow`, `tracing` | everywhere |
 | `rusqlite` (`bundled`, no bindgen features) | L1.2 |
-| `clap` (derive) | L1.8 |
+| `clap` (derive) | L1.9 |
 | `interprocess` or `tokio::net` named pipes + `UnixListener` | L1.4 |
 | `ulid` | command ids |
 | `sysinfo` | L3.1 |

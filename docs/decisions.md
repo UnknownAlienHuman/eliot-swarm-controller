@@ -7,7 +7,7 @@ editing its entry in a PR that the owner approves; do not add addenda.
 | --- | --- | --- |
 | D-01 | **v2 is a fresh build in layers; v1 is archived at tag `v1-final`.** v1 code is a donor to read, not a base to refactor. | v1 grew to 533k lines of Rust and 61k lines of docs/audits while core paths stayed unqualified; refactoring it produced audit cycles, not features ([lessons](reference/lessons-v1.md)). |
 | D-02 | One binary `eliot` (CLI, daemon, built-in plugins, hook shim, MCP). | Light install, one version, no sibling-artifact provenance checks. |
-| D-03 | Plugins are separate processes speaking JSON-RPC over stdio; one process per harness kind serves many agents. | Crash isolation; any language during bring-up (R11); one protocol for built-in and external plugins; scales by multiplexing, not by process count. |
+| D-03 | Plugins are separate processes speaking JSON-RPC over stdio; one process per harness kind serves many agents when the native side allows it. | Crash isolation; any language during bring-up (R11); one protocol for built-in and external plugins; scales by multiplexing, not by process count. |
 | D-04 | One SQLite file, WAL, one writer task, numbered migrations via `user_version`. | Enough for one host and millions of rows; no server; v1's schema hashing and reference-DDL checks added nothing. |
 | D-05 | Events persisted with a global `seq`; streaming deltas and samples are ephemeral. | Replayable history without storing token streams. Native transcripts remain the full record. |
 | D-06 | The core has no Task/Issue/review/acceptance/publication engine. | Not in the owner's statement; it was v1's largest source of code and bureaucracy. Build such workflows from rules, scripts and agents. |

@@ -1,11 +1,11 @@
 # OpenCodex (provider proxy)
 
 Not a harness: a provider proxy that harnesses talk to. Eliot treats it as a
-**service** ([configuration](../spec/configuration.md#proxies)). Layer L2.6.
+**service** ([configuration](../spec/configuration.md#proxies)). Layer L2.7.
 
 Facts checked 2026-10-25 against [lidge-jun/opencodex](https://github.com/lidge-jun/opencodex)
 (MIT; latest release v2.92.0, 2026-10-24). Third-party project, fast-moving: re-check
-the README before L2.6.
+the README before L2.7.
 
 ## What it does
 
@@ -29,7 +29,7 @@ owner wants Eliot to supervise it):
 ```toml
 [proxies.opencodex]
 attach = "http://127.0.0.1:10100"
-health = "/api/system/health"        # verify path in L2.6; v1 used it against v2.75
+health = "/api/system/health"        # verify path in L2.7; v1 used it against v2.75
 api_key_env = "OPENCODEX_API_KEY"
 # launch = ["ocx", "start"]          # check whether it stays in the foreground
 ```

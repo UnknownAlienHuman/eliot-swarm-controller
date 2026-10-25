@@ -41,11 +41,11 @@ Each requirement maps to the owner statement and to the layer that delivers it
 | R3 | Launch a harness through a provider proxy (OpenCodex and similar); the proxy is a managed or attached service. | 3 | L2 |
 | R4 | Real-time monitoring from several sources: native event stream, native transcripts, native hooks, OS processes, Git, filesystem. Every source reports its own freshness; missing data is `unknown`, never `zero`. | 4 | L3 |
 | R5 | Control verbs: `send`, `steer`, `inject`, `interrupt` (abort), `stop`, `resume`, `approve`/`deny`, `answer`, `configure`, `goal`, plus native hook decisions. | 5 | L1–L4 |
-| R6 | Every action is available by explicit command (CLI, agent, API) and automatically (rules, timers, Goal loop). Native Goal is used where the harness has one; otherwise the Eliot Goal loop drives the agent. | 6 | L5 |
+| R6 | Every action is available by explicit command (CLI, agent, API) and automatically (rules, timers, Goal loop). The harness's native Goal and the Eliot Goal loop are independent and can run together. | 6 | L2, L5 |
 | R7 | Programmable automation: rules (`event → actions`), timers (`every`, `cron`, `at`), built-in actions (git fetch/push, launch, send, ...) and scripts in any language. | 7 | L5 |
 | R8 | One bus and one command language. The caller never uses harness-specific terms; the plugin translates. | 8 | L1 |
-| R9 | No architectural limit on the number of agents; parent/child trees of any depth; native subagents appear as children. | 9 | L1, L7 |
-| R10 | Agents talk to each other directly (messages, shared variables) and can ask "who works on this path" — answered from Git facts. | 10 | L6 |
+| R9 | No architectural limit on the number of agents; parent/child trees of any depth (configurable guards only); native subagents appear as children. | 9 | L1, L6, L7 |
+| R10 | Agents talk to each other directly (messages, shared variables) and can ask "who works on this path" — answered from Git facts and the agents' own file-change events. | 10 | L3, L6 |
 | R11 | Core in Rust. Plugins and scripts may be written in any language during bring-up and are ported to Rust later. | 11 | L8 |
 
 ## Non-goals

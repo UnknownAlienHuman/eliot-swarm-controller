@@ -32,9 +32,9 @@
 | `events.subscribe` | `after_seq?`, `filter` | stream of `events.item` notifications: replays persisted events after `after_seq`, then live events. Each subscriber has a bounded buffer (items and bytes); on overflow it gets `events.lagged {dropped, from_seq, through_seq}` before newer events and can re-read persisted ones with `events.read` |
 | `hook.event` | `agent`, `harness`, `hook`, `payload` | decision JSON for the hook shim ([plugin protocol](plugin-protocol.md#hooks)) |
 | `agent.discover` | `harness?` | native sessions found by plugins `discover` |
-| `agent.attach` | `harness`, `native_ref`, `observe_only` | new `origin=external` agent |
+| `agent.attach` | `harness`, `native_scope`, `native_ref`, `observe_only` | new `origin=external` agent (`not_allowed` if another live agent controls that session) |
 | `mail.send` | `to`, `text`, `mode?`, `reply_to?` | message ids ([coordination](coordination.md#mailbox)) |
-| `mail.inbox` | `wait_s?`, `all?` | caller's messages; marks them delivered |
+| `mail.inbox` | `wait_s?`, `all?` | caller's messages; marks them read |
 | `mail.read` | `id` | one message; marks it read |
 | `var.get` / `var.set` / `var.list` / `var.watch` | `scope/key`, `value`, `expect_version?`, `note?` / prefix | value + version; `watch` streams `var.changed` ([coordination](coordination.md#shared-variables)) |
 | `who` | `paths: [pathspec]`, `history?` | rows per agent ([coordination](coordination.md#who-works-on-this)) |
@@ -63,6 +63,8 @@ as the owner.
 
 All commands accept `--json` (machine output on stdout, logs on stderr) and
 `--data-dir` (default `%LOCALAPPDATA%\Eliot` / `~/.local/share/eliot`, or `ELIOT_HOME`).
+Every command that changes something accepts `--id ID`; without it the CLI generates
+one and prints it, and a retry after an unknown outcome must pass the same `--id`.
 
 `eliot daemon` (without `--foreground`) starts itself again with `--foreground`,
 detached from the calling terminal so it survives that terminal closing, and returns
@@ -73,7 +75,7 @@ running they fail with `unavailable` and say so.
 
 | Code | Meaning | Error codes |
 | --- | --- | --- |
-| 0 | ok (command `applied`, query answered) | — |
+| 0 | ok (command `applied` or `queued`, query answered) | — |
 | 1 | error | `not_found`, `invalid`, `busy`, `unavailable`, `internal`, command `failed` |
 | 2 | CLI usage error (bad flags) | — |
 | 3 | rejected — nothing happened | `unsupported`, `not_allowed`, `bad_state` |
@@ -118,6 +120,7 @@ eliot timer list|run ID
 eliot discover [--harness H]                list native sessions on this machine not launched by Eliot
 eliot service list | stop NAME              proxies and native servers Eliot supervises (L2.7, L7.6)
 eliot doctor                                orphans, unused services, stale worktrees, disk use (L7.7)
+eliot daemon install | uninstall            per-user logon task (L7.8)
 eliot attach SESSION [--observe-only]       start watching (and if supported, controlling) one of them
 eliot plugin NAME                           (internal) run a built-in plugin on stdio
 eliot plugin-test CMD... [--replay-dir DIR]  run the plugin conformance suite against any plugin command
