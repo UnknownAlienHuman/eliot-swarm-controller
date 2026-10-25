@@ -2,8 +2,18 @@
 
 ## Current state
 
-**SOURCE_AUDIT_INCOMPLETE / TARGET DOCUMENTS WORKING DRAFT /
+**SOURCE_AUDIT_INCOMPLETE / TARGET DOCUMENTS CANONICAL FOR PACKETED SLICES /
 RUNTIME REFACTOR IN PROGRESS.**
+
+**Documentation readiness: STRUCTURALLY READY for controlled packeted implementation;
+NOT READY for a whole-project autonomous implementation claim.** Authority, navigation,
+AR/PF prevention, slice eligibility and exact packet rules are reconciled. The
+[implementation slice register](agent-operations/implementation-slice-register.md)
+permits only `APPROVED_PACKET` work; every other slice is dependency-blocked or
+`AUDIT_REQUIRED`. Package/domain [source-audit coverage](agent-operations/source-audit-coverage.md)
+remains incomplete. The generated [readiness report](agent-operations/documentation-readiness-report.md)
+reports structural and source-completeness verdicts separately. A branch or PR is not
+landed behavior.
 
 Runtime slice was inspected and reduced on **2026-10-24** at
 `3c7a84ffc6d1e349fe989e4beaa62b03ed4e21bb`. The active source audit remains
@@ -31,6 +41,8 @@ Merged work immediately preceding this checkpoint:
 - [Evidence/source index](agent-operations/audit-index.md)
 - [Architecture](agent-operations/architecture.md)
 - [Single implementation program](agent-operations/implementation.md)
+- [Implementation slice register](agent-operations/implementation-slice-register.md)
+- [Exact task-packet index](agent-operations/task-packets/README.md)
 - [Gateway target](gateway.md)
 - [Gateway dependency register](agent-operations/gateway-dependency-register.md)
 - [Observability target](agent-operations/observability.md)
@@ -54,8 +66,9 @@ Merged work immediately preceding this checkpoint:
 A0   LANDED                   active v6 coordinate
 A1a  LANDED / SCOPED PASS     terminal decoupling + producer lifecycle
 A1b  LANDED / SCOPED PASS     refresh/proof gate removed; current fences retained
-A2   NEXT / NOT IMPLEMENTED   durable outcome/body/page delivery and successor completion
-A3   NOT IMPLEMENTED          real typed actions and one active route
+A2.1 APPROVED PACKET          durable same-owner outcome/page delivery; exact main@797ea93 blob lease
+A2.2 BLOCKED ON A2.1          authorized successor delivery, aggregate coverage and restart evidence
+A3   BLOCKED ON A2.2          real typed actions and one active route
 B–V  TARGET WORK              largely unreduced current runtime
 U/R  SMALL CLEANUP LANDED      disconnected GitHub PR/projection source removed
 J0   SELECTED / NOT LANDED     release MCP slot lock before shared RPC
@@ -63,8 +76,12 @@ R0–R6 TARGET ONLY              source-owned joined Governor observation
 V0–V3 TARGET ONLY              secret/session/origin/standalone gateway cut
 ```
 
-The next exact implementation slice is **A2**. J0 is a bounded independent frontend
-fix; R0–R6 and V0–V3 remain later connected programs and do not reorder A.
+The only current assignable runtime slice is **A2.1**, through its exact
+[approved packet](agent-operations/task-packets/a2-1-antigravity-durable-delivery.md).
+A2.2 is blocked until A2.1 lands and the Store/custody boundary is refreshed. Neither
+slice substitutes for the separate package/domain source audit recorded in
+[source-audit coverage](agent-operations/source-audit-coverage.md). J0, R0–R6 and
+V0–V3 remain `AUDIT_REQUIRED` or dependency-blocked in the slice register.
 
 ## Source-inspection result
 
@@ -186,15 +203,17 @@ inspection and a successful compile cannot substitute for those results.
 
 ## Next work
 
-**Runtime A2:** retain complete Antigravity outcome/body/page Store-delivery parameters
-in private atomic files before treating them as locally retained. Same-boot reconnect
-may resend identical bytes; after verified prior-owner departure, an authorized
-successor may deliver the original Operation with immutable origin boot/source identity.
-Never persist or replay native prompt intent. Missing/partial capture remains visible
-unknown and must not complete a newer Attempt.
+**Approved A2.1:** implement only the exact durable same-owner delivery packet:
+save already-formed outcome/page params before IPC, resend byte-identically after
+connection loss, delete only the exact ACKed record and quarantine prior-boot files.
+The packet pins `main@797ea93` and every pre-existing adapter write-owner blob.
 
-**Subsequent A3:** keep only real typed actions and one active Antigravity route; remove
-placeholder controls and concrete retired Node work after finite disposition.
+**Blocked A2.2:** after A2.1 merges, refresh exact Store/custody owners and connect
+authorized successor delivery, Store aggregate coverage, safe body release and the
+focused restart/ACK-loss matrix. Never persist or replay native prompt intent.
+
+**Subsequent A3:** only after A2.2, keep real typed actions and one active Antigravity
+route; remove placeholder controls and concrete retired Node work after finite disposition.
 
 Selected independent future slices remain J0 from
 [IPC/MCP](agent-operations/ipc-mcp.md), R0–R6 from

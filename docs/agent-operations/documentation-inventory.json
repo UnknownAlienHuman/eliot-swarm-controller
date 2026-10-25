@@ -1,0 +1,2475 @@
+{
+  "schema_version": 4,
+  "documentation_sha256": "c22a20b0438f72608da7a7988946e3d75cf7ddec81e909b698c0dc0172e98794",
+  "verdict": "STRUCTURALLY READY FOR CONTROLLED PACKETED IMPLEMENTATION / WHOLE-PROJECT SOURCE AUDIT INCOMPLETE",
+  "reasons": [],
+  "counts": {
+    "markdown_inputs": 159,
+    "docs_root_files": 41,
+    "audit-evidence": 43,
+    "current-contract": 27,
+    "current-status": 1,
+    "entrypoint": 3,
+    "generated-audit": 1,
+    "handoff-register": 1,
+    "historical-snapshot": 7,
+    "module-guide": 16,
+    "qualification-evidence": 9,
+    "supporting-reference": 48,
+    "task-packet": 3,
+    "broken_local_links": 0,
+    "oversized_25k_or_more": 15,
+    "approved_task_packets": 1
+  },
+  "missing_required_documents": [],
+  "approved_task_packets": [
+    "docs/agent-operations/task-packets/a2-1-antigravity-durable-delivery.md"
+  ],
+  "explicit_incomplete_documents": [
+    "docs/agent-operations/audit-index.md",
+    "docs/agent-operations/implementation.md",
+    "docs/agent-operations/refactoring.md",
+    "docs/implementation-status.md"
+  ],
+  "broken_links": [],
+  "oversized_documents": [
+    {
+      "path": "docs/agent_swarm.implementation-v6.md",
+      "bytes": 91087,
+      "lines": 464,
+      "headings": 27,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-09/CURRENT-AUDIT.md",
+      "bytes": 80179,
+      "lines": 562,
+      "headings": 9,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent_swarm.md",
+      "bytes": 79824,
+      "lines": 419,
+      "headings": 24,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/documentation-program.md",
+      "bytes": 72125,
+      "lines": 1141,
+      "headings": 106,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent_swarm.module-contract-v2.md",
+      "bytes": 64819,
+      "lines": 384,
+      "headings": 26,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/opencode/README.md",
+      "bytes": 45912,
+      "lines": 291,
+      "headings": 21,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/implementation.md",
+      "bytes": 45042,
+      "lines": 819,
+      "headings": 31,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": true,
+        "not_exhaustive": true,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/audit-register.md",
+      "bytes": 44128,
+      "lines": 401,
+      "headings": 22,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": true
+      }
+    },
+    {
+      "path": "docs/lessons-learned.md",
+      "bytes": 40975,
+      "lines": 137,
+      "headings": 8,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-08/36-donor-registry.md",
+      "bytes": 38969,
+      "lines": 477,
+      "headings": 30,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/documentation-program-implementation-review.md",
+      "bytes": 38029,
+      "lines": 769,
+      "headings": 48,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/gemini-spark-integration.md",
+      "bytes": 32964,
+      "lines": 838,
+      "headings": 70,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/runtime-notes.md",
+      "bytes": 29248,
+      "lines": 157,
+      "headings": 12,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/mcp-tool-catalog-and-loading.md",
+      "bytes": 28601,
+      "lines": 904,
+      "headings": 57,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/configuration.md",
+      "bytes": 25621,
+      "lines": 463,
+      "headings": 16,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    }
+  ],
+  "documents": [
+    {
+      "path": "AGENTS.md",
+      "bytes": 8973,
+      "lines": 167,
+      "headings": 8,
+      "classification": "entrypoint",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": true
+      }
+    },
+    {
+      "path": "README.md",
+      "bytes": 10819,
+      "lines": 166,
+      "headings": 10,
+      "classification": "entrypoint",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": true
+      }
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "bytes": 7185,
+      "lines": 48,
+      "headings": 9,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "crates/swarm-adapter-command/README.md",
+      "bytes": 8269,
+      "lines": 52,
+      "headings": 4,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "crates/swarm-adapter-muse/README.md",
+      "bytes": 3800,
+      "lines": 62,
+      "headings": 2,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "crates/swarm-adapter-muse/registration/INTEGRATION.md",
+      "bytes": 3081,
+      "lines": 76,
+      "headings": 6,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "crates/swarm-adapter-muse/wire/README.md",
+      "bytes": 3246,
+      "lines": 57,
+      "headings": 3,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "crates/swarm-adapter-opencode/README.md",
+      "bytes": 8547,
+      "lines": 219,
+      "headings": 12,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "crates/swarm-gateway/README.md",
+      "bytes": 3972,
+      "lines": 81,
+      "headings": 6,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "crates/swarm-kernel-host/docs/owner-decisions.md",
+      "bytes": 337,
+      "lines": 6,
+      "headings": 1,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "crates/swarm-kernel-host/docs/owner-policy-v2.md",
+      "bytes": 2531,
+      "lines": 40,
+      "headings": 2,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-communication-field-evidence.md",
+      "bytes": 12797,
+      "lines": 209,
+      "headings": 26,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-communication-fleet-scale-sources.md",
+      "bytes": 13601,
+      "lines": 288,
+      "headings": 30,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-communication-peer-autonomy-sources.md",
+      "bytes": 8700,
+      "lines": 251,
+      "headings": 25,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-communication-program.md",
+      "bytes": 17501,
+      "lines": 381,
+      "headings": 24,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/README.md",
+      "bytes": 7135,
+      "lines": 100,
+      "headings": 6,
+      "classification": "entrypoint",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": true
+      }
+    },
+    {
+      "path": "docs/agent-operations/architecture.md",
+      "bytes": 6144,
+      "lines": 124,
+      "headings": 17,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/audit-current.md",
+      "bytes": 14489,
+      "lines": 162,
+      "headings": 10,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": true
+      }
+    },
+    {
+      "path": "docs/agent-operations/audit-entrypoints-public-surfaces-20261024.md",
+      "bytes": 9177,
+      "lines": 159,
+      "headings": 10,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/audit-index.md",
+      "bytes": 14579,
+      "lines": 129,
+      "headings": 8,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": true,
+        "not_exhaustive": false,
+        "resume_here": true
+      }
+    },
+    {
+      "path": "docs/agent-operations/audit-register.md",
+      "bytes": 44128,
+      "lines": 401,
+      "headings": 22,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": true
+      }
+    },
+    {
+      "path": "docs/agent-operations/configuration.md",
+      "bytes": 25621,
+      "lines": 463,
+      "headings": 16,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/delivery.md",
+      "bytes": 17277,
+      "lines": 355,
+      "headings": 19,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/documentation-map.md",
+      "bytes": 4747,
+      "lines": 101,
+      "headings": 12,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/donor-map.md",
+      "bytes": 23325,
+      "lines": 265,
+      "headings": 26,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/external-effects.md",
+      "bytes": 9205,
+      "lines": 208,
+      "headings": 13,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/failure-prevention-register.md",
+      "bytes": 14513,
+      "lines": 81,
+      "headings": 6,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/gateway-dependency-register.md",
+      "bytes": 4215,
+      "lines": 40,
+      "headings": 4,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/github-sources.md",
+      "bytes": 10727,
+      "lines": 250,
+      "headings": 13,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/implementation-slice-register.md",
+      "bytes": 9044,
+      "lines": 79,
+      "headings": 5,
+      "classification": "handoff-register",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/implementation.md",
+      "bytes": 45042,
+      "lines": 819,
+      "headings": 31,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": true,
+        "not_exhaustive": true,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/ipc-mcp.md",
+      "bytes": 14226,
+      "lines": 350,
+      "headings": 26,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/modularity-review-2026-10-05.md",
+      "bytes": 12908,
+      "lines": 194,
+      "headings": 13,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/modularity.md",
+      "bytes": 12922,
+      "lines": 244,
+      "headings": 10,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/module-api.md",
+      "bytes": 17995,
+      "lines": 321,
+      "headings": 19,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/module-installation.md",
+      "bytes": 10156,
+      "lines": 236,
+      "headings": 10,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/observability.md",
+      "bytes": 17269,
+      "lines": 400,
+      "headings": 24,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/refactoring.md",
+      "bytes": 18170,
+      "lines": 340,
+      "headings": 34,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": true,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/shared-packages.md",
+      "bytes": 7780,
+      "lines": 117,
+      "headings": 7,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/source-audit-coverage.md",
+      "bytes": 9086,
+      "lines": 72,
+      "headings": 5,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/source-surface-inventory.md",
+      "bytes": 4429,
+      "lines": 91,
+      "headings": 9,
+      "classification": "generated-audit",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/store-evolution.md",
+      "bytes": 14449,
+      "lines": 372,
+      "headings": 26,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/task-packet-template.md",
+      "bytes": 4375,
+      "lines": 128,
+      "headings": 15,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/task-packets/README.md",
+      "bytes": 2313,
+      "lines": 33,
+      "headings": 4,
+      "classification": "task-packet",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/task-packets/a2-1-antigravity-durable-delivery.md",
+      "bytes": 7726,
+      "lines": 118,
+      "headings": 12,
+      "classification": "task-packet",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent-operations/task-packets/a2-2-antigravity-restart-coverage.md",
+      "bytes": 5530,
+      "lines": 94,
+      "headings": 10,
+      "classification": "task-packet",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent_swarm.implementation-v6.md",
+      "bytes": 91087,
+      "lines": 464,
+      "headings": 27,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent_swarm.md",
+      "bytes": 79824,
+      "lines": 419,
+      "headings": 24,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent_swarm.module-contract-v2.md",
+      "bytes": 64819,
+      "lines": 384,
+      "headings": 26,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/agent_swarm.spec-v18/README.md",
+      "bytes": 5943,
+      "lines": 58,
+      "headings": 3,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/candidate-notes.md",
+      "bytes": 12447,
+      "lines": 52,
+      "headings": 4,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/check-runner.md",
+      "bytes": 13252,
+      "lines": 312,
+      "headings": 18,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/ci-scoped-builds.md",
+      "bytes": 3775,
+      "lines": 14,
+      "headings": 1,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/continuation/2026-10-06/contract-decisions-v2/README.md",
+      "bytes": 2624,
+      "lines": 18,
+      "headings": 1,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/documentation-program-implementation-review.md",
+      "bytes": 38029,
+      "lines": 769,
+      "headings": 48,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/documentation-program.md",
+      "bytes": 72125,
+      "lines": 1141,
+      "headings": 106,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/eliot-memory-os-integration.md",
+      "bytes": 3990,
+      "lines": 44,
+      "headings": 4,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/forge-publication.md",
+      "bytes": 7189,
+      "lines": 159,
+      "headings": 11,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/gateway.md",
+      "bytes": 11266,
+      "lines": 241,
+      "headings": 15,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/gemini-spark-integration.md",
+      "bytes": 32964,
+      "lines": 838,
+      "headings": 70,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/gm-session-continuity.md",
+      "bytes": 8483,
+      "lines": 153,
+      "headings": 3,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/gm-submission-recovery.md",
+      "bytes": 2704,
+      "lines": 47,
+      "headings": 1,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/hooks.md",
+      "bytes": 6743,
+      "lines": 114,
+      "headings": 5,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/host-load-qualification.md",
+      "bytes": 14848,
+      "lines": 343,
+      "headings": 8,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/host-recovery.md",
+      "bytes": 17399,
+      "lines": 223,
+      "headings": 2,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/implementation-status.md",
+      "bytes": 15571,
+      "lines": 226,
+      "headings": 14,
+      "classification": "current-status",
+      "status_markers": {
+        "source_audit_incomplete": true,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/javascript-provenance.md",
+      "bytes": 3124,
+      "lines": 16,
+      "headings": 1,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/legacy-swarm-transition.md",
+      "bytes": 10522,
+      "lines": 51,
+      "headings": 5,
+      "classification": "historical-snapshot",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/lessons-learned.md",
+      "bytes": 40975,
+      "lines": 137,
+      "headings": 8,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/local-models/README.md",
+      "bytes": 13747,
+      "lines": 119,
+      "headings": 8,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/local-models/contracts.md",
+      "bytes": 24268,
+      "lines": 195,
+      "headings": 16,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/local-models/donors.md",
+      "bytes": 15216,
+      "lines": 112,
+      "headings": 10,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/local-models/kilo-code.md",
+      "bytes": 17419,
+      "lines": 139,
+      "headings": 10,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/local-models/qualification.md",
+      "bytes": 13396,
+      "lines": 115,
+      "headings": 9,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/local-models/wsl-vllm.md",
+      "bytes": 9347,
+      "lines": 90,
+      "headings": 8,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/mcp-canonical-surfaces-and-topologies.md",
+      "bytes": 17252,
+      "lines": 240,
+      "headings": 16,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/mcp-profiles.md",
+      "bytes": 7580,
+      "lines": 178,
+      "headings": 9,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/mcp-tool-catalog-and-loading.md",
+      "bytes": 28601,
+      "lines": 904,
+      "headings": 57,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/mcp-tool-catalog-sources.md",
+      "bytes": 17507,
+      "lines": 439,
+      "headings": 40,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/owner-decisions.md",
+      "bytes": 17893,
+      "lines": 266,
+      "headings": 29,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/owner-policy-v2.md",
+      "bytes": 2517,
+      "lines": 40,
+      "headings": 2,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/qualification/2026-10-03-forge-native.md",
+      "bytes": 2686,
+      "lines": 46,
+      "headings": 1,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/qualification/2026-10-03-opencode-restart.md",
+      "bytes": 2536,
+      "lines": 49,
+      "headings": 4,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/qualification/2026-10-03-r7-host-load.md",
+      "bytes": 2212,
+      "lines": 44,
+      "headings": 1,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/qualification-2026-10-03.md",
+      "bytes": 10798,
+      "lines": 180,
+      "headings": 7,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-07/04-muse-pending.md",
+      "bytes": 5508,
+      "lines": 81,
+      "headings": 7,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-07/10-automation-disable.md",
+      "bytes": 4613,
+      "lines": 55,
+      "headings": 8,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-07/11-event-projections.md",
+      "bytes": 4340,
+      "lines": 78,
+      "headings": 7,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-07/12-scheduler-fairness.md",
+      "bytes": 2761,
+      "lines": 55,
+      "headings": 4,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-08/12-calendar-dst.md",
+      "bytes": 3714,
+      "lines": 101,
+      "headings": 6,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-08/21-correction-package.md",
+      "bytes": 5382,
+      "lines": 42,
+      "headings": 5,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-08/33-donor-field-reviews.md",
+      "bytes": 19820,
+      "lines": 278,
+      "headings": 29,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-08/36-donor-registry.md",
+      "bytes": 38969,
+      "lines": 477,
+      "headings": 30,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-09/52-store-bootstrap.md",
+      "bytes": 8825,
+      "lines": 211,
+      "headings": 14,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-09/CURRENT-AUDIT.md",
+      "bytes": 80179,
+      "lines": 562,
+      "headings": 9,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-09/EXECUTION-MAP.md",
+      "bytes": 22759,
+      "lines": 205,
+      "headings": 21,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-09/QUALIFICATION-PLAN.md",
+      "bytes": 23038,
+      "lines": 85,
+      "headings": 5,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/ANTIGRAVITY-TERMINAL-CONTRACT-PROOF.md",
+      "bytes": 5447,
+      "lines": 43,
+      "headings": 3,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/ARTIFACT-PUBLICATION.md",
+      "bytes": 939,
+      "lines": 16,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/CLAUDE-SCRIPT-DONOR-REVIEW.md",
+      "bytes": 10066,
+      "lines": 99,
+      "headings": 5,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/EXECUTION-RESULTS-O.md",
+      "bytes": 11415,
+      "lines": 194,
+      "headings": 13,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/PROCESS-CUSTODY-ASSEMBLY.md",
+      "bytes": 2056,
+      "lines": 34,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/REPAIR-SLOT-MIGRATION.md",
+      "bytes": 2193,
+      "lines": 36,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/SCHEDULER-SOURCE-ISOLATION.md",
+      "bytes": 1422,
+      "lines": 24,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/TASK-PROMPT-CONSUMERS.md",
+      "bytes": 7312,
+      "lines": 74,
+      "headings": 5,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-10/TASK-PROMPT-MIGRATION.md",
+      "bytes": 1689,
+      "lines": 30,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/CATALOG-AND-R48-SOURCE-REPAIR.md",
+      "bytes": 3168,
+      "lines": 52,
+      "headings": 2,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/COORDINATION-SCAN-CURSOR.md",
+      "bytes": 1636,
+      "lines": 27,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/DEPENDENCIES-REMAINING.md",
+      "bytes": 2314,
+      "lines": 34,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/NATIVE-T-OBSERVATIONS.md",
+      "bytes": 2911,
+      "lines": 45,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/OPENCODE-NATIVE-MODEL-COORDINATE.md",
+      "bytes": 1765,
+      "lines": 31,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/OPENCODE-S3-DIAGNOSIS.md",
+      "bytes": 1855,
+      "lines": 34,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/QUALIFICATION-OBSERVATION-REPAIR.md",
+      "bytes": 3815,
+      "lines": 60,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/R48-CLI-CUSTODY-REPAIR.md",
+      "bytes": 2123,
+      "lines": 37,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/R48-COMPLETION-EVIDENCE-REPAIR.md",
+      "bytes": 2921,
+      "lines": 50,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/R48-INSTALLED-W.md",
+      "bytes": 3003,
+      "lines": 51,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/R48-PUBLIC-CONTRACT-REPAIR.md",
+      "bytes": 8952,
+      "lines": 149,
+      "headings": 3,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/R48-SCHEDULER-LIFETIME.md",
+      "bytes": 2784,
+      "lines": 44,
+      "headings": 1,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-11/WATCHER-ANCESTOR-REPAIR.md",
+      "bytes": 2255,
+      "lines": 42,
+      "headings": 2,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-13/PR40-CATALOG-REUSE-PROOF.md",
+      "bytes": 4194,
+      "lines": 73,
+      "headings": 2,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-13/REG23-MODULE-DEMAND-ATOMIC-FAILURE-PROOF.md",
+      "bytes": 3308,
+      "lines": 31,
+      "headings": 3,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-14/CLAUDE-MANAGED-AGENTS-DONOR-REVIEW.md",
+      "bytes": 19458,
+      "lines": 95,
+      "headings": 11,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remediation/2026-10-15/ISSUE-153-CLOSEOUT.md",
+      "bytes": 24199,
+      "lines": 84,
+      "headings": 8,
+      "classification": "audit-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/remote-agent-gateway.md",
+      "bytes": 443,
+      "lines": 10,
+      "headings": 1,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/restart-checkpoint-2026-10-03.md",
+      "bytes": 6147,
+      "lines": 105,
+      "headings": 6,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/restart-checkpoint-2026-10-06.md",
+      "bytes": 9638,
+      "lines": 149,
+      "headings": 7,
+      "classification": "qualification-evidence",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/runtime-notes.md",
+      "bytes": 29248,
+      "lines": 157,
+      "headings": 12,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/schedules.md",
+      "bytes": 7162,
+      "lines": 147,
+      "headings": 4,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/script-runner.md",
+      "bytes": 10021,
+      "lines": 235,
+      "headings": 13,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/swarm-launcher-assignment-context.md",
+      "bytes": 17261,
+      "lines": 273,
+      "headings": 12,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/task-policy.md",
+      "bytes": 11682,
+      "lines": 238,
+      "headings": 13,
+      "classification": "current-contract",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "docs/zed-batch.md",
+      "bytes": 5677,
+      "lines": 28,
+      "headings": 3,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/antigravity/README.md",
+      "bytes": 12346,
+      "lines": 182,
+      "headings": 7,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/antigravity/UPDATE.md",
+      "bytes": 4842,
+      "lines": 80,
+      "headings": 8,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/antigravity-rust/README.md",
+      "bytes": 12218,
+      "lines": 60,
+      "headings": 5,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/atlas-redact/UPDATE.md",
+      "bytes": 2201,
+      "lines": 44,
+      "headings": 4,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/claude/README.md",
+      "bytes": 15321,
+      "lines": 99,
+      "headings": 8,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/claude/UPDATE.md",
+      "bytes": 4713,
+      "lines": 38,
+      "headings": 6,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/claude-rust/README.md",
+      "bytes": 4956,
+      "lines": 80,
+      "headings": 1,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/README.md",
+      "bytes": 3894,
+      "lines": 61,
+      "headings": 4,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/UPDATE.md",
+      "bytes": 9387,
+      "lines": 162,
+      "headings": 7,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/VENDOR-SECURITY-PATCHES.md",
+      "bytes": 2283,
+      "lines": 39,
+      "headings": 1,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/vendor_bridge/README.md",
+      "bytes": 1910,
+      "lines": 76,
+      "headings": 6,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/vendor_bridge/RELEASING.md",
+      "bytes": 2492,
+      "lines": 39,
+      "headings": 1,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/vendor_bridge/docs/api-reference.md",
+      "bytes": 17198,
+      "lines": 421,
+      "headings": 22,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/vendor_bridge/docs/faq.md",
+      "bytes": 6728,
+      "lines": 170,
+      "headings": 17,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/vendor_bridge/docs/getting-started.md",
+      "bytes": 4255,
+      "lines": 172,
+      "headings": 10,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/codex/vendor_bridge/examples/README.md",
+      "bytes": 3069,
+      "lines": 98,
+      "headings": 6,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/command/README.md",
+      "bytes": 5380,
+      "lines": 33,
+      "headings": 3,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/command/UPDATE.md",
+      "bytes": 3017,
+      "lines": 18,
+      "headings": 3,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/muse/README.md",
+      "bytes": 6194,
+      "lines": 166,
+      "headings": 10,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/muse/UPDATE.md",
+      "bytes": 3678,
+      "lines": 60,
+      "headings": 4,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/opencode/README.md",
+      "bytes": 45912,
+      "lines": 291,
+      "headings": 21,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/opencode/UPDATE.md",
+      "bytes": 7860,
+      "lines": 119,
+      "headings": 8,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/opencodex/README.md",
+      "bytes": 18645,
+      "lines": 315,
+      "headings": 11,
+      "classification": "module-guide",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "modules/opencodex/UPDATE.md",
+      "bytes": 16069,
+      "lines": 314,
+      "headings": 17,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "tools/modules/MODULE_OWNER.md",
+      "bytes": 6517,
+      "lines": 47,
+      "headings": 4,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "tools/modules/README.md",
+      "bytes": 7545,
+      "lines": 154,
+      "headings": 2,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    },
+    {
+      "path": "tools/muse-connector/README.md",
+      "bytes": 3526,
+      "lines": 66,
+      "headings": 8,
+      "classification": "supporting-reference",
+      "status_markers": {
+        "source_audit_incomplete": false,
+        "working_draft": false,
+        "audit_incomplete_phrase": false,
+        "not_exhaustive": false,
+        "resume_here": false
+      }
+    }
+  ]
+}

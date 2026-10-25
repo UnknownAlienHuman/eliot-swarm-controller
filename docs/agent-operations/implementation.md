@@ -1,12 +1,23 @@
 # Eliot Swarm Controller — implementation
 
-This is the single implementation program for the
-[architecture](architecture.md). The 2026-10-21 preservation pass compared
-`c92120ed70ca7e625440a8a19517c481e73b13c9` with the pre-refactor specification,
-October 6 audit, master audit v26 and retained Claude-script review. This is a
-focused requirements/contract review, not an exhaustive reread of every source file.
-[Findings](refactoring.md) explain the current excess;
-[status](../implementation-status.md) separates landed code from plans.
+This is the strategic dependency order and source-owner map for the
+[architecture](architecture.md). It is **not a self-contained worker prompt** and does
+not prove that every current source file was audited. The 2026-10-21 preservation pass
+compared `c92120ed70ca7e625440a8a19517c481e73b13c9` with selected pre-refactor
+specification, audit and Claude-script evidence; it was a focused requirements review,
+not an exhaustive source reread. The repository-wide audit remains incomplete; see
+[source-audit coverage](source-audit-coverage.md), [current audit](audit-current.md),
+[documentation readiness](documentation-readiness-report.md) and
+[status](../implementation-status.md).
+
+Assignment eligibility is owned by the
+[implementation slice register](implementation-slice-register.md). A coding agent
+receives one approved packet from the [task-packet index](task-packets/README.md) for
+one exact revision; the [template](task-packet-template.md) defines the required
+fields but is not itself a work order. The packet cites the applicable
+[failure-prevention entries](failure-prevention-register.md), current symbols,
+positive path, deletions/data disposition and focused acceptance evidence. Do not send
+this entire A–V roadmap as an assignment.
 
 Do not start another horizontal framework migration. Complete one vertical
 caller-to-result path, delete its replaced path, then use a second current caller to
@@ -183,10 +194,22 @@ binding/root checks and `agent.refresh` remains a standalone read action. Run
 No integration, installed harness, crash or load qualification is claimed. Net change:
 −305 production Rust lines, −20 qualification-glue lines and +3 test lines.
 
-**A2:** retain complete terminal bytes and final outcome/result parameters with
-Operation, original binding/generation and origin boot in private atomic files before
-acknowledging local retention. Same-boot IPC reconnect resends unchanged parameters;
-delete only after Store ACK. Observations use one replaceable checkpoint per source.
+**A2.1 — approved packet:** durable same-owner Store delivery. Persist exact
+`module.outcome` and `module.result` params before IPC, resend only byte-identical
+params after connection loss, delete only the exact ACKed record and quarantine every
+prior-boot file. See the exact source/blob lease and acceptance boundary in
+[`task-packets/a2-1-antigravity-durable-delivery.md`](task-packets/a2-1-antigravity-durable-delivery.md).
+
+**A2.2 — blocked on A2.1:** authorized successor delivery, Store-authoritative aggregate
+coverage, safe local body release and restart/ACK-loss evidence. It may be assigned only
+after A2.1 lands and its packet is refreshed to exact merged blobs; see
+[`task-packets/a2-2-antigravity-restart-coverage.md`](task-packets/a2-2-antigravity-restart-coverage.md).
+
+The full A2 target remains: retain complete terminal bytes and final outcome/result
+parameters with Operation, original binding/generation and origin boot in private
+atomic files before acknowledging local retention. Same-boot IPC reconnect resends
+unchanged parameters; delete only after Store ACK. Observations use one replaceable
+checkpoint per source.
 
 A process restart is not an IPC reconnect. After existing custody checks fence the
 previous delivery owner, the authorized successor uses the existing reconciliation

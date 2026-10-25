@@ -1,0 +1,1560 @@
+{
+  "schema_version": 2,
+  "latest_source_touching_commit": "e8416d6e7faf26a1b4466800b0befb7f497b1a4d",
+  "cluster_source_sha256": "c55118a3580219f5fd1f4a90082eb51da3bc718e9d8516fac648007859d3d9f7",
+  "clusters": {
+    "root-entrypoints": {
+      "package": "eliot-swarm-controller",
+      "files": [
+        {
+          "path": "src/lib.rs",
+          "bytes": 326,
+          "lines": 7,
+          "sha256": "b0d3907b9a8ac518f6d9b5cb9969212207c52f0232393b070f82c5c76bb78830",
+          "functions": [],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "use",
+              "name": "swarm_kernel_host"
+            }
+          ],
+          "marker_counts": {
+            "compatibility": 1,
+            "historical": 1
+          }
+        },
+        {
+          "path": "src/main.rs",
+          "bytes": 5282,
+          "lines": 177,
+          "sha256": "455733b6791a9abd29b3424d7fc0fb1b2ed804e559e40a8288731ed9864e2912",
+          "functions": [
+            "emit_wrapper_error",
+            "main",
+            "remaining",
+            "report_start_failure",
+            "report_start_failure_until",
+            "report_wait_failure",
+            "status_to_exit_code"
+          ],
+          "modules": [],
+          "public_items": [],
+          "marker_counts": {
+            "wrapper": 8
+          }
+        }
+      ],
+      "file_count": 2,
+      "bytes": 5608,
+      "lines": 184,
+      "source_sha256": "af7dfd6d876d05f5b08331023a3631c795028d9feef67f6f43fea309dacc7b3e",
+      "cargo_dependents": [],
+      "method_literals": [
+        "swarm-kernel-host.exe"
+      ]
+    },
+    "swarm-cli": {
+      "package": "swarm-cli",
+      "files": [
+        {
+          "path": "crates/swarm-cli/src/lib.rs",
+          "bytes": 10138,
+          "lines": 277,
+          "sha256": "83a56df039281452ebff02c5c607381758cecd678b711b6ac0ea438858d655b5",
+          "functions": [
+            "call",
+            "default_data_dir",
+            "hook_emit_ack_matches",
+            "hook_emit_params",
+            "hook_emit_with_retry",
+            "load",
+            "prepare_call",
+            "required_text",
+            "validate",
+            "validate_call_method"
+          ],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "struct",
+              "name": "ClientConfig"
+            },
+            {
+              "kind": "fn",
+              "name": "load"
+            },
+            {
+              "kind": "fn",
+              "name": "call"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_call_method"
+            },
+            {
+              "kind": "fn",
+              "name": "prepare_call"
+            }
+          ],
+          "marker_counts": {
+            "standalone": 1
+          }
+        },
+        {
+          "path": "crates/swarm-cli/src/main.rs",
+          "bytes": 72277,
+          "lines": 2187,
+          "sha256": "19930d7336ee0b245b4190cf837ae441f372b2f4a36c5b97544336716e64686b",
+          "functions": [
+            "command_uses_host",
+            "command_uses_mcp",
+            "delegate_to_host",
+            "delegate_to_mcp",
+            "emit_host_wrapper_error",
+            "load_credential",
+            "main",
+            "map_command",
+            "read_json",
+            "read_json_with_concilium_id",
+            "remaining",
+            "report_host_start_failure",
+            "report_host_start_failure_until",
+            "report_host_wait_failure",
+            "run",
+            "status_to_exit_code"
+          ],
+          "modules": [],
+          "public_items": [],
+          "marker_counts": {
+            "historical": 1,
+            "delegate": 5,
+            "wrapper": 8
+          }
+        }
+      ],
+      "file_count": 2,
+      "bytes": 82415,
+      "lines": 2464,
+      "source_sha256": "28dfebcf297ca52962529a3d570c7e4c791a3f1eea52909670e065c7826c3a48",
+      "cargo_dependents": [],
+      "method_literals": [
+        "agent.family",
+        "agent.list",
+        "agent.result",
+        "agent.state",
+        "agent.usage",
+        "artifact.assemble",
+        "artifact.get",
+        "artifact.parts",
+        "artifact.read",
+        "attempt.bind_producer",
+        "attempt.get",
+        "automation.config.apply",
+        "automation.config.explain",
+        "automation.config.get",
+        "automation.config.preview",
+        "automation.config.transfer",
+        "check.cancel",
+        "check.get",
+        "check.profiles",
+        "check.run",
+        "code.scope.accept",
+        "code.scope.conflicts",
+        "code.scope.inspect",
+        "code.scope.propose",
+        "code.scope.release",
+        "concilium.close",
+        "concilium.get",
+        "concilium.list",
+        "concilium.open",
+        "concilium.position.submit",
+        "concilium.preview",
+        "concilium.propose",
+        "concilium.round.advance",
+        "coordination.agreement.get",
+        "coordination.consult",
+        "coordination.contract.get",
+        "coordination.contract.list",
+        "coordination.contract.propose",
+        "coordination.contract.respond",
+        "coordination.contract_card.get",
+        "coordination.contract_card.list",
+        "coordination.contract_card.publish",
+        "coordination.contract_card.withdraw",
+        "coordination.inbox",
+        "coordination.integration.ack",
+        "coordination.message.send",
+        "coordination.participant.disable",
+        "coordination.participant.get",
+        "coordination.participant.list",
+        "coordination.participant.register",
+        "coordination.peer.find",
+        "coordination.send",
+        "coordination.sync_integration",
+        "coordination.thread.get",
+        "coordination.thread.list",
+        "coordination.thread.open",
+        "coordination.thread.resolve",
+        "coordination.thread.supersede",
+        "coordination.thread.withdraw",
+        "coordination.watch.cancel",
+        "coordination.watch.create",
+        "coordination.watch.list",
+        "coordination.work_card.get",
+        "coordination.work_card.list",
+        "coordination.work_card.publish",
+        "coordination.work_card.withdraw",
+        "doctor.inspect",
+        "git.post_commit",
+        "github.source.get",
+        "github.source.inspect",
+        "github.source.poll",
+        "github.source.setup",
+        "github.work_pool.apply",
+        "github.work_pool.preview",
+        "gm.handover",
+        "goal.create",
+        "goal.disable",
+        "goal.enable",
+        "goal.get",
+        "goal.list",
+        "goal.readback",
+        "goal.revise",
+        "hook.emit",
+        "hook.source.get",
+        "hook.source.revoke",
+        "hook.source.setup",
+        "host.status",
+        "monitor.follow",
+        "monitor.snapshot",
+        "operator.json",
+        "report.delta",
+        "review.assign",
+        "review.get",
+        "review.list",
+        "review.submit",
+        "script.activate",
+        "script.get",
+        "script.list",
+        "script.register",
+        "script.revise",
+        "script.run",
+        "script.validate",
+        "source.capture",
+        "swarm-host.exe",
+        "swarm-mcp.exe",
+        "swarm.agent.inspect",
+        "swarm.context.get",
+        "swarm.dashboard",
+        "swarm.exceptions.get",
+        "swarm.launch",
+        "swarm.launch.preview",
+        "swarm.overlap.check",
+        "swarm.queue.get",
+        "swarm.review.context",
+        "task.accept",
+        "task.acceptance",
+        "task.claim",
+        "task.create",
+        "task.get",
+        "task.invalidate_acceptance",
+        "task.list",
+        "task.request_changes",
+        "task.revise",
+        "task.submission",
+        "task.submit",
+        "task.submit.recover"
+      ]
+    },
+    "swarm-kernel": {
+      "package": "swarm-kernel",
+      "files": [
+        {
+          "path": "crates/swarm-kernel/src/acceptance.rs",
+          "bytes": 26936,
+          "lines": 745,
+          "sha256": "9588c4aad5840e4be268a5e5fbd04b912a43b01fad0b3958cc315a75e7d112d2",
+          "functions": [
+            "code",
+            "dependency_receipt_ids",
+            "evidence_level",
+            "has_exact_keys",
+            "invalid",
+            "key",
+            "message",
+            "new",
+            "profile_identity",
+            "requirement_evidence_plan",
+            "requirement_evidence_plan_value",
+            "requirement_verification",
+            "text",
+            "validate_accept_request",
+            "validate_acceptance_required",
+            "validate_cached_operation",
+            "validate_cached_source",
+            "validate_candidate_identity",
+            "validate_check",
+            "validate_check_operation",
+            "validate_check_profile_identity",
+            "validate_checks_complete",
+            "validate_coalesced_scope",
+            "validate_frozen_requirement_evidence_plan",
+            "validate_invalidation",
+            "validate_policy",
+            "validate_review_coverage",
+            "validate_reviewer_independence",
+            "validate_submission_scope"
+          ],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "struct",
+              "name": "ValidationError"
+            },
+            {
+              "kind": "fn",
+              "name": "code"
+            },
+            {
+              "kind": "fn",
+              "name": "message"
+            },
+            {
+              "kind": "type",
+              "name": "Result"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_policy"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_accept_request"
+            },
+            {
+              "kind": "struct",
+              "name": "RequirementEvidencePlan"
+            },
+            {
+              "kind": "struct",
+              "name": "CheckProfileIdentity"
+            },
+            {
+              "kind": "fn",
+              "name": "requirement_evidence_plan"
+            },
+            {
+              "kind": "fn",
+              "name": "requirement_evidence_plan_value"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_frozen_requirement_evidence_plan"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_review_coverage"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_invalidation"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_submission_scope"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_reviewer_independence"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_acceptance_required"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_candidate_identity"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_check"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_check_profile_identity"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_check_operation"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_cached_source"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_cached_operation"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_checks_complete"
+            },
+            {
+              "kind": "fn",
+              "name": "evidence_level"
+            },
+            {
+              "kind": "fn",
+              "name": "dependency_receipt_ids"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_coalesced_scope"
+            }
+          ],
+          "marker_counts": {
+            "legacy": 3
+          }
+        },
+        {
+          "path": "crates/swarm-kernel/src/dispatch.rs",
+          "bytes": 3599,
+          "lines": 123,
+          "sha256": "e57251e33a5e4702a0003563e8b3589b76c8c87cead425c32c7d939ac28a5455",
+          "functions": [
+            "error_code",
+            "not_dispatched_payload",
+            "safe_error_code",
+            "stage",
+            "status",
+            "validate",
+            "validate_fields"
+          ],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "struct",
+              "name": "DispatchFailure"
+            },
+            {
+              "kind": "fn",
+              "name": "status"
+            },
+            {
+              "kind": "fn",
+              "name": "stage"
+            },
+            {
+              "kind": "fn",
+              "name": "error_code"
+            },
+            {
+              "kind": "enum",
+              "name": "DispatchFailureError"
+            },
+            {
+              "kind": "fn",
+              "name": "not_dispatched_payload"
+            },
+            {
+              "kind": "fn",
+              "name": "validate"
+            }
+          ],
+          "marker_counts": {}
+        },
+        {
+          "path": "crates/swarm-kernel/src/lib.rs",
+          "bytes": 28580,
+          "lines": 805,
+          "sha256": "9ec3309319a696beb2b2aa61b36b312584a06799e15305b23a5b4fb90e209406",
+          "functions": [
+            "admission_state",
+            "clone",
+            "close_admission",
+            "default",
+            "drop",
+            "fmt",
+            "handle",
+            "join",
+            "next_writer_job",
+            "refresh_writer_status",
+            "snapshot",
+            "spawn_kernel_host",
+            "spawn_writer_actor",
+            "spawn_writer_actor_inner",
+            "status_lock",
+            "status_receiver",
+            "submit",
+            "validate",
+            "wait_ready",
+            "writer_closed_error"
+          ],
+          "modules": [
+            "acceptance",
+            "dispatch",
+            "reviews",
+            "tasks"
+          ],
+          "public_items": [
+            {
+              "kind": "mod",
+              "name": "acceptance"
+            },
+            {
+              "kind": "mod",
+              "name": "dispatch"
+            },
+            {
+              "kind": "mod",
+              "name": "reviews"
+            },
+            {
+              "kind": "mod",
+              "name": "tasks"
+            },
+            {
+              "kind": "enum",
+              "name": "WriterJob"
+            },
+            {
+              "kind": "type",
+              "name": "WriterSender"
+            },
+            {
+              "kind": "struct",
+              "name": "WriterActor"
+            },
+            {
+              "kind": "fn",
+              "name": "spawn_writer_actor"
+            },
+            {
+              "kind": "struct",
+              "name": "KernelHostConfig"
+            },
+            {
+              "kind": "fn",
+              "name": "validate"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelHostConfigError"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelAdmissionFault"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelAdmissionState"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelHostLifecycle"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelHostFailure"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelHostJoinError"
+            },
+            {
+              "kind": "struct",
+              "name": "KernelHostSnapshot"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelHostSpawnError"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelSubmitError"
+            },
+            {
+              "kind": "enum",
+              "name": "KernelHostReadyError"
+            },
+            {
+              "kind": "struct",
+              "name": "KernelHost"
+            },
+            {
+              "kind": "struct",
+              "name": "KernelHostHandle"
+            },
+            {
+              "kind": "fn",
+              "name": "snapshot"
+            },
+            {
+              "kind": "fn",
+              "name": "admission_state"
+            },
+            {
+              "kind": "fn",
+              "name": "status_receiver"
+            },
+            {
+              "kind": "fn",
+              "name": "submit"
+            },
+            {
+              "kind": "fn",
+              "name": "snapshot"
+            },
+            {
+              "kind": "fn",
+              "name": "admission_state"
+            },
+            {
+              "kind": "fn",
+              "name": "handle"
+            },
+            {
+              "kind": "fn",
+              "name": "close_admission"
+            },
+            {
+              "kind": "fn",
+              "name": "wait_ready"
+            },
+            {
+              "kind": "fn",
+              "name": "submit"
+            },
+            {
+              "kind": "fn",
+              "name": "join"
+            },
+            {
+              "kind": "fn",
+              "name": "spawn_kernel_host"
+            }
+          ],
+          "marker_counts": {}
+        },
+        {
+          "path": "crates/swarm-kernel/src/reviews.rs",
+          "bytes": 21944,
+          "lines": 641,
+          "sha256": "156cf99c681460d37eb7b562c0a6928c286a7f0b5d713b47f4a185b1380b48bd",
+          "functions": [
+            "actionable_finding",
+            "as_str",
+            "exact_object",
+            "fmt",
+            "nonempty_text_array",
+            "parse",
+            "required_text",
+            "valid_sha256",
+            "validate_disposition",
+            "validate_finding_requirements",
+            "validate_findings_shape",
+            "validate_requirement_coverage",
+            "validate_requirement_reviews_shape",
+            "validate_result",
+            "validate_result_event",
+            "validate_result_input",
+            "validate_result_record",
+            "validate_review_semantics",
+            "validate_slot_identity",
+            "validate_submit_request"
+          ],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "enum",
+              "name": "ReviewValidationError"
+            },
+            {
+              "kind": "enum",
+              "name": "ReviewVerdict"
+            },
+            {
+              "kind": "fn",
+              "name": "parse"
+            },
+            {
+              "kind": "fn",
+              "name": "as_str"
+            },
+            {
+              "kind": "enum",
+              "name": "ReviewCoverage"
+            },
+            {
+              "kind": "fn",
+              "name": "parse"
+            },
+            {
+              "kind": "fn",
+              "name": "as_str"
+            },
+            {
+              "kind": "enum",
+              "name": "ReviewApplicability"
+            },
+            {
+              "kind": "struct",
+              "name": "ReviewResult"
+            },
+            {
+              "kind": "enum",
+              "name": "ReviewDisposition"
+            },
+            {
+              "kind": "fn",
+              "name": "as_str"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_submit_request"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_finding_requirements"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_requirement_coverage"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_result"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_result_record"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_result_event"
+            },
+            {
+              "kind": "fn",
+              "name": "actionable_finding"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_disposition"
+            }
+          ],
+          "marker_counts": {
+            "historical": 3
+          }
+        },
+        {
+          "path": "crates/swarm-kernel/src/tasks.rs",
+          "bytes": 15353,
+          "lines": 425,
+          "sha256": "1619cce05eb034ba1703e0a87f8ff322c0109d35d3e1d09c1b9e5100979acaba",
+          "functions": [
+            "code",
+            "invalid",
+            "message",
+            "new",
+            "sha256",
+            "validate_claim_binding_pair",
+            "validate_claim_start",
+            "validate_claim_task_state",
+            "validate_release_request",
+            "validate_release_transition",
+            "validate_revision_state",
+            "validate_revision_transition",
+            "validate_revision_update",
+            "validate_source_index_entry",
+            "validate_spec"
+          ],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "struct",
+              "name": "ValidationError"
+            },
+            {
+              "kind": "fn",
+              "name": "code"
+            },
+            {
+              "kind": "fn",
+              "name": "message"
+            },
+            {
+              "kind": "type",
+              "name": "Result"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_spec"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_source_index_entry"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_revision_transition"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_revision_state"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_revision_update"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_claim_start"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_claim_binding_pair"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_claim_task_state"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_release_request"
+            },
+            {
+              "kind": "fn",
+              "name": "validate_release_transition"
+            }
+          ],
+          "marker_counts": {}
+        }
+      ],
+      "file_count": 5,
+      "bytes": 96412,
+      "lines": 2739,
+      "source_sha256": "410feaeca5fa669577562efe780d3c80c3035b74236e960a692f3748eb95ab0b",
+      "cargo_dependents": [
+        "swarm-kernel-host"
+      ],
+      "method_literals": [
+        "check.run",
+        "review.disposition",
+        "swarm.acceptance_policy"
+      ]
+    },
+    "swarm-bus": {
+      "package": "swarm-bus",
+      "files": [
+        {
+          "path": "crates/swarm-bus/src/bin/dispatcher.rs",
+          "bytes": 30618,
+          "lines": 872,
+          "sha256": "a67a4d8557233634ee05b2ca15a9767a7e5cfdbc972ce86d1b99f50a99ccb137",
+          "functions": [
+            "admission_request_id",
+            "call_once",
+            "drop",
+            "enroll",
+            "enroll_managed",
+            "ensure_private_directory",
+            "hex_sha256",
+            "is_link_or_reparse",
+            "is_sha256",
+            "main",
+            "parse_bool_option",
+            "parse_options",
+            "poll_once",
+            "read_credential",
+            "read_private_file",
+            "read_worker_config",
+            "read_worker_config_with_digest",
+            "reject_unknown_options",
+            "required",
+            "retryable_transport_code",
+            "revoke",
+            "run_cli",
+            "run_managed_worker",
+            "run_unmanaged_worker",
+            "run_worker",
+            "stop_requested",
+            "validate_consumer_client_id",
+            "worker_file_sha256",
+            "write_worker_config"
+          ],
+          "modules": [],
+          "public_items": [],
+          "marker_counts": {
+            "standalone": 1
+          }
+        },
+        {
+          "path": "crates/swarm-bus/src/lib.rs",
+          "bytes": 10105,
+          "lines": 349,
+          "sha256": "da622092defaca19a39a573184c2e40001f12a0aafe31053c442bc164140c91b",
+          "functions": [
+            "action",
+            "as_str",
+            "consumer_id",
+            "consumer_name",
+            "event_kind",
+            "fmt",
+            "into_items",
+            "items",
+            "matches",
+            "new",
+            "observation_id",
+            "parse",
+            "route_event",
+            "same_slot",
+            "selector",
+            "selector_name",
+            "source_id",
+            "status",
+            "valid_name"
+          ],
+          "modules": [
+            "managed_worker_config",
+            "service_scope"
+          ],
+          "public_items": [
+            {
+              "kind": "mod",
+              "name": "managed_worker_config"
+            },
+            {
+              "kind": "mod",
+              "name": "service_scope"
+            },
+            {
+              "kind": "use",
+              "name": "managed_worker_config"
+            },
+            {
+              "kind": "enum",
+              "name": "EventStatus"
+            },
+            {
+              "kind": "fn",
+              "name": "as_str"
+            },
+            {
+              "kind": "fn",
+              "name": "parse"
+            },
+            {
+              "kind": "struct",
+              "name": "EventMetadata"
+            },
+            {
+              "kind": "fn",
+              "name": "new"
+            },
+            {
+              "kind": "fn",
+              "name": "observation_id"
+            },
+            {
+              "kind": "fn",
+              "name": "source_id"
+            },
+            {
+              "kind": "fn",
+              "name": "event_kind"
+            },
+            {
+              "kind": "fn",
+              "name": "status"
+            },
+            {
+              "kind": "enum",
+              "name": "Action"
+            },
+            {
+              "kind": "fn",
+              "name": "as_str"
+            },
+            {
+              "kind": "struct",
+              "name": "EventSelector"
+            },
+            {
+              "kind": "fn",
+              "name": "new"
+            },
+            {
+              "kind": "fn",
+              "name": "source_id"
+            },
+            {
+              "kind": "fn",
+              "name": "event_kind"
+            },
+            {
+              "kind": "fn",
+              "name": "status"
+            },
+            {
+              "kind": "fn",
+              "name": "matches"
+            },
+            {
+              "kind": "struct",
+              "name": "Subscription"
+            },
+            {
+              "kind": "fn",
+              "name": "new"
+            },
+            {
+              "kind": "fn",
+              "name": "consumer_id"
+            },
+            {
+              "kind": "fn",
+              "name": "selector"
+            },
+            {
+              "kind": "fn",
+              "name": "action"
+            },
+            {
+              "kind": "struct",
+              "name": "DispatchItem"
+            },
+            {
+              "kind": "fn",
+              "name": "consumer_id"
+            },
+            {
+              "kind": "fn",
+              "name": "observation_id"
+            },
+            {
+              "kind": "fn",
+              "name": "action"
+            },
+            {
+              "kind": "struct",
+              "name": "RoutePlan"
+            },
+            {
+              "kind": "fn",
+              "name": "items"
+            },
+            {
+              "kind": "fn",
+              "name": "into_items"
+            },
+            {
+              "kind": "fn",
+              "name": "route_event"
+            },
+            {
+              "kind": "enum",
+              "name": "ValidationError"
+            },
+            {
+              "kind": "use",
+              "name": "service_scope"
+            }
+          ],
+          "marker_counts": {}
+        },
+        {
+          "path": "crates/swarm-bus/src/managed_worker_config.rs",
+          "bytes": 6988,
+          "lines": 211,
+          "sha256": "b20093732eedad40b20be8e3620d5241c8ad033b63496c4cb4a1ad4abf48730d",
+          "functions": [
+            "bootstrap_path_canonical_managed_config_is_readable",
+            "drop",
+            "hex_sha256",
+            "is_link_or_reparse",
+            "reject_link_components",
+            "valid_sha256",
+            "verify_managed_worker_config"
+          ],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "struct",
+              "name": "ManagedWorkerConfigExpectation"
+            },
+            {
+              "kind": "fn",
+              "name": "verify_managed_worker_config"
+            }
+          ],
+          "marker_counts": {}
+        },
+        {
+          "path": "crates/swarm-bus/src/service_scope.rs",
+          "bytes": 1562,
+          "lines": 43,
+          "sha256": "88c413068eb3849568e9441c31c3f6c816dbecbf9c57bfbe54a140fffadd835e",
+          "functions": [
+            "managed_service_component",
+            "managed_service_state_path",
+            "managed_worker_config_path"
+          ],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "fn",
+              "name": "managed_service_component"
+            },
+            {
+              "kind": "fn",
+              "name": "managed_worker_config_path"
+            },
+            {
+              "kind": "fn",
+              "name": "managed_service_state_path"
+            }
+          ],
+          "marker_counts": {}
+        }
+      ],
+      "file_count": 4,
+      "bytes": 49273,
+      "lines": 1475,
+      "source_sha256": "0bf716a783172fb70225d7b23e7903d237a17320fd28a244e9f4b6113c32be67",
+      "cargo_dependents": [
+        "swarm-kernel-host",
+        "swarm-scripts"
+      ],
+      "method_literals": [
+        "bus.consumer.admit",
+        "bus.consumer.register",
+        "bus.consumer.revoke",
+        "bus.events.page",
+        "owner.json",
+        "stop.request",
+        "task.submission",
+        "worker.json"
+      ]
+    },
+    "swarm-telemetry": {
+      "package": "swarm-telemetry",
+      "files": [
+        {
+          "path": "crates/swarm-telemetry/src/lib.rs",
+          "bytes": 61483,
+          "lines": 1719,
+          "sha256": "a765ecfedee79f599440b49b042692be233641308c33a4dd53feaee6e411d2a3",
+          "functions": [
+            "allows",
+            "atomic_add",
+            "atomic_sub",
+            "blocked_writer",
+            "blocked_writer_with_length",
+            "bounded_queue_rejects_byte_overload_without_exceeding_capacity",
+            "bounded_queue_rejects_overload_and_flush_waits_for_active_write",
+            "default",
+            "disabled",
+            "emit",
+            "ensure_writer",
+            "exact_scoped_policy",
+            "finish_pending",
+            "fmt",
+            "from_atom",
+            "from_bounded",
+            "from_build_id",
+            "from_event_id",
+            "from_known",
+            "from_version",
+            "has_extended_correlation",
+            "is_enabled",
+            "load",
+            "mark_stderr_failed",
+            "mark_worker_failed",
+            "matches",
+            "metadata_stderr",
+            "new",
+            "next_sequence",
+            "observer_panic_does_not_disable_healthy_stderr",
+            "pending_bytes",
+            "ready",
+            "record",
+            "record_drop",
+            "replace_scoped_filters",
+            "reserve",
+            "scoped_filter_count",
+            "scoped_policy_for",
+            "selected_policy",
+            "specificity",
+            "stats",
+            "stderr_failure_keeps_observer_admission_without_retrying_stderr",
+            "stderr_failure_without_observer_is_terminal_and_does_not_retry",
+            "text_capture_admitted_for",
+            "text_capture_components",
+            "unix_time_ms",
+            "unix_time_ms_signed",
+            "wait_for_idle",
+            "with_artifact_id",
+            "with_artifact_version",
+            "with_attempt_id",
+            "with_binding_generation",
+            "with_binding_id",
+            "with_build_id",
+            "with_client_id",
+            "with_code",
+            "with_component",
+            "with_event_id",
+            "with_limits",
+            "with_line_observer",
+            "with_line_observer_and_writer",
+            "with_link_id",
+            "with_module_boot_id",
+            "with_module_id",
+            "with_operation_id",
+            "with_task_id",
+            "with_text",
+            "with_text_capture_policy",
+            "with_text_redactor",
+            "writer_loop"
+          ],
+          "modules": [],
+          "public_items": [
+            {
+              "kind": "type",
+              "name": "TextRedactor"
+            },
+            {
+              "kind": "type",
+              "name": "TextCapturePolicy"
+            },
+            {
+              "kind": "struct",
+              "name": "Config"
+            },
+            {
+              "kind": "fn",
+              "name": "metadata_stderr"
+            },
+            {
+              "kind": "fn",
+              "name": "disabled"
+            },
+            {
+              "kind": "fn",
+              "name": "with_limits"
+            },
+            {
+              "kind": "fn",
+              "name": "is_enabled"
+            },
+            {
+              "kind": "fn",
+              "name": "with_text_redactor"
+            },
+            {
+              "kind": "fn",
+              "name": "with_text_capture_policy"
+            },
+            {
+              "kind": "enum",
+              "name": "ConfigError"
+            },
+            {
+              "kind": "enum",
+              "name": "Severity"
+            },
+            {
+              "kind": "enum",
+              "name": "Kind"
+            },
+            {
+              "kind": "enum",
+              "name": "Component"
+            },
+            {
+              "kind": "enum",
+              "name": "Phase"
+            },
+            {
+              "kind": "enum",
+              "name": "Code"
+            },
+            {
+              "kind": "struct",
+              "name": "Record"
+            },
+            {
+              "kind": "fn",
+              "name": "new"
+            },
+            {
+              "kind": "fn",
+              "name": "with_code"
+            },
+            {
+              "kind": "fn",
+              "name": "with_component"
+            },
+            {
+              "kind": "fn",
+              "name": "with_client_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_link_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_binding_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_binding_generation"
+            },
+            {
+              "kind": "fn",
+              "name": "with_operation_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_module_boot_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_event_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_module_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_artifact_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_artifact_version"
+            },
+            {
+              "kind": "fn",
+              "name": "with_build_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_task_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_attempt_id"
+            },
+            {
+              "kind": "fn",
+              "name": "with_text"
+            },
+            {
+              "kind": "type",
+              "name": "LineObserver"
+            },
+            {
+              "kind": "enum",
+              "name": "FilterLevel"
+            },
+            {
+              "kind": "fn",
+              "name": "allows"
+            },
+            {
+              "kind": "enum",
+              "name": "FilterContent"
+            },
+            {
+              "kind": "struct",
+              "name": "ScopedPolicyOverride"
+            },
+            {
+              "kind": "struct",
+              "name": "FilterScope"
+            },
+            {
+              "kind": "fn",
+              "name": "new"
+            },
+            {
+              "kind": "struct",
+              "name": "ScopedFilter"
+            },
+            {
+              "kind": "enum",
+              "name": "FilterError"
+            },
+            {
+              "kind": "struct",
+              "name": "Producer"
+            },
+            {
+              "kind": "fn",
+              "name": "new"
+            },
+            {
+              "kind": "fn",
+              "name": "with_line_observer"
+            },
+            {
+              "kind": "fn",
+              "name": "emit"
+            },
+            {
+              "kind": "fn",
+              "name": "stats"
+            },
+            {
+              "kind": "fn",
+              "name": "text_capture_components"
+            },
+            {
+              "kind": "fn",
+              "name": "text_capture_admitted_for"
+            },
+            {
+              "kind": "fn",
+              "name": "scoped_policy_for"
+            },
+            {
+              "kind": "fn",
+              "name": "exact_scoped_policy"
+            },
+            {
+              "kind": "fn",
+              "name": "replace_scoped_filters"
+            },
+            {
+              "kind": "fn",
+              "name": "scoped_filter_count"
+            },
+            {
+              "kind": "fn",
+              "name": "wait_for_idle"
+            },
+            {
+              "kind": "enum",
+              "name": "DropReason"
+            },
+            {
+              "kind": "enum",
+              "name": "EmitResult"
+            },
+            {
+              "kind": "enum",
+              "name": "SinkState"
+            },
+            {
+              "kind": "struct",
+              "name": "Stats"
+            },
+            {
+              "kind": "struct",
+              "name": "TextCaptureComponents"
+            },
+            {
+              "kind": "fn",
+              "name": "ready"
+            }
+          ],
+          "marker_counts": {
+            "compatibility": 2
+          }
+        }
+      ],
+      "file_count": 1,
+      "bytes": 61483,
+      "lines": 1719,
+      "source_sha256": "9276d3663e3a92bb4a603907d407b48a0dc456c350613665cce1415aae1b0ee7",
+      "cargo_dependents": [
+        "swarm-kernel-host",
+        "swarm-observer"
+      ],
+      "method_literals": []
+    }
+  },
+  "facts": {
+    "root_lib_reexports_kernel_host": true,
+    "root_main_spawns_kernel_host_sibling": true,
+    "cli_delegates_host": true,
+    "cli_delegates_mcp": true,
+    "cli_command_variants": [
+      "Host",
+      "Mcp",
+      "Gateway",
+      "ModuleRun",
+      "CheckWorker",
+      "OwnedOpencodeService",
+      "ScriptWorker",
+      "Source",
+      "Code",
+      "Check",
+      "Status",
+      "Doctor",
+      "Call",
+      "Task",
+      "Coordination",
+      "Concilium",
+      "Review",
+      "Automation",
+      "Script",
+      "Hook",
+      "Goal",
+      "GitHub",
+      "Launcher",
+      "ClientCreate",
+      "GmHandover",
+      "Agent",
+      "Attempt",
+      "Family",
+      "Result",
+      "Artifact",
+      "Report",
+      "Observer",
+      "Monitor"
+    ],
+    "cli_command_variant_count": 33,
+    "kernel_consumers": [
+      "crates/swarm-kernel/tests/kernel_failure.rs",
+      "crates/swarm-kernel-host/src/acceptance.rs",
+      "crates/swarm-kernel-host/src/automation/authorization.rs",
+      "crates/swarm-kernel-host/src/host.rs",
+      "crates/swarm-kernel-host/src/model.rs",
+      "crates/swarm-kernel-host/src/review.rs",
+      "crates/swarm-kernel-host/src/store/acceptance.rs",
+      "crates/swarm-kernel-host/src/store/automation_acceptance.rs",
+      "crates/swarm-kernel-host/src/store/automation_disposition.rs",
+      "crates/swarm-kernel-host/src/store/mod.rs",
+      "crates/swarm-kernel-host/src/store/operations.rs",
+      "crates/swarm-kernel-host/src/store/review_disposition.rs",
+      "crates/swarm-kernel-host/src/store/reviews.rs",
+      "crates/swarm-kernel-host/src/store/status_reader.rs",
+      "crates/swarm-kernel-host/src/store/submissions.rs",
+      "crates/swarm-kernel-host/src/store/task_prompt.rs",
+      "crates/swarm-kernel-host/src/store/tasks.rs"
+    ],
+    "bus_consumers": [
+      "crates/swarm-bus/src/bin/dispatcher.rs",
+      "crates/swarm-kernel-host/src/host_bus_supervisor.rs",
+      "crates/swarm-kernel-host/src/store/automation_dispatch_bus.rs",
+      "crates/swarm-scripts/src/error.rs",
+      "crates/swarm-scripts/src/lib.rs"
+    ],
+    "telemetry_consumers": [
+      "crates/swarm-kernel-host/src/host.rs",
+      "crates/swarm-kernel-host/src/store/core_failure_tests.rs",
+      "crates/swarm-kernel-host/src/store/logging.rs",
+      "crates/swarm-kernel-host/src/store/mod.rs",
+      "crates/swarm-kernel-host/src/store/module_supervisor_observation.rs",
+      "crates/swarm-observer/src/host.rs",
+      "crates/swarm-observer/src/lib.rs",
+      "crates/swarm-observer/src/live_config.rs"
+    ],
+    "legacy_worker_coordinator_present": true,
+    "legacy_worker_demand_present": true,
+    "bus_dispatcher_binary_present": true
+  }
+}
