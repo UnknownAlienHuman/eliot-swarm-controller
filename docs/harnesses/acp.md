@@ -1,6 +1,6 @@
 # ACP agents (generic plugin)
 
-Layer L4.5. Plugin: `plugins/acp` (Rust, `agent-client-protocol` crate). One plugin
+Layer L4.6. Plugin: `plugins/acp` (Rust, `agent-client-protocol` crate). One plugin
 covers every agent that speaks the Agent Client Protocol; the profile names the
 command.
 
@@ -22,13 +22,13 @@ and capabilities.
 | Eliot verb | ACP v1 | Notes |
 | --- | --- | --- |
 | `launch` | `initialize` → `session/new` (cwd) → `session/prompt` | `native_ref` = session id. |
-| `send` | `session/prompt` | One prompt at a time; the request completes at turn end. Queue in the plugin while busy. |
+| `send` | `session/prompt` | One prompt at a time; the request completes at turn end. Arrives only when idle (Eliot queues). |
 | `steer`, `inject` | not in v1 → `rejected` (`inject` may prepend to next prompt) | |
 | `interrupt` | `session/cancel` | Queued-input cancel, turn cancel and session close are different things. |
 | `stop` | `session/close` if supported, then end the process | |
 | `resume` | `session/load` / `session/resume` when the agent advertises them | |
 | `approve` / `deny` | answer `session/request_permission` with one of the offered option ids | Use the agent's option ids; never invent "allow". |
-| `configure` | `session/set_mode` when advertised | |
+| `configure` | `session/set_config_option` with typed selectors (`model`, `thought_level` for effort, `mode`), confirmed by readback; `session/set_mode` for mode when advertised | |
 | `goal.*` | Eliot Goal loop | |
 
 Events come from `session/update` notifications (message chunks, tool calls and

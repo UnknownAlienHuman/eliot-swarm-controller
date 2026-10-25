@@ -11,7 +11,11 @@ serves many agents of one harness kind.
 
 ## Framing
 
-- JSON-RPC 2.0, one JSON object per line on stdout/stdin, UTF-8, no BOM.
+- JSON-RPC 2.0, one JSON object per line on stdout/stdin, UTF-8, no BOM, at most
+  1 MiB per line.
+- Rust: read lines with `tokio_util` `FramedRead` + `LinesCodec` (cancel-safe); never
+  `read_line` inside a `select!` that can cancel it (partial lines are lost). A
+  long-lived native reader gets its own task — `spawn_blocking` work cannot be aborted.
 - stderr is free-form log text; the host captures it (bounded) into the daemon log.
 - Both sides may send requests and notifications. Ids are unique per direction.
 - Every agent-scoped message carries `agent_id`. The plugin keeps its own map
@@ -24,7 +28,7 @@ serves many agents of one harness kind.
 | --- | --- | --- |
 | `initialize` | `protocol`, `plugin_config` (its `[plugins.<name>]` table), `data_dir` | `Manifest` (below) |
 | `agent.start` | `agent_id`, `profile` (resolved), `workspace?`, `prompt?`, `env` (Eliot vars to inject), `system_note` ([text](coordination.md#communication-guidance-for-agent-prompts)), `parent_native_ref?` | `{native_ref, pids: [Pid], effective: {model?, permissions?, system_note: native|prepended, endpoint?}}` |
-| `agent.attach` | `agent_id`, `native_ref`, `observe_only` | `{state, pids}` — after a plugin/daemon restart or for discovered sessions; error `not_found` if the session is gone |
+| `agent.attach` | `agent_id`, `native_ref`, `observe_only` | `{state, pids}` — after a plugin/daemon restart or for discovered sessions; error `not_found` if the session is gone. If a turn was running and its end is not confirmed, the state is `busy` (no `turn.completed` is invented) and the host repeats `agent.snapshot` until the native side settles it. |
 | `agent.command` | `agent_id`, `command_id`, `verb`, `args` | `{status: applied|rejected|failed|unknown, applies?: now|next_tool|next_turn|next_session, detail?}` |
 | `agent.snapshot` | `agent_id`, `commands?: [command_id]` | `{state, pending: [Request], goal?, usage?, commands?: {id: applied|not_applied|unknown}}` |
 | `agent.stop` | `agent_id`, `force` | `{}` once the native session ended (or `force` killed it) |
@@ -49,7 +53,7 @@ Verb routing: `launch` arrives as `agent.start`, `stop` as `agent.stop`, `resume
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `child` | `{parent_agent_id, native_ref, name?, labels?}` | `{agent_id}` — the host creates an `origin=native` agent (idempotent per `native_ref`) |
+| `child` | `{parent_agent_id, native_ref, name?, labels?}` | `{agent_id, token}` — the host creates an `origin=native` agent (idempotent per `native_ref`). Where the harness lets the plugin set a child's environment, it gives the child this token; otherwise it strips `ELIOT_AGENT_*` from the child's environment. A child must never act with its parent's token. If neither is possible (subagents running inside the parent's process), the child's `eliot` calls count as the parent's and `eliot show` says so. |
 | `decide` | `{agent_id, request: Request}` | `{decision: allow|deny|ask, reason?, context?}` — synchronous answer for approvals the plugin must answer inline. The host evaluates approval rules within 2 s (L5.5); until then, and on no match, `ask`. |
 
 ## Manifest
@@ -62,7 +66,8 @@ Verb routing: `launch` arrives as `agent.start`, `stop` as `agent.stop`, `resume
             "approve","deny","answer","configure","goal.set","goal.pause","goal.resume","goal.clear"],
   "child_verbs": ["send","interrupt"],
   "features": { "native_goal": true, "native_children": true, "hooks": false,
-                "transcripts": true, "discover": true },
+                "transcripts": true, "discover": true, "cost": false,
+                "multi_session": true },
   "proxy": "config"
 }
 ```
@@ -97,11 +102,17 @@ versions are for display; they are never a gate.
   pieces go to `message.delta` (ephemeral).
 - `tool.*` summaries are short (`"bash: cargo test -p foo"`); full output stays native.
 - Usage: send cumulative values with their `scope` (`turn` or `session`); never sum
-  cumulative counters.
+  cumulative counters. A harness without a machine-readable quota reports quota as
+  unknown, never zero.
 - Provider errors map to `provider.limited.kind`: `rate_limit` (retry soon), `quota`
   (window exhausted), `model_gone`, `auth`. A 429 is `rate_limit` unless the native
   error says quota.
 - Unknown native events may be forwarded as `x.<harness>.<name>` for debugging.
+- Events may arrive before the reply to the command that caused them (a fast
+  `turn.started` before `send`'s reply). Correlate by native turn/request ids, never
+  by arrival order.
+- Usage of a child is reported on the child; a parent's usage never includes its
+  children unless the native side says it does (then say so in `data`).
 
 ## Hooks
 
@@ -119,7 +130,9 @@ The daemon turns the hook into events (`tool.started`, `approval.requested`, ...
 runs matching [approval rules](automation.md#approvals) and delivers pending `inject`
 text as additional context when the hook allows it. If the daemon does not answer
 within the hook timeout (default 2 s), the shim prints the configured default
-(`allow` for observation-only hooks, `ask` for decision hooks) and exits 0. SDK-based
+(`allow` for observation-only hooks, `ask` for decision hooks) and exits 0. If the
+daemon is unreachable the shim tries at most three times (0, 100, 400 ms); after that
+the hook event is dropped and counted in `source.health` — there is no durable queue. SDK-based
 plugins (Claude Agent SDK) use in-process hook callbacks instead of the shim.
 
 ## Transcripts and discovery
@@ -130,18 +143,44 @@ Eliot watches sessions it did not launch (`origin=external`, `observe_only=true`
 the plugin can attach for control). The plugin stores its read offsets in its own state
 dir (`<data_dir>/plugins/<name>/`); the host does not parse transcripts.
 
+Tailing a file that is still being written: only a final line without a newline is a
+torn write and waits for more bytes; a complete line that fails to parse becomes a gap
+event, never a silent drop. On Windows open, read and close the file on each poll —
+a held handle blocks the harness from rotating or replacing it.
+
 ## Lifecycle and errors
 
 - The host starts a plugin on first use, sends `initialize`, and restarts it with
-  backoff (1 s → 30 s) if it exits. On restart it re-attaches every live agent
+  backoff (1 s → 30 s) if it exits. Starting a plugin or a service is single-flight
+  per name (two launches share one start); a stop during a start cancels it and a
+  late start result is discarded. On restart it re-attaches every live agent
   (`not_found` → `session.lost`) and asks `agent.snapshot` for open commands.
 - **A plugin exits when its stdin closes** and ends the native processes it launched.
-  This is how native sessions end when the daemon dies; Job objects / process groups
-  (L3.1) make it hold even if a plugin hangs.
+  Closing stdin is a request, not a kill: if a plugin or native process is still alive
+  after the stop timeout (10 s), the host kills its process tree and verifies the
+  recorded `(pid, start_time)` identities. Job objects / process groups (L3.1) make this
+  hold even if the daemon itself dies.
+- Windows: create plugin stdio pipes non-inheritable and pass an explicit handle list
+  at process creation (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`); otherwise an unrelated
+  child that inherited the write end keeps the pipe open and stdin EOF never arrives.
 - A plugin that fails `initialize` three times is marked `failed`; its agents become
   `lost`. Other plugins are unaffected.
-- Requests time out (default 30 s, `agent.start` 120 s). A timed-out command becomes
-  `unknown`.
+- Requests time out (default 30 s, `agent.start` 120 s). A deadline bounds the whole
+  reply, not each read (a peer trickling bytes must not extend it). A timed-out command
+  becomes `unknown` and is never resent. A parent deadline is always longer than the
+  whole budget of what it waits for; no wait on a child process is unbounded — every
+  wait ends in kill-and-verify.
+- A child's exit and its last stdout line arrive in either order: finish a turn or
+  request only after stdout reached EOF (or the terminal event arrived), never on the
+  exit signal alone.
+- Bound every native payload the plugin forwards (default 1 MiB per message); an
+  oversized item becomes an explicit gap event, never a reconnect loop.
+- The host reads every plugin's stdout continuously. Replies and plugin requests
+  (`child`, `decide`) are handled on a path that never waits for the event queue, so an
+  approval is never stuck behind telemetry. Under pressure ephemeral events are
+  dropped (subscribers see `events.lagged`); persisted events never are.
+- A plugin must not block its own stdin reader on native I/O: a slow native call must
+  not delay `interrupt` or `stop` for another agent.
 
 ## Fake plugin
 
@@ -166,9 +205,11 @@ Any input text (launch prompt, `send`, `steer`, `inject`) is a script if it pars
 | `exit` | — | `session.ended` for this agent |
 
 `interrupt` ends the running turn with `turn.completed status=interrupted`. `stop` emits
-`session.ended`. Agent scripts and positions are kept in
-`<data_dir>/plugins/fake/` so `resume` can re-open a session after a restart; resuming
-never replays earlier steps.
+`session.ended`. Like a stdio harness, live sessions exist only inside the plugin
+process: after the process dies, `agent.attach` answers `not_found`. Each session's
+history and position are written to `<data_dir>/plugins/fake/`, so `resume` re-opens
+it (like a harness resuming from its transcript); resuming never replays earlier
+steps.
 
 ## Recordings
 
@@ -196,8 +237,8 @@ and checks, for the verbs the manifest declares:
 
 1. `initialize` returns a valid manifest;
 2. `agent.start` → `session.ready` → a turn with `turn.started` / `turn.completed`;
-3. `send` while busy is queued (not lost, not merged into the running turn unless the
-   manifest says so);
+3. `send` arrives only while the agent is idle (the host queues sends for busy
+   agents) and starts exactly one turn;
 4. `steer`, `interrupt`, `approve`/`deny`, `answer`, `goal.*`, `child` — each declared
    verb produces its documented events; each undeclared verb is never sent;
 5. closing stdin ends the plugin and its native processes;

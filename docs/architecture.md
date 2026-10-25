@@ -63,6 +63,9 @@ This page is the map. Exact formats live in [spec/](spec/); build order lives in
    the owner all submit the same commands through the same router.
 7. **Plugins own native details; the core owns identity and history.** The core never
    parses vendor payloads; plugins never write to the Store.
+8. **Routes are explicit.** Eliot never changes an agent's provider, model, effort,
+   permissions or billing route (subscription vs API key vs proxy) on its own.
+   Fallbacks exist only as rules the owner wrote.
 
 ## Process and lifetime model
 
@@ -70,11 +73,20 @@ This page is the map. Exact formats live in [spec/](spec/); build order lives in
 - A plugin process may launch native processes (e.g. `codex app-server`) or attach to
   external services (e.g. a running `opencode serve`). It reports every native PID it
   owns so the process monitor can watch it.
-- Native processes launched by Eliot belong to the daemon's process tree (Job object
-  on Windows, process group on Unix). Stopping the daemon stops them. After a daemon
-  restart, agents are re-attached through the plugin (`agent.attach`) or marked
-  `lost`; continuing a lost session is an explicit `resume` — the last prompt is never
-  resent.
+- Native processes launched by Eliot over stdio belong to the daemon's process tree
+  (Job object on Windows, process group on Unix): stopping the daemon ends those
+  sessions (use `eliot daemon stop --drain` before an upgrade). After a restart the
+  plugin re-attaches what still exists (`agent.attach`); the rest is `lost`, and
+  continuing it is an explicit `resume` — the last prompt is never resent.
+- Harnesses with a server mode (Codex `app-server --listen`, `opencode serve`) can run
+  their server as an Eliot **service** that lives outside the daemon (L7.6): a daemon
+  restart then re-attaches without interrupting running turns.
+- A plugin crash ends the stdio sessions it owned (they become `lost`; `resume`
+  continues them).
+- Upgrades: builds install into a versioned directory and the daemon never overwrites
+  its own executable (Windows cannot replace a running `.exe`). Upgrade = `eliot daemon
+  stop --drain`, then start the new build. External plugins (started via `cmd`) are
+  upgraded by restarting just that plugin.
 - Services (proxies, shared servers) are refcounted: the daemon starts a managed
   service before the first agent that needs it and never kills an attached external
   service.
@@ -112,8 +124,10 @@ Scale comes from cheap bookkeeping, not from many processes:
 
 - An agent is a row plus, while live, a small in-memory record (target ≤ 2 KB). No
   thread or task per idle agent.
-- One plugin process multiplexes many agents; the daemon can run several instances of
-  the same plugin (`instances = N`) and shard agents across them.
+- One plugin process multiplexes many agents when its native side keeps sessions
+  independent (manifest `features.multi_session`); otherwise it runs one agent per
+  process. The daemon can run several instances of a plugin (`instances = N`) and
+  shard agents across them.
 - Writes are batched (group commit). Ephemeral events (token deltas, CPU samples) are
   never written.
 - Every list API is paginated; every subscription is filtered on the daemon side.

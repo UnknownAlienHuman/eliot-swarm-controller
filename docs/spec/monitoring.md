@@ -26,13 +26,42 @@ own health (`source.health`). A failing source never blocks another one or the r
   processes of an agent are gone and the plugin reported no `session.ended` within
   3 s, emit `session.lost` (the reducer then moves the agent to `lost`).
 - `process.stats` (CPU, RSS) every 5 s for watched processes; ephemeral.
+- A process that disappears while its identity is being read counts as gone (liveness
+  loss), not as a monitor error.
+- After a crash the exit code of a Job member may be unrecoverable: record it as
+  `unknown` (never `0`); prove that a tree is gone by the Job's active-process count
+  (Windows) or the process group being empty (Unix), not by one PID missing.
 - Stop/kill: Windows Job object per plugin instance with `KILL_ON_JOB_CLOSE` (if the
-  daemon dies, the processes it launched die too — no orphans); Unix process group.
+  daemon dies, the stdio sessions it launched die too — no orphans); Unix process
+  group. Services (L7.6) get their own Job without kill-on-close.
   `stop --force` terminates the agent's process tree and verifies the identities are
   gone; if not, the agent stays `stopping` and an event says which PIDs survived.
   Processes Eliot only attached to (external services) are never killed.
 - Shared processes (an app-server serving several agents, a proxy) are watched once
   and attributed to all their agents; they are not killed by stopping one agent.
+
+## Starting processes
+
+These rules apply to plugins, services, hook shims, scripts and git actions:
+
+- Resolve the executable to a full path before spawning; pass argv as a list, never a
+  shell string (scripts that want a shell say so in `cmd`).
+- Windows: create console children with `CREATE_NO_WINDOW` (not `DETACHED_PROCESS`,
+  which breaks console-dependent tools); put a child into its Job at creation
+  (`CREATE_SUSPENDED` → assign → resume) so grandchildren cannot escape; when merging
+  environment variables, treat `PATH`/`Path` case-insensitively; resolve PowerShell 7
+  as `pwsh.exe` by full path, not `powershell.exe`.
+- Long inputs (prompts, scripts) go through files or stdin, never argv (Windows
+  command-line limit ~32 KiB).
+- Text files Eliot writes are UTF-8 without BOM with `
+` line endings; Git always
+  runs with `GIT_TERMINAL_PROMPT=0` and no editor.
+- Never edit a script or hook file that may be running; write a new file and switch.
+- Windows: a file cannot be replaced or deleted while any handle to it is open (also
+  SQLite files with an open connection — close them first in tests).
+- Paths are normalized before comparison (strip the `\\?\` verbatim prefix that
+  `canonicalize` returns on Windows, unify separators, compare case-insensitively on
+  Windows).
 
 ## Git monitor
 
@@ -44,7 +73,9 @@ Per distinct worktree used by any live agent:
   `index.lock` and never competes with agents):
   - `status --porcelain=v2 --branch -z` → branch, HEAD, upstream, ahead/behind, dirty set;
   - on HEAD change: `log --format=%H%x00%ae%x00%s --name-only <old>..<new>` → `git.commit`;
-  - `diff --name-only <base>...HEAD` → committed-but-unmerged set (for `who`).
+  - committed-but-unmerged set (for `who`): paths in `diff --name-only <base>...HEAD`
+    that still differ in `diff --name-only <base> HEAD` — after a squash merge the
+    branch is not an ancestor of its base, and this drops the already-merged paths.
 - Remote refs change only through an explicit fetch (rule action or command) or the
   optional `git.remote_poll` (`ls-remote`, default off). `git.ref` events report them.
 - The monitor keeps per-worktree sets in memory (`dirty`, `branch_changes`) for

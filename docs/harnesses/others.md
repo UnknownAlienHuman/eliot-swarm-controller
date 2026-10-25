@@ -1,20 +1,7 @@
-# Other harnesses (L4.6, only if still used)
+# Other harnesses (L4.7, only when needed)
 
-Short notes carried over from v1 so nothing is lost. None of these is planned until
-the owner confirms it is in use ([decisions](../decisions.md#open-questions-for-the-owner)).
-
-## Muse (Muse Code SDK)
-
-- [meta-models/muse-code-sdk](https://github.com/meta-models/muse-code-sdk), docs
-  [1.4](https://meta-models.github.io/muse-code-sdk/1.4/); npm `@muse-code/sdk` and
-  PyPI `muse-code-sdk` 1.4.13 (2026-10-24). MIT per v1 records.
-- Muse Session Protocol (MSP) v1: JSON-RPC 2.0, one message per line on the agent
-  process's stdin/stdout.
-- Methods: `turn/start` (sessionId, commandId, input), `view/page`, `item/readOutput`,
-  `goal/set|edit|pause|resume|clear` (commandId required) — native goal and
-  caller-chosen command ids, so `unknown` outcomes can be checked by command id.
-- v1: one inbound pump per connection; parent idle does not close children; answer
-  approvals with the current choice ids; long sessions grew large (233 MB in 6.5 h).
+Short notes carried over from v1 so nothing is lost. None of these is built until
+someone needs it ([defaults](../decisions.md#defaults)).
 
 ## Command Code
 
@@ -23,7 +10,8 @@ the owner confirms it is in use ([decisions](../decisions.md#open-questions-for-
   [goal](https://commandcode.ai/docs/goal) (v1 links, not re-checked).
 - Batch `cmd -p` with NDJSON output, or ACP (`cmd acp`) → use the [ACP plugin](acp.md).
 - v1: a mod exception could leave the CLI running; steer via `queueMessage` applies
-  only after a tool batch; goal did not persist across resume.
+  only after a tool batch; goal did not persist across resume; `turn_end` can arrive
+  before the agent's last commit (push on `git.commit`, not on `turn.completed`).
 
 ## Kilo Code
 

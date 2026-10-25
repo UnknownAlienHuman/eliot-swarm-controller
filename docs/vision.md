@@ -70,11 +70,14 @@ The product is done when all of these work on the owner's Windows machine:
 2. The same `eliot send|steer|inject|interrupt|stop` commands work for Codex, Claude
    Code and OpenCode without harness-specific flags. Unsupported verbs fail fast with
    a clear reason.
-3. A rule `on turn.completed (role=writer) → git push` and a timer `every 30m → git
+3. A manager agent (any harness) launches three workers on other harnesses, gives
+   them tasks with `eliot send ... --wait` / `eliot wait @children`, steers one of them
+   and collects all results — using only Eliot's verbs, never harness-specific ones.
+4. A rule `on git.commit (role=writer) → git push` and a timer `every 30m → git
    fetch` run unattended for 24 hours without duplicate pushes or lost firings.
-4. An Eliot Goal with a check command drives an agent until the check passes, and
+5. An Eliot Goal with a check command drives an agent until the check passes, and
    stops on budget or no progress.
-5. Two agents agree on a shared variable through messages; one of them runs
+6. Two agents agree on a shared variable through messages; one of them runs
    `eliot who src/foo.rs` and gets the other agent.
-6. 10,000 simulated agents (fake plugin) run on one host with flat memory and a
+7. 10,000 simulated agents (fake plugin) run on one host with flat memory and a
    responsive CLI.

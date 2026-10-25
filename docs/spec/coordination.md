@@ -16,12 +16,18 @@ Identity comes from `ELIOT_AGENT_TOKEN` (see [API](api.md#transport)). Rules:
 | rule / timer / script | everyone (owner authority) | everything |
 
 `control` comes from the profile (`control = "tree"`) or `launch --control`. A child
-never gets more control than its parent. This is the whole permission model.
+never gets more control than its parent. This is the whole permission model. Message
+modes that start or change a turn (`send`, `steer`) count as commands: a sender needs
+command rights on the recipient, otherwise it gets `not_allowed` and can use `queue`
+or `inject`.
 
 ## Mailbox
 
 ```text
-Message { id, from, to, thread?, reply_to?, mode, text (≤ 32 KiB), created_at, delivered_at?, read_at? }
+Message { id, from, to, thread?, reply_to?, mode, text (≤ 32 KiB),
+          admitted_at, presented_at?, read_at? }
+// admitted = stored; presented = the plugin reports the text entered the model
+// (inject, prepend or turn start); read = `eliot inbox` / `mail.read`
 from = origin string: agent:<id> | owner | rule:<id> | timer:<id>   (same form as command origins)
 ```
 
@@ -48,7 +54,7 @@ CREATE TABLE messages (
   id INTEGER PRIMARY KEY, sender TEXT NOT NULL,   -- origin string, see `from`
   recipient INTEGER NOT NULL,
   thread INTEGER, reply_to INTEGER, mode TEXT NOT NULL, text TEXT NOT NULL,
-  created_at INTEGER NOT NULL, delivered_at INTEGER, read_at INTEGER
+  admitted_at INTEGER NOT NULL, presented_at INTEGER, read_at INTEGER
 );
 CREATE INDEX messages_inbox ON messages(recipient, read_at, id);
 ```
@@ -83,14 +89,16 @@ CREATE TABLE vars (
 ## Who works on this
 
 `eliot who <pathspec>...` answers "which agents are touching these files", from Git
-facts collected by the [Git monitor](monitoring.md#git-monitor):
+facts collected by the [Git monitor](monitoring.md#git-monitor) and from the agents'
+own file-change events:
 
 | Signal | Source | Meaning |
 | --- | --- | --- |
-| `dirty` | `git status` of each live agent's worktree | uncommitted changes to matching paths right now |
+| `edited` | the agent's `file.changed` events (native edit/write items and tools) for paths that are still dirty | this agent changed these files and they are not committed yet — the only per-agent signal when several agents share one checkout |
+| `dirty` | `git status` of a worktree used by exactly one live agent | uncommitted changes to matching paths right now |
 | `branch` | `git diff --name-only <base_ref>...HEAD` per agent worktree (`base_ref` unset → `origin/HEAD` if it exists, else skipped) | committed on the agent's branch, not yet in its base |
 | `claim` | claims table | the agent announced it will work there |
-| `history` (with `--history N`) | `git log -N -- <pathspec>` in the repo | recent commits, mapped to agents by branch or author email |
+| `history` (with `--history N`) | `git log -N -- <pathspec>` in the repo | authored recently — provenance, never reported as the current owner |
 
 Output (one line per agent, strongest signal first):
 
@@ -105,8 +113,21 @@ Mapping commits to agents: each agent worktree has its branch recorded in the
 `git_identity = "inherit"`. `who --history` maps author emails of that form back to
 agents; other authors are shown as is.
 
+In a checkout shared by several agents, `git status` cannot say who changed a file;
+there `who` reports `edited` per agent and lists remaining dirty files as
+`unattributed`. In a shared checkout an agent stages only its own paths
+(`git add <paths>`, never `-A` or `.`); Eliot's own git actions never stage with `-A`
+there. `who` and claims inform; they do not prevent conflicts. Several agents
+running `git add`/`commit` in one checkout collide on `index.lock` and mix each
+other's changes: in `shared` mode let one agent (usually the manager) commit, or give
+writers `worktree` mode.
+
+Pathspecs and recorded paths are normalized the same way before matching
+([path rules](monitoring.md#starting-processes)).
+
 `who` is a query over in-memory sets plus at most one `git log`; it never runs
-`git status` itself.
+`git status` itself. The `edited` sets are rebuilt from persisted `file.changed`
+events after a restart.
 
 ## Claims
 
@@ -132,12 +153,18 @@ CREATE TABLE claims (
 ## Hierarchy
 
 - `launch --parent A` creates a child; `depth = parent.depth + 1`; `root` is
-  inherited. No depth limit in the model; `limits.max_depth` in config (default 8)
-  guards against runaway recursive spawning.
+  inherited. No limit in the model; config guards against runaway spawning:
+  `limits.max_depth` (8), `limits.max_children_per_agent` (20) and
+  `limits.max_tree_agents` (100). A launch past a limit fails `not_allowed` and names
+  it (v1 field data: one recursive request produced 48+ agents and ~1.5M tokens).
 - Native subagents become `origin = native` children automatically.
 - Tree operations: `stop --tree A`, `send @tree:A`, `ls --tree A`, `watch @tree:A`.
 - Parent notifications: when a child reaches `stopped`, `failed`, `lost` or its goal
   becomes `done`/`blocked`, a `queue` message goes to the parent (configurable).
+- A manager that must react to its children waits inside its own turn with
+  `eliot wait @children` or `eliot send <child> "<task>" --wait` — an idle model is
+  not woken by a queued message, and `inject` reaches a busy agent only at its next
+  safe point.
 
 ## Communication guidance for agent prompts
 
@@ -159,4 +186,15 @@ The `eliot` command talks to the controller:
 Coordinate through shared vars and `who` first, messages second. Message one specific
 agent, not everyone. Ask concrete questions with the facts needed to answer. Do not
 send acknowledgements or status updates; the controller already shows status.
+```
+
+Agents with `control = tree` or `project` also get:
+
+```text
+You may direct other agents:
+  eliot launch --profile <p> --parent {id} "<task>"   start a child
+  eliot send <agent> "<text>" --wait                  give work and wait for the answer
+  eliot wait @children [--for turn|idle|stopped]      wait for children (re-run after timeout)
+  eliot result <agent>                                last answer of an agent
+  eliot steer|interrupt|stop <agent>                  correct or stop work
 ```

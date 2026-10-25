@@ -1,7 +1,7 @@
 # Eliot
 
 A small local controller for vendor coding-agent harnesses — Codex, Claude Code,
-OpenCode, Antigravity, ACP agents. Eliot launches them (optionally through a provider
+Muse, OpenCode, Antigravity, ACP agents. Eliot launches them (optionally through a provider
 proxy such as OpenCodex), watches them in real time (events, processes, Git), controls
 them with one harness-neutral command language (`send`, `steer`, `inject`,
 `interrupt`, `approve`, `goal`, ...), automates reactions with rules and cron timers,
@@ -13,6 +13,7 @@ eliot watch a12
 eliot steer a12 "keep the v1 handlers, only add new ones"
 eliot who src/api/
 eliot goal set a12 "all tests pass" --check "cargo test" --max-turns 15
+eliot send a13 "review the diff of a12" --wait
 ```
 
 ## Status

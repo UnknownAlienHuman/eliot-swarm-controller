@@ -26,8 +26,8 @@ on it. Borrow from it only what [donors](docs/reference/donors.md) lists.
 If the spec is wrong or silent, fix the owning spec page in the same PR with the
 smallest edit and say so under *Spec changes*. If a vendor fact on a harness page is
 wrong, correct it there with the source URL and date. If a real product decision is
-needed, add it to [decisions](docs/decisions.md#open-questions-for-the-owner) with a
-default, use the default, and keep going.
+needed, pick the simplest choice that fits the vision, record it in the
+[defaults](docs/decisions.md#defaults) table, and keep going.
 
 ## Rules
 

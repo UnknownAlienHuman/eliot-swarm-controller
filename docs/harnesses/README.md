@@ -1,7 +1,7 @@
 # Harnesses
 
-Plugin order: Codex (L2) → Claude Code, OpenCode, Antigravity, ACP agents (L4) →
-others only on request. Each page lists official sources with the date they were
+Plugin order: Codex (L2) → Claude Code, Muse, OpenCode, Antigravity, ACP agents (L4)
+→ [others](others.md) only when needed. Each page lists official sources with the date they were
 checked and a "verify during L-x" list. When a plugin lands, update its column below
 from what the plugin actually does (not from docs).
 
@@ -10,21 +10,21 @@ from what the plugin actually does (not from docs).
 ✓ documented native mechanism · ~ emulated by the plugin (mechanism reported) ·
 ✗ not available (verb rejected) · ? to verify in that plugin's layer
 
-| Verb / feature | [Codex](codex.md) | [Claude Code](claude-code.md) | [OpenCode](opencode.md) | [Antigravity](antigravity.md) | [ACP](acp.md) |
-| --- | --- | --- | --- | --- | --- |
-| Transport | app-server, NDJSON stdio | Agent SDK / `-p` stream-json | HTTP + SSE | `agy` stream-json stdio | JSON-RPC stdio |
-| `launch` / `send` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `steer` | ✓ `turn/steer` | ~ PostToolUse `additionalContext` ? | ? | ✗ | ✗ |
-| `inject` | ~ steer / prepend | ✓ hook `additionalContext` | ? / prepend | ~ prepend | ~ prepend |
-| `interrupt` | ✓ `turn/interrupt` | ✓ `interrupt()` | ✓ `abort` | ? | ✓ `session/cancel` |
-| `resume` | ✓ `thread/resume` | ✓ `resume` | ✓ re-attach | ✓ `--conversation` | ? `session/load` |
-| `approve` / `deny` | ✓ request replies | ✓ `canUseTool` | ✓ permission reply | ✗ policy only | ✓ `request_permission` |
-| `answer` | ✓ `requestUserInput` | ? AskUserQuestion | ? | ✗ | ✗ |
-| native goal | ✓ `thread/goal/*` | ? `/goal` | ✗ → Eliot loop | ✗ → Eliot loop | ✗ → Eliot loop |
-| children | ✓ subagent threads | ✓ `parent_tool_use_id`, Subagent hooks | ✓ `/children` | ✓ `subagent_info` | ? |
-| hooks | ✓ 12 events | ✓ 33 events | ? plugins | ✓ (page exists) | ✗ |
-| transcripts | ✓ rollout JSONL | ✓ project JSONL | ✓ SQLite (read-only) | ✗ | ✗ |
-| proxy wiring | ✓ `model_providers` | ✓ `ANTHROPIC_BASE_URL` | ✓ provider `baseURL` | ✗ | per agent |
+| Verb / feature | [Codex](codex.md) | [Claude Code](claude-code.md) | [Muse](muse.md) | [OpenCode](opencode.md) | [Antigravity](antigravity.md) | [ACP](acp.md) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Transport | app-server, NDJSON stdio | Agent SDK / `-p` stream-json | MSP (JSON-RPC stdio) | HTTP + SSE | `agy` stream-json stdio | JSON-RPC stdio |
+| `launch` / `send` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `steer` | ✓ `turn/steer` | ~ PostToolUse `additionalContext` ? | ✓ expected-turn steer | ? | ✗ | ✗ |
+| `inject` | ~ steer / prepend | ✓ hook `additionalContext` | ~ steer / prepend | ? / prepend | ~ prepend | ~ prepend |
+| `interrupt` | ✓ `turn/interrupt` | ✓ `interrupt()` | ✓ `turn/interrupt` | ✓ `abort` | ? | ✓ `session/cancel` |
+| `resume` | ✓ `thread/resume` | ✓ `resume` | ✓ session resume | ✓ re-attach | ✓ `--conversation` | ? `session/load` |
+| `approve` / `deny` | ✓ request replies | ✓ `canUseTool` | ✓ choice ids | ✓ permission reply | ✗ policy only | ✓ `request_permission` |
+| `answer` | ✓ `requestUserInput` | ? AskUserQuestion | ✓ requirement ids | ? | ✗ | ✗ |
+| native goal | ✓ `thread/goal/*` | ? `/goal` | ✓ `goal/*` | ✗ → Eliot loop | ✗ → Eliot loop | ✗ → Eliot loop |
+| children | ✓ subagent threads | ✓ `parent_tool_use_id`, Subagent hooks | ✓ child provenance | ✓ `/children` | ✓ `subagent_info` | ? |
+| hooks | ✓ 12 events | ✓ 33 events | ? `hook/list` | ? plugins | ✓ (page exists) | ✗ |
+| transcripts | ✓ rollout JSONL | ✓ project JSONL | ? | ✓ SQLite (read-only) | ✗ | ✗ |
+| proxy wiring | ✓ `model_providers` | ✓ `ANTHROPIC_BASE_URL` | ✗ (Muse owns inference) | ✓ provider `baseURL` | ✗ | per agent |
 
 ## Writing a plugin
 

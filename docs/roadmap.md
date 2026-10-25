@@ -52,7 +52,8 @@ Goal: a clean workspace where layer 1 can start.
       with `check` (`cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
       `cargo test`) and `loc`.
 - [ ] **L0.3 CI.** One workflow: `just check` on `windows-latest` and `ubuntu-latest`,
-      plus `just loc` (installs `tokei`). Nothing else.
+      plus `just loc` (installs `tokei`); Markdown-only changes skip Cargo. Nothing
+      else. Add per-package scoping only when a full check takes over 10 minutes.
 
 **Exit test:** CI green on the empty workspace.
 
@@ -67,7 +68,8 @@ Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-p
       input) of the [state table](spec/core.md#states).
 - [ ] **L1.2 Store.** Migration runner (`user_version`), L1 schema, writer task with
       group commit, reader pool, queries used by `agent.list`/`events.read`. Tests on a
-      temp file DB, including reopen.
+      temp file DB, including reopen (on Windows close every connection before
+      deleting the temp dir).
 - [ ] **L1.3 Bus.** Persist-then-broadcast for P events, broadcast-only for E events,
       subscribe-from-seq with replay then live, lag → `events.lagged`. Test with a
       slow subscriber.
@@ -81,14 +83,15 @@ Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-p
       notifications both ways, timeouts, restart with backoff, re-attach, `unknown` on
       lost replies, plugin exit on stdin EOF.
 - [ ] **L1.7 Router.** `command.submit` validation order (launch creates the agent;
-      others: exists → supported → allowed → state), persistence, dispatch, outcome
-      recording, selectors, idempotent command ids.
+      others: exists → supported → allowed → state), persistence, per-agent ordered
+      dispatch (`interrupt`/`stop` skip the line), outcome recording, selectors,
+      idempotent command ids, profile `max_live` launch queue.
 - [ ] **L1.8 Fake plugin.** `plugins/fake`, run as `eliot plugin fake`, implementing the
       [fake plugin spec](spec/plugin-protocol.md#fake-plugin).
 - [ ] **L1.9 CLI.** `daemon`, `status`, `launch`, `ls`, `show`, `watch`, `events`,
-      `send`, `steer`, `inject`, `interrupt`/`abort`, `stop`, `resume`, `approve`,
-      `deny`, `answer`, `cmd show`; `--json` everywhere; exit codes from
-      [API](spec/api.md#exit-codes).
+      `send` (incl. `--wait`), `steer`, `inject`, `interrupt`/`abort`, `stop`,
+      `resume`, `approve`, `deny`, `answer`, `wait`, `result`, `cmd show`; `--json`
+      everywhere; exit codes from [API](spec/api.md#exit-codes).
 - [ ] **L1.10 Conformance kit.** `eliot plugin-test <cmd>` runs the
       [suite](spec/plugin-protocol.md#conformance-kit) against a plugin; the fake
       plugin passes it.
@@ -110,12 +113,17 @@ dir and drive it only through the `eliot` binary:
 4. with a second plugin entry `[plugins.fake-narrow]` (`cmd = ["eliot", "plugin",
    "fake"]`, `verbs = ["launch","send","stop"]`) and `launch --harness fake-narrow`,
    `steer` → exit code 3 (`unsupported`) and the plugin received no request;
-5. a `hang` step, then `kill` the plugin process → that command becomes `unknown`
-   (exit code 4), the plugin restarts and live agents re-attach;
-6. kill the daemon, start it again → the same agents are listed as `lost` (their
-   plugin died with the daemon); `resume A` → `agent.idle` and no `message.user` with
-   the old prompt;
-7. launch 1,000 fake agents in under 30 s with daemon RSS under 200 MB.
+5. `send A '{"steps":[{"hang":null}]}'`, then `steer A x` (no reply comes), then kill
+   the fake plugin process → the `steer` becomes `unknown` (exit code 4) and is not
+   resent; the plugin restarts; A, B and C are `lost` (their sessions died with it);
+   `resume A` → `agent.idle` with no `message.user` repeating an old prompt;
+6. kill the daemon, start it again → the same agents are listed with the states they
+   had (live ones now `lost`, since their plugin died with the daemon);
+7. `send B '{"steps":[{"sleep_ms":500},{"say":"ok"}]}' --wait` prints `ok`;
+   `wait A B --for idle` returns 0;
+8. with `[profiles.fake2] harness = "fake"`, `max_live = 2`, launching 3 agents leaves
+   the third `created` until one of the first two stops;
+9. launch 1,000 fake agents in under 30 s with daemon RSS under 200 MB.
 
 ## L2 — First real harness: Codex
 
@@ -155,8 +163,12 @@ Specs: [monitoring](spec/monitoring.md).
 - [ ] **L3.1 Process monitor.** Identities, descendants, stats, `session.lost`, Job
       object / process group custody, `stop --force` verification.
 - [ ] **L3.2 Workspaces.** `workspace_mode = "worktree"` / `--worktree` creates
-      `git worktree add` under `<data_dir>/worktrees`, per-agent Git identity, cleanup
-      on `stop` (keeps the branch).
+      `git worktree add` under `<data_dir>/worktrees`, runs the profile's `setup`
+      commands (a new worktree has no ignored files, submodules or LFS content),
+      per-agent Git identity. On `stop` the worktree is removed only if
+      `git status --porcelain` is empty and HEAD is on a branch (kept); otherwise it
+      stays and `eliot doctor` lists it. After a squash merge, start from a new
+      worktree on the new base; never continue the merged branch.
 - [ ] **L3.3 Git monitor.** Status/commit/diff sets with `--no-optional-locks`,
       fs-triggered refresh, backoff for slow repos, `git.*` events.
 - [ ] **L3.4 Transcripts and discovery.** Codex rollout tail; `eliot discover`,
@@ -178,10 +190,11 @@ first (R11).
 - [ ] **L4.1 Hook shim.** `eliot hook`, `hook.event`, session-scoped hook config
       generation, inject delivery via hook context, default on timeout.
 - [ ] **L4.2 Claude Code** (Agent SDK; in-process hooks for inject/steer/approvals).
-- [ ] **L4.3 OpenCode** (`opencode serve` HTTP + SSE; attach to a running server).
-- [ ] **L4.4 Antigravity** (`agy` stream-json, warm process).
-- [ ] **L4.5 ACP generic** (any ACP agent, e.g. Gemini CLI).
-- [ ] **L4.6 Muse, Command Code, Kilo** — only if the owner still uses them.
+- [ ] **L4.3 Muse** (MSP over stdio; official Rust SDK or low-level connection).
+- [ ] **L4.4 OpenCode** (`opencode serve` HTTP + SSE; attach to a running server).
+- [ ] **L4.5 Antigravity** (`agy` stream-json, warm process).
+- [ ] **L4.6 ACP generic** (any ACP agent, e.g. Gemini CLI).
+- [ ] **L4.7 Others** ([Command Code, Kilo, Zed](harnesses/others.md)) — when needed.
 
 **Exit test:** the same scripted scenario (launch, send, steer, interrupt, approve,
 stop) passes on every L4 harness, where each verb either works or is rejected with a
@@ -217,22 +230,46 @@ Specs: [coordination](spec/coordination.md).
 - [ ] **L6.3 Who + claims.** In-memory Git sets, history mapping, claim conflicts.
 - [ ] **L6.4 Hierarchy ops.** Tree selectors, `stop --tree`, parent notifications,
       `max_depth`.
-- [ ] **L6.5 MCP server.** `eliot mcp` exposing msg/var/who/claim/ls/send tools for
-      harnesses that prefer tools over shell.
+- [ ] **L6.5 MCP server.** `eliot mcp` for harnesses that prefer tools over shell. The
+      tool set follows the caller's control: `self` gets inbox, msg, var, who, claim,
+      ls; `tree`/`project` add launch, send, wait, result, steer, stop. One bridge per
+      session: it loads nothing at start (a v1 donor bridge that loaded its whole
+      ledger used ~207 MiB each), holds no Store handle, exits when stdin closes, and
+      `eliot doctor` lists orphans. `eliot show` reports whether the agent has actually
+      used `eliot`/MCP yet (`unused` / `used`), so a harness that cannot reach it is
+      visible.
 
 **Exit test:** two real agents (different harnesses) agree on a shared variable via
 messages; one runs `eliot who` and names the other; a claim conflict notifies both.
 
 ## L7 — Scale and hardening
 
-- [ ] **L7.1 Load test.** 10,000 fake agents, 2,000 events/s for 1 h: flat RSS, CLI
-      `ls`/`show` p95 < 100 ms, no event loss for persisted kinds.
+- [ ] **L7.1 Load test.** 10,000 fake agents, 2,000 persisted events/s for 1 h: flat
+      RSS, CLI `ls`/`show` p95 < 100 ms, no event loss for persisted kinds; reads never
+      wait behind the writer. (v1 reference: status p95 ≈ 1.2 ms with 200 IPC clients
+      on Windows, but at most 285 persisted events/s because it committed and fsynced
+      every event — group commit is what makes the target reachable.)
 - [ ] **L7.2 Plugin sharding.** `instances = N` per plugin.
 - [ ] **L7.3 Retention.** Event pruning in batches; DB size stable in the load test.
-- [ ] **L7.4 Drain.** `eliot daemon stop --drain` also stops timers and rules from
-      admitting work.
-- [ ] **L7.5 Windows hardening.** No console windows for children, long argv via
-      files, UTF-8 without BOM everywhere, path quoting tests.
+- [ ] **L7.4 Drain.** `eliot daemon stop --drain` stops new launches, rule and timer
+      firings; running turns finish; approvals, answers and results keep working.
+- [ ] **L7.5 Windows hardening.** Tests for the [process start rules](spec/monitoring.md#starting-processes):
+      no console windows, Job assignment at creation, long inputs via files,
+      `PATH`/`Path` merge, paths with spaces and non-ASCII characters.
+- [ ] **L7.6 Service mode.** Codex `app-server --listen unix://…` (or
+      `ws://127.0.0.1:<port>` where unix sockets do not work) and `opencode serve` run
+      as Eliot services in their own
+      Job without kill-on-close; the plugin connects to them; a daemon restart
+      re-attaches and running turns continue. `eliot service list|stop`.
+- [ ] **L7.7 Doctor.** `eliot doctor`: harness processes that belong to no live
+      agent, services nobody uses, worktrees of stopped agents, data dir and DB size,
+      stale sources. Reports and suggests commands; changes nothing by itself.
+- [ ] **L7.8 Autostart.** `eliot daemon install` registers a per-user logon task
+      (Windows Task Scheduler / systemd user unit). No promise of continuity across
+      logoff or reboot: stdio sessions end (D-18) and are resumed.
+- [ ] **L7.9 Redaction.** Pattern-based secret redaction of persisted event text
+      (token-shaped strings), on top of the L1 known-value masking; donor:
+      `v1-final:vendor/atlas/crates/atlas-redact`.
 
 ## L8 — Port to Rust
 
@@ -240,5 +277,11 @@ messages; one runs `eliot who` and names the other; a claim conflict notifies bo
 
 ## L9 — Later (not planned yet)
 
-Remote access (authenticated gateway), multi-host federation, TUI/web view. Each needs
-an owner decision first ([decisions](decisions.md)).
+Remote access (authenticated gateway), multi-host federation, TUI/web view, Eliot
+Memory OS integration. Each needs an owner decision first ([decisions](decisions.md)).
+Notes for then: v1 studied Gemini Spark as a remote MCP client (observer role first;
+Spark silence is never terminal evidence; a Google write confirmation is not Eliot
+authorization; MCP revision 2026-07-28 deprecates dynamic client registration) —
+`git show v1-final:docs/gemini-spark-integration.md`. Memory OS: disabled mode
+contacts nothing, an absent or stale packet is an explicit failure —
+`git show v1-final:docs/eliot-memory-os-integration.md`.

@@ -27,12 +27,21 @@ Project-level files live in the repository, so they are versioned with the code:
   scripts/
 ```
 
+Project files are loaded only for repositories registered in the global config
+(`[projects.<name>] path = "C:/src/app"`), and only from that path, never from an
+agent's worktree. Agents can write files in the repo; a rule they add takes effect
+only when it reaches the registered checkout, and every reload is reported as a
+`source.health` event for `config` naming the changed files. The project name is the
+default `project` of agents launched in that repo.
+
 ## `config.toml`
 
 ```toml
 [daemon]
 retention.events_days = 30
 limits.max_depth = 8
+limits.max_children_per_agent = 20
+limits.max_tree_agents = 100
 automation.max_actions_per_minute = 120
 
 [process]
@@ -47,7 +56,11 @@ instances = 1
 [plugins.claude]
 cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]   # external plugin, any language
 
+[projects.app]
+path = "C:/src/app"
+
 [proxies.opencodex]
+max_live = 8                          # optional: cap live agents across all profiles using this proxy
 attach = "http://127.0.0.1:10100"     # use a running service ...
 # launch = ["opencodex", "..."]       # ... or let Eliot start and supervise it
 health = "/api/system/health"
@@ -84,6 +97,24 @@ Rules:
   credentials ([D-07](../decisions.md)).
 - `extends` merges one profile over another (one level; `extends` of an `extends` is
   an error). Missing fields take the [defaults](core.md#profile).
+- Separate native accounts are separate profiles whose `env` points the harness at its
+  own config/auth dir (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, ...). Combine with
+  `max_live` to respect each account's limits. A launch must fit both its profile's
+  and its proxy's `max_live`.
+- After `provider.limited` of kind `rate_limit` or `quota`, new launches of that
+  profile wait (agents already running are not touched). `retry_after` is not proof of
+  recovery: after it passes, one launch runs as a probe and the rest wait until the
+  probe's first turn succeeds.
+- Harness processes inherit the daemon's environment, then the profile's `env`, then
+  the Eliot variables. `env_clear = true` starts from an OS baseline instead (Windows:
+  at least `SystemRoot`, `USERPROFILE`, `HOME`, `PATH`, `TEMP`; v1 found that a fully
+  cleared environment breaks harness startup) plus the profile's `env`.
+- Rust projects: give each worktree its own `CARGO_TARGET_DIR` (profile `env`); two
+  live agents building in one target directory block or corrupt each other's builds.
+  Eliot does not serialize Cargo for them.
+- Windows: keep the data dir short (worktrees live under it and `MAX_PATH` is real);
+  Eliot sets `core.longpaths=true` in worktrees it creates and fails with a clear error
+  when a path is still too long.
 - Unknown keys are an error at load time, with the file and line.
 - `eliot status` shows the effective merged config source for each profile.
 

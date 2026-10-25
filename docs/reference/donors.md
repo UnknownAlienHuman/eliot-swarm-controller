@@ -17,8 +17,8 @@ Copy and cut down; do not depend on v1 crates. Paths are as of `dc6f70aa`.
 | Line-framed multiplexed IPC with frame limits | `crates/swarm-client/src/multiplex.rs`, `client.rs` | L1.4 | Drop the authentication layer. |
 | Process CPU/RSS sampling on Windows | `crates/swarm-observer/src/process_metrics.rs` | L3.1 | Or replace with `sysinfo`. |
 | Codex app-server protocol knowledge | `crates/swarm-adapter-codex/src/lib.rs` | L2 | Read for method names and edge cases; do not port its journals/checkpoints. |
-| Antigravity stream examples (from official docs) | `modules/antigravity/fixtures/*.stream.json` | L4.4 | Doc-derived, not live captures. |
-| Secret redaction (Apache-2.0, vendored Atlas) | `vendor/atlas/crates/atlas-redact` | optional, L7 | Only if persisted message text must be redacted. |
+| Antigravity stream examples (from official docs) | `modules/antigravity/fixtures/*.stream.json` | L4.5 | Doc-derived, not live captures. |
+| Secret redaction (Apache-2.0, vendored Atlas) | `vendor/atlas/crates/atlas-redact` | L7.9 | Pattern-based redaction of persisted event text. |
 
 Anti-donors in v1: result paging/assembly, per-adapter journals and tombstones,
 receipt/proof types, the Task/Attempt/review/acceptance Store, policy editions,
@@ -38,7 +38,7 @@ module descriptors and provenance packaging.
 | `globset` | matchers, claims |
 | `croner` | L5.2 cron |
 | `windows-sys` | Job objects, pipe ACLs |
-| `agent-client-protocol` (Apache-2.0) | L4.5 ACP plugin |
+| `agent-client-protocol` (Apache-2.0) | L4.6 ACP plugin |
 | `rmcp` (Apache-2.0) | L6.5 MCP server |
 
 ## External design patterns

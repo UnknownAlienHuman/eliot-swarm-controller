@@ -52,6 +52,18 @@ Base `/api/` with the admin token. Documented: `GET /api/system/memory`; v1 also
 read endpoints for `source.health` and `provider.limited`; Eliot does not change
 OpenCodex settings.
 
+## Billing and routes
+
+- Billing follows the provider's `authMode` in OpenCodex: `forward` = the ChatGPT plan
+  behind the caller's Codex login, `oauth` = that provider account's subscription,
+  `key` = the key's own account. OpenCodex reports quota windows but not the plan tier.
+- A working main chat does not prove the whole route: titles, compaction and subagent
+  calls may use other models or endpoints. Check them in the L2.8 live run; until then
+  `eliot show` marks the route as verified for the main chat only.
+- Management reads use the admin token (header `X-OpenCodex-API-Key` or bearer), which
+  is separate from the client key `x-opencodex-api-key`. Changing OpenCodex settings
+  stays with the owner (v1 had a config-write module; v2 drops it).
+
 ## v1 pitfalls
 
 - Claude via OpenCodex's `anthropic` provider in OAuth mode spends the subscription

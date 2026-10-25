@@ -24,10 +24,14 @@ The SDK is under Anthropic's commercial terms, not an open-source license.
 ## Transport
 
 - SDK: `query({ prompt: AsyncIterable<SDKUserMessage>, options })` keeps one session
-  open with streaming input; the SDK runs the Claude Code binary.
+  open with streaming input. The SDK runs its bundled Claude Code binary unless
+  `pathToClaudeCodeExecutable` is set; the native version is reported only in the init
+  message; show it in `eliot show`.
 - CLI (for the Rust port): `claude -p --input-format stream-json --output-format
   stream-json` (examples also pass `--verbose`); `--include-partial-messages` for
   deltas; `--resume <id>`, `--session-id <uuid>`; `--permission-mode`.
+- Windows: a custom `pathToClaudeCodeExecutable` must be an absolute `.exe`; `.cmd` /
+  `.bat` shims are not accepted.
 - Do not use `--bare` for managed agents: it skips hooks, skills, MCP and CLAUDE.md
   discovery, and the docs say it will become the default for `-p` — pass explicit
   settings so hooks keep working.
@@ -36,14 +40,14 @@ The SDK is under Anthropic's commercial terms, not an open-source license.
 
 | Eliot verb | Claude Code | Notes |
 | --- | --- | --- |
-| `launch` | `query()` with streaming input, `cwd`, `model`, `permissionMode` | `native_ref` = session id from the init message. |
+| `launch` | `query()` with streaming input, `cwd`, `model`, `permissionMode` | `native_ref` = session id from the init message. An unset `permissionMode` lets the SDK pick its own fallback, which differs from an explicit `default`; read the effective mode from the init message. |
 | `send` | push an `SDKUserMessage` into the input stream | Verify whether a message pushed mid-turn is queued for the next turn (expected) or merged. |
 | `steer` | text returned as `additionalContext` from the next `PostToolUse` hook | Lands after the current tool call; verify `additionalContext` on `PostToolUse` in L4.2. Report `applies: next_tool`; if the turn ends without another tool call, the text is delivered with the next turn. |
 | `inject` | `additionalContext` on `UserPromptSubmit` / `PostToolUse` hooks (≤ 10,000 chars) | |
 | `interrupt` | `Query.interrupt()` | Streaming mode only. |
 | `stop` | end the input stream; `force` kills the process tree | |
 | `resume` | `options.resume = <session id>` | Resume does not refresh the system prompt; never resend the old input. |
-| `approve` / `deny` | `canUseTool` callback returns allow/deny — the plugin awaits an Eliot `approve`/`deny` (or host `decide`) | `canUseTool` runs only when a prompt would appear; a `PreToolUse` hook sees every call. |
+| `approve` / `deny` | `canUseTool` callback returns allow/deny — the plugin awaits an Eliot `approve`/`deny` (or host `decide`) | `canUseTool` runs only when a prompt would appear; a `PreToolUse` hook is expected to see every call (universal coverage on the installed version is unverified — check in L4.2). |
 | `answer` | the `AskUserQuestion` tool via `canUseTool` (answers in the returned input) | Verify the exact shape in L4.2. |
 | `configure` | `setPermissionMode()` (now); model per query option (`applies: next_session` unless the SDK exposes a live setter) | |
 | `goal.*` | Claude Code has a native goal feature ([goal docs](https://code.claude.com/docs/en/goal)); evaluate in L4.2, default to the Eliot Goal loop | Its Stop-hook check spends model calls. |
@@ -58,9 +62,14 @@ The SDK is under Anthropic's commercial terms, not an open-source license.
 | messages with `parent_tool_use_id`; `SubagentStart`/`SubagentStop` hooks (`agent_id`, `agent_type`, `agent_transcript_path`) | `child` registration and child events |
 | `PreToolUse`, `PermissionRequest`, `PermissionDenied` | `approval.requested` / `approval.resolved` |
 | `Stop`, `StopFailure`, `PreCompact`/`PostCompact` | `turn.completed`, `x.claude.*` |
+| `result` (`subtype`) | `success` → `turn.completed status=completed`; `error_during_execution`, `error_max_turns`, `error_max_budget_usd`, `error_max_structured_output_retries` → `status=failed` with the subtype kept; `error_during_execution` before the init message → `session.error` (launch failed) with `errors[]` |
 
 Subagents are spawned with the `Agent` tool (renamed from `Task` in v2.1.63; `Task`
-remains an alias).
+remains an alias). Full subagent messages need the SDK option `forwardSubagentText:
+true`. A child is finished only when the root receives the `tool_result` for its
+`Agent` tool_use id (or a `task_notification`), never because the child went quiet.
+A resumed session may first report the whole conversation's cumulative cost: send it
+as `scope=session`, never as a turn delta.
 
 ## Hooks
 
