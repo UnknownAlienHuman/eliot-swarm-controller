@@ -85,7 +85,7 @@ facts collected by the [Git monitor](monitoring.md#git-monitor):
 | Signal | Source | Meaning |
 | --- | --- | --- |
 | `dirty` | `git status` of each live agent's worktree | uncommitted changes to matching paths right now |
-| `branch` | `git diff --name-only <base>...HEAD` per agent worktree | committed on the agent's branch, not yet in its base |
+| `branch` | `git diff --name-only <base_ref>...HEAD` per agent worktree (`base_ref` unset → `origin/HEAD` if it exists, else skipped) | committed on the agent's branch, not yet in its base |
 | `claim` | claims table | the agent announced it will work there |
 | `history` (with `--history N`) | `git log -N -- <pathspec>` in the repo | recent commits, mapped to agents by branch or author email |
 

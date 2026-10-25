@@ -24,7 +24,8 @@ Agent {
   parent?, root, depth,                // tree; root = self for top-level agents
   origin: eliot | native | external,   // launched by us | subagent spawned by a harness | observed, not launched by us
   harness, profile,                    // plugin kind and profile name
-  native_ref?, workspace?,             // workspace = path (+ branch/base when a worktree)
+  native_ref?, workspace?,             // workspace = absolute path of the agent's checkout
+  branch?, base_ref?,                  // set when Eliot created a worktree (or detected a branch); used by `who`
   state, stalled_since?, pending: [RequestRef],   // open approvals/questions
   goal?: GoalRef, labels: map<string,string>,     // labels drive selectors and rules (role=writer)
   control: self | tree | project,                 // what this agent may command (see coordination)
@@ -194,7 +195,8 @@ CREATE TABLE agents (
   id INTEGER PRIMARY KEY, name TEXT UNIQUE, project TEXT NOT NULL,
   parent INTEGER REFERENCES agents(id), root INTEGER NOT NULL, depth INTEGER NOT NULL,
   origin TEXT NOT NULL, harness TEXT NOT NULL, profile TEXT NOT NULL,
-  native_ref TEXT, workspace TEXT, state TEXT NOT NULL, stalled_since INTEGER,
+  native_ref TEXT, workspace TEXT, branch TEXT, base_ref TEXT,
+  state TEXT NOT NULL, stalled_since INTEGER,
   labels TEXT NOT NULL DEFAULT '{}', control TEXT NOT NULL DEFAULT 'self',
   observe_only INTEGER NOT NULL DEFAULT 0,
   token TEXT NOT NULL,             -- random per agent; never shown in output

@@ -26,8 +26,20 @@
 | `events.read` | `after_seq`, `filter`, `limit` | persisted events page |
 | `events.subscribe` | `after_seq?`, `filter` | stream of `events.item` notifications: replays persisted events after `after_seq`, then live events; sends `events.lagged {resume_seq}` if the client falls behind |
 | `hook.event` | `agent`, `harness`, `hook`, `payload` | decision JSON for the hook shim ([plugin protocol](plugin-protocol.md#hooks)) |
-| `mail.*`, `var.*`, `who`, `claim.*` | see [coordination](coordination.md) | |
-| `rule.*`, `timer.*`, `goal.*` | see [automation](automation.md) | |
+| `agent.discover` | `harness?` | native sessions found by plugins `discover` |
+| `agent.attach` | `harness`, `native_ref`, `observe_only` | new `origin=external` agent |
+| `mail.send` | `to`, `text`, `mode?`, `reply_to?` | message ids ([coordination](coordination.md#mailbox)) |
+| `mail.inbox` | `wait_s?`, `all?` | caller's messages; marks them delivered |
+| `mail.read` | `id` | one message; marks it read |
+| `var.get` / `var.set` / `var.list` / `var.watch` | `scope/key`, `value`, `expect_version?`, `note?` / prefix | value + version; `watch` streams `var.changed` ([coordination](coordination.md#shared-variables)) |
+| `who` | `paths: [pathspec]`, `history?` | rows per agent ([coordination](coordination.md#who-works-on-this)) |
+| `claim.add` / `claim.release` | `glob`, `note?`, `ttl?` | claim / conflicts ([coordination](coordination.md#claims)) |
+| `rule.list` / `rule.get` / `rule.enable` / `rule.disable` / `rule.test` | `id`, `event?` | rules; `test` returns the actions it would run ([automation](automation.md#rules)) |
+| `rules.pause` / `rules.resume` | — | global automation switch |
+| `timer.list` / `timer.run` | `id` | time-triggered rules with next fire time |
+
+Goals are commands: `goal.set|pause|resume|clear` go through `command.submit`;
+`agent.get` returns the current goal.
 
 `filter` = `{kinds?: [glob], agents?: [id], tree?: id, sources?: [glob], ephemeral?: bool}`.
 
