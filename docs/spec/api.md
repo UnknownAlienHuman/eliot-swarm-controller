@@ -19,9 +19,9 @@
 | --- | --- | --- |
 | `daemon.status` | — | version, uptime, plugins, sources health, counts by state |
 | `daemon.shutdown` | `drain?` | stops accepting new launches; with `drain`, waits for running turns |
-| `agent.list` | `filter{state?, harness?, project?, label?, root?, parent?}`, `after?`, `limit≤1000` | page of agents + `next` |
+| `agent.list` | `filter{state?, harness?, project?, label?, tree?, parent?}` (`tree` = the agent and all descendants), `after?`, `limit≤1000` | page of agents + `next` |
 | `agent.get` | `agent` | agent + pending requests + goal + last events |
-| `command.submit` | `id?`, `target` (id/name/selector), `verb`, `args` | `{command_id, state, outcome?}`; waits for the plugin reply up to `wait_ms` (default 10 s), then returns current state |
+| `command.submit` | `id?`, `target?` (id/name/selector; omitted for `launch`), `verb`, `args`, `wait_ms?` (default 10000) | `{command_id, agent?, state, outcome?}` — waits up to `wait_ms` for the plugin reply, then returns the current state; `agent` is the new id for `launch` |
 | `command.get` | `id` | command |
 | `events.read` | `after_seq`, `filter`, `limit` | persisted events page |
 | `events.subscribe` | `after_seq?`, `filter` | stream of `events.item` notifications: replays persisted events after `after_seq`, then live events; sends `events.lagged {resume_seq}` if the client falls behind |
@@ -46,16 +46,30 @@ Goals are commands: `goal.set|pause|resume|clear` go through `command.submit`;
 Errors use JSON-RPC error objects with a stable `data.code`: `not_found`,
 `unsupported`, `not_allowed`, `bad_state`, `invalid`, `busy`, `unavailable`, `internal`.
 
+Script callers (rules' `run` actions) and any CLI call without `ELIOT_AGENT_TOKEN` act
+as the owner.
+
 ## CLI
 
 All commands accept `--json` (machine output on stdout, logs on stderr) and
 `--data-dir` (default `%LOCALAPPDATA%\Eliot` / `~/.local/share/eliot`, or `ELIOT_HOME`).
-Exit codes: `0` ok, `1` error, `2` usage, `3` rejected/unsupported, `4` unknown outcome.
+
+### Exit codes
+
+| Code | Meaning | Error codes |
+| --- | --- | --- |
+| 0 | ok (command `applied`, query answered) | — |
+| 1 | error | `not_found`, `invalid`, `busy`, `unavailable`, `internal`, command `failed` |
+| 2 | CLI usage error (bad flags) | — |
+| 3 | rejected — nothing happened | `unsupported`, `not_allowed`, `bad_state` |
+| 4 | outcome unknown | command `unknown` |
 
 ```text
 eliot daemon [--foreground]                 start the daemon (default: background, returns when ready)
+eliot daemon stop [--drain]                 stop it (drain: wait for running turns, admit nothing new)
 eliot status                                daemon, plugins, sources
 eliot launch [--profile P] [--harness H] [--name N] [--parent A] [--label k=v]...
+             [--project NAME] [--control self|tree|project]
              [--workspace PATH | --worktree BRANCH [--base REF]] [PROMPT]
 eliot ls [--state S] [--tree A] [--label k=v] [--all]
 eliot show A                                details, pending requests, goal, recent events
@@ -63,10 +77,11 @@ eliot watch [A|SELECTOR] [--kind GLOB]... [--since SEQ]    live event stream
 eliot top                                   live table: agents, state, turn time, tokens, cpu/ram, git
 eliot send|steer|inject A TEXT [--or-send]
 eliot interrupt A (alias: abort) | stop A [--force] [--tree] | resume A [PROMPT]
-eliot approve|deny A [REQUEST_ID]           default: the only pending request
-eliot answer A [REQUEST_ID] TEXT
+eliot approve|deny A [--request R] [--remember]   default: the only pending request
+eliot answer A TEXT [--request R] [--choice N]
 eliot configure A [--model M] [--effort E] [--permissions P]
-eliot goal set A TEXT [--check CMD] [--max-turns N] [--max-cost USD] [--no-progress N]
+eliot goal set A TEXT [--check CMD|marker:TEXT] [--max-turns N] [--max-cost USD] [--no-progress N]
+                                            (the three limits form `budget`)
 eliot goal pause|resume|clear|show A
 eliot cmd show ID                           command state/outcome
 eliot events [--since SEQ] [--kind GLOB] [--agent A]
@@ -85,9 +100,7 @@ eliot hook --harness H --event E            (internal) hook shim: stdin JSON →
 eliot mcp                                   MCP server on stdio exposing the same API to agents (L6)
 ```
 
-Selectors: `@children` (of the caller), `@parent`, `@siblings`, `@tree:A`,
-`@project`, `@label:k=v`, `@all`. When the caller is the owner, `@children` means
-top-level agents.
+Selectors: see [core](core.md#commands).
 
 `eliot` inside an agent: the daemon injects `ELIOT_HOME`, `ELIOT_AGENT_ID`,
 `ELIOT_AGENT_TOKEN` and puts `eliot` on `PATH`, so every harness that can run shell

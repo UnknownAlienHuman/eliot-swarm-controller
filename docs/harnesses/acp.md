@@ -37,7 +37,10 @@ variants: take from the schema crate, not from this page.
 
 ## Profiles
 
-| Agent | Command (from the ACP registry, 2026-10-25) |
+The agent binary is the profile's `cmd` ([core](../spec/core.md#profile)), e.g.
+`[profiles.gemini] harness = "acp"`, `cmd = ["gemini", "--acp"]`.
+
+| Agent | `cmd` (from the ACP registry, 2026-10-25) |
 | --- | --- |
 | Gemini CLI | `gemini --acp` (v0.65.0; `--experimental-acp` is the deprecated name; docs lag, see google-gemini/gemini-cli#29010) |
 | Claude (adapter) | `npx @agentclientprotocol/claude-agent-acp` — prefer the native [Claude plugin](claude-code.md) |

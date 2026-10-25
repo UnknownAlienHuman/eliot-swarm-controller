@@ -53,12 +53,16 @@ attach = "http://127.0.0.1:10100"     # use a running service ...
 health = "/api/system/health"
 api_key_env = "OPENCODEX_API_KEY"     # name of the env var holding the client key; never the key itself
 
+[plugins.fake]
+verbs = ["launch", "send", "steer", "inject", "interrupt", "stop", "resume",
+         "approve", "deny", "answer", "configure"]   # optional: narrow the declared verbs
+
 [profiles.codex]
 harness = "codex"
 model = "<model id>"                  # passed through to the harness as is
 effort = "high"
 permissions = "workspace-write"
-workspace_mode = "worktree"
+workspace_mode = "shared"             # "worktree" from L3.2
 labels = { role = "writer" }
 
 [profiles.codex-opencodex]
@@ -74,10 +78,12 @@ labels = { role = "manager" }
 
 Rules:
 
-- Secrets never live in config, the Store, events or messages. Config names
-  environment variables (`api_key_env`); the daemon passes them through to the
-  harness process only.
-- `extends` merges one profile over another (one level is enough; no chains needed).
+- Credentials (API keys, OAuth tokens) never live in config, the Store, events or
+  messages. Config names environment variables (`api_key_env`); the daemon passes
+  them through to the harness process only. Agent tokens are routing handles, not
+  credentials ([D-07](../decisions.md)).
+- `extends` merges one profile over another (one level; `extends` of an `extends` is
+  an error). Missing fields take the [defaults](core.md#profile).
 - Unknown keys are an error at load time, with the file and line.
 - `eliot status` shows the effective merged config source for each profile.
 
@@ -98,4 +104,4 @@ How a profile's proxy reaches the harness is plugin knowledge (each plugin's man
 `proxy` section and its [harness page](../harnesses/README.md)): e.g. Claude Code via
 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`, Codex via a `model_providers` entry,
 OpenCode via a provider `options.baseURL`. The plugin reports the effective endpoint
-in `agent.ready`.
+in `session.ready`.

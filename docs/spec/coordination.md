@@ -13,7 +13,7 @@ Identity comes from `ELIOT_AGENT_TOKEN` (see [API](api.md#transport)). Rules:
 | agent with `control = self` (default) | itself | its project |
 | agent with `control = tree` | itself and its descendants | its project |
 | agent with `control = project` (manager role) | every agent in its project | its project |
-| rule / timer / script | everyone (owner authority) unless the rule sets `as = "<agent>"` | everything |
+| rule / timer / script | everyone (owner authority) | everything |
 
 `control` comes from the profile (`control = "tree"`) or `launch --control`. A child
 never gets more control than its parent. This is the whole permission model.
@@ -22,6 +22,7 @@ never gets more control than its parent. This is the whole permission model.
 
 ```text
 Message { id, from, to, thread?, reply_to?, mode, text (≤ 32 KiB), created_at, delivered_at?, read_at? }
+from = origin string: agent:<id> | owner | rule:<id> | timer:<id>   (same form as command origins)
 ```
 
 - `to` is an agent id/name or a selector (`@parent`, `@children`, `@siblings`,
@@ -44,7 +45,8 @@ Schema (L6 migration):
 
 ```sql
 CREATE TABLE messages (
-  id INTEGER PRIMARY KEY, sender TEXT NOT NULL, recipient INTEGER NOT NULL,
+  id INTEGER PRIMARY KEY, sender TEXT NOT NULL,   -- origin string, see `from`
+  recipient INTEGER NOT NULL,
   thread INTEGER, reply_to INTEGER, mode TEXT NOT NULL, text TEXT NOT NULL,
   created_at INTEGER NOT NULL, delivered_at INTEGER, read_at INTEGER
 );
@@ -63,7 +65,8 @@ eliot var watch project/api.*                → streams var.changed
 ```
 
 - Scopes: `project/` (default: caller's project), `tree/` (caller's root tree),
-  `global/`.
+  `global/`. Stored as `scope = "project:<name>"`, `"tree:<root id>"` or `"global"`;
+  the owner must name the project (`project:<name>/key`) when it has no project.
 - Values are JSON or strings, ≤ 16 KiB. Each write bumps `version`;
   `--expect-version` makes it a compare-and-set (`bad_state` on mismatch), so two
   agents cannot silently overwrite each other.

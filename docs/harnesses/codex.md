@@ -30,8 +30,9 @@ schema generator before coding.
 - Handshake: request `initialize` with `clientInfo` and `capabilities`
   (`experimentalApi: true` is needed for child discovery filters), then the client
   initialized notification (exact name: check the generated schema).
-- One app-server process can host many threads → one app-server per plugin instance
-  (or per workspace if cwd/config must differ; decide in L2.1 after a test).
+- One app-server process hosts many threads. Topology: one app-server per distinct
+  set of launch-time config overrides (normally one per proxy route); agents whose
+  profiles resolve to the same overrides share it. `cwd` is per thread.
 
 ## Verb mapping
 
@@ -45,16 +46,29 @@ schema generator before coding.
 | `stop` | interrupt active turn, `thread/goal/clear` if a goal is set, then close the thread / stop the app-server instance if it serves no other agent | v1 field failure: a server-side goal woke a stopped session. |
 | `resume` | `thread/resume` | Never re-send the previous input. |
 | `fork` | `thread/fork` | |
-| `approve` / `deny` | reply to `item/commandExecution/requestApproval` (`accept`, `acceptForSession`, `decline`, `cancel`), `item/fileChange/requestApproval` (`accept`, `acceptForSession`, `decline`, `cancel`), `item/permissions/requestApproval` | `remember` → `acceptForSession`. |
+| `approve` / `deny` | reply to `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`: `approve` → `accept`, `approve --remember` → `acceptForSession`, `deny` → `decline` | `cancel` (ends the turn) is used only by `interrupt` while a request is pending. |
 | `answer` | reply to `item/tool/requestUserInput` | |
-| `goal.*` | `thread/goal/set`, `thread/goal/get`, `thread/goal/clear` (`status` active/paused for pause/resume) | Needs the Goals feature and an allowed provider. |
+| `goal.*` | `goal.set` → `thread/goal/set`; `goal.pause`/`goal.resume` → `thread/goal/set` with `status` `paused`/`active`; `goal.clear` → `thread/goal/clear` | Needs the Goals feature and an allowed provider. Status → `goal.updated.status`: active → `active`, paused → `paused`, complete → `done`, blocked / usage-limited / budget-limited → `blocked` (`reason` = native status), cleared → `cleared`. |
 | `configure` | per-turn settings on `turn/start`; session-level settings `applies: next_session` | Check which fields `turn/start` accepts in the schema. |
+
+## Permissions
+
+| Eliot `permissions` | Codex `sandbox_mode` | Codex `approval_policy` |
+| --- | --- | --- |
+| `read-only` | `read-only` | `never` |
+| `workspace-write` | `workspace-write` | `never` |
+| `ask` | `workspace-write` | `on-request` (requests surface as `approval.requested`) |
+| `full` | `danger-full-access` | `never` |
+
+Passed per thread on `thread/start` when the schema allows it, else as launch-time
+overrides. Value names are from the long-standing config keys; confirm them in the
+generated schema of the installed version.
 
 ## Events
 
 | Codex notification | Eliot event |
 | --- | --- |
-| `thread/started` | `agent.ready` (`native_ref` = thread id) |
+| `thread/started` | `session.ready` (`native_ref` = thread id) |
 | `turn/started` / `turn/completed` | `turn.started` / `turn.completed` (+ usage) |
 | `item/started` / `item/completed` | `tool.*`, `message.agent`, `file.changed`, `plan.updated` by item type |
 | `item/agentMessage/delta`, `item/commandExecution/outputDelta` | `message.delta` (E) |
@@ -98,13 +112,14 @@ env_key = "OPENCODEX_API_KEY"     # env var holding the key
 wire_api = "responses"            # the only accepted value; "chat" is rejected
 ```
 
-- Project-local `.codex/config.toml` cannot set `model_provider`/`model_providers`;
-  the plugin passes them as config overrides at launch (`codex -c key=value`, or the
-  app-server's per-thread config if available — verify in L2.6) so the user's global
-  config is never edited.
-- OpenCodex expects its client key in header `x-opencodex-api-key`; check in L2.6
-  whether Codex's `http_headers` / `env_http_headers` provider keys are needed for
-  that, or whether OpenCodex also accepts the bearer token.
+- Project-local `.codex/config.toml` cannot set `model_provider`/`model_providers`.
+  Default: the plugin starts the app-server with config overrides
+  (`codex -c model_provider=... -c model_providers.eliot-proxy.base_url=... app-server`),
+  so the owner's global config is never edited.
+- OpenCodex expects its client key in header `x-opencodex-api-key`. Default: set both
+  `env_key = "OPENCODEX_API_KEY"` (bearer) and
+  `env_http_headers = { "x-opencodex-api-key" = "OPENCODEX_API_KEY" }`; drop whichever
+  OpenCodex does not need once the L2.8 live run shows it.
 - `openai_base_url` (top level) overrides the built-in provider's URL; prefer a named
   provider so the proxy is explicit.
 
@@ -117,9 +132,20 @@ wire_api = "responses"            # the only accepted value; "chat" is rejected
 - Settings like `agents.max_concurrent_threads_per_session` apply at `thread/start`.
 - v1 code with protocol details: `git show v1-final:crates/swarm-adapter-codex/src/lib.rs`.
 
-## Verify during L2
+## Scenarios
 
-- [ ] Exact initialized-notification name and `turn/start` settings fields (schema).
-- [ ] Per-thread config overrides vs. `-c` flags for proxy wiring.
-- [ ] Whether `turn/steer` is accepted while an approval is pending.
-- [ ] App-server behavior when the plugin's stdin closes (does the process exit?).
+`just record-codex` records these into `plugins/codex/fixtures/` (cheapest model, tiny
+prompts in a scratch repo): `turn` (launch + one turn), `send-busy`, `steer`,
+`interrupt`, `approve-command`, `deny-command`, `approve-file`, `user-input`, `goal`
+(set, pause, resume, clear), `subagent`, `resume`, `bad-model` (error).
+
+## Unverified
+
+Facts the docs did not settle; the recordings answer them. Correct this page when they
+do.
+
+- Name of the client's initialized notification and the settings fields `turn/start`
+  and `thread/start` accept (generated schema).
+- Whether `-c` overrides reach `codex app-server`, or per-thread config is needed.
+- Whether `turn/steer` is accepted while an approval is pending.
+- Whether the app-server exits when its stdin closes.

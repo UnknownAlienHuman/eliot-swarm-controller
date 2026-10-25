@@ -39,10 +39,10 @@ Facts checked 2026-10-25 against [headless](https://antigravity.google/docs/cli/
 
 | Native | Eliot |
 | --- | --- |
-| `init` (`cwd`, `tools`, `permission_mode`) | `agent.ready` |
+| `init` (`cwd`, `tools`, `permission_mode`) | `session.ready` |
 | `step_update` `user_input` / `agent_response` (`text_delta`) / `tool` (`tool_info`, `error`) / `checkpoint` | `turn.started`, `message.delta`, `tool.*`, `approval.resolved` for soft denials |
 | `step_update.subagent_info.subagents[]` (`conversation_id`, `role`, `type_name`, `workspace_uris`) | `child` registration |
-| `result` (`status`: SUCCESS, ERROR, CANCELED, INTERRUPTED, INVALID, WAITING, RUNNING; `usage`, `num_turns`) | `turn.completed` |
+| `result` (`status`, `usage`, `num_turns`) | `turn.completed`: SUCCESS → `completed`; ERROR, INVALID → `failed`; CANCELED, INTERRUPTED → `interrupted`; WAITING, RUNNING are not turn ends (forward as `x.antigravity.result`) |
 
 Usage counters in `result` are cumulative over the session: replace, never sum.
 

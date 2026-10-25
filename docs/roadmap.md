@@ -8,10 +8,17 @@ Rules for every task: implement → tests → `just check` green → PR with wha
 how it was tested and net lines added. No design reports, audit files or status
 documents. If a spec is wrong or missing something, fix the spec in the same PR.
 
+Live runs against real harnesses (`just live-<name>`, `just record-<name>`) are
+allowed on a developer machine where the harness is installed and logged in; keep them
+short (cheapest model/effort that shows the behavior). They never run in CI.
+
 ## Code budgets
 
-Production lines (excluding tests and comments), checked by `just loc` in CI. A PR
-that exceeds a budget must raise it in this table with a one-line reason.
+Production lines per crate, checked by `just loc` in CI against `budgets.toml`
+(created in L0.2 with the values below). Counted with `tokei` as code lines (no
+comments/blank) in `src/**/*.rs`, excluding `tests/` directories and files named
+`tests.rs` or `*_tests.rs` — keep unit tests in those files, not inline. A PR that
+exceeds a budget raises it in `budgets.toml` and in this table with a one-line reason.
 
 | Crate | Budget |
 | --- | --- |
@@ -20,7 +27,7 @@ that exceeds a budget must raise it in this table with a one-line reason.
 | `eliot-daemon` | 9,000 |
 | `eliot-plugin` | 800 |
 | `eliot` (binary) | 3,000 |
-| each plugin | 3,000 |
+| each plugin crate (`plugins/<name>`) | 3,000 |
 
 For scale: v1 reached 533,000 lines of Rust; its largest single file had 9,105.
 
@@ -30,99 +37,126 @@ For scale: v1 reached 533,000 lines of Rust; its largest single file had 9,105.
 
 Goal: a clean workspace where layer 1 can start.
 
-- [ ] **L0.1 Archive v1.** Create tag `v1-final` on the last v1 commit. Delete v1
-      code from `main`: `crates/`, `modules/`, `migrations/`, `src/`, `tests/`,
-      `tools/`, `vendor/`, `config/`, `docs/owner-decisions.md`, old workflows,
-      `Justfile`, `Cargo.lock`. Update `THIRD_PARTY_NOTICES.md` (nothing vendored).
+- [ ] **L0.1 Archive v1.** Push tag `v1-final` at the `main` commit this PR starts
+      from (the last commit that contains v1 code). Delete v1 code from `main`:
+      `crates/`, `modules/`, `migrations/`, `src/`, `tests/`, `tools/`, `vendor/`,
+      `config/`, `docs/owner-decisions.md`, all `.github/workflows/*`, `Justfile`,
+      `Cargo.lock`, `THIRD_PARTY_NOTICES.md` (nothing third-party remains). Replace
+      `v1-final` / `dc6f70aa` hints in docs only if the tag points elsewhere.
 - [ ] **L0.2 Skeleton.** Workspace `Cargo.toml` (edition 2024, `resolver = "3"`,
       workspace lints: `clippy::all` deny, `unsafe_code` deny except in
-      `eliot-daemon::platform`), empty crates from [architecture](architecture.md#repository-layout-target),
-      `rust-toolchain.toml` pinned to current stable, new `Justfile` with `check`
-      (`fmt --check`, `clippy -D warnings`, `test`), `loc`, `run`.
+      `eliot-daemon::platform`), the crates from
+      [architecture](architecture.md#repository-layout-target) as empty libraries plus
+      the `eliot` binary, `plugins/fake` as an empty library crate,
+      `rust-toolchain.toml` pinned to current stable, `budgets.toml`, and a `Justfile`
+      with `check` (`cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
+      `cargo test`) and `loc`.
 - [ ] **L0.3 CI.** One workflow: `just check` on `windows-latest` and `ubuntu-latest`,
-      plus `just loc`. Nothing else.
+      plus `just loc` (installs `tokei`). Nothing else.
 
 **Exit test:** CI green on the empty workspace.
 
 ## L1 — Core and bus (fake harness only)
 
 Goal: everything except real harnesses works and is tested end-to-end.
-Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-protocol.md).
+Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-protocol.md),
+[configuration](spec/configuration.md).
 
 - [ ] **L1.1 Core types.** Ids, `Agent`, `AgentState`, `Event`, event kinds, verbs,
-      `Command`, `Selector`, the state reducer with table-driven tests for every
-      transition in [states](spec/core.md#states).
+      `Command`, selectors, and the reducer with one test per row (and per ignored
+      input) of the [state table](spec/core.md#states).
 - [ ] **L1.2 Store.** Migration runner (`user_version`), L1 schema, writer task with
       group commit, reader pool, queries used by `agent.list`/`events.read`. Tests on a
       temp file DB, including reopen.
 - [ ] **L1.3 Bus.** Persist-then-broadcast for P events, broadcast-only for E events,
       subscribe-from-seq with replay then live, lag → `events.lagged`. Test with a
       slow subscriber.
-- [ ] **L1.4 Daemon + IPC.** `eliot daemon`, lock file, `daemon.json`, named pipe /
-      Unix socket, JSON-RPC with multiplexing, `daemon.status`, graceful shutdown.
-- [ ] **L1.5 Plugin host.** Spawn plugin processes, `initialize`, request/notify both
-      ways, timeouts, restart with backoff, re-attach, `unknown` on lost replies.
-- [ ] **L1.6 Router.** `command.submit` validation order (exists → supported →
-      allowed → state), persistence, dispatch, outcome recording, selectors,
-      idempotent command ids.
-- [ ] **L1.7 Fake plugin.** `eliot plugin fake`: deterministic harness driven by a
-      JSON script in the prompt (`say`, `sleep_ms`, `tool`, `approval`, `question`,
-      `spawn`, `crash`, `hang`, `exit`); plain text = echo. Supports every verb; plugin
-      config `verbs = [...]` narrows the declared set so rejection paths can be tested.
-      `resume` works from its state dir (`<data_dir>/plugins/fake/`).
-- [ ] **L1.8 CLI.** `daemon`, `status`, `launch`, `ls`, `show`, `watch`, `events`,
-      `send`, `steer`, `inject`, `interrupt`, `stop`, `resume`, `approve`, `deny`,
-      `answer`, `cmd show`; `--json` everywhere; exit codes from [API](spec/api.md#cli).
-- [ ] **L1.9 Conformance kit.** `eliot plugin-test <cmd>` runs the protocol suite;
-      the fake plugin passes it.
-- [ ] **L1.10 Agent env.** Inject `ELIOT_HOME`, `ELIOT_AGENT_ID`,
-      `ELIOT_AGENT_TOKEN`, `PATH`; token → caller identity; `control` checks.
+- [ ] **L1.4 Daemon + IPC.** `eliot daemon [--foreground]`, `eliot daemon stop
+      [--drain]`, lock file, `daemon.json`, named pipe / Unix socket, JSON-RPC with
+      multiplexing, `daemon.status`, graceful shutdown.
+- [ ] **L1.5 Config.** Load `config.toml` (global + project), profiles with defaults
+      and `extends`, implicit profiles (`--harness H`), `[plugins.<name>]` sections;
+      unknown keys are errors. Proxies are parsed but used only in L2.6.
+- [ ] **L1.6 Plugin host.** Spawn plugin processes, `initialize`, requests and
+      notifications both ways, timeouts, restart with backoff, re-attach, `unknown` on
+      lost replies, plugin exit on stdin EOF.
+- [ ] **L1.7 Router.** `command.submit` validation order (launch creates the agent;
+      others: exists → supported → allowed → state), persistence, dispatch, outcome
+      recording, selectors, idempotent command ids.
+- [ ] **L1.8 Fake plugin.** `plugins/fake`, run as `eliot plugin fake`, implementing the
+      [fake plugin spec](spec/plugin-protocol.md#fake-plugin).
+- [ ] **L1.9 CLI.** `daemon`, `status`, `launch`, `ls`, `show`, `watch`, `events`,
+      `send`, `steer`, `inject`, `interrupt`/`abort`, `stop`, `resume`, `approve`,
+      `deny`, `answer`, `cmd show`; `--json` everywhere; exit codes from
+      [API](spec/api.md#exit-codes).
+- [ ] **L1.10 Conformance kit.** `eliot plugin-test <cmd>` runs the
+      [suite](spec/plugin-protocol.md#conformance-kit) against a plugin; the fake
+      plugin passes it.
+- [ ] **L1.11 Agent env and control.** Inject `ELIOT_HOME`, `ELIOT_AGENT_ID`,
+      `ELIOT_AGENT_TOKEN`, `PATH`, `system_note`; token → caller identity; `control`
+      checks from [coordination](spec/coordination.md#who-may-do-what).
 
-**Exit test (`crates/eliot/tests/e2e_l1.rs`, runs in CI):** start daemon in a temp
-dir; launch 3 fake agents (one is a child of another); send/steer/interrupt/approve
-and see the expected events in order; with a narrowed fake profile an unsupported verb
-is rejected with no plugin I/O; kill the plugin mid-command → command `unknown`,
-plugin restarts, agents re-attach; kill and restart the daemon → the same agents are
-listed, now `lost` (their processes died with the daemon), and `resume` brings one
-back to `idle` without resending its prompt; launch 1,000 fake agents in under 30 s
-with daemon RSS under 200 MB.
+**Exit test (`crates/eliot/tests/e2e_l1.rs`, runs in CI):** start the daemon in a temp
+dir and drive it only through the `eliot` binary:
+
+1. launch fake agents A and B, and C with `--parent A`; `ls --tree A` shows A and C;
+2. `send A '{"steps":[{"say":"hi"},{"approval":{"kind":"command","command":"rm x"}},{"say":"done"}]}'`
+   → events in order: `turn.started`, `agent.busy`, `message.agent "hi"`,
+   `approval.requested`, `agent.waiting`; `approve A` → `approval.resolved`,
+   `agent.busy`, `message.agent "done"`, `turn.completed status=completed`, `agent.idle`;
+3. `steer` on an idle agent → exit code 3 (`bad_state`); `steer` during a
+   `sleep_ms` step → `command.applied`; `interrupt` during a sleep →
+   `turn.completed status=interrupted`;
+4. with a second plugin entry `[plugins.fake-narrow]` (`cmd = ["eliot", "plugin",
+   "fake"]`, `verbs = ["launch","send","stop"]`) and `launch --harness fake-narrow`,
+   `steer` → exit code 3 (`unsupported`) and the plugin received no request;
+5. a `hang` step, then `kill` the plugin process → that command becomes `unknown`
+   (exit code 4), the plugin restarts and live agents re-attach;
+6. kill the daemon, start it again → the same agents are listed as `lost` (their
+   plugin died with the daemon); `resume A` → `agent.idle` and no `message.user` with
+   the old prompt;
+7. launch 1,000 fake agents in under 30 s with daemon RSS under 200 MB.
 
 ## L2 — First real harness: Codex
 
 Goal: one real harness fully controlled, including a proxy.
 Specs: [Codex](harnesses/codex.md), [OpenCodex](harnesses/opencodex.md),
-[configuration](spec/configuration.md).
+[configuration](spec/configuration.md#proxies).
 
-- [ ] **L2.1 Codex plugin: launch and turns.** Start `codex app-server` (stdio),
+- [ ] **L2.1 Recording and replay.** `ELIOT_RECORD` / `ELIOT_REPLAY` support in
+      `eliot-plugin` ([format](spec/plugin-protocol.md#recordings)); `just record-codex`
+      records the scenarios listed in the [Codex page](harnesses/codex.md#scenarios)
+      into `plugins/codex/fixtures/`.
+- [ ] **L2.2 Codex plugin: launch and turns.** Start `codex app-server` (stdio),
       `initialize`, start thread, start turn, map notifications to events, final text,
-      usage. Fixture tests from a recorded real session (stored under
-      `plugins/codex/fixtures/`, labelled as recorded with version and date).
-- [ ] **L2.2 Control verbs.** `send` (queued while busy), `steer` (active turn id),
+      usage; tests replay the fixtures.
+- [ ] **L2.3 Control verbs.** `send` (queued while busy), `steer` (active turn id),
       `interrupt`, `stop`, `resume`, `configure` (reports `applies`).
-- [ ] **L2.3 Approvals and questions.** Native approval requests → `approval.requested`;
-      `approve`/`deny`; `decide` for inline policy.
-- [ ] **L2.4 Native goal.** `goal.*` mapped to Codex thread goals; `goal.updated`.
-      `show` displays the last `goal.updated`; budgets and the `goals` table come in L5.6.
-- [ ] **L2.5 Children.** Subagent threads → `child` → `origin=native` agents.
-- [ ] **L2.6 Profiles and proxy.** Profile resolution, `permissions` mapping,
-      `[proxies]` attach/launch/health as a refcounted service, Codex pointed at
-      OpenCodex.
-- [ ] **L2.7 Live check script.** `just live-codex` (owner runs it; real model): launch,
-      steer, interrupt, approve, goal, child, through OpenCodex and without. Paste the
-      output into the PR.
+- [ ] **L2.4 Approvals and questions.** Native requests → `approval.requested` /
+      `question.asked`; `approve`/`deny`/`answer`. Host `decide` answers `ask` until
+      L5.5.
+- [ ] **L2.5 Native goal.** `goal.set|pause|resume|clear` mapped to Codex thread goals
+      with the [status mapping](harnesses/codex.md#verb-mapping); `goal.updated`.
+      `check` and `budget` are rejected as `unsupported` until L5.6.
+- [ ] **L2.6 Children.** Subagent threads → `child` → `origin=native` agents.
+- [ ] **L2.7 Permissions and proxy.** `permissions` mapping from the Codex page;
+      `[proxies]` attach/launch/health as a refcounted service; Codex pointed at
+      OpenCodex with the [default wiring](harnesses/codex.md#proxy-opencodex-or-any-responses-compatible-endpoint).
+- [ ] **L2.8 Live check.** `just live-codex`: launch, steer, interrupt, approve, goal,
+      child — through OpenCodex and without. Paste the output into the PR.
 
-**Exit test:** conformance kit passes against the Codex plugin with fixtures; the
-owner's `just live-codex` run passes.
+**Exit test:** `eliot plugin-test` passes against the Codex plugin in replay mode (CI);
+`just live-codex` passes on a machine with Codex installed.
 
 ## L3 — Monitoring
 
 Specs: [monitoring](spec/monitoring.md).
 
-- [ ] **L3.1 Process monitor.** Identities, descendants, stats, `agent.lost`, Job
+- [ ] **L3.1 Process monitor.** Identities, descendants, stats, `session.lost`, Job
       object / process group custody, `stop --force` verification.
-- [ ] **L3.2 Workspaces.** `--worktree` creates `git worktree add` under
-      `<data_dir>/worktrees`, per-agent Git identity, cleanup on `stop` (keeps the
-      branch).
+- [ ] **L3.2 Workspaces.** `workspace_mode = "worktree"` / `--worktree` creates
+      `git worktree add` under `<data_dir>/worktrees`, per-agent Git identity, cleanup
+      on `stop` (keeps the branch).
 - [ ] **L3.3 Git monitor.** Status/commit/diff sets with `--no-optional-locks`,
       fs-triggered refresh, backoff for slow repos, `git.*` events.
 - [ ] **L3.4 Transcripts and discovery.** Codex rollout tail; `eliot discover`,
@@ -130,31 +164,33 @@ Specs: [monitoring](spec/monitoring.md).
 - [ ] **L3.5 Liveness.** Stall flag, source health, `unknown` display.
 - [ ] **L3.6 Views.** `eliot top`, richer `show`, `watch` formatting.
 
-**Exit test:** killing a native Codex process yields `agent.lost` within 5 s; a commit
-in an agent worktree yields `git.commit` within 20 s; an idle-but-alive agent is never
-shown as lost; a Codex session started by hand is discovered and watched.
+**Exit test:** killing a native Codex process yields `agent.lost` within 10 s; a
+commit in an agent worktree yields `git.commit` within 20 s; an idle-but-alive agent
+is never shown as lost; a Codex session started by hand is discovered and watched.
 
 ## L4 — Other harnesses
 
-One task per harness, in this order. Each: plugin + fixtures + conformance kit +
-`just live-<name>` + its [harness page](harnesses/README.md) updated with what was
-verified. Plugins may be TypeScript/Python first (R11).
+One task per harness, in this order. Each: plugin + recordings + conformance kit in
+replay mode + `just live-<name>`; correct the harness page and the
+[matrix](harnesses/README.md) where reality differs. Plugins may be TypeScript/Python
+first (R11).
 
 - [ ] **L4.1 Hook shim.** `eliot hook`, `hook.event`, session-scoped hook config
       generation, inject delivery via hook context, default on timeout.
-- [ ] **L4.2 Claude Code** (stream-json CLI or Agent SDK; hooks for inject/approvals).
+- [ ] **L4.2 Claude Code** (Agent SDK; in-process hooks for inject/steer/approvals).
 - [ ] **L4.3 OpenCode** (`opencode serve` HTTP + SSE; attach to a running server).
 - [ ] **L4.4 Antigravity** (`agy` stream-json, warm process).
-- [ ] **L4.5 ACP generic** (any ACP agent, e.g. Gemini CLI; covers Zed-compatible agents).
+- [ ] **L4.5 ACP generic** (any ACP agent, e.g. Gemini CLI).
 - [ ] **L4.6 Muse, Command Code, Kilo** — only if the owner still uses them.
 
-**Exit test:** the same scripted scenario (launch, send, steer-or-reject, interrupt,
-approve, stop) passes on every L4 harness, with the capability matrix in
-[harnesses](harnesses/README.md) matching reality.
+**Exit test:** the same scripted scenario (launch, send, steer, interrupt, approve,
+stop) passes on every L4 harness, where each verb either works or is rejected with a
+reason that matches the harness page.
 
 ## L5 — Automation
 
-Specs: [automation](spec/automation.md).
+Specs: [automation](spec/automation.md). Time comes from an injectable clock so timer
+tests run in simulated time.
 
 - [ ] **L5.1 Rules engine.** TOML loading/reload, event triggers, matchers,
       placeholders, limits, loop guard, `rule.*` events, `eliot rule test`.
@@ -164,12 +200,13 @@ Specs: [automation](spec/automation.md).
 - [ ] **L5.4 Scripts.** `run` action with the NDJSON contract; example scripts.
 - [ ] **L5.5 Approvals policy.** Approval rules incl. inline `decide`.
 - [ ] **L5.6 Goal loop.** Eliot mode and native-mode budgets, `no_progress`, parent
-      notification.
+      notification, `goals` table.
 - [ ] **L5.7 Recipes.** `examples/` with the three [workflow recipes](spec/automation.md#workflow-recipes).
 
-**Exit test:** a 24 h soak with the fake plugin: 1 rule per minute firing, cron fetch,
-a goal reaching `done`, a goal hitting `no_progress`; zero duplicate actions, zero
-missed timer firings, loop guard suppresses a deliberately looping rule.
+**Exit test:** 24 h of simulated time with the fake plugin and a local Git remote: a
+rule firing every minute, a cron fetch, a goal reaching `done`, a goal hitting
+`no_progress`; zero duplicate actions, zero missed timer firings, and the loop guard
+suppresses a deliberately looping rule.
 
 ## L6 — Coordination
 
@@ -192,7 +229,8 @@ messages; one runs `eliot who` and names the other; a claim conflict notifies bo
       `ls`/`show` p95 < 100 ms, no event loss for persisted kinds.
 - [ ] **L7.2 Plugin sharding.** `instances = N` per plugin.
 - [ ] **L7.3 Retention.** Event pruning in batches; DB size stable in the load test.
-- [ ] **L7.4 Drain.** `daemon.shutdown --drain`; timers and rules stop admitting work.
+- [ ] **L7.4 Drain.** `eliot daemon stop --drain` also stops timers and rules from
+      admitting work.
 - [ ] **L7.5 Windows hardening.** No console windows for children, long argv via
       files, UTF-8 without BOM everywhere, path quoting tests.
 

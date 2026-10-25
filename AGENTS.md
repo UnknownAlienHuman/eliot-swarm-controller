@@ -39,12 +39,14 @@ default, use the default, and keep going.
   new docs pages. The roadmap checkbox and the tests are the status.
 - **Stay small.** Respect the [code budgets](docs/roadmap.md#code-budgets). No new
   crate, trait or abstraction without two real users today.
-- **Unknown stays unknown.** Never retry a command whose outcome is unknown; never
+- **Unknown stays unknown.** Never retry a command whose outcome is unknown (only
+  `interrupt`/`stop` are retried once, see [core](docs/spec/core.md#commands)); never
   treat silence or a missing source as idle, zero or done.
 - **Native first.** Use the harness's own mechanism; reject a verb rather than fake it.
 - **No secrets** in code, config, events, messages, fixtures or logs.
-- **No paid model calls in CI.** Real harness runs happen only in `just live-*`
-  scripts that the owner runs.
+- **No model calls in CI.** CI replays recordings. Real harness runs
+  (`just record-*`, `just live-*`) are fine on a machine where the harness is
+  installed and logged in; keep them short and cheap.
 
 ## Code
 
@@ -63,4 +65,5 @@ default, use the default, and keep going.
 - `eliot-store`: temp-file databases, including reopen and migration.
 - Everything else: end-to-end through the `eliot` binary with the fake plugin
   (`plugins/fake`) in a temp data dir.
-- Harness plugins: recorded fixtures + `eliot plugin-test`; live runs via `just live-<name>`.
+- Harness plugins: recordings + `eliot plugin-test` in replay mode; live runs via
+  `just live-<name>`.

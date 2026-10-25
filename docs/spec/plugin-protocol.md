@@ -1,9 +1,13 @@
 # Plugin protocol
 
-A plugin is an executable that speaks this protocol on stdin/stdout. Built-in Rust
-plugins run as `eliot plugin <name>`; external plugins are any command declared in
-config (`[plugins.<name>] cmd = ["node", "plugins/claude/main.mjs"]`). One plugin
-process serves many agents of one harness kind.
+A plugin is a process that speaks this protocol on stdin/stdout. One plugin process
+serves many agents of one harness kind.
+
+- **Built-in plugins** are Rust library crates in `plugins/<name>/` that depend on
+  `eliot-plugin`; the `eliot` binary links them and runs one as `eliot plugin <name>`.
+- **External plugins** (any language) live in `plugins/<name>/` with their own
+  toolchain and are started from config: `[plugins.<name>] cmd = ["node",
+  "plugins/claude/main.mjs"]`.
 
 ## Framing
 
@@ -18,10 +22,10 @@ process serves many agents of one harness kind.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `initialize` | `protocol`, `plugin_config` (from Eliot config), `data_dir` | `Manifest` (below) |
-| `agent.start` | `agent_id`, `profile` (resolved), `workspace?`, `prompt?`, `env` (Eliot vars to inject), `system_note` ([text](coordination.md#communication-guidance-for-agent-prompts)), `parent_native_ref?` | `{native_ref, pids: [Pid], effective: {model?, permissions?, system_note: native|prepended, ...}}` |
-| `agent.attach` | `agent_id`, `native_ref`, `observe_only` | `{state, pids}` — after daemon restart or for discovered sessions |
-| `agent.command` | `agent_id`, `command_id`, `verb`, `args` | `{status: applied|rejected|failed|unknown, applies?: now|next_turn|next_session, detail?}` |
+| `initialize` | `protocol`, `plugin_config` (its `[plugins.<name>]` table), `data_dir` | `Manifest` (below) |
+| `agent.start` | `agent_id`, `profile` (resolved), `workspace?`, `prompt?`, `env` (Eliot vars to inject), `system_note` ([text](coordination.md#communication-guidance-for-agent-prompts)), `parent_native_ref?` | `{native_ref, pids: [Pid], effective: {model?, permissions?, system_note: native|prepended, endpoint?}}` |
+| `agent.attach` | `agent_id`, `native_ref`, `observe_only` | `{state, pids}` — after a plugin/daemon restart or for discovered sessions; error `not_found` if the session is gone |
+| `agent.command` | `agent_id`, `command_id`, `verb`, `args` | `{status: applied|rejected|failed|unknown, applies?: now|next_tool|next_turn|next_session, detail?}` |
 | `agent.snapshot` | `agent_id`, `commands?: [command_id]` | `{state, pending: [Request], goal?, usage?, commands?: {id: applied|not_applied|unknown}}` |
 | `agent.stop` | `agent_id`, `force` | `{}` once the native session ended (or `force` killed it) |
 | `discover` | `{}` | `[{native_ref, workspace?, started_at?, title?, live}]` — native sessions on this machine |
@@ -46,26 +50,26 @@ Verb routing: `launch` arrives as `agent.start`, `stop` as `agent.stop`, `resume
 | Method | Params | Result |
 | --- | --- | --- |
 | `child` | `{parent_agent_id, native_ref, name?, labels?}` | `{agent_id}` — the host creates an `origin=native` agent (idempotent per `native_ref`) |
-| `decide` | `{agent_id, request: Request}` | `{decision: allow|deny|ask, reason?, context?}` — synchronous policy answer for approvals the plugin must answer inline (host runs approval rules with a timeout; default `ask`) |
+| `decide` | `{agent_id, request: Request}` | `{decision: allow|deny|ask, reason?, context?}` — synchronous answer for approvals the plugin must answer inline. The host evaluates approval rules within 2 s (L5.5); until then, and on no match, `ask`. |
 
 ## Manifest
 
 ```json
 {
   "name": "codex", "version": "0.1.0", "protocol": "eliot-plugin/1",
-  "harness_version": "codex-cli 0.x (reported by the native side, or null)",
+  "harness_version": "codex-cli 0.164.0 (as reported by the native side, or null)",
   "verbs": ["launch","send","steer","inject","interrupt","stop","resume",
             "approve","deny","answer","configure","goal.set","goal.pause","goal.resume","goal.clear"],
   "child_verbs": ["send","interrupt"],
   "features": { "native_goal": true, "native_children": true, "hooks": false,
-                "transcripts": true, "discover": true, "survives_daemon_restart": false },
-  "permissions": { "read-only": "...", "workspace-write": "...", "full": "...", "ask": "..." },
-  "proxy": { "env": ["OPENAI_BASE_URL"], "config": "model_providers.<name>.base_url" }
+                "transcripts": true, "discover": true },
+  "proxy": "config"
 }
 ```
 
-The host routes only the declared verbs. Harness versions are reported for display and
-debugging; they are never a gate.
+`proxy`: `config` | `env` | `none` — how the plugin points its harness at a proxy
+(details on its harness page). The host routes only the declared verbs. Harness
+versions are for display; they are never a gate.
 
 ## Verb translation rules
 
@@ -75,20 +79,24 @@ debugging; they are never a gate.
    `detail.reason`. Never substitute a weaker action silently (e.g. `send` for `steer`).
 3. `unknown` when the request may have reached the native side but no reply arrived.
    The plugin must not retry it.
-4. Report `applies` for `configure`: many harnesses read settings only at session or
-   turn start.
+4. Report `applies` for `configure` and for mechanisms that land later
+   (`next_tool` = after the current tool call).
 5. Approval/question ids are native ids passed through unchanged as `request_id`.
 6. Children: when the harness spawns a subagent, call `child` once, then send that
    child's events with the returned `agent_id`.
 
 ## Event normalization rules
 
+- Session lifecycle: `session.ready` once the native session accepts input;
+  `session.ended` when it ends normally; `session.error` when it cannot continue.
+  The host derives `agent.*` state events; plugins never send `agent.*`.
 - Emit `turn.started` / `turn.completed` exactly once per native turn; `status`
-  distinguishes completed, interrupted and failed.
+  distinguishes completed, interrupted and failed. Non-terminal native statuses are not
+  turn ends.
 - `message.agent` carries the final text of an assistant message (bounded); streaming
   pieces go to `message.delta` (ephemeral).
 - `tool.*` summaries are short (`"bash: cargo test -p foo"`); full output stays native.
-- Usage: send cumulative values with their scope (`turn` or `session`); never sum
+- Usage: send cumulative values with their `scope` (`turn` or `session`); never sum
   cumulative counters.
 - Provider errors map to `provider.limited.kind`: `rate_limit` (retry soon), `quota`
   (window exhausted), `model_gone`, `auth`. A 429 is `rate_limit` unless the native
@@ -97,8 +105,9 @@ debugging; they are never a gate.
 
 ## Hooks
 
-For harnesses with native hooks (Claude Code, Antigravity, ...), the plugin writes a
-**session-scoped** hook config (never the user's global settings) whose command is:
+For harnesses with native hooks (Codex, Claude Code CLI, Antigravity), the plugin
+writes a **session-scoped** hook config (never the user's global settings) whose
+command is:
 
 ```text
 eliot hook --harness <name> --event <HookName>
@@ -110,7 +119,8 @@ The daemon turns the hook into events (`tool.started`, `approval.requested`, ...
 runs matching [approval rules](automation.md#approvals) and delivers pending `inject`
 text as additional context when the hook allows it. If the daemon does not answer
 within the hook timeout (default 2 s), the shim prints the configured default
-(`allow` for observation-only hooks, `ask` for decision hooks) and exits 0.
+(`allow` for observation-only hooks, `ask` for decision hooks) and exits 0. SDK-based
+plugins (Claude Agent SDK) use in-process hook callbacks instead of the shim.
 
 ## Transcripts and discovery
 
@@ -123,16 +133,76 @@ dir (`<data_dir>/plugins/<name>/`); the host does not parse transcripts.
 ## Lifecycle and errors
 
 - The host starts a plugin on first use, sends `initialize`, and restarts it with
-  backoff (1 s → 30 s) if it exits. On restart it re-attaches every live agent and asks
-  `agent.snapshot` for open commands.
+  backoff (1 s → 30 s) if it exits. On restart it re-attaches every live agent
+  (`not_found` → `session.lost`) and asks `agent.snapshot` for open commands.
+- **A plugin exits when its stdin closes** and ends the native processes it launched.
+  This is how native sessions end when the daemon dies; Job objects / process groups
+  (L3.1) make it hold even if a plugin hangs.
 - A plugin that fails `initialize` three times is marked `failed`; its agents become
   `lost`. Other plugins are unaffected.
 - Requests time out (default 30 s, `agent.start` 120 s). A timed-out command becomes
   `unknown`.
 
+## Fake plugin
+
+`plugins/fake` simulates a harness deterministically; it is used by every L1 test and
+by load tests. It declares all verbs unless `[plugins.fake] verbs = [...]` narrows them.
+
+Any input text (launch prompt, `send`, `steer`, `inject`) is a script if it parses as
+`{"steps": [...]}`; otherwise it is echoed (`message.agent` with the same text). A
+`send`/`launch` script runs as one turn: `turn.started` … `turn.completed`.
+
+| Step | Fields | Emits |
+| --- | --- | --- |
+| `say` | text | `message.agent {text}` |
+| `sleep_ms` | n | nothing for n ms (turn stays busy; `steer` during it emits `message.user` and continues) |
+| `tool` | `{name, ok?=true, ms?=0}` | `tool.started`, then after `ms` `tool.completed {ok}` |
+| `approval` | `{kind, command?, path?}` | `approval.requested`; the script waits for `approve`/`deny`, then `approval.resolved` (on deny, the next step is skipped) |
+| `question` | `{text, options?}` | `question.asked`; waits for `answer`, then `question.answered` |
+| `spawn` | `{name?, steps}` | calls `child`, then runs `steps` as the child's first turn |
+| `usage` | `{tokens_in, tokens_out}` | `usage.updated {scope: turn}` |
+| `crash` | — | the plugin process exits with code 1 |
+| `hang` | — | stops answering requests (to test timeouts) |
+| `exit` | — | `session.ended` for this agent |
+
+`interrupt` ends the running turn with `turn.completed status=interrupted`. `stop` emits
+`session.ended`. Agent scripts and positions are kept in
+`<data_dir>/plugins/fake/` so `resume` can re-open a session after a restart; resuming
+never replays earlier steps.
+
+## Recordings
+
+Real harness traffic is recorded once and replayed in tests, so CI never calls a model.
+
+- `ELIOT_RECORD=<file>`: the plugin appends every native message it sends or
+  receives as one JSON line `{"t": <ms since start>, "dir": "out"|"in", "chan":
+  "<stdio|http|sse|...>", "msg": <native message>}`.
+- `ELIOT_REPLAY=<file>`: instead of starting the native process, the plugin uses a
+  replay transport that checks each outgoing message against the next `out` line
+  (same method/path; ids and timestamps ignored) and delivers the following `in`
+  lines. A mismatch fails the test with both messages printed.
+- Files live in `plugins/<name>/fixtures/<scenario>.jsonl`, named with the harness
+  version and date in a first line `{"meta": {"harness_version", "recorded_at",
+  "scenario"}}`. Secrets are removed before commit (the recorder drops auth headers
+  and env).
+
+`eliot-plugin` provides both transports for Rust plugins; external plugins implement
+the same file format.
+
 ## Conformance kit
 
-`eliot plugin-test <cmd...>` (L1) runs a scripted suite against any plugin with a
-mock or recorded native side: initialize, start, send, steer/interrupt if declared,
-unsupported verb rejection, child registration, crash/restart re-attach, unknown
-outcome handling. Every plugin, in any language, must pass it before merge.
+`eliot plugin-test <cmd...> [--replay-dir DIR]` starts the plugin with a temp data dir
+and checks, for the verbs the manifest declares:
+
+1. `initialize` returns a valid manifest;
+2. `agent.start` → `session.ready` → a turn with `turn.started` / `turn.completed`;
+3. `send` while busy is queued (not lost, not merged into the running turn unless the
+   manifest says so);
+4. `steer`, `interrupt`, `approve`/`deny`, `answer`, `goal.*`, `child` — each declared
+   verb produces its documented events; each undeclared verb is never sent;
+5. closing stdin ends the plugin and its native processes;
+6. a killed and restarted plugin re-attaches or reports `not_found`;
+7. a request without a reply is reported `unknown` and not retried.
+
+For real harnesses the kit runs in replay mode against `plugins/<name>/fixtures/`;
+for the fake plugin it runs live. Every plugin, in any language, passes it before merge.

@@ -29,8 +29,11 @@ from what the plugin actually does (not from docs).
 ## Writing a plugin
 
 1. Read the harness page and the [plugin protocol](../spec/plugin-protocol.md).
-2. Record one real session (owner runs it) into `plugins/<name>/fixtures/` with the
-   harness version and date in the file name.
-3. Implement against the fixtures; pass `eliot plugin-test`.
-4. Add `just live-<name>`; the owner runs it; paste the output in the PR.
-5. Update the matrix above and the page's "verify" list from what you observed.
+2. Record scenarios with `just record-<name>`
+   ([recordings](../spec/plugin-protocol.md#recordings)): the page's list, or by
+   default `turn`, `send-busy`, `steer`, `interrupt`, `approve`, `deny`, `question`,
+   `goal`, `subagent`, `resume`, `error` — skipping what the harness cannot do.
+3. Implement against the recordings; pass `eliot plugin-test` in replay mode.
+4. Add `just live-<name>`, run it, paste the output in the PR.
+5. Where the harness behaved differently from this page or the matrix, correct them
+   with the source (recording name, version, date).

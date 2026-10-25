@@ -85,8 +85,8 @@ push whose reply is lost is checked with `git ls-remote` — never pushed again 
 `run` starts an executable in any language:
 
 - stdin: one JSON object `{event, agent, rule}`;
-- env: `ELIOT_HOME`, `ELIOT_RULE`, and an owner-level token (scripts act with the
-  rule's authority);
+- env: `ELIOT_HOME`, `ELIOT_RULE`; no agent token, so its `eliot` calls act as the
+  owner;
 - stdout: zero or more NDJSON actions in the same shape as `do` entries — the daemon
   executes them with the same limits; stderr goes to the daemon log;
 - exit code ≠ 0 → `rule.failed` with the stderr tail.
@@ -113,8 +113,9 @@ do = [{ action = "approve" }]
 `goal.set` with `mode = native` when the plugin declares `native_goal`, else `eliot`.
 
 ```text
-Goal { text, check?: [argv] | "marker:<TEXT>", max_turns (default 20),
-       max_cost_usd?, no_progress (default 3), status, turns_used, last_check? }
+Goal { text, check?: string ("marker:<TEXT>" or a shell command line, see core verbs),
+       budget: {max_turns (default 20), max_cost_usd?, no_progress (default 3)},
+       status, turns_used, last_check? }
 ```
 
 **Native mode.** Eliot sets the native goal and mirrors `goal.updated`. It enforces

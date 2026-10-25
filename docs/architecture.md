@@ -135,9 +135,9 @@ crates/
   eliot-plugin/            small SDK for Rust plugins (stdio JSON-RPC loop, typed messages)
   eliot/                   the binary: CLI, `daemon`, `plugin <builtin>`, `hook`, `mcp`
 plugins/
-  fake/                    deterministic simulated harness (tests, load)
-  codex/                   first real harness (Rust)
-  claude/ opencode/ ...    later; any language during bring-up
+  fake/                    Rust crate, linked into `eliot`: deterministic simulated harness
+  codex/                   Rust crate, linked into `eliot`: first real harness
+  claude/ opencode/ ...    later; Rust crates (linked) or any-language programs started via `cmd`
 docs/                      this documentation
 ```
 

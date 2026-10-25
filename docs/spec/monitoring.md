@@ -10,7 +10,7 @@ own health (`source.health`). A failing source never blocks another one or the r
 | Native stream | turns, messages, tools, approvals, children, goal, usage | plugin protocol (live) | `turn.*`, `message.*`, `tool.*`, `approval.*`, `child.spawned`, `goal.updated`, `usage.updated` |
 | Native transcripts | the same, for sessions Eliot did not launch or after a restart | plugin tails native files | same kinds, `source=transcript` |
 | Native hooks | tool calls, prompts, stops, subagent stops, compaction | hook shim → daemon | `tool.*`, `approval.requested`, `x.<harness>.*` |
-| Processes | life of native processes and their descendants | `sysinfo` + plugin-registered PIDs | `process.started/exited`, `process.stats` (E), `agent.lost` |
+| Processes | life of native processes and their descendants | `sysinfo` + plugin-registered PIDs | `process.started/exited`, `process.stats` (E), `session.lost` |
 | Git | branch, HEAD, dirty files, new commits, ahead/behind, remote refs | `git` CLI, read-only flags | `git.status`, `git.commit`, `git.ref` |
 | Filesystem | changes in agent workspaces | `notify` watcher, debounced | `fs.changed` (E), triggers Git refresh |
 | Proxy/provider | proxy health, usage, limits | proxy management API when configured | `source.health`, `provider.limited` |
@@ -23,8 +23,8 @@ own health (`source.health`). A failing source never blocks another one or the r
   parent chain every `process.scan_interval` (default 2 s). One `sysinfo::System`
   instance, refreshed selectively for watched PIDs only.
 - `process.exited` when a watched identity disappears. If all `harness`/`server`
-  processes of an agent are gone and the plugin reported no terminal event within
-  10 s, emit `agent.lost`.
+  processes of an agent are gone and the plugin reported no `session.ended` within
+  3 s, emit `session.lost` (the reducer then moves the agent to `lost`).
 - `process.stats` (CPU, RSS) every 5 s for watched processes; ephemeral.
 - Stop/kill: Windows Job object per plugin instance with `KILL_ON_JOB_CLOSE` (if the
   daemon dies, the processes it launched die too — no orphans); Unix process group.
@@ -60,7 +60,7 @@ Per distinct worktree used by any live agent:
 | No events while `busy` for `stall_after` | `agent.stalled` (flag), nothing else |
 | Parent idle, children busy | parent is idle; the tree is not done |
 | Process alive, stream disconnected | source `stale`; agent state unchanged |
-| Process gone, no terminal event | `agent.lost` |
+| Process gone, no terminal event | `session.lost` → `agent.lost` |
 | Source not read for 3 × its interval | `source.health status=stale`; values shown as `unknown` |
 | Provider 429 | `provider.limited kind=rate_limit`; not quota, model unchanged |
 
