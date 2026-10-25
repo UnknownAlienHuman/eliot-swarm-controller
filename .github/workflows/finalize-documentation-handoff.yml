@@ -37,10 +37,13 @@ jobs:
           grep -F 'STRUCTURALLY READY FOR CONTROLLED PACKETED IMPLEMENTATION' docs/agent-operations/documentation-readiness-report.md
           grep -F 'WHOLE-PROJECT SOURCE AUDIT INCOMPLETE' docs/agent-operations/documentation-readiness-report.md
           grep -F 'Approved exact task packets | 1' docs/agent-operations/documentation-readiness-report.md
-      - name: Remove one-shot machinery and publish
+      - name: Publish non-workflow handoff changes
         shell: bash
         run: |
-          rm -f tools/ci/finalize_documentation_handoff.py tools/ci/finalize_documentation_handoff.py.gz.b64 .github/workflows/finalize-documentation-handoff.yml
+          # GitHub App tokens cannot update workflow files. Restore that one file;
+          # it is applied separately through the manager's GitHub API write path.
+          git checkout -- .github/workflows/documentation-readiness-audit.yml
+          rm -f tools/ci/finalize_documentation_handoff.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
