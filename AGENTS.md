@@ -1,166 +1,66 @@
-# Working on Eliot Swarm Controller
+# Working on Eliot
 
-Read the owner's current task, the short
-[architecture](docs/agent-operations/architecture.md), and the
-[documentation authority map](docs/agent-operations/documentation-map.md) first.
-[Implementation](docs/agent-operations/implementation.md) is the strategic order and
-source-owner map, **not a self-contained worker prompt**. The
-[implementation slice register](docs/agent-operations/implementation-slice-register.md)
-records which bounded slices are actually eligible for assignment. A coding worker
-receives one approved packet from the
-[task-packet index](docs/agent-operations/task-packets/README.md); the
-[packet template](docs/agent-operations/task-packet-template.md) is only the required
-format. [Failure prevention](docs/agent-operations/failure-prevention-register.md) maps
-prior failures to retained invariants and acceptance gates. [Status](docs/implementation-status.md)
-separates implemented facts from plans and qualification. Historical specifications,
-audits, remediation plans and Claude scripts are evidence for the manager, never
-additional worker instructions. The owner's latest explicit decision wins.
+Eliot v2 is built from scratch in layers. Read, in this order:
+[vision](docs/vision.md) → [architecture](docs/architecture.md) →
+[roadmap](docs/roadmap.md) → the spec pages your task links to.
 
-The repository-wide source audit is currently incomplete. Do not claim that the whole
-project is ready for autonomous implementation merely because one slice has a design,
-source trace or passing compiler gate. Only a slice marked `APPROVED_PACKET` may be
-assigned, and its exact source commit/blob lease must match before editing. Unmerged
-branches are evidence or anti-donors, never landed behavior or implicit patch sources.
-The generated
-[documentation readiness audit](docs/agent-operations/documentation-readiness-report.md)
-records structural gaps; it does not replace source review.
+## The tree right now
 
-For audit tasks, read and update [current audit / Resume here](docs/agent-operations/audit-current.md#resume-here)
-and the [audit index](docs/agent-operations/audit-index.md). Retain the inspected
-commit, actual paths/symbols, confirmed/refuted findings, untraced boundaries and next
-exact chain. After interruption compare source changes before continuing. A source
-review is not an executed check; neither is a completed fix. The audit checkpoint is
-not another implementation queue or worker context pack.
+Until roadmap task **L0.1** lands, `crates/`, `modules/`, `migrations/`, `src/`,
+`tests/`, `tools/`, `vendor/`, `config/`, `Justfile` and the CI workflows are **v1
+legacy code**. Do not change it, do not take requirements from it, and do not build
+on it. Borrow from it only what [donors](docs/reference/donors.md) lists.
 
-## Start with the requested code
+## How to do a task
 
-A runtime task starts by reading the exact current callers, owners and symbols and
-editing them. Do not produce another design report, issue series, compatibility plan
-or framework before the requested source change. An audit/documentation task stays in
-that scope.
+1. Take the first unchecked task of the current layer in the
+   [roadmap](docs/roadmap.md) (or the task you were given). One task = one branch =
+   one PR.
+2. Read only the spec sections it links to and the code it touches.
+3. Implement it with tests. Run `just check` (fmt, clippy `-D warnings`, tests).
+4. Tick the task's box in `docs/roadmap.md` in the same PR.
+5. PR description, four short parts: **What** (behavior added), **Tested** (commands
+   and what they showed), **Lines** (net production/test lines per crate),
+   **Spec changes** (if any).
 
-The manager gives each coding worker one compact slice:
+If the spec is wrong or silent, fix the owning spec page in the same PR with the
+smallest edit and say so under *Spec changes*. If a vendor fact on a harness page is
+wrong, correct it there with the source URL and date. If a real product decision is
+needed, add it to [decisions](docs/decisions.md#open-questions-for-the-owner) with a
+default, use the default, and keep going.
 
-- exact base commit and disjoint write scope;
-- observable behavior and completion condition;
-- exact source owners and symbols;
-- applicable AR/PF failure-prevention IDs;
-- retained requirements and unsupported/uncertain cases;
-- old callers, config, fixtures, schemas and branches to delete;
-- one named donor/native mechanism when relevant;
-- minimal affected format/Clippy/build command;
-- focused connected acceptance evidence;
-- report: behavior, deletions, net owned-code change and unresolved facts.
+## Rules
 
-Do not send a worker the full Issue history, audit archive or repository-wide roadmap.
-Use current symbols and paths, not stale line numbers. Changed product meaning creates
-one current Task/Attempt revision or a new slice, not an addendum chain. A confirmed
-finding omitted from the packet is a packet defect; an uncited historical note is not
-automatically a requirement.
+- **Build what the task says, through the real path.** No shims, fallbacks,
+  compatibility layers, placeholder code or code without a caller.
+- **Replace means delete.** When new code replaces old code, the old code goes in the
+  same PR.
+- **No paperwork.** Do not add reports, audits, inventories, status files, plans or
+  new docs pages. The roadmap checkbox and the tests are the status.
+- **Stay small.** Respect the [code budgets](docs/roadmap.md#code-budgets). No new
+  crate, trait or abstraction without two real users today.
+- **Unknown stays unknown.** Never retry a command whose outcome is unknown; never
+  treat silence or a missing source as idle, zero or done.
+- **Native first.** Use the harness's own mechanism; reject a verb rather than fake it.
+- **No secrets** in code, config, events, messages, fixtures or logs.
+- **No paid model calls in CI.** Real harness runs happen only in `just live-*`
+  scripts that the owner runs.
 
-## Preserve autonomous behavior
+## Code
 
-Governor and Manager are agent roles. A direct or explicit command is an attributable
-Store action, not a mandatory human click. Removing a workflow, journal or policy
-layer is valid only when the same slice connects the retained positive path through an
-existing owner.
+- Rust 2024, stable toolchain from `rust-toolchain.toml`, workspace lints.
+- `thiserror` in libraries, `anyhow` in the binary, `tracing` for logs, `tokio` runtime.
+- No `unwrap()` outside tests; `expect("why this cannot fail")` for real invariants.
+- `unsafe` only in `eliot-daemon::platform` (Windows/Unix process and pipe calls).
+- Windows is a first-class target: CI runs on Windows; UTF-8 without BOM; no console
+  windows for child processes; long inputs via files, not argv.
+- Before adding a dependency, check its current version, license and maintenance on
+  docs.rs/crates.io, and name it in the PR.
 
-For every removed mechanism, name and implement:
+## Tests
 
-```text
-trigger/current fact
--> authorized ordinary command
--> state/effect owner
--> readback/result
--> next automatic action or one addressed Governor decision
-```
-
-Do not replace automation with “the operator handles it”, “the manager decides” or
-“unsupported” unless the remaining case genuinely lacks owner authority, credentials
-or product intent. Routine route choice, permission handling, review dispatch,
-all-findings correction, acceptance, publication and recovery should run under the
-configured agent policy. Unknown effects remain visible and block only their exact
-resource while unrelated work continues.
-
-A task for an implementation agent must state what to build, not only what is
-forbidden. Prefer the maintained native capability. When a harness cannot perform the
-requested semantic action, fail at routing with the exact unsupported scope and keep a
-working fallback only when policy selected one; never silently weaken guarantees.
-
-## Keep ownership and slices small
-
-One manager owns one worktree and integrates its candidate. Shared contracts, Store
-state transitions and files touched by several slices stay with that manager. Delegate
-narrow non-overlapping leaf edits. Do not split one atomic transition across workers
-or give several workers independent Git-index ownership.
-
-Use one current implementation and storage format per retained responsibility. Remove
-replaced callers, config, compatibility branches and tests with the new path. A
-semantic product action may have one real consumer. A shared implementation
-abstraction requires two current consumers and must delete both duplicates in the same
-change.
-
-Do not add a crate, service, registry, workflow language, generic repository,
-compatibility facade, generated protocol family or wrapper for hypothetical future
-use. Prefer existing packages and maintained native APIs.
-
-## Do not persist a view
-
-Queue, lane, dashboard, provider status, capacity and work pool are projections over
-current Tasks, Operations, bindings, workspaces and source observations. Do not turn
-them into another state machine, cursor backlog or database.
-
-A blocked item stays in its owning domain; the next pass queries current state.
-Notifications and timers are wake hints. Lost/coalesced wakeups are recovered by a
-bounded current-state query, not per-domain daemons.
-
-Capacity counts actual reserved roots/effects, not API calls. Readback, result,
-refresh and reconcile do not acquire model capacity. Route fallback is an explicit
-ordered policy; never silently substitute provider, model, effort, permissions or
-workspace policy.
-
-## Effects, recovery and evidence
-
-Keep admission atomic and external I/O outside Store transactions. Use native durable
-command/message identity and readback before inventing local retry. Never replay an
-uncertain prompt because a socket closed or an ACK was lost.
-
-Common adapter code may own authenticated Eliot IPC and exact already-formed Store
-deliveries. It must not become a universal effect journal, native session store,
-scheduler or recovery coordinator. Vendor effect recovery stays in the selected
-adapter; Store remains Task/Operation authority.
-
-Check caller and exact object rights at the boundary. Package versions, document
-hashes, compiler paths and historical editions do not grant execution authority.
-Keep every result attached to its original Task, Attempt, Operation, candidate and
-origin boot.
-
-## Requirements, prompts and review
-
-Preserve the current per-requirement evidence plan and candidate-specific acceptance
-semantics. A compact TaskPacket renders goal, requirements, selected sources, write
-boundary, deliverable and verification for the model; Store keeps identity and
-verification policy. Do not put controller proof JSON into the prompt, and do not
-remove executable requirement criteria as “bureaucracy”.
-
-Return all actionable review findings in one correction. Preserve current missing or
-inconclusive reviewer replacement. An unchanged source can gain relevant evidence; a
-fresh ID or unrelated edit is not progress. Bounded no-progress escalates once to the
-Governor agent with concrete choices, not repeatedly to a human.
-
-## Integrate and verify
-
-Publish directly to `main` when the owner requests it. Review the combined
-caller-to-result path and delete superseded code before completion. One independent
-verifier checks the changed boundary after manager integration.
-
-During construction run formatting and the minimal affected warnings-denied Clippy or
-syntax check from [scoped checks](docs/ci-scoped-builds.md). Do not build a broad test
-campaign around an incomplete product path. Run focused connected cases when the
-slice closes and full installed/native/load qualification when the product path is
-ready.
-
-A slice is complete only when new behavior is connected, the old path is absent,
-uncertain outcomes remain honest, routine automation has not been replaced by human
-work, and owning contract/status/audit/prevention records are updated. Report net
-production Rust, JS and glue separately from tests. Keep one implementation queue.
+- `eliot-core`: table-driven unit tests (state reducer, matchers, selectors).
+- `eliot-store`: temp-file databases, including reopen and migration.
+- Everything else: end-to-end through the `eliot` binary with the fake plugin
+  (`plugins/fake`) in a temp data dir.
+- Harness plugins: recorded fixtures + `eliot plugin-test`; live runs via `just live-<name>`.
