@@ -3,6 +3,7 @@ name: Documentation and source audit consistency
 on:
   pull_request:
     paths:
+      - .github/workflows/documentation-readiness-audit.yml
       - AGENTS.md
       - README.md
       - docs/**
@@ -20,6 +21,7 @@ on:
     branches:
       - main
     paths:
+      - .github/workflows/documentation-readiness-audit.yml
       - AGENTS.md
       - README.md
       - docs/**
@@ -46,10 +48,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Validate audit generators
+        run: python -m py_compile tools/ci/documentation_readiness_audit.py tools/ci/source_surface_inventory.py
       - name: Regenerate source inventory
         run: python tools/ci/source_surface_inventory.py
       - name: Regenerate documentation inventory
         run: python tools/ci/documentation_readiness_audit.py
+      - name: Require controlled handoff verdict
+        shell: bash
+        run: |
+          grep -F 'STRUCTURALLY READY FOR CONTROLLED PACKETED IMPLEMENTATION' docs/agent-operations/documentation-readiness-report.md
+          grep -F 'WHOLE-PROJECT SOURCE AUDIT INCOMPLETE' docs/agent-operations/documentation-readiness-report.md
+          grep -F 'Approved exact task packets | 1' docs/agent-operations/documentation-readiness-report.md
       - name: Require committed generated evidence
         shell: bash
         run: |
