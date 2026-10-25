@@ -4,18 +4,24 @@ Read the owner's current task, the short
 [architecture](docs/agent-operations/architecture.md), and the
 [documentation authority map](docs/agent-operations/documentation-map.md) first.
 [Implementation](docs/agent-operations/implementation.md) is the strategic order and
-source-owner map, **not a self-contained worker prompt**. A coding worker receives one
-approved [task packet](docs/agent-operations/task-packet-template.md), or an explicit
-owner instruction containing the same fields, for one exact source revision.
-[Failure prevention](docs/agent-operations/failure-prevention-register.md) maps prior
-failures to retained invariants and acceptance gates. [Status](docs/implementation-status.md)
+source-owner map, **not a self-contained worker prompt**. The
+[implementation slice register](docs/agent-operations/implementation-slice-register.md)
+records which bounded slices are actually eligible for assignment. A coding worker
+receives one approved packet from the
+[task-packet index](docs/agent-operations/task-packets/README.md); the
+[packet template](docs/agent-operations/task-packet-template.md) is only the required
+format. [Failure prevention](docs/agent-operations/failure-prevention-register.md) maps
+prior failures to retained invariants and acceptance gates. [Status](docs/implementation-status.md)
 separates implemented facts from plans and qualification. Historical specifications,
 audits, remediation plans and Claude scripts are evidence for the manager, never
 additional worker instructions. The owner's latest explicit decision wins.
 
 The repository-wide source audit is currently incomplete. Do not claim that the whole
 project is ready for autonomous implementation merely because one slice has a design,
-source trace or passing compiler gate. The generated
+source trace or passing compiler gate. Only a slice marked `APPROVED_PACKET` may be
+assigned, and its exact source commit/blob lease must match before editing. Unmerged
+branches are evidence or anti-donors, never landed behavior or implicit patch sources.
+The generated
 [documentation readiness audit](docs/agent-operations/documentation-readiness-report.md)
 records structural gaps; it does not replace source review.
 

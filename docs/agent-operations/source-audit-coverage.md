@@ -61,7 +61,7 @@ The source audit is complete only when:
 
 Do not continue implementation A2 as a substitute for this audit. Continue source review in manager-owned, non-overlapping clusters:
 
-1. **Finish entrypoints/public surfaces:** generate CLI ↔ host policy/catalog mapping; trace root compatibility retirement consumers; classify every public `swarm-kernel` function; trace bus enrollment/poll/cursor/action; trace telemetry producer-to-persisted-readback. Record the result in the existing CP checkpoint.
+1. **Close the remaining CP-001–006 cross-boundaries:** generate CLI ↔ host policy/catalog mapping; trace root compatibility retirement consumers; classify every public `swarm-kernel` function; trace Bus enrollment/poll/cursor/action; trace telemetry producer-to-persisted-readback/disclosure/shutdown. Extend the existing CP checkpoint; do not relabel the already inventoried packages as untraced.
 2. **Shared boundaries:** `swarm-contracts`, `swarm-client`, `swarm-process`; enumerate every current consumer and compatibility format.
 3. **Store completeness:** file-level `swarm-kernel-host/src/store`, `swarm-store`, all migrations and read models; reconcile against AR-001–170.
 4. **Adapters:** one adapter at a time, exact action/recovery/result matrix plus old package/data disposition.

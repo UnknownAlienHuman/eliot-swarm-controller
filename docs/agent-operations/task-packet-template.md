@@ -4,6 +4,7 @@ A coding agent receives one completed copy of this packet, not the repository-wi
 
 ## Identity
 
+- **Packet status:** `APPROVED | BLOCKED | SUPERSEDED`
 - **Slice ID:**
 - **Owner decision / Task revision:**
 - **Base branch and exact commit:**
@@ -11,6 +12,16 @@ A coding agent receives one completed copy of this packet, not the repository-wi
 - **Assigned agent and disjoint write scope:**
 - **Owning current contract:**
 - **Related audit/failure-prevention IDs:**
+
+## Source lease
+
+| Pre-existing write owner | Required blob SHA | Why it is in scope |
+| --- | --- | --- |
+| | | |
+
+Every blob must match the packet's exact base. A mismatch blocks the packet until the
+manager rereads the changed caller/consumer, deletion/data disposition and focused
+acceptance boundary. Do not update SHAs mechanically.
 
 ## Observable result
 
@@ -64,6 +75,16 @@ Add slice-specific cases. Do not silently weaken guarantees or substitute a prov
 | | | | | |
 
 A new path is incomplete while the replaced producer, caller, config, schema, fixture or compatibility branch still accepts new work.
+
+## Prior attempts and anti-donors
+
+- **Unmerged branches/PRs inspected:**
+- **Mechanisms retained:**
+- **Mechanisms explicitly rejected:**
+- **Why no wholesale cherry-pick is permitted:**
+
+An experimental branch is evidence only. It cannot authorize source drift, import its
+status claims or replace the packet's exact invariants and data disposition.
 
 ## Donor/native mechanism
 

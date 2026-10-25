@@ -33,7 +33,11 @@ substitute. Assign implementation only through an exact
 
 The generated [surface inventory](source-surface-inventory.md) is syntax/dependency
 evidence, not semantic or runtime qualification. CP IDs are package-coverage findings,
-not additions to the stable AR-001–170 failure register.
+not additions to the stable AR-001–170 failure register. CP-001–006 closes the initial
+package-role inventory for these surfaces; it does **not** close the named CLI/host,
+compatibility-retirement, kernel-function, Bus lifecycle or telemetry persistence
+chains. Assignment eligibility is tracked separately in the
+[implementation slice register](implementation-slice-register.md).
 
 <a id="evidence-checkpoints"></a>
 ## Evidence checkpoints

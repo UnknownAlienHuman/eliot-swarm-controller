@@ -10,8 +10,11 @@ not an exhaustive source reread. The repository-wide audit remains incomplete; s
 [documentation readiness](documentation-readiness-report.md) and
 [status](../implementation-status.md).
 
-A coding agent receives one approved [task packet](task-packet-template.md) for one
-exact revision. The packet cites the applicable
+Assignment eligibility is owned by the
+[implementation slice register](implementation-slice-register.md). A coding agent
+receives one approved packet from the [task-packet index](task-packets/README.md) for
+one exact revision; the [template](task-packet-template.md) defines the required
+fields but is not itself a work order. The packet cites the applicable
 [failure-prevention entries](failure-prevention-register.md), current symbols,
 positive path, deletions/data disposition and focused acceptance evidence. Do not send
 this entire A–V roadmap as an assignment.
@@ -191,10 +194,22 @@ binding/root checks and `agent.refresh` remains a standalone read action. Run
 No integration, installed harness, crash or load qualification is claimed. Net change:
 −305 production Rust lines, −20 qualification-glue lines and +3 test lines.
 
-**A2:** retain complete terminal bytes and final outcome/result parameters with
-Operation, original binding/generation and origin boot in private atomic files before
-acknowledging local retention. Same-boot IPC reconnect resends unchanged parameters;
-delete only after Store ACK. Observations use one replaceable checkpoint per source.
+**A2.1 — approved packet:** durable same-owner Store delivery. Persist exact
+`module.outcome` and `module.result` params before IPC, resend only byte-identical
+params after connection loss, delete only the exact ACKed record and quarantine every
+prior-boot file. See the exact source/blob lease and acceptance boundary in
+[`task-packets/a2-1-antigravity-durable-delivery.md`](task-packets/a2-1-antigravity-durable-delivery.md).
+
+**A2.2 — blocked on A2.1:** authorized successor delivery, Store-authoritative aggregate
+coverage, safe local body release and restart/ACK-loss evidence. It may be assigned only
+after A2.1 lands and its packet is refreshed to exact merged blobs; see
+[`task-packets/a2-2-antigravity-restart-coverage.md`](task-packets/a2-2-antigravity-restart-coverage.md).
+
+The full A2 target remains: retain complete terminal bytes and final outcome/result
+parameters with Operation, original binding/generation and origin boot in private
+atomic files before acknowledging local retention. Same-boot IPC reconnect resends
+unchanged parameters; delete only after Store ACK. Observations use one replaceable
+checkpoint per source.
 
 A process restart is not an IPC reconnect. After existing custody checks fence the
 previous delivery owner, the authorized successor uses the existing reconciliation

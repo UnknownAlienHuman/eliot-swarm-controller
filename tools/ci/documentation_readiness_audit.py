@@ -29,6 +29,8 @@ ENTRYPOINTS = {
     "docs/agent-operations/README.md",
 }
 CURRENT_STATUS = {"docs/implementation-status.md"}
+HANDOFF_REGISTERS = {"docs/agent-operations/implementation-slice-register.md"}
+TASK_PACKET_PREFIX = "docs/agent-operations/task-packets/"
 CURRENT_CONTRACTS = {
     "docs/agent-operations/architecture.md",
     "docs/agent-operations/implementation.md",
@@ -161,6 +163,10 @@ def classify(path: Path) -> str:
         return "entrypoint"
     if name in CURRENT_STATUS:
         return "current-status"
+    if name in HANDOFF_REGISTERS:
+        return "handoff-register"
+    if name.startswith(TASK_PACKET_PREFIX):
+        return "task-packet"
     if name in CURRENT_CONTRACTS:
         return "current-contract"
     if name in GENERATED_AUDIT:
@@ -218,8 +224,14 @@ def main() -> None:
         or item["status_markers"]["audit_incomplete_phrase"]
         or item["status_markers"]["not_exhaustive"]
     ]
-    required = sorted(ENTRYPOINTS | CURRENT_STATUS | CURRENT_CONTRACTS)
+    required = sorted(ENTRYPOINTS | CURRENT_STATUS | HANDOFF_REGISTERS | CURRENT_CONTRACTS)
     missing_required = [path for path in required if not (ROOT / path).exists()]
+    approved_packets = [
+        item["path"]
+        for item in records
+        if item["classification"] == "task-packet"
+        and "**Packet status: APPROVED**" in (ROOT / item["path"]).read_text(encoding="utf-8")
+    ]
     oversized = sorted(
         (item for item in records if item["bytes"] >= 25_000),
         key=lambda item: item["bytes"],
@@ -232,23 +244,28 @@ def main() -> None:
     ]
     counts = Counter(item["classification"] for item in records)
 
-    reasons: list[str] = []
-    if explicit_incomplete:
-        reasons.append(
-            "current source-of-truth documents explicitly declare the source audit incomplete or non-exhaustive"
-        )
+    structural_reasons: list[str] = []
     if broken:
-        reasons.append("repository-local Markdown links are broken")
+        structural_reasons.append("repository-local Markdown links are broken")
     if missing_required:
-        reasons.append("required entry points/contracts are missing")
-    verdict = (
-        "NOT READY"
-        if reasons
-        else "STRUCTURALLY READY; SOURCE COMPLETENESS STILL REQUIRES EVIDENCE REVIEW"
+        structural_reasons.append("required entry points/contracts/handoff registers are missing")
+    if not approved_packets:
+        structural_reasons.append("no exact approved implementation packet exists")
+    structural_verdict = (
+        "NOT STRUCTURALLY READY"
+        if structural_reasons
+        else "STRUCTURALLY READY FOR CONTROLLED PACKETED IMPLEMENTATION"
     )
+    source_verdict = (
+        "WHOLE-PROJECT SOURCE AUDIT INCOMPLETE"
+        if explicit_incomplete
+        else "NO EXPLICIT SOURCE-INCOMPLETENESS MARKER; MANUAL EVIDENCE REVIEW REQUIRED"
+    )
+    verdict = f"{structural_verdict} / {source_verdict}"
+    reasons = structural_reasons
 
     inventory = {
-        "schema_version": 3,
+        "schema_version": 4,
         "documentation_sha256": documentation_sha256,
         "verdict": verdict,
         "reasons": reasons,
@@ -258,8 +275,10 @@ def main() -> None:
             **dict(sorted(counts.items())),
             "broken_local_links": len(broken),
             "oversized_25k_or_more": len(oversized),
+            "approved_task_packets": len(approved_packets),
         },
         "missing_required_documents": missing_required,
+        "approved_task_packets": approved_packets,
         "explicit_incomplete_documents": explicit_incomplete,
         "broken_links": [item.__dict__ for item in broken],
         "oversized_documents": oversized,
@@ -284,7 +303,9 @@ def main() -> None:
     lines.extend(
         [
             "",
-            "This verdict concerns whether an implementation agent can safely treat the documentation as complete. It does not convert source reading, design text or a compiler pass into runtime qualification.",
+            f"Structural verdict: **{structural_verdict}**. Whole-project source verdict: **{source_verdict}**.",
+            "",
+            "Structural readiness authorizes only exact approved packets. It does not convert source reading, design text or a compiler pass into whole-project source completeness or runtime qualification.",
             "",
             "## Inventory",
             "",
@@ -300,6 +321,7 @@ def main() -> None:
         [
             f"| Broken repository-local Markdown links | {len(broken)} |",
             f"| Documents at least 25 KiB | {len(oversized)} |",
+            f"| Approved exact task packets | {len(approved_packets)} |",
             "",
             "Classification follows [`documentation-map.md`](documentation-map.md). `supporting-reference` is an explicit non-authoritative class, not an unreviewed worker instruction.",
             "",

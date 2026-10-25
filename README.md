@@ -35,11 +35,13 @@ V3 is the required refactoring target, not a description of a completed rewrite.
 Start at the [documentation authority map](docs/agent-operations/documentation-map.md)
 and [current document index](docs/agent-operations/README.md). Resume source research
 at [current audit / Resume here](docs/agent-operations/audit-current.md#resume-here),
-not the frozen historical register. Coding agents receive one approved
-[task packet](docs/agent-operations/task-packet-template.md) constrained by the
-[failure-prevention register](docs/agent-operations/failure-prevention-register.md).
-Old programs/specifications are dated evidence, never additional implementation
-queues.
+not the frozen historical register. The
+[implementation slice register](docs/agent-operations/implementation-slice-register.md)
+shows which work is audited enough to assign; agents receive one approved packet from
+the [task-packet index](docs/agent-operations/task-packets/README.md), constrained by
+the [failure-prevention register](docs/agent-operations/failure-prevention-register.md).
+Old programs, specifications and unmerged implementation branches are evidence or
+anti-donors, never additional queues or implicit patch sources.
 
 ## Build and run
 

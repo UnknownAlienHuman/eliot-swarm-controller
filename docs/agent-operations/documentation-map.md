@@ -8,9 +8,11 @@ This map prevents old audits, specifications and remediation plans from becoming
 2. [`AGENTS.md`](../../AGENTS.md): repository-wide working rules.
 3. This directory's [`README`](README.md): navigation and current document roles.
 4. [`architecture.md`](architecture.md): product purpose and non-negotiable boundaries.
-5. An approved [task packet](task-packet-template.md) for one exact source revision.
-6. The domain contract named by that task packet.
-7. Current source and executed evidence.
+5. The [implementation slice register](implementation-slice-register.md), which may
+   mark only a bounded slice `APPROVED_PACKET`.
+6. One exact approved packet from the [task-packet index](task-packets/README.md).
+7. The domain contract named by that packet.
+8. Current source and executed evidence.
 
 [`implementation.md`](implementation.md) is the strategic dependency/order map. It is not a self-contained worker prompt. No agent receives the whole A–V roadmap as its assignment.
 
@@ -21,7 +23,8 @@ This map prevents old audits, specifications and remediation plans from becoming
 | `entrypoint` | Repository navigation and worker rules. | Yes, together with a task packet. |
 | `current-contract` | Normative target for one current responsibility. | Only for the assigned slice. |
 | `current-status` | Landed behavior, open limits and qualification state. | No; it constrains claims. |
-| `task-packet` | Exact base, symbols, positive path, deletions and gates for one slice. | Yes. |
+| `handoff-register` | Slice eligibility, dependencies and packet state. | Selects a packet; does not replace it. |
+| `task-packet` | Exact base/blob lease, symbols, positive path, deletions and gates for one slice. | Yes, only while `APPROVED`. |
 | `module-guide` | Current package/artifact-specific operation notes. | Only when the packet names that module. |
 | `audit-evidence` | Source findings, traces and immutable checkpoints. | No; evidence must be translated into the current contract/packet. |
 | `qualification-evidence` | Executed check receipts tied to exact source/binaries. | No; it proves only its recorded scope. |
@@ -42,6 +45,13 @@ This map prevents old audits, specifications and remediation plans from becoming
 - `docs/agent-operations/{architecture,implementation,delivery,configuration,module-api,module-installation,store-evolution,ipc-mcp,external-effects,github-sources,observability,modularity,shared-packages,donor-map,refactoring}.md`
 - `docs/implementation-status.md`
 - Current domain documents explicitly linked by the Agent Operations README, including launcher, CheckRun, ScriptRun, communication, gateway and MCP contracts.
+
+### Handoff register and task packets
+
+- `docs/agent-operations/implementation-slice-register.md`
+- `docs/agent-operations/task-packets/README.md`
+- `docs/agent-operations/task-packets/*.md`
+- `docs/agent-operations/task-packet-template.md` is the format contract, not an approved assignment.
 
 ### Audit and qualification evidence
 

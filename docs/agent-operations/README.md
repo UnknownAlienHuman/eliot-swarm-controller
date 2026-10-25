@@ -2,16 +2,19 @@
 
 The V3 target is a compact controller for native-agent work. Implementation is partial;
 [status](../implementation-status.md) separates landed code, source evidence and
-unexecuted qualification. The whole-project source audit and documentation-readiness
-gate are **not complete**.
+unexecuted qualification. The documentation authority, failure-prevention and packet
+handoff are structurally ready for controlled slice-by-slice work. The whole-project
+source audit and runtime qualification remain **incomplete** and are reported
+separately.
 
 ## Read in this order
 
 1. [Documentation authority map](documentation-map.md): what is current, evidence or historical.
 2. [Architecture](architecture.md): product purpose and non-negotiable boundaries.
 3. [Failure-prevention register](failure-prevention-register.md): prior failures and mandatory gates.
-4. One approved [task packet](task-packet-template.md) for the assigned exact source revision.
-5. The domain contract and current source named by that packet.
+4. [Implementation slice register](implementation-slice-register.md): which slice is assignable now.
+5. One `APPROVED` packet from the [task-packet index](task-packets/README.md).
+6. The domain contract and exact current source named by that packet.
 
 [Implementation](implementation.md) is the strategic dependency/order map. It is not a
 self-contained worker assignment. Coding agents receive one narrow slice and do not
@@ -20,15 +23,15 @@ receive the whole audit archive or repository-wide A–V roadmap.
 
 ## Current readiness
 
-The generated [documentation readiness report](documentation-readiness-report.md)
-and [machine inventory](documentation-inventory.json) check local links, explicit
-incompleteness markers and classification. They do not prove source or runtime
-correctness.
+The generated [documentation readiness report](documentation-readiness-report.md) and
+[machine inventory](documentation-inventory.json) check authority classification,
+required handoff documents, approved packet presence and local links. The structural
+verdict is independent from the whole-project source-audit verdict.
 
-Until the report and [implementation status](../implementation-status.md) both record a
-completed whole-project source audit, agents may implement only explicitly approved
-slices with exact current symbols and acceptance evidence. No document may describe
-unmerged code as landed.
+Controlled implementation is allowed only for a slice marked `APPROVED_PACKET` in the
+[slice register](implementation-slice-register.md) and backed by an exact packet in
+[`task-packets/`](task-packets/README.md). Every other slice remains blocked by a named
+dependency or `AUDIT_REQUIRED`. No document may describe unmerged code as landed.
 
 ## Resume research after an interruption
 
@@ -51,8 +54,10 @@ infer a runtime repair from documentation, a search hit or a test that was only 
 | [Current audit](audit-current.md) | Active source findings, exact resume point and untraced boundaries. |
 | [Audit index](audit-index.md) | Immutable evidence checkpoints and source/target navigation. |
 | [Failure prevention](failure-prevention-register.md) | AR/PF invariants, implementation owner and closure evidence. |
+| [Implementation slice register](implementation-slice-register.md) | Assignment eligibility, dependency blocks and handoff order for A–V. |
+| [Task-packet index](task-packets/README.md) | Approved, blocked and superseded exact worker packets. |
 | [Source-audit coverage](source-audit-coverage.md) | Package/non-workspace coverage, untraced boundaries and next audit sequence. |
-| [Task packet](task-packet-template.md) | Exact assignment format for one implementation slice. |
+| [Task packet template](task-packet-template.md) | Required assignment format; not an assignment by itself. |
 | [Delivery](delivery.md) | Assignment, capture, review, correction, acceptance and publication cycle. |
 | [Configuration](configuration.md) | Manager policy and the target current-state loop. |
 | [Module API](module-api.md) | Semantic harness actions, result delivery and recovery. |
@@ -77,7 +82,8 @@ infer a runtime repair from documentation, a search hit or a test that was only 
 | What may an agent treat as current? | [Documentation authority map](documentation-map.md) |
 | What must the product do? | [Architecture](architecture.md), [delivery](delivery.md) |
 | What is the strategic order? | [Implementation runtime order](implementation.md#5-runtime-order) |
-| What may this worker change now? | Its approved [task packet](task-packet-template.md) |
+| Which slice may be assigned now? | [Implementation slice register](implementation-slice-register.md) |
+| What may this worker change now? | Its exact approved packet from [task-packets](task-packets/README.md) |
 | Which previous failures constrain this slice? | [Failure prevention](failure-prevention-register.md) |
 | How does Store schema compatibility work? | [Store evolution](store-evolution.md) |
 | How do frontend concurrency and subscriptions work? | [IPC/MCP](ipc-mcp.md) |

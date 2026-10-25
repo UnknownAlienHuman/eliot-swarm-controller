@@ -22,41 +22,41 @@ mechanisms; and [status](../implementation-status.md) owns landed behavior.
 
 - **Live merged source basis:** `main` at
   `797ea93f1cfcaad8c8dde2629d666e64efb131c2` (PR #194, Antigravity A1b).
-- **Last completed source-audit range:** AR-160–170, frozen at
-  `0a228cd3a2fde9f38be136485b53b88c7e0e5c84`. A1b is a later implementation
-  checkpoint, not a new audit range and not evidence that unchanged packages were read.
-- **Whole-project source audit:** incomplete. The package inventory in
-  [source-audit coverage](source-audit-coverage.md) records broad partial coverage for
-  `swarm-kernel-host`, partial coverage for several adapters/effect owners, and
-  untraced package boundaries including `swarm-cli`, `swarm-kernel`, `swarm-bus` and
-  `swarm-telemetry`.
-- **Documentation readiness:** the 2026-10-24 structural audit found stale authority,
-  broken links and unclassified evidence. The current repair adds one
-  [authority map](documentation-map.md), one [task-packet format](task-packet-template.md)
-  and one [failure-prevention register](failure-prevention-register.md); this improves
-  assignment safety but does not complete source review.
+- **Stable historical finding coverage:** AR-001–170 is indexed through the gateway
+  checkpoint. This is a failure/evidence register, not proof that every package was read.
+- **Completed package checkpoint:** CP-001–006 inventoried root entrypoints,
+  `swarm-cli`, `swarm-kernel`, `swarm-bus` and `swarm-telemetry` at the source basis
+  above. Their package roles are no longer “untraced”; the exact cross-boundary chains
+  listed in the checkpoint remain partial/open.
+- **Whole-project source audit:** incomplete. Shared contracts/client/process,
+  file-level Store/migrations/read models, adapters, effect/observation owners and
+  non-workspace tooling/qualification surfaces still require the sequence in
+  [source-audit coverage](source-audit-coverage.md).
+- **Documentation handoff:** authority, AR/PF prevention and assignment eligibility are
+  reconciled. [A2.1](task-packets/a2-1-antigravity-durable-delivery.md) is the only
+  current `APPROVED` implementation packet and is leased to exact `main@797ea93` blobs.
+  [A2.2](task-packets/a2-2-antigravity-restart-coverage.md) is explicitly blocked until
+  A2.1 lands and the Store/custody boundary is refreshed.
+- **Unmerged A2 experiment:** `impl/antigravity-a2-delivery-20261024` at
+  `37caeb337cdfa4a6242e401352b52fec4a09e105` is evidence/anti-donor only. It is not
+  landed, assignable or a wholesale cherry-pick source.
 - **Preserve from A1b:** exact Task/Attempt/current-revision and launch-parent checks;
-  binding generation and current route; boot/root/connection/recovery fences; model
-  readback honesty; workspace authority; adapter command-time binding/root checks; no
-  replay after uncertain input. `agent.refresh` remains optional readback and is not a
-  dispatch permission.
-- **Unmerged implementation branch:** `impl/antigravity-a2-delivery-20261024` is an
-  experiment/PR candidate only. Do not describe A2a as landed on `main` or use its
-  documentation as the whole-project audit checkpoint.
-- **Next exact audit sequence:** (1) root entrypoints plus `swarm-cli`, `swarm-kernel`,
-  `swarm-bus`, `swarm-telemetry`; (2) shared contracts/client/process and every current
-  consumer; (3) file-level Store/migrations/read models; (4) one adapter at a time;
-  (5) effects/observation; (6) tooling, installers, descriptors, tests and evidence.
-  Update this register, the [audit index](audit-index.md),
-  [source-audit coverage](source-audit-coverage.md) and
-  [failure prevention](failure-prevention-register.md) after each cluster.
+  binding generation and route; boot/root/connection/recovery fences; honest model
+  readback; workspace authority; adapter command-time binding/root checks; no replay
+  after uncertain input. `agent.refresh` remains optional readback, not dispatch authority.
+- **Next exact source-audit chain:** close the remaining CP-001–006 cross-boundaries:
+  CLI ↔ host method policy/catalog, root compatibility retirement consumers, every
+  public `swarm-kernel` function, Bus enrollment/poll/cursor/action, and telemetry
+  producer → persisted readback/disclosure/shutdown. Then continue shared
+  contracts/client/process and every current consumer.
 - **Qualification remains separate:** source reading and compiler gates do not prove
-  provider, installed harness, crash/restart, migration, security, Windows/Linux,
-  concurrency or load behavior.
+  installed provider, crash/restart, migration, security, Windows/Linux, concurrency
+  or load behavior.
 
-Do not continue implementation A2 as an audit substitute. Compare each selected audit
-cluster with live `main`, trace caller → authority → state/effect → readback → consumer,
-and record every uninspected boundary rather than treating it as clean.
+Do not continue an implementation branch as an audit substitute. For audit work compare
+the selected chain with live `main`, trace caller → authority → state/effect → readback
+→ consumer, and record every uninspected boundary. For implementation work assign only
+an exact approved packet whose commit and blob lease still match.
 
 <a id="findings-ar-160170"></a>
 ## Findings AR-160–170
