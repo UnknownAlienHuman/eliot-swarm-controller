@@ -1,0 +1,52 @@
+name: Finalize documentation handoff
+
+on:
+  push:
+    branches:
+      - docs/agent-ready-audit-20261024
+    paths:
+      - .github/workflows/finalize-documentation-handoff.yml
+      - tools/ci/finalize_documentation_handoff.py.gz.b64
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decode finite patcher
+        shell: bash
+        run: |
+          base64 --decode tools/ci/finalize_documentation_handoff.py.gz.b64 | gzip --decompress > tools/ci/finalize_documentation_handoff.py
+      - name: Reconcile documentation handoff
+        run: python tools/ci/finalize_documentation_handoff.py
+      - name: Regenerate source and documentation evidence
+        run: |
+          python tools/ci/source_surface_inventory.py
+          python tools/ci/documentation_readiness_audit.py
+      - name: Validate generated result
+        shell: bash
+        run: |
+          git diff --check
+          python -m py_compile tools/ci/documentation_readiness_audit.py tools/ci/source_surface_inventory.py
+          grep -F 'STRUCTURALLY READY FOR CONTROLLED PACKETED IMPLEMENTATION' docs/agent-operations/documentation-readiness-report.md
+          grep -F 'WHOLE-PROJECT SOURCE AUDIT INCOMPLETE' docs/agent-operations/documentation-readiness-report.md
+          grep -F 'Approved exact task packets | 1' docs/agent-operations/documentation-readiness-report.md
+      - name: Remove one-shot machinery and publish
+        shell: bash
+        run: |
+          rm -f tools/ci/finalize_documentation_handoff.py tools/ci/finalize_documentation_handoff.py.gz.b64 .github/workflows/finalize-documentation-handoff.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No changes to publish'
+            exit 0
+          fi
+          git commit -m 'docs: finalize controlled implementation handoff'
+          git push origin HEAD:${GITHUB_REF_NAME}
