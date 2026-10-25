@@ -68,8 +68,9 @@ implement only that one. The v2 paths v1 used: `GET /api/info` (version),
 - The SSE stream is volatile: after a gap, rebuild from message reads.
 - The installed client registers its server in `$XDG_STATE_HOME/opencode/service.json`
   (default `~/.local/state/opencode/service.json`): `url`, `pid`, optional `version`,
-  `id` and local HTTP `password` (never log it) — use it to attach to the owner's
-  server.
+  `id` and local HTTP `password` — use it to find the owner's server URL; the
+  password, if any, comes from the env var named in config (`password_env`), never
+  from that file or a log.
 - Data dir `~/.local/share/opencode` (`%USERPROFILE%\.local\share\opencode` on
   Windows) with `opencode.db` (SQLite: projects, sessions, messages). Read-only access
   for `discover`; never write; it is a live WAL database.

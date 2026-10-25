@@ -19,9 +19,8 @@ on it. Borrow from it only what [donors](docs/reference/donors.md) lists.
 2. Read only the spec sections it links to and the code it touches.
 3. Implement it with tests. Run `just check` (fmt, clippy `-D warnings`, tests).
 4. Tick the task's box in `docs/roadmap.md` in the same PR.
-5. PR description, four short parts: **What** (behavior added), **Tested** (commands
-   and what they showed), **Lines** (net production/test lines per crate),
-   **Spec changes** (if any).
+5. PR description, three short parts: **What** (behavior added), **Tested** (commands
+   and what they showed), **Spec changes** (if any). CI prints line counts.
 
 If the spec is wrong or silent, fix the owning spec page in the same PR with the
 smallest edit and say so under *Spec changes*. If a vendor fact on a harness page is
@@ -42,7 +41,9 @@ needed, pick the simplest choice that fits the vision, record it in the
 - **Unknown stays unknown.** Never retry a command whose outcome is unknown (only
   `interrupt`/`stop` are retried once, see [core](docs/spec/core.md#commands)); never
   treat silence or a missing source as idle, zero or done.
-- **Native first.** Use the harness's own mechanism; reject a verb rather than fake it.
+- **Native first.** Use the harness's own mechanism. Where the plugin protocol allows an
+  equivalent mechanism (reported in `detail.mechanism`, e.g. `inject` by prepending),
+  use it; never substitute a weaker action silently — reject the verb instead.
 - **No secrets** in code, config, events, messages, fixtures or logs.
 - **No model calls in CI.** CI replays recordings. Real harness runs
   (`just record-*`, `just live-*`) are fine on a machine where the harness is

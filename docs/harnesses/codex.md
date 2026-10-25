@@ -30,9 +30,10 @@ schema generator before coding.
 - Handshake: request `initialize` with `clientInfo` and `capabilities`
   (`experimentalApi: true` is needed for child discovery filters), then the client
   initialized notification (exact name: check the generated schema).
-- One app-server process hosts many threads. Topology: one app-server per distinct
-  set of launch-time config overrides (normally one per proxy route); agents whose
-  profiles resolve to the same overrides share it. `cwd` is per thread.
+- One app-server process can host many threads, but tools run by any thread inherit
+  that process's environment — so agents sharing an app-server would share
+  `ELIOT_AGENT_TOKEN` and Git identity. Topology: one app-server per agent; the plugin
+  process manages many of them (`multi_session: true`).
 
 ## Auth
 
@@ -160,7 +161,9 @@ wire_api = "responses"            # the only accepted value; "chat" is rejected
 `just record-codex` records these into `plugins/codex/fixtures/` (cheapest model, tiny
 prompts in a scratch repo): `turn` (launch + one turn), `two-turns`, `steer`,
 `interrupt`, `approve-command`, `deny-command`, `approve-file`, `user-input`, `goal`
-(set, pause, resume, clear), `subagent`, `resume`, `bad-model` (error).
+(set, pause, resume, clear), `subagent`, `resume`, `bad-model` (error), plus two
+replay-only scenarios built from those recordings with control lines: `no-reply`
+(`{"dir": "hang"}`) and `reattach` (`{"dir": "exit"}` then a new session).
 
 ## Unverified
 
@@ -170,5 +173,7 @@ do.
 - Name of the client's initialized notification and the settings fields `turn/start`
   and `thread/start` accept (generated schema).
 - Whether `-c` overrides reach `codex app-server`, or per-thread config is needed.
+  If neither works, proxy routing for Codex falls back to OpenCodex's own
+  `ocx codex-shim` and the plugin reports `proxy: none`.
 - Whether `turn/steer` is accepted while an approval is pending.
 - Whether the app-server exits when its stdin closes.

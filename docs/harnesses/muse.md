@@ -64,8 +64,9 @@ release tags; the registries are the version source. MIT per v1 records.
 
 ## Billing routes
 
-Muse Max subscription, Muse Go and pay-as-you-go are different routes. A profile names
-one; Eliot never substitutes another ([architecture](../architecture.md#core-rules)
+Muse runs inference itself and documents no base-URL override, so proxies do not
+apply (manifest `proxy: none`). Muse Max subscription, Muse Go and pay-as-you-go are
+different routes. A profile names one; Eliot never substitutes another ([architecture](../architecture.md#core-rules)
 rule 8).
 
 ## v1 pitfalls

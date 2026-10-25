@@ -117,9 +117,14 @@ Rules:
   live agents building in one target directory block or corrupt each other's builds.
   Eliot does not serialize Cargo for them.
 - Windows: keep the data dir short (worktrees live under it and `MAX_PATH` is real);
-  Eliot sets `core.longpaths=true` in worktrees it creates and fails with a clear error
-  when a path is still too long.
-- Unknown keys are an error at load time, with the file and line.
+  Eliot passes `core.longpaths=true` to its own `git` calls and to agent processes
+  through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` (no config file is
+  written) and fails with a clear error when a path is still too long.
+- Merging: a project file's `[profiles.X]` replaces the global `[profiles.X]` as a
+  whole; other tables merge key by key, project over global.
+- Unknown keys are an error at load time, with the file and line — except inside
+  `[plugins.<name>]`, whose extra keys are passed to the plugin and validated by it at
+  `initialize`.
 - `eliot status` shows the effective merged config source for each profile.
 
 ## Plugins
@@ -143,6 +148,7 @@ gateway, or a [local model server](../harnesses/local-models.md)):
 | `attach` | Base URL of an already running proxy. Eliot checks `health` and never stops it. |
 | `max_live` | Optional cap on live agents across all profiles that use this proxy. |
 | `launch` | Command to start it. Eliot supervises it as a service: starts before the first agent that needs it, health-checks, restarts with backoff, stops when no agent uses it for `idle_stop` (default never). |
+| `idle_stop` | For `launch`ed proxies: stop after no agent used it for this long (default: never). |
 | `health` | Path for the health check (HTTP 200 = up). |
 | `api_key_env` | Env var with the key the harness must send to the proxy. |
 | `base_url_for` | Optional per-harness override, e.g. `{ claude = "http://127.0.0.1:10100/anthropic" }`. |

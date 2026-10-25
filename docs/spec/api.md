@@ -5,11 +5,11 @@
 - JSON-RPC 2.0, one JSON object per line (NDJSON), UTF-8.
 - Windows: named pipe `\\.\pipe\eliot-<hash(data_dir)>`, ACL limited to the current
   user. Unix: socket `<data_dir>/eliot.sock`, mode `0600`.
-- The daemon writes the endpoint into `<data_dir>/daemon.json` (`pid`, `endpoint`,
-  `version`, `started_at`). Clients read it; no discovery service. A client or a
-  second daemon treats it as live only if that PID exists with the recorded process
-  start time (PIDs are reused); a stale `daemon.lock` is taken over only under the
-  same check.
+- Single instance: the daemon holds an OS exclusive lock on `<data_dir>/daemon.lock`
+  for its lifetime (the OS releases it on a crash, so no takeover logic is needed).
+  It then writes `<data_dir>/daemon.json` (`pid`, `endpoint`, `version`,
+  `started_at`). Clients read it; no discovery service. A client treats it as live
+  only if that PID exists with the recorded process start time (PIDs are reused).
 - Caller identity: requests without a token are the **owner**. Agents get
   `ELIOT_AGENT_TOKEN` at launch and the CLI sends it automatically; the daemon maps it
   to the agent id. This is attribution and routing, not a security boundary
@@ -66,26 +66,27 @@ All commands accept `--json` (machine output on stdout, logs on stderr) and
 Every command that changes something accepts `--id ID`; without it the CLI generates
 one and prints it, and a retry after an unknown outcome must pass the same `--id`.
 
-`eliot daemon` (without `--foreground`) starts itself again with `--foreground`,
-detached from the calling terminal so it survives that terminal closing, and returns
-once `daemon.json` appears. Other commands never start the daemon; when it is not
+`eliot daemon` (without `--foreground`) removes a stale `daemon.json`, starts itself
+again with `--foreground`, detached from the calling terminal so it survives that
+terminal closing, and returns once a `daemon.json` with the child's PID appears. Other commands never start the daemon; when it is not
 running they fail with `unavailable` and say so.
 
 ### Exit codes
 
 | Code | Meaning | Error codes |
 | --- | --- | --- |
-| 0 | ok (command `applied` or `queued`, query answered) | — |
+| 0 | ok (command `applied` or `queued`, `cmd cancel` succeeded, query answered) | — |
 | 1 | error | `not_found`, `invalid`, `busy`, `unavailable`, `internal`, command `failed` |
 | 2 | CLI usage error (bad flags) | — |
-| 3 | rejected — nothing happened | `unsupported`, `not_allowed`, `bad_state` |
+| 3 | rejected — nothing happened | `unsupported`, `not_allowed`, `bad_state`, command `rejected` |
 | 4 | outcome unknown | command `unknown` |
 | 5 | `wait` timed out | — |
+| 6 | pending: the command is still `dispatched` when the CLI stops waiting; read it back with `eliot cmd show ID` | — |
 
 ```text
 eliot daemon [--foreground]                 start the daemon (default: background, returns when ready)
 eliot daemon stop [--drain | --force]       stop it (drain: let running turns finish, admit nothing new)
-eliot status                                daemon, plugins, sources
+eliot status                                daemon, plugins, sources, where each profile's config came from
 eliot launch [--profile P] [--harness H] [--name N] [--parent A] [--label k=v]...
              [--project NAME] [--control self|tree|project]
              [--workspace PATH | --worktree BRANCH [--base REF]] [PROMPT]
@@ -93,40 +94,44 @@ eliot ls [--state S] [--tree A] [--label k=v] [--all]
 eliot show A                                details, pending requests, goal, recent events
 eliot watch [A|SELECTOR] [--kind GLOB]... [--since SEQ]    live event stream
 eliot top                                   live table: agents, state, turn time, tokens, cpu/ram, git
-eliot send|steer|inject A TEXT [--or-send]
+eliot send|inject A TEXT
+eliot steer A TEXT [--or-send]
 eliot send A TEXT --wait [--timeout DUR]    send, wait for that turn to end, print its final text
 eliot wait TARGET... [--for turn|idle|stopped|goal] [--timeout DUR]
                                             block until every target gets there (default --for turn,
                                             --timeout 9m: stay under harness shell-tool time limits; re-run to keep waiting)
 eliot result A [--turns N]                  final text of the last turn(s)
 eliot interrupt A (alias: abort) | stop A [--force] [--tree] | resume A [PROMPT]
+                                            (`--tree` = the selector `@tree:A`)
 eliot approve|deny A [--request R] [--remember]   default: the only pending request
-eliot answer A TEXT [--request R] [--choice N]
+eliot answer A [TEXT] [--request R] [--choice N]
 eliot configure A [--model M] [--effort E] [--permissions P]
+eliot compact|fork|background A             native-only verbs
 eliot goal set A TEXT [--mode auto|native|eliot] [--check CMD|marker:TEXT] [--every DUR]
                     [--max-turns N] [--max-cost USD] [--no-progress N]   (limits form `budget`)
 eliot goal pause|resume|clear A [--mode native|eliot] | eliot goal show A
-eliot cmd show ID                           command state/outcome
+eliot cmd show ID                           command state/outcome; exits with the code of that state
 eliot cmd cancel ID                         withdraw a queued send that has not started
 eliot cmd resolve ID --as applied|failed --reason TEXT   owner settles an `unknown` command by hand
 eliot events [--since SEQ] [--kind GLOB] [--agent A]
 eliot msg send TO TEXT [--mode queue|inject|send|steer] [--reply-to M]
 eliot inbox [--wait SECS] [--all]           for agents: unread messages
-eliot var get|set|list|watch ...
+eliot var get KEY | set KEY VALUE [--expect-version N] [--note T] | list PREFIX | watch PATTERN
 eliot who PATHSPEC... [--history N]
 eliot claim GLOB [--note T] [--ttl DUR] | eliot release [GLOB]
 eliot rule list|show|enable|disable|test ID [--event FILE] | eliot rules pause|resume
 eliot timer list|run ID
 eliot discover [--harness H]                list native sessions on this machine not launched by Eliot
 eliot service list | stop NAME              proxies and native servers Eliot supervises (L2.7, L7.6)
+eliot worktree remove A                     remove a stopped agent's worktree (L3.2 rules)
 eliot doctor                                orphans, unused services, stale worktrees, disk use (L7.7)
 eliot daemon install | uninstall            per-user logon task (L7.8)
-eliot attach SESSION [--observe-only]       start watching (and if supported, controlling) one of them
+eliot attach --harness H SCOPE/REF [--observe-only]   watch (and if supported, control) a session from `discover`
 eliot plugin NAME                           (internal) run a built-in plugin on stdio
 eliot plugin-test CMD... [--replay-dir DIR]  run the plugin conformance suite against any plugin command
 eliot hook --harness H --event E            (internal) hook shim: stdin JSON → daemon → stdout decision
 eliot detach A                              stop controlling A; its native session keeps running
-eliot mcp                                   MCP server on stdio for agents (L6.5); tools depend on the caller's control
+eliot mcp                                   MCP server on stdio for agents (L5.5); tools depend on the caller's control
 ```
 
 Selectors: see [core](core.md#commands).

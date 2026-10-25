@@ -2,8 +2,9 @@
 
 Plugin order: Codex (L2) → Claude Code, Muse, OpenCode, Antigravity, ACP agents (L4)
 → [others](others.md) only when needed. Proxies: [OpenCodex](opencodex.md),
-[local model servers](local-models.md). Each page lists official sources with the date they were
-checked and a "verify during L-x" list. When a plugin lands, update its column below
+[local model servers](local-models.md). Each harness page lists official sources with
+the date they were checked and the facts still unverified (the short notes in
+[others](others.md) and [local-models](local-models.md) carry v1 facts only). When a plugin lands, update its column below
 from what the plugin actually does (not from docs).
 
 ## Capability matrix (from official docs, 2026-10-25)
@@ -31,9 +32,8 @@ from what the plugin actually does (not from docs).
 
 1. Read the harness page and the [plugin protocol](../spec/plugin-protocol.md).
 2. Record scenarios with `just record-<name>`
-   ([recordings](../spec/plugin-protocol.md#recordings)): the page's list, or by
-   default `turn`, `two-turns`, `steer`, `interrupt`, `approve`, `deny`, `question`,
-   `goal`, `subagent`, `resume`, `error` — skipping what the harness cannot do.
+   ([recordings](../spec/plugin-protocol.md#recordings)): the same scenarios as the
+   [Codex list](codex.md#scenarios), skipping what the harness cannot do.
 3. Implement against the recordings; pass `eliot plugin-test` in replay mode.
 4. Add `just live-<name>`, run it, paste the output in the PR.
 5. Where the harness behaved differently from this page or the matrix, correct them

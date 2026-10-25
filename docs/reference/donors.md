@@ -11,7 +11,7 @@ Copy and cut down; do not depend on v1 crates. Paths are as of `dc6f70aa`.
 | Mechanism | v1 path | Use in | Note |
 | --- | --- | --- | --- |
 | Windows Job objects, process birth/image identity, Unix groups | `crates/swarm-process/src/process_group.rs` | L3.1 | 1,555 lines; take identity + job + kill-tree only. |
-| Bounded child pipe capture | `crates/swarm-process/src/capture.rs` | L1.6, L5.4 | 64 MiB cap per stream. |
+| Bounded child pipe capture | `crates/swarm-process/src/capture.rs` | L1.6, L6.4 | v1 capped 64 MiB per stream; v2 caps script output at 1 MiB. |
 | Private files (0600 / Windows ACL), durable replace | `crates/swarm-process/src/permissions.rs` | L1.4 (`daemon.json`, lock) | Keep only what L1.4 needs. |
 | Named pipe with user-only ACL | `crates/swarm-kernel-host/src/platform/windows.rs` | L1.4 | 145 lines, small and direct. |
 | Line-framed multiplexed IPC with frame limits | `crates/swarm-client/src/multiplex.rs`, `client.rs` | L1.4 | Drop the authentication layer. |
@@ -36,10 +36,10 @@ module descriptors and provenance packaging.
 | `sysinfo` | L3.1 |
 | `notify` (+ debouncer) | L3.3 |
 | `globset` | matchers, claims |
-| `croner` | L5.2 cron |
+| `croner` | L6.2 cron |
 | `windows-sys` | Job objects, pipe ACLs |
 | `agent-client-protocol` (Apache-2.0) | L4.6 ACP plugin |
-| `rmcp` (Apache-2.0) | L6.5 MCP server |
+| `rmcp` (Apache-2.0) | L5.5 MCP server |
 
 ## External design patterns
 

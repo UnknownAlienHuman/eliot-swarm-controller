@@ -24,20 +24,23 @@ or `inject`.
 ## Mailbox
 
 ```text
-Message { id, from, to, thread?, reply_to?, mode, text (≤ 32 KiB),
+Message { id, sender, recipient, thread?, reply_to?, mode, text (≤ 32 KiB),
           admitted_at, presented_at?, read_at? }
 // admitted = stored; presented = the plugin reports the text entered the model
 // (inject, prepend or turn start); read = `eliot inbox` / `mail.read`
-from = origin string: agent:<id> | owner | rule:<id> | timer:<id>   (same form as command origins)
+sender = origin string: agent:<id> | owner | rule:<id> | timer:<id>   (same form as command origins)
 ```
 
-- `to` is an agent id/name or a selector (`@parent`, `@children`, `@siblings`,
+- The `to` argument of `mail.send` / `eliot msg send` is an agent id/name or a selector (`@parent`, `@children`, `@siblings`,
   `@project`, `@label:role=reviewer`). A selector expands at send time into one
   message per recipient sharing a `thread`.
 - `mode` decides how the text reaches a running agent:
-  - `queue` (default): stored. The recipient sees it with `eliot inbox`; additionally,
-    if its plugin supports `inject`, a one-line notice
-    (`[eliot] 1 new message from a7 (writer): eliot inbox`) is injected.
+  - `queue` (default): stored; the recipient reads it with `eliot inbox`. It is also
+    told: a busy recipient gets a one-line notice injected at its next safe point
+    (`[eliot] 1 new message from a7 (writer): eliot inbox`); an idle recipient is woken
+    with that notice as a short turn. Wake-ups are coalesced (at most one per
+    recipient per minute), need no command rights, and can be turned off per profile
+    (`wake_on_mail = false`). This is what lets peers talk without a manager.
   - `inject`: the full text is injected as context (no new turn).
   - `send`: delivered as a new turn (wakes an idle agent).
   - `steer`: delivered into the running turn (urgent).
@@ -47,7 +50,7 @@ from = origin string: agent:<id> | owner | rule:<id> | timer:<id>   (same form a
 - `eliot inbox --wait 60` blocks until a message arrives (for agents waiting on a
   peer instead of polling a model).
 
-Schema (L6 migration):
+Schema (L5 migration):
 
 ```sql
 CREATE TABLE messages (
@@ -108,9 +111,11 @@ a9  tests-2   claude  claim   src/api/**  "adding integration tests" (expires 14
 ```
 
 Mapping commits to agents: each agent worktree has its branch recorded in the
-`agents` row, and Eliot sets the worktree-local Git identity
-`user.email = <agent-name>.<id>@agents.eliot` unless the profile sets
-`git_identity = "inherit"`. `who --history` maps author emails of that form back to
+`agents` row, and Eliot gives each agent process its own Git identity through the
+environment (`GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` = agent name,
+`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` = `<agent-name>.<id>@agents.eliot`) unless
+the profile sets `git_identity = "inherit"`. No repository config is written, so this
+also works in shared checkouts. `who --history` maps author emails of that form back to
 agents; other authors are shown as is.
 
 In a checkout shared by several agents, `git status` cannot say who changed a file;
@@ -155,8 +160,8 @@ CREATE TABLE claims (
 - `launch --parent A` creates a child; `depth = parent.depth + 1`; `root` is
   inherited. No limit in the model; config guards against runaway spawning:
   `limits.max_depth` (8), `limits.max_children_per_agent` (20) and
-  `limits.max_tree_agents` (100). A launch past a limit fails `not_allowed` and names
-  it (v1 field data: one recursive request produced 48+ agents and ~1.5M tokens).
+  `limits.max_tree_agents` (100); `0` means no limit. These guard against accidents,
+  not against scale. A launch past a limit fails `not_allowed` and names it (v1 field data: one recursive request produced 48+ agents and ~1.5M tokens).
 - Native subagents become `origin = native` children automatically.
 - Tree operations: `stop --tree A`, `send @tree:A`, `ls --tree A`, `watch @tree:A`.
 - Parent notifications: when a child reaches `stopped`, `failed`, `lost` or its goal
@@ -171,7 +176,8 @@ CREATE TABLE claims (
 
 Research and v1 field data agree: dense chatter costs tokens and makes agents
 converge early ([research](../reference/research.md)). Every launched agent therefore
-gets this **system note** (passed as `system_note` in `agent.start`; the plugin uses
+gets this **system note** (it lists only commands the running build has — the
+coordination lines arrive with L5) (passed as `system_note` in `agent.start`; the plugin uses
 the harness's system/developer-instructions mechanism, or prepends it to the first
 prompt). Profiles may replace it with `system_note = "<file>"`.
 

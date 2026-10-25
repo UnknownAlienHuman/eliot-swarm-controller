@@ -38,9 +38,11 @@ independent (`features.multi_session`), otherwise one.
 
 `Pid = {pid, start_time, role}`; `role` = `harness` | `server` | `tool` | `proxy`.
 
-Verb routing: `launch` arrives as `agent.start`, `stop` as `agent.stop`, `resume` as
-`agent.attach` followed by `agent.command {verb: resume}`; every other verb arrives as
-`agent.command`.
+Verb routing: `launch` arrives as `agent.start`, `stop` as `agent.stop`; every other
+verb arrives as `agent.command` — including `resume`, which carries `native_scope` and
+`native_ref` and re-opens the session from native (or, for the fake, persisted)
+state. `agent.attach` is only for re-attaching sessions that may still be running
+after a plugin or daemon restart, and for discovered sessions.
 
 ## Plugin → host notifications
 
@@ -54,8 +56,7 @@ Verb routing: `launch` arrives as `agent.start`, `stop` as `agent.stop`, `resume
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `child` | `{parent_agent_id, native_ref, name?, labels?}` | `{agent_id, token}` — the host creates an `origin=native` agent (idempotent per `native_ref`). Where the harness lets the plugin set a child's environment, it gives the child this token; otherwise it strips `ELIOT_AGENT_*` from the child's environment. A child must never act with its parent's token. If neither is possible (subagents running inside the parent's process), the child's `eliot` calls count as the parent's and `eliot show` says so. |
-| `decide` | `{agent_id, request: Request}` | `{decision: allow|deny|ask, reason?, context?}` — synchronous answer for approvals the plugin must answer inline. The host evaluates approval rules within 2 s (L5.5); until then, and on no match, `ask`. |
+| `child` | `{parent_agent_id, native_ref, name?, labels?}` | `{agent_id, token}` — the host creates an `origin=native` agent (idempotent per `native_ref`). Where the harness lets the plugin set a child's environment, it gives the child this token. Where it cannot (subagents running inside the parent's process share its environment), the child's `eliot` calls are indistinguishable from the parent's and are attributed to the parent; `eliot show` says so for that child. |
 
 ## Manifest
 
@@ -63,6 +64,7 @@ Verb routing: `launch` arrives as `agent.start`, `stop` as `agent.stop`, `resume
 {
   "name": "codex", "version": "0.1.0", "protocol": "eliot-plugin/1",
   "harness_version": "codex-cli 0.164.0 (as reported by the native side, or null)",
+  "available": true,
   "verbs": ["launch","send","steer","inject","interrupt","stop","resume",
             "approve","deny","answer","configure","goal.set","goal.pause","goal.resume","goal.clear"],
   "child_verbs": ["send","interrupt"],
@@ -73,8 +75,11 @@ Verb routing: `launch` arrives as `agent.start`, `stop` as `agent.stop`, `resume
 }
 ```
 
-`proxy`: `config` | `env` | `none` — how the plugin points its harness at a proxy
-(details on its harness page). The host routes only the declared verbs. Harness
+`available`: the plugin found a usable native harness (binary present and runnable);
+`launch` preflight requires it. `proxy`: `config` | `env` | `none` — how the plugin
+points its harness at a proxy (details on its harness page). Method names on this page
+belong to the plugin connection; they are separate from client API methods of the
+same name. The host routes only the declared verbs. Harness
 versions are for display; they are never a gate.
 
 ## Verb translation rules
@@ -94,7 +99,9 @@ versions are for display; they are never a gate.
 ## Event normalization rules
 
 - Session lifecycle: `session.ready` once the native session accepts input;
-  `session.ended` when it ends normally; `session.error` when it cannot continue.
+  `session.ended` when it ends normally; `session.error` when the native side reports
+  a fatal error while still running; `session.lost` when the native process exits
+  unexpectedly (an exit is never reported as `session.error`).
   The host derives `agent.*` state events; plugins never send `agent.*`.
 - Emit `turn.started` / `turn.completed` exactly once per native turn; `status`
   distinguishes completed, interrupted and failed. Non-terminal native statuses are not
@@ -161,9 +168,12 @@ a held handle blocks the harness from rotating or replacing it.
   after the stop timeout (10 s), the host kills its process tree and verifies the
   recorded `(pid, start_time)` identities. Job objects / process groups (L3.1) make this
   hold even if the daemon itself dies.
-- Windows: create plugin stdio pipes non-inheritable and pass an explicit handle list
-  at process creation (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`); otherwise an unrelated
-  child that inherited the write end keeps the pipe open and stdin EOF never arrives.
+- Windows: only the child's ends of its stdio pipes are inheritable, and they are
+  passed in an explicit handle list (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, which
+  requires inheritable handles) via `CreateProcessW` in `eliot-daemon::platform`;
+  the parent's ends are never inheritable. Otherwise an unrelated child that
+  inherited a write end keeps the pipe open and stdin EOF never arrives. `std::process`
+  has no handle-list API.
 - A plugin that fails `initialize` three times is marked `failed`; its agents become
   `lost`. Other plugins are unaffected.
 - Requests time out (default 30 s, `agent.start` 120 s). A deadline bounds the whole
@@ -177,7 +187,7 @@ a held handle blocks the harness from rotating or replacing it.
 - Bound every native payload the plugin forwards (default 1 MiB per message); an
   oversized item becomes an explicit gap event, never a reconnect loop.
 - The host reads every plugin's stdout continuously. Replies and plugin requests
-  (`child`, `decide`) are handled on a path that never waits for the event queue, so an
+  (`child`) are handled on a path that never waits for the event queue, so an
   approval is never stuck behind telemetry. Under pressure ephemeral events are
   dropped (subscribers see `events.lagged`); persisted events never are.
 - A plugin must not block its own stdin reader on native I/O: a slow native call must
@@ -186,10 +196,15 @@ a held handle blocks the harness from rotating or replacing it.
 ## Fake plugin
 
 `plugins/fake` simulates a harness deterministically; it is used by every L1 test and
-by load tests. It declares all verbs unless `[plugins.fake] verbs = [...]` narrows them.
+by load tests. It declares `launch`, `send`, `steer`, `inject`, `interrupt`, `stop`,
+`resume`, `approve`, `deny`, `answer`, `configure` (no native goal, children are
+created by the `spawn` step), unless `[plugins.fake] verbs = [...]` narrows them.
+It reports `system_note: native` and `configure` applies `now`.
 
 Any input text (launch prompt, `send`, `steer`, `inject`) is a script if it parses as
-`{"steps": [...]}`; otherwise it is echoed (`message.agent` with the same text). A
+`{"steps": [...]}`; otherwise it is echoed (`message.agent` with the same text).
+`inject` shows up as `message.user {injected: true}` at the next step boundary of a
+running turn, or at the start of the next turn when idle. A
 `send`/`launch` script runs as one turn: `turn.started` … `turn.completed`.
 
 | Step | Fields | Emits |
@@ -222,7 +237,9 @@ Real harness traffic is recorded once and replayed in tests, so CI never calls a
 - `ELIOT_REPLAY=<file>`: instead of starting the native process, the plugin uses a
   replay transport that checks each outgoing message against the next `out` line
   (same method/path; ids and timestamps ignored) and delivers the following `in`
-  lines. A mismatch fails the test with both messages printed.
+  lines. A mismatch fails the test with both messages printed. Two control lines
+  simulate failures: `{"dir": "hang"}` (no further replies) and `{"dir": "exit",
+  "code": N}` (the native process dies).
 - Files live in `plugins/<name>/fixtures/<scenario>.jsonl`, named with the harness
   version and date in a first line `{"meta": {"harness_version", "recorded_at",
   "scenario"}}`. Secrets are removed before commit (the recorder drops auth headers

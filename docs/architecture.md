@@ -97,6 +97,7 @@ This page is the map. Exact formats live in [spec/](spec/); build order lives in
 eliot steer a12 "use the v2 API"
  → CLI → IPC request command.submit {id, target: a12, verb: steer, args}
  → Router: a12 exists; plugin codex supports steer; caller may command a12; a12 is busy
+   (a failed check is stored as state=rejected with its reason and returned)
  → Store: insert command (state=accepted) + event command.accepted       (one tx)
  → Plugin host → plugin: agent.command {agent_id, command_id, verb, args}   (state=dispatched)
  → plugin → native: turn/steer {threadId, expectedTurnId, input}

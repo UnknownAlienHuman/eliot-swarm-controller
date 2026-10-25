@@ -15,13 +15,18 @@ own health (`source.health`). A failing source never blocks another one or the r
 | Filesystem | changes in agent workspaces | `notify` watcher, debounced | `fs.changed` (E), triggers Git refresh |
 | Proxy/provider | proxy health, usage, limits | proxy management API when configured | `source.health`, `provider.limited` |
 | Derived | stalls, idle time, turn durations | timers over the above | `agent.stalled/unstalled` |
+| Store / config | failed commits; config reloads and parse errors | the daemon itself | `source.health` (`store`, `config`) |
 
 ## Process monitor
 
-- Identity is `(pid, start_time)`, never PID alone (PIDs are reused).
-- Plugins register their native PIDs; the monitor adds descendants by walking the
-  parent chain every `process.scan_interval` (default 2 s). One `sysinfo::System`
-  instance, refreshed selectively for watched PIDs only.
+- Identity is `(pid, start_time)`, never PID alone (PIDs are reused). `start_time` is
+  the OS creation time at full resolution (Windows `GetProcessTimes`, 100 ns; Linux
+  `/proc/<pid>/stat` start ticks), not a seconds value.
+- Descendants come from custody, not from walking parent PIDs (a parent chain breaks
+  when an intermediate process exits): on Windows the Job's process list
+  (`JOBOBJECT_BASIC_PROCESS_ID_LIST`), on Unix the process group. Scan every
+  `process.scan_interval` (default 2 s). Plugins also register native PIDs they know.
+  CPU/RSS sampling uses one `sysinfo::System`, refreshed only for watched PIDs.
 - `process.exited` when a watched identity disappears. If all `harness`/`server`
   processes of an agent are gone and the plugin reported no `session.ended` within
   3 s, emit `session.lost` (the reducer then moves the agent to `lost`).
@@ -91,7 +96,8 @@ Per distinct worktree used by any live agent:
 | Parent idle, children busy | parent is idle; the tree is not done |
 | Process alive, stream disconnected | source `stale`; agent state unchanged |
 | Process gone, no terminal event | `session.lost` → `agent.lost` |
-| Source not read for 3 × its interval | `source.health status=stale`; values shown as `unknown` |
+| Polled source (process, Git, proxy) not read for 3 × its interval | `source.health status=stale`; values shown as `unknown` |
+| Event-driven source (native stream, transcript, hooks) lost its connection | `stale` until it reconnects; silence alone is not staleness |
 | Provider 429 | `provider.limited kind=rate_limit`; not quota, model unchanged |
 
 ## Views
@@ -102,6 +108,6 @@ Per distinct worktree used by any live agent:
   turn time, tokens, cost, CPU, RSS, branch, dirty count, last event age. Sort and
   filter keys. Built on `agent.list` + `events.subscribe`; no separate state.
 - `eliot show A` — one agent: profile, effective settings, pending requests, goal,
-  processes, workspace, last 20 events, unread mail.
+  processes, workspace, last 20 events (unread mail from L5.1).
 - `daemon.status` — per-source health table. A stale source is shown as stale, never
   hidden.

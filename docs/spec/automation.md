@@ -6,6 +6,8 @@ the owner. It adds no workflow state of its own beyond rule/timer bookkeeping.
 ## Rules
 
 Rules live in TOML files: `<project>/.eliot/rules/*.toml` and `<data_dir>/rules/*.toml`.
+Rule keys: `id`, `on`, `do`, and optional `limit`, `catch_up`, `allow_self`,
+`enabled` (default true).
 The daemon reloads them on change; a file that fails to parse is reported
 (`rule.failed`) and the previous version stays active.
 
@@ -77,11 +79,7 @@ an argument value (one argv element, or a field like `text`), never the program
 
 | Action | Fields | Effect |
 | --- | --- | --- |
-| `launch` | `profile`, `prompt`, `name?`, `parent?`, `labels?`, `worktree?` | new agent |
-| `send` / `steer` / `inject` | `agent`, `text` | command to an agent or selector |
-| `interrupt` / `stop` / `resume` | `agent` | command |
-| `approve` / `deny` | `agent`, `request_id` (default: from event) | answer an approval |
-| `goal.set` / `goal.clear` | `agent`, `text`, `check?`, `budget?` | goal |
+| any [verb](core.md#verbs) (`launch`, `send`, `steer`, `inject`, `interrupt`, `stop`, `resume`, `approve`, `deny`, `answer`, `configure`, `goal.*`, `cancel`, `detach`, `compact`, `fork`, `background`) | `agent` (id, name or selector; default: the event's agent), then the verb's args; `request_id` defaults to the event's | the same command a person would submit |
 | `git.fetch` / `git.pull` / `git.push` | `workspace` or `repo`, `remote?`, `ref?` | `pull` is `--ff-only`; `push` never forces |
 | `git.worktree` | `repo`, `branch`, `base` | create a worktree |
 | `msg.send` | `to`, `text`, `mode?` | mailbox |
@@ -117,9 +115,10 @@ Scripts may also call the `eliot` CLI directly. Scripts are versioned with the p
 ## Approvals
 
 `approval.requested` events go through rules like any event. A rule with `approve`
-or `deny` answers it. For plugins that need an inline answer (`decide` request), the
-host evaluates only rules whose actions are `approve`/`deny`, with a 2 s budget; no
-match → `ask`. An unanswered request is sent once as a `queue` message to the agent's
+or `deny` answers it with an ordinary command; the plugin holds the native request
+until that command arrives. A hook that must answer synchronously (the
+[hook shim](plugin-protocol.md#hooks)) gets the decision of matching `approve`/`deny`
+rules within the hook timeout; no match → `ask`. An unanswered request is sent once as a `queue` message to the agent's
 parent (or the project's `role=manager` agent if there is no parent, else the owner),
 naming the request id. Nothing ever answers it by timeout, by picking the first or
 "recommended" option, or by denying everything.
@@ -162,9 +161,8 @@ active Eliot goal:
    default 10 min; at most `automation.max_parallel_checks`, default 2, checks run at
    once on the machine). Pass → `done`. With `marker:X`, done when the last `message.agent`
    contains `X`.
-3. If a budget is exhausted → `blocked` (`budget`). `max_cost_usd` counts only where
-   the plugin reports cost (subscription routes often do not); `max_turns` always
-   applies.
+3. If a budget is exhausted → `blocked` (`budget`). `max_cost_usd` is accepted only
+   for plugins that report cost (see core verbs); `max_turns` always applies.
 4. Progress = the workspace tree hash or the check output changed since the last
    round. Tree hash: with `GIT_INDEX_FILE=<temp file>` run `git read-tree HEAD`,
    `git add -A`, `git write-tree` (the agent's own index is never touched). No progress
@@ -183,7 +181,7 @@ goal's own budget.
 only if the generation read at the start of the round is still current, so a goal
 paused during a long check never sends another turn.
 
-## Storage (L5 migration)
+## Storage (L6 migration)
 
 Rules themselves live in files. The Store keeps only what must survive a restart:
 
@@ -221,7 +219,7 @@ Rate-limit windows and loop-depth counters are in memory; a restart resets them.
 ## Workflow recipes
 
 Workflows are rules + scripts + agents, not core features. Examples kept in
-`examples/` once L5 lands:
+`examples/` once L6 lands:
 
 - **Writer → reviewer**: on `turn.completed` of `role=writer` with dirty files →
   `launch` a reviewer with the diff → on reviewer `turn.completed` → `run` a script

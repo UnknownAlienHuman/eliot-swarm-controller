@@ -1,7 +1,7 @@
 # Documentation
 
-Everything an agent needs to build Eliot v2. Nothing here is history or status
-except the roadmap checkboxes.
+Everything an agent needs to build Eliot v2: current specs plus a few reference pages
+(lessons, donors, research). Status lives only in the roadmap checkboxes.
 
 | Read | When |
 | --- | --- |

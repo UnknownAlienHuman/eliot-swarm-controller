@@ -47,7 +47,7 @@ The SDK is under Anthropic's commercial terms, not an open-source license.
 | `interrupt` | `Query.interrupt()` | Streaming mode only. |
 | `stop` | end the input stream; `force` kills the process tree | |
 | `resume` | `options.resume = <session id>` | Resume does not refresh the system prompt; never resend the old input. |
-| `approve` / `deny` | `canUseTool` callback returns allow/deny — the plugin awaits an Eliot `approve`/`deny` (or host `decide`) | `canUseTool` runs only when a prompt would appear; a `PreToolUse` hook is expected to see every call (universal coverage on the installed version is unverified — check in L4.2). |
+| `approve` / `deny` | `canUseTool` callback returns allow/deny — the plugin awaits an Eliot `approve`/`deny` command | `canUseTool` runs only when a prompt would appear; a `PreToolUse` hook is expected to see every call (universal coverage on the installed version is unverified — check in L4.2). |
 | `answer` | the `AskUserQuestion` tool via `canUseTool` (answers in the returned input) | Verify the exact shape in L4.2. |
 | `configure` | `setPermissionMode()` (now); model per query option (`applies: next_session` unless the SDK exposes a live setter) | |
 | `goal.*` | Claude Code has a native goal feature ([goal docs](https://code.claude.com/docs/en/goal)); evaluate in L4.2, default to the Eliot Goal loop | Its Stop-hook check spends model calls. |

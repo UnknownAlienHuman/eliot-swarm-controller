@@ -9,7 +9,7 @@ All timestamps are Unix milliseconds (UTC).
 | Id | Form | Source | Notes |
 | --- | --- | --- | --- |
 | `AgentId` | `a<u64>` e.g. `a42` | Store sequence | Short so people and agents can type it. |
-| `CommandId` | ULID string | Caller; the CLI generates one only when `--id` is not given and prints it | Idempotency key: resubmitting the same id with the same verb and args returns the existing command; the same id with different content fails `invalid`. A retry after a lost reply must reuse the id (`--id`); a new id is a new command. |
+| `CommandId` | string (≤ 128 chars); a ULID when generated | Caller; the CLI generates one only when `--id` is not given and prints it. Derived ids: `<selector command id>/<agent id>` for selector expansions, `rule:<rule id>@<key>/<n>` for rule firings | Idempotency key: resubmitting the same id with the same verb and args returns the existing command; the same id with different content fails `invalid`. A retry after a lost reply must reuse the id (`--id`); a new id is a new command. |
 | `seq` | `u64` | Store, per persisted event | Total order of persisted events. |
 | `MessageId` | `m<u64>` | Store sequence | Mailbox ([coordination](coordination.md)). |
 | `native_ref` | opaque string | Plugin | Native thread/session/conversation id. Eliot never parses it. |
@@ -56,9 +56,10 @@ Live states: `starting`, `idle`, `busy`, `waiting`, `stopping`.
 | From | Trigger | To |
 | --- | --- | --- |
 | — | `launch` accepted (router creates the row) | `created` |
-| `created` | a launch slot is free (profile and proxy `max_live`, no provider hold) and the router sends `agent.start` | `starting` |
+| `created` | router input `start_dispatched` (it found a free launch slot: profile and proxy `max_live`, no provider hold) | `starting` |
+| `created` | `stop` accepted (the queued launch is cancelled; no native I/O) | `stopped` |
 | `starting` | `session.ready` | `idle` |
-| `starting` | `agent.start` error or timeout, or `session.error` | `failed` |
+| `starting` | router input `start_failed` (`agent.start` error or timeout), or `session.error` | `failed` |
 | `idle` | `turn.started` | `busy` |
 | `busy` | `approval.requested` / `question.asked` | `waiting` |
 | `waiting` | last pending request resolved (`approval.resolved` / `question.answered`) | `busy` |
@@ -76,8 +77,9 @@ flag, not a state: `busy`/`waiting` with no event for `stall_after` sets
 `stalled_since`; the next event of that agent clears it.
 
 The reducer `fn apply(agent: &mut Agent, input: &Input) -> Option<AgentState>` in
-`eliot-core` (input = an event or an accepted command) is the only code that changes
-`state`. It is pure and table-tested against the table above. Every state change is
+`eliot-core` is the only code that changes `state`. `Input` is an event, an accepted
+command (`stop`, `resume`), or a router input (`start_dispatched`, `start_failed`);
+deciding launch slots and holds is the router's job, not the reducer's. It is pure and table-tested against the table above. Every state change is
 published as a derived event `agent.<new state>`.
 
 ## Profile
@@ -92,8 +94,9 @@ Profile { harness, extends?, cmd?: [string],      // cmd: binary for plugins tha
           workspace_mode [shared]: shared | worktree,
           control [self]: self | tree | project, git_identity [agent]: agent | inherit,
           system_note?: path, labels [{}], stall_after [5m], max_live? [unlimited],
-          billing?, account?, setup [[]],         // setup: commands run in a new worktree (submodules, LFS)
-          notify_parent [true] }                  // message the parent when this agent stops or its goal ends
+          billing?, account?, setup [[]],         // setup: argv lists run in a new worktree (submodules, LFS)
+          scratch [["target/", "node_modules/"]],  // ignored paths `eliot worktree remove` may delete
+          notify_parent [true], wake_on_mail [true] }   // parent notices; idle wake-up on new mail
 ```
 
 `max_live` caps live agents of this profile (provider quota and subscription limits
@@ -184,7 +187,7 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
 | `steer` | `text` | Add input to the **running** turn. | `busy`; native support |
 | `inject` | `text` | Add context without starting a turn by itself; delivered at the next native safe point (hook `additionalContext`, pending-input queue, or prepended to the next `send`). | live; plugin decides mechanism and reports it |
 | `interrupt` (CLI alias `abort`) | — | Abort the running turn; session stays alive. | `busy`/`waiting` |
-| `stop` | `force?` | End the session. `force` kills the process tree. | any live |
+| `stop` | `force?` | End the session. `force` kills the process tree. (The CLI's `--tree` is the selector `@tree:<agent>`.) | any live |
 | `resume` | `prompt?` | Re-open a `stopped`/`lost`/`failed` session by `native_ref`. Never resends old input. | native support |
 | `approve` / `deny` | `request_id?` (default: the only pending request), `remember?` | Answer a pending approval. | request pending |
 | `answer` | `request_id?`, `text` or `choice` | Answer a pending question. | request pending |
@@ -192,7 +195,7 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
 | `goal.set` | `text`, `mode?: auto|native|eliot`, `check?`, `budget?`, `cadence?` | `native` = the harness's own goal; `eliot` = the Eliot Goal loop ([automation](automation.md#goal-loop)); `auto` (default) = native if supported, else eliot. One goal per mode; a native and an Eliot goal may run at the same time with different texts. | live |
 | `goal.pause` / `goal.resume` / `goal.clear` | `mode?` (default: every active mode) | | goal exists |
 | `cancel` | `command` | Withdraw a `queued` send that has not started (no native I/O). A started turn needs `interrupt`. | that command is `queued` |
-| `detach` | — | Stop controlling the agent but leave the native session running (its goal, children and turns continue). The agent becomes `observe_only`. | live; plugin declares it (only sessions that live outside Eliot's process tree, e.g. a service or an owner-run server) |
+| `detach` | — | Stop controlling the agent but leave the native session running (its goal, children and turns continue). The agent becomes `observe_only`. Available from L7.6. | live; plugin declares it (only sessions that live outside Eliot's process tree, e.g. a service or an owner-run server) |
 | `compact` / `fork` / `background` | — | Native only (`background` moves the running foreground tool to the background where the harness supports it). | native support |
 
 - `check`: `marker:<TEXT>`, or an argv list run without a shell in the agent's
@@ -229,7 +232,8 @@ state  = accepted → [queued →] dispatched → applied | rejected | failed | 
   state back with `eliot cmd show ID`.
 - `rejected`: refused before any native I/O — by the router (invalid, unsupported,
   not allowed, wrong state) or by a plugin that knows no native request was sent.
-  A plugin that is not sure returns `unknown`, never `rejected`.
+  A plugin that is not sure returns `unknown`, never `rejected`. Router rejections are
+  stored too (with their reason), so `cmd show` and the same-id rule work for them.
 - `failed`: native side reported an error — nothing applied.
 - `unknown`: may or may not have happened (timeout, plugin crash, lost reply). Never
   retried automatically. Only `interrupt` and `stop` are retried once after a plugin
@@ -242,26 +246,31 @@ state  = accepted → [queued →] dispatched → applied | rejected | failed | 
 - Only readback or the owner's `eliot cmd resolve ID --as applied|failed --reason
   TEXT` clears `unknown`; time never does. The resolution is recorded as an event.
 - `launch` checks before creating the agent: the profile resolves, the workspace
-  exists, the plugin is up and its manifest reports the harness available
-  (`harness_version` not null), the proxy (if any) is healthy, and the tree limits
+  exists, the plugin is up and its manifest says `available: true`, the proxy (if
+  any) is healthy, and the tree limits
   allow it. A failed check returns `invalid`, `unavailable` or `not_allowed` and
   creates nothing.
 - Selectors: `@children` | `@parent` | `@siblings` | `@tree:<agent>` |
   `@project[:<name>]` | `@label:<key>=<value>` | `@all`, resolved relative to the
   caller (for the owner, `@children` = top-level agents). A selector command is stored
-  with `selector` set and expands at submit time into one command per agent; each gets
-  a fresh ULID and `cause.command = <selector command id>`. The selector command is
-  `applied` once all are created; its `outcome` lists them.
+  with `selector` set and expands at submit time, in the same transaction, into one
+  command per agent with id `<selector command id>/<agent id>` and
+  `cause.command = <selector command id>`, so a repeated submit never duplicates them.
+  The selector command is `applied` once all are created; its `outcome` lists them.
 
 ## Storage
 
-One SQLite file `eliot.db` in the data dir, WAL mode, `PRAGMA user_version` = schema
+`rusqlite` with the bundled SQLite: one writer thread that owns the write connection,
+a small fixed set of read connections. One SQLite file `eliot.db` in the data dir,
+WAL mode, `PRAGMA user_version` = schema
 number, migrations are numbered SQL files applied in one transaction each. No schema
-hashes. Open order matters: set `busy_timeout` first; check `application_id` and
+hashes. Open order matters: set `busy_timeout` first; check `application_id`
+(`0x454C494F`, "ELIO", set by the first migration) and
 `user_version` (refuse a foreign or newer database); only then set
 `journal_mode=WAL` (persistent — never on a file that failed the check) and
 `synchronous=FULL`; `foreign_keys=ON` on every connection; writes use
-`BEGIN IMMEDIATE`; never create a database over an existing non-empty file. No retry
+`BEGIN IMMEDIATE`; never create a database over an existing non-empty file. A new
+file gets `application_id` and its schema from migration 1 in one transaction. No retry
 loop around `SQLITE_BUSY`. One writer task owns the write connection and commits in
 batches (≤ 10 ms or ≤ 500 statements); readers use separate connections.
 
