@@ -1,207 +1,248 @@
 # Coordination
 
-How agents work together without a manager relaying every word. Everything here is
-usable from the CLI inside any agent (`eliot ...`) and later from `eliot mcp`.
+Agents coordinate directly through the same local API. Mail is durable communication;
+variables and `who` carry shared facts; claims are advisory. None of these creates a
+second work scheduler.
 
-## Who may do what
+## Authority
 
-Identity comes from `ELIOT_AGENT_TOKEN` (see [API](api.md#transport)). Rules:
+Identity is `(agent id, generation)` from the current token
+([API](api.md#transport)).
 
-| Caller | May command (`send`, `steer`, `stop`, ...) | May message / read vars / `who` |
+| Caller | May command agents | May queue mail / read project coordination |
 | --- | --- | --- |
 | owner (no token) | everyone | everything |
-| agent with `control = self` (default) | itself | its project |
-| agent with `control = tree` | itself and its descendants | its project |
-| agent with `control = project` (manager role) | every agent in its project | its project |
-| rule / timer / script | everyone (owner authority) | everything |
+| `control=self` | itself | its project |
+| `control=tree` | itself + descendants | its project |
+| `control=project` | every agent in its project | its project |
+| rule/timer/script | everyone (owner authority) | everything |
 
-`control` comes from the profile (`control = "tree"`) or `launch --control`. A child
-never gets more control than its parent. This is the whole permission model. Message
-modes that start or change a turn (`send`, `steer`) count as commands: a sender needs
-command rights on the recipient, otherwise it gets `not_allowed` and can use `queue`
-or `inject`.
+A child never gets more control than its parent. `send`, `steer` and `inject` alter a
+model turn/context and therefore require command rights on the recipient. `queue` does
+not: the recipient opted into how queued mail is presented through its profile.
+
+A stale-generation token cannot queue mail, write vars or command a replacement
+session. Owner authority is used only when no token was supplied; an invalid supplied
+token never falls back to owner.
 
 ## Mailbox
 
 ```text
-Message { id, sender, recipient, thread?, reply_to?, mode, text (≤ 32 KiB),
-          admitted_at, presented_at?, read_at? }
-// admitted = stored; presented = the plugin reports the text entered the model
-// (inject, prepend or turn start); read = `eliot inbox` / `mail.read`
-sender = origin string: agent:<id> | owner | rule:<id> | timer:<id>   (same form as command origins)
+Message {
+  id, sender, sender_generation?, recipient,
+  thread?, reply_to?, mode, text (≤ 32 KiB),
+  admitted_at, presented_at?, presented_generation?, read_at?,
+  presentation_command?
+}
+sender = owner | agent:<id>#<generation> | rule:<id> | timer:<id>
 ```
 
-- The `to` argument of `mail.send` / `eliot msg send` is an agent id/name or a selector (`@parent`, `@children`, `@siblings`,
-  `@project`, `@label:role=reviewer`). A selector expands at send time into one
-  message per recipient sharing a `thread`.
-- `mode` decides how the text reaches a running agent:
-  - `queue` (default): stored; the recipient reads it with `eliot inbox`. It is also
-    told: a busy recipient gets a one-line notice injected at its next safe point
-    (`[eliot] 1 new message from a7 (writer): eliot inbox`); an idle recipient is woken
-    with that notice as a short turn. Wake-ups are coalesced (at most one per
-    recipient per minute), need no command rights, and can be turned off per profile
-    (`wake_on_mail = false`). This is what lets peers talk without a manager.
-  - `inject`: the full text is injected as context (no new turn).
-  - `send`: delivered as a new turn (wakes an idle agent).
-  - `steer`: delivered into the running turn (urgent).
-- Delivered text format, so models recognise it:
-  `[eliot message m12 from a7 writer-1 | reply: eliot msg send a7 --reply-to m12 "..."]\n<text>`
-- Unknown recipient → error, never an implicit new identity.
-- `eliot inbox --wait 60` blocks until a message arrives (for agents waiting on a
-  peer instead of polling a model).
+`admitted` means stored. `presented` means the plugin confirmed that the full text or
+a mailbox notice entered a particular model generation. `read` means an inbox/read
+call returned it. Stored is not presented; presented is not understood or answered.
 
-Schema (L5 migration):
+### Recipients and modes
+
+`to` accepts id/name or selector (`@parent`, `@children`, `@siblings`, `@project`,
+`@label:role=reviewer`). Expansion happens transactionally at send time: one stable
+message per recipient, one shared thread id.
+
+- `queue` (default): store the full text. It does not grant the sender control.
+  If recipient profile `wake_on_mail=true`, the daemon may present one short notice:
+  `[eliot] N unread messages; run: eliot inbox`. For a busy agent this is an inject at
+  the next safe point; for an idle agent it is a short turn. The action is a
+  recipient-configured daemon action, not sender command authority.
+- `inject`: present the full text at the next safe point; requires command rights.
+- `send`: present as a new turn; requires command rights.
+- `steer`: present inside the exact active turn; requires command rights and native
+  steer support.
+
+Presentation text for a full message is:
+
+```text
+[eliot message m12 from a7#3 writer-1 | reply: eliot msg send a7 --reply-to m12 "..."]
+<text>
+```
+
+### Wake guardrails
+
+- Coalesce unread mail into at most one notice per recipient per minute and at most one
+  open presentation command. A message burst never creates a turn per message.
+- A presentation command binds the recipient's current generation. If that generation
+  changes first, the command fails stale; messages remain unread and may be presented
+  to the new generation later.
+- No wake/inject occurs while daemon admission is draining, while the recipient has an
+  unknown control command, or while a pending approval/question requires an answer.
+- A lost/unknown notice is never retried blindly. Mail remains available through
+  `inbox`; later presentation requires readback or a new coalesced action after the
+  old one is resolved.
+- `wake_on_mail=false` means queue-only. Parent completion messages and peer mail obey
+  the same setting.
+- Broadcast to more than 50 recipients requires owner/rule authority or explicit
+  `--confirm-broadcast`.
+
+Unknown recipient is an error, never a new identity. `eliot inbox --wait 60` blocks
+without spending another model turn when an already-running agent is waiting on a
+peer.
 
 ```sql
 CREATE TABLE messages (
-  id INTEGER PRIMARY KEY, sender TEXT NOT NULL,   -- origin string, see `from`
+  id INTEGER PRIMARY KEY,
+  sender TEXT NOT NULL,
+  sender_generation INTEGER,
   recipient INTEGER NOT NULL,
-  thread INTEGER, reply_to INTEGER, mode TEXT NOT NULL, text TEXT NOT NULL,
-  admitted_at INTEGER NOT NULL, presented_at INTEGER, read_at INTEGER
+  thread INTEGER,
+  reply_to INTEGER,
+  mode TEXT NOT NULL,
+  text TEXT NOT NULL,
+  admitted_at INTEGER NOT NULL,
+  presented_at INTEGER,
+  presented_generation INTEGER,
+  presentation_command TEXT,
+  read_at INTEGER
 );
 CREATE INDEX messages_inbox ON messages(recipient, read_at, id);
 ```
 
 ## Shared variables
 
-Small shared facts agents agree on (ports, API names, schema versions, decisions).
+Small agreed facts: ports, API names, schema versions and decisions.
 
 ```text
-eliot var set project/api.base_path /v2 [--expect-version 3] [--note "agreed with a7"]
-eliot var get project/api.base_path          → value, version, set_by, set_at
-eliot var list project/ [--json]
-eliot var watch project/api.*                → streams var.changed
+eliot var set project/api.base_path /v2 --expect-version 3 --note "agreed with a7"
+eliot var get project/api.base_path
+eliot var list project/
+eliot var watch project/api.*
 ```
 
-- Scopes: `project/` (caller's project; a key without a scope prefix means this),
-  `tree/` (caller's root tree), `global/`. Stored as `scope = "project:<name>"`, `"tree:<root id>"` or `"global"`;
-  the owner must name the project (`project:<name>/key`) when it has no project.
-- Values are JSON or strings, ≤ 16 KiB. Each write bumps `version`;
-  `--expect-version` makes it a compare-and-set (`bad_state` on mismatch), so two
-  agents cannot silently overwrite each other.
-- Every change is a `var.changed` event, so rules can react (e.g. inject the new value
-  into every agent of the project).
+Scopes:
+
+- `project/` (default for an agent), stored as `project:<name>`;
+- `tree/`, stored as `tree:<root id>`;
+- `global/`.
+
+The owner must name a project explicitly when it has no caller project. Values are
+JSON/string ≤16 KiB. Each successful write increments `version`.
+`--expect-version` is compare-and-set; mismatch is `bad_state`. Every change emits
+`var.changed`. `set_by` includes caller generation so a stale process cannot be
+mistaken for the current incarnation.
 
 ```sql
 CREATE TABLE vars (
-  scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, version INTEGER NOT NULL,
-  set_by TEXT NOT NULL, note TEXT, set_at INTEGER NOT NULL, PRIMARY KEY (scope, key)
+  scope TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  set_by TEXT NOT NULL,
+  note TEXT,
+  set_at INTEGER NOT NULL,
+  PRIMARY KEY(scope, key)
 );
 ```
 
 ## Who works on this
 
-`eliot who <pathspec>...` answers "which agents are touching these files", from Git
-facts collected by the [Git monitor](monitoring.md#git-monitor) and from the agents'
-own file-change events:
+`eliot who <pathspec>...` combines facts already maintained by the
+[Git monitor](monitoring.md#git-monitor):
 
 | Signal | Source | Meaning |
 | --- | --- | --- |
-| `edited` | the agent's `file.changed` events (native edit/write items and tools) for paths that are still dirty | this agent changed these files and they are not committed yet — the only per-agent signal when several agents share one checkout |
-| `dirty` | `git status` of a worktree used by exactly one live agent | uncommitted changes to matching paths right now |
-| `branch` | the committed-but-unmerged set of the agent's worktree ([Git monitor](monitoring.md#git-monitor); `base_ref` unset → `origin/HEAD` if it exists, else skipped) | committed on the agent's branch and still different from its base |
-| `claim` | claims table | the agent announced it will work there |
-| `history` (with `--history N`) | `git log -N -- <pathspec>` in the repo | authored recently — provenance, never reported as the current owner |
+| `edited` | generation-matched agent `file.changed` events whose paths remain dirty | this agent changed the path in its current generation |
+| `dirty` | Git status for a worktree used by exactly one live agent | uncommitted now |
+| `branch` | branch changes still different from base | committed but unmerged |
+| `claim` | claim table | announced intention |
+| `history` | optional bounded Git log | recent authorship, not current ownership |
 
-Output (one line per agent, strongest signal first):
+Example:
 
 ```text
-a7  writer-1  codex   dirty   src/api/routes.rs, src/api/mod.rs   branch feat/routes
-a9  tests-2   claude  claim   src/api/**  "adding integration tests" (expires 14:30)
+a7#3 writer-1 codex  dirty src/api/routes.rs src/api/mod.rs branch feat/routes
+a9#1 tests-2  claude claim src/api/** "integration tests" expires 14:30
 ```
 
-Mapping commits to agents: each agent worktree has its branch recorded in the
-`agents` row, and Eliot gives each agent process its own Git identity through the
-environment (`GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` = agent name,
-`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` = `<agent-name>.<id>@agents.eliot`) unless
-the profile sets `git_identity = "inherit"`. No repository config is written, so this
-also works in shared checkouts. `who --history` maps author emails of that form back to
-agents; other authors are shown as is.
+Each agent process gets Git identity in environment only:
 
-In a checkout shared by several agents, `git status` cannot say who changed a file;
-there `who` reports `edited` per agent and lists remaining dirty files as
-`unattributed`. In a shared checkout an agent stages only its own paths
-(`git add <paths>`, never `-A` or `.`); Eliot's own git actions never stage with `-A`
-there. `who` and claims inform; they do not prevent conflicts. Several agents
-running `git add`/`commit` in one checkout collide on `index.lock` and mix each
-other's changes: in `shared` mode let one agent (usually the manager) commit, or give
-writers `worktree` mode.
+```text
+GIT_AUTHOR_NAME / GIT_COMMITTER_NAME = agent name
+GIT_AUTHOR_EMAIL / GIT_COMMITTER_EMAIL = <name>.<id>@agents.eliot
+```
 
-Pathspecs and recorded paths are normalized the same way before matching
-([path rules](monitoring.md#starting-processes)).
+`git_identity="inherit"` opts out. Eliot never writes repository Git config.
 
-`who` is a query over in-memory sets plus at most one `git log`; it never runs
-`git status` itself. The `edited` sets are rebuilt from persisted `file.changed`
-events after a restart.
+In a shared checkout, Git cannot attribute uncommitted bytes. Eliot reports
+agent-specific native edit events plus `unattributed` remaining dirty paths. Agents in
+a shared checkout stage explicit paths, never `git add -A` or `.`; one manager should
+commit, or writers should use worktrees. Claims and `who` inform but do not lock.
+
+`who` queries cached sets and at most one bounded Git log. It never runs a fresh status
+per request. Paths use the common normalization rules.
 
 ## Claims
 
-Advisory announcements, not locks (Eliot cannot sandbox a native shell, and a fake
-lock is worse than none):
+Claims announce intent; they are not locks:
 
 ```text
 eliot claim 'src/api/**' --note "routes refactor" --ttl 2h
-eliot release ['src/api/**']
+eliot release 'src/api/**'
 ```
 
-- Overlapping claims, or a claim over another agent's `dirty`/`branch` files, emit
-  `claim.conflict` and send a `queue` message to both agents with the other's note.
-- Claims expire (`ttl`, default 4 h) and are dropped when the agent stops.
+Overlapping claims or claims over another agent's dirty/branch set emit
+`claim.conflict` and queue one coalesced message to both. Default TTL is 4 h. Claims
+are released on terminal agent state or expiry; a generation change updates/requires a
+new claim rather than letting an old process own it indefinitely.
 
 ```sql
 CREATE TABLE claims (
-  agent INTEGER NOT NULL, glob TEXT NOT NULL, note TEXT, expires_at INTEGER NOT NULL,
-  created_at INTEGER NOT NULL, PRIMARY KEY (agent, glob)
+  agent INTEGER NOT NULL,
+  generation INTEGER NOT NULL,
+  glob TEXT NOT NULL,
+  note TEXT,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(agent, generation, glob)
 );
 ```
 
 ## Hierarchy
 
-- `launch --parent A` creates a child; `depth = parent.depth + 1`; `root` is
-  inherited. No limit in the model; config guards against runaway spawning:
-  `limits.max_depth` (8), `limits.max_children_per_agent` (20) and
-  `limits.max_tree_agents` (100); `0` means no limit. These guard against accidents,
-  not against scale. A launch past a limit fails `not_allowed` and names it (v1 field data: one recursive request produced 48+ agents and ~1.5M tokens).
-- Native subagents become `origin = native` children automatically.
-- Tree operations: `stop --tree A`, `send @tree:A`, `ls --tree A`, `watch @tree:A`.
-- Parent notifications: when a child reaches `stopped`, `failed`, `lost` or its goal
-  becomes `done`/`blocked`, a `queue` message goes to the parent (profile
-  `notify_parent`, default on).
-- A manager that must react to its children waits inside its own turn with
-  `eliot wait @children` or `eliot send <child> "<task>" --wait` — an idle model is
-  not woken by a queued message, and `inject` reaches a busy agent only at its next
-  safe point.
+`launch --parent A` inherits root/project and sets depth +1. The model itself has no
+arbitrary hierarchy limit; configuration prevents accidental fan-out:
+`max_depth=8`, `max_children_per_agent=20`, `max_tree_agents=100`; 0 disables a limit.
+A rejected launch names the limit.
 
-## Communication guidance for agent prompts
+Native subagents register as `origin=native` children. Tree selectors work for list,
+watch, send and stop. When a child reaches terminal state or its goal becomes
+done/blocked, Eliot queues one parent message if `notify_parent=true`; mailbox wake
+policy decides whether that notice starts/presents a turn.
 
-Research and v1 field data agree: dense chatter costs tokens and makes agents
-converge early ([research](../reference/research.md)). Every launched agent therefore
-gets this **system note** (it lists only commands the running build has — the
-coordination lines arrive with L5) (passed as `system_note` in `agent.start`; the plugin uses
-the harness's system/developer-instructions mechanism, or prepends it to the first
-prompt). Profiles may replace it with `system_note = "<file>"`.
+A manager that must synchronously react should stay in a turn and use
+`eliot send <child> "<task>" --wait` or `eliot wait @children`. Queue delivery is for
+asynchronous communication and may wake only according to the recipient profile.
+
+## Prompt guidance
+
+Default system note, trimmed to commands present in the running layer:
 
 ```text
-You are Eliot agent {id} ({name}) on {harness}, project {project}, parent {parent}.
-The `eliot` command talks to the controller:
-  eliot inbox                      your messages
-  eliot msg send <agent> "<text>"  message one agent (reply: --reply-to <msg>)
-  eliot var get|set <key> [value]  shared project facts (ports, API names, decisions)
-  eliot who <path>                 who else is changing these files
-  eliot claim <glob>               announce the area you will change
-  eliot ls                         other agents
-Coordinate through shared vars and `who` first, messages second. Message one specific
-agent, not everyone. Ask concrete questions with the facts needed to answer. Do not
-send acknowledgements or status updates; the controller already shows status.
+You are Eliot agent {id} generation {generation} ({name}) on {harness}, project
+{project}, parent {parent}. The `eliot` command talks to the controller:
+  eliot inbox
+  eliot msg send <agent> "<text>"
+  eliot var get|set <key> [value]
+  eliot who <path>
+  eliot claim <glob>
+  eliot ls
+Use shared vars and `who` first, specific messages second. Ask one concrete recipient
+with the facts needed to answer. Do not send acknowledgements or routine status; the
+controller already exposes status.
 ```
 
-Agents with `control = tree` or `project` also get:
+Agents with tree/project control additionally get:
 
 ```text
-You may direct other agents:
-  eliot launch --profile <p> --parent {id} "<task>"   start a child
-  eliot send <agent> "<text>" --wait                  give work and wait for the answer
-  eliot wait @children [--for turn|idle|stopped]      wait for children (re-run after timeout)
-  eliot result <agent>                                last answer of an agent
-  eliot steer|interrupt|stop <agent>                  correct or stop work
+  eliot launch --profile <p> --parent {id} "<task>"
+  eliot send <agent> "<text>" --wait
+  eliot wait @children [--for turn|idle|stopped]
+  eliot result <agent>
+  eliot steer|interrupt|stop <agent>
 ```
