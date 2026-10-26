@@ -1,184 +1,175 @@
 # Automation
 
-Automation turns committed events/time into ordinary commands or bounded local
-external actions. It has no Task/review workflow model. Its durable state exists only
-to prevent missed triggers, retargeting and blind replay.
+Automation turns committed events/time into ordinary commands or bounded local actions.
+It has no Task/review workflow model. Durable state exists only to avoid missed
+triggers, retargeting and blind replay.
 
-## Rule files and revisions
+## Rule scope, files and revisions
 
-Rules live in project/data-dir TOML. Required keys: `id`, `on`, `do`; optional:
-`enabled`, `limit`, `catch_up`, `allow_self`. IDs and files are bounded and validated.
+- `<data_dir>/rules/*.toml`: global rule, owner authority.
+- `<registered project>/.eliot/rules/*.toml`: project rule, limited to that project.
 
-Every valid canonical rule has a fixed `revision` digest. Existing admitted runs retain
-the revision they were rendered from. Editing a rule creates a new revision; it never
-mutates an old run.
+Project rules may command/message project agents, use project/tree vars, run scripts in
+the registered project and act on that repository. They cannot target another project,
+global vars, arbitrary cwd, plugin/service/account config or undeclared webhook. This
+is a correctness boundary inside the one-user trust model, not hostile-process security.
 
-First load of a new event-rule revision starts at the current persisted event high-water
-(no implicit historical backfill). Daemon restart with the same revision resumes from
-the durable cursor. A future explicit replay command may name a starting seq; ordinary
-hot reload does not.
+Scripts receive an ephemeral scoped automation token; omitting it does not turn them
+into owner. Global scripts get owner scope, project scripts project scope.
 
-Timer revision semantics are simple and visible: any `on` edit creates a new timer
-schedule/anchor. An action-only edit also creates a new rule revision but does not
-re-fire a slot already admitted by the previous revision; future due slots use the new
-revision. The timer row stores schedule identity separately from action revision.
+Required keys: `id`, `on`, `do`; optional `enabled`, `limit`, `catch_up`, `allow_self`.
+Canonical rule bytes produce fixed `revision`. Admitted runs retain their revision.
+Editing never mutates an old run.
 
-## Event trigger cursor
+First load of a new event-rule revision starts at current event high-water; no implicit
+historical replay. Restart with the same revision resumes its durable cursor. Disabled
+or globally paused event rules advance to current high-water without firing, so pause
+does not create a later burst or pin retention. Re-enable starts from that cursor.
 
-Event rules are level-reconciled from the persisted log, not dependent on a volatile
-bus callback:
+## Event cursor and retention
 
-1. read a bounded page `(event_cursor, high_water]`;
-2. evaluate each committed event in seq order against the stored rule revision;
-3. in one transaction, create any immutable run/actions and advance cursor past that
-   event;
-4. on conflict from a previously committed run, advance the cursor without duplicating.
+Event rules reconcile from the persisted log:
 
-Crash before transaction repeats evaluation safely; crash after transaction cannot
-lose the event. Ephemeral events never trigger durable automation.
+1. read bounded page `(cursor, high_water]`;
+2. evaluate committed event + its stored event-time subject snapshot;
+3. transactionally create immutable run/actions and advance cursor;
+4. duplicate run conflict advances cursor without another effect.
 
-## Timer triggers
+Crash before transaction repeats safely; after transaction cannot lose the event.
+Ephemeral/late-diagnostic events are ineligible unless explicitly matched by their
+`x.*` kind.
 
-- interval: anchored slot number;
-- cron: scheduled UTC instant, with explicit timezone/DST rules;
-- once: UTC instant;
-- manual: generated command id.
+Retention deletes only through the minimum cursor of active event-rule revisions. Rule
+lag is visible. If one active rule exceeds configured backlog count/age, automation
+pauses that rule with `backlog_limit` and stops advancing it until the owner chooses
+`resume --catch-up` or `resume --from-now`; it never silently discards history or pins
+disk indefinitely.
 
-Missed time uses `latest` or `none`, never burst. The same rule/schedule does not stack
-while a run is queued/running/unknown. Due processing is reconciled from timer rows on
-startup, not from an in-memory timer alone.
+## Timers/revisions
+
+Interval key is anchored slot; cron/once key is scheduled UTC instant; manual key is
+caller id. DST is evaluated in declared timezone but identity is UTC. Missed time is
+`latest` or `none`, never burst. Due rows reconcile on startup.
+
+Changing `on` creates a schedule revision/new anchor. Action-only edit changes action
+revision but never re-fires an admitted slot; future slots use new actions. One schedule
+does not stack while its previous run is queued/running/unknown.
 
 ## Durable firing and frozen target
 
-A run identity is fixed-length derived from rule id, rule revision and trigger key. In
-one transaction the daemon:
+Run id is fixed derived id of principal/rule revision/trigger key. One transaction:
 
-1. verifies the trigger key has no run for that schedule/revision;
-2. reads one consistent trigger snapshot;
-3. renders/validates actions;
-4. resolves selectors/names to concrete agent ids and exact generations;
+1. verifies uniqueness;
+2. reads the stored trigger snapshot;
+3. renders/validates actions under rule principal;
+4. resolves names/selectors to concrete agent ids/generations;
 5. captures exact turn/request for delayed controls;
 6. expands multi-target work to immutable per-target actions;
-7. updates cursor/timer state and emits run/action events.
+7. advances event cursor/timer and emits run/action state.
 
 Delayed automation never resolves “whatever is current later”. Replacement generation
-is stale and requires a new trigger/manual run.
+is stale and needs a new trigger/manual run.
 
 ## Action states
 
 ```text
 queued → dispatched → applied | failed | unknown
 queued → cancelled
-unknown → applied | failed       // exact readback or owner resolution
+unknown → applied | failed       // exact readback or explicit owner resolution
 ```
 
-Queued actions resume after restart. Dispatched actions become unknown. Unknown is
-never run again automatically. Store-local writes use stable ids. External writers
-need exact readback or remain unknown. Actions in a run execute in order; unknown or
-failed stops later actions.
+Queued resumes after restart. Dispatched becomes unknown. Unknown is never executed
+again. Actions run in order; failed/unknown/cancelled stops later actions. Store-local
+writes use stable ids; external writers require exact readback or remain unknown.
 
-## Matching and rendering
+## Matching/rendering
 
-Match exact/glob/regex/one-of/presence paths in the committed `{event,agent,data}`
-snapshot. Core stale/diagnostic events are not eligible unless a rule explicitly
-matches their `x.eliot.*` kind.
+Match exact/glob/regex/one-of/presence paths in stored `{event,subject,data}`. Never join
+a later mutable Agent row. Placeholders fill values only—not executable, cwd root, env
+name, action kind, option, credential, authority or target scope. Missing value fails the
+firing transaction.
 
-Placeholders may fill data values only. They cannot choose executable, cwd root, env
-name, action kind, option name, credential, authority or target scope. Missing values
-fail the firing transaction.
-
-A delayed steer/interrupt must carry exact turn id; approve/answer exact request id.
-An omitted agent on an event rule means the concrete triggering agent+generation—not a
-future lookup.
+Omitted event target means the exact triggering agent+generation. Delayed steer/
+interrupt needs exact turn; request replies need exact request.
 
 ## Actions
 
-| Action | Rule |
+| Action | Boundary |
 | --- | --- |
-| core verb | submit stable command id with frozen expected/target binding |
-| Git fetch/pull/push/worktree | explicit argv and repository/ref intent; push never force; unknown uses exact readback only |
-| mail/var | stable Store admission per concrete recipient/key |
-| script `run` | fixed executable/argv/cwd; bounded streams; no generic replay |
-| `notify log|desktop` | local bounded result |
-| `notify webhook` | named configured endpoint only; no raw URL/secret persisted in rule/action |
-| `emit` | bounded `x.user.*` persisted event |
+| core verb | stable command id + frozen expected/target binding, routed under rule principal |
+| Git fetch/pull/push/worktree | explicit repo/ref/path intent; push never force; exact readback only |
+| mail/var | concrete recipients/scope under rule principal |
+| script | fixed executable/argv/project-safe cwd; bounded streams; no unknown rerun |
+| log/desktop notify | bounded local result |
+| webhook | globally named endpoint; project must be allowlisted; no raw URL/secret in payload |
+| emit | bounded `x.user.*` in principal scope |
 
-Git unknown settlement waits for exact process custody to be empty. Unknown push then
-reads exact remote ref; it never pushes again. A repository has a narrow writer hold
-while an earlier push is unknown.
+Unknown Git settlement waits for exact process custody empty. Push then reads exact
+remote ref; never pushes again. One repository has a narrow writer hold while its push
+is unknown.
 
-`run` environment uses literal nonsecret values plus named `pass_env` references.
-Secret values are resolved at execution and never stored in action payload/output. A
-script receives bounded JSON on stdin. The daemon buffers all stdout action objects,
-waits for exit 0, validates/resolves them against one snapshot, appends them in one
-transaction, then dispatches. Lost script outcome is unknown and not rerun.
+Script env uses nonsecret literals + globally allowed named env references resolved at
+execution. stdout actions are fully buffered, parsed, authority-checked and appended in
+one transaction after exit 0; only then dispatch. Lost script outcome is unknown.
 
 ## Approval rules
 
-Approval/answer actions store exact generation/turn/request from the triggering event.
-Synchronous hooks return a decision only after its durable admission commits; Store
-failure/timeout returns native-safe `ask`. No timeout chooses a default option.
+Request actions freeze generation/turn/request. Synchronous hook decision is returned
+only after durable command/action admission commits. Timeout/Store failure returns
+native-safe `ask`, never a default choice.
 
 ## Goal loop
 
-Native and Eliot goals are independent but generation-bound. Internal cost is integer
-micro-USD; user CLI may accept decimal USD and parse it exactly. No floating-point
-budget storage.
+Native/Eliot goals are independent and generation-bound. Cost uses integer micro-USD;
+`max_cost` is accepted only when the plugin reports exact machine-readable cost.
+Generation change pauses both projections until explicit readback/rebind.
 
 ```text
 Goal {
-  agent, agent_generation, mode, text, check?, cadence,
+  agent, generation, mode, text, check?, cadence,
   max_turns, max_cost_microusd?, no_progress,
   status, turns_used, cost_used_microusd?, revision,
   next_due_at?, last_workspace_hash?, last_check_hash?
 }
 ```
 
-A generation change pauses the goal. Resume/set explicitly rebinds it after native
-readback where applicable.
+Goal rounds reconcile from current rows on startup/state changes; no idle edge is
+required. A round is an `automation_run` under principal `goal:<agent>`:
 
-Goal rounds are level-reconciled. On startup and after every relevant state change, the
-daemon queries active goals whose agent is idle/due and has no in-flight round. It does
-not rely solely on an `agent.idle` edge that a crash could miss.
+1. capture generation/revision/pending/unknown/native-goal state;
+2. skip on request/unknown; on-idle also waits for active native goal;
+3. marker check is read-only Store action; argv check is a journaled process action;
+4. unknown argv-check outcome blocks the round and is never rerun automatically;
+5. pass → done; exact budget exhausted → blocked;
+6. progress = changed complete check output or complete workspace fingerprint;
+7. re-read generation/revision and admit one exact send if unchanged.
 
-One round:
+Stable goal-run identity prevents duplicate continuation. Pause/clear/generation change
+invalidates a running check before send admission.
 
-1. capture generation + goal revision + pending/unknown/native-goal state;
-2. skip on pending request or unknown effect; `on_idle` also waits for active native
-   goal;
-3. run bounded check;
-4. pass → done; exhausted exact budget → blocked;
-5. progress = changed complete check output or complete read-only workspace
-   fingerprint; unavailable fingerprint alone is not no-progress;
-6. re-read generation/revision and admit one exact linked send only if unchanged.
+## Level reconciliation
 
-A durable `goal_round` identity prevents duplicate continuation after restart. Pause,
-clear or generation change invalidates a running check before send admission.
-
-## Mail/rule/launch recovery is level-based
-
-Automation is not the only component using current-state reconciliation:
-
-- unread mail with no presentation action is reconsidered after restart;
-- `created` launches and queued resumes are reconsidered against current capacity;
-- active goals reconcile as above;
-- provider holds/probes reconcile from persisted route state.
-
-A lost wakeup never requires repeating an uncertain native effect.
+The same current-state pattern covers unread mail presentation, created launches,
+queued resumes, provider holds/probes and active goals. A lost wakeup never authorizes
+repeating an uncertain native effect.
 
 ## Storage
 
 ```sql
 CREATE TABLE rule_state (
+  principal TEXT NOT NULL,
   rule TEXT NOT NULL,
   revision TEXT NOT NULL,
+  active INTEGER NOT NULL,
   event_cursor INTEGER NOT NULL,
+  paused_reason TEXT,
   loaded_at INTEGER NOT NULL,
-  PRIMARY KEY(rule, revision)
+  PRIMARY KEY(principal, rule, revision)
 );
 
 CREATE TABLE automation_runs (
   id TEXT PRIMARY KEY,
+  principal TEXT NOT NULL,
   rule TEXT NOT NULL,
   rule_revision TEXT NOT NULL,
   trigger_key TEXT NOT NULL,
@@ -186,7 +177,7 @@ CREATE TABLE automation_runs (
   state TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  UNIQUE(rule, rule_revision, trigger_key)
+  UNIQUE(principal, rule, rule_revision, trigger_key)
 );
 
 CREATE TABLE automation_actions (
@@ -195,49 +186,39 @@ CREATE TABLE automation_actions (
   kind TEXT NOT NULL,
   payload TEXT NOT NULL,
   state TEXT NOT NULL,
-  ref TEXT,
-  outcome TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
+  ref TEXT, outcome TEXT,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   PRIMARY KEY(run, idx)
 );
 CREATE INDEX automation_actions_open ON automation_actions(state)
   WHERE state IN ('queued','dispatched','unknown');
 
 CREATE TABLE timers (
+  principal TEXT NOT NULL,
   rule TEXT NOT NULL,
   schedule_revision TEXT NOT NULL,
   action_revision TEXT NOT NULL,
-  last_key TEXT,
-  next_due_at INTEGER,
-  PRIMARY KEY(rule, schedule_revision)
+  last_key TEXT, next_due_at INTEGER,
+  PRIMARY KEY(principal, rule, schedule_revision)
 );
 
 CREATE TABLE goals (
-  agent INTEGER NOT NULL,
-  mode TEXT NOT NULL,
+  agent INTEGER NOT NULL, mode TEXT NOT NULL,
   agent_generation INTEGER NOT NULL,
-  text TEXT NOT NULL,
-  check_cmd TEXT,
-  cadence TEXT NOT NULL,
+  text TEXT NOT NULL, check_cmd TEXT, cadence TEXT NOT NULL,
   status TEXT NOT NULL,
-  max_turns INTEGER NOT NULL,
-  turns_used INTEGER NOT NULL DEFAULT 0,
-  max_cost_microusd INTEGER,
-  cost_used_microusd INTEGER,
-  no_progress INTEGER NOT NULL,
-  stale_turns INTEGER NOT NULL DEFAULT 0,
-  last_workspace_hash TEXT,
-  last_check_hash TEXT,
+  max_turns INTEGER NOT NULL, turns_used INTEGER NOT NULL DEFAULT 0,
+  max_cost_microusd INTEGER, cost_used_microusd INTEGER,
+  no_progress INTEGER NOT NULL, stale_turns INTEGER NOT NULL DEFAULT 0,
+  last_workspace_hash TEXT, last_check_hash TEXT,
   revision INTEGER NOT NULL DEFAULT 0,
-  next_due_at INTEGER,
-  updated_at INTEGER NOT NULL,
+  next_due_at INTEGER, updated_at INTEGER NOT NULL,
   PRIMARY KEY(agent, mode)
 );
 ```
 
 ## Guardrails
 
-Cause depth, per-rule/global rate limits, self-trigger protection, bounded payloads and
-current router validation all apply. Paused/draining automation admits no new run or
-goal continuation. No guardrail is implemented as another model call.
+Cause depth, principal scope, per-rule/global rate limits, self-trigger protection,
+bounded payloads and router validation all apply. Draining admits no new run/goal round.
+No guardrail uses another model call.
