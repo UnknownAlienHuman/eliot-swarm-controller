@@ -1,99 +1,92 @@
 # Antigravity CLI (`agy`)
 
-Layer L4.5. Plugin: `plugins/antigravity`, `session_mode = "per_agent"`. One warm
-`agy` process belongs to one Eliot agent generation and its exact process group.
+Layer L4.5, `plugins/antigravity`, `per_agent`. One warm `agy` custody unit belongs to
+one Eliot generation. Exact force only with exact platform backend.
 
 Facts checked 2026-10-25 against official headless/CLI/subagent/permission/hook pages
-and `google-antigravity/antigravity-cli` changelog (top entry 1.4.7; pages undated).
-Some documented defaults conflict and remain explicit below.
+and changelog; conflicting defaults require installed recording.
 
-## Install and auth
+## Transport and start
 
-`agy` comes from the vendor installer and is logged in interactively once; headless
-runs use cached credentials. v1 observed Windows binary
-`%LOCALAPPDATA%\agy\bin\agy.exe` at version 1.3.3 on 2026-10-14. Do not encode that
-path/version as a gate; discover/report the installed binary.
+`agy --input-format stream-json --output-format stream-json ...` accepts one JSON user
+line at a time and emits init/step/result. Stream mode does not accept slash or Claude
+control commands.
 
-## Transport and binding
+Installed behavior must establish whether stable conversation/init exists before first
+user line:
 
-```text
-agy --input-format stream-json --output-format stream-json
-    [--model M] [--mode accept-edits|auto|plan] [--effort E]
-    [--conversation <id>]
-```
+- init first → `start_requires_input=false`; open source, commit ready, then linked send;
+- input required → `start_requires_input=true`; linked send is `agent.start.initial`,
+  but session and exact input/turn outcomes remain separate.
 
-- stdin prompt: one JSON line `{"event":"user","message":{"content":"..."}}`;
-  text only. One `result` settles a turn. Closing stdin requests process exit.
-- stdout events: `init` once, `step_update`, `result`.
-- Stream mode does not accept slash commands or Claude-style control lines; observed
-  versions exit 2 when they are sent.
-- The plugin binds process/conversation to `(agent_id,generation)`. Inputs and results
-  pair by order **inside that one generation/process** because native results do not
-  name the input. At most one prompt is in flight.
-- Resume starts a new per-agent process and a new Eliot generation with retained
-  `--conversation`; late output from the old process is stale and cannot complete it.
+Never write optional prompt without linked command identity. Lost init/write/result is
+the corresponding unknown; never create another conversation as retry. Resume starts
+new generation with exact conversation id; optional text is linked send.
 
-## Verb mapping
+Controlled stdout source uses stable open id/key and contiguous commit acknowledgements.
+If plugin cannot backpressure/replay lines, it maintains bounded durable spool; loss/
+overflow closes source gapped. stdout/process exit alone is not completion.
 
-| Eliot verb | Antigravity | Notes |
-| --- | --- | --- |
-| `launch` | start process, write optional first prompt | `native_ref` is `conversation_id` from init/updates. Emit `session.ready` after init/effective settings and before start success. A lost initial write/result is unknown; never start another conversation as retry. |
-| `send` | next user line after prior terminal result | Native write acceptance is not turn start/completion; keep command/turn correlation locally. |
-| `steer` | unsupported | Reject before native I/O. |
-| `inject` | prepend to the next send only | Report `mechanism=queued:next_send`; never claim current-turn delivery. |
-| `interrupt` | unsupported until an installed recording proves a native exact-turn mechanism | `stop --force` is not interrupt. |
-| `stop` | close stdin and wait; force kills this process group | Preserve child handle/exit code. Unknown close/exit is not retried against a replacement generation. |
-| `resume` | new process with exact conversation id | No old prompt replay. |
-| `approve` / `deny` | no headless request channel; launch policy decides | A soft-denied tool remains a native tool outcome, not an Eliot pending approval. |
-| `answer` | unsupported | |
-| `configure` | launch flags only | `applies=next_session`; in-stream `/model` is forbidden. |
-| `goal.*` | Eliot Goal loop | |
+## Correlation and verbs
 
-## Events and source ownership
+Native result may not name input. One process/generation therefore has at most one
+unresolved prompt; plugin retains exact Eliot command ↔ local input ordinal ↔ native
+turn/result. Ambiguity across reconnect/process becomes unknown, never reconstructed by
+time/order from another generation.
 
-The controlled stdout stream owns session/turn/message/tool lifecycle. Official
-example fixtures are protocol examples, not a concurrent runtime source.
-
-| Native | Eliot |
+| Eliot | Antigravity |
 | --- | --- |
-| `init` | `session.ready` with effective cwd/tools/permission/model |
-| first progress for an admitted prompt | `turn.started` for the locally bound input |
-| agent text delta | ephemeral `message.delta` |
-| tool update | `tool.started/completed`; scan errors for soft denials |
-| subagent info | exact child registration; omitted workspace list = unchanged, empty = cleared |
-| pre-init terminal error | `session.error` only when it proves no session/prompt was admitted; otherwise unknown launch outcome |
-| terminal `result` | exact bound `turn.completed`: SUCCESS completed; ERROR/INVALID failed; CANCELED/INTERRUPTED interrupted |
-| WAITING/RUNNING result-like update | harness-specific nonterminal event, never completion |
+| send | next line only after previous input association/turn terminal; applied at exact bound native execution |
+| steer | unsupported |
+| inject | prepend-next-send only, reported explicitly |
+| interrupt | unsupported until exact installed mechanism; force-stop is not interrupt |
+| stop | close stdin/wait; exact force via custody only; unknown close not replayed |
+| approve/deny/answer | no headless request channel; policy/soft denial is native tool outcome |
+| configure | launch flags, `next_session` |
+| goal | Eliot goal only |
 
-If stdout closes while the process remains or a terminal line may have been lost, the
-turn/command is unknown. Silence does not complete it. Usage in current result examples
-is cumulative session usage: replace, do not sum.
+## Events and readback
 
-## Config, permissions and children
+Controlled stdout owns lifecycle. Init provides conversation/effective settings where
+available. First exact progress after admitted input starts bound turn. Result settles
+only that turn: success completed, error/invalid failed, cancelled/interrupted
+interrupted; waiting/running nonterminal.
 
-Settings are under the vendor config directory. Permission rules use documented
-allow/deny/ask precedence; `--dangerously-skip-permissions` is an explicit full-access
-profile choice and effective init state must show it.
+Pre-init error is definite no-effect only with native evidence. stdout closure with
+possible lost terminal frame creates unknown turn after source drain rules. Cumulative
+session usage replaces rather than sums. Soft-denied tools remain visible even if top
+result says success.
 
-Native subagents are invoked by parent tools and may wake later. Register them by
-conversation/provenance ids. Parent result or idle state does not prove child
-completion.
+## Native children and process ownership
 
-Documented conflicts to resolve with installed recordings in L7: print-timeout default,
-allowed effort values and headless error exit code.
+Subagents register by exact conversation/provenance subject and stable registration id.
+Omitted workspace list means unchanged; empty means cleared. Parent result never proves
+child completion.
 
-## Proxy and retained failures
+Antigravity subagents normally execute inside the same `agy` process/environment. Until
+installed evidence proves child-specific environment injection, declare
+`child_environment=false`: child rows are visible, but shell/CLI/Git activity is
+attributed to parent and no child token is minted.
 
-No documented base-URL override was found at the checked date; manifest proxy support
-is `none`. Do not invent an API route or silently replace the subscription with an API
-provider.
+The warm `agy` PID is owned by parent agent custody. Additional descendant registration
+must pass OS membership; OS monitor owns exit/stats. A future shared server PID would be
+service-owned, never child-owned.
 
-L7 retains these cases:
+## Environment and route
 
-- `SUCCESS` with a soft-denied tool is not clean success; expose the denial.
-- No qualified history API means crash recovery may remain unknown even if
-  conversation resume is possible.
-- Result/input correlation is valid only while one-at-a-time order and the same
-  process generation are intact.
-- v1 fixtures at `v1-final:modules/antigravity/fixtures/` are doc-derived, not live
-  evidence.
+No qualified proxy/base-URL override; manifest proxy none. Minimal environment passes
+named vendor auth/config plus parent Eliot identity. Permission mode explicit and
+reported from init; full access never inferred.
+
+## L7 cases
+
+- init-before-input and lost source/start/input/result acknowledgements;
+- one-at-a-time association, reconnect ambiguity/unknown turn and stale generation;
+- soft denial under success and cumulative usage;
+- child canonical subject/workspace semantics, independent completion and parent
+  attribution without child env;
+- descendant registration vs OS enumeration;
+- close/force exact/degraded custody;
+- installed print-timeout/effort/exit-code conflicts.
+
+Frozen v1 fixtures are official-example transcriptions, not live qualification.

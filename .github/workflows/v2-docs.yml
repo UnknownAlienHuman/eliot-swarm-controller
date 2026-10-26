@@ -1,0 +1,38 @@
+name: V2 docs
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'docs/**'
+      - 'tools/ci/validate-v2-docs.py'
+      - 'tools/ci/validate-v2-schema.py'
+      - '.github/workflows/v2-docs.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'docs/**'
+      - 'tools/ci/validate-v2-docs.py'
+      - 'tools/ci/validate-v2-schema.py'
+      - '.github/workflows/v2-docs.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    name: Active v2 links, anchors and SQLite schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Validate local links, images and GitHub-style anchors
+        run: python3 -I tools/ci/validate-v2-docs.py
+      - name: Execute documented SQLite DDL and key invariants
+        run: python3 -I tools/ci/validate-v2-schema.py

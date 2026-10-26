@@ -1,179 +1,279 @@
 # Monitoring
 
-Every source runs independently, emits bounded facts and reports its own health. A
-failed source never blocks the router or another source. It also never gets to invent
-facts owned by a healthier source.
-
-## Sources
-
-| Source | What it sees | How | Events |
-| --- | --- | --- | --- |
-| Native stream | session, turns, messages, tools, approvals, children, goals, usage | plugin protocol | `session.*`, `turn.*`, `message.*`, `tool.*`, `approval.*`, `child.spawned`, `goal.updated`, `usage.updated` |
-| Native transcript | the same for discovered/observe-only sessions, or explicit stream recovery | plugin tails native files | only the event families assigned to it |
-| Native hooks | synchronous decisions and facts missing from the primary stream | hook shim / SDK callback | assigned `approval.*`, tool/prompt facts, `x.<harness>.*` |
-| Processes | life and resource use of owned processes | Job/process-group custody + registered PIDs | `process.started/exited`, `process.stats`, `session.lost` |
-| Git | branch, HEAD, dirty files, commits, ahead/behind, remote refs | read-only Git CLI | `git.status`, `git.commit`, `git.ref` |
-| Filesystem | workspace changes | `notify`, debounced | `fs.changed`, Git refresh |
-| Proxy/provider | health, usage, limits | configured management API | `source.health`, `provider.limited` |
-| Derived | stalls, durations, idle time | timers over progress facts | `agent.stalled/unstalled` |
-| Store/config | commit availability and config reload | daemon | `source.health` |
+Sources are independent and bounded. Failure reports health/gaps and never invents a
+fact owned by another source.
 
 ## Source ownership
 
-For each `(agent, generation, event family)`, exactly one source is authoritative.
-Examples: the live Codex app-server stream owns turns/messages/tools; a transcript may
-own those families for an observe-only thread; a hook may own permission decisions
-while the stream owns tool lifecycle.
+For each `(agent,generation,event family)` exactly one source is authoritative. Current
+projection stores owner, stable source open id/key, Store source-sequence watermark and
+last native cursor. Backup may track raw position privately but cannot publish duplicate
+lifecycle.
 
-Rules:
+Handoff begins strictly after last committed native cursor. Unprovable interval is a
+visible gap. Wrong generation/turn/request, stale source sequence and vendor replay are
+bounded diagnostics, never ordinary lifecycle or automation triggers.
 
-1. `session.ready` records the selected owners and any native cursor/watermark in
-   `effective.event_owners` when the harness has several possible sources.
-2. A backup source does not publish the same normalized family concurrently. It may
-   collect raw position privately.
-3. Handoff starts after the last committed native id/cursor. If the old and new formats
-   cannot prove a complete boundary, emit `source.health status=stale` with a bounded
-   gap description; do not replay old completions or treat the missing interval as
-   empty.
-4. Duplicate native ids from reconnect/replay are suppressed by the plugin before the
-   bus. The daemon additionally rejects wrong-generation input.
-5. Hooks and transcripts may still emit harness-specific `x.<harness>.*` diagnostics,
-   but those diagnostics never drive core state unless that family was assigned to the
-   source.
+A well-formed source-owned event that is a stale binding or vendor duplicate still
+advances source sequence transactionally: vendor duplicate returns original Store event
+seq; stale binding may create one bounded diagnostic. Malformed envelope, undeclared
+family or digest mismatch is source integrity failure and does not advance. Thus a
+valid late fact cannot wedge later input, while unauthorized families never enter bus.
 
-This prevents a live stream plus transcript tail from firing two `turn.completed`
-events and therefore two rules.
+## Process identity and custody projections
 
-## Process monitor and custody
+Process identity is `(host_boot_id,pid,start_time)`, never PID alone. Linux uses kernel
+boot id plus proc start ticks. Windows uses stable machine identity plus native boot
+session/time identity and `GetProcessTimes` creation time. Reboot cannot match old row.
 
-Process identity is `(pid, start_time)`, never PID alone. `start_time` is the OS
-creation time at native resolution (Windows `GetProcessTimes`; Linux proc start ticks).
+A custody owner is one stable string:
 
-### Per-agent mode
+```text
+agent:<agent-id>#<generation>
+service:<service-name>
+action:<run-id>/<action-index>
+workspace:<agent-id>/<step-index>
+```
 
-A per-agent plugin and every native child it launches are placed in one agent-owned
-Windows Job / Unix process group before the child can run:
+A process belongs to exactly one owner. Shared-service membership of agents is session
+metadata, not duplicate process ownership.
 
-- Windows: create suspended, assign to Job, then resume. The Job uses
-  `KILL_ON_JOB_CLOSE` for daemon-owned stdio sessions.
-- Unix: create the process group before exec. The plugin must exit when stdin closes;
-  on plugin failure the daemon explicitly terminates and verifies the group.
+```sql
+CREATE TABLE custodies (
+  owner TEXT PRIMARY KEY,
+  backend TEXT NOT NULL,              -- windows_job|linux_cgroup|process_group|external
+  capability TEXT NOT NULL,           -- exact|degraded|external
+  native_id TEXT,
+  guardian_boot TEXT,
+  guardian_pid INTEGER,
+  guardian_start INTEGER,
+  state TEXT NOT NULL,                 -- live|stopping|empty|orphan_possible|unknown
+  updated_at INTEGER NOT NULL
+);
 
-The daemon owns the custody handle. A plugin exit causes it to stop the remaining
-exact group and verify every known `(pid,start_time)` is gone. Only then may it emit
-`session.lost`. `stop --force` targets this group and cannot affect another agent.
+CREATE TABLE processes (
+  host_boot_id TEXT NOT NULL,
+  pid INTEGER NOT NULL,
+  start_time INTEGER NOT NULL,
+  owner TEXT NOT NULL REFERENCES custodies(owner),
+  role TEXT NOT NULL,
+  state TEXT NOT NULL,
+  exit_code INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(host_boot_id,pid,start_time)
+);
+CREATE INDEX processes_owner ON processes(owner,state);
+```
 
-### Shared mode and services
+The daemon/OS process monitor is authoritative for `process.started`, `process.exited`
+and stats. It registers plugin/harness processes it spawns before execution where
+possible and enumerates exact custody. A per-agent plugin may additionally submit a
+commit-acknowledged sequenced `process.put` for an agent-owned descendant it discovered;
+the host verifies exact birth and custody membership, then upserts the same projection.
+Host enumeration and plugin registration of one identity publish only one start event.
+A lost `process.put` reply resends the same source sequence; process-history pruning
+cannot turn it into a new process.
 
-A shared plugin may attach to a native service or launch one daemon-managed service.
-The service is watched once and attributed to its users. Stopping one agent uses an
-exact native session operation; it never kills the shared plugin/service. If the
-native service has no isolated force operation, `stop --force` is `unsupported`.
-Attached owner-run services are never killed.
+A shared plugin cannot assign the shared server or uncontained service children to an
+Agent owner. Managed/attached service processes are registered under `service:<name>` by
+service management. Session-attributed tool PID information may be a bounded harness
+diagnostic, never custody ownership. Agent stop therefore never kills a shared service
+process.
 
-Service mode (L7.6) uses a separate custody object without kill-on-close so a daemon
-upgrade can re-attach. Its endpoint, process identity and native session refs are
-persisted before use.
+Internal Git/script/check/workspace runners register their action owner directly in the
+same spawn/custody transaction. Restart never reconstructs custody from PID guesses.
 
-### Observation
+### Peer caller classification
 
-- Plugins register every PID they know; custody enumerates descendants so an
-  intermediate parent exiting does not hide grandchildren.
-- Scan `process.scan_interval` (default 2 s). One `sysinfo::System` is refreshed only
-  for watched PIDs; platform calls provide exact birth identity.
-- `process.exited` is emitted when the identity disappears. Exit code may be unknown
-  after a crash; never record unknown as 0.
-- A process disappearing while identity is read counts as gone, not monitor failure.
-- If all owned harness processes for a generation are gone and no `session.ended`
-  arrived within 3 s, emit `session.lost`. For a shared service, plugin/session
-  readback—not the shared process alone—decides which agents were lost.
-- `process.stats` is ephemeral every 5 s. It never counts as model progress and never
-  clears a stall.
+Persisted `processes` is an optimization/audit projection, **not proof that an unlisted
+peer is uncontrolled**. Before no-token owner fallback, API server:
+
+1. obtains peer PID and pins current boot/start identity;
+2. looks for exact projection row;
+3. on miss, checks live OS membership against every current custody:
+   - Windows: pinned peer + `IsProcessInJob` on live Job handles;
+   - Linux exact: pinned peer cgroup vs registered Eliot cgroups;
+   - degraded: pinned peer PGID vs registered live groups, without upgrading guarantee;
+4. rechecks birth/liveness;
+5. grants no-token owner only when local OS user and definitively outside every custody.
+
+Membership maps caller to custody principal and requires matching scoped token. Access
+failure, birth race, incomplete inventory or ambiguity rejects
+`caller_identity_unknown`. Containment applies before execution, so registration lag
+creates no authority window.
+
+Shared-service process still needs exact per-session token. Deliberate same-user escape
+from degraded group is outside declared containment/security guarantee; status reports
+that boundary rather than pretending hostile same-user isolation.
+
+## Process custody backends
+
+### Windows exact
+
+Per-agent plugin/descendants enter a no-breakaway Job before execution resumes. Every
+script/Git/check/workspace action has its own Job. Daemon-owned stdio Jobs use
+kill-on-close; managed services use separate named non-killing Jobs. Force verifies
+boot-scoped identity and zero active members.
+
+### Linux exact and degraded
+
+Exact custody requires delegated cgroup v2 (or qualified equivalent) plus internal
+owner-death guardian. Guardian lives outside owned group, monitors daemon boot/process
+identity and kills/verifies group on abnormal daemon loss. Clean shutdown disarms only
+after group empty.
+
+Guardian boot/PID/start and health are monitored. Missing/mismatched guardian blocks new
+exact launches and visibly downgrades existing groups; daemon never silently claims
+owner-death cleanup.
+
+Process-group fallback may observe/gracefully stop non-escaping members. Same-user child
+can `setsid`, so capability is degraded: exact force, kill-on-owner-loss and proof all
+descendants are gone are unsupported. Other Unix remains degraded until qualified.
+
+### Shared services
+
+Shared plugin/service is watched once. Agent stop uses exact native session control,
+never server kill. Attached owner service is external and never stopped. Managed service
+custody/process projection is separate from agents/actions.
+
+## Process observation and terminal settlement
+
+Session lifecycle and descendant containment are distinct:
+
+- `stopped` only from exact native terminal/close or exact normal-end readback;
+- `lost` when exact session control is proven gone:
+  - exact backend empty plus authoritative source drained/gapped;
+  - shared-session readback says subject absent; or
+  - degraded backend controlling plugin/native-controller identities gone and
+    authoritative channel EOF/gap, although escaped descendants cannot be ruled out;
+- degraded third case sets custody `orphan_possible`; `lost` describes session control,
+  not proof every descendant died.
+
+Additional rules:
+
+- exact custody enumerates complete container; prior-boot rows are historical;
+- stats are ephemeral and never model progress;
+- unknown exit code stays unknown;
+- process exit/final output may race; drain authoritative source to EOF or bounded
+  terminal deadline;
+- timeout alone is not terminal evidence; one exact/shared/degraded control-loss
+  condition must also hold;
+- live shared server says nothing about one session;
+- late terminal data after source closure is diagnostic.
 
 ## Starting processes
 
-These rules apply to plugins, services, hook shims, scripts and Git actions:
+- Resolve executable fully; argv/cwd/env separate and bounded.
+- Apply containment before execution.
+- Only intended child handles inheritable.
+- Long input uses stdin/files; Eliot text UTF-8 without BOM and LF.
+- Git prompts/editor disabled.
+- Environment follows minimal/inherit policy; Windows keys merge case-insensitively.
+- Running script/hook/plugin paths are immutable/versioned.
+- Normalize paths; never follow untrusted symlink/reparse point for cleanup,
+  fingerprint or setup.
 
-- Resolve executables to full paths; pass argv as a list, never an implicit shell.
-- Long input uses stdin or files, never argv.
-- Windows console children use `CREATE_NO_WINDOW`, not `DETACHED_PROCESS`.
-  Environment keys such as PATH are merged case-insensitively; PowerShell 7 is
-  `pwsh.exe` resolved by path.
-- Eliot-written text is UTF-8 without BOM and LF. Git always has
-  `GIT_TERMINAL_PROMPT=0` and no editor.
-- Do not replace a script/hook binary that may be running; install a new versioned
-  path and switch future launches.
-- Normalize paths before comparison: remove Windows verbatim prefixes, unify
-  separators and compare case-insensitively on Windows.
-- Windows file deletion/replacement can fail while a handle is open; tests close
-  SQLite/files before cleanup rather than looping forever.
+## Workspace preparation
 
-## Git monitor
+`launch --worktree` is durable pre-start work over a frozen
+[workspace binding](configuration.md#frozen-workspace-binding):
 
-One monitor exists per distinct worktree used by a live agent.
+1. create Agent generation 0, `workspace_state=preparing`, deterministic path;
+2. journal repo, requested branch, diagnostic base ref, exact `base_oid`, path and setup
+   revision;
+3. run explicit `git worktree add` against frozen OID under workspace custody;
+4. read back `git worktree list --porcelain`, branch and exact HEAD OID;
+5. run setup argv sequentially, each in its own custody;
+6. commit ready; only then allow native start.
 
-- Refresh on `fs.changed` (500 ms debounce) and every `git.poll_interval` (15 s), but
-  no more often than every 2 s per worktree.
-- All monitor commands use `git --no-optional-locks` and never write the index:
-  - `status --porcelain=v2 --branch -z` → branch, HEAD, upstream, dirty set;
-  - on HEAD change, bounded `log --format=%H%x00%ae%x00%s --name-only old..new` →
-    `git.commit`;
-  - current branch-change set = paths in `diff --name-only base...HEAD` that still
-    differ in `diff --name-only base HEAD`.
-- Remote refs change only after explicit fetch or optional `git.remote_poll`
-  (`ls-remote`, default off).
-- Dirty/branch sets live in memory for [`who`](coordination.md#who-works-on-this) and
-  are rebuilt after restart.
-- If status exceeds 2 s, back off the interval up to 5 minutes and report
-  `source.health status=slow`.
+No implicit fetch/ref re-resolution occurs at dispatch. If requested branch already
+exists, exact current OID must equal frozen `base_oid` (or explicit reuse policy must
+name it); otherwise fail. Moving branch/remote ref after admission cannot alter
+workspace.
 
-### Read-only workspace fingerprint
+Lost Git response is read back, never blindly repeated. Lost setup has no generic
+readback: workspace becomes unknown, launch stays blocked, owner resolves or removes/
+recreates. Setup is not assumed idempotent.
 
-The Eliot Goal loop needs a progress signal without `git add`, a temporary index or
-writing objects into the repository.
+Cancel/stop during preparation terminates current exact action. Git step is read back;
+interrupted setup leaves workspace unknown. Native generation never starts from partial
+workspace.
 
-For a Git workspace, the monitor exposes a fingerprint of:
+Collision/mismatch fails. Cleanup is explicit, stopped-agent only, exact path under data
+root and Git-clean except allowlisted relative scratch. Scratch cleanup rejects symlink,
+device and alternate-stream escape. Branch remains.
+
+## Git and filesystem monitor
+
+One monitor per distinct live worktree:
+
+- read-only `git --no-optional-locks status --porcelain=v2 --branch -z`;
+- bounded log on HEAD change;
+- frozen base-OID-vs-HEAD diff for still-unmerged paths;
+- watcher debounce 500 ms, minimum refresh 2 s;
+- slow status backoff plus health;
+- remote refs only after explicit fetch or optional `ls-remote`.
+
+Monitor never writes index, refs or objects.
+
+### Durable edit attribution
+
+```sql
+CREATE TABLE agent_edits (
+  agent INTEGER NOT NULL,
+  generation INTEGER NOT NULL,
+  workspace TEXT NOT NULL,
+  path TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(agent,generation,path)
+);
+CREATE INDEX agent_edits_workspace ON agent_edits(workspace,path);
+```
+
+Generation-matched edit events upsert with event. When Git proves path clean, remove
+rows. Terminal/superseded generation remains until paths clean; restart never rebuilds
+from event history. Unowned shared-checkout path is `unattributed`.
+
+### Read-only progress fingerprint
 
 ```text
 HEAD + sorted(dirty/untracked path, file type, size, content hash)
 ```
 
-It hashes only paths already reported dirty/untracked, excludes ignored files and
-profile `scratch` paths, reads symlink targets rather than following them, and caches
-hashes until filesystem metadata/a watcher event changes. The content hash is computed
-in Eliot (for example BLAKE3); `git hash-object -w`, `git add` and `write-tree` are
-forbidden. A configurable byte/file cap protects huge workspaces. Crossing the cap
-returns `unavailable`, never a fake stable fingerprint; a no-progress budget cannot
-block solely on incomplete fingerprint data. Non-Git workspaces use the same bounded
-file-set mechanism when the plugin supplies changed paths, otherwise check output is
-the only progress signal.
+Hash only dirty/untracked excluding ignored/scratch; hash symlink target text without
+following. Cache until watcher/metadata change and enforce caps. Incomplete is
+unavailable, never no-progress. No temporary index, `git add`, object writes or
+`write-tree`.
 
 ## Liveness
 
-Only progress-bearing native facts update `last_progress_at`: turn/message/tool/plan,
-file-change, request/answer and explicit plugin heartbeat that proves the model loop
-advanced. Process samples, Git polling, mail and source-health events do not.
+Only exact-generation model progress updates `last_progress_at`.
 
 | Observation | Conclusion |
 | --- | --- |
-| No progress fact while `busy`/`waiting` for `stall_after` | `agent.stalled` flag; no state change or automatic restart |
-| Parent idle, children busy | parent idle; tree not done |
-| Process alive, stream disconnected | source stale; state unchanged |
-| Exact owned process group gone, no terminal event | `session.lost` for that generation |
-| Polled source unread for 3 × interval | source `stale`; its values display unknown |
-| Event-driven connection lost | source `stale` until recovery; silence itself is not terminal |
-| Handoff cursor cannot cover an interval | explicit source gap; no inferred events |
-| Provider 429 | `rate_limit`, not quota unless native evidence says quota |
-| Old-generation notification | ignored from normal bus; counted/logged as stale input |
+| no progress while busy/waiting | stalled flag only |
+| parent idle, child busy | parent idle; tree incomplete |
+| process alive, stream disconnected | source stale; state unchanged |
+| exact custody empty + source drained/gapped | lost; no possible members in custody |
+| degraded controller gone + source EOF/gap | lost session control; custody orphan possible |
+| shared server live, session readback unknown | stale/unknown, not lost |
+| handoff gap | explicit gap; no inferred event |
+| old boot/generation/source sequence | historical diagnostic only |
+
+## Restart reconciliation
+
+1. compute current boot id; prior-boot live rows cannot match;
+2. reopen exact named custody/service/guardian identities for current boot;
+3. reattach sessions and snapshot commands, inputs, turns and source watermarks;
+4. settle missing exact groups/degraded controller loss only under terminal rules;
+5. reconcile preparing/unknown workspaces against frozen base OID/setup journal;
+6. rebuild Git facts and load edit projection;
+7. keep dispatched command/action/workspace effects unknown until readback;
+8. report `routing_key_error` and block token issuance if key identity mismatches.
 
 ## Views
 
-- `eliot watch`: filtered event stream, for example
-  `12:14:03 a12#4 writer turn.completed ok 2m14s 18k tok`.
-- `eliot top`: id/generation, name, harness, state + stalled/open stop, turn age,
-  tokens/cost, CPU/RSS, branch, dirty count, source health and last-progress age. It is
-  `agent.list` + event subscription, not separate state.
-- `eliot show A`: profile/effective settings, generation/native refs, event owners and
-  gaps, pending requests/commands, goal, processes, workspace and recent events.
-- `daemon.status`: every source and plugin instance with health, custody mode, last
-  successful read and gaps. Stale/unknown values are shown, never hidden.
+Expose boot-scoped process identity, custody owner, generation/turn/input gate/open stop,
+workspace binding/state, exact/degraded custody/guardian/orphan possibility, source
+open ids/keys/gaps/watermarks, model progress, usage, branch/edit, provider holds,
+caller-classification failures, routing-key health and Store/WAL health.

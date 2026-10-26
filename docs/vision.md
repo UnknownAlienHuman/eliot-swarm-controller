@@ -2,8 +2,8 @@
 
 ## Owner statement (source of truth)
 
-Quoted as given by the owner on 2026-10-25. If any other document contradicts it,
-this statement wins and the other document is a bug.
+Quoted as given by the owner on 2026-10-25. If another document contradicts it, that
+document is a bug.
 
 > 1. Проект модульный, довольно легкий.
 > 2. Он запускает чужие (вендорские) harness и управляет ими.
@@ -21,63 +21,56 @@ this statement wins and the other document is a bug.
 
 ## What Eliot is
 
-Eliot is a small local controller for vendor coding-agent harnesses (Codex, Claude
-Code, OpenCode, Antigravity, ...). It **launches** them, **watches** them in real time,
-**controls** them through one harness-neutral command language, **automates**
-reactions with rules and timers, and lets agents **coordinate** with each other.
-
-Eliot does not contain a model loop, tools, an editor or a chat UI. Everything the
-harness does natively stays native; Eliot drives and observes it from outside.
+Eliot is a small local controller for vendor coding-agent harnesses. It launches,
+observes and controls them through one harness-neutral language, automates bounded
+reactions, and lets agents coordinate directly. Native model loop, tools, context,
+subagents, permissions and detailed history stay native.
 
 ## Requirements
 
-Each requirement maps to the owner statement and to the layer that delivers it
-([roadmap](roadmap.md)).
-
 | ID | Requirement | Owner point | Layer |
 | --- | --- | --- | --- |
-| R1 | Small modular core; all harness-specific code lives in plugins. One `eliot` binary. Code budgets in [roadmap](roadmap.md#code-budgets). | 1 | all |
-| R2 | Launch any supported harness headless with a profile: model, permissions, workspace, env, args. | 2 | L2, L4 |
-| R3 | Launch a harness through a provider proxy (OpenCodex and similar); the proxy is a managed or attached service. | 3 | L2 |
-| R4 | Real-time monitoring from several sources: native event stream, native transcripts, native hooks, OS processes, Git, filesystem. Every source reports its own freshness; missing data is `unknown`, never `zero`. | 4 | L3 |
-| R5 | Control verbs: `send`, `steer`, `inject`, `interrupt` (abort), `stop`, `resume`, `approve`/`deny`, `answer`, `configure`, `goal`, plus native hook decisions. | 5 | L1–L4 |
-| R6 | Every action is available by explicit command (CLI, agent, API) and automatically (rules, timers, Goal loop). The harness's native Goal and the Eliot Goal loop are independent and can run together. | 6 | L2, L6 |
-| R7 | Programmable automation: rules (`event → actions`), timers (`every`, `cron`, `at`), built-in actions (git fetch/push, launch, send, ...) and scripts in any language. | 7 | L6 |
-| R8 | One bus and one command language. The caller never uses harness-specific terms; the plugin translates. | 8 | L1 |
-| R9 | No architectural limit on the number of agents; parent/child trees of any depth (configurable guards only); native subagents appear as children. | 9 | L1, L5, L7 |
-| R10 | Agents talk to each other directly (messages, shared variables) and can ask "who works on this path" — answered from Git facts and the agents' own file-change events. | 10 | L3, L5 |
-| R11 | Core in Rust. Plugins and scripts may be written in any language during bring-up and are ported to Rust later. | 11 | L8 |
+| R1 | Small modular core; harness-specific code in plugins; one `eliot` binary; explicit [code budgets](roadmap.md#code-budgets). | 1 | all |
+| R2 | Launch a supported headless harness with explicit profile/model/permissions/workspace/environment/args. | 2 | L2, L4 |
+| R3 | Launch through explicit OpenCodex/similar provider proxy, attached or managed. | 3 | L2 |
+| R4 | Real-time native/process/Git/filesystem monitoring with source freshness/gaps; unknown never becomes zero. | 4 | L3 |
+| R5 | Semantic send/steer/inject/interrupt/stop/resume/request/configure/goal controls, rejecting unsupported semantics. | 5 | L1–L4 |
+| R6 | The same controls work explicitly and through rules/timers/goals; native and Eliot goals are independent. | 6 | L2, L6 |
+| R7 | Programmable committed-event/time actions, built-in Git/agent actions and scripts. | 7 | L6 |
+| R8 | One bus/command language; plugins translate native protocols. | 8 | L1 |
+| R9 | No logical architecture cap on registered agents/child depth; configurable accident guards and honest live-host limits. | 9 | L1, L5, L7 |
+| R10 | Direct addressed mail/shared variables and Git-backed `who works here`. | 10 | L3, L5 |
+| R11 | Rust core; bring-up plugins/scripts may use other languages and retained ones can be ported later. | 11 | L8 |
 
 ## Non-goals
 
-- **No Task/Issue/review/acceptance/publication engine in the core.** Such workflows
-  are built from agents, rules and scripts (examples in
-  [automation](spec/automation.md#workflow-recipes)). v1 drowned in this machinery.
-- **No multi-user security platform.** One local owner; agents are processes of the
-  same OS user. Inside a host, identity is for attribution and routing, not a security
-  boundary. Remote access is a separate later layer.
-- **No GUI in the core.** CLI, JSON output and a live `eliot top` table. A TUI or web
-  view is a client of the same API.
-- **No proof ceremony.** No document hashes, receipts, proof packets, audit registers,
-  readiness reports or provenance checks on every operation.
+- No Task/Issue/review/acceptance/publication engine. Such project workflows are
+  composed from the bounded [automation primitives](spec/automation.md), agents and
+  scripts.
+- No multi-user security platform. One local OS user is the trust boundary; tokens
+  fence stale generations and attribution. Remote access requires a later real auth
+  boundary.
+- No GUI in core. CLI/JSON/live table use the same API; later UI is a client.
+- No proof ceremony: no document hashes, proof packets, audit registers or readiness
+  report hierarchy.
+- No promise that documentation alone eliminates runtime defects. Release requires the
+  feature-complete L7 real-path qualification campaign.
 
 ## Product acceptance
 
-The product is done when all of these work on the owner's Windows machine:
+The product is ready only when the L7 suite and current owner-machine live runs prove:
 
-1. `eliot launch --profile codex-opencodex "..."` starts Codex through OpenCodex, and
-   `eliot watch` shows its turns, tool calls, child agents, processes and commits live.
-2. The same `eliot send|steer|inject|interrupt|stop` commands work for Codex, Claude
-   Code and OpenCode without harness-specific flags. Unsupported verbs fail fast with
-   a clear reason.
-3. A manager agent (any harness) launches three workers on other harnesses, gives
-   them tasks with `eliot send ... --wait` / `eliot wait @children`, steers one of them
-   and collects all results — using only Eliot's verbs, never harness-specific ones.
-4. A rule `on git.commit (role=writer) → git push` and a timer `every 30m → git
-   fetch` run unattended for 24 hours without duplicate pushes or lost firings.
-5. An Eliot Goal with a check command drives an agent until the check passes, and
-   stops on budget or no progress.
-6. Two agents agree on a shared variable through messages; one of them runs
-   `eliot who src/foo.rs` and gets the other agent.
-7. 10,000 simulated agents (fake plugin) run on one host with flat memory and a
-   responsive CLI.
+1. Codex launches through OpenCodex and native/process/Git/child activity is visible.
+2. The same semantic controls work on required harnesses; unsupported verbs reject
+   clearly without hidden fallback.
+3. A manager launches/controls/waits for workers on different harnesses using only
+   Eliot verbs and exact generations.
+4. Event rule push and periodic fetch run 24 hours without missed firing admission,
+   duplicate external writes or blind replay after uncertainty.
+5. Eliot Goal reaches a passing check or bounded budget/no-progress terminal state and
+   recovers correctly across restart.
+6. Two agents exchange one addressed message/CAS variable and `who` identifies current
+   file-area work without false lock claims.
+7. 10,000 fake agents maintain bounded memory/WAL and responsive paginated CLI.
+8. Windows exact custody and Linux exact/degraded behavior match their advertised
+   guarantees; no cross-agent or attached-service kill.
