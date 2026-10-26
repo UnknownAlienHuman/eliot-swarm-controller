@@ -46,12 +46,17 @@ changes behavior; never append a contradictory addendum.
 | D-39 | Mail uses capability-aware wake plus immutable inbox-batch acknowledgement. | Stored ≠ presented ≠ safely received; lost reply must not consume mail. |
 | D-40 | Historical replay exposes an explicit gap when requested events were pruned. | Silent jump from an old cursor falsely claims complete history. |
 | D-41 | Command admission and turn outcome are separate. A missing terminal result becomes an unknown turn that blocks further work in that generation until exact readback or constrained owner resolution. | `send applied` proves turn association, not completion; reconnect must neither invent success nor wedge recovery permanently. |
-| D-42 | Plugin Store idempotency is a compact source watermark: one stable source key, contiguous sequence and last-envelope digest. Native cursor still suppresses vendor replay. | A lost `event.put` acknowledgement after event retention must not fire automation twice or grow O(events) dedupe state. |
+| D-42 | Plugin Store idempotency is a compact source watermark: daemon-issued source key, contiguous sequence and last-envelope digest. Native cursor still suppresses vendor replay. | A lost `event.put` acknowledgement after event retention must not fire automation twice or grow O(events) dedupe state. |
 | D-43 | No-token owner fallback requires a live, birth-pinned OS check proving the peer is outside every current Eliot custody; ambiguity rejects. | Process registration can lag execution, so a projection miss is not proof that an Eliot-managed child is an owner process. |
 | D-44 | Routing-token presence follows control lifecycle, not generation alone. Terminal/detached/observe-only rows revoke by clearing the hash while preserving monotonic generation. | Detach must invalidate credentials without rewriting identity history. |
 | D-45 | A deterministic event-rule firing error is a durable failed run with no actions and advances the rule cursor atomically; only Store failure retries the event. | Missing placeholders or invalid actions must not wedge all later events behind one permanent error. |
 | D-46 | Script environment references are principal-scoped. Project scripts require both global automation approval and the project's own allowlist before any value is read. | A global credential allowed elsewhere must not leak into a project script before returned-action validation. |
 | D-47 | Editing an enabled event rule creates an old→new high-water handoff: old revision drains through H, new revision starts after H. Disable/pause instead records and skips through H. | Simply starting every new revision “at now” can lose events between the old cursor and reload boundary. |
+| D-48 | Synchronous hook decisions are deadline-bound, non-dispatchable Store proposals. Only the immediate hook response can apply them; timeout/late commit returns safe default and can never approve later. | An ordinary queued action can outlive the native hook deadline and mutate the wrong request. |
+| D-49 | On a degraded backend, exact controller/channel loss may mark the session lost while custody remains `orphan_possible`; it never proves all descendants died or makes force exact. | Otherwise the system either wedges forever or lies about process containment. |
+| D-50 | Provider recovery probes are explicit owner/current-agent `send` or linked launch/resume input commands. Automation, wakeups and hidden model calls can never become probes. | Recovery must not spend tokens invisibly or clear a hold from mere session creation. |
+| D-51 | Advisory claims exist only while their exact generation is live and controlled; terminal, resume or detach releases them transactionally. | A detached/lost agent must not keep advertising current ownership. |
+| D-52 | Every external daemon mutation uses a canonical ULID receipt within a configured idempotency window. Pruning advances a monotonic ULID floor; retries below it reject instead of reapplying. Internal derived IDs follow their durable owner lifecycle. | Bounded retention must not turn an old lost-reply retry into a new external effect. |
 
 ## Defaults
 
@@ -59,11 +64,13 @@ changes behavior; never append a contradictory addendum.
 | --- | --- |
 | Environment | `minimal`; `inherit` requires a trusted global profile. |
 | Script environment | empty global allowlist; project scripts use global∩project. |
-| Linux custody without exact backend | degraded; graceful control allowed, exact force rejected. |
+| External idempotency window | 90 days; receipt floor is monotonic. |
+| Linux custody without exact backend | degraded; graceful control allowed, exact force rejected; controller loss may leave `orphan_possible`. |
 | New event-rule id | start at current high-water; no implicit historical replay. |
 | Edited enabled event rule | old revision drains to captured H; new revision starts after H. |
 | Paused/disabled event rule | record skipped range and advance cursor without firing. |
 | Project automation | project-scoped principal. |
+| Provider probe | explicit owner/current controlled-agent request only. |
 | Unknown live turn | block new send/goal; exact readback or owner resolution after native-not-active proof. |
 | L4.7 harnesses | Do not build until concrete need. |
 | Git identity | Per agent; explicit inherit opts out. |
