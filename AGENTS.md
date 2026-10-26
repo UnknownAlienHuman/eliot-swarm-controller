@@ -1,166 +1,107 @@
-# Working on Eliot Swarm Controller
+# Working on Eliot
 
-Read the owner's current task, the short
-[architecture](docs/agent-operations/architecture.md), and the
-[documentation authority map](docs/agent-operations/documentation-map.md) first.
-[Implementation](docs/agent-operations/implementation.md) is the strategic order and
-source-owner map, **not a self-contained worker prompt**. The
-[implementation slice register](docs/agent-operations/implementation-slice-register.md)
-records which bounded slices are actually eligible for assignment. A coding worker
-receives one approved packet from the
-[task-packet index](docs/agent-operations/task-packets/README.md); the
-[packet template](docs/agent-operations/task-packet-template.md) is only the required
-format. [Failure prevention](docs/agent-operations/failure-prevention-register.md) maps
-prior failures to retained invariants and acceptance gates. [Status](docs/implementation-status.md)
-separates implemented facts from plans and qualification. Historical specifications,
-audits, remediation plans and Claude scripts are evidence for the manager, never
-additional worker instructions. The owner's latest explicit decision wins.
+Eliot v2 is built from scratch in vertical layers. Read, in order:
+[vision](docs/vision.md) → [architecture](docs/architecture.md) →
+[roadmap](docs/roadmap.md) → only the spec pages linked by your task.
 
-The repository-wide source audit is currently incomplete. Do not claim that the whole
-project is ready for autonomous implementation merely because one slice has a design,
-source trace or passing compiler gate. Only a slice marked `APPROVED_PACKET` may be
-assigned, and its exact source commit/blob lease must match before editing. Unmerged
-branches are evidence or anti-donors, never landed behavior or implicit patch sources.
-The generated
-[documentation readiness audit](docs/agent-operations/documentation-readiness-report.md)
-records structural gaps; it does not replace source review.
+## The tree right now
 
-For audit tasks, read and update [current audit / Resume here](docs/agent-operations/audit-current.md#resume-here)
-and the [audit index](docs/agent-operations/audit-index.md). Retain the inspected
-commit, actual paths/symbols, confirmed/refuted findings, untraced boundaries and next
-exact chain. After interruption compare source changes before continuing. A source
-review is not an executed check; neither is a completed fix. The audit checkpoint is
-not another implementation queue or worker context pack.
+Until **L0.1** lands, `crates/`, `modules/`, `migrations/`, `src/`, `tests/`, `tools/`,
+`vendor/`, `config/`, `Justfile` and current CI workflows are v1 legacy. Do not modify
+or extend them. Borrow only the exact mechanisms named in
+[donors](docs/reference/donors.md); copy the small part into v2 and remove its old
+coupling.
 
-## Start with the requested code
+## One manager, one worktree
 
-A runtime task starts by reading the exact current callers, owners and symbols and
-editing them. Do not produce another design report, issue series, compatibility plan
-or framework before the requested source change. An audit/documentation task stays in
-that scope.
+- One manager owns one worktree, branch and PR at a time.
+- The manager may delegate narrow, disjoint reading or coding assignments, but reviews
+  every returned diff and integrates it in that one worktree.
+- No two managers share a Git index/worktree. Do not create ceremony, queues or task
+  packets around the rule; it is simply the ownership boundary.
+- One roadmap task normally produces one PR. Split only when the first PR is already a
+  useful connected vertical path, not a placeholder framework.
 
-The manager gives each coding worker one compact slice:
+## How to implement a task
 
-- exact base commit and disjoint write scope;
-- observable behavior and completion condition;
-- exact source owners and symbols;
-- applicable AR/PF failure-prevention IDs;
-- retained requirements and unsupported/uncertain cases;
-- old callers, config, fixtures, schemas and branches to delete;
-- one named donor/native mechanism when relevant;
-- minimal affected format/Clippy/build command;
-- focused connected acceptance evidence;
-- report: behavior, deletions, net owned-code change and unresolved facts.
+1. Take the first unchecked task of the current layer, or the exact task assigned.
+2. Read its linked specs and the code it changes. Read donor code only for the named
+   mechanism; do not refactor v1.
+3. Write the real path first. No test framework, compatibility shell or abstraction
+   before its caller exists.
+4. Run only:
 
-Do not send a worker the full Issue history, audit archive or repository-wide roadmap.
-Use current symbols and paths, not stale line numbers. Changed product meaning creates
-one current Task/Attempt revision or a new slice, not an addendum chain. A confirmed
-finding omitted from the packet is a packet defect; an uncited historical note is not
-automatically a requirement.
+   ```text
+   cargo fmt --check
+   cargo clippy -p <changed-package> --lib --bins -- -D warnings
+   ```
 
-## Preserve autonomous behavior
+   Add a second package only when the changed contract requires it to compile
+   together. Broad tests and live qualification start after feature-complete L6, in
+   L7. A tiny deterministic regression test is allowed when review cannot establish
+   safety without it; do not expand it into a campaign.
+5. Tick the task in `docs/roadmap.md` in the same PR.
+6. PR body has three compact sections: **What**, **Checked** (fmt/scoped Clippy and any
+   essential manual proof), **Spec changes**.
 
-Governor and Manager are agent roles. A direct or explicit command is an attributable
-Store action, not a mandatory human click. Removing a workflow, journal or policy
-layer is valid only when the same slice connects the retained positive path through an
-existing owner.
+When a spec is wrong or incomplete, repair the owning page in the same PR with the
+smallest complete change. When an installed harness contradicts its page, update the
+page with the official/live source and date. A genuinely new product decision goes in
+`docs/decisions.md`; do not create an addendum or report.
 
-For every removed mechanism, name and implement:
+## Non-negotiable rules
 
-```text
-trigger/current fact
--> authorized ordinary command
--> state/effect owner
--> readback/result
--> next automatic action or one addressed Governor decision
-```
+- **Build the connected behavior.** No shim, fallback, compatibility family,
+  placeholder, dead path or API without a caller.
+- **Replace means delete.** The old route leaves in the same PR that activates the new
+  one.
+- **No paperwork.** Do not add audit, readiness, packet, inventory, progress or status
+  documents. Roadmap checkboxes and executable behavior are the status.
+- **Stay inside budgets.** No crate, trait, queue or service without two real consumers
+  today. Prefer a direct function and explicit data.
+- **Exact scope before effect.** Agent commands carry current generation; steer/
+  interrupt carry exact turn; approval/answer carry exact request. Stale input is
+  rejected before native I/O.
+- **Unknown stays unknown.** Never retry any command or external action whose outcome
+  may have applied—not even `interrupt` or `stop`. Use exact readback or explicit owner
+  resolution. Silence, timeout, missing source and list absence are not idle, zero or
+  complete.
+- **One lifecycle source.** A live stream, transcript or hook owns each normalized
+  event family at a time. Do not emit duplicate turn/session completion from two
+  sources; an unbridgeable handoff is a visible gap.
+- **Native first, semantics intact.** Use the harness mechanism that implements the
+  requested verb and report it. Do not silently turn steer into send, resume into
+  restart, answer into a default choice, or force-stop into killing a shared service.
+- **No secrets** in source, config values, Store, events, messages, fixtures or logs.
+- **No model calls in CI.** Recordings support later replay. Live qualification is L7
+  and uses the cheapest route that proves the behavior.
 
-Do not replace automation with “the operator handles it”, “the manager decides” or
-“unsupported” unless the remaining case genuinely lacks owner authority, credentials
-or product intent. Routine route choice, permission handling, review dispatch,
-all-findings correction, acceptance, publication and recovery should run under the
-configured agent policy. Unknown effects remain visible and block only their exact
-resource while unrelated work continues.
+## Code
 
-A task for an implementation agent must state what to build, not only what is
-forbidden. Prefer the maintained native capability. When a harness cannot perform the
-requested semantic action, fail at routing with the exact unsupported scope and keep a
-working fallback only when policy selected one; never silently weaken guarantees.
+- Rust 2024; stable pinned toolchain; workspace lints.
+- `thiserror` in libraries, `anyhow` at the binary boundary, `tracing` for logs,
+  `tokio` for async I/O.
+- No `unwrap()` in production. `expect("why this cannot fail")` only for a real
+  invariant.
+- `unsafe` only in the documented platform boundary for process/pipe OS calls.
+- Windows is first-class: no console windows for children, explicit inherited handles,
+  UTF-8 without BOM, long input through stdin/files, case-insensitive environment-key
+  merge.
+- Resolve executable + argv separately; never insert an implicit shell.
+- Before adding a dependency, verify current version, license, maintenance and MSRV;
+  state it in the PR.
 
-## Keep ownership and slices small
+## Qualification after feature completion
 
-One manager owns one worktree and integrates its candidate. Shared contracts, Store
-state transitions and files touched by several slices stay with that manager. Delegate
-narrow non-overlapping leaf edits. Do not split one atomic transition across workers
-or give several workers independent Git-index ownership.
+L7 builds and runs the complete suite once the product path exists:
 
-Use one current implementation and storage format per retained responsibility. Remove
-replaced callers, config, compatibility branches and tests with the new path. A
-semantic product action may have one real consumer. A shared implementation
-abstraction requires two current consumers and must delete both duplicates in the same
-change.
+- pure reducer/Store cases;
+- end-to-end fake harness through the CLI;
+- crash/restart, generation and unknown-outcome cases;
+- plugin recordings/conformance and short live runs;
+- coordination/automation simulated-time cases;
+- Windows/Linux process, security and recovery cases;
+- load and retention.
 
-Do not add a crate, service, registry, workflow language, generic repository,
-compatibility facade, generated protocol family or wrapper for hypothetical future
-use. Prefer existing packages and maintained native APIs.
-
-## Do not persist a view
-
-Queue, lane, dashboard, provider status, capacity and work pool are projections over
-current Tasks, Operations, bindings, workspaces and source observations. Do not turn
-them into another state machine, cursor backlog or database.
-
-A blocked item stays in its owning domain; the next pass queries current state.
-Notifications and timers are wake hints. Lost/coalesced wakeups are recovered by a
-bounded current-state query, not per-domain daemons.
-
-Capacity counts actual reserved roots/effects, not API calls. Readback, result,
-refresh and reconcile do not acquire model capacity. Route fallback is an explicit
-ordered policy; never silently substitute provider, model, effort, permissions or
-workspace policy.
-
-## Effects, recovery and evidence
-
-Keep admission atomic and external I/O outside Store transactions. Use native durable
-command/message identity and readback before inventing local retry. Never replay an
-uncertain prompt because a socket closed or an ACK was lost.
-
-Common adapter code may own authenticated Eliot IPC and exact already-formed Store
-deliveries. It must not become a universal effect journal, native session store,
-scheduler or recovery coordinator. Vendor effect recovery stays in the selected
-adapter; Store remains Task/Operation authority.
-
-Check caller and exact object rights at the boundary. Package versions, document
-hashes, compiler paths and historical editions do not grant execution authority.
-Keep every result attached to its original Task, Attempt, Operation, candidate and
-origin boot.
-
-## Requirements, prompts and review
-
-Preserve the current per-requirement evidence plan and candidate-specific acceptance
-semantics. A compact TaskPacket renders goal, requirements, selected sources, write
-boundary, deliverable and verification for the model; Store keeps identity and
-verification policy. Do not put controller proof JSON into the prompt, and do not
-remove executable requirement criteria as “bureaucracy”.
-
-Return all actionable review findings in one correction. Preserve current missing or
-inconclusive reviewer replacement. An unchanged source can gain relevant evidence; a
-fresh ID or unrelated edit is not progress. Bounded no-progress escalates once to the
-Governor agent with concrete choices, not repeatedly to a human.
-
-## Integrate and verify
-
-Publish directly to `main` when the owner requests it. Review the combined
-caller-to-result path and delete superseded code before completion. One independent
-verifier checks the changed boundary after manager integration.
-
-During construction run formatting and the minimal affected warnings-denied Clippy or
-syntax check from [scoped checks](docs/ci-scoped-builds.md). Do not build a broad test
-campaign around an incomplete product path. Run focused connected cases when the
-slice closes and full installed/native/load qualification when the product path is
-ready.
-
-A slice is complete only when new behavior is connected, the old path is absent,
-uncertain outcomes remain honest, routine automation has not been replaced by human
-work, and owning contract/status/audit/prevention records are updated. Report net
-production Rust, JS and glue separately from tests. Keep one implementation queue.
+Do not claim a runtime property from source review, Clippy or a fixture alone. During
+L0–L6, report only what the implementation and scoped compile gate actually establish.
