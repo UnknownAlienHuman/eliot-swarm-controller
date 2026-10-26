@@ -1,8 +1,8 @@
 # Core model
 
-`eliot-core` contains pure types and reducers. `eliot-store` owns SQLite,
-allocation and projections. Wire names are `snake_case`; every persisted integer fits
-SQLite signed 64-bit.
+`eliot-core` contains pure types and reducers. `eliot-store` owns SQLite, allocation and
+projections. Wire names are `snake_case`; every persisted integer fits SQLite signed
+64-bit.
 
 ## Scalar and identifier bounds
 
@@ -17,43 +17,44 @@ SQLite signed 64-bit.
 | native subject | bounded `(native_scope,native_ref)` | Canonical vendor store/server namespace + opaque session/thread id. |
 
 Allocation that would overflow fails `id_exhausted` before mutation. A derived-id
-collision with a different canonical payload is integrity failure.
+collision with another canonical payload is an integrity failure.
 
-## External write idempotency and retention
+## External write idempotency
 
-Every owner/agent/API mutation obtains `WriteId` before send. Receipt lookup occurs
-before age/floor checks:
+Every external mutation obtains a `WriteId` before send. Receipt lookup precedes age or
+floor validation:
 
-1. existing id + same principal/method/canonical semantic payload returns current/
-   original result;
-2. existing id with mismatch fails `id_conflict`;
-3. only absent id is checked against monotonic floor, live window and future skew;
+1. existing id + same principal/method/canonical semantic payload returns the retained
+   current/original result;
+2. existing id with another principal/method/payload fails `id_conflict`;
+3. only an absent id is checked against monotonic floor, live window and future skew;
 4. valid absent id inserts a compact receipt in the same transaction as domain rows.
 
-Canonical payload excludes transport/request id, output format, client timeout and
-`wait_ms`. Receipt stores BLAKE3-256 digest and bounded sanitized result/reference.
-Domain rows may be pruned earlier. Receipt pruning advances `write_id_floor_ms` through
-the largest pruned ULID timestamp in the same transaction; later retry is
-`id_expired`, never a new effect.
+Canonical payload excludes transport request id, output format, pager, client timeout
+and `wait_ms`. Receipt stores a BLAKE3-256 digest and bounded sanitized result/reference.
+Receipt retention is a minimum: a referenced receipt survives until every retained
+domain row using it can be pruned. Floor advances only through receipts actually deleted
+in the same transaction. A later absent retry below floor is `id_expired`, never a new
+effect.
 
 CLI uses a locked, atomically replaced monotonic ULID state file. Internal derived ids
-never use external receipt namespace; their lifetime follows durable owner object.
+never enter the external receipt namespace.
 
 ## Canonical native subject
 
-One native subject maps to one Agent row for its history. Observe clients subscribe to
-that row. Attach upgrades/returns it; detach changes control on it. Resume retains the
+One native subject maps to one Agent row for its whole Eliot history. Observers subscribe
+to that row. Attach upgrades/returns it; detach changes control on it. Resume retains the
 subject; another subject is fork/new Agent. Scope changes before vendor ref reuse.
 
 Native child registration supplies exact child scope/ref. Parent-local child ids use a
-scope containing parent subject. Existing subject with different parent/root/project/
-harness is integrity conflict, never silent reparenting.
+scope containing the parent subject. Existing subject with another parent/root/project/
+harness is an integrity conflict, never silent reparenting.
 
-## Agent and routing token
+## Agent, binding and routing
 
 ```text
 Agent {
-  id, generation, token_version,
+  id, generation, token_version, routing_enabled,
   name?, project, parent?, root, depth,
   origin: eliot | native | external,
   harness, profile, native_scope?, native_ref?,
@@ -61,40 +62,51 @@ Agent {
   state, active_turn?, stalled_since?, last_progress_at?,
   pending: [Request], goal?, effective?, labels,
   control: self | tree | project, observe_only,
-  created_at, updated_at
+  guard_exceeded?, created_at, updated_at
 }
 ```
 
-Private `routing.key` deterministically derives raw
-`eliot_at_<base64url>` from `(agent,generation,token_version)` via keyed BLAKE3. Store
-keeps only domain-separated hash; comparison is constant-time. This lets a lost child/
-reattach reply return the same current token without storing plaintext.
+Every target native incarnation has one immutable `AgentBinding` row containing the
+fully resolved nonsecret profile/route/environment names/artifact references and its
+binding mode (`launch|resume|control_attach|observe_attach`). Launch creates the binding
+for target generation 1 while the Agent remains generation 0; resume creates `g+1`.
+Observe attach uses synthetic `observe:<harness>` binding. Control attach requires an
+owner-selected allowed profile and capacity reservation; plugin readback must prove its
+session is compatible before control is granted.
 
-Token lifecycle:
+Native control and direct Eliot routing are independent. `routing_enabled=true` means
+Eliot has proved it can inject this Agent's distinct token/environment before its own
+CLI/tools run. A native child may be controllable through the parent plugin while
+`routing_enabled=false`; in that case it has no token and its shell/Git attribution is
+the parent/session identity.
 
-- controlled live (`starting|idle|busy|waiting`, not observe-only): one hash and
-  positive version;
-- generation 0, terminal, detached, observe-only: no hash;
-- terminal/detach clears hash without changing generation/version;
-- explicit control reattach preserves generation, increments version and installs fresh
-  token after exact attach;
-- daemon/plugin recovery of already-controlled incarnation preserves version/hash;
-- resume increments generation and version.
+Private `routing.key` derives raw `eliot_at_<base64url>` from
+`(agent,generation,token_version)` through keyed BLAKE3. Store keeps only a
+domain-separated constant-time-comparable hash. Token lifecycle:
 
-Missing/mismatched routing key blocks token issue/reissue but does not prevent
-verification of already-presented tokens against stored hashes.
+- controlled live + direct routing: positive version and one hash;
+- generation 0, terminal, detached, observe-only or routing-disabled: no hash;
+- terminal/detach clears hash without rewriting generation/version;
+- explicit control reattach preserves generation, increments version and enables routing
+  only after exact attach/environment proof;
+- recovery of the same already-controlled incarnation preserves version/hash;
+- resume increments generation and version when routing remains available.
+
+Missing/mismatched routing key blocks token issue/reissue but not verification of an
+already presented token against its retained hash. Owner identity uses a separate
+explicit owner credential; absence of an Agent token never implies owner.
 
 ### States
 
-Live states: `starting`, `idle`, `busy`, `waiting`. Open stop is displayed beside
-observed state, never synthetic `stopping`.
+Live states are `starting`, `idle`, `busy`, `waiting`. Open stop is displayed beside the
+observed state; there is no synthetic `stopping` state.
 
 | From | Exact input | Effect |
 | --- | --- | --- |
-| — | launch admitted | `created`, generation 0, token version 0 |
-| created | first start dispatched | generation 1, increment token version, hash token, `starting` |
+| — | launch admitted | `created`, generation 0, binding targets 1 |
+| created | first start dispatched | generation 1, optional routing token install, `starting` |
 | created | cancel/stop before dispatch | launch/linked input cancelled, `stopped` |
-| terminal g | resume dispatched with expected g | generation g+1, increment token version, clear turn/requests, `starting` |
+| terminal g | resume dispatched with expected g | generation g+1, new binding, clear turn/requests, `starting` |
 | starting | matching ready | `idle` |
 | starting | definite no-effect start failure | `failed`, revoke token, linked input fails without I/O |
 | starting | possible start + lost reply | unchanged, start unknown, linked input blocked |
@@ -106,26 +118,37 @@ observed state, never synthetic `stopping`.
 | any live | fatal session error | `failed`, revoke token, clear turn/requests, pause goals |
 | any live | exact session-control loss | `lost`, revoke token, clear turn/requests, pause goals |
 
-Resume row change occurs only when dispatch commits; one resume may be open. Cancelling
-queued resume cancels linked input and leaves g.
+Resume row change occurs only when dispatch commits; only one resume may be open.
+Cancelling a queued resume cancels linked input and leaves generation g.
 
 Detach is valid only for independently owned/reattachable service lifetime. It preserves
-observed state, sets observe-only, revokes token and releases claims transactionally.
-Daemon-owned per-agent process must stop.
+observed native state, sets observe-only, disables routing, revokes token, releases
+claims and releases Eliot control capacity only when the profile contract says detached
+sessions no longer count. Daemon-owned per-agent process must stop instead.
 
-### Input and unknown turn gates
+An already-created native child is always recorded. Controller launch/depth/tree limits
+block new Eliot-created fanout, not vendor reality. A native child beyond a guard gets
+`guard_exceeded`, `control=self`, `routing_enabled=false`, no automatic wake and no
+project authority; native observation and safe parent-mediated verbs remain available.
+
+### Input and unknown-turn gates
 
 Vendor inbox acceptance without turn association keeps `send` dispatched.
-`input.admitted` records command/native input id but does not free lane. Another
-send/configure/goal continuation is blocked; exact control/stop/readback remains.
-Pre-turn drop settles failed. Exact association settles command applied. Deadline after
-possible admission produces unknown and preserves readback key/lane.
+`input.admitted` may store a native input id when one exists, but does not free the lane.
+Another send/configure/Goal continuation is blocked; exact control/stop/readback remains.
+Pre-turn drop settles failed. Exact command→turn association settles command applied.
+Deadline after possible admission produces unknown and preserves the readback key/lane.
 
-If reconnect proves session exists but not active-turn terminal outcome, turn becomes
-unknown. Live Agent remains busy/waiting and blocks new turn/goal. Owner resolution is
-allowed only after native-not-active proof or terminal generation and records
-`turn.resolved`, never fabricated plugin completion. Unknown old generation never
-crosses resume.
+Some vendors expose an exact command→turn mapping without a separate input id. Therefore
+`native_input_id` is optional. A direct `turn.started` can create the input projection
+and turn mapping atomically; a later native id may fill the projection but cannot change
+the mapped turn.
+
+If reconnect proves the session exists but cannot prove the active turn terminal
+outcome, turn becomes unknown. A live Agent remains busy/waiting and blocks new
+turn/Goal work. Owner resolution is allowed only after native-not-active proof or a
+terminal generation and records `turn.resolved`, never fabricated plugin completion.
+Unknown old generation never crosses resume.
 
 Only exact-generation model progress updates `last_progress_at`.
 
@@ -133,19 +156,21 @@ Only exact-generation model progress updates `last_progress_at`.
 
 ```text
 Profile {
-  harness, extends?, cmd?, model?, effort?, permissions,
+  harness, plugin, model?, effort?, permissions,
   args, env_mode [minimal], env, pass_env, secret_env, proxy?,
   workspace_mode [shared], control [self], git_identity [agent],
-  system_note?, labels, stall_after [5m], max_live?,
-  billing?, account?, setup, scratch,
+  system_note_artifact?, labels, stall_after [5m], max_live?,
+  billing?, account?, setup_artifacts, scratch,
   notify_parent [true], wake_on_mail [true]
 }
 ```
 
-Environment/account/immutable launch binding are defined in
-[configuration](configuration.md). Requested/effective facts remain separate.
+Owner global config defines executable routes. Project config may only apply a validated
+narrowing overlay to an allowed global profile; it never changes harness/plugin/account/
+proxy/argv/inherit policy. Environment/account/artifact/immutable binding semantics are
+in [configuration](configuration.md). Requested and effective facts remain separate.
 
-## Events and source ownership
+## Events and authoritative sources
 
 ```text
 Event {
@@ -154,53 +179,64 @@ Event {
 }
 ```
 
-Agent event `subject` is bounded post-transition snapshot:
+Persisted `data` is at most 64 KiB; final assistant text projection is at most 64 KiB.
+Larger native detail is truncated with `truncated=true` and a safe native/artifact
+pointer when available. Agent event `subject` is a bounded post-transition snapshot:
 `{id,generation,project,parent,root,depth,harness,profile,state,workspace?,branch?,
-control,observe_only,labels}`. It contains no token/credential/request text. Rules use
-stored snapshot, never later Agent row.
+control,observe_only,routing_enabled,guard_exceeded?,labels}`. Rules never join a later
+Agent row.
 
-Known secrets/token patterns are masked in native output. Semantic durable writes with
-known secret reject instead of storing altered text.
+Known secrets/token patterns are masked in native output. Semantic durable writes with a
+known secret reject rather than storing altered text.
 
-### Authoritative source epoch
+### Source epoch and vendor replay
 
-Plugin durably creates stable `open_id` before `source.open`. Store canonicalizes
-`source_name`, declared families, mechanism and initial cursor into `open_digest`, then
-maps `(agent,generation,open_id)` to one daemon `source_key`. Lost open reply returns the
-same key/watermark; mismatched fields are integrity failure.
+Plugin durably creates stable `open_id` before `source.open`. Store canonicalizes source
+name, families, mechanism, dedupe mode and initial cursor into `open_digest`, then maps
+`(agent,generation,open_id)` to one source key. The initial source opens before the first
+native start/input effect. Lost open reply returns the same key/watermark; mismatched
+fields are integrity failure.
 
-`source_family_owners` contains exactly one current owner per
-`(agent,generation,family)`. Opening/handoff and closing old owner update watermark,
-family rows and gap/cursor boundary in one transaction. A source cannot publish a kind
-outside its declared families.
+Each source declares `dedupe_mode`:
 
-Each epoch emits contiguous positive `source_seq`, assigning exact typed envelope before
-send and allowing at most one unacknowledged durable request. Daemon computes canonical
-digest.
+- `strict_cursor`: vendor guarantees a resumable total-order cursor and replay strictly
+  after the committed cursor; source watermark/cursor is sufficient;
+- `event_id`: every persisted lifecycle fact carries a stable per-event native id and
+  Store retains a compact `native_event_receipts` row after event history pruning;
+- `none`: source cannot claim lossless recovery; reconnect/handoff closes it with an
+  explicit gap and starts only after a proven current boundary.
 
-- n=high+1: commit watermark plus normalized event/process projection/reducer changes;
-- n=high with matching digest: lost-reply duplicate, return saved Store seq even after
-  history pruning;
+Exactly one current owner exists per `(agent,generation,family)`. Initial open installs
+owners when absent. Planned replacement uses one predecessor-aware open transaction that
+verifies the old key/high-water/cursor, closes or gaps it, creates the new epoch and
+transfers owners. Separate close then open is only an explicitly gapped handoff.
+
+Each epoch emits contiguous positive `source_seq`, assigning the exact typed envelope
+before send and allowing at most one unacknowledged durable request. Daemon computes a
+canonical digest.
+
+- n=high+1: commit watermark plus native receipt (when required), normalized event or
+  process projection and reducer changes;
+- n=high with matching digest: lost-reply duplicate, return the saved result;
 - same n/different digest: integrity error;
-- n<high: stale source state, reject with current watermark/cursor;
-- n>high+1: gap, admit nothing until replay or explicit gapped close.
+- n<high: stale source state, reject with watermark/cursor;
+- n>high+1: hole, admit nothing until replay or explicit gapped replacement.
 
-A well-formed vendor duplicate or stale turn/request may advance source sequence while
-returning original event seq or a bounded diagnostic; it cannot fire lifecycle twice.
-Malformed envelope/undeclared family does not advance.
+For `event_id`, a matching native receipt returns its original Store event seq even if
+the event row was pruned, while advancing the new source envelope sequence. Same native
+key with another payload digest is integrity failure. Receipt reclamation is allowed only
+after generation supersession/deletion and every legal replay source/spool is closed.
 
-Both `event.put` and qualified per-agent `process.put` use this contract. Native id/
-cursor suppress vendor replay. Current-generation source rows remain while legal
-reattach/replay is possible; reclaim after generation supersession/deletion and all
-source/spool closure. Storage is O(source epochs), not events.
+A well-formed stale turn/request may advance source sequence while producing one bounded
+diagnostic. Malformed envelope or undeclared family does not advance.
 
-Input/turn events:
+Input/turn event shapes:
 
-- `input.admitted {command_id,native_input_id}` — transport/inbox acceptance only;
-- `input.dropped` — exact pre-turn drop/rejection;
-- `turn.started {turn_id,input_commands[]}`;
-- `turn.inputs` — later commands coalesced into same turn;
-- `turn.completed` — exact native terminal/output/usage;
+- `input.admitted {command_id,native_input_id?}`;
+- `input.dropped {command_id,native_input_id?}`;
+- `turn.started {turn_id,inputs:[{command_id,native_input_id?}]}`;
+- `turn.inputs {turn_id,inputs:[...]}`;
+- `turn.completed {turn_id,status,final_text?,usage?}`;
 - `turn.resolved` — readback/owner resolution, distinct from plugin completion.
 
 A command maps to at most one turn; multiple commands may map to one turn.
@@ -217,15 +253,16 @@ outcomes remain separate. Ready never proves input.
 | send | FIFO input, applied only at exact turn/execution association |
 | steer/inject/interrupt | exact current-turn/native-safe-point semantics only |
 | stop | exact generation; force only with qualified custody/native isolation |
-| resume | next generation from same canonical subject |
+| resume | next generation from same canonical subject and new binding |
 | approve/deny/answer | exact pending request |
 | configure | explicit application point/readback; blocked by unresolved input |
 | goal.* | generation-bound; continuation blocked by unresolved input/turn |
 | cancel | queued command only; admitted input needs native cancel/readback |
-| detach | attached/service-backed lifetime only; release control/revoke token |
+| detach | attached/service-backed lifetime only; release control/routing |
 | compact/fork/background | native-only declared semantics |
 
-Input text at most 512 KiB UTF-8; larger content is file-referenced.
+Input text is at most 512 KiB UTF-8. Large immutable notes/scripts/config payloads are
+passed as bounded `ArtifactRef {digest,path,size}` rather than inline bytes.
 
 ```text
 Command {
@@ -238,28 +275,28 @@ state = accepted → [queued →] dispatched → applied | rejected | failed | u
 ```
 
 External concrete/fanout parent has `id=receipt_id=write_id`. Linked input, selector
-child, rule/timer/goal command and daemon presentation use derived id/no receipt.
+child, rule/timer/Goal command and daemon presentation use derived id/no receipt.
 
-Interactive selector is Store-only parent. One transaction resolves concrete targets,
-checks `max_selector_targets`, creates derived children/links and marks parent applied
-with `{count,digest}`. It does not claim child native effects. Exceeding limit rejects
-before any row. Children settle independently. Child list is paginated; links remain
-while any child open. `--wait` waits captured set only.
+Interactive selector is a Store-only parent. One transaction resolves concrete targets,
+checks `max_selector_targets`, creates derived children/links and marks the parent
+applied with `{count,digest}`. It does not claim child native effects. Exceeding limit
+rejects before any row. Children settle independently and are paginated; `--wait` waits
+only the captured set.
 
 Ordinary expected generation equals target. Launch targets 1; resume expects g/targets
-g+1. Ready calls serialize. One dispatched/unknown input gate blocks later send/
-configure/goal in same generation but not control/stop/readback.
+g+1. Ready native calls serialize. One dispatched/unknown input gate blocks later send/
+configure/Goal in the same generation but not exact control/stop/readback.
 
-Rejected means no native I/O; failed exact no-effect; unknown may have applied and is
-never retried. Restart makes dispatched unknown. Generation change stales queued work.
-Exact readback/constrained owner resolution settles; time/new generation does not infer.
-Send applied means turn association, not terminal success.
+Rejected means no native I/O; failed means exact no-effect; unknown may have applied and
+is never retried. Restart makes dispatched unknown. Generation change stales queued
+work. Exact readback/constrained owner resolution settles; time/new generation does not
+infer. Send applied means turn association, not terminal success.
 
 ## Storage
 
-Use bundled SQLite, WAL, `synchronous=FULL`, one writer and bounded group commit.
-Verify application/schema identity before WAL. Read connections use foreign keys,
-`query_only`, bounded pages/deadlines and release transactions before network waits.
+Use bundled SQLite, WAL, `synchronous=FULL`, one writer and bounded group commit. Verify
+application/schema identity before WAL. Read connections use foreign keys, `query_only`,
+bounded pages/deadlines and release transactions before network waits.
 
 ```sql
 CREATE TABLE store_meta (
@@ -278,7 +315,7 @@ CREATE TABLE write_receipts (
   principal TEXT NOT NULL,
   method TEXT NOT NULL,
   payload_digest BLOB NOT NULL CHECK(length(payload_digest) = 32),
-  state TEXT NOT NULL,                 -- open|final
+  state TEXT NOT NULL,
   result_ref TEXT,
   final_result TEXT,
   admitted_at INTEGER NOT NULL,
@@ -291,6 +328,7 @@ CREATE TABLE agents (
   id INTEGER PRIMARY KEY,
   generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
   token_version INTEGER NOT NULL DEFAULT 0 CHECK(token_version >= 0),
+  routing_enabled INTEGER NOT NULL DEFAULT 0,
   name TEXT UNIQUE, project TEXT NOT NULL,
   parent INTEGER REFERENCES agents(id),
   root INTEGER NOT NULL REFERENCES agents(id),
@@ -303,15 +341,20 @@ CREATE TABLE agents (
   pending TEXT NOT NULL DEFAULT '[]', goal TEXT, effective TEXT,
   labels TEXT NOT NULL DEFAULT '{}', control TEXT NOT NULL DEFAULT 'self',
   observe_only INTEGER NOT NULL DEFAULT 0,
+  guard_exceeded INTEGER NOT NULL DEFAULT 0,
   token_hash BLOB,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  CHECK(routing_enabled IN (0,1)),
+  CHECK(observe_only IN (0,1)),
+  CHECK(guard_exceeded IN (0,1)),
   CHECK(
     (token_hash IS NOT NULL AND length(token_hash) = 32
-      AND generation > 0 AND token_version > 0 AND observe_only = 0
+      AND routing_enabled = 1 AND generation > 0 AND token_version > 0
+      AND observe_only = 0
       AND state IN ('starting','idle','busy','waiting'))
     OR
     (token_hash IS NULL AND
-      (generation = 0 OR observe_only = 1
+      (routing_enabled = 0 OR generation = 0 OR observe_only = 1
        OR state NOT IN ('starting','idle','busy','waiting')))
   ),
   CHECK(generation > 0 OR token_version = 0)
@@ -321,6 +364,17 @@ CREATE UNIQUE INDEX agents_native_subject ON agents(native_scope,native_ref)
 CREATE INDEX agents_parent ON agents(parent);
 CREATE INDEX agents_root ON agents(root);
 CREATE INDEX agents_state ON agents(state);
+
+CREATE TABLE agent_bindings (
+  agent INTEGER NOT NULL REFERENCES agents(id),
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  mode TEXT NOT NULL,
+  profile_name TEXT NOT NULL,
+  profile_revision TEXT NOT NULL,
+  binding TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(agent,generation)
+);
 
 CREATE TABLE events (
   seq INTEGER PRIMARY KEY,
@@ -337,9 +391,6 @@ CREATE INDEX events_kind ON events(kind,seq);
 CREATE UNIQUE INDEX events_source_sequence
   ON events(agent,generation,source_key,source_seq)
   WHERE agent IS NOT NULL AND generation IS NOT NULL AND source_key IS NOT NULL;
-CREATE UNIQUE INDEX events_native_dedupe
-  ON events(agent,generation,kind,native_id)
-  WHERE agent IS NOT NULL AND generation IS NOT NULL AND native_id IS NOT NULL;
 
 CREATE TABLE plugin_source_watermarks (
   agent INTEGER NOT NULL,
@@ -348,16 +399,18 @@ CREATE TABLE plugin_source_watermarks (
   source_key TEXT NOT NULL,
   source_name TEXT NOT NULL,
   mechanism TEXT NOT NULL,
+  dedupe_mode TEXT NOT NULL,
   open_digest BLOB NOT NULL CHECK(length(open_digest) = 32),
   high_water_seq INTEGER NOT NULL CHECK(high_water_seq >= 0),
   last_digest BLOB,
   last_store_seq INTEGER,
   native_cursor TEXT,
-  state TEXT NOT NULL,                 -- open|closed|gap
+  state TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(agent,generation,source_key),
   UNIQUE(source_key),
   UNIQUE(agent,generation,open_id),
+  CHECK(dedupe_mode IN ('strict_cursor','event_id','none')),
   CHECK((high_water_seq = 0 AND last_digest IS NULL AND last_store_seq IS NULL) OR
         (high_water_seq > 0 AND length(last_digest) = 32
           AND last_store_seq IS NOT NULL))
@@ -372,6 +425,20 @@ CREATE TABLE source_family_owners (
   FOREIGN KEY(agent,generation,source_key)
     REFERENCES plugin_source_watermarks(agent,generation,source_key)
 );
+
+CREATE TABLE native_event_receipts (
+  agent INTEGER NOT NULL,
+  generation INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  native_id TEXT NOT NULL,
+  payload_digest BLOB NOT NULL CHECK(length(payload_digest) = 32),
+  first_store_seq INTEGER NOT NULL,
+  first_source_key TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(agent,generation,kind,native_id)
+);
+CREATE INDEX native_event_receipts_generation
+  ON native_event_receipts(agent,generation,created_at);
 
 CREATE TABLE commands (
   id TEXT PRIMARY KEY,
@@ -392,7 +459,7 @@ CREATE INDEX commands_open ON commands(state)
 CREATE TABLE command_links (
   parent_id TEXT NOT NULL REFERENCES commands(id),
   child_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
-  kind TEXT NOT NULL,                   -- linked_input|selector_child
+  kind TEXT NOT NULL,
   ordinal INTEGER NOT NULL,
   PRIMARY KEY(parent_id,child_id),
   UNIQUE(parent_id,ordinal)
@@ -403,21 +470,23 @@ CREATE TABLE native_inputs (
   command_id TEXT PRIMARY KEY,
   agent INTEGER NOT NULL,
   generation INTEGER NOT NULL,
-  native_input_id TEXT NOT NULL,
-  state TEXT NOT NULL,                  -- admitted|associated|dropped|unknown
+  native_input_id TEXT,
+  state TEXT NOT NULL,
   admitted_at INTEGER,
   first_observed_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  UNIQUE(agent,generation,native_input_id)
+  updated_at INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX native_inputs_native_id
+  ON native_inputs(agent,generation,native_input_id)
+  WHERE native_input_id IS NOT NULL;
 
 CREATE TABLE turns (
   agent INTEGER NOT NULL REFERENCES agents(id),
   generation INTEGER NOT NULL,
   turn_id TEXT NOT NULL,
-  state TEXT NOT NULL,                  -- running|completed|unknown
-  status TEXT,                          -- completed|interrupted|failed
-  resolution_source TEXT,               -- native|readback|owner
+  state TEXT NOT NULL,
+  status TEXT,
+  resolution_source TEXT,
   final_text TEXT, usage TEXT,
   started_at INTEGER,
   first_observed_at INTEGER NOT NULL,
@@ -444,28 +513,20 @@ External receipt/domain admission commits together. Receipt may outlive domain h
 its bounded result preserves stable object/fanout id, count and digest. Internal commands
 have no fake receipts.
 
-`native_inputs.command_id` and `turn_inputs.command_id` intentionally lack command FK so
+`native_inputs.command_id` and `turn_inputs.command_id` intentionally lack command FKs so
 input/turn readback survives command pruning. Admission/association transaction still
-requires command or retained link. A direct `turn.started` observed before
-`input.admitted` creates associated native-input projection with `admitted_at=NULL`.
-Unresolved input/turn/link rows never age-prune.
+requires a command or retained link. Unresolved input/turn/link rows never age-prune.
 
-Selector/linked rows remain while child work open. After normal terminal retention,
-receipt summary preserves fanout count/digest/aggregate result; paginated child history
-may return `history_gap` rather than inventing list.
+Source open/handoff, source sequence, native receipt, event/projection/reducer changes
+commit atomically. Event retention never deletes current source watermarks or native
+receipts still needed for replay safety.
 
-`source.open` upserts by open id/digest and atomically installs family owners. Close/
-handoff atomically updates owners and cursor/gap boundary. `event.put`/qualified
-`process.put` lock watermark and commit watermark plus projection/normalized event.
-Vendor duplicate advances watermark without duplicate lifecycle. History retention never
-deletes current source watermark.
-
-Input/turn association, counter/root/event allocation and reducer changes are
-transactional. Failed result commit blocks new writes, retains same pending commit where
-possible and never repeats external cause; crash leaves dispatched effects unknown.
+Counter/root allocation, input/turn association and reducer changes are transactional.
+Failed result commit blocks new writes, retains the same pending commit where possible
+and never repeats its external cause; crash leaves dispatched effects unknown.
 
 WAL/readers are monitored. Replays release transactions; hard pressure rejects new long
 reads and exposes pins, never deleting evidence or blind-truncating active readers.
-Event retention follows active automation cursors. Current input/edit/turn state,
+Event retention follows active automation cursors. Current binding/input/edit/turn state,
 receipts and source watermarks live in compact projections. Native stores are never
 generically cleaned.
