@@ -14,8 +14,9 @@ Wire names are `snake_case`; every persisted integer fits SQLite signed 64-bit.
 | event `seq`, message id | positive signed-64 Store counter | Transactional allocation; never `MAX(id)+1`. |
 | native subject | bounded `(native_scope,native_ref)` | Canonical vendor store/server namespace + opaque session/thread id. Scope changes before refs can be reused. |
 
-Derived ids cover selector children, linked initial sends, rule actions and all internal
-writes; no unbounded concatenation.
+A counter allocation that would require `i64::MAX + 1` fails `id_exhausted` before any
+row is created. Derived ids cover selector children, linked initial sends, rule actions
+and all internal writes; no unbounded concatenation.
 
 ## Canonical native subject
 
@@ -130,26 +131,53 @@ separate; Eliot never silently substitutes them.
 ## Events
 
 ```text
-Event { seq?, ts, kind, agent?, generation?, source, native_id?, cause?, subject?, data }
+Event {
+  seq?, ts, kind, agent?, generation?, source,
+  source_key?, source_seq?, native_id?, cause?, subject?, data
+}
 ```
 
-`subject` is the bounded post-transition event-time projection used for deterministic
-rule replay. Rules never join a later mutable Agent row.
+For an agent-scoped event, `subject` is a bounded ≤16 KiB post-transition snapshot:
+`{id,generation,project,parent,root,depth,harness,profile,state,workspace?,branch?,
+control,observe_only,labels}`. It contains no token, credential, pending request text or
+unbounded effective settings. Rules evaluate this stored snapshot and never join a
+later mutable Agent row.
 
 Known secrets and token patterns are masked in native output/logs. Semantic durable
 writes containing a known secret are rejected rather than stored with altered text.
 
-A persisted plugin lifecycle event requires:
+### Commit-acknowledged source sequence
 
-1. authoritative source ownership;
-2. exact current generation/turn/request binding where applicable;
-3. a stable per-event native id (vendor event id or persisted cursor/offset);
-4. a new receipt key `(agent,generation,kind,native_id)`.
+Every authoritative plugin source ownership epoch has a stable bounded `source_key` and
+a strictly contiguous positive `source_seq`. The plugin durably assigns the sequence
+before sending and allows at most one unacknowledged persisted `event.put` per source
+key. Future native facts may accumulate in its bounded spool but are sent in order.
 
-The receipt is committed atomically with the event and is independent of event
-retention. A repeated `event.put` returns the original receipt/sequence as duplicate
-even when the original event row has already been pruned. A source without stable event
-identity may publish ephemeral diagnostics but not replay-safe lifecycle.
+The Store keeps one compact watermark per source key. For an `event.put` canonical
+envelope digest D and sequence n:
+
+- `n = high_water + 1`: commit watermark, event and all reducer/projection changes in
+  one transaction, then acknowledge;
+- `n = high_water` and D equals `last_digest`: lost-reply duplicate; return the saved
+  Store event sequence without inserting or firing again, even if that event row was
+  pruned;
+- `n = high_water` with another digest: source integrity error;
+- `n < high_water`: stale local source state; return current watermark and admit
+  nothing;
+- `n > high_water + 1`: explicit source gap; admit nothing until the missing sequence
+  is replayed or the ownership epoch is closed as gapped.
+
+`native_id` remains the exact vendor event/request/turn/item id or cursor where one
+exists. It supports readback and vendor replay suppression, but Store crash idempotency
+does not depend on retaining one receipt row per native event. A source without a
+replayable vendor cursor must preserve its bounded spool; loss beyond that boundary is
+a visible gap, not invented history.
+
+A plugin restart/attach reads the current source watermark before publishing. Normal
+restart reuses the same source key. A stream→transcript/hook ownership handoff creates a
+new source key only after the old cursor boundary is committed. Old source watermark
+rows may be removed after the Agent advances beyond that generation and every old
+source/spool is closed; row count is therefore O(source ownership epochs), not O(events).
 
 Input/turn events:
 
@@ -265,26 +293,36 @@ CREATE TABLE events (
   seq INTEGER PRIMARY KEY,
   ts INTEGER NOT NULL, kind TEXT NOT NULL,
   agent INTEGER, generation INTEGER,
-  source TEXT NOT NULL, native_id TEXT,
-  cause TEXT, subject TEXT, data TEXT NOT NULL
+  source TEXT NOT NULL,
+  source_key TEXT, source_seq INTEGER,
+  native_id TEXT, cause TEXT, subject TEXT, data TEXT NOT NULL,
+  CHECK((source_key IS NULL AND source_seq IS NULL) OR
+        (source_key IS NOT NULL AND source_seq > 0))
 );
 CREATE INDEX events_agent ON events(agent,seq);
 CREATE INDEX events_kind ON events(kind,seq);
+CREATE UNIQUE INDEX events_source_sequence
+  ON events(agent,generation,source_key,source_seq)
+  WHERE agent IS NOT NULL AND generation IS NOT NULL AND source_key IS NOT NULL;
 CREATE UNIQUE INDEX events_native_dedupe
   ON events(agent,generation,kind,native_id)
   WHERE agent IS NOT NULL AND generation IS NOT NULL AND native_id IS NOT NULL;
 
-CREATE TABLE native_event_receipts (
+CREATE TABLE plugin_source_watermarks (
   agent INTEGER NOT NULL,
   generation INTEGER NOT NULL,
-  kind TEXT NOT NULL,
-  native_id TEXT NOT NULL,
-  first_seq INTEGER NOT NULL,
-  first_seen_at INTEGER NOT NULL,
-  PRIMARY KEY(agent,generation,kind,native_id)
+  source_key TEXT NOT NULL,
+  source_name TEXT NOT NULL,
+  high_water_seq INTEGER NOT NULL CHECK(high_water_seq >= 0),
+  last_digest BLOB,
+  last_event_seq INTEGER,
+  native_cursor TEXT,
+  state TEXT NOT NULL,                 -- open|closed|gap
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(agent,generation,source_key),
+  CHECK((high_water_seq = 0 AND last_digest IS NULL AND last_event_seq IS NULL) OR
+        (high_water_seq > 0 AND last_digest IS NOT NULL AND last_event_seq IS NOT NULL))
 );
-CREATE INDEX native_event_receipts_generation
-  ON native_event_receipts(agent,generation,first_seq);
 
 CREATE TABLE commands (
   id TEXT PRIMARY KEY,
@@ -337,17 +375,16 @@ CREATE TABLE turn_inputs (
 );
 ```
 
-`event.put` first inserts `native_event_receipts`; on conflict it returns
-`duplicate=true` and the stored `first_seq` without inserting another event. A new
-receipt and event/projection changes commit in one transaction. Event retention never
-deletes receipts.
+`event.put` locks/reads the source watermark, validates sequence/digest and commits the
+new watermark, event and projection changes in one transaction. A duplicate of the one
+possible unacknowledged sequence returns `last_event_seq`; older source state is rejected
+with the current watermark. Event retention never deletes source watermarks.
 
-Receipts for the current generation remain while that generation can legally
-reattach/replay. They may be reclaimed only after the Agent has advanced to a newer
+A source watermark for the current generation remains while that source can legally
+reattach/replay. It may be reclaimed only after the Agent advances to a newer
 generation (or is explicitly deleted) and every source/spool for the old generation is
-closed; any later old-generation input is then rejected before the normal bus. A
-terminal but still-current generation keeps its receipts. This is the explicit safe
-reclamation boundary.
+closed. A terminal but still-current generation keeps its source rows. This is bounded
+by ownership epochs rather than event count.
 
 `input.admitted` updates `native_inputs` with event/command metadata. Association moves
 it to associated and inserts `turn_inputs` in the same transaction as the turn event.
@@ -356,7 +393,7 @@ then turn. Several commands may wait on the same turn. Results survive event ret
 unresolved inputs/turns are never pruned.
 
 The counter allocates root id before self-reference. Event seq is transactional. A
-receipt conflict is duplicate input, not Store failure.
+source-sequence duplicate is normal lost-reply readback, not Store failure.
 
 Failed result commit blocks writes, retains the same pending commit where possible and
 never repeats its external cause; crash leaves dispatched effects unknown.
@@ -366,6 +403,6 @@ long reads and exposes the pin—never deleting evidence or blind-truncating act
 readers.
 
 Event retention follows the minimum active automation cursor. Paused/disabled rules
-advance by policy. Current native input/edit/turn state and native-event receipts live
-in compact projections independent of event rows. Native stores are never generically
-cleaned.
+advance by policy. Current native input/edit/turn state and plugin-source watermarks
+live in compact projections independent of event rows. Native stores are never
+generically cleaned.
