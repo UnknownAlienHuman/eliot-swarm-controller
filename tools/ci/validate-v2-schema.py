@@ -125,7 +125,6 @@ def expect_integrity(
 def validate_agent_and_binding(connection: sqlite3.Connection) -> None:
     token_hash = sqlite3.Binary(b"T" * 32)
 
-    # Eliot-launched Agent has a target-generation binding before native start.
     connection.execute(
         """
         INSERT INTO agents (
@@ -156,7 +155,6 @@ def validate_agent_and_binding(connection: sqlite3.Connection) -> None:
     )
     connection.execute("UPDATE agents SET state='idle' WHERE id=1")
 
-    # Token lifecycle is independent of monotonic generation.
     connection.execute(
         "UPDATE agents SET observe_only=1,routing_enabled=0,token_hash=NULL WHERE id=1"
     )
@@ -198,8 +196,6 @@ def validate_agent_and_binding(connection: sqlite3.Connection) -> None:
         label="invalid token hash length",
     )
 
-    # One vendor incarnation can transition observe -> control -> detach without
-    # rewriting immutable binding rows or changing generation.
     connection.execute(
         """
         INSERT INTO agents (
@@ -230,7 +226,6 @@ def validate_agent_and_binding(connection: sqlite3.Connection) -> None:
         ) VALUES (2,1,2,1,'control_attach','fake','r2','{}',3)
         """
     )
-    # Candidate exists, but current pointer stays observe until attach applies.
     current = connection.execute(
         "SELECT revision FROM agent_binding_current WHERE agent=2 AND generation=1"
     ).fetchone()
@@ -298,7 +293,6 @@ def validate_agent_and_binding(connection: sqlite3.Connection) -> None:
         label="current pointer to missing binding revision",
     )
 
-    # Live native child may be controlled through parent plugin with no direct token.
     connection.execute(
         """
         INSERT INTO agents (
@@ -337,10 +331,11 @@ def validate_receipts_and_commands(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO commands (
-          id,receipt_id,target,generation,verb,args,origin,state,created_at,updated_at
-        ) VALUES (?,?,?,?,?,?,?,'applied',?,?)
+          id,receipt_id,target,generation,binding_revision,verb,args,origin,state,
+          created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,'applied',?,?)
         """,
-        (receipt_id, receipt_id, 1, 1, "send", "{}", "owner", 1, 1),
+        (receipt_id, receipt_id, 1, 1, 1, "send", "{}", "owner", 1, 1),
     )
     connection.execute(
         """
@@ -352,16 +347,16 @@ def validate_receipts_and_commands(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO commands (
-          id,target,generation,verb,args,origin,state,created_at,updated_at
-        ) VALUES ('d_internal',1,1,'send','{}','rule:r','queued',1,1)
+          id,target,generation,binding_revision,verb,args,origin,state,created_at,updated_at
+        ) VALUES ('d_internal',1,1,1,'send','{}','rule:r','queued',1,1)
         """
     )
     expect_integrity(
         connection,
         """
         INSERT INTO commands (
-          id,target,generation,verb,args,origin,state,created_at,updated_at
-        ) VALUES ('not-derived',1,1,'send','{}','rule:r','queued',1,1)
+          id,target,generation,binding_revision,verb,args,origin,state,created_at,updated_at
+        ) VALUES ('not-derived',1,1,1,'send','{}','rule:r','queued',1,1)
         """,
         label="internal command without derived prefix",
     )
@@ -571,9 +566,9 @@ def validate_workspace_and_automation(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO goals (
-          agent,mode,agent_generation,text,cadence,status,max_turns,no_progress,
-          eligibility_seq,updated_at
-        ) VALUES (1,'eliot',1,'finish','on_idle','active',20,3,42,1)
+          agent,mode,agent_generation,binding_revision,text,cadence,status,max_turns,
+          no_progress,eligibility_seq,updated_at
+        ) VALUES (1,'eliot',1,1,'finish','on_idle','active',20,3,42,1)
         """
     )
     connection.execute(
