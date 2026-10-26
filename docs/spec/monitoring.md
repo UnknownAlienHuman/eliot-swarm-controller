@@ -16,9 +16,9 @@ never normal lifecycle/automation triggers.
 ## Process identity and custody projections
 
 Process identity is `(host_boot_id,pid,start_time)`, never PID alone. Linux uses kernel
-boot id plus proc start ticks. Windows uses stable machine identity plus native boot
-time/session identifier and `GetProcessTimes` creation time. A reboot therefore cannot
-make an old row match a new process.
+boot id + proc start ticks. Windows uses stable machine identity + native boot session/
+time identity + `GetProcessTimes` creation time. Reboot cannot make old row match new
+process.
 
 `daemon.json`, process events, service state and stop/readback carry `host_boot_id`.
 
@@ -29,13 +29,14 @@ CREATE TABLE custodies (
   service TEXT,
   backend TEXT NOT NULL,              -- windows_job|linux_cgroup|process_group|external
   capability TEXT NOT NULL,           -- exact|degraded|external
-  native_id TEXT,                     -- named Job/cgroup path/group/service id
+  native_id TEXT,
   guardian_boot TEXT,
   guardian_pid INTEGER,
   guardian_start INTEGER,
   state TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
-  CHECK((agent IS NOT NULL AND generation IS NOT NULL) OR service IS NOT NULL)
+  CHECK((service IS NULL AND agent IS NOT NULL AND generation IS NOT NULL) OR
+        (service IS NOT NULL AND agent IS NULL AND generation IS NULL))
 );
 CREATE UNIQUE INDEX custody_agent ON custodies(agent,generation)
   WHERE agent IS NOT NULL;
@@ -53,14 +54,18 @@ CREATE TABLE processes (
   state TEXT NOT NULL,
   exit_code INTEGER,
   updated_at INTEGER NOT NULL,
-  PRIMARY KEY(host_boot_id,pid,start_time)
+  PRIMARY KEY(host_boot_id,pid,start_time),
+  CHECK((service IS NULL AND agent IS NOT NULL AND generation IS NOT NULL) OR
+        (service IS NOT NULL AND agent IS NULL AND generation IS NULL))
 );
 CREATE INDEX processes_agent ON processes(agent,generation,state);
 CREATE INDEX processes_service ON processes(service,state);
 ```
 
-`process.put` updates this projection in the same transaction as its process event.
-Restart never reconstructs custody from PID guesses.
+A process belongs to one agent generation or one service, never both. Shared service
+membership is represented by agent↔service session metadata, not duplicate process rows.
+`process.put` updates projection with process event. Restart never reconstructs custody
+from PID guesses.
 
 ## Process custody backends
 
@@ -68,43 +73,42 @@ Restart never reconstructs custody from PID guesses.
 
 Per-agent plugin/descendants enter a no-breakaway Job before execution resumes.
 Daemon-owned stdio Jobs use kill-on-close; managed services use separate named
-non-killing Jobs. Force stop verifies boot-scoped process identities and zero active Job
-members.
+non-killing Jobs. Force stop verifies boot-scoped identities and zero active members.
 
 ### Linux exact/degraded
 
-Exact custody requires delegated cgroup v2 (or another qualified equivalent) plus an
-internal owner-death guardian. Guardian is outside owned group, monitors daemon boot/
-process identity, and kills/verifies cgroup on abnormal daemon loss. Clean shutdown
-disarms only after group empty.
+Exact custody requires delegated cgroup v2 (or qualified equivalent) plus internal
+owner-death guardian. Guardian is outside owned group, monitors daemon boot/process
+identity, and kills/verifies cgroup on abnormal daemon loss. Clean shutdown disarms
+only after group empty.
 
 Guardian boot/PID/start and health are monitored. Missing/mismatched guardian blocks new
-exact launches and visibly downgrades existing groups until repaired; daemon never
-silently keeps claiming owner-death cleanup.
+exact launches and visibly downgrades existing groups; daemon never silently keeps
+claiming owner-death cleanup.
 
 Process-group fallback may observe/gracefully stop non-escaping members. Same-user child
 can `setsid`, so capability is degraded: exact force/kill-on-owner-loss unsupported.
-Other Unix remains degraded until an exact backend is qualified.
+Other Unix remains degraded until exact backend qualified.
 
 ### Shared services
 
 Shared plugin/service is watched once. Agent stop uses exact native session control,
-never server kill. Attached owner service is external and never stopped. Managed
-service custody/process projection is separate from agent generations.
+never server kill. Attached owner service is external/never stopped. Managed service
+custody/process projection is separate from agents.
 
 ## Process observation and terminal settlement
 
-- Plugins register PIDs through commit-acknowledged process facts; host verifies/tag
+- Plugins register PIDs through commit-acknowledged process facts; host verifies/tags
   current boot id and exact start identity before commit.
-- Exact custody enumerates complete container; stale prior-boot rows are historical.
+- Exact custody enumerates complete container; prior-boot rows are historical.
 - Stats are ephemeral and never model progress.
 - Unknown exit code stays unknown.
-- Process exit and final native output may race. When owned harness processes end,
-  drain authoritative source to EOF or bounded `terminal_drain_timeout`.
-- Timeout is not terminal silence evidence. Mark source gap and emit lost only when
-  exact custody is empty or exact shared-session readback says absent.
+- Process exit/final native output may race. Drain authoritative source to EOF or
+  bounded terminal deadline.
+- Timeout is not terminal silence evidence. Mark gap and emit lost only when exact
+  custody empty or exact shared-session readback absent.
 - Live shared server says nothing about one session.
-- Late terminal data after source closure is diagnostic and cannot mutate newer state.
+- Late terminal data after source closure is diagnostic only.
 
 ## Starting processes
 
@@ -115,28 +119,26 @@ service custody/process projection is separate from agent generations.
 - Git prompts/editor disabled.
 - Environment follows minimal/inherit policy; Windows key merge case-insensitive.
 - Running script/hook/plugin paths immutable/versioned.
-- Normalize paths; never follow untrusted symlink/reparse point for cleanup,
-  fingerprint or setup.
+- Normalize paths; never follow untrusted symlink/reparse for cleanup/fingerprint/setup.
 
 ## Workspace preparation
 
-`launch --worktree` is a durable pre-start phase:
+`launch --worktree` is durable pre-start:
 
-1. create Agent generation 0, `workspace_state=preparing`, deterministic
-   `<data_dir>/worktrees/<agent-id>`;
-2. journal repository/branch/base/path;
-3. run explicit `git worktree add`;
-4. read back worktree list, branch and HEAD;
-5. run setup argv sequentially under custody;
-6. commit ready; only then dispatch first native start.
+1. create Agent generation 0, `workspace_state=preparing`, deterministic path;
+2. journal repo/branch/base/path;
+3. explicit `git worktree add`;
+4. read back worktree list, branch, HEAD;
+5. setup argv sequentially under custody;
+6. commit ready, then allow native start.
 
-Lost Git response is reconciled from exact path/branch/HEAD, never blindly repeated.
-Lost setup has no generic readback: workspace becomes unknown, launch blocked, owner
-resolves/removes/recreates explicitly. Setup is not assumed idempotent.
+Lost Git response is read back, never blindly repeated. Lost setup has no generic
+readback: workspace unknown, launch blocked, owner resolves/removes/recreates. Setup is
+not assumed idempotent.
 
-Collision/mismatch fails. Cleanup is explicit, stopped-agent only, exact path under data
-root, Git-clean except allowlisted relative scratch. Scratch cleanup rejects symlink,
-device and alternate-stream escape. Branch retained.
+Collision/mismatch fails. Cleanup explicit, stopped-agent only, exact path under data
+root, Git-clean except allowlisted relative scratch; reject symlink/device/alternate-
+stream escape. Branch retained.
 
 ## Git/filesystem monitor
 
@@ -146,10 +148,10 @@ One monitor per distinct live worktree:
 - bounded log on HEAD change;
 - base-vs-HEAD diff for still-unmerged paths;
 - watcher debounce 500 ms, minimum refresh 2 s;
-- slow status backoff to five minutes + health;
-- remote refs change only after explicit fetch or optional `ls-remote`.
+- slow status backoff + health;
+- remote refs only after explicit fetch or optional `ls-remote`.
 
-Monitor never writes index, refs or objects.
+Never write index, refs or objects.
 
 ### Durable edit attribution
 
@@ -165,10 +167,9 @@ CREATE TABLE agent_edits (
 CREATE INDEX agent_edits_workspace ON agent_edits(workspace,path);
 ```
 
-Generation-matched native edit events upsert with event. When Git proves path clean,
-remove rows. Terminal/superseded generation stays until paths clean; restart never
-reconstructs attribution from event history. Unowned shared-checkout path is
-`unattributed`.
+Generation-matched edit events upsert with event. When Git proves path clean, remove
+rows. Terminal/superseded generation stays until paths clean; restart never rebuilds
+from event history. Unowned shared-checkout path is `unattributed`.
 
 ### Read-only progress fingerprint
 
@@ -176,10 +177,9 @@ reconstructs attribution from event history. Unowned shared-checkout path is
 HEAD + sorted(dirty/untracked path, file type, size, content hash)
 ```
 
-Hash only dirty/untracked paths excluding ignored/scratch; hash symlink target text
-without following. Cache until watcher/metadata change and enforce caps. Incomplete is
-unavailable and never no-progress. No temporary index, `git add`, object writes or
-`write-tree`.
+Hash only dirty/untracked excluding ignored/scratch; hash symlink target text without
+following. Cache until watcher/metadata change, enforce caps. Incomplete is unavailable,
+never no-progress. No temporary index, `git add`, object writes or `write-tree`.
 
 ## Liveness
 
@@ -187,7 +187,7 @@ Only exact-generation model progress updates `last_progress_at`.
 
 | Observation | Conclusion |
 | --- | --- |
-| no progress while busy/waiting past threshold | stalled flag only |
+| no progress while busy/waiting | stalled flag only |
 | parent idle, child busy | parent idle; tree incomplete |
 | process alive, stream disconnected | source stale; state unchanged |
 | exact boot-scoped custody empty + source drained/gapped | lost for generation |
@@ -197,18 +197,16 @@ Only exact-generation model progress updates `last_progress_at`.
 
 ## Restart reconciliation
 
-On daemon start:
-
-1. compute current `host_boot_id`; prior-boot live process/custody rows cannot match;
+1. compute current boot id; prior-boot live rows cannot match;
 2. reopen exact named custody/service/guardian identities for current boot;
-3. reattach live shared/service sessions and snapshot open commands/turns;
-4. settle missing owned groups only after terminal-source rules;
-5. reconcile preparing/unknown workspaces from Git journal;
-6. rebuild Git facts and load edit projection;
-7. keep previously dispatched command/action/workspace effects unknown until readback.
+3. reattach shared/service sessions and snapshot commands/turns/inputs;
+4. settle missing owned groups only after source-drain rules;
+5. reconcile preparing/unknown workspaces;
+6. rebuild Git facts/load edit projection;
+7. keep dispatched effects unknown until readback.
 
 ## Views
 
-`watch`, `top`, `show`, `status` expose boot-scoped process identity, generation/turn/
-open stop/workspace state, exact/degraded custody/guardian health, source gaps, last
-model progress, usage, branch/edit attribution, provider holds and Store/WAL.
+Expose boot-scoped process identity, generation/turn/input gate/open stop/workspace,
+exact/degraded custody/guardian, source gaps, model progress, usage, branch/edit,
+provider holds and Store/WAL.
