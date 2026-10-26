@@ -19,6 +19,7 @@ are smaller.
 | agent list/get | paginated current projections, generation/native subject/open effects |
 | agent wait/result | exact captured generation/turn/goal terminal result |
 | command submit/get | durable linked session/input commands and readback |
+| turn get/resolve | exact native/readback result or explicit owner resolution of an unknown, no-longer-active turn |
 | events read/subscribe | bounded persisted replay + live stream with explicit gaps |
 | hook event | generation/request-bound synchronous decision |
 | discover/attach/detach | canonical native subject; one Agent row |
@@ -51,9 +52,9 @@ Launch/resume with text returns session command + linked send. Waiting without `
 means session readiness only. `--wait` with text waits for the linked command's exact
 turn and prints it. Start and initial input never share one outcome.
 
-Interactive calls may omit expected fields; the admission transaction captures them.
-Durable automation supplies frozen values. Interactive selectors expand at admission;
-automation already stores concrete targets.
+Interactive calls may omit expected fields; admission captures them. Durable automation
+supplies frozen values. Interactive selectors expand at admission; automation already
+stores concrete targets.
 
 Same external write id + canonical payload returns original result; different payload
 is invalid. Internal ids are fixed derived ids.
@@ -61,59 +62,78 @@ is invalid. Internal ids are fixed derived ids.
 Errors: `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`,
 `invalid`, `busy`, `unavailable`, `history_gap`, `secret_in_payload`, `internal`.
 
-## Wait semantics
+## Turn outcome and wait
 
-`agent.wait` captures each target's generation at call start.
+A send command becoming applied means native input was admitted. It does not settle the
+turn. `turn.get {agent,generation,turn_id}` returns `running|completed|unknown`, native/
+readback/owner resolution source, status, bounded final text and usage.
 
-- `turn` with `after_command`: wait for the exact turn correlated to that command;
-- `turn` without it: if busy/waiting, wait for current active turn; if idle, wait for
-  the first turn starting after the call's event high-water;
-- `idle`: immediate if captured generation is idle;
-- `stopped`: stopped/failed/lost for captured generation;
-- `goal`: done/blocked for captured goal revision.
+On reconnect, if exact native history cannot prove terminal outcome, the turn is
+`unknown`. The live generation remains blocked from new send/goal continuation until
+exact readback or owner resolution. Owner may call:
 
-Replacement generation returns `stale_generation`, never success for different work.
-Timeout has no cancellation side effect.
+```text
+turn.resolve {
+  id, agent, generation, turn_id,
+  status: completed | interrupted | failed,
+  reason,
+  final_text?          // optional owner-supplied bounded text, labelled owner
+}
+```
+
+Resolution is rejected while readback says that native turn is still active. It records
+`turn.resolved`, never fabricates a plugin completion. Unknown historical turn in a
+terminal old generation does not block resume/new generation.
+
+`agent.wait` captures each target generation at call start:
+
+- turn + `after_command`: exact turn linked to that command;
+- turn without it: current active turn, or first turn starting after call high-water;
+- idle: immediate only if no active/unknown turn in captured generation;
+- stopped: stopped/failed/lost for captured generation;
+- goal: done/blocked for captured goal revision.
+
+Completed returns result; unknown returns outcome unknown/exit 4; replacement generation
+is stale, never success for different work. Timeout has no cancellation side effect.
 
 ## Attach/discover
 
 Discover returns subjects only. Attach looks up unique subject: return existing row,
 upgrade observe-only to control after exact native attach, or create one external row if
-absent. Another live control path/unverified takeover rejects. Detach changes the same
-row. Native subject reuse requires a new scope.
+absent. Another live control path/unverified takeover rejects. Detach changes same row.
+Native subject reuse requires a new scope.
 
 ## Drain/shutdown
 
 Drain commits admission mode first. It rejects new work-starting commands/runs but
-allows exact interrupt/stop/request replies/cancel/detach/goal pause-clear, queries and
-manual resolution. All pre-boundary work continues, including queued sends/action
-chains; streams/readback stay alive.
+allows exact interrupt/stop/request replies/cancel/detach/goal pause-clear, queries,
+turn/command/action readback and manual resolution. All pre-boundary work continues;
+streams/readback stay alive.
 
-Exit waits for pre-drain effects and daemon-owned sessions. Unknown outcomes are
-blockers. Once admitted commands settle, external/attached service sessions may be
-detached without killing them. Without drain, shutdown refuses owned live work. Force
-kills only exact supported custody, marks ambiguous effects unknown and never kills
-attached owner services.
+Exit waits for pre-drain effects and owned sessions. Unknown outcomes are blockers until
+resolved or explicitly abandoned by owner policy. Once admitted commands settle,
+external/attached service sessions may be detached without killing them. Without drain,
+shutdown refuses owned live work. Force kills only exact supported custody, marks
+ambiguous effects unknown and never kills attached services.
 
 ## Event replay/gaps
 
-Subscribe registers bounded live buffer, captures Store high-water, replays bounded
+Subscribe registers a bounded live buffer, captures Store high-water, replays bounded
 pages `(after_seq,high_water]`, then releases buffered persisted events in order. No
 read transaction spans client wait. Ephemeral replay-window events are best effort.
 Overflow emits `events.lagged`.
 
-Store exposes `earliest_seq`. If caller requests an already-pruned sequence, default is
-`history_gap {requested,earliest}`. With explicit `allow_gap=true`, stream first emits
-`events.gap` and continues from earliest. No silent jump. Rule cursors use stricter
-retention coordination and never opt into a silent gap.
+Store exposes `earliest_seq`. Request before it returns `history_gap`. Explicit
+`allow_gap=true` first emits `events.gap` and continues from earliest; no silent jump.
+Rule cursors use stricter retention coordination and never opt into a silent gap.
 
 ## Mail acknowledgement
 
-One open immutable inbox batch/recipient. `mail.inbox` repeatedly returns it until
+One open immutable inbox batch/recipient. `mail.inbox` returns the same batch until
 `mail.ack(batch_id,id)` commits; newly arrived messages wait for next batch. CLI writes
 complete stdout before ack. Lost inbox leaves unread; lost ack uses same id/readback.
-`mail.read ID` explicitly acknowledges one message. `--all` includes acknowledged
-history.
+`mail.read ID` is allowed only when no open batch contains that message; otherwise the
+caller acknowledges the batch. `--all` includes history.
 
 ## CLI
 
@@ -126,6 +146,8 @@ eliot send|inject A TEXT [--generation N]
 eliot steer A TEXT [--or-send] [--generation N] [--turn ID]
 eliot wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
 eliot result A [--generation N] [--turns N]
+eliot turn show A TURN [--generation N]
+eliot turn resolve A TURN --generation N --as completed|interrupted|failed --reason T
 eliot interrupt|abort A [--generation N] [--turn ID]
 eliot stop A [--force] [--tree] [--generation N]
 eliot resume A [PROMPT] [--generation N] [--wait]
@@ -146,6 +168,6 @@ eliot plugin NAME | plugin-test ... | hook ... | mcp
 Exit codes: 0 success/queued; 1 definite error; 2 usage; 3 rejected before effect; 4
 unknown; 5 wait timeout; 6 still pending/dispatched.
 
-Daemon injects home, agent id/generation/raw token and CLI path. Store has only token
-hash. Known credentials are masked from native output and rejected in durable semantic
+Daemon injects home, agent id/generation/raw token and CLI path. Store has token hash
+only. Known credentials are masked from native output and rejected in durable semantic
 payloads.
