@@ -25,7 +25,7 @@ generation. Readers are continuously drained and cancel-safe. Protocol
 | --- | --- |
 | `initialize` | config/private dir/instance → manifest |
 | `agent.start` | target generation, frozen profile/workspace/env/note, resume subject?, linked initial? → session result + separate initial status |
-| `agent.attach` | exact subject/generation/control mode + host-known turn/source watermarks → exact native state, turn/source reconciliation, requests, pids/effective or not-found |
+| `agent.attach` | exact subject/generation/control mode + host-known turn/source watermarks → exact native state, turn/source reconciliation, requests, agent-owned pids/effective or not-found |
 | `agent.command` | command id, exact generation/turn/request, verb/args → applied/rejected/failed/unknown + mechanism/application point |
 | `agent.snapshot` | exact generation + command/turn ids → current state/readback + source watermarks |
 | `agent.stop` | exact generation/command/force → success only after generation ended |
@@ -36,7 +36,7 @@ generation. Readers are continuously drained and cancel-safe. Protocol
 resume_from = { native_scope, native_ref }
 initial = { command_id, text }
 start result = {
-  native_scope, native_ref, pids, effective,
+  native_scope, native_ref, agent_owned_pids, effective,
   initial_status?: applied | rejected | failed | unknown,
   initial_turn_id?: string
 }
@@ -81,7 +81,7 @@ Transport/inbox acceptance such as HTTP 204 is an intermediate fact. The plugin 
 
 The daemon does not dispatch another send/configuration/goal continuation while
 association is unresolved. If one native execution drains several admitted inputs, one
-turn carries the ordered `input_commands`; Store maps every wait to that result.
+turn carries ordered `input_commands`; Store maps every wait to that result.
 
 ### Attach and turn reconciliation
 
@@ -102,72 +102,90 @@ Persisted facts are commit-acknowledged requests:
 | --- | --- |
 | `source.open {open_id,agent,generation,source_name,families,mechanism,native_cursor?}` | idempotent daemon source key + current watermark; exclusive family ownership validated |
 | `event.put {agent,generation,source_key,source_seq,kind,native_id?,native_cursor?,ts?,data}` | Store event seq + duplicate/high-water after watermark/event/projection commit |
-| `process.put {agent,generation,source_key,source_seq,pid,start_time,role}` | Store event seq + duplicate/high-water after verified process projection and `process.started` commit |
-| `child {registration_id,parent agent/generation,child scope/ref,name?,labels?,request_token?}` | canonical child row/generation and, only when supported, the current re-derivable child token |
+| `process.put {agent,generation,source_key,source_seq,pid,start_time,role}` | per-agent process-registration result + duplicate/high-water after verified projection and one normalized registration event |
+| `child {registration_id,parent agent/generation,child scope/ref,name?,labels?,request_token?}` | canonical child row/generation and, only when supported, current re-derivable child token |
 | `source.close {source_key,native_cursor?,state=closed|gap,reason?}` | idempotent committed terminal/handoff boundary |
 
-Best-effort `log` and `event.ephemeral` remain notifications and make no durability
-claim.
+Best-effort `log` and `event.ephemeral` remain notifications with no durability claim.
 
 ### Idempotent source opening
 
-`open_id` is a bounded stable internal id durably chosen by the plugin **before** the
-first request for one ownership epoch. The Store has a unique
-`(agent,generation,open_id)` record. Same id + same canonical fields returns the same
-`source_key` and watermark after a lost reply; any field mismatch is integrity failure.
-A handoff/new epoch uses a new open id only after the old source closes or gaps.
+`open_id` is a bounded stable internal id durably chosen by plugin **before** first
+request for one ownership epoch. Store uniquely maps `(agent,generation,open_id)` to one
+daemon `source_key`. Same id + same canonical fields returns same key/watermark after a
+lost reply; mismatch is integrity failure. Handoff/new epoch uses a new id only after
+old source closes/gaps.
 
-The plugin never invents a source key. Normal reconnect reuses the key returned by
-snapshot/attach. `source.close` retry is idempotent for the same final state/cursor;
-conflicting close data is an integrity error.
+Plugin never invents source key. Normal reconnect reuses snapshot/attach key.
+`source.close` retry is idempotent for same final state/cursor; conflicting close data is
+integrity error.
 
 ### Source sequencing and lost acknowledgements
 
-Every durable `event.put` **and** `process.put` belongs to exactly one source epoch with
-a contiguous positive `source_seq`. A process source is normally a separate family/key
-from model lifecycle. The plugin durably assigns the sequence and typed envelope before
-send and permits at most one unacknowledged durable request per source key. Later facts
-may accumulate in a bounded durable spool but are sent in order.
+Every durable `event.put` and valid per-agent `process.put` belongs to one source epoch
+with contiguous positive `source_seq`. A process-registration source is separate from
+model lifecycle. Plugin durably assigns sequence/envelope before send and permits at
+most one unacknowledged durable request per key; later facts spool boundedly in order.
 
-After reply, the plugin durably records the acknowledgement/removes the entry before
-sending the next sequence. On restart it reads the host watermark first.
+After reply, plugin records acknowledgement/removes entry before sending next sequence.
+On restart it reads host watermark first.
 
-The daemon computes the envelope digest over one versioned/domain-separated canonical
-encoding: length-prefixed scalar fields and recursively key-sorted normalized JSON.
-Host-derived process `host_boot_id` is projection data, not part of the plugin resend
-envelope.
+Daemon computes digest over one versioned/domain-separated canonical encoding:
+length-prefixed scalar fields plus recursively key-sorted normalized JSON. Host-derived
+`host_boot_id` is projection data, not part of plugin resend envelope.
 
-- next sequence commits watermark, event/process projection and normalized event in one
-  transaction;
-- resend of current high-water with matching digest returns the saved Store seq;
+- next sequence commits watermark, normalized event or process registration and
+  projection in one transaction;
+- current high-water resend with matching digest returns saved Store seq;
 - same sequence/different digest is integrity error;
-- older sequence is rejected with current watermark/cursor;
-- a hole is rejected until replay or explicit gapped close.
+- older sequence rejects with current watermark/cursor;
+- a hole rejects until replay or explicit gapped close.
 
-The plugin advances native cursor only after commit reply. `native_id`/cursor suppress
-vendor replay; source sequence prevents Store duplicate admission after event-row or
-process-history retention.
+A source-owned vendor duplicate or stale turn/request may advance the sequence while
+returning the original event seq or one bounded diagnostic; it cannot fire ordinary
+lifecycle twice. Malformed envelope or undeclared family does not advance.
+
+Plugin advances native cursor only after commit reply. `native_id`/cursor suppress
+vendor replay; source sequence prevents Store duplicate admission after event/process
+history retention.
 
 If vendor replay/backpressure is unavailable and spool is lost/overflows, close gapped
-and stop claiming complete coverage. Source watermark rows stay for the current
-generation and are reclaimed only after generation supersession and source/spool
-closure.
+and stop claiming complete coverage. Source watermark rows stay for current generation
+and are reclaimed only after generation supersession and source/spool closure.
+
+### Process registration and ownership
+
+`process.put` is valid only for a PID that belongs to the calling **per-agent** plugin's
+agent custody (for example a native harness/tool child not already enumerated by the
+host). The host pins birth identity and verifies custody membership before accepting.
+It is a registration family; the OS process monitor is the sole authoritative source
+for exit and resource-stat lifecycle.
+
+A shared plugin must not assign the shared server or one of its uncontained children to
+an Agent owner. Managed/attached service processes are registered by daemon service
+management under `service:<name>` custody. If a service exposes a session-attributed tool
+PID, the plugin may emit bounded harness diagnostic/attribution data, but that does not
+change process custody or make agent stop kill the service process.
+
+Host enumeration and plugin registration of the same PID are idempotent by exact
+boot/birth identity. Only one `process.started` is published; later OS disappearance
+produces one host-owned `process.exited`.
 
 ### Native child registration and tokens
 
-`registration_id` is stable across a lost child reply. Canonical child scope/ref is the
-identity; retries upsert the same Agent row. Manifest feature `child_environment`
-indicates whether the plugin can inject a distinct child environment/token.
+`registration_id` is stable across lost child reply. Canonical child scope/ref is
+identity; retries upsert same Agent row. Existing subject with different parent/root/
+project/harness is integrity conflict, never silent reparenting. Manifest
+`child_environment` says whether plugin can inject distinct child environment/token.
 
-When `request_token=true` and that feature is qualified, the daemon returns the token
-for the row's current `token_version`. Routing tokens are re-derived from the private
-daemon routing key and therefore the same registration retry can return the same raw
-token without storing it in SQLite. The plugin durably stores the response before
-injecting/spawning the child. If distinct injection is unavailable, token is absent and
-child CLI activity is explicitly attributed to the parent.
+When `request_token=true` and qualified, daemon returns token for row's current
+`token_version`. Tokens are re-derived from private daemon routing key, so same retry
+returns same raw token without SQLite plaintext. Plugin durably stores response before
+injecting/spawning child. If distinct injection is unavailable, token is absent and
+child CLI activity is explicitly attributed to parent.
 
-A different token version is issued only by an explicit routing lifecycle transition
-(control reattach/resume), never because a response was lost.
+Different token version is issued only by explicit routing lifecycle transition
+(control reattach/resume), never lost response.
 
 ## Manifest
 
@@ -223,18 +241,18 @@ identifies known input commands; later coalesced inputs use `turn.inputs`. Inter
 status, inbox acceptance, process exit or silence is not completion. Final output
 commits before terminal event or publication waits for output drain.
 
-Reconnect resends only the one unacknowledged source sequence, then facts newer than the
-committed native cursor. An unbridgeable interval is a gap, never replayed completion.
+Reconnect resends only one unacknowledged source sequence, then facts newer than
+committed native cursor. Unbridgeable interval is a gap, never replayed completion.
 
 ## Hooks and transcripts
 
 Hooks are session-scoped with current identity, stable native hook/request id and one
-absolute deadline. `hook.event` returns either a committed non-dispatchable proposal or
-native-safe `ask` (`allow` only for observation hooks). The proposal can act only
-through that immediate response; late commit/response expires and never approves later.
-There is no durable hook queue.
+absolute deadline. `hook.event` returns either committed non-dispatchable proposal or
+native-safe `ask` (`allow` only for observation hooks). Proposal acts only through that
+immediate response; late commit/response expires and never approves later. No durable
+hook queue.
 
-Transcript readers persist cursors, wait only for an incomplete final line, and report
+Transcript readers persist cursors, wait only for incomplete final line, and report
 complete unparsable input/gaps. They never infer end from silence/truncation.
 
 ## Custody
@@ -247,14 +265,14 @@ complete unparsable input/gaps. They never infer end from silence/truncation.
   degraded; exact force, complete descendant death and daemon-death containment are
   unsupported.
 
-Guardian lives outside the owned group and disarms only after clean empty shutdown.
+Guardian lives outside owned group and disarms only after clean empty shutdown.
 Attached services are never killed; managed services have separate custody.
 
 When process exit races final output, drain authoritative source to EOF or terminal
-deadline. Deadline creates a gap. Exact backend emptiness or exact shared-session
-absence proves loss. On degraded backend, controlling process/channel loss may prove
-session control lost while custody remains `orphan_possible`; it never proves every
-descendant died.
+deadline. Deadline creates gap. Exact backend emptiness or exact shared-session absence
+proves loss. On degraded backend, controlling process/channel loss may prove session
+control lost while custody remains `orphan_possible`; it never proves every descendant
+died.
 
 ## Fake, recordings and L7
 
@@ -263,7 +281,8 @@ spool state and exact session snapshots. Recordings are bounded sanitized native
 CI never calls a model.
 
 L7 conformance covers lost `source.open|close|event.put|process.put|child` replies,
-source digest mismatch/hole/stale recovery, process-history pruning, child-token retry,
-start versus initial input, async inbox association, coalesced inputs, source handoff/
-gap, unknown turn, hook timeout, exact bindings, no unknown retry, custody, readback,
-bounded buffers and unsupported-before-I/O.
+source digest mismatch/hole/stale/vendor-duplicate recovery, process registration versus
+host enumeration/history pruning, rejection of shared-service PID ownership, child
+parent conflict/token retry, start versus initial input, async inbox/coalesced inputs,
+source handoff/gap, unknown turn, hook timeout, exact bindings, no unknown retry,
+custody, readback, bounded buffers and unsupported-before-I/O.
