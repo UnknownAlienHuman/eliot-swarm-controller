@@ -50,6 +50,7 @@ command or proxy credentials.
 [daemon]
 retention.events_days = 30
 retention.turns_days = 90
+retention.automation_history_days = 30
 store.wal_warn_bytes = 536870912
 store.wal_hard_bytes = 2147483648
 limits.max_depth = 8
@@ -59,7 +60,10 @@ automation.max_actions_per_minute = 120
 automation.max_parallel_checks = 2
 automation.check_timeout = "10m"
 automation.max_event_backlog = 100000
-automation.script_pass_env_allow = []   # global script ceiling; project also needs its own allow
+automation.script_pass_env_allow = []   # global ceiling; project also needs its own allow
+hooks.response_margin = "100ms"
+sources.spool_max_events = 4096
+sources.spool_max_bytes = 16777216
 
 [process]
 scan_interval = "2s"
@@ -165,7 +169,7 @@ Resolved secret values never enter config, Store, rule/action payload or logs. N
 references persist. Native output is masked; durable semantic text containing a known
 secret is rejected.
 
-## Accounts, capacity and holds
+## Accounts, capacity and provider holds
 
 A profile references `[accounts.<id>]`. Atomic start reservation must fit profile,
 shared account and proxy/service caps. Starting, live and unresolved-unknown start
@@ -188,14 +192,26 @@ CREATE TABLE provider_holds (
 );
 ```
 
-A hold blocks new provider-backed launch/send/goal continuation in its proven scope; it
-never blocks stop/interrupt/request replies/readback or local checks. Unknown coverage
-holds only the exact observed route/profile. After `retry_after`, the first explicit
-queued/user send may atomically become the probe. Mail wake, parent notice, timer or
-hidden model call is never selected as a probe. The probe clears only after an exact
-successful provider-backed turn; unknown keeps the hold and probe command visible.
-Auth/model-gone without recovery evidence requires an explicit owner/config change
-rather than a timed probe. Restart restores all hold/probe state.
+A hold blocks new provider-backed launch, send and goal continuation in its proven
+scope. It never blocks stop/interrupt/request replies/readback or local checks. Unknown
+coverage holds only the exact observed route/profile.
+
+After `retry_after`, recovery requires an explicit command with `probe=true`:
+
+- `send` to an existing exact generation; or
+- `launch`/`resume` with a linked initial prompt, where that linked send—not mere session
+  creation—is the probe.
+
+The router atomically claims `probe_command`; only one probe exists per hold. An owner
+or currently controlled agent may explicitly request it. Rules, timers, Goal loop,
+mail/parent wake and hidden model calls may never set `probe=true`. A launch without
+input is not a provider probe and remains blocked when its route would consume the held
+provider.
+
+The hold clears only after the exact probe-linked provider turn completes successfully.
+A definite limit updates the hold; unknown keeps it and the probe command visible until
+readback/resolution. Auth/model-gone without recovery evidence requires explicit owner
+configuration change rather than a timed probe. Restart restores all hold/probe state.
 
 ## Profiles and paths
 
@@ -207,12 +223,16 @@ validated at initialize. Names, labels, argv/environment counts and values are b
 absolute paths, `..`, symlink escape and platform alternate-stream/device forms.
 Different Rust worktrees use distinct `CARGO_TARGET_DIR`s.
 
-## Plugins, services and webhooks
+## Plugins, sources, services and webhooks
 
 External plugin `cmd` is global-only. `instances` is shared-mode only; per-agent mode
 gets a private instance/data directory per generation. The operator cannot override
 returned custody mode. Shared control must prove per-session environment, identity,
 readback and isolated stop.
+
+Source spool limits apply per authoritative source key. The plugin must backpressure or
+commit an explicit source gap when either cap is reached; it never drops persisted
+lifecycle silently or expands the spool without bound.
 
 An `attach` service is owner-run and never stopped/reconfigured. A `launch` service has
 separate managed custody and persisted endpoint/process identity. Agent stop never
@@ -223,9 +243,16 @@ principal may use only its allowlist. The action id is sent through a configured
 idempotency header when supported; otherwise a lost response remains unknown and is
 never retried.
 
-## Store and WAL limits
+## Retention, Store and WAL limits
+
+Terminal automation history may be removed after
+`retention.automation_history_days` only under the safe cursor/timer conditions in the
+automation spec. Open/unknown effects and current projections are never age-pruned.
 
 The daemon passive-checkpoints, records WAL/database size and tracks Eliot-owned
 readers. Replays paginate and release transactions. Warning pressure is visible. At
-hard size, reject new long reads while preserving short control/result commits. Never
-delete evidence, kill an unknown reader or blind-truncate with active readers.
+hard size, reject new work and long reads while reserving short commits for
+stop/interrupt/request replies/results. Actual filesystem/SQLite failure still enters
+the Store error boundary; Eliot never claims the configured limit can defeat a full
+disk. Never delete evidence, kill an unknown reader or blind-truncate with active
+readers.
