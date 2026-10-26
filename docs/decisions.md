@@ -5,7 +5,7 @@ changes the product; never append a contradictory addendum.
 
 | ID | Decision | Why |
 | --- | --- | --- |
-| D-01 | **v2 is a fresh layered build; v1 is archived at `v1-final`.** v1 is a narrow donor, not a refactor base. | v1 reached about 533k Rust lines and 61k process/audit docs without qualified core paths. |
+| D-01 | **v2 is a fresh layered build.** v1's frozen pre-reset ref is commit `dc6f70aa`; L0.1 creates `v1-final` there before deleting v1 from `main`. v1 is a narrow donor, not a refactor base. | v1 reached about 533k Rust lines and 61k process/audit docs without qualified core paths. |
 | D-02 | One `eliot` binary contains CLI, daemon entry, built-in plugin entry, hook shim and optional MCP entry. | Simple installation/versioning; no sibling-artifact provenance platform. |
 | D-03 | Plugins speak JSON-RPC over stdio. A plugin that owns native processes runs **per agent generation**; shared mode is allowed only for a native service that already isolates sessions and can stop one without killing the service. | Exact custody and honest force-stop matter more than one small controller process. Fake and service-backed harnesses can still multiplex. |
 | D-04 | One SQLite database in WAL mode, one writer task, numbered `user_version` migrations. | Enough for one host/millions of rows; no database server or schema-hash ceremony. |
