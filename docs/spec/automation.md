@@ -39,11 +39,18 @@ Crash before transaction repeats safely; after transaction cannot lose the event
 Ephemeral/late-diagnostic events are ineligible unless explicitly matched by their
 `x.*` kind.
 
-Retention deletes only through the minimum cursor of active event-rule revisions. Rule
-lag is visible. If one active rule exceeds configured backlog count/age, automation
-pauses that rule with `backlog_limit` and stops advancing it until the owner chooses
-`resume --catch-up` or `resume --from-now`; it never silently discards history or pins
-disk indefinitely.
+Retention deletes only through the minimum cursor of active event-rule revisions.
+Rule lag is visible and bounded by configured count/age. When a rule exceeds that
+limit, one transaction:
+
+1. records `rule.paused reason=backlog_limit` and the exact skipped seq range;
+2. advances its normal cursor to current high-water so it no longer pins storage;
+3. leaves the rule disabled until explicit owner action.
+
+`resume --from-now` continues from that cursor. `resume --catch-up` creates an explicit
+new replay revision over the recorded range only while those events still exist; if
+retention already removed any part, it fails `history_gap`. Nothing is silently lost
+or allowed to pin disk indefinitely.
 
 ## Timers/revisions
 
@@ -114,15 +121,15 @@ one transaction after exit 0; only then dispatch. Lost script outcome is unknown
 
 ## Approval rules
 
-Request actions freeze generation/turn/request. Synchronous hook decision is returned
+Request actions freeze generation/turn/request. Synchronous hooks return a decision
 only after durable command/action admission commits. Timeout/Store failure returns
-native-safe `ask`, never a default choice.
+native-safe `ask`, never a default option.
 
 ## Goal loop
 
 Native/Eliot goals are independent and generation-bound. Cost uses integer micro-USD;
-`max_cost` is accepted only when the plugin reports exact machine-readable cost.
-Generation change pauses both projections until explicit readback/rebind.
+`max_cost` is accepted only when plugin reports exact machine-readable cost. Generation
+change pauses both projections until explicit readback/rebind.
 
 ```text
 Goal {
@@ -163,6 +170,8 @@ CREATE TABLE rule_state (
   active INTEGER NOT NULL,
   event_cursor INTEGER NOT NULL,
   paused_reason TEXT,
+  skipped_from INTEGER,
+  skipped_through INTEGER,
   loaded_at INTEGER NOT NULL,
   PRIMARY KEY(principal, rule, revision)
 );
@@ -220,5 +229,5 @@ CREATE TABLE goals (
 ## Guardrails
 
 Cause depth, principal scope, per-rule/global rate limits, self-trigger protection,
-bounded payloads and router validation all apply. Draining admits no new run/goal round.
-No guardrail uses another model call.
+bounded payloads and router validation all apply. Draining admits no new run/goal
+round. No guardrail uses another model call.
