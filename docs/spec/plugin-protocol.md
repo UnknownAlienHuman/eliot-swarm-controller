@@ -1,88 +1,88 @@
 # Plugin protocol
 
-A plugin translates Eliot semantic commands to one native harness and normalizes
-facts. It never writes the Store or retries an uncertain effect.
+A plugin translates one native harness and normalizes facts. It never writes SQLite or
+retries an uncertain effect.
 
 ## Modes
 
-Manifest `session_mode`:
+- `per_agent`: one plugin instance/custody unit per Eliot generation.
+- `shared`: one plugin talks to a native service with exact per-session identity,
+  environment/tool attribution, attach/readback and isolated stop.
 
-- `per_agent`: one plugin instance owns one Eliot agent generation and its native
-  processes;
-- `shared`: one plugin talks to a service that provides exact per-session identity,
-  environment/tool attribution and stop/attach. One agent stop never kills the shared
-  process/service.
-
-A service lacking per-session environment/control may be observed, but cannot be a
-shared **controlling** plugin. The plugin must use per-agent service mode or reject the
-control attach.
+A service missing any shared-control prerequisite is per-agent or observe-only. Shared
+mode is not selected merely because the vendor hosts multiple chats.
 
 ## Framing
 
-JSON-RPC 2.0 over UTF-8 NDJSON, maximum 1 MiB per line. stdout is protocol only;
-stderr is bounded log text. Both directions may issue requests. Every agent-scoped
-message carries `agent_id` and `generation`. Readers are cancel-safe and continuously
-drained. Protocol version is `eliot-plugin/1` with additive fields only.
+JSON-RPC 2.0 over UTF-8 NDJSON, ≤1 MiB/line. stdout is protocol; stderr bounded logs.
+Both directions issue requests. Every scoped message carries agent + generation.
+Readers are continuously drained/cancel-safe. Protocol `eliot-plugin/1` allows additive
+fields only.
 
 ## Host → plugin
 
-| Method | Params | Result |
-| --- | --- | --- |
-| `initialize` | protocol, config, private data dir, instance id | manifest/capabilities |
-| `agent.start` | agent id, target generation, resolved profile, workspace, env, system note, `resume_from?`, `initial?` | session result plus separate optional initial-command status |
-| `agent.attach` | agent/generation, exact native subject, observe-only/control | exact state, active turn, pending requests, pids/effective or not-found |
-| `agent.command` | agent/generation, command id, verb/args, expected turn/request | applied/rejected/failed/unknown + mechanism/application point |
-| `agent.snapshot` | agent/generation, optional command ids | exact current state and command readback |
-| `agent.stop` | agent/generation, command id, force | success only after that generation ended |
-| `discover` | — | native subjects with stable scope/ref and metadata |
-| `shutdown` | — | reply, finish owned cleanup, exit |
+| Method | Key fields/result |
+| --- | --- |
+| `initialize` | config/private dir/instance → manifest |
+| `agent.start` | target generation, resolved profile/workspace/env/note, resume subject?, linked initial? → session result + separate initial status |
+| `agent.attach` | exact subject/generation/control mode → exact state/turn/requests/pids/effective or not-found |
+| `agent.command` | command id, exact generation/turn/request, verb/args → applied/rejected/failed/unknown + mechanism/application point |
+| `agent.snapshot` | exact generation + command ids → current state/readback |
+| `agent.stop` | exact generation/command/force → success only after that generation ended |
+| `discover` | canonical native subjects |
+| `shutdown` | finish owned cleanup and exit |
 
 ```text
 resume_from = { native_scope, native_ref }
-initial = { command_id, text }       // linked send, not part of launch identity
+initial = { command_id, text }
 start result = {
   native_scope, native_ref, pids, effective,
-  initial_status?: applied | failed | unknown
+  initial_status?: applied | rejected | failed | unknown
 }
 ```
 
-Most plugins start the native session without `initial`; the daemon later dispatches
-the linked send normally. A plugin that requires first input to obtain a session id
-sets `features.start_requires_input=true` and receives the linked send in `initial`.
-The session and initial input still have separate Eliot commands/outcomes.
+Most harnesses start without initial input. A plugin requiring input to obtain a native
+subject declares `start_requires_input=true`; it receives the linked command in
+`initial`. Session and initial command remain separate outcomes. `applied` means native
+input admitted, not turn completed.
 
 ### Start contract
 
-1. Establish the exact native subject ↔ target generation mapping.
-2. Emit exactly one matching `session.ready` once the session accepts control.
-3. If `initial` exists, admit it exactly once or return `failed/unknown` for that
-   command; emit its normal turn/input events with the linked command id.
-4. Return the session result and separate initial status.
+1. Establish exact native subject ↔ generation.
+2. Emit one commit-acknowledged `session.ready` when control is possible.
+3. If initial is required, admit it once and report its separate status/events.
+4. Return matching start result.
 
-`session.ready` proves session start only. It never proves initial prompt admission.
-The host does not dispatch later commands until ready is committed and the reply agrees.
-Native events arriving earlier are kept in a bounded pre-ready buffer. Overflow fails
-the source/start explicitly; it never grows without limit or drops a terminal event.
+Ready never proves initial input. Before ready commit, the plugin backpressures the
+native reader or keeps a bounded spool. If the spool cannot retain all persisted events,
+it reports a source gap, marks the initial effect unknown as needed, and still reports
+session start according to actual native evidence; it never falsely turns the whole
+session into a definite failure or drops a terminal event silently.
 
-Launch and resume both use `agent.start`; resume supplies `resume_from` and a new Eliot
-generation. Old input is never inferred or resent. Exact re-attach to the same live
-incarnation preserves generation.
+Launch and resume both use `agent.start`. Resume supplies the same canonical subject and
+a new Eliot generation. Old input is never inferred/replayed. Exact recovery attach to
+the same live incarnation preserves generation.
 
-## Plugin → host
+## Plugin → host requests/notifications
 
-| Method | Params |
+Persisted facts are requests, not fire-and-forget notifications:
+
+| Method | Result |
 | --- | --- |
-| `event` | agent, generation, kind, timestamp?, unique native event id?, data |
-| `process` | agent, generation, pid, native start identity, role |
-| `log` | level/message |
-| `child` request | parent agent/generation, child `native_scope`, child `native_ref`, optional name/labels |
+| `event.put {agent,generation,kind,native_id,ts?,data}` | `{seq, duplicate}` only after Store commit/dedupe |
+| `process.put {agent,generation,pid,start_time,role}` | committed identity/duplicate acknowledgement |
+| `child {parent agent/generation, child scope/ref,...}` | canonical child row/generation/token |
+| `log` notification | no durability claim; bounded diagnostic only |
+| `event.ephemeral` notification | best-effort delta/sample only |
 
-`child` upserts the canonical native subject. Parent generation is provenance; host
-returns the existing/new child row and token where independently injectable.
+Every persisted plugin lifecycle event has stable per-event identity. Plugin advances
+its source cursor/removes unacknowledged spool entry only after `event.put` reply. Lost
+reply causes resend with the same id; Store uniqueness returns duplicate safely. If the
+vendor cannot replay/backpressure and the bounded unacknowledged spool overflows, emit a
+source gap and do not claim complete lifecycle coverage.
 
-Stale generation, non-owner source, duplicate `(kind,native_id)`, wrong turn and wrong
-request are rejected before the normal event bus. Plugins must provide a true event id
-where available, not reuse a turn/item id for multiple updates of the same kind.
+`child` upserts one canonical native subject. Parent generation is provenance; child
+scope/ref defines identity.
 
 ## Manifest
 
@@ -111,94 +111,68 @@ where available, not reuse a turn/item id for multiple updates of the same kind.
 }
 ```
 
-Shared control requires `session_environment` when native tools need Eliot token/Git
-environment, and an exact session stop/interrupt path. `instances=N` applies only to
-shared plugins. Versions are display/fixture facts, not gates.
+Shared control requires session environment when native tools need Eliot identity and an
+exact isolated stop/interrupt. `instances=N` is shared-only. Versions are facts, not
+authority gates.
 
 ## Translation rules
 
 1. Validate generation before native I/O.
-2. Steer/interrupt bind exact active turn; approval/answer bind exact request.
-3. Translate one semantic verb to one documented mechanism and report
-   `now|next_tool|next_turn|next_session` where relevant.
-4. Reject unsupported semantics; no steer→send, resume→fresh unrelated session,
-   answer→default choice, or force→shared-service kill.
+2. Steer/interrupt bind exact active turn; request replies bind exact request.
+3. Map one semantic verb to one documented native mechanism and application point.
+4. Reject weaker substitutions/hidden route changes.
 5. Unknown is never retried.
-6. Preserve native event/request/turn ids and command correlation.
-7. Daemon owns send FIFO and generation expiry.
-8. Reject oversized or known-secret durable payloads before native I/O.
+6. Preserve command/native turn/request/event correlation.
+7. Daemon owns queued-send order/generation expiry.
+8. Reject oversized/known-secret durable payloads before native I/O.
 
-## Event normalization and source ownership
+## Source ownership/normalization
 
-One authoritative source owns each normalized family for one generation. Controlled
-live stream normally owns lifecycle; transcript owns observe-only/recovery after an
-explicit cursor handoff; hooks own only assigned missing facts or synchronous decisions.
+One source owns each family per generation. Live stream normally owns controlled
+lifecycle; transcript owns observe-only or explicit cursor recovery; hooks own assigned
+missing facts/synchronous decisions only.
 
-Emit one start and one terminal event per native turn. Intermediate status is not
-completion. Process exit alone is not completion. Final output is ordered before the
-terminal event or the plugin delays completion until its output stream is drained.
-Unknown vendor events may be `x.<harness>.*` but never mutate core state.
+One turn start and one terminal completion per native turn. Intermediate status/process
+exit/silence is not completion. Final output is committed before terminal completion or
+the plugin delays terminal publication until authoritative output is drained. Unknown
+vendor facts can be diagnostic but cannot mutate core state.
 
-Reconnect suppresses already committed native event ids. If no lossless cursor boundary
-exists, report a source gap; never replay an old completion.
+Reconnect resends only unacknowledged or native-cursor-new events. An unbridgeable
+interval is a gap, never replayed completion.
 
-## Hooks and transcripts
+## Hooks/transcripts
 
-Hooks are session-scoped and receive current agent id/generation/token. The shim has a
-single absolute deadline; timeout returns a configured native-safe default (`allow`
-for observation, `ask` for decisions). There is no durable hook queue.
+Hooks are session-scoped with current agent/generation/token and one absolute deadline.
+Timeout returns native-safe allow for observation or ask for decisions. A synchronous
+decision is returned only after its durable action/command admission commits; no Store
+commit means ask. No durable hook queue.
 
-Transcript readers store bounded cursors, wait only for an incomplete final line, and
-report complete unparsable lines as gaps. They never infer end from silence/truncation.
+Transcript readers persist cursors, wait only for an incomplete final line, and report
+a complete unparsable line/gap. They never infer end from silence/truncation.
 
 ## Custody
 
-Custody capability is explicit:
+- Windows exact: assign-before-resume Job, no breakaway, kill-on-close for owned
+  sessions.
+- Linux exact: delegated cgroup v2/equivalent plus owner-death guardian; membership and
+  group kill/readback prove termination.
+- Linux/other Unix fallback: process group + guardian for non-escaping members,
+  reported degraded; exact force/daemon-death containment unsupported.
 
-- Windows exact backend: Job object, assign-before-resume, no breakaway, kill-on-close
-  for daemon-owned sessions.
-- Linux exact backend: delegated cgroup v2 (or equivalent qualified containment) plus
-  an owner-death guardian. `cgroup.kill`/membership proves group termination.
-- Linux/other Unix fallback: process group + guardian for non-escaping members. It is
-  reported `degraded`; exact `stop --force` and kill-on-daemon-death guarantees are
-  unsupported until an exact backend is available.
+Guardian lives outside the owned group, survives daemon loss within the user session,
+and disarms only after clean empty-group shutdown. Attached services are never killed;
+managed services have separate custody.
 
-The internal guardian is outside the plugin's native group, monitors daemon death, and
-kills/verifies the exact owned group on abnormal owner loss. Clean shutdown disarms it
-only after the group is empty. This closes the gap that a Unix process group alone does
-not die when its parent daemon crashes, while still refusing to pretend an escaped
-`setsid` child is contained.
+When process exit races final output, drain authoritative source to EOF or bounded
+terminal-drain deadline. Deadline creates a gap; lost requires exact empty custody or
+session-not-found readback, never silence alone.
 
-Shared services have separate ownership: attached services are never killed; managed
-services are stopped only through service lifecycle, not an agent stop.
+## Fake, recordings and L7
 
-A process exit and final stdout/terminal event may race. The host drains the authoritative
-source to EOF or a bounded terminal-drain deadline before deciding lost. Deadline expiry
-creates a source gap plus `session.lost` only after exact custody/session readback; no
-fixed silence delay is terminal evidence.
+Fake is shared/isolated, generation-bound, stable-event-id and persists minimum exact
+snapshot/resume state. Recordings are bounded sanitized native NDJSON with version/date.
+CI never calls a model.
 
-## Fake plugin and recordings
-
-Fake is shared, generation-bound and persists the minimum state needed for exact
-snapshot/resume tests. It emits stable per-step event ids and rejects stale
-turn/request/generation before effects. Scripts cover say/sleep/tool/request/child/
-usage/crash/hang/exit.
-
-Recordings are sanitized bounded NDJSON native traffic with harness version/date and
-scenario. Replay checks stable method/path/payload fields; hang/exit controls simulate
-failure. CI never calls a model.
-
-## L7 conformance
-
-The complete kit verifies:
-
-1. manifest/mode/capability honesty;
-2. one ready-before-start-success and separate initial-input outcome;
-3. exact generation/turn/request fences;
-4. no duplicate lifecycle on replay/handoff;
-5. no unknown retry;
-6. canonical child/native subject upsert;
-7. exact/degraded custody reporting and no cross-agent kill;
-8. attach/readback or explicit not-found/gap;
-9. bounded pre-ready/output/telemetry behavior;
-10. unsupported verbs rejected before native I/O.
+L7 conformance covers start vs initial outcome, commit-ack event replay/dedupe,
+source-gap overflow, exact bindings, canonical children, no unknown retry,
+exact/degraded custody, attach/readback, bounded buffers and unsupported-before-I/O.
