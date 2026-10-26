@@ -1,12 +1,15 @@
 # Claude Code
 
-Layer L4.2. Plugin: `plugins/claude`. Start in TypeScript on the Agent SDK (fastest
-documented path: streaming input, `interrupt()`, `canUseTool`, in-process hooks);
-port to Rust in L8 by driving the CLI's stream-json mode directly.
+Layer L4.2. Plugin: `plugins/claude`, initially TypeScript on the Agent SDK.
+Manifest mode is `per_agent`: one plugin/SDK query process group per Eliot agent
+generation. This preserves session-specific environment, hook callbacks, Git identity
+and exact force-stop custody. A later Rust port drives stream-json behind the same
+protocol and conformance cases.
 
-Facts checked 2026-10-25 (docs page marker v2.1.309; npm `@anthropic-ai/claude-code`
-2.1.310, `@anthropic-ai/claude-agent-sdk` 0.3.310; PyPI `claude-agent-sdk` 0.2.174).
-The SDK is under Anthropic's commercial terms, not an open-source license.
+Facts checked 2026-10-25: docs page marker v2.1.309; npm
+`@anthropic-ai/claude-code` 2.1.310 and `@anthropic-ai/claude-agent-sdk` 0.3.310;
+PyPI `claude-agent-sdk` 0.2.174. The SDK is under Anthropic commercial terms, not an
+open-source license; recheck terms/version when adding it.
 
 ## Sources
 
@@ -14,91 +17,101 @@ The SDK is under Anthropic's commercial terms, not an open-source license.
 [CLI reference](https://code.claude.com/docs/en/cli-reference),
 [hooks](https://code.claude.com/docs/en/hooks),
 [Agent SDK TypeScript](https://code.claude.com/docs/en/agent-sdk/typescript),
-[Agent SDK Python](https://code.claude.com/docs/en/agent-sdk/python),
 [subagents](https://code.claude.com/docs/en/sub-agents),
 [sessions](https://code.claude.com/docs/en/sessions),
 [goal](https://code.claude.com/docs/en/goal),
 [env vars](https://code.claude.com/docs/en/env-vars),
 [LLM gateway](https://code.claude.com/docs/en/llm-gateway).
 
-## Transport
+## Transport and binding
 
-- SDK: `query({ prompt: AsyncIterable<SDKUserMessage>, options })` keeps one session
-  open with streaming input. The SDK runs its bundled Claude Code binary unless
-  `pathToClaudeCodeExecutable` is set; the native version is reported only in the init
-  message; show it in `eliot show`.
-- CLI (for the Rust port): `claude -p --input-format stream-json --output-format
-  stream-json` (examples also pass `--verbose`); `--include-partial-messages` for
-  deltas; `--resume <id>`, `--session-id <uuid>`; `--permission-mode`.
-- Windows: a custom `pathToClaudeCodeExecutable` must be an absolute `.exe`; `.cmd` /
-  `.bat` shims are not accepted.
-- Do not use `--bare` for managed agents: it skips hooks, skills, MCP and CLAUDE.md
-  discovery, and the docs say it will become the default for `-p` — pass explicit
-  settings so hooks keep working.
+- SDK: `query({prompt: AsyncIterable<SDKUserMessage>, options})` keeps one native
+  session open with streaming input. It runs the bundled Claude Code binary unless
+  `pathToClaudeCodeExecutable` is set.
+- Rust-port CLI: `claude -p --input-format stream-json --output-format stream-json
+  --verbose`; optional `--include-partial-messages`, `--resume`, `--session-id`,
+  explicit permission/settings flags.
+- A custom Windows executable path must be an absolute `.exe`; do not pass `.cmd` or
+  `.bat` shims where the SDK forbids them.
+- Do not use `--bare` for a managed agent: it disables hooks/skills/MCP/instructions.
+  Pass explicit settings so upstream default changes cannot silently remove controls.
+
+The plugin binds the SDK query/session to Eliot `(agent_id,generation)`. All callbacks,
+hooks, inputs and requests carry that generation. Resume increments Eliot generation
+and rotates the token even when Claude reuses the native session id. Late callbacks
+from the old SDK object are dropped from the normal bus.
 
 ## Verb mapping
 
 | Eliot verb | Claude Code | Notes |
 | --- | --- | --- |
-| `launch` | `query()` with streaming input, `cwd`, `model`, `permissionMode` | `native_ref` = session id from the init message. An unset `permissionMode` lets the SDK pick its own fallback, which differs from an explicit `default`; read the effective mode from the init message. |
-| `send` | push an `SDKUserMessage` into the input stream | Arrives only when idle (Eliot queues). |
-| `steer` | text returned as `additionalContext` from the next `PostToolUse` hook | Lands after the current tool call; verify `additionalContext` on `PostToolUse` in L4.2. Report `applies: next_tool`; if the turn ends without another tool call, the text is delivered with the next turn. |
-| `inject` | `additionalContext` on `UserPromptSubmit` / `PostToolUse` hooks (≤ 10,000 chars) | |
-| `interrupt` | `Query.interrupt()` | Streaming mode only. |
-| `stop` | end the input stream; `force` kills the process tree | |
-| `resume` | `options.resume = <session id>` | Resume does not refresh the system prompt; never resend the old input. |
-| `approve` / `deny` | `canUseTool` callback returns allow/deny — the plugin awaits an Eliot `approve`/`deny` command | `canUseTool` runs only when a prompt would appear; a `PreToolUse` hook is expected to see every call (universal coverage on the installed version is unverified — check in L4.2). |
-| `answer` | the `AskUserQuestion` tool via `canUseTool` (answers in the returned input) | Verify the exact shape in L4.2. |
-| `configure` | `setPermissionMode()` (now); model per query option (`applies: next_session` unless the SDK exposes a live setter) | |
-| `goal.*` | Claude Code has a native goal feature ([goal docs](https://code.claude.com/docs/en/goal)); evaluate in L4.2, default to the Eliot Goal loop | Its Stop-hook check spends model calls. |
+| `launch` | `query()` with streaming input, cwd/model/permission mode | Read native session id/effective settings from init, emit `session.ready`, then return success. A pre-init error is definite only when no session/input was admitted; ambiguity is unknown and never relaunched blindly. |
+| `send` | push `SDKUserMessage` to the input stream | Eliot dispatches only when idle/current generation. |
+| `steer` | `additionalContext` returned by the next `PostToolUse` callback | Not exact in-turn immediate steer. Bind the current Eliot turn, report `applies=next_tool`; if the turn ends before another tool, do not apply it to a later turn without explicit readback/requeue semantics. Verify installed behavior before declaring support. |
+| `inject` | `additionalContext` through assigned `UserPromptSubmit`/`PostToolUse` hook | Bounded by native hook limits; report actual safe point. |
+| `interrupt` | `Query.interrupt()` for the bound active query/turn | No blind retry. Exact snapshot/session result must settle unknown. |
+| `stop` | end input stream and close query; force terminates only this per-agent group | Reply after bound generation ended. Clear any native goal mechanism first if it can wake the session. |
+| `resume` | new plugin generation with `options.resume=<session id>` | System prompt may not refresh; never resend previous user input. |
+| `approve` / `deny` | exact `canUseTool` callback decision | `canUseTool` occurs only for prompts. Verify universal observation through assigned hooks; never answer a different current request. |
+| `answer` | exact `AskUserQuestion` request through callback shape | Verify installed schema before support. |
+| `configure` | live setter where documented; otherwise next turn/session option | Report `applies`; requested and effective values remain separate. |
+| `goal.*` | native goal only after installed qualification; otherwise Eliot Goal loop | Native Stop-hook goal checks may spend model calls and are independent of Eliot goal. |
 
-## Events
+## Event/source ownership
 
-| Native | Eliot |
+The SDK message stream owns controlled session/turn/message/tool lifecycle. In-process
+hooks own only synchronous decisions and facts not present in that stream; transcript
+JSONL is for discovery/observe-only or explicit cursor recovery, not a concurrent
+second producer.
+
+| Native fact | Eliot |
 | --- | --- |
-| system init message | `session.ready` (session id, model, tools, permission mode) |
-| assistant / user messages | `message.agent`, `message.user`, `tool.started/completed` |
-| `stream_event` partials | `message.delta` (E) |
-| messages with `parent_tool_use_id`; `SubagentStart`/`SubagentStop` hooks (`agent_id`, `agent_type`, `agent_transcript_path`) | `child` registration and child events |
-| `PreToolUse`, `PermissionRequest`, `PermissionDenied` | `approval.requested` / `approval.resolved` |
-| `Stop`, `StopFailure`, `PreCompact`/`PostCompact` | `turn.completed`, `x.claude.*` |
-| `result` (`subtype`) | `success` → `turn.completed status=completed`; `error_during_execution`, `error_max_turns`, `error_max_budget_usd`, `error_max_structured_output_retries` → `status=failed` with the subtype kept; `error_during_execution` before the init message → `session.error` (launch failed) with `errors[]` |
+| init | `session.ready` with session id/model/tools/permission mode |
+| assistant/user messages | `message.agent` / `message.user`; tool lifecycle |
+| partial `stream_event` | ephemeral `message.delta` with turn id |
+| `parent_tool_use_id`, Subagent hooks | exact child registration/events |
+| permission callbacks/assigned hooks | request/resolution events |
+| Stop/StopFailure and result subtype | exact `turn.completed` or fatal `session.error` |
+| Pre/PostCompact | harness-specific diagnostics unless core ownership is assigned |
 
-Subagents are spawned with the `Agent` tool (renamed from `Task` in v2.1.63; `Task`
-remains an alias). Full subagent messages need the SDK option `forwardSubagentText:
-true`. A child is finished only when the root receives the `tool_result` for its
-`Agent` tool_use id (or a `task_notification`), never because the child went quiet.
-A resumed session may first report the whole conversation's cumulative cost: send it
-as `scope=session`, never as a turn delta.
+Result subtype `success` maps completed; documented execution/budget/max-turn/output
+errors map failed with subtype retained. An error before init may be launch failure;
+a lost callback/transport after possible admission is unknown.
+
+Subagents are spawned by the `Agent` tool (`Task` remains an alias in current docs).
+Full text may require `forwardSubagentText=true`. A child is complete only from its
+exact tool result/task notification, never silence. Cumulative resumed-session cost is
+reported as `scope=session`, not summed as a turn delta.
 
 ## Hooks
 
-33 events, including `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-`PermissionRequest`, `PostToolUse`, `PostToolUseFailure`, `SubagentStart`,
-`SubagentStop`, `Stop`, `PreCompact`, `SessionEnd`. Exit code 2 blocks for decision
-events; JSON output uses `hookSpecificOutput` with `hookEventName`
-(`permissionDecision: allow|deny|ask|defer`, `additionalContext`). After 8
-consecutive Stop-hook blocks the block is overridden
-(`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`). With the SDK, hooks are in-process callbacks
-(`options.hooks`); the [hook shim](../spec/plugin-protocol.md#hooks) is for the CLI
-port.
+The SDK exposes in-process callbacks across session/tool/permission/subagent/compact
+and stop events. Configure only the families needed for inject/decision/missing facts.
+Never publish duplicate tool/turn completion beside the SDK stream. After the native
+Stop-hook block cap, upstream may override repeated blocks; preserve that as a source
+fact rather than pretending the block remained effective.
 
-## Transcripts
+The CLI hook shim is for the later Rust/CLI port and uses session-scoped configuration.
+Global owner settings are never edited.
 
-`~/.claude/projects/<cwd with non-alphanumerics as ->/<session-id>.jsonl`
-(`%USERPROFILE%\.claude` on Windows; `CLAUDE_CONFIG_DIR` relocates it). Internal
-format — parse defensively; retained `cleanupPeriodDays` (default 30).
+## Transcript and proxy
 
-## Proxy
+Transcript default: `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`
+(`%USERPROFILE%\.claude` on Windows; relocatable with `CLAUDE_CONFIG_DIR`). It is an
+internal format and has native retention; parse defensively and expose gaps.
 
-`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Bearer`);
-`ANTHROPIC_CUSTOM_HEADERS` for extra headers (e.g. `x-opencodex-api-key: ...`). A
-gateway credential replaces the claude.ai login; `ANTHROPIC_BASE_URL` alone does not.
-`ANTHROPIC_API_KEY`, when set, is always used with `-p` — the plugin must not leak the
-owner's key into proxied agents.
+Proxy route uses `ANTHROPIC_BASE_URL` plus the documented auth/header variables.
+`ANTHROPIC_API_KEY` may force API-key behavior in print mode, so the per-agent profile
+must explicitly construct/clear environment and never leak the owner's key into a
+proxy route. Read the effective endpoint/billing route from available init facts; a
+requested base URL is not proof of use.
 
-## v1 pitfalls
+## v1 failures retained for L7
 
-- Several content blocks share one `message.id`; deduplicating by it loses tool blocks.
-- Respawning without history can repeat the original prompt.
-- `--bg` is not `-p`; `--bare` is not a "quiet" flag.
+- Several content blocks may share one message id; dedupe by native item/block, not
+  message id alone.
+- Respawn without exact resume/history can repeat the original prompt.
+- `--bg` is not print mode; `--bare` is not a quiet flag.
+- Late hook/callback from an old generation cannot answer or complete a replacement.
+- A queued `additionalContext` tied to a turn must not leak into the next turn after
+  that turn already ended.
