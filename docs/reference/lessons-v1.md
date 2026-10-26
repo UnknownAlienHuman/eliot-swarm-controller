@@ -1,52 +1,61 @@
 # Lessons from v1
 
-v1 is archived at tag `v1-final` (last commit before the reset: `dc6f70aa`). Numbers
-in section A marked "measured" were taken from that tree on 2026-10-25; the rest come
-from v1's own records (`git show dc6f70aa:docs/lessons-learned.md`), which are
-owner-machine reports, not re-run tests.
+v1's last pre-reset commit is `dc6f70aa` and is archived as `v1-final`. Measured sizes
+below were read from that tree on 2026-10-25. Operational observations come from v1
+records/owner runs unless explicitly re-qualified; they are requirements/risk evidence,
+not fresh benchmark claims.
 
 ## A. How the project rotted
 
-| What happened | Rule for v2 | Where enforced |
+| What happened | v2 rule | Enforced by |
 | --- | --- | --- |
-| (measured) 533,000 lines of Rust and 1,502 commits in 26 days for a controller whose core paths were never qualified on a real harness. Largest crate (`swarm-kernel-host`) 365k lines, 300k without test files; largest file 9,105. | Code budgets per crate; a layer is done only when its exit test passes. | [roadmap](../roadmap.md#code-budgets), CI `just loc` |
-| (measured) 61,000 lines of docs: 177 remediation files, an audit register with 170 findings, slice registers, task packets, readiness reports, generated inventories, and a CI job that grepped for the phrase "STRUCTURALLY READY FOR CONTROLLED PACKETED IMPLEMENTATION". Work became writing documents about documents. | Docs are spec + roadmap only. Status = roadmap checkboxes + tests. | [D-15](../decisions.md), [AGENTS.md](../../AGENTS.md) |
-| Agents received huge histories, old queues and contradictory addenda; a rule removed in one file stayed alive in another. | One current spec per topic; change it in place; delete superseded text. | AGENTS.md |
-| A symbol, a receipt, a grep hit or a compiled fixture was reported as "done". In the script-driven swarm run of 12.09–06.10 that Eliot was built to replace, an external auditor refuted 218 of 243 "done" claims; the top defect classes were fallback/compat instead of the real guarantee (113), code without a caller (81), weakened guarantee (76). | Done = the layer's end-to-end test passes through the real path. No shims, no dead code, no fixture standing in for the real path. | roadmap exit tests |
-| Same swarm run: 2,721 merges over 545 Issues, but only 37 Issues closed after 22.09 and 470 stayed PARTIAL. More PRs did not mean more finished work. | Count finished roadmap tasks, not PRs. One task per PR. | roadmap |
-| Several executors per harness survived every migration (Python bridge, Node bridge, built-in host executor, standalone Rust adapter). | One plugin per harness. Replacing one means deleting the old one in the same PR. | AGENTS.md |
-| Identity and proof ceremony everywhere: owner policy pinned by SHA-256 of a Markdown section inside a test, receipts echoing Store identity, provenance and executable hashing per operation, GM epochs and handovers. | Plain ids and SQLite transactions. No document hashes. Crypto only at a real trust boundary (none inside one host). | [D-07](../decisions.md), [core](../spec/core.md) |
-| The core grew a Task/Attempt/review/acceptance/publication/CheckRun/ScriptRun engine (e.g. `store/checks.rs` 8.5k lines, `store/coordination.rs` 8.9k) that the product description never asked for. | No workflow engine in the core; workflows are rules + scripts + agents. | [D-06](../decisions.md) |
-| Agents patched `main` through "one-shot" CI workflows that edited code remotely, then removed them. | Changes go through normal commits and PRs that pass `just check` locally and in CI. | AGENTS.md |
-| Blanket "do not" rules without the positive path made agents stop or hand routine work back to a human. | Every spec says what to build; unsupported cases fail fast with a reason. | specs |
+| About 533k Rust lines and 1,502 commits in 26 days; largest host crate about 365k lines and largest file 9,105 lines, while core live paths were not qualified. | Small crate budgets, connected vertical slices, no abstraction without current callers. Implement first with scoped Clippy; run one broad qualification campaign only after feature completion. | [roadmap](../roadmap.md), [AGENTS](../../AGENTS.md) |
+| About 61k documentation lines: remediation trees, audit registers, packets, readiness reports, generated inventories and CI that checked verdict phrases. | One current spec per topic, one roadmap, compact donor/research references. No reports about reports. | [D-15](../decisions.md), AGENTS |
+| Agents consumed huge histories and contradictory addenda; deleted rules remained active elsewhere. | Replace the owning text in place and delete superseded rules. Worker read order is vision → architecture → roadmap → linked spec only. | docs index, AGENTS |
+| Symbols, receipts, grep hits, compiled fixtures and one-shot patches were reported as product completion. An external audit of the old swarm disputed most "done" claims, especially fallback/compatibility paths, code without callers and weakened guarantees. | During L0–L6 claim only implemented behavior plus scoped compile facts. Runtime guarantees are claimed only after L7 end-to-end/live qualification through the real route. No shim or fixture substitutes for it. | roadmap L7, AGENTS |
+| Thousands of merges and hundreds of Issues still left most work partial. | Track finished connected roadmap tasks, not commit/PR count. One manager/worktree/PR owns one task. | roadmap, AGENTS |
+| Multiple executors survived for each harness (Node/Python/Rust/host paths). | One selected plugin route per harness. Replacement deletes the old route in the same PR. | plugin protocol, AGENTS |
+| Identity/proof ceremony spread everywhere: Markdown hashes, receipts echoing Store identity, executable/provenance hashes and handover epochs. | Plain logical ids, session generation, exact turn/request ids and SQLite transactions. Crypto only at a real trust boundary. | [core](../spec/core.md), [D-07](../decisions.md) |
+| Core absorbed Task/Attempt/review/acceptance/publication/CheckRun engines not requested by the product. | No workflow engine. Use small rules/scripts/agents plus the minimal run/action journal needed for crash safety. | [D-06](../decisions.md), [automation](../spec/automation.md) |
+| One-shot CI workflows edited code remotely and then deleted themselves. | Normal branch/worktree/PR writes through GitHub. Implementation gate is fmt + changed-package Clippy; qualification is a later explicit phase. | AGENTS, roadmap |
+| Blanket prohibitions without a positive implementation path caused agents to stop or delegate routine choices. | Every constraint names the permitted path: exact readback, source ownership, explicit unsupported result, per-agent custody, or shared native service. | specs |
 
 ## B. Design mistakes not to repeat
 
 | v1 mistake | v2 rule |
 | --- | --- |
-| Queues, lanes, dashboards, capacity and schedules each became their own state machine and database. | Views are queries over agents/events/commands. Besides those, only automation (timers, goals) and coordination (messages, vars, claims) keep small tables. |
-| Adapter persistence grew into universal journals, outboxes, tombstones and result paging (24 KiB pages, assembly, coverage). | Plugins keep native state natively; Eliot stores bounded final text plus a pointer to the native transcript. |
-| Version/provenance gates (expected versions, descriptor hashes) blocked work without preventing failures. | Versions are reported, never gates ([D-17](../decisions.md)). |
-| `rusqlite` with `preupdate_hook` required `libclang` for every build. | Use bundled SQLite without bindgen features. |
-| Policy for one Issue at a time was encoded in Store transitions. | Policy belongs in rules and config, not schema. |
+| Queues, lanes, dashboards, capacity and schedules each became separate state machines/databases. | Agent/command/event projections answer status. Only coordination data, goals/timers and automation run/action state get small dedicated tables. |
+| Adapter persistence became universal journals, outboxes, tombstones and result assembly. | Native systems keep detailed history. Eliot stores bounded normalized facts plus native ids/pointers and exact unknown outcomes. |
+| Version/provenance gates blocked work without preventing semantic failure. | Versions are reported and recorded with fixtures, not used as authorization gates. |
+| `rusqlite` features pulled in bindgen/libclang for every build. | Use bundled SQLite without unnecessary bindgen hooks. |
+| One-Issue workflow policy became Store transition machinery. | Project policy is an agent/rule/script concern; core does not know Issues/reviews. |
+| "Strict command order" became a single blocking line, so a future queued send could obstruct control of the current turn. | Readiness lanes: ready native calls serialize, queued sends remain FIFO, exact current-turn/request controls may proceed. |
+| A shared plugin/Job was treated as if it could force-stop one agent. | Process-owning harnesses use per-agent plugin custody; shared mode is only for native services with exact session isolation. |
+| Live stream, transcript and hooks could all report the same lifecycle. | One authoritative source per event family/generation; cursor handoff or explicit gap. |
 
-## C. Runtime facts worth keeping
+## C. Runtime facts worth preserving
 
-These were observed in the field and still shape the specs.
-
-| Fact | Consequence in v2 |
+| Field fact | v2 consequence |
 | --- | --- |
-| Lost reply ≠ not applied. Replaying an uncertain prompt duplicated expensive work and pushes. | `unknown` state, readback only ([D-14](../decisions.md)). |
-| Silence, parent idle, wrapper exit, tunnel loss are not terminal evidence. A parent vanished from "active" while its children kept working; Codex reported 0 children while 4 ran. | `stalled` is a flag; `lost` needs process evidence; children are tracked as agents. |
-| PIDs are reused; a stop helper reported success while Cargo descendants survived. | Process identity = PID + start time; `stop --force` verifies. |
-| Git snapshots before/after every tool competed for the index; disabling them cut median read time 14 s → 1.9 s and edit time 42 s → 4.9 s (owner-reported, OpenCode 2.0.7). | Git monitor uses `--no-optional-locks`, never writes, rate-limited per worktree. |
-| A cron set inside the GM's chat never fired; a maintenance runner was forgotten after reboot; a Windows scheduled task outlived its owner. | Timers belong to the daemon and are visible in `eliot timer list`. |
-| Settings often apply only to the next session (e.g. Codex `agents.max_concurrent_threads_per_session` is read at `thread/start`). Requested model ≠ effective model. | `configure` reports `applies`; profiles show requested and effective values. |
-| 429 is a rate limit, not quota; models disappeared overnight (404); free tiers share account limits. | `provider.limited.kind` distinguishes them; no global "wait one hour" rule. |
-| Stopped sessions were woken by late results, steer into idle sessions, background shell completion, or a server-side Codex goal — two managers ended up in one worktree. | A stopped agent accepts no `send`/`steer`; stopping Codex also clears its native goal and interrupts the turn. |
-| Long sessions degraded: a Muse session with 7 subagents grew to 233 MB in 6.5 h; throughput 7.8 Issues/h right after a restart vs 1–3/h late in a session. | Rotation is a rule (`on` turns/age → checkpoint + `resume` or new agent), not core magic. |
-| Status and failure comments triggering full agent turns caused ping-pong loops (Multica: ~18M tokens). | Self-trigger guard and loop depth limit in [automation](../spec/automation.md#guardrails). |
-| Test runs left orphaned `surreal.exe` (~4 GB each) and `git fsmonitor` processes; a WAL grew to 109 GB; build dirs to 143 GB. | Job object kill-on-close; orphans and disk usage in `eliot doctor`. |
-| Windows: editing a running script caused syntax errors; BOM/CRLF, escaping, an interactive Git editor and long argv broke tooling; UAC/Job/console settings failed differently. | Scripts are files never edited while running; UTF-8 without BOM; long input via files; `GIT_TERMINAL_PROMPT=0`, no editor; no console windows for children. |
-| Cleanup ran in the wrong order: deleting Codex rollouts before archiving left 1,841 threads Codex could not archive; "delete all branches" would have closed open PRs. | Eliot never deletes native data; cleanup of native stores is the harness's own command. Worktree removal keeps the branch. |
-| A one-line micro-task (1 file, 1 test, exact command) succeeded 10/10 first time on weak models; Issue-sized tasks on weak models produced rethinking and PARTIAL. | Roadmap tasks are PR-sized with exact exit tests. |
+| Lost reply is not evidence of non-application; replay duplicated prompts and pushes. | `unknown`, exact readback/manual resolution, no automatic retry—including stop/interrupt. |
+| Silence, parent idle, wrapper exit or tunnel loss did not prove terminal state; children could continue unseen. | Stalled is a flag based on missing progress; lost needs exact custody/session evidence; children are independent agents. |
+| Late results from an earlier binding could wake/complete replacement work. | Monotonic Eliot generation, rotated token, exact turn/request binding; stale input never mutates current projection. |
+| PIDs were reused and stop helpers claimed success while descendants survived. | Identity is `(pid,start_time)`; custody enumerates and verifies the exact process group. |
+| Git snapshots around every tool contended on the index; owner-observed OpenCode timings improved sharply when disabled. | Monitoring is read-only with `--no-optional-locks`; progress fingerprint hashes only already-dirty paths without index/object writes. |
+| A cron written into a chat never ran; maintenance vanished after reboot; OS task lifetime diverged from controller ownership. | Timers belong to the daemon, have durable firing keys and visible in-flight runs; autostart does not imply session continuity. |
+| Settings often applied only at next turn/session; requested model differed from effective. | `configure` reports application point; profiles/show keep requested and effective facts separate. |
+| 429, quota exhaustion, model removal and auth failure were conflated. | Distinct provider-limited kinds and holds scoped to actual profile/account/proxy; no silent fallback. |
+| Stopped sessions woke from late results, idle steer, background completion or native goals; multiple managers ended in one worktree. | Stop binds exact generation, clears native goal where needed, and old events/commands are stale. One manager owns one worktree. |
+| Long Muse sessions degraded in owner runs. | Rotation is explicit: checkpoint, settle children/requests, then new generation; no timer-based core magic. |
+| Status/failure messages caused recursive model turns and token storms in other systems. | Source status is on the bus, mail wakes are coalesced/recipient-controlled, automation has self/depth/rate guards. |
+| Tests left orphaned large processes and storage. | Exact Jobs/process groups, bounded artifacts, read-only doctor and late qualification cleanup checks. |
+| Windows broke on live script replacement, BOM/CRLF, long argv, PATH casing, console/Job inheritance and interactive Git. | Versioned scripts, UTF-8/LF, stdin/files for long input, explicit argv/handles, case-insensitive env merge and no editor/console. |
+| Cleanup deleted native data/branches needed for recovery/open PRs. | Eliot never cleans vendor stores; worktree removal is explicit, clean-only and preserves branch. |
+| Tiny exact tasks succeeded more reliably than broad Issue-sized prompts. | Roadmap tasks are small connected vertical changes with exact owner/spec boundaries, not packets or micro-PRs containing only scaffolding. |
+
+## D. What v1 is allowed to donate
+
+Read only the narrow mechanism named in [donors](donors.md): protocol parsing edge
+cases, Windows process helpers, redaction and recorded vendor behavior. Do not port
+v1's Store schema, workflow state machines, audit/remediation structure, proof packets,
+compatibility executors or CI patchers.
