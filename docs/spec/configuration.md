@@ -14,9 +14,9 @@ symlink/reparse-point roots or unsafe ownership. Logs are private, rotated and b
   logs/, rules/, plugins/, services/, worktrees/
 ```
 
-Project `.eliot/{config.toml,rules/,scripts/}` is loaded only from a globally
-registered checkout, never an agent worktree. Agent edits take effect only after they
-reach that checkout. Invalid reload keeps the last valid revision and reports health.
+Project `.eliot/{config.toml,rules/,scripts/}` is loaded only from a globally registered
+checkout, never an agent worktree. Agent edits take effect only after reaching that
+checkout. Invalid reload keeps the last valid revision and reports health.
 
 ## Configuration authority
 
@@ -25,16 +25,22 @@ proxies, services, webhooks, allowed environment names and base profiles.
 
 Project config may only:
 
-- define/replace profiles using globally registered harness/plugin/account/proxy names;
+- define/replace profiles whose names are in that project's `profiles_allow`;
 - narrow permissions, control, labels, workspace mode, model/effort and limits;
-- add nonsecret literal env values and `pass_env` names from the global project's
-  allowlist;
+- select only that project's allowed global account/proxy/profile references;
+- add nonsecret literal env values and `pass_env` names from the project's allowlist;
 - set project-local setup/scratch/system-note paths.
 
 Project config cannot define executable `cmd`, plugin instances/private config,
 accounts/proxies/services/webhooks, `env_mode=inherit`, arbitrary `pass_env`, daemon
 limits or another project path. Project rules/scripts execute under that project's
 principal, never owner by omission.
+
+A project agent/rule may launch only an effective profile named in
+`[projects.<name>].profiles_allow`. The router checks this even when the profile exists
+globally. Owner may launch any global profile. This prevents project control from
+selecting a profile carrying another project's account, inherited environment, plugin
+command or proxy credentials.
 
 ## Example
 
@@ -65,11 +71,17 @@ fingerprint_max_bytes = 67108864
 
 [projects.app]
 path = "C:/src/app"
+profiles_allow = ["codex", "codex-opencodex", "manager"]
+accounts_allow = ["codex-main", "claude-main"]
+proxies_allow = ["opencodex"]
 pass_env_allow = ["CODEX_HOME", "CLAUDE_CONFIG_DIR"]
 webhook_allow = ["ops"]
 
 [accounts.codex-main]
 max_live = 8
+
+[accounts.claude-main]
+max_live = 4
 
 [plugins.codex]
 [plugins.claude]
@@ -105,6 +117,7 @@ proxy = "opencodex"
 
 [profiles.manager]
 harness = "claude"
+account = "claude-main"
 permissions = "workspace-write"
 pass_env = ["CLAUDE_CONFIG_DIR"]
 workspace_mode = "worktree"
@@ -119,17 +132,18 @@ Baseline contains only OS spawn essentials (PATH, home/profile, system root, tem
 locale and required certificate variables). Additional values are explicit:
 
 - `env`: literal nonsecret values;
-- `pass_env`: copy a globally allowed daemon variable at execution and treat it as
-  secret;
+- `pass_env`: copy a globally/project-allowed daemon variable at execution and treat it
+  as secret;
 - `secret_env`: literal env names whose values require masking;
 - proxy/account/plugin credentials: automatically secret and delivered only to the
   process/session needing them;
 - agent/automation token: automatically secret.
 
-`env_mode="inherit"` is global-owner opt-in for a trusted profile and is shown as a
-warning. Secret values shorter than the configured safe redaction minimum are rejected
-for managed injection rather than pretending exact value redaction is reliable. Agent
-tokens have a prefixed high-entropy format that is pattern-redacted after restart.
+`env_mode="inherit"` is global-owner opt-in for a trusted global profile and is shown
+as a warning. Secret values shorter than the configured safe redaction minimum are
+rejected for managed injection rather than pretending exact value redaction is
+reliable. Agent tokens have a prefixed high-entropy format that is pattern-redacted
+after restart.
 
 Resolved secret values never enter config, Store, rule/action payload or logs. Named
 references persist. Native output is masked; durable semantic text containing a known
@@ -138,12 +152,12 @@ secret is rejected.
 ## Accounts, capacity and holds
 
 A profile references `[accounts.<id>]`. Atomic start reservation must fit profile,
-shared account and proxy/service caps. `starting`, live and unresolved-unknown start
+shared account and proxy/service caps. Starting, live and unresolved-unknown start
 incarnations retain reservations until exact terminal/readback; a crash cannot release
 capacity merely by losing a process handle.
 
 If account is omitted, profile becomes the scope and status warns that cross-profile
-sharing is unknown.
+sharing is unknown. Project principals may use only allowed account/proxy references.
 
 ```sql
 CREATE TABLE provider_holds (
@@ -163,7 +177,8 @@ coverage holds only the exact observed route/profile. After `retry_after`, the f
 explicit queued/user send may atomically become the probe. Mail wake, parent notice,
 timer or hidden model call is never selected as a probe. Probe clears hold only after
 an exact successful provider-backed turn; unknown keeps the hold and probe command
-visible. Restart restores both.
+visible. Auth/model-gone without recovery evidence requires an explicit owner/config
+change rather than a timed probe. Restart restores all hold/probe state.
 
 ## Profiles and paths
 
@@ -178,16 +193,18 @@ Different Rust worktrees use distinct `CARGO_TARGET_DIR`s.
 ## Plugins, services and webhooks
 
 External plugin `cmd` is global-only. `instances` is shared-mode only; per-agent gets a
-private instance/data dir per generation. Operator cannot override returned custody
-mode. Shared control must prove per-session environment/identity/readback/isolated stop.
+private instance/data directory per generation. Operator cannot override returned
+custody mode. Shared control must prove per-session environment, identity, readback and
+isolated stop.
 
 `attach` service is owner-run and never stopped/reconfigured. `launch` service has
 separate managed custody and persisted endpoint/process identity. Agent stop never
 stops a shared service.
 
-Webhook actions store a globally named endpoint, not URL/header/secret. The action id
-is sent through configured idempotency header when supported; otherwise a lost response
-stays unknown and is never retried automatically.
+Webhook actions store a globally named endpoint, not URL/header/secret. Project
+principal may use only its allowlist. The action id is sent through a configured
+idempotency header when supported; otherwise a lost response remains unknown and is
+never retried.
 
 ## Store/WAL limits
 
