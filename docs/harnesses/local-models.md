@@ -9,7 +9,7 @@ These notes are inherited from v1 and require installed-server verification.
 - Codex named provider requires the Responses wire API. Chat-Completions-only servers
   need an explicitly selected compatible proxy; Eliot never inserts one silently.
 - OpenCode/Kilo use their installed provider/base-URL mechanism
-  ([OpenCode route](opencode.md#providerproxy-configuration)).
+  ([OpenCode route](opencode.md#provider-configuration)).
 - Profile names model, service, account and capacity scope. No cloud/API fallback when
   local inference is slow/unavailable/incompatible.
 
