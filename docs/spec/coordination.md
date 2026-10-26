@@ -40,16 +40,17 @@ Message {
 }
 ```
 
-Text ≤32 KiB; known secrets reject. Selector expansion is transactional into concrete
-recipients. Agent/project automation selectors cannot escape project. Unknown recipient
-fails. Large broadcast requires explicit owner/global-rule confirmation.
+Text is at most 32 KiB and known secrets reject. Selector expansion is transactional
+into concrete recipients. Agent/project automation selectors cannot escape project.
+Unknown recipient fails. Large broadcast requires explicit owner/global-rule
+confirmation.
 
 ### Modes
 
 - queue: durable unread mail; recipient wake policy decides presentation;
-- inject: full text at declared exact safe point; requires command rights;
+- inject: full text at a declared exact safe point; requires command rights;
 - send: full text as a new turn; requires command rights;
-- steer: full text into exact active turn; requires exact steer/control.
+- steer: full text into the exact active turn; requires exact steer/control.
 
 `presentation_kind=notice|full` distinguishes a mailbox notice from full message
 context. Presented is not acknowledged/read.
@@ -65,10 +66,11 @@ For queue + `wake_on_mail=true`:
 4. observe-only, draining, pending request, provider hold not designated for wake, or
    unknown control/input/turn → no presentation.
 
-No send/steer substitute while busy. At most one open presentation command and one
-notice/minute/recipient. Unknown presentation is not retried. New generation makes old
-presentation stale but unread mail eligible again. Startup/current-state reconciliation
-finds unread recipients with no open presentation; no volatile wake edge is required.
+There is no send/steer substitute while busy. At most one open presentation command and
+one notice/minute/recipient. Unknown presentation is not retried. A new generation makes
+an old presentation stale but leaves unread mail eligible again. Startup/current-state
+reconciliation finds unread recipients with no open presentation; no volatile wake edge
+is required.
 
 ### Inbox acknowledgement
 
@@ -78,9 +80,9 @@ most 1 MiB of encoded message data; excess unread messages wait for the next bat
 while waiting: `--wait` sleeps on a bounded notification, then performs a short query.
 
 The CLI writes complete stdout, then calls `mail.ack(batch_id)` with a stable write id.
-Lost inbox leaves unread; lost ack is idempotently read back. `mail.read ID` is allowed
-only when no open batch contains that message; otherwise acknowledge the batch.
-`--all` is paginated acknowledged history.
+A lost inbox reply leaves unread; a lost ack is idempotently read back. `mail.read ID`
+is allowed only when no open batch contains that message; otherwise acknowledge the
+batch. `--all` is paginated acknowledged history.
 
 ```sql
 CREATE TABLE messages (
@@ -109,9 +111,9 @@ CREATE UNIQUE INDEX mail_open_batch ON mail_batches(recipient)
 
 ## Shared variables
 
-Scopes: project (agent/project rule default), tree root, global. Only owner/global rule
-writes global. Values are bounded ≤16 KiB JSON/string, reject known secrets, increment
-version and record principal/generation. `expect_version` is CAS.
+Scopes are project (agent/project rule default), tree root or global. Only owner/global
+rule writes global. Values are bounded to 16 KiB JSON/string, reject known secrets,
+increment version and record principal/generation. `expect_version` is CAS.
 
 ```sql
 CREATE TABLE vars (
@@ -142,15 +144,21 @@ manager commits, or writers use worktrees.
 
 ## Claims
 
-Generation-bound, repository-relative, normalized globs with note/TTL. Overlap with
-another live claim or dirty/branch path emits conflict and one coalesced queue message.
-Claims never prevent writes and expire/release on generation end. Project principals
-cannot claim outside project.
+Claims are bounded repository-relative normalized globs with note/TTL and exact owner
+`(agent,generation)`. They are active only while that generation is both live and
+controlled. Overlap with another active claim or dirty/branch path emits conflict and
+one coalesced queue message. Claims never prevent writes.
+
+Terminal transition, resume to a new generation, detach/observe-only transition or
+explicit release removes the old generation's claims in the same transaction as the
+control-state change. TTL is a fallback, not the primary cleanup path. A detached or
+lost agent therefore cannot continue advertising current intent. Project principals
+cannot claim outside their project.
 
 ## Hierarchy
 
 Parent/root/depth are logical. Config limits accidental fan-out. Native children upsert
-by canonical native subject with parent generation provenance. Parent completion/goal
+by canonical native subject with parent-generation provenance. Parent completion/goal
 notifications use ordinary queue mail and wake rules.
 
 Tree selectors resolve at admission; later-spawned work is not silently included.
@@ -159,5 +167,5 @@ Synchronous manager flow uses exact send/wait/result; queue remains asynchronous
 ## Prompt guidance
 
 Default note lists only available commands and says: vars/`who` first, specific mail
-second, no acknowledgements/status chatter, no credentials. Manager profiles add exact
-launch/send/wait/result/steer/interrupt/stop guidance.
+second, no acknowledgements/status chatter and no credentials. Manager profiles add
+exact launch/send/wait/result/steer/interrupt/stop guidance.
