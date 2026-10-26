@@ -25,9 +25,9 @@ generation. Readers are continuously drained and cancel-safe. Protocol
 | --- | --- |
 | `initialize` | config/private dir/instance → manifest |
 | `agent.start` | target generation, resolved profile/workspace/env/note, resume subject?, linked initial? → session result + separate initial status |
-| `agent.attach` | exact subject/generation/control mode + host-known active turn? → exact native state, turn reconciliation, requests, pids/effective or not-found |
+| `agent.attach` | exact subject/generation/control mode + host-known active turn/source watermarks → exact native state, turn/source reconciliation, requests, pids/effective or not-found |
 | `agent.command` | command id, exact generation/turn/request, verb/args → applied/rejected/failed/unknown + mechanism/application point |
-| `agent.snapshot` | exact generation + command/turn ids → current state/readback |
+| `agent.snapshot` | exact generation + command/turn ids → current state/readback + source watermarks |
 | `agent.stop` | exact generation/command/force → success only after generation ended |
 | `discover` | canonical native subjects |
 | `shutdown` | finish owned cleanup and exit |
@@ -43,6 +43,8 @@ start result = {
 attach/snapshot turn readback =
   { turn_id, state: running | completed | not_active_unknown,
     input_commands?: [id], status?, final_text?, usage? }
+source watermark =
+  { source_key, high_water_seq, last_native_cursor?, state }
 ```
 
 Most harnesses start without initial input. A plugin requiring input to obtain a native
@@ -103,28 +105,44 @@ Persisted facts are commit-acknowledged requests:
 
 | Method | Result |
 | --- | --- |
-| `event.put {agent,generation,kind,native_id,ts?,data}` | `{seq,duplicate,first_seq}` after Store receipt + event/projection commit |
+| `event.put {agent,generation,source_key,source_seq,kind,native_id?,native_cursor?,ts?,data}` | `{store_seq,duplicate,high_water_seq}` after Store watermark + event/projection commit |
 | `process.put {agent,generation,pid,start_time,role}` | committed identity/duplicate ack; host adds boot id |
 | `child {parent agent/generation, child scope/ref,...}` | canonical child row/generation/token |
+| `source.gap {agent,generation,source_key,expected_seq,reason,cursor?}` | committed source-gap state |
 | `log` notification | bounded diagnostic; no durability claim |
 | `event.ephemeral` notification | best-effort delta/sample only |
 
-The plugin advances its source cursor or removes an unacknowledged spool entry only
-after the commit reply. A lost reply resends the **same** native id. The Store first
-checks `native_event_receipts`, which is independent of the retained `events` table, and
-returns the original `first_seq` as duplicate even if that event row has already been
-pruned. Event retention therefore cannot turn a resent acknowledged native event into a
-new rule firing.
+### Source sequencing and lost acknowledgements
 
-Receipt reclamation is also explicit: receipts remain for the current generation while
-it can legally reattach/replay. They may be deleted only after the Agent advances to a
-newer generation (or is explicitly deleted) and all source instances/spools for the old
-generation are closed. Any later old-generation event is then rejected before the
-normal bus. A terminal but still-current generation keeps its receipts.
+Each authoritative source ownership epoch has one stable `source_key`. The plugin
+persists a strictly contiguous positive `source_seq` with the exact canonical event
+envelope before sending it and permits at most one unacknowledged persisted request per
+source key. It may continue reading native data into a bounded durable spool, but sends
+that spool in sequence order.
 
-If the vendor cannot replay/backpressure and the bounded spool overflows, emit a source
-gap and do not claim complete coverage. `child` upserts the canonical native subject;
-parent generation is provenance.
+The host maintains one compact watermark row per source key:
+
+- next sequence commits and advances the watermark atomically with event/projections;
+- resend of the current high-water sequence with the same envelope digest is the one
+  possible lost-reply duplicate and returns the saved Store sequence;
+- the same sequence with a different digest is an integrity error;
+- an older sequence is rejected with the current watermark so the plugin can reconcile;
+- a future sequence with a hole is rejected as a source gap.
+
+The plugin advances its native cursor or removes the spool entry only after commit
+reply. On restart/attach it reads the host watermark first. A normal reconnect reuses
+the same source key; stream→transcript/hook handoff creates a new key only after the
+old native cursor boundary is committed. `native_id` and `native_cursor` still suppress
+vendor replay; source sequence prevents Store-side duplicate admission after event-row
+retention without one receipt row per event.
+
+If the vendor cannot replay/backpressure and the spool is lost or overflows, the plugin
+commits `source.gap` and stops claiming complete coverage. It never assigns fresh
+source sequences to old history as if it were current. Source watermark rows remain for
+the current generation and are reclaimed only after that generation is superseded and
+all old sources/spools are closed.
+
+`child` upserts the canonical native subject; parent generation is provenance.
 
 ## Manifest
 
@@ -180,8 +198,9 @@ Intermediate status, inbox acceptance, process exit or silence is not completion
 output commits before terminal event, or the plugin delays terminal publication until
 output drains.
 
-Reconnect resends only unacknowledged or native-cursor-new events. An unbridgeable
-interval is a gap, never replayed completion.
+Reconnect resends only the one unacknowledged source sequence, then events newer than
+the committed native cursor. An unbridgeable interval is a gap, never replayed
+completion.
 
 ## Hooks and transcripts
 
@@ -211,12 +230,12 @@ session-not-found readback, never silence.
 
 ## Fake, recordings and L7
 
-Fake is shared and isolated, generation-bound, uses stable event ids and persists the
-minimum exact snapshot/resume state. Recordings are bounded sanitized native NDJSON.
+Fake is shared and isolated, generation-bound, persists source sequence/spool state and
+the minimum exact snapshot/resume state. Recordings are bounded sanitized native NDJSON.
 CI never calls a model.
 
 L7 conformance covers start versus initial input, async inbox association/timeout,
-multiple input commands per turn, commit-ack lost reply after event retention,
-receipt reclamation boundary, source-gap overflow, reconnect unknown turn, exact
-bindings, canonical children, no unknown retry, custody, attach/readback, bounded
-buffers and unsupported-before-I/O.
+multiple input commands per turn, lost `event.put` reply after event-row retention,
+source-sequence digest mismatch/hole/stale recovery, source-key handoff/gap, reconnect
+unknown turn, exact bindings, canonical children, no unknown retry, custody,
+attach/readback, bounded buffers and unsupported-before-I/O.
