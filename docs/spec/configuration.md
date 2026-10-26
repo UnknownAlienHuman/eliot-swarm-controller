@@ -20,9 +20,9 @@ symlink/reparse-point roots or unsafe ownership. Logs are private, rotated and b
 
 `owner.token` is a replaceable high-entropy `eliot_ot_<base64url>` local attribution
 credential. `eliot --owner` reads it explicitly. It is never stored in SQLite/logs and
-is never inherited by Agent/automation processes. If missing, a local operator may
-recreate it atomically because principal identity remains `owner`; WriteId receipts
-still prevent mutation replay. This token is not hostile same-user isolation.
+never inherited by Agent/automation processes. If missing, a local operator may recreate
+it atomically because principal identity remains `owner`; WriteId receipts still prevent
+mutation replay. This token is not hostile same-user isolation.
 
 `routing.key` is different: it deterministically re-derives current Agent routing
 tokens. It is atomically created before the first database, never stored in SQLite/logs,
@@ -191,42 +191,60 @@ scratch = ["target/", ".cache/"]
 over it rejects before any row; caller narrows or batches. Plugin discovery/snapshot
 pages obey both item and encoded-byte limits.
 
-## Effective profile and Agent binding
+## Effective profile and binding revisions
 
 Owner profile plus validated project overlay resolves one bounded canonical nonsecret
-binding:
+binding payload:
 
 ```text
-AgentBinding {
-  mode: launch | resume | control_attach | observe_attach,
+AgentBindingPayload {
+  mode: launch | resume | control_attach | observe_attach | detach_observe,
   profile_name, profile_revision,
   harness, plugin_name,
   model?, effort?, permissions,
   args, env_mode, literal_env, pass_env_names, secret_env_names,
   workspace_mode, control, git_identity,
   system_note_artifact?, setup_artifacts[], scratch,
-  labels,
+  labels, notify_parent, wake_on_mail,
   account_scope?, proxy_scope?, service_scope?,
   requested_endpoint?, billing?, source_config_files
 }
 ```
 
-Observe attach uses synthetic `observe:<harness>`: no credentials, account, routing or
-native mutation. Control attach requires a real allowed global profile, exact native
-readback and a capacity reservation. Plugin must prove existing session route/workspace/
-permissions are compatible; it never silently rewrites them to match requested profile.
+The payload is stored as an immutable `(agent,generation,binding_revision)` row. A
+separate current pointer identifies the effective revision for that native incarnation.
+Bindings are not overwritten when control changes.
 
-At admission every project note/setup/check script is resolved from its allowed root,
-read without following untrusted links, bounded, hashed and copied to immutable artifact
-storage. `profile_revision` includes canonical effective profile plus artifact digests
-and named references, never resolved secrets. A later checkout edit cannot change queued
-launch/setup/note semantics.
+- launch and resume create revision 1 for their target generation before dispatch;
+- first observe attach creates synthetic `observe:<harness>` revision 1;
+- control attach creates candidate `current+1`, superseding the current observe/detach
+  revision; current pointer moves only after exact native attach/environment/readback;
+- failed/unknown attach keeps the old pointer and immutable candidate linked to its
+  command;
+- detach success creates a new `detach_observe` revision and moves the pointer;
+- control reattach creates another control revision; exact recovery of an already
+  controlled session reuses the current revision.
 
-Binding is immutable. Dispatch revalidates prohibitions without substitution: project
-allowlist/overlay, owner-only inherit, plugin/service capabilities, artifact presence/
-digest, safe paths, capacity, provider hold/probe and routing-key availability when
-direct routing is required. Secrets resolve once immediately before start. Resume gets
-a new binding; exact recovery attach reuses the current generation binding.
+`Agent.profile` is a projection of the current pointer. The start/attach/detach command
+stores the exact candidate/current revision, so client disconnect or later config edits
+cannot change the native effect being read back.
+
+Observe attach has no credentials, account, routing or native mutation beyond read-only
+attach. Control attach requires a real allowed global profile, capacity reservation and
+exact native compatibility. Plugin never rewrites an existing session to pretend it
+matches the requested route/workspace/permissions.
+
+At revision creation, every project note/setup/check script is resolved from its allowed
+root, read without following untrusted links, bounded, hashed and copied to immutable
+artifact storage. `profile_revision` includes canonical effective profile plus artifact
+digests and named references, never resolved secrets. A later checkout edit cannot
+change the candidate/revision.
+
+Dispatch revalidates prohibitions without substitution: project allowlist/overlay,
+owner-only inherit, plugin/service capabilities, artifact presence/digest, safe paths,
+capacity, provider hold/probe and routing-key availability where direct routing is
+required. Secrets resolve immediately before native effect. Resume gets a new
+generation/revision sequence; recovery attach reuses current revision.
 
 ## Frozen workspace binding
 
@@ -257,14 +275,14 @@ Validation occurs before value lookup/start; returned actions cannot add env ref
 `env_mode=inherit` is an owner-defined trusted global profile and visibly warned. A
 project overlay cannot enable it. Too-short unmaskable secret rejects managed injection.
 Tokens are prefixed/high entropy. Persisted source spools are masked with the
-generation's frozen secret set; raw vendor detail stays in the private vendor store.
+binding revision's frozen secret-name/value set; raw vendor detail stays private.
 Resolved secrets never enter config, Store, rule/action/artifact/log. Durable semantic
 text containing a known secret rejects.
 
 ## Capacity reservations and provider holds
 
-Frozen binding names profile/account/proxy-service scopes. Start or control-attach
-transaction checks all limits and inserts reservations atomically.
+A control binding revision names profile/account/proxy-service scopes. Start or
+control-attach transaction checks all limits and inserts reservations atomically.
 
 ```sql
 CREATE TABLE capacity_reservations (
@@ -293,10 +311,11 @@ CREATE TABLE provider_holds (
 Queue selects the oldest command whose complete scope set is available; unrelated
 scopes are not head-of-line blocked. Existing reservations count after limit lowering.
 Starting/live/unknown start retains reservation. Exact terminal/no-session failure
-releases. A controlled external session acquired through attach gets the same
-reservation; if unavailable, control attach fails without modifying its observe row.
-Detach of a still-live independent session does not free provider/account capacity until
-exact terminal observation.
+releases. An observe row has no control reservation. A control-attach candidate reserves
+capacity before native I/O; definite failure releases, unknown retains until readback.
+Exact attach success moves binding pointer and converts reservation to live. If capacity
+is unavailable, no candidate/effect is admitted. Detach of a still-live provider
+session does not pretend account capacity was freed until terminal observation.
 
 A hold blocks provider-backed launch/send/Goal in proven scope, not stop/interrupt,
 request reply, readback or local checks. Unknown coverage holds exact route/profile.
@@ -307,12 +326,11 @@ cannot.
 Probe state:
 
 - exact successful provider-backed turn clears hold and claim;
-- new provider limitation replaces/extends hold and updates claim from exact response;
-- unknown after possible provider I/O keeps hold and probe reserved;
-- exact rejection/failure before any provider request releases probe claim but keeps
-  hold, allowing another explicit probe;
-- owner cancellation before dispatch likewise releases claim;
-- time alone never releases an in-flight/unknown probe.
+- new provider limitation replaces/extends hold from exact response;
+- unknown after possible provider I/O keeps hold/probe reserved;
+- exact failure before any provider request or owner cancellation before dispatch
+  releases the probe claim but keeps hold;
+- time alone never releases in-flight/unknown probe.
 
 For launch/resume only linked input is probe. Auth/model-gone requires explicit config/
 recovery evidence rather than timed probe.
@@ -320,22 +338,22 @@ recovery evidence rather than timed probe.
 ## Profiles, setup and paths
 
 One-level `extends` exists only among global owner profiles. Project overlay applies
-after global resolution and can only narrow the fields listed above. Unknown keys are
-errors except plugin-private global keys. Values/counts are bounded.
+after global resolution and can only narrow the listed fields. Unknown keys are errors
+except plugin-private global keys. Values/counts are bounded.
 
 Project setup source is repository-relative `.eliot/scripts/`; global owner may name
 configured executables. Script bytes become immutable artifacts at admission. Setup runs
-with a project read-only automation token, minimal environment and global∩project
-script allowlist. Setup/scratch/scripts/notes reject absolute, `..`, symlink escape,
+with a project read-only automation token, minimal environment and global∩project script
+allowlist. Setup/scratch/scripts/notes reject absolute, `..`, symlink escape,
 alternate-stream/device forms. Rust worktrees use separate target dirs.
 
-Interpreters/external executables resolve to full configured paths. A queued binding
+Interpreters/executables resolve to full configured paths. A queued binding revision
 stores executable identity/path; incompatible replacement before dispatch fails rather
-than silently selecting another executable.
+than selecting another executable.
 
 ## Plugins, sources, services and webhooks
 
-External plugin command is global-only. `instances` is shared-only; per-agent gets a
+External plugin command is global-only. `instances` is shared-only; per-Agent gets a
 private directory. Custody mode cannot be overridden. Shared control proves per-session
 environment, identity, readback and isolated stop.
 
@@ -353,19 +371,21 @@ idempotency header when available; otherwise lost response stays unknown/no retr
 ## Retention, artifacts, idempotency and WAL limits
 
 `retention.idempotency_days` is minimum eligibility age. Receipt lookup precedes floor
-checks, so an existing receipt remains readable below current floor. A terminal receipt
-may be deleted only when older than the window, no retained domain row references it,
-no open/unknown linked effect needs it and final result is outside supported readback.
-Rows prune in dependency order; floor advances only through receipts actually deleted.
+checks. A terminal receipt may be deleted only when older than the window, no retained
+domain row references it, no open/unknown linked effect needs it and final result is
+outside supported readback. Rows prune in dependency order; floor advances only through
+receipts actually deleted.
 
 A native-event receipt in `event_id` mode outlives its event row. It may be removed only
 after generation supersession/deletion, all source epochs/spools capable of replaying
 that generation are closed and no retained readback depends on it. `strict_cursor`
 watermarks remain until the same boundary. `none` retains the recorded gap boundary.
 
-An artifact may be removed only after no Agent/workspace/rule activation/run/action/
-check record references its digest and no running process has it open. Artifacts are
-implementation inputs, not an audit-document hierarchy.
+An artifact may be removed only after no Agent binding revision/workspace/rule
+activation/run/action/check references its digest and no running process has it open.
+Binding revisions referenced by current pointers or retained commands/receipts remain;
+unreferenced failed candidates may prune only after their command history becomes
+prunable. Artifacts are implementation inputs, not an audit-document hierarchy.
 
 Other history may prune only after compact projections/summaries preserve readback.
 Unread mail, open batches, unresolved input/turn/action, held capacity, current source
