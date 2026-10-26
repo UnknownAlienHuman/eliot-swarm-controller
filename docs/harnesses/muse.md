@@ -1,100 +1,86 @@
 # Muse Code
 
-Layer L4.3, `plugins/muse`, default `per_agent`. One plugin/host custody unit owns one
-Eliot generation; native subagents are child Agent rows, not extra host owners.
+Layer L4.3. Plugin: `plugins/muse`. Muse was v1's main swarm route (Muse Max
+subscription, a GM with a pool of 7 subagents), so it comes right after Claude Code.
 
-Facts checked 2026-10-25 against Muse Code SDK/MSP 1.4 docs/registries. Recheck package,
-license and MSRV at implementation.
+Facts checked 2026-10-25: [meta-models/muse-code-sdk](https://github.com/meta-models/muse-code-sdk)
+("TypeScript SDK and developer documentation for building clients that drive Muse
+Code agent sessions over the Muse Session Protocol"), docs for
+[Muse Code 1.4](https://meta-models.github.io/muse-code-sdk/1.4/) and the
+[method list](https://meta-models.github.io/muse-code-sdk/1.4/generated/msp/methods/);
+npm `@muse-code/sdk` and PyPI `muse-code-sdk` 1.4.13 (2026-10-24). The repo has no
+release tags; the registries are the version source. MIT per v1 records.
 
-## Transport and start
+## Transport
 
-MSP v1 is JSON-RPC 2.0 NDJSON. Use a lower-level/caller-known `commandId`; a helper that
-mints the id after send is insufficient for unknown readback.
-
-Muse starts a session before the user turn:
-
-1. persist/open authoritative source epochs before native session I/O;
-2. initialize + `session/start`;
-3. validate native subject/effective model/approval mode;
-4. commit-acknowledge `session.ready`;
-5. return session outcome;
-6. dispatch linked initial `turn/start` separately.
-
-`start_requires_input=false`. Lost session-start and first-turn replies remain separate
-unknowns. Resume opens new-generation sources first, then calls `session/resume` on the
-retained subject; optional text is a linked send, never implicit replay.
-
-The live MSP source declares the qualified native page/output cursor or stable per-event
-ids. Lost source/event reply resends the identical Eliot source sequence. `view/page`
-and output references are readback/recovery, not concurrent lifecycle producers. An
-unbridgeable cursor transition uses atomic gapped source replacement.
-
-Large system notes/config are ArtifactRefs. Discovery/page/output responses are paged
-below plugin frame limits.
+- Muse Session Protocol (MSP) v1: JSON-RPC 2.0, one message per line over the Muse
+  Code process's stdin/stdout. The SDK spawns or attaches to that process.
+- Official Rust crate `muse-code-sdk` (1.4.11 when v1 reviewed it; MIT; Rust 1.97+):
+  spawn/attach, typed MSP, sessions, turns, approvals, fold, gap recovery, bounded
+  close. Use it for a Rust plugin, with one caveat: its high-level `send_user_turn`
+  mints the command id itself, while Eliot wants to know the command id before
+  sending (so an `unknown` outcome can be checked later). Use the lower-level
+  connection with caller-chosen `commandId`, or record the minted id before the
+  request leaves.
+- SDK and Muse host versions are paired; upgrade them together.
+- One plugin process and one Muse Code host per agent. Native subagents run inside
+  that host: `child_environment: false` unless L4.3 shows a per-subagent environment.
+- `initialize` needs `clientInfo`; its result carries `schema.version` (1) and
+  `schema.fingerprint` (`sha256:` + 64 hex). A fingerprint mismatch is a warning to
+  show, not an error.
 
 ## Verb mapping
 
-| Eliot | MSP |
-| --- | --- |
-| send | `turn/start` with caller-known command id; applied at exact turn association |
-| steer | exact `turn/steer` current turn |
-| inject | steer while busy or explicit prepend-next-send, mechanism reported |
-| interrupt | exact `turn/interrupt`; cancel/unqueue remain distinct |
-| stop | pause/clear Goal, close session/process, exact custody only |
-| approve/deny | exact session/child/request and currently offered choice ids |
-| answer | exact `userInput/answer` |
-| configure | model/reasoning/approval setter + application point/readback |
-| Goal | native set/edit/pause/resume/clear; idle set/resume may start work |
-| compact/fork/background | native method with explicit new subject/result |
+| Eliot verb | MSP | Notes |
+| --- | --- | --- |
+| `launch` | `session/start` → `session.ready`; the prompt is the linked send | `start_requires_input: false`. |
+| `send` | `turn/start` (`sessionId`, `commandId` = the Eliot command id, `input`) | Arrives only when idle (Eliot queues). The caller-chosen `commandId` is what makes an `unknown` checkable later. |
+| `steer` | `turn/steer` with the expected (current) turn id | v1 bridge supported exact steer. |
+| `inject` | steer when busy, prepend when idle | |
+| `interrupt` | `turn/interrupt` (`turn/cancel` and `turn/unqueue` also exist) | Method names from the 1.4 method list; check params in the generated types. |
+| `resume` | `session/resume` for the recorded session | Never a fresh session, never the original prompt again; a prompt is a linked send. |
+| `approve` / `deny` | `approval/decide` with the request's current choice ids (`approval/listPending` to read) | Key a pending request by (session, kind, native request id) — a bare id collides between root and child. Stale choice ids leave children waiting (v1). |
+| `answer` | `userInput/answer` | |
+| `goal.*` | `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, `goal/clear` (`commandId` required; objective non-empty) | Idle set/edit/resume may start a goal turn; pause/clear never do. |
+| `configure` | `session/setModel`, `session/setReasoningEffort`, `session/setApprovalMode`, with readback | Effort per turn was fixed upstream in 1.2.1 (issue #6); host `settings.json` defaults are separate. |
+| `compact` / `fork` / `background` | `session/compact`, `session/fork`, `task/background` | |
 
-## Observation and readback
+## Observation
 
-Controlled MSP stream owns lifecycle. Store source watermark plus native cursor/event
-receipts suppress reconnect duplicates after event pruning. If page/output cursor cannot
-bridge an interval, replace the source with a visible gap. `notLoaded` is one host view,
-not terminal. Reconnect with session but no terminal proof produces unknown turn.
+- `view/subscribe` (observation, not a session load or lease), `view/page`
+  (`sessionId`, `limit`; exact revision), `item/readOutput` (`itemId`, `outputRef`,
+  `sessionId`; range reads, capped at 6 MiB per call in the rolling docs). v1 (SDK
+  1.3) used `viewCursor/replay` after gaps; it is not in the 1.4 method list — recover
+  with `view/page` from the last cursor. That page cursor is the Eliot event `cursor`
+  ([cursors](../spec/plugin-protocol.md#cursors-and-replay)), so a recovery read
+  never stores a fact twice.
+- Use output-ref ids, not URIs; reuse cursors instead of re-walking history for every
+  read (v1 had an unbounded rediscovery loop).
+- `notLoaded` is one host's view, not proof the session is gone.
+- Children: `subagent/*` methods (`interrupt`, `stop`, `resume`, `sendMessage`,
+  `readResult`, ...) control native subagents — the plugin's `child_verbs`.
+- Pending approvals: a refresh or `approval/listPending` snapshot taken before a
+  resolution can resurrect a resolved request or drop a live one; keep a per-session
+  generation, bump it on every server message, and apply a snapshot only if the
+  generation did not change meanwhile. An `approval/updated` without its original
+  request is a gap, not a new question.
+- `hook/list` exists; whether Muse hooks can call an external command is unverified.
 
-Pending-list snapshot races live updates: capture observation epoch and apply only if no
-live update occurred. Update without original request is a gap, not a new request. Final
-output commits before turn completion and obeys bounded projection rules.
+## Billing routes
 
-## Native children and routing
+Muse runs inference itself and documents no base-URL override, so proxies do not
+apply (manifest `proxy: none`). Muse Max subscription, Muse Go and pay-as-you-go are
+different routes. A profile names one; Eliot never substitutes another ([architecture](../architecture.md#core-rules)
+rule 8).
 
-Subagents register from exact native provenance with stable registration id, child
-scope/ref and parent generation. Parent turn end never finishes a child. Child/page
-queries are bounded and paginated.
+## v1 pitfalls
 
-Muse SDK/host may multiplex subagents inside one host session. Until an installed
-recording proves child-specific environment injection before tools, declare
-`child_environment=false`: child row and native controls remain first-class, but
-`routing_enabled=false`, child CLI/Git activity is attributed to parent and no separate
-token is minted. A vendor child beyond controller guards is still recorded with reduced
-authority/wake.
-
-A shared host/service PID is never assigned to child ownership. Per-Agent descendant
-registration requires exact custody membership; OS monitor owns process exit/stats.
-
-## Route and custody
-
-Muse owns inference; no qualified proxy override. Max/Go/pay-as-you-go are explicit
-owner-defined account/profile routes and are never substituted. Minimal environment
-passes named Muse config/auth plus parent Eliot identity only when routing is enabled.
-
-Exact force exists only on an exact platform backend. Transport disconnect is not
-session close; exact command/session readback decides outcome.
-
-## L7 cases
-
-- source open committed before initialize/session start/resume;
-- lost source-open/ready/initial-turn acknowledgements;
-- caller-known command id and unknown readback;
-- stale turn/request/choice ids and reconnect missing terminal;
-- strict cursor/event-id replay, atomic gap handoff and paging/frame limits;
-- approval snapshot race;
-- child canonical subject/guard/completion and parent attribution without child env;
-- native Goal wake/stop/generation pause and durable Eliot Goal eligibility;
-- long-session rotation/resource behavior;
-- process registration vs OS enumeration, account isolation and exact/degraded custody.
-
-Read v1 protocol edge cases at the frozen commit only; do not port journals/tombstones/
-receipts.
+- A host/IPC disconnect does not close Muse; a transport loss after a submit is
+  `unknown` and is checked by its command id.
+- Parent turn end does not mean the subagents are done; subagents sat silent for up to
+  90 minutes while `inProgress`.
+- A GM session with 7 subagents grew to 233 MB in 6.5 h and took a full CPU core;
+  throughput dropped from 7.8 to 1–3 finished items per hour late in a session —
+  rotate long sessions ([recipe](../spec/automation.md#workflow-recipes)).
+- v1 code: `git show v1-final:modules/muse/bridge.mjs` (Node, SDK 1.3.0) and
+  `v1-final:crates/swarm-adapter-muse` (retired Rust candidate).

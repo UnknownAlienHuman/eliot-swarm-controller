@@ -1,294 +1,158 @@
 # Monitoring
 
-Sources are independent and bounded. Failure reports health/gaps and never invents a
-fact owned by another source.
+Every source runs independently, emits normalized events on the bus and reports its
+own health (`source.health`). A failing source never blocks another one or the router.
 
-## Source ownership
+## Sources
 
-For each `(agent,generation,event family)` exactly one source is authoritative. Current
-projection stores owner, stable open id/key, Store sequence watermark, dedupe mode and
-last native cursor. A backup may track raw position privately but cannot publish
-lifecycle concurrently.
+| Source | What it sees | How | Events |
+| --- | --- | --- | --- |
+| Native stream | turns, messages, tools, approvals, children, goal, usage | plugin protocol (live) | `turn.*`, `message.*`, `tool.*`, `approval.*`, `child.spawned`, `goal.updated`, `usage.updated` |
+| Native transcripts | the same, for sessions Eliot did not launch or after a restart | plugin tails native files | same kinds, `source=transcript` |
+| Native hooks | tool calls, prompts, stops, subagent stops, compaction | hook shim → daemon | `tool.*`, `approval.requested`, `x.<harness>.*` |
+| Processes | life of native processes and their descendants | `sysinfo` + plugin-registered PIDs | `process.started/exited`, `process.stats` (E), `session.lost` |
+| Git | branch, HEAD, dirty files, new commits, ahead/behind, remote refs | `git` CLI, read-only flags | `git.status`, `git.commit`, `git.ref` |
+| Filesystem | changes in agent workspaces | `notify` watcher, debounced | `fs.changed` (E), triggers Git refresh |
+| Proxy/provider | proxy health, usage, limits | proxy management API when configured | `source.health`, `provider.limited` |
+| Derived | stalls, idle time, turn durations | timers over the above | `agent.stalled/unstalled` |
+| Store / config | failed commits; config reloads and parse errors | the daemon itself | `source.health` (`store`, `config`) |
 
-Initial epochs open before the first native start/input effect. Planned handoff is a
-single predecessor-aware `source.open` transaction that verifies old watermark/cursor,
-closes or gaps the predecessor and transfers family ownership. Separate close/open is an
-explicitly gapped boundary.
+## Process monitor
 
-Dedupe modes:
-
-- `strict_cursor`: resume strictly after committed total-order vendor cursor;
-- `event_id`: compact native-event receipts survive event-row retention;
-- `none`: reconnect starts after a visible gap and never replays history.
-
-A well-formed source-owned stale binding or vendor duplicate may advance source sequence
-transactionally while returning the original Store event seq or one bounded diagnostic.
-Malformed envelope, undeclared family, missing required native identity or digest
-mismatch does not advance. Wrong generation/turn/request and replay are never ordinary
-lifecycle or automation triggers.
-
-## Process identity and custody projections
-
-Process identity is `(host_boot_id,pid,start_time)`, never PID alone. Linux uses kernel
-boot id plus proc start ticks. Windows uses stable machine identity plus boot-session
-identity and `GetProcessTimes` creation time. Reboot cannot match an old row.
-
-A custody owner is one stable string:
-
-```text
-agent:<agent-id>#<generation>
-service:<service-name>
-action:<run-id>/<action-index>
-workspace:<agent-id>/<step-index>
-```
-
-A process belongs to exactly one owner. Shared-service membership of Agents is native
-session metadata, not duplicate process ownership.
-
-```sql
-CREATE TABLE custodies (
-  owner TEXT PRIMARY KEY,
-  backend TEXT NOT NULL,
-  capability TEXT NOT NULL,
-  native_id TEXT,
-  guardian_boot TEXT,
-  guardian_pid INTEGER,
-  guardian_start INTEGER,
-  state TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE processes (
-  host_boot_id TEXT NOT NULL,
-  pid INTEGER NOT NULL,
-  start_time INTEGER NOT NULL,
-  owner TEXT NOT NULL REFERENCES custodies(owner),
-  role TEXT NOT NULL,
-  state TEXT NOT NULL,
-  exit_code INTEGER,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY(host_boot_id,pid,start_time)
-);
-CREATE INDEX processes_owner ON processes(owner,state);
-```
-
-Daemon/OS monitor is authoritative for `process.started`, `process.exited` and stats. It
-registers plugin/harness processes before execution where possible and enumerates exact
-custody. A per-agent plugin may additionally submit sequenced `process.put` for a
-descendant it discovered; host pins exact birth and verifies custody membership before
-upserting the same projection. Host enumeration and plugin registration publish one
-start event. Shared plugin cannot assign its server or uncontained service child to an
-Agent. Managed/attached service processes belong to `service:<name>`.
-
-Internal Git/script/check/workspace runners register their action owner directly in the
-spawn/custody transaction. Restart never reconstructs custody from PID guesses.
-
-Process custody does **not** choose API authority. Connected API calls require explicit
-owner/Agent/automation credentials; absence of a token is invalid. Process projection
-exists for ownership, cleanup and diagnostics only.
-
-## Process custody backends
-
-### Windows exact
-
-Per-agent plugin/descendants enter a no-breakaway Job before execution resumes. Every
-script/Git/check/workspace action has its own Job. Daemon-owned stdio Jobs use
-kill-on-close; managed services use separate named non-killing Jobs. Force verifies
-boot-scoped identity and zero active members.
-
-### Linux exact and degraded
-
-Exact custody requires delegated cgroup v2 (or qualified equivalent) plus an internal
-owner-death guardian. Guardian lives outside the owned group, monitors daemon boot/
-process identity and kills/verifies the group on abnormal daemon loss. Clean shutdown
-disarms only after group empty.
-
-Guardian boot/PID/start and health are monitored. Missing/mismatched guardian blocks new
-exact launches and visibly downgrades existing groups; daemon never silently claims
-owner-death cleanup.
-
-Process-group fallback may observe/gracefully stop non-escaping members. A same-user
-child can `setsid`, so capability is degraded: exact force, kill-on-owner-loss and proof
-all descendants are gone are unsupported. Other Unix remains degraded until qualified.
-
-### Shared services
-
-Shared plugin/service is watched once. Agent stop uses exact native session control,
-never server kill. Attached owner service is external and never stopped. Managed
-service custody/process projection is separate from Agents/actions.
-
-## Process observation and terminal settlement
-
-Session lifecycle and descendant containment are distinct:
-
-- `stopped` only from exact native terminal/close or exact normal-end readback;
-- `lost` when exact session control is proven gone:
-  - exact backend empty plus authoritative source drained/gapped;
-  - shared-session readback says subject absent; or
-  - degraded backend controlling plugin/controller identities are gone and authoritative
-    channel is EOF/gapped, while escaped descendants remain possible;
-- degraded third case sets custody `orphan_possible`; `lost` describes session control,
-  not proof every descendant died.
-
-Additional rules:
-
-- exact custody enumerates the complete container; prior-boot rows are historical;
-- stats are ephemeral and never model progress;
-- unknown exit code stays unknown;
-- process exit/final native output may race; drain authoritative source to EOF or a
-  bounded terminal deadline;
-- timeout alone is not terminal evidence; one exact/shared/degraded control-loss
-  condition must also hold;
-- live shared server says nothing about one session;
-- late terminal data after source closure is diagnostic.
+- Identity is `(pid, start_time)`, never PID alone (PIDs are reused). `start_time` is
+  the OS creation time at full resolution (Windows `GetProcessTimes`, 100 ns; Linux
+  `/proc/<pid>/stat` start ticks), not a seconds value. Linux start ticks count from
+  boot, so there the identity also carries the kernel boot id
+  (`/proc/sys/kernel/random/boot_id`); a row from an earlier boot never matches.
+- **Custody** is the container that holds one agent's processes: the per-agent plugin,
+  its harness and every tool they start. Descendants come from custody, not from
+  walking parent PIDs (a parent chain breaks when an intermediate process exits): on
+  Windows the Job's process list (`JOBOBJECT_BASIC_PROCESS_ID_LIST`), on Unix the
+  process group. Scan every `process.scan_interval` (default 2 s). Plugins also report
+  native PIDs they know; the monitor records only those inside the agent's custody.
+  CPU/RSS sampling uses one `sysinfo::System`, refreshed only for watched PIDs.
+- Windows custody is **exact**: a Job without breakaway contains every descendant.
+  Unix custody is **degraded**: a process can leave its group (`setsid`) and a group
+  does not die with the daemon. There `stop --force` kills what it can see and says
+  what it could not prove; `eliot show` marks custody `degraded`, `eliot doctor`
+  lists possible orphans. Exact Linux custody (cgroup v2) is L7.2.
+- `process.exited` when a watched identity disappears. If all `harness`/`server`
+  processes of an agent are gone and the plugin reported no `session.ended` within
+  3 s, emit `session.lost` (the reducer then moves the agent to `lost`).
+- `process.stats` (CPU, RSS) every 5 s for watched processes; ephemeral.
+- A process that disappears while its identity is being read counts as gone (liveness
+  loss), not as a monitor error.
+- After a crash the exit code of a Job member may be unrecoverable: record it as
+  `unknown` (never `0`); prove that a tree is gone by the Job's active-process count
+  (Windows) or the process group being empty (Unix), not by one PID missing.
+- Stop/kill: Windows Job object per agent (per plugin process for a `multi_session`
+  plugin) with `KILL_ON_JOB_CLOSE` (if the daemon dies, the stdio sessions it launched
+  die too — no orphans); Unix process group. Services (L7.6) get their own Job without
+  kill-on-close. `stop --force` terminates the agent's process tree and verifies the
+  identities are gone; if not, the agent stays `stopping` and an event says which PIDs
+  survived. Processes Eliot only attached to (external services) are never killed.
+- Shared processes (a proxy, a server several sessions use) belong to their service,
+  not to any agent: they are watched once and never killed by stopping an agent.
 
 ## Starting processes
 
-- Resolve executable fully; argv/cwd/env are separate and bounded.
-- Apply containment before execution.
-- Only intended child handles are inheritable.
-- Long input uses stdin/files; Eliot text is UTF-8 without BOM and LF.
-- Git prompts/editor are disabled.
-- Environment follows minimal/inherit policy; Windows keys merge case-insensitively.
-- Running script/hook/plugin paths are immutable/versioned.
-- Normalize paths; never follow untrusted symlink/reparse point for cleanup,
-  fingerprint or setup.
+These rules apply to plugins, services, hook shims, scripts and git actions:
 
-## Workspace preparation
+- Resolve the executable to a full path before spawning; pass argv as a list, never a
+  shell string (scripts that want a shell say so in `cmd`).
+- Windows: create console children with `CREATE_NO_WINDOW` (not `DETACHED_PROCESS`,
+  which breaks console-dependent tools); put a child into its Job at creation
+  (`CREATE_SUSPENDED` → assign → resume) so grandchildren cannot escape; when merging
+  environment variables, treat `PATH`/`Path` case-insensitively; resolve PowerShell 7
+  as `pwsh.exe` by full path, not `powershell.exe`.
+- Long inputs (prompts, scripts) go through files or stdin, never argv (Windows
+  command-line limit ~32 KiB).
+- Text files Eliot writes are UTF-8 without BOM with LF line endings; Git always
+  runs with `GIT_TERMINAL_PROMPT=0` and no editor.
+- Never edit a script or hook file that may be running; write a new file and switch.
+- Windows: a file cannot be replaced or deleted while any handle to it is open (also
+  SQLite files with an open connection — close them first in tests).
+- Paths are normalized before comparison (strip the `\\?\` verbatim prefix that
+  `canonicalize` returns on Windows, unify separators, compare case-insensitively on
+  Windows).
 
-`launch --worktree` is durable pre-start work over a frozen
-[workspace binding](configuration.md#frozen-workspace-binding).
+## Git monitor
 
-```sql
-CREATE TABLE workspaces (
-  agent INTEGER PRIMARY KEY REFERENCES agents(id),
-  project TEXT NOT NULL,
-  repo_path TEXT NOT NULL,
-  requested_branch TEXT NOT NULL,
-  base_ref TEXT,
-  base_oid TEXT NOT NULL,
-  worktree_path TEXT NOT NULL UNIQUE,
-  setup_revision TEXT NOT NULL,
-  state TEXT NOT NULL,
-  outcome TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
+Per distinct worktree used by any live agent:
 
-CREATE TABLE workspace_steps (
-  agent INTEGER NOT NULL REFERENCES workspaces(agent),
-  idx INTEGER NOT NULL,
-  kind TEXT NOT NULL,
-  intent TEXT NOT NULL,
-  state TEXT NOT NULL,
-  outcome TEXT,
-  custody_owner TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY(agent,idx)
-);
-CREATE INDEX workspace_steps_open ON workspace_steps(state)
-  WHERE state IN ('queued','dispatched','unknown');
-```
-
-Flow:
-
-1. create Agent generation 0 plus `workspaces.state=preparing`, deterministic path and
-   immutable binding;
-2. journal repo/branch/diagnostic base ref/exact `base_oid`/path/setup revision;
-3. run explicit `git worktree add` against frozen OID under workspace custody;
-4. read back worktree list, branch and exact HEAD OID;
-5. run immutable setup artifacts sequentially, each as its own journaled step/custody;
-6. commit ready; only then allow native start.
-
-No implicit fetch/ref re-resolution occurs at dispatch. Existing branch/path must match
-frozen OID or an explicit reuse policy. Lost Git response is read back, never repeated
-blindly. Lost setup has no generic readback: workspace becomes unknown and launch stays
-blocked until owner resolution/removal/recreation. Setup is never assumed idempotent.
-
-Cancel/stop during preparation terminates the current exact action. Git step is read
-back; interrupted setup leaves workspace unknown. Native generation never starts from a
-partial workspace.
-
-Cleanup is explicit, stopped-Agent only, exact path under data root and Git-clean except
-allowlisted relative scratch. Scratch cleanup rejects symlink/device/alternate-stream
-escape. Branch remains.
-
-## Git and filesystem monitor
-
-One monitor per distinct live worktree:
-
-- read-only `git --no-optional-locks status --porcelain=v2 --branch -z`;
-- bounded log on HEAD change;
-- frozen-base-OID-vs-HEAD diff for still-unmerged paths;
-- watcher debounce 500 ms, minimum refresh 2 s;
-- slow status backoff plus health;
-- remote refs only after explicit fetch or optional `ls-remote`.
-
-Monitor never writes index, refs or objects.
-
-### Durable edit attribution
+- Refresh on `fs.changed` (debounce 500 ms) and every `git.poll_interval` (default
+  15 s), never more often than every 2 s per worktree.
+- Commands (always `git --no-optional-locks`, so the monitor never takes
+  `index.lock` and never competes with agents):
+  - `status --porcelain=v2 --branch -z` → branch, HEAD, upstream, ahead/behind, dirty set;
+  - on HEAD change: `log --format=%H%x00%ae%x00%s --name-only <old>..<new>` → `git.commit`;
+  - committed-but-unmerged set (for `who`): paths in `diff --name-only <base>...HEAD`
+    that still differ in `diff --name-only <base> HEAD` — after a squash merge the
+    branch is not an ancestor of its base, and this drops the already-merged paths.
+    `<base>` is the agent's `base_oid` (frozen at launch, below), else its `base_ref`.
+- Remote refs change only through an explicit fetch (rule action or command) or the
+  optional `git.remote_poll` (`ls-remote`, default off). `git.ref` events report them.
+- Huge repos: if `status` takes longer than 2 s, the interval doubles (max 5 min) and
+  `source.health` reports `slow`.
+- The monitor keeps per-worktree sets in memory (`dirty`, `branch_changes`) for
+  [`who`](coordination.md#who-works-on-this). They are rebuilt from Git after restart;
+  they are not stored. The per-agent `edited` set is stored, because Git cannot
+  rebuild it:
 
 ```sql
-CREATE TABLE agent_edits (
-  agent INTEGER NOT NULL,
-  generation INTEGER NOT NULL,
-  workspace TEXT NOT NULL,
-  path TEXT NOT NULL,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY(agent,generation,path)
+CREATE TABLE agent_edits (      -- L3.3 migration
+  agent INTEGER NOT NULL REFERENCES agents(id), workspace TEXT NOT NULL,
+  path TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (agent, path)
 );
-CREATE INDEX agent_edits_workspace ON agent_edits(workspace,path);
+CREATE INDEX agent_edits_path ON agent_edits(workspace, path);
 ```
 
-Generation-matched edit events upsert with their event. When Git proves a path clean,
-remove rows. Terminal/superseded generation remains until paths clean for provenance but
-is not a current worker. Restart loads the projection rather than replaying event history.
-Unowned shared-checkout path is `unattributed`.
+  A `file.changed` event upserts its row in the same transaction; a row is deleted
+  when Git shows the path clean.
 
-### Read-only progress fingerprint
+## Workspaces
 
-```text
-HEAD + sorted(dirty/untracked path, file type, size, content hash)
-```
+`launch --worktree BRANCH [--base REF]`:
 
-Hash only dirty/untracked excluding ignored/scratch; hash symlink target text without
-following. Cache until watcher/metadata change and enforce caps. Incomplete is
-unavailable, never no-progress. No temporary index, `git add`, object writes or
-`write-tree`.
+1. At admission the daemon resolves `REF` (default: the repository's `HEAD`) to a
+   commit OID with `git rev-parse --verify REF^{commit}` — read-only, no fetch — and
+   stores it as the agent's `base_oid`. A ref that does not resolve fails `invalid`.
+   A later move of the ref does not change a queued launch.
+2. At start: `git worktree add` under `<data_dir>/worktrees/<agent>` — `-b BRANCH
+   <base_oid>` if BRANCH does not exist, otherwise check it out (it must exist
+   locally). Then read back the worktree's branch and HEAD.
+3. Run the profile's `setup` argv lists once, in order, in the agent's custody (a new
+   worktree has no ignored files, submodules or LFS content). A setup that fails fails
+   the launch. A setup interrupted by a daemon crash has an unknown effect: it is not
+   run again — the agent becomes `failed` (`setup_unknown`) and the owner removes the
+   worktree and launches again.
+4. Only then `agent.start`.
 
-## Liveness
+Worktrees are never removed automatically: `eliot worktree remove A` removes a stopped
+agent's worktree only if `git status --porcelain --ignored` lists nothing outside the
+profile's `scratch` globs; the branch is kept.
 
-Only exact-generation model progress updates `last_progress_at`.
+## Liveness rules
 
 | Observation | Conclusion |
 | --- | --- |
-| no progress while busy/waiting | stalled flag only |
-| parent idle, child busy | parent idle; tree incomplete |
-| process alive, stream disconnected | source stale; state unchanged |
-| exact custody empty + source drained/gapped | lost; no possible members in custody |
-| degraded controller gone + source EOF/gap | lost session control; custody orphan possible |
-| shared server live, session readback unknown | stale/unknown, not lost |
-| handoff gap | explicit gap; no inferred event |
-| old boot/generation/source sequence/native receipt | historical diagnostic only |
-
-## Restart reconciliation
-
-1. compute current boot id; prior-boot live rows cannot match;
-2. reopen exact named custody/service/guardian identities for current boot;
-3. reattach sessions and snapshot commands, inputs, turns and source watermarks;
-4. reconcile source dedupe mode: strict cursor resumes after cursor, event-id checks
-   receipts, none creates a gap;
-5. settle missing exact groups/degraded controller loss only under terminal rules;
-6. reconcile preparing/unknown workspaces against frozen base OID/setup journal;
-7. rebuild Git facts and load edit projection;
-8. keep dispatched command/action/workspace effects unknown until readback;
-9. report `routing_key_error` and block new Agent-token issuance if key identity
-   mismatches; owner credential remains independent.
+| No events while `busy` for `stall_after` | `agent.stalled` (flag), nothing else |
+| Parent idle, children busy | parent is idle; the tree is not done |
+| Process alive, stream disconnected | source `stale`; agent state unchanged |
+| Process gone, no terminal event | `session.lost` → `agent.lost` |
+| Polled source (process, Git, proxy) not read for 3 × its interval | `source.health status=stale`; values shown as `unknown` |
+| Event-driven source (native stream, transcript, hooks) lost its connection | `stale` until it reconnects; silence alone is not staleness |
+| Provider 429 | `provider.limited kind=rate_limit`; not quota, model unchanged |
 
 ## Views
 
-Expose boot-scoped process identity, custody owner, generation/turn/input gate/open stop,
-workspace binding/state, exact/degraded custody/guardian/orphan possibility, source
-open ids/keys/dedupe modes/gaps/watermarks, model progress, usage, branch/edit, provider
-holds, routing availability and Store/WAL health.
+- `eliot watch` — stream with filters; text format
+  `HH:MM:SS a12 writer  turn.completed  ok 2m14s 18k tok`.
+- `eliot top` — refreshes every second: id, name, harness, state (+stalled), current
+  turn time, tokens, cost, CPU, RSS, branch, dirty count, last event age. Sort and
+  filter keys. Built on `agent.list` + `events.subscribe`; no separate state.
+- `eliot show A` — one agent: profile, effective settings, pending requests, goal,
+  processes, workspace, last 20 events (unread mail from L5.1).
+- `daemon.status` — per-source health table. A stale source is shown as stale, never
+  hidden.

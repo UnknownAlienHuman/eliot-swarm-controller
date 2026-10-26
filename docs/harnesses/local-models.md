@@ -1,35 +1,32 @@
 # Local model servers
 
-A local model server is an inference endpoint, not an agent harness. Eliot treats it as
-an attached or managed [proxy/service](../spec/configuration.md#plugins-sources-services-and-webhooks).
-These notes are inherited from v1 and require installed-server verification.
+Not a harness: an inference endpoint (llama.cpp `llama-server`, vLLM, LM Studio,
+Unsloth Studio, ...) that a harness talks to. Eliot treats it like any other
+[proxy](../spec/configuration.md#proxies): an attached service it health-checks and
+never stops. Notes carried over from v1 (`git show v1-final:docs/local-models/`), not
+re-checked; verify against the installed server before relying on them.
 
 ## Wiring
 
-- Codex named provider requires the Responses wire API. Chat-Completions-only servers
-  need an explicitly selected compatible proxy; Eliot never inserts one silently.
-- OpenCode/Kilo use their installed provider/base-URL mechanism
-  ([OpenCode route](opencode.md#provider-configuration)).
-- Profile names model, service, account and capacity scope. No cloud/API fallback when
-  local inference is slow/unavailable/incompatible.
+- Codex accepts only `wire_api = "responses"`. A server that speaks only Chat
+  Completions needs a Responses-capable proxy in front (e.g. OpenCodex); otherwise use
+  a harness with an OpenAI-compatible provider (OpenCode, Kilo).
+- OpenCode/Kilo: a custom provider with `npm = "@ai-sdk/openai-compatible"` and
+  `options.baseURL` ([OpenCode page](opencode.md#proxy)).
 
-## Ownership/capacity
+## Rules
 
-`attach` is owner-run and never stopped/reconfigured. `launch` is a separately managed
-service and stops only through service lifecycle. Agents never kill the shared model
-server. Models sharing one GPU/capacity pool share a service/account cap; missing
-metrics remain unknown.
+- A route is usable only after one real tool-call round trip succeeds; `/v1/models`
+  proves neither tool support nor a loaded model.
+- Context overflow, early EOF, an HTTP 200 with a cut stream or a bare `[DONE]` are
+  failures with the native finish reason, never silently truncated success.
+- Models sharing one GPU are one capacity unit: put them behind one proxy entry with
+  `max_live`. Missing GPU counters are `unknown`, not zero.
 
-## Qualification
+## WSL (vLLM inside WSL2 on the owner's Windows machine)
 
-A health/catalogue response proves only reachability. One real harness tool-call round
-trip must prove effective model/endpoint and terminal streaming semantics. Context
-overflow, early EOF, truncated 200 or bare incomplete `[DONE]` is failure/unknown—not
-success. A timed-out request that may have reached inference is never blindly retried.
-
-## WSL2
-
-Read-only health checks must not start a stopped distro. Never blanket shutdown/
-terminate WSL, change firewall/portproxy or expose `0.0.0.0` automatically. Prefer
-loopback and test from Windows. A systemd unit inside WSL does not prove distro/service
-lifetime; report the boundary honestly.
+- Read-only checks must not use `wsl.exe --exec`: it starts a stopped distro.
+- Never `wsl --shutdown` / `--terminate`: other work runs there.
+- Bind the server to `127.0.0.1` inside WSL and test from Windows; never `0.0.0.0`,
+  `portproxy` or firewall changes.
+- A systemd service inside the distro does not by itself keep WSL running.
