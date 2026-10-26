@@ -2,140 +2,176 @@
 
 ## Transport
 
-- JSON-RPC 2.0, one JSON object per line (NDJSON), UTF-8.
-- Windows: named pipe `\\.\pipe\eliot-<hash(data_dir)>`, ACL limited to the current
-  user. Unix: socket `<data_dir>/eliot.sock`, mode `0600`.
-- Single instance: the daemon holds an OS exclusive lock on `<data_dir>/daemon.lock`
-  for its lifetime (the OS releases it on a crash, so no takeover logic is needed).
-  It then writes `<data_dir>/daemon.json` (`pid`, `endpoint`, `version`,
-  `started_at`). Clients read it; no discovery service. A client treats it as live
-  only if that PID exists with the recorded process start time (PIDs are reused).
-- Caller identity: requests without a token are the **owner**. Agents get
-  `ELIOT_AGENT_TOKEN` at launch and the CLI sends it automatically; the daemon maps it
-  to the agent id. This is attribution and routing, not a security boundary
-  ([decisions](../decisions.md) D-07).
-- Max frame 4 MiB. Requests are multiplexed by `id`; a slow call never blocks others.
+- JSON-RPC 2.0 over NDJSON, UTF-8.
+- Windows: named pipe `\\.\pipe\eliot-<hash(data_dir)>`, ACL current user only.
+  Unix: `<data_dir>/eliot.sock`, mode `0600`.
+- One daemon per data directory: exclusive OS lock on `daemon.lock`; `daemon.json`
+  records pid, process start identity, endpoint, version and start time. Clients trust
+  it only while `(pid,start_time)` still matches.
+- Requests **without** a token are the owner. Agents receive current-generation
+  `ELIOT_AGENT_ID`, `ELIOT_AGENT_GENERATION` and `ELIOT_AGENT_TOKEN`; the CLI sends
+  them automatically. A request that supplies an invalid/stale token is rejected—it is
+  never downgraded to owner. This is correctness/attribution, not an OS security
+  boundary ([D-07](../decisions.md)).
+- Maximum API frame 4 MiB; semantic text limits are smaller
+  ([core](core.md#verbs)). Requests are multiplexed by JSON-RPC id.
 
 ## Methods
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `daemon.status` | — | version, uptime, plugins, sources health, counts by state |
-| `daemon.shutdown` | `drain?`, `force?` | with `drain`: no new launches, rules or timer firings; running turns finish, approvals, answers and results keep working; then stop. Without `drain` it refuses (`busy`) while any stdio session has a running turn, unless `force` — those turns would be lost. |
-| `agent.list` | `filter{state?, harness?, project?, label?, tree?, parent?}` (`tree` = the agent and all descendants), `after?`, `limit≤1000` | page of agents + `next` |
-| `agent.get` | `agent` | agent + pending requests + goal + last events |
-| `agent.wait` | `targets` (ids/names/selector), `for: turn|idle|stopped|goal`, `after_command?`, `timeout_ms` | per agent: state reached or not, state, last `final_text`. `turn` = the running or next turn ends — with `after_command`, the turn started by that command's dispatch, so a late end of an earlier turn never satisfies it (`send --wait` always passes it); `idle` = state is `idle` (immediate if already); `stopped` = `stopped`/`failed`/`lost`; `goal` = goal `done`/`blocked`. |
-| `agent.result` | `agent`, `turns?` (default 1) | `final_text`, status and usage of the last N completed turns |
-| `command.submit` | `id?`, `target?` (id/name/selector; omitted for `launch`), `verb`, `args`, `wait_ms?` (default 10000) | `{command_id, agent?, state, outcome?}` — waits up to `wait_ms` for the plugin reply, then returns the current state; `agent` is the new id for `launch` |
-| `command.get` | `id` | command |
+| `daemon.status` | — | version, uptime, admission mode, plugins/custody, sources/gaps, counts by state and open command/action state |
+| `daemon.shutdown` | `drain?`, `force?` | See [drain](#drain-and-shutdown). |
+| `agent.list` | `filter{state?, harness?, project?, label?, tree?, parent?}`, `after?`, `limit≤1000` | page + `next`; every row includes generation |
+| `agent.get` | `agent` | agent, generation/native refs, pending requests, open commands/actions, goals, event owners/gaps, recent events |
+| `agent.wait` | `targets`, `for: turn|idle|stopped|goal`, `generation?`, `after_command?`, `timeout_ms` | per target result. Default generation is captured at call start; a later generation returns `stale_generation`, not success for replacement work. `turn` with `after_command` waits for the exact turn correlated to that command. |
+| `agent.result` | `agent`, `generation?`, `turns?` | bounded final text/status/usage of completed turns in the selected generation (default current) |
+| `command.submit` | `id?`, `target?`, `verb`, `args`, `wait_ms?` | `{command_id, agent?, generation?, state, outcome?}`. It waits only for state progress; timeout does not cancel. |
+| `command.get` | `id` | command including bound generation/turn/request and outcome |
 | `events.read` | `after_seq`, `filter`, `limit` | persisted events page |
-| `events.subscribe` | `after_seq?`, `filter` | stream of `events.item` notifications: replays persisted events after `after_seq`, then live events. Each subscriber has a bounded buffer (items and bytes); on overflow it gets `events.lagged {dropped, from_seq, through_seq}` before newer events and can re-read persisted ones with `events.read` |
-| `hook.event` | `agent`, `harness`, `hook`, `payload` | decision JSON for the hook shim ([plugin protocol](plugin-protocol.md#hooks)) |
-| `agent.discover` | `harness?` | native sessions found by plugins `discover` |
-| `agent.attach` | `harness`, `native_scope`, `native_ref`, `observe_only` | new `origin=external` agent (`not_allowed` if another live agent controls that session) |
-| `mail.send` | `to`, `text`, `mode?`, `reply_to?` | message ids ([coordination](coordination.md#mailbox)) |
-| `mail.inbox` | `wait_s?`, `all?` | caller's messages; marks them read |
-| `mail.read` | `id` | one message; marks it read |
-| `var.get` / `var.set` / `var.list` / `var.watch` | `scope/key`, `value`, `expect_version?`, `note?` / prefix | value + version; `watch` streams `var.changed` ([coordination](coordination.md#shared-variables)) |
-| `who` | `paths: [pathspec]`, `history?` | rows per agent ([coordination](coordination.md#who-works-on-this)) |
-| `claim.add` / `claim.release` | `glob`, `note?`, `ttl?` | claim / conflicts ([coordination](coordination.md#claims)) |
-| `rule.list` / `rule.get` / `rule.enable` / `rule.disable` / `rule.test` | `id`, `event?` | rules; `test` returns the actions it would run ([automation](automation.md#rules)) |
-| `rules.pause` / `rules.resume` | — | global automation switch |
-| `timer.list` / `timer.run` | `id` | time-triggered rules with next fire time |
+| `events.subscribe` | `after_seq?`, `filter` | replay then live `events.item`; bounded buffer and `events.lagged` with persisted sequence range |
+| `hook.event` | `agent`, `generation`, `harness`, `hook`, `payload` | exact hook decision |
+| `agent.discover` | `harness?` | native sessions found by plugins |
+| `agent.attach` | `harness`, `native_scope`, `native_ref`, `observe_only` | new external agent at generation 1, or `not_allowed` on live control conflict |
+| `mail.send` | `to`, `text`, `mode?`, `reply_to?` | message ids |
+| `mail.inbox` | `wait_s?`, `all?` | caller messages; marks returned items read |
+| `mail.read` | `id` | one message; marks read |
+| `var.get/set/list/watch` | scope/key/value/version/prefix | value + version or stream |
+| `who` | `paths`, `history?` | per-agent rows |
+| `claim.add/release` | `glob`, `note?`, `ttl?` | claim/conflicts |
+| `rule.list/get/enable/disable/test` | `id`, `event?` | rules; test renders without admitting |
+| `rules.pause/resume` | — | global automation switch |
+| `timer.list/run` | `id` | schedules/runs |
+| `action.get/resolve/cancel` | `run`, `index`, outcome/reason | automation action state/manual resolution |
 
-Goals are commands: `goal.set|pause|resume|clear` go through `command.submit`;
-`agent.get` returns the current goal.
+Goals are commands. Event filter is
+`{kinds?:[glob], agents?:[id], tree?:id, sources?:[glob], ephemeral?:bool}`.
 
-`filter` = `{kinds?: [glob], agents?: [id], tree?: id, sources?: [glob], ephemeral?: bool}`.
+Every write method accepts optional `id`. Same id + same canonical payload returns the
+first admission/result; same id + different payload is `invalid`. This idempotence
+ends at Eliot's transaction boundary—it does not justify replaying native I/O.
 
-Every write method (`command.submit`, `mail.send`, `var.set`, `claim.add`, ...) takes
-an optional `id`: repeating a call with the same `id` and payload returns the first
-result; the same `id` with a different payload fails `invalid`. Use it when retrying
-after a lost reply.
+Stable error `data.code` values: `not_found`, `unsupported`, `not_allowed`,
+`bad_state`, `stale_generation`, `invalid`, `busy`, `unavailable`, `internal`.
 
-Errors use JSON-RPC error objects with a stable `data.code`: `not_found`,
-`unsupported`, `not_allowed`, `bad_state`, `invalid`, `busy`, `unavailable`, `internal`.
+## Drain and shutdown
 
-Script callers (rules' `run` actions) and any CLI call without `ELIOT_AGENT_TOKEN` act
-as the owner.
+`daemon.shutdown {drain:true}` first commits admission mode `draining`.
+
+While draining:
+
+- reject new work-starting commands: `launch`, `send`, `steer`, `inject`, `resume`,
+  `fork`, `background`, `goal.set`, `goal.resume`;
+- admit `interrupt`, `stop`, `approve`, `deny`, `answer`, `cancel`, `detach`,
+  `goal.pause`, `goal.clear`, read/query operations and exact manual resolution;
+- admit no new rule/timer/goal-loop runs and dispatch no newly created automation
+  action;
+- continue commands/actions already admitted before the mode change, including queued
+  sends, because accepted work is not silently discarded;
+- keep streams, approvals, answers, results and readback alive.
+
+The daemon exits only after pre-drain admitted work is terminal, no process action is
+running, no unresolved `unknown` blocks custody, and daemon-owned live turns/sessions
+have ended or been explicitly stopped. It reports blockers while waiting.
+
+Without `drain`, shutdown refuses `busy` while daemon-owned sessions/process actions
+are live. `force` terminates exact daemon-owned groups, marks affected in-flight
+commands/actions `unknown` and sessions `lost`, then exits. It never kills attached
+owner-run services. A service-mode session may be detached/preserved according to its
+explicit service policy.
+
+## Subscription boundary
+
+For `events.subscribe`, the daemon:
+
+1. registers the bounded live buffer;
+2. captures current persisted high-water `seq`;
+3. replays `(after_seq, high_water]`;
+4. releases buffered live persisted events above high-water in sequence order, then
+   follows live.
+
+Ephemeral events received during replay are buffered best-effort and delivered after
+the persisted boundary with no total-order claim. Overflow always reports lag; it is
+never silent.
 
 ## CLI
 
-All commands accept `--json` (machine output on stdout, logs on stderr) and
-`--data-dir` (default `%LOCALAPPDATA%\Eliot` / `~/.local/share/eliot`, or `ELIOT_HOME`).
-Every command that changes something accepts `--id ID`; without it the CLI generates
-one and prints it, and a retry after an unknown outcome must pass the same `--id`.
+All commands accept `--json` and `--data-dir`. Every write accepts `--id`; without it
+the CLI generates/prints one. Retry of a lost client reply reuses the same id.
 
-`eliot daemon` (without `--foreground`) removes a stale `daemon.json`, starts itself
-again with `--foreground`, detached from the calling terminal so it survives that
-terminal closing, and returns once a `daemon.json` with the child's PID appears. Other commands never start the daemon; when it is not
-running they fail with `unavailable` and say so.
+`eliot daemon` background-starts itself and returns only after a live `daemon.json`
+with matching process identity appears. Other commands never auto-start it.
 
 ### Exit codes
 
-| Code | Meaning | Error codes |
-| --- | --- | --- |
-| 0 | ok (command `applied` or `queued`, `cmd cancel` succeeded, query answered) | — |
-| 1 | error | `not_found`, `invalid`, `busy`, `unavailable`, `internal`, command `failed` |
-| 2 | CLI usage error (bad flags) | — |
-| 3 | rejected — nothing happened | `unsupported`, `not_allowed`, `bad_state`, command `rejected` |
-| 4 | outcome unknown | command `unknown` |
-| 5 | `wait` timed out | — |
-| 6 | pending: the command is still `dispatched` when the CLI stops waiting; read it back with `eliot cmd show ID` | — |
+| Code | Meaning |
+| --- | --- |
+| 0 | query ok; command/action applied or queued; cancellation succeeded |
+| 1 | error (`not_found`, `invalid`, `busy`, `unavailable`, `internal`, definite failure) |
+| 2 | CLI usage error |
+| 3 | rejected before effect (`unsupported`, `not_allowed`, `bad_state`, `stale_generation`) |
+| 4 | outcome unknown |
+| 5 | wait timed out |
+| 6 | still dispatched/pending when CLI wait ended; read back by id |
 
 ```text
-eliot daemon [--foreground]                 start the daemon (default: background, returns when ready)
-eliot daemon stop [--drain | --force]       stop it (drain: let running turns finish, admit nothing new)
-eliot status                                daemon, plugins, sources, where each profile's config came from
-eliot launch [--profile P] [--harness H] [--name N] [--parent A] [--label k=v]...
-             [--project NAME] [--control self|tree|project]
+eliot daemon [--foreground]
+eliot daemon stop [--drain | --force]
+eliot status
+eliot launch [--profile P] [--harness H] [--name N] [--parent A]
+             [--label k=v]... [--project NAME] [--control self|tree|project]
              [--workspace PATH | --worktree BRANCH [--base REF]] [PROMPT]
 eliot ls [--state S] [--tree A] [--label k=v] [--all]
-eliot show A                                details, pending requests, goal, recent events
-eliot watch [A|SELECTOR] [--kind GLOB]... [--since SEQ]    live event stream
-eliot top                                   live table: agents, state, turn time, tokens, cpu/ram, git
+eliot show A
+eliot watch [A|SELECTOR] [--kind GLOB]... [--since SEQ]
+eliot top
 eliot send|inject A TEXT
 eliot steer A TEXT [--or-send]
-eliot send A TEXT --wait [--timeout DUR]    send, wait for that turn to end, print its final text
+eliot send A TEXT --wait [--timeout DUR]
 eliot wait TARGET... [--for turn|idle|stopped|goal] [--timeout DUR]
-                                            block until every target gets there (default --for turn,
-                                            --timeout 9m: stay under harness shell-tool time limits; re-run to keep waiting)
-eliot result A [--turns N]                  final text of the last turn(s)
-eliot interrupt A (alias: abort) | stop A [--force] [--tree] | resume A [PROMPT]
-                                            (`--tree` = the selector `@tree:A`)
-eliot approve|deny A [--request R] [--remember]   default: the only pending request
+eliot result A [--generation N] [--turns N]
+eliot interrupt A | abort A
+eliot stop A [--force] [--tree]
+eliot resume A [PROMPT]
+eliot approve|deny A [--request R] [--remember]
 eliot answer A [TEXT] [--request R] [--choice N]
 eliot configure A [--model M] [--effort E] [--permissions P]
-eliot compact|fork|background A             native-only verbs
-eliot goal set A TEXT [--mode auto|native|eliot] [--check CMD|marker:TEXT] [--every DUR]
-                    [--max-turns N] [--max-cost USD] [--no-progress N]   (limits form `budget`)
-eliot goal pause|resume|clear A [--mode native|eliot] | eliot goal show A
-eliot cmd show ID                           command state/outcome; exits with the code of that state
-eliot cmd cancel ID                         withdraw a queued send that has not started
-eliot cmd resolve ID --as applied|failed --reason TEXT   owner settles an `unknown` command by hand
+eliot compact|fork|background A
+eliot goal set A TEXT [--mode auto|native|eliot] [--check CMD|marker:TEXT]
+                    [--every DUR] [--max-turns N] [--max-cost USD] [--no-progress N]
+eliot goal pause|resume|clear A [--mode native|eliot]
+eliot goal show A
+eliot cmd show ID
+eliot cmd cancel ID
+eliot cmd resolve ID --as applied|failed --reason TEXT
+eliot action show RUN/INDEX
+eliot action cancel RUN/INDEX
+eliot action resolve RUN/INDEX --as applied|failed --reason TEXT
 eliot events [--since SEQ] [--kind GLOB] [--agent A]
 eliot msg send TO TEXT [--mode queue|inject|send|steer] [--reply-to M]
-eliot inbox [--wait SECS] [--all]           for agents: unread messages
+eliot inbox [--wait SECS] [--all]
 eliot var get KEY | set KEY VALUE [--expect-version N] [--note T] | list PREFIX | watch PATTERN
 eliot who PATHSPEC... [--history N]
 eliot claim GLOB [--note T] [--ttl DUR] | eliot release [GLOB]
-eliot rule list|show|enable|disable|test ID [--event FILE] | eliot rules pause|resume
+eliot rule list|show|enable|disable|test ID [--event FILE]
+eliot rules pause|resume
 eliot timer list|run ID
-eliot discover [--harness H]                list native sessions on this machine not launched by Eliot
-eliot service list | stop NAME              proxies and native servers Eliot supervises (L2.7, L7.6)
-eliot worktree remove A                     remove a stopped agent's worktree (L3.2 rules)
-eliot doctor                                orphans, unused services, stale worktrees, disk use (L7.7)
-eliot daemon install | uninstall            per-user logon task (L7.8)
-eliot attach --harness H SCOPE/REF [--observe-only]   watch (and if supported, control) a session from `discover`
-eliot plugin NAME                           (internal) run a built-in plugin on stdio
-eliot plugin-test CMD... [--replay-dir DIR]  run the plugin conformance suite against any plugin command
-eliot hook --harness H --event E            (internal) hook shim: stdin JSON → daemon → stdout decision
-eliot detach A                              stop controlling A; its native session keeps running
-eliot mcp                                   MCP server on stdio for agents (L5.5); tools depend on the caller's control
+eliot discover [--harness H]
+eliot attach --harness H SCOPE/REF [--observe-only]
+eliot detach A
+eliot service list | stop NAME
+eliot worktree remove A
+eliot doctor
+eliot daemon install | uninstall
+eliot plugin NAME
+eliot plugin-test CMD... [--replay-dir DIR]
+eliot hook --harness H --event E
+eliot mcp
 ```
 
-Selectors: see [core](core.md#commands).
+Selectors are defined in [core](core.md#commands).
 
-`eliot` inside an agent: the daemon injects `ELIOT_HOME`, `ELIOT_AGENT_ID`,
-`ELIOT_AGENT_TOKEN` and puts `eliot` on `PATH`, so every harness that can run shell
-commands can use the CLI with no extra setup.
+Inside an agent, the daemon injects `ELIOT_HOME`, `ELIOT_AGENT_ID`,
+`ELIOT_AGENT_GENERATION`, `ELIOT_AGENT_TOKEN` and the `eliot` executable on PATH.
+Every harness with shell/tool execution can therefore use the same CLI. The CLI never
+falls back to owner when a token variable is present but rejected as stale.
