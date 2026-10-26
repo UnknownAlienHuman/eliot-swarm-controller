@@ -57,6 +57,7 @@ changes behavior; never append a contradictory addendum.
 | D-50 | Provider recovery probes are explicit owner/current-agent `send` or linked launch/resume input commands. Automation, wakeups and hidden model calls can never become probes. | Recovery must not spend tokens invisibly or clear a hold from mere session creation. |
 | D-51 | Advisory claims exist only while their exact generation is live and controlled; terminal, resume or detach releases them transactionally. | A detached/lost agent must not keep advertising current ownership. |
 | D-52 | Every external daemon mutation uses a canonical ULID receipt within a configured idempotency window. Pruning advances a monotonic ULID floor; retries below it reject instead of reapplying. Internal derived IDs follow their durable owner lifecycle. | Bounded retention must not turn an old lost-reply retry into a new external effect. |
+| D-53 | External mutation receipts and command identity are separate. External commands use `id=receipt_id=WriteId`; linked, selector-child and automation commands use derived ids with no fake receipt. Input/turn mappings outlive pruned command history independently. | A foreign key from every command to external receipts makes internal automation impossible and conflicts with result-retention requirements. |
 
 ## Defaults
 
