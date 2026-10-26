@@ -127,7 +127,7 @@ is stale and requires a new trigger or manual run.
 ```text
 queued → dispatched → applied | failed | unknown
 queued → cancelled
-unknown → applied | failed       // exact readback or explicit owner resolution
+unknown → applied | failed       // exact readback or explicit owner assertion
 ```
 
 Queued actions resume after restart. Dispatched becomes unknown. Unknown is never
@@ -151,16 +151,39 @@ request replies require exact request.
 | Action | Boundary |
 | --- | --- |
 | core verb | stable command id + frozen expected/target binding, routed under rule principal |
-| Git fetch/pull/push/worktree | explicit repo/ref/path intent; push never force; exact readback only |
+| Git fetch/pull/push/worktree | explicit repository/remote/ref/path intent; no force; exact desired-state readback only |
 | mail/var | concrete recipients/scope under rule principal |
 | script | fixed executable/argv/project-safe cwd; principal-scoped env; bounded streams; no unknown rerun |
 | log/desktop notify | bounded local result |
 | webhook | globally named endpoint; project must be allowlisted; no raw URL/secret in payload |
 | emit | bounded `x.user.*` in principal scope |
 
-Unknown Git settlement waits until exact process custody is empty. Push then reads the
-exact remote ref and never pushes again. One repository has a narrow writer hold while
-an earlier push is unknown.
+### External action readback
+
+Every process action records pre-state, intended state and exact custody before spawn.
+Readback begins only after that custody is proven empty; otherwise the action remains
+unknown.
+
+- `git.fetch`: explicit remote/refspec. After a lost reply, compare the requested local
+  tracking refs with a fresh read-only `ls-remote`. Equality proves the desired fetch
+  state is present; mismatch or remote movement during readback remains unknown. Never
+  refetch to settle.
+- `git.pull`: always fast-forward-only. Record pre-HEAD, branch and upstream. Applied
+  requires post-HEAD/worktree to equal the exact upstream OID established by readback;
+  a divergent/moved ref or another possible writer leaves unknown. Never rerun pull.
+- `git.push`: record intended local OID/ref before dispatch. Applied requires
+  `ls-remote` to show that exact OID at the exact remote ref. A different OID after a
+  lost reply is unknown, not failed and not another push. Force is unsupported.
+- `git.worktree`: applied requires exact normalized path, branch and expected HEAD in
+  `git worktree list --porcelain`; existing mismatch fails visibly.
+- `webhook`: send action id through the configured idempotency header when supported.
+  Eliot still does not retry automatically. Applied readback exists only when the
+  endpoint has a separately configured exact status lookup; otherwise lost response is
+  unknown.
+- generic script/process: no generic effect readback; lost outcome is unknown.
+
+One repository has a narrow writer hold while an older push/pull/worktree write is
+unknown. Read-only monitoring continues.
 
 ### Script environment and output
 
@@ -183,12 +206,46 @@ Script stdout actions are fully buffered, parsed, authority-checked and appended
 transaction after exit 0; only then are they dispatched. A lost script outcome is
 unknown and the script is not rerun.
 
-## Approval rules
+## Approval rules and synchronous hooks
 
-Request actions freeze generation/turn/request. A synchronous hook decision is a
-deadline-bound proposal returned only after its durable command/action admission
-commits. Timeout or Store failure returns native-safe `ask`; it never creates a delayed
-automatic approval and never chooses a default option.
+Asynchronous approval/answer actions are ordinary frozen actions and may execute later
+only while the exact generation/turn/request remains pending.
+
+A synchronous native hook is **not** implemented as an ordinary action that might run
+after the hook timed out. The hook path:
+
+1. receives stable native hook/request id plus exact generation/turn/request and an
+   absolute deadline;
+2. evaluates only matching bounded rules—no model call or external process;
+3. in one transaction validates the still-pending request and inserts/reuses a
+   non-dispatchable `hook_decision` proposal with `expires_at` before an internal
+   deadline margin;
+4. returns the proposal only if commit acknowledgement arrives before the native
+   deadline and the request remains pending;
+5. otherwise returns the native-safe default `ask` and never dispatches that proposal.
+
+A proposal has no scheduler/action state and can affect the native request only through
+the immediate hook response. If the response is lost and the native hook retries the
+same stable id before expiry, Eliot may return the same proposal. A late commit is
+expired/audit-only; it can never become delayed approve/deny. Native resolution later
+marks the proposal resolved. Store failure also returns `ask`.
+
+```sql
+CREATE TABLE hook_decisions (
+  id TEXT PRIMARY KEY,                  -- derived from harness/request/hook invocation
+  agent INTEGER NOT NULL,
+  generation INTEGER NOT NULL,
+  turn_id TEXT,
+  request_id TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  rule TEXT NOT NULL,
+  rule_revision TEXT NOT NULL,
+  state TEXT NOT NULL,                 -- proposed|returned|expired|resolved
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER
+);
+```
 
 ## Goal loop
 
@@ -217,7 +274,9 @@ required. A round is an `automation_run` under principal `goal:<agent>`:
 7. re-read generation/revision and admit one exact send if unchanged.
 
 Stable goal-run identity prevents duplicate continuation. Pause, clear or generation
-change invalidates a running check before send admission.
+change invalidates a running check before send admission. A turn budget increments only
+when the exact goal-linked input is associated with a turn; an unknown input/turn does
+not silently consume or refund the budget and blocks the round until resolution.
 
 ## Level reconciliation
 
@@ -297,9 +356,12 @@ CREATE TABLE goals (
 );
 ```
 
-Retired rule/timer revisions may be pruned only after no open/unknown run references
-them and their event/time interval can no longer be revisited. Open and unknown
-runs/actions are never removed by history retention.
+Terminal event/timer runs and action payloads may be pruned after configured history
+only when the trigger is irrevocably behind the relevant event cursor or timer key and
+no open/unknown action references them. Retired revisions may then be pruned when their
+interval cannot be revisited. Open/unknown runs/actions and unresolved hook proposals
+are never removed by history retention. Manual run ids remain subject to the general
+write-id retention policy.
 
 ## Guardrails
 
