@@ -2,7 +2,7 @@
 
 ## Private data directory
 
-Default `%LOCALAPPDATA%\Eliot` (Windows) or `~/.local/share/eliot`; override with
+Default `%LOCALAPPDATA%\Eliot` on Windows or `~/.local/share/eliot`; override with
 `--data-dir` / `ELIOT_HOME`. Create current-user-only permissions/ACL and refuse
 symlink/reparse-point roots or unsafe ownership. Logs are private, rotated and bounded.
 
@@ -21,14 +21,16 @@ checkout. Invalid reload keeps the last valid revision and reports health.
 ## Configuration authority
 
 Global config owns daemon/process/Store/Git limits, projects, accounts, plugins,
-proxies, services, webhooks, allowed environment names and base profiles.
+proxies, services, webhooks, base profiles and the global automation environment
+allowlist.
 
 Project config may only:
 
 - define/replace profiles whose names are in that project's `profiles_allow`;
 - narrow permissions, control, labels, workspace mode, model/effort and limits;
 - select only that project's allowed global account/proxy/profile references;
-- add nonsecret literal env values and `pass_env` names from the project's allowlist;
+- add nonsecret literal environment values and `pass_env` names from the project's
+  allowlist;
 - set project-local setup/scratch/system-note paths.
 
 Project config cannot define executable `cmd`, plugin instances/private config,
@@ -38,7 +40,7 @@ principal, never owner by omission.
 
 A project agent/rule may launch only an effective profile named in
 `[projects.<name>].profiles_allow`. The router checks this even when the profile exists
-globally. Owner may launch any global profile. This prevents project control from
+globally. The owner may launch any global profile. This prevents project control from
 selecting a profile carrying another project's account, inherited environment, plugin
 command or proxy credentials.
 
@@ -57,6 +59,7 @@ automation.max_actions_per_minute = 120
 automation.max_parallel_checks = 2
 automation.check_timeout = "10m"
 automation.max_event_backlog = 100000
+automation.script_pass_env_allow = []   # global script ceiling; project also needs its own allow
 
 [process]
 scan_interval = "2s"
@@ -127,19 +130,32 @@ labels = { role = "manager" }
 
 ## Environment and secrets
 
-Default `env_mode="minimal"`; do not inherit the daemon's complete environment.
-Baseline contains only OS spawn essentials (PATH, home/profile, system root, temp,
-locale and required certificate variables). Additional values are explicit:
+Default `env_mode="minimal"`; do not inherit the daemon's complete environment. The
+baseline contains only OS spawn essentials: PATH, home/profile, system root, temp,
+locale and required certificate variables. Additional values are explicit:
 
 - `env`: literal nonsecret values;
-- `pass_env`: copy a globally/project-allowed daemon variable at execution and treat it
-  as secret;
-- `secret_env`: literal env names whose values require masking;
+- profile `pass_env`: copy a globally/project-allowed daemon value at launch and treat
+  it as secret;
+- script environment references: resolve only after automation-principal validation;
+- `secret_env`: literal environment names whose values require masking;
 - proxy/account/plugin credentials: automatically secret and delivered only to the
-  process/session needing them;
+  process/session that needs them;
 - agent/automation token: automatically secret.
 
-`env_mode="inherit"` is global-owner opt-in for a trusted global profile and is shown
+The script rule is deliberately stricter than profile launch:
+
+- global scripts may reference only names in
+  `daemon.automation.script_pass_env_allow`;
+- project scripts may reference only names present in **both** that global list and the
+  project's `pass_env_allow`;
+- validation happens before reading the daemon environment or starting a process;
+- a returned script action cannot request another environment reference.
+
+Thus a credential made available to one profile or project is not implicitly available
+to another project's script.
+
+`env_mode="inherit"` is a global-owner opt-in for a trusted global profile and is shown
 as a warning. Secret values shorter than the configured safe redaction minimum are
 rejected for managed injection rather than pretending exact value redaction is
 reliable. Agent tokens have a prefixed high-entropy format that is pattern-redacted
@@ -156,8 +172,9 @@ shared account and proxy/service caps. Starting, live and unresolved-unknown sta
 incarnations retain reservations until exact terminal/readback; a crash cannot release
 capacity merely by losing a process handle.
 
-If account is omitted, profile becomes the scope and status warns that cross-profile
-sharing is unknown. Project principals may use only allowed account/proxy references.
+If account is omitted, the profile becomes the scope and status warns that
+cross-profile sharing is unknown. Project principals may use only allowed account/proxy
+references.
 
 ```sql
 CREATE TABLE provider_holds (
@@ -171,20 +188,20 @@ CREATE TABLE provider_holds (
 );
 ```
 
-A hold blocks new provider-backed launch/send/goal continuation in its proven scope;
-it never blocks stop/interrupt/request replies/readback or local checks. Unknown
-coverage holds only the exact observed route/profile. After `retry_after`, the first
-explicit queued/user send may atomically become the probe. Mail wake, parent notice,
-timer or hidden model call is never selected as a probe. Probe clears hold only after
-an exact successful provider-backed turn; unknown keeps the hold and probe command
-visible. Auth/model-gone without recovery evidence requires an explicit owner/config
-change rather than a timed probe. Restart restores all hold/probe state.
+A hold blocks new provider-backed launch/send/goal continuation in its proven scope; it
+never blocks stop/interrupt/request replies/readback or local checks. Unknown coverage
+holds only the exact observed route/profile. After `retry_after`, the first explicit
+queued/user send may atomically become the probe. Mail wake, parent notice, timer or
+hidden model call is never selected as a probe. The probe clears only after an exact
+successful provider-backed turn; unknown keeps the hold and probe command visible.
+Auth/model-gone without recovery evidence requires an explicit owner/config change
+rather than a timed probe. Restart restores all hold/probe state.
 
 ## Profiles and paths
 
-One-level `extends`; project profile replaces the global profile as a whole after
-project-authority validation. Unknown keys are errors except plugin-private global
-keys validated at initialize. Names, labels, argv/env counts/values are bounded.
+One-level `extends`; a project profile replaces the global profile as a whole after
+project-authority validation. Unknown keys are errors except plugin-private global keys
+validated at initialize. Names, labels, argv/environment counts and values are bounded.
 
 `setup`, `scratch`, scripts and system notes are repository-relative and reject
 absolute paths, `..`, symlink escape and platform alternate-stream/device forms.
@@ -192,23 +209,23 @@ Different Rust worktrees use distinct `CARGO_TARGET_DIR`s.
 
 ## Plugins, services and webhooks
 
-External plugin `cmd` is global-only. `instances` is shared-mode only; per-agent gets a
-private instance/data directory per generation. Operator cannot override returned
-custody mode. Shared control must prove per-session environment, identity, readback and
-isolated stop.
+External plugin `cmd` is global-only. `instances` is shared-mode only; per-agent mode
+gets a private instance/data directory per generation. The operator cannot override
+returned custody mode. Shared control must prove per-session environment, identity,
+readback and isolated stop.
 
-`attach` service is owner-run and never stopped/reconfigured. `launch` service has
+An `attach` service is owner-run and never stopped/reconfigured. A `launch` service has
 separate managed custody and persisted endpoint/process identity. Agent stop never
 stops a shared service.
 
-Webhook actions store a globally named endpoint, not URL/header/secret. Project
+Webhook actions store a globally named endpoint, not URL/header/secret. A project
 principal may use only its allowlist. The action id is sent through a configured
 idempotency header when supported; otherwise a lost response remains unknown and is
 never retried.
 
-## Store/WAL limits
+## Store and WAL limits
 
-Daemon passive-checkpoints, records WAL/database size and tracks Eliot-owned readers.
-Replays paginate/release transactions. Warning pressure is visible. At hard size reject
-new long reads while preserving short control/result commits. Never delete evidence,
-kill an unknown reader or blind-truncate with active readers.
+The daemon passive-checkpoints, records WAL/database size and tracks Eliot-owned
+readers. Replays paginate and release transactions. Warning pressure is visible. At
+hard size, reject new long reads while preserving short control/result commits. Never
+delete evidence, kill an unknown reader or blind-truncate with active readers.
