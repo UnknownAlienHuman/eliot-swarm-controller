@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate local links and GitHub-style heading anchors in active v2 docs."""
+"""Validate active v2 Markdown links and GitHub-style heading anchors."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def strip_fenced_lines(text: str) -> list[tuple[int, str]]:
 
 
 def strip_inline_code(line: str) -> str:
-    """Replace complete backtick spans so link-looking code is not validated."""
+    """Replace complete backtick spans so link-looking code is ignored."""
     chars = list(line)
     index = 0
     while index < len(chars):
@@ -83,18 +83,16 @@ def heading_plain_text(value: str) -> str:
     value = html.unescape(value)
     value = MARKDOWN_LINK_TEXT_RE.sub(r"\1", value)
     value = HTML_TAG_RE.sub("", value)
-    value = value.replace("*", "")
-    return value.strip()
+    return value.replace("*", "").strip()
 
 
 def github_slug(value: str) -> str:
-    value = heading_plain_text(value).lower()
-    value = GITHUB_PUNCT_RE.sub("", value)
+    value = GITHUB_PUNCT_RE.sub("", heading_plain_text(value).lower())
     return value.replace(" ", "-")
 
 
 def anchors(path: Path, text: str) -> set[str]:
-    del path  # reserved for future per-file diagnostics
+    del path
     counts: defaultdict[str, int] = defaultdict(int)
     result: set[str] = set()
     for _, line in strip_fenced_lines(text):
@@ -115,16 +113,36 @@ def destination_token(raw: str) -> str:
         if end == -1:
             raise ValueError("unterminated angle-bracket destination")
         return raw[1:end]
-    # Optional Markdown title follows whitespace. Repository-relative paths use
-    # percent-encoding rather than literal spaces.
     return raw.split(maxsplit=1)[0]
+
+
+def validate_destination_syntax(destination: str) -> None:
+    if "\x00" in destination or any(ord(char) < 0x20 for char in destination):
+        raise ValueError("control character in destination")
+    if destination.startswith("//"):
+        raise ValueError("protocol-relative URL is forbidden; use explicit https://")
+
+    split = urlsplit(destination)
+    if split.netloc and not split.scheme:
+        raise ValueError("network location without an explicit allowed scheme")
+
+    scheme = split.scheme.lower()
+    if scheme and scheme not in ALLOWED_EXTERNAL_SCHEMES:
+        raise ValueError(f"unsupported or unsafe URI scheme '{scheme}'")
+
+    if not scheme:
+        decoded_path = unquote(split.path)
+        if "\\" in decoded_path:
+            raise ValueError("repository-relative links must use '/' separators")
+        if decoded_path.startswith("~"):
+            raise ValueError("ambiguous home-relative destination")
 
 
 def resolve_target(source: Path, destination: str) -> tuple[Path, str]:
     split = urlsplit(destination)
     fragment = unquote(split.fragment)
     relative = unquote(split.path)
-    target = source if not relative else (source.parent / relative)
+    target = source if not relative else source.parent / relative
     target = target.resolve()
     try:
         target.relative_to(ROOT.resolve())
@@ -149,7 +167,7 @@ def main() -> int:
     files = active_markdown_files()
     heading_sets: dict[Path, set[str]] = {}
     errors: list[str] = []
-    link_count = 0
+    local_link_count = 0
 
     for path in files:
         try:
@@ -164,25 +182,18 @@ def main() -> int:
             for raw in line_destinations(line):
                 try:
                     destination = destination_token(raw)
+                    if not destination:
+                        continue
+                    validate_destination_syntax(destination)
                 except ValueError as error:
                     errors.append(f"{path.relative_to(ROOT)}:{line_number}: {error}")
                     continue
-                if not destination:
-                    continue
 
                 split = urlsplit(destination)
-                scheme = split.scheme.lower()
-                if scheme:
-                    if scheme not in ALLOWED_EXTERNAL_SCHEMES:
-                        errors.append(
-                            f"{path.relative_to(ROOT)}:{line_number}: unsupported or unsafe "
-                            f"URI scheme '{scheme}'"
-                        )
-                    continue
-                if destination.startswith("//"):
+                if split.scheme:
                     continue
 
-                link_count += 1
+                local_link_count += 1
                 try:
                     target, fragment = resolve_target(path, destination)
                 except ValueError as error:
@@ -220,7 +231,10 @@ def main() -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
 
-    print(f"Validated {len(files)} active Markdown files and {link_count} local links/anchors.")
+    print(
+        f"Validated {len(files)} active Markdown files and "
+        f"{local_link_count} local links/anchors."
+    )
     return 0
 
 
