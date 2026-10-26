@@ -155,9 +155,11 @@ rejects weaker substitution.
 
 ## L5 — Coordination
 
-- [ ] **Mailbox.** Bounded selector expansion, `off|notice|full|parent` delivery;
-      notice only for directly routed Agents; capability-aware presentation, immutable
-      bounded batch + ack, restart reconciliation, retention/gaps and secret rejection.
+- [ ] **Mailbox.** Bounded selector expansion; `wake_on_mail=false` queue-only;
+      routed Agents receive one coalesced notice; routing-disabled native children use
+      routed parent relay or remain queue-only; full content requires explicit
+      inject/send/steer control; immutable bounded batch + ack, restart reconciliation,
+      retention/gaps and secret rejection.
 - [ ] **Variables.** Project/tree/global bounded CAS with exact principal/generation.
 - [ ] **Who/claims.** Live-controlled current edits + Git/history, project-relative
       generation claims with uniqueness/conflict mail and transactional release.
@@ -229,8 +231,9 @@ one complete qualification campaign.
 - [ ] global/project overlay/account/proxy/script/webhook escape negatives;
 - [ ] timer/Goal/mail/workspace/launch/provider startup reconciliation;
 - [ ] every action/check/script crash phase and no external replay;
-- [ ] routed notice vs routing-disabled full/parent/off, lost inbox/ack and one open
-      batch; edits/turn results across retention/restart.
+- [ ] routed notice, routing-disabled parent relay/queue-only, explicit full control
+      delivery, lost inbox/ack and one open batch; edits/turn results across retention/
+      restart.
 
 ### Plugins, platform and live paths
 
