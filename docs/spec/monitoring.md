@@ -6,13 +6,14 @@ fact owned by another source.
 ## Source ownership
 
 For each `(agent,generation,event family)` exactly one source is authoritative. The
-owner and last committed native cursor/watermark are stored in the current source
-projection. A backup may track raw position privately but does not publish duplicate
-lifecycle.
+owner, daemon-issued source key, Store source-sequence watermark and last native
+cursor/watermark are stored in the current source projection. A backup may track raw
+position privately but does not publish duplicate lifecycle.
 
-Handoff begins strictly after the last committed cursor. An unprovable interval is a
-visible gap. Wrong-generation, wrong-turn/request and duplicate native events are
-bounded diagnostics, never normal lifecycle or automation triggers.
+Handoff begins strictly after the last committed native cursor. An unprovable interval
+is a visible gap. Wrong-generation, wrong-turn/request, stale source sequence and
+vendor-replay duplicates are bounded diagnostics, never normal lifecycle or automation
+triggers.
 
 ## Process identity and custody projections
 
@@ -42,7 +43,7 @@ CREATE TABLE custodies (
   guardian_boot TEXT,
   guardian_pid INTEGER,
   guardian_start INTEGER,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL,                 -- live|stopping|empty|orphan_possible|unknown
   updated_at INTEGER NOT NULL
 );
 
@@ -75,34 +76,36 @@ registered. Before any no-token owner fallback, the API server:
 2. looks for that exact identity in `processes`;
 3. if no row exists, performs a live OS membership check against every current Eliot
    custody owned by the daemon:
-   - Windows: open/pin the peer process and call `IsProcessInJob` for live Job handles;
-   - Linux exact: read the pinned peer's cgroup membership and compare with registered
-     Eliot cgroups;
+   - Windows: open/pin the peer and call `IsProcessInJob` for live Job handles;
+   - Linux exact: read the pinned peer's cgroup and compare with registered Eliot
+     cgroups;
    - degraded process-group mode: compare the pinned peer's PGID with registered live
-     groups, without upgrading the backend's containment guarantee;
+     groups, without upgrading containment guarantees;
 4. rechecks peer birth/liveness after classification;
 5. grants no-token owner identity only when the peer is the local OS user and is
    **definitively not a member** of any current Eliot custody.
 
 Membership maps the call to that custody principal and requires its matching scoped
 token. Any access failure, PID/birth race, incomplete backend inventory or otherwise
-ambiguous membership rejects the call as `caller_identity_unknown`; absence from the
-projection never becomes owner authority. Containment is applied before child execution,
-so registration lag cannot create an authority window.
+ambiguous membership rejects as `caller_identity_unknown`; absence from the projection
+never becomes owner authority. Containment is applied before child execution, so
+registration lag cannot create an authority window.
 
 A shared-service process still needs an exact per-session token because service custody
 is not an agent identity. An arbitrary same-user process outside Eliot custody remains
-inside the declared one-user trust boundary; this mechanism prevents accidental
-principal escalation by Eliot-managed descendants.
+inside the declared one-user trust boundary. In degraded mode a process that deliberately
+escapes its group is outside the containment guarantee; ordinary managed children retain
+their injected token, and status reports the degraded boundary rather than claiming
+hostile same-user isolation.
 
 ## Process custody backends
 
 ### Windows exact
 
 Per-agent plugin and descendants enter a no-breakaway Job before execution resumes.
-Every script/Git/check/workspace action gets its own Job as well. Daemon-owned stdio
-Jobs use kill-on-close; managed services use separate named non-killing Jobs. Force stop
-verifies boot-scoped identities and zero active members.
+Every script/Git/check/workspace action gets its own Job. Daemon-owned stdio Jobs use
+kill-on-close; managed services use separate named non-killing Jobs. Force stop verifies
+boot-scoped identities and zero active members.
 
 ### Linux exact and degraded
 
@@ -116,9 +119,9 @@ blocks new exact launches and visibly downgrades existing groups; the daemon nev
 silently keeps claiming owner-death cleanup.
 
 Process-group fallback may observe and gracefully stop non-escaping members. A
-same-user child can call `setsid`, so capability is degraded: exact force and
-kill-on-owner-death are unsupported. Other Unix platforms remain degraded until an
-exact backend is qualified.
+same-user child can call `setsid`, so capability is degraded: exact force,
+kill-on-owner-death and proof that all descendants are gone are unsupported. Other Unix
+platforms remain degraded until an exact backend is qualified.
 
 ### Shared services
 
@@ -128,6 +131,22 @@ service custody/process projection is separate from agent/action owners.
 
 ## Process observation and terminal settlement
 
+Session lifecycle and descendant containment are related but distinct:
+
+- A generation becomes `stopped` only from an exact native terminal/close result or
+  exact readback that the session ended normally.
+- A generation becomes `lost` when control of that exact native session is proven gone:
+  - exact backend empty plus authoritative source drained/gapped;
+  - shared-session readback says native subject absent; or
+  - degraded backend: the exact controlling plugin/native-controller process identities
+    are gone and their authoritative channel reached EOF/gap, even though escaped tool
+    descendants cannot be ruled out.
+- In the degraded third case, custody becomes `orphan_possible` and is shown by
+  `status/doctor`; `lost` describes session control, **not** proof that every descendant
+  died. It does not make `--force` exact or report clean process cleanup.
+
+Additional rules:
+
 - Plugins register PIDs through commit-acknowledged process facts; the host verifies and
   tags current boot id and exact start identity before commit.
 - Exact custody enumerates the complete container; prior-boot rows are historical.
@@ -135,8 +154,8 @@ service custody/process projection is separate from agent/action owners.
 - Unknown exit code stays unknown.
 - Process exit and final native output may race. Drain the authoritative source to EOF
   or a bounded terminal deadline.
-- Timeout is not terminal silence evidence. Mark a gap and emit lost only when exact
-  custody is empty or exact shared-session readback says absent.
+- Timeout is not terminal silence evidence. It marks a source gap; one of the exact/
+  shared/degraded control-loss conditions above must still hold.
 - A live shared server says nothing about one session.
 - Late terminal data after source closure is diagnostic only.
 
@@ -227,17 +246,20 @@ Only exact-generation model progress updates `last_progress_at`.
 | no progress while busy/waiting | stalled flag only |
 | parent idle, child busy | parent idle; tree incomplete |
 | process alive, stream disconnected | source stale; state unchanged |
-| exact boot-scoped custody empty + source drained/gapped | lost for generation |
+| exact custody empty + source drained/gapped | lost; no possible descendants in that custody |
+| degraded controller gone + source EOF/gap | lost session control; custody `orphan_possible` |
 | shared server live, session readback unknown | stale/unknown, not lost |
 | handoff gap | explicit gap; no inferred event |
-| old boot/generation/duplicate | historical diagnostic only |
+| old boot/generation/source sequence | historical diagnostic only |
 
 ## Restart reconciliation
 
 1. compute current boot id; prior-boot live rows cannot match;
 2. reopen exact named custody/service/guardian identities for the current boot;
-3. reattach shared/service sessions and snapshot commands, native inputs and turns;
-4. settle missing owned groups only after source-drain rules;
+3. reattach shared/service sessions and snapshot commands, native inputs, turns and
+   plugin source watermarks;
+4. settle missing exact groups or degraded controller loss only under the terminal rules
+   above; preserve `orphan_possible` separately;
 5. reconcile preparing/unknown workspaces;
 6. rebuild Git facts and load edit projection;
 7. keep dispatched command/action/workspace effects unknown until readback.
@@ -245,5 +267,6 @@ Only exact-generation model progress updates `last_progress_at`.
 ## Views
 
 Expose boot-scoped process identity, custody owner, generation/turn/input gate/open
-stop/workspace state, exact/degraded custody/guardian, source gaps, model progress,
-usage, branch/edit, provider holds, caller-classification failures and Store/WAL health.
+stop/workspace state, exact/degraded custody/guardian, orphan possibility, source
+keys/gaps/watermarks, model progress, usage, branch/edit, provider holds,
+caller-classification failures and Store/WAL health.
