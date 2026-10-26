@@ -9,7 +9,7 @@ Wire names are `snake_case`; every persisted integer fits SQLite signed 64-bit.
 | --- | --- | --- |
 | `AgentId` | `a<1..i64::MAX>` | Store counter; stable logical row. |
 | generation | `0..i64::MAX` | 0 before first native start; first incarnation 1; explicit resume increments. |
-| external command/write id | 1–128 UTF-8 bytes | Same id + canonical payload returns original admission; different payload invalid. |
+| external `WriteId` | canonical 26-char ULID | Required for every external mutation; timestamp must be above the Store idempotency floor and within allowed future skew. |
 | internal derived id | `d_` + unpadded base32 BLAKE3-256 | Domain tag + length-delimited canonical components; parent identity stays in columns/cause. |
 | event `seq`, message id | positive signed-64 Store counter | Transactional allocation; never `MAX(id)+1`. |
 | native subject | bounded `(native_scope,native_ref)` | Canonical vendor store/server namespace + opaque session/thread id. Scope changes before refs can be reused. |
@@ -17,6 +17,28 @@ Wire names are `snake_case`; every persisted integer fits SQLite signed 64-bit.
 A counter allocation that would require `i64::MAX + 1` fails `id_exhausted` before any
 row is created. A derived-id collision with a different canonical payload is an
 integrity failure, never idempotent success.
+
+### External write idempotency and retention
+
+Every owner/agent/API mutation carries a canonical ULID before the request leaves the
+client. The CLI uses a persisted monotonic ULID generator seeded from the daemon's
+`write_id_floor_ms`; normal local clock rollback therefore cannot recreate an expired
+range. A first admission rejects an id whose embedded timestamp is:
+
+- at or below the persisted floor;
+- older than the configured idempotency window; or
+- farther in the future than the configured skew allowance.
+
+The mutation transaction inserts one compact `write_receipts` row containing principal,
+method and a canonical BLAKE3-256 payload digest before creating the domain rows. Same
+id + same principal/method/payload returns the original/current result. Any mismatch is
+`id_conflict`.
+
+Terminal domain history may be pruned before the receipt. The receipt then retains one
+bounded sanitized final result. When expired receipts are deleted, the same transaction
+advances `write_id_floor_ms` monotonically through their largest ULID timestamp. A later
+retry of a pruned id is `id_expired`, never a fresh effect. Internal derived ids are not
+ULIDs; their owning rule/action/source objects define their safe pruning boundary.
 
 ## Canonical native subject
 
@@ -230,7 +252,8 @@ Input text is at most 512 KiB UTF-8; larger content is file-referenced.
 
 ```text
 Command {
-  id, target?, selector?, expected_generation?, generation?, turn_id?, request_id?,
+  id: WriteId,
+  target?, selector?, expected_generation?, generation?, turn_id?, request_id?,
   verb, args, origin, cause?, state, outcome?, created_at, updated_at
 }
 state = accepted → [queued →] dispatched → applied | rejected | failed | unknown
@@ -261,10 +284,31 @@ Verify application/schema identity before WAL. Read connections use foreign keys
 `query_only`, bounded pages/deadlines and release transactions before network waits.
 
 ```sql
+CREATE TABLE store_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+-- store_meta['write_id_floor_ms'] is a monotonically increasing integer string.
+
 CREATE TABLE id_counters (
   name TEXT PRIMARY KEY,
   next INTEGER NOT NULL CHECK(next BETWEEN 1 AND 9223372036854775807)
 );
+
+CREATE TABLE write_receipts (
+  id TEXT PRIMARY KEY,
+  id_time INTEGER NOT NULL,
+  principal TEXT NOT NULL,
+  method TEXT NOT NULL,
+  payload_digest BLOB NOT NULL CHECK(length(payload_digest) = 32),
+  state TEXT NOT NULL,                 -- open|final
+  result_ref TEXT,
+  final_result TEXT,                   -- bounded sanitized result after domain pruning
+  admitted_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX write_receipts_expiry ON write_receipts(admitted_at)
+  WHERE state = 'final';
 
 CREATE TABLE agents (
   id INTEGER PRIMARY KEY,
@@ -336,7 +380,7 @@ CREATE TABLE plugin_source_watermarks (
 );
 
 CREATE TABLE commands (
-  id TEXT PRIMARY KEY,
+  id TEXT PRIMARY KEY REFERENCES write_receipts(id),
   target INTEGER, selector TEXT,
   expected_generation INTEGER, generation INTEGER,
   turn_id TEXT, request_id TEXT,
@@ -389,6 +433,17 @@ CREATE TABLE turn_inputs (
 );
 ```
 
+Every external mutation inserts/reads its `write_receipts` row in the same transaction
+as the mutation. An open receipt follows its domain object; terminalization updates a
+bounded sanitized summary. Domain rows may be removed only after no projection/open
+reference needs them. The receipt remains until its idempotency window expires.
+
+Receipt pruning computes the largest pruned ULID timestamp P and sets
+`write_id_floor_ms=max(old_floor,P)` in the same transaction before deleting. New or
+retried IDs at/below the floor reject. The CLI learns the floor during daemon handshake
+and generates a monotonic ULID greater than it; a first request with excessive future
+skew rejects.
+
 `event.put` locks/reads the source watermark, validates sequence/digest and commits the
 new watermark, event and projection changes in one transaction. A duplicate of the one
 possible unacknowledged sequence returns `last_event_seq`; older source state is rejected
@@ -419,6 +474,6 @@ long reads and exposes the pin—never deleting evidence or blind-truncating act
 readers.
 
 Event retention follows the minimum active automation cursor. Paused/disabled rules
-advance by policy. Current native input/edit/turn state and plugin-source watermarks
-live in compact projections independent of event rows. Native stores are never
-generically cleaned.
+advance by policy. Current native input/edit/turn state, write receipts and plugin-source
+watermarks live in compact projections independent of event rows. Native stores are
+never generically cleaned.
