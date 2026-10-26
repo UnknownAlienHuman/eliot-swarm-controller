@@ -23,8 +23,8 @@ One native subject maps to one Agent row for its history. Observe clients subscr
 that row. Attach returns/upgrades it; detach changes control. Resume retains the same
 subject; a different native subject is a fork/new Agent.
 
-Native child registration includes child scope/ref. If child ids are parent-local,
-scope includes exact parent subject. Parent generation is provenance.
+Native child registration includes child scope/ref. Parent-local child ids use a scope
+containing the exact parent native subject. Parent generation is provenance.
 
 ## Agent
 
@@ -45,10 +45,9 @@ Agent {
 }
 ```
 
-Generation 0 has no routing token. First-start/resume dispatch stores only a
-constant-time-comparable hash and returns one raw high-entropy
-`eliot_at_<base64url>` token for injection. The prefix remains pattern-redactable after
-restart. Invalid/stale supplied token is rejected, never owner authority.
+Generation 0 has no routing token. First-start/resume stores only a constant-time hash
+and returns one raw high-entropy `eliot_at_<base64url>` token for injection. Prefix is
+pattern-redactable after restart. Invalid/stale supplied token is rejected, never owner.
 
 ### States
 
@@ -75,15 +74,21 @@ observed state, not as synthetic `stopping`.
 Resume expects g and targets g+1; row moves only when dispatch commits. One open resume.
 Cancelling queued resume also cancels linked send and leaves g unchanged.
 
-If reconnect/readback proves session exists but cannot prove active turn terminal
-outcome, turn becomes `unknown`. Live Agent remains busy/waiting and blocks new send/
-goal continuation for that generation; interrupt/stop/readback remain available. Exact
-history may settle it. Owner `turn.resolve` is allowed only when native turn is proven
-not active, or generation is terminal. It records `turn.resolved`, not a fabricated
-plugin completion.
+An admitted async input that has reached a vendor inbox but is not yet associated with
+an exact native turn keeps its `send` command `dispatched`. The per-agent input gate
+blocks another send/configuration/goal continuation, while stop/readback remain allowed.
+The plugin replies applied only after an exact `turn.started`/execution association.
+Deadline after possible inbox admission makes the command unknown, not retried, and the
+same gate remains until readback proves its turn or proves no effect.
 
-Terminal generation may retain unknown historical turn. Resume may start a new
-generation; unknown never crosses generations. Generation-bound goals pause on change.
+If reconnect proves session exists but cannot prove active turn terminal outcome, turn
+becomes `unknown`. Live Agent remains busy/waiting and blocks new send/goal for that
+generation; interrupt/stop/readback remain. Exact history may settle it. Owner
+`turn.resolve` is allowed only when native turn is proven not active or generation is
+terminal; it records `turn.resolved`, not fabricated plugin completion.
+
+Terminal generation may retain unknown historical turn. Resume can start new
+generation; unknown never crosses generation. Generation-bound goals pause on change.
 
 Wrong generation/turn/request/source and duplicate native input never enters normal
 lifecycle. At most one bounded diagnostic is emitted. Only model progress updates
@@ -103,8 +108,8 @@ Profile {
 ```
 
 Environment/account semantics are in [configuration](configuration.md). Profile cap is
-local narrowing; account/proxy caps are shared. Requested/effective route facts remain
-separate; Eliot never silently substitutes them.
+local narrowing; account/proxy caps shared. Requested/effective route facts remain
+separate; Eliot never silently substitutes.
 
 ## Events
 
@@ -112,46 +117,43 @@ separate; Eliot never silently substitutes them.
 Event { seq?, ts, kind, agent?, generation?, source, native_id?, cause?, subject?, data }
 ```
 
-`subject` is bounded event-time projection for deterministic replay: project, harness,
-profile, labels, state, workspace/branch and allowlisted match fields. Rules never join
-a later mutable Agent row.
+`subject` is bounded event-time projection for deterministic replay. Rules never join a
+later mutable Agent row.
 
-Known secrets and `eliot_at_...` pattern are masked in native output/logs. Semantic
-durable writes containing a known secret reject rather than storing altered text.
+Known secrets and token pattern are masked in native output/logs. Semantic durable
+writes containing known secret reject rather than storing altered text.
 
-A persisted plugin lifecycle event requires authoritative source, current exact
+A persisted plugin lifecycle event requires authoritative source, exact current
 binding, stable per-event native id (vendor event id or persisted cursor/offset), and no
 existing `(agent,generation,kind,native_id)`. Source without stable identity may publish
 ephemeral diagnostics but not replay-safe lifecycle.
 
-`turn.started` carries `input_commands:[...]` when known. A harness may associate
-additional already-admitted inputs with the same running turn using an exact
-`turn.inputs` event. The same command can belong to at most one turn. This supports
-native servers that coalesce several queued inputs into one execution without
-pretending there were several terminal turns.
+`turn.started` carries `input_commands:[...]` when known. Additional already-admitted
+inputs may associate through exact `turn.inputs`. Same command belongs to at most one
+turn. This handles native coalescing without inventing several terminal turns.
 
 Main families include session/agent/turn/message/tool/file/plan/request/child/goal/
-usage/provider/process/Git/source plus command/rule/action/mail/var/claim. `turn.resolved`
-is daemon/owner evidence. Cost is integer micro-USD. Provider limitation includes
-kind/scope/coverage/route/account/retry time; unknown coverage holds only observed route.
+usage/provider/process/Git/source plus command/rule/action/mail/var/claim.
+`turn.resolved` is daemon/owner evidence. Cost is integer micro-USD. Provider limitation
+includes kind/scope/coverage/route/account/retry time.
 
 ## Verbs and linked initial input
 
-Launch/resume with optional text creates session command plus linked send targeting new
-generation. Normally send waits for ready. `start_requires_input` plugin receives linked
-command in start, but session/input outcomes remain separate. Ready never proves input.
+Launch/resume with optional text creates session command + linked send. Normally send
+waits for ready. `start_requires_input` plugin receives linked command in start, but
+session/input outcomes remain separate. Ready never proves input.
 
 | Verb | Semantics |
 | --- | --- |
 | launch | create row and start generation 1 after preflight/capacity/workspace readiness |
-| send | one admitted input; FIFO while busy; may be coalesced by native turn; never crosses generation |
+| send | one input; FIFO; command applies only when associated with exact native turn/execution; never crosses generation |
 | steer/inject/interrupt | exact current-turn/native-safe-point semantics only |
 | stop | exact generation; force only with qualified custody/native isolation |
 | resume | next generation from same canonical subject |
 | approve/deny/answer | exact pending request |
-| configure | report application point/effective readback |
-| goal.* | generation-bound native/Eliot goal control |
-| cancel | withdraw queued input/command; linked dependants settle transactionally |
+| configure | report application point/effective readback; blocked by unresolved input |
+| goal.* | generation-bound goal control; continuation blocked by unresolved input/turn |
+| cancel | withdraw queued command only; vendor-inbox input requires native cancel/readback |
 | detach | release control of same canonical row |
 | compact/fork/background | native-only declared semantics |
 
@@ -169,17 +171,17 @@ state = accepted → [queued →] dispatched → applied | rejected | failed | u
 ```
 
 Ordinary expected=target generation. Launch targets 1. Resume expects g/targets g+1.
-Ready native calls serialize. Queued inputs remain FIFO but do not block exact current
-controls/answers/configuration.
+Ready calls serialize. Queued inputs remain FIFO and do not block current controls, but
+one dispatched/unknown input gate blocks later send/configure/goal in that generation.
 
 Rejected means no native I/O; failed exact no-effect; unknown may have applied and is
 never retried. Restart makes dispatched unknown. Generation change stales older queued.
 Exact readback or owner resolution settles unknown; time/new generation does not infer.
 
-Send applied means input admission, not turn success. Turn outcome and command→turn
-mapping live in turn projections. Resolving send never manufactures terminal state.
-Resolving start applied does not synthesize ready/native identity; linked send remains
-blocked until exact ready/attach.
+For send, applied means exact association to a native turn/execution, not terminal
+success. Turn outcome and command→turn mapping live in turn projections. Resolving send
+never manufactures terminal state. Resolving start applied does not synthesize ready;
+linked send remains blocked until exact ready/attach.
 
 Selectors expand transactionally; automation stores concrete targets/bindings.
 
@@ -268,15 +270,16 @@ CREATE TABLE turn_inputs (
   command_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
   ordinal INTEGER NOT NULL,
   PRIMARY KEY(agent,generation,turn_id,command_id),
+  UNIQUE(agent,generation,turn_id,ordinal),
   FOREIGN KEY(agent,generation,turn_id)
     REFERENCES turns(agent,generation,turn_id)
 );
 ```
 
-Turn start/input association/completion/unknown/resolution updates projections with
-source event/reducer. `wait --after-command` follows `turn_inputs`; several commands may
-wait on the same terminal turn. `wait`/`result` survive event retention. Final text/
-usage bounded; unresolved turns are never pruned.
+Turn association/completion/unknown/resolution updates projections with source event/
+reducer. `wait --after-command` follows `turn_inputs`; several commands may wait on one
+terminal turn. `wait`/`result` survive event retention. Final text/usage bounded;
+unresolved turns never pruned.
 
 Counter allocates root id before self-reference. Event seq transactional. Native-event
 unique conflict is duplicate input, not Store failure.
@@ -288,5 +291,5 @@ WAL/readers monitored. Replays release transactions; hard pressure rejects new l
 reads and exposes pin—never deletes evidence or blind-truncates active readers.
 
 Event retention follows minimum active automation cursor. Paused/disabled rules advance
-by policy. Current edit/turn results live in compact projections. Native stores are
-never generically cleaned.
+by policy. Current edit/turn results live in compact projections. Native stores never
+generically cleaned.
