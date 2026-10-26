@@ -20,7 +20,7 @@ credential. Missing/incomplete/revoked identity rejects; it never becomes owner.
 | managed script/setup/check | read-only in principal/project scope | no direct mutation; return stdout actions |
 
 This is correctness in a one-user system, not hostile same-user isolation. Commands pass
-router generation/turn/request checks. Queue mail does not grant sender control; full
+router generation/turn/request checks. Queue mail does not grant sender control; explicit
 send/steer/inject does.
 
 A rule principal belongs to daemon, not the script process. After exit 0, daemon
@@ -32,9 +32,9 @@ the same read-only restriction.
 Child inherits project/root. Requested control cannot exceed launcher and parent:
 self→self; tree parent grants self/tree; project parent grants self/tree/project. Native
 children default self. A guard-exceeding native child is still recorded but gets
-`control=self`, `routing_enabled=false`, no project authority and no automatic wake.
-Project principal cannot change project/parent/root or select a profile outside its
-allowlist.
+`control=self`, `routing_enabled=false`, no project authority and no automatic direct
+wake. Project principal cannot change project/parent/root or select a profile outside
+its allowlist.
 
 ## Mailbox
 
@@ -56,45 +56,42 @@ confirmation but still cannot exceed the hard fanout limit.
 
 Modes:
 
-- `queue`: durable unread; recipient delivery policy decides presentation;
+- `queue`: durable unread; recipient wake policy decides presentation;
 - `inject`: full text at exact safe point; command rights required;
 - `send`: full text as a new turn; command rights required;
 - `steer`: full text into exact active turn; exact steer/control required.
 
-`presentation_kind=notice|full|parent`; presented is not acknowledged.
+`presentation_kind=notice|parent`; presented is not acknowledged.
 
-### Delivery policy
+### Queue wake policy
 
-Profile field is:
+Profile field remains one boolean: `wake_on_mail`.
 
-```text
-mail_delivery = off | notice | full | parent
-```
+- `false`: queue only; recipient/manager reads explicitly.
+- `true` + `routing_enabled=true`: daemon may present one short notice
+  `[eliot] N unread messages; run eliot inbox`.
+- `true` + `routing_enabled=false`: daemon cannot present an unusable CLI notice. It
+  queues one coalesced notice to the nearest live directly routed parent/project manager;
+  if none exists, original message remains queue-only and status reports
+  `delivery_unavailable`.
 
-- `off`: queue only; recipient reads explicitly.
-- `notice`: daemon presents `[eliot] N unread messages; run eliot inbox`. This requires
-  `routing_enabled=true`, because the recipient needs its own credential to read inbox.
-- `full`: daemon may present the full bounded message through a qualified native
-  inject/send mechanism. It does not require recipient CLI routing, but it does require
-  exact generation binding and declared native delivery semantics.
-- `parent`: queue one coalesced notice to the nearest live routed parent/project manager;
-  original message remains addressed to the child.
+Full message presentation is never an automatic queue fallback. A sender/automation with
+control rights must explicitly choose `inject|send|steer`, which preserves authority and
+native application semantics.
 
-For `notice`/`full`:
+For a routed notice:
 
-1. busy + qualified exact inject → one generation-bound presentation at safe point;
+1. busy + qualified exact inject → one generation-bound notice at safe point;
 2. busy without inject → leave unread; same generation idle may receive one short send
-   or full send according to policy;
-3. idle → one bounded send presentation if supported;
+   notice;
+3. idle → one short send notice if sending is supported;
 4. observe-only, draining, pending request, matching provider hold or unknown control/
    input/turn → no presentation.
 
-A routing-disabled Agent with `notice` is treated as queue-only and reports
-`delivery_unavailable`; it never receives an unusable CLI instruction. Wake can never be
-a provider probe. No send/steer substitution while busy. At most one open presentation
-command and one presentation/minute/recipient. Unknown presentation is not retried. A
-new generation stales presentation but unread mail remains eligible. Startup reconciles
-unread recipients with no open presentation.
+Wake can never be a provider probe. No send/steer substitution while busy. At most one
+open presentation command and one notice/minute/recipient. Unknown presentation is not
+retried. A new generation stales presentation but unread mail remains eligible. Startup
+reconciles unread recipients with no open presentation.
 
 ### Inbox acknowledgement
 
@@ -199,8 +196,8 @@ CREATE INDEX claims_owner ON claims(agent,generation);
 
 Parent/root/depth are logical. Config limits controller-created fanout/depth. Native
 children upsert by canonical subject with parent-generation provenance even when guards
-are exceeded. Parent completion/Goal notification uses ordinary queue mail and the
-recipient delivery policy.
+are exceeded. Parent completion/Goal notification uses ordinary queue mail and the same
+wake policy.
 
 Tree selectors resolve at admission; later work is not included. Synchronous manager
 uses exact send/wait/result; queue remains asynchronous.
