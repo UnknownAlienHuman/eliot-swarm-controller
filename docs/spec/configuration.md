@@ -2,37 +2,37 @@
 
 ## Data directory
 
-Default `%LOCALAPPDATA%\Eliot` (Windows) or `~/.local/share/eliot`; override with
-`--data-dir` or `ELIOT_HOME`. The daemon creates it on first start and takes
-`daemon.lock` (one daemon per data dir).
+Default `%LOCALAPPDATA%\Eliot` on Windows or `~/.local/share/eliot`; override with
+`--data-dir` or `ELIOT_HOME`. One daemon owns one data directory and holds
+`daemon.lock`.
 
 ```text
 <data_dir>/
-  config.toml          global config (below)
-  eliot.db             SQLite store
-  daemon.json          pid, endpoint, version (written by the daemon)
+  config.toml
+  eliot.db
+  daemon.json             pid, endpoint, version, start identity
   daemon.lock
-  logs/daemon.log      rotated, bounded
-  rules/*.toml         global rules
-  plugins/<name>/      plugin private state (offsets, generated hook configs)
-  worktrees/<agent>/   worktrees created by Eliot (when workspace_mode = worktree)
+  logs/daemon.log         rotated and bounded
+  rules/*.toml
+  plugins/<name>/         shared-plugin state
+  plugins/<name>/<agent>-g<generation>/   per-agent plugin state
+  services/<name>/        managed service endpoint/process state
+  worktrees/<agent>/      worktrees created by Eliot
 ```
 
-Project-level files live in the repository, so they are versioned with the code:
+Project files are versioned in the registered repository:
 
 ```text
 <repo>/.eliot/
-  config.toml          project profiles and settings (merged over global)
+  config.toml
   rules/*.toml
   scripts/
 ```
 
-Project files are loaded only for repositories registered in the global config
-(`[projects.<name>] path = "C:/src/app"`), and only from that path, never from an
-agent's worktree. Agents can write files in the repo; a rule they add takes effect
-only when it reaches the registered checkout, and every reload is reported as a
-`source.health` event for `config` naming the changed files. The project name is the
-default `project` of agents launched in that repo.
+Project files are loaded only for repositories registered in global config and only
+from that registered checkout, never from an agent worktree. A rule an agent writes in
+a worktree takes effect only after it reaches the registered checkout. Every reload or
+parse failure is reported by the config source.
 
 ## `config.toml`
 
@@ -43,7 +43,7 @@ limits.max_depth = 8
 limits.max_children_per_agent = 20
 limits.max_tree_agents = 100
 automation.max_actions_per_minute = 120
-automation.max_parallel_checks = 2       # goal checks running at once
+automation.max_parallel_checks = 2
 automation.check_timeout = "10m"
 
 [process]
@@ -51,35 +51,41 @@ scan_interval = "2s"
 
 [git]
 poll_interval = "15s"
-remote_poll = "off"            # or "10m": periodic ls-remote
+remote_poll = "off"                 # or "10m": periodic ls-remote
+fingerprint_max_files = 5000
+fingerprint_max_bytes = 67108864
 
-[plugins.codex]                # built-in: no cmd needed
-instances = 1
+# Built-in per-agent plugin. Session mode comes from its manifest, not config.
+[plugins.codex]
+
+# External per-agent plugin. The host starts this command once per live agent.
 [plugins.claude]
-cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]   # external plugin, any language
+cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]
+
+# Shared plugins may run a small pool; per-agent plugins reject `instances`.
+[plugins.fake]
+instances = 1
+verbs = ["launch", "send", "steer", "inject", "interrupt", "stop", "resume",
+         "approve", "deny", "answer", "configure"]
 
 [projects.app]
 path = "C:/src/app"
 
 [proxies.opencodex]
-max_live = 8                          # optional: cap live agents across all profiles using this proxy
-attach = "http://127.0.0.1:10100"     # use a running service ...
-# launch = ["opencodex", "..."]       # ... or let Eliot start and supervise it
+max_live = 8
+attach = "http://127.0.0.1:10100"    # attach to owner-run service
+# launch = ["opencodex", "..."]       # or supervise a managed service
 health = "/api/system/health"
-api_key_env = "OPENCODEX_API_KEY"     # name of the env var holding the client key; never the key itself
-
-[plugins.fake]
-verbs = ["launch", "send", "steer", "inject", "interrupt", "stop", "resume",
-         "approve", "deny", "answer", "configure"]   # optional: narrow the declared verbs
+api_key_env = "OPENCODEX_API_KEY"
 
 [profiles.codex]
 harness = "codex"
-model = "<model id>"                  # passed through to the harness as is
-effort = "high"                       # the harness's own value
+model = "<native model id>"
+effort = "high"
 billing = "subscription"
 account = "main"
 permissions = "workspace-write"
-workspace_mode = "shared"             # "worktree" from L3.2
+workspace_mode = "shared"
 labels = { role = "writer" }
 
 [profiles.codex-opencodex]
@@ -89,72 +95,79 @@ proxy = "opencodex"
 [profiles.manager]
 harness = "claude"
 permissions = "workspace-write"
+workspace_mode = "worktree"
 control = "project"
 labels = { role = "manager" }
 ```
 
-Rules:
+## General rules
 
-- Credentials (API keys, OAuth tokens) never live in config, the Store, events or
-  messages. Config names environment variables (`api_key_env`); the daemon passes
-  them through to the harness process only. Agent tokens are routing handles, not
-  credentials ([D-07](../decisions.md)).
-- `extends` merges one profile over another (one level; `extends` of an `extends` is
-  an error). Missing fields take the [defaults](core.md#profile).
-- Separate native accounts are separate profiles whose `env` points the harness at its
-  own config/auth dir (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, ...). Combine with
-  `max_live` to respect each account's limits. A launch must fit both its profile's
-  and its proxy's `max_live`.
-- After `provider.limited` of kind `rate_limit` or `quota`, new launches of that
-  profile wait (agents already running are not touched). `retry_after` is not proof of
-  recovery: after it passes, one launch runs as a probe and the rest wait until the
-  probe's first turn succeeds.
-- Harness processes inherit the daemon's environment, then the profile's `env`, then
-  the Eliot variables. `env_clear = true` starts from an OS baseline instead (Windows:
-  at least `SystemRoot`, `USERPROFILE`, `HOME`, `PATH`, `TEMP`; v1 found that a fully
-  cleared environment breaks harness startup) plus the profile's `env`.
-- Rust projects: give each worktree its own `CARGO_TARGET_DIR` (profile `env`); two
-  live agents building in one target directory block or corrupt each other's builds.
-  Eliot does not serialize Cargo for them.
-- Windows: keep the data dir short (worktrees live under it and `MAX_PATH` is real);
-  Eliot passes `core.longpaths=true` to its own `git` calls and to agent processes
-  through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` (no config file is
-  written) and fails with a clear error when a path is still too long.
-- Merging: a project file's `[profiles.X]` replaces the global `[profiles.X]` as a
-  whole; other tables merge key by key, project over global.
-- Unknown keys are an error at load time, with the file and line — except inside
-  `[plugins.<name>]`, whose extra keys are passed to the plugin and validated by it at
-  `initialize`.
-- `eliot status` shows the effective merged config source for each profile.
+- Credentials never live in config values, Store, events or messages. Config names
+  environment variables (`api_key_env`, `secret_env`); the daemon resolves them in
+  memory for the native process.
+- Agent tokens are generation-scoped routing handles. `ELIOT_AGENT_ID`,
+  `ELIOT_AGENT_GENERATION`, `ELIOT_AGENT_TOKEN` and endpoint are injected after the
+  profile environment; users do not configure them.
+- `extends` merges one base profile (one level). Missing fields use
+  [core defaults](core.md#profile).
+- Separate native accounts are separate profiles whose environment points to distinct
+  auth/config directories (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, ...). `max_live` applies
+  per profile; a proxy may add another cap shared by profiles.
+- Provider holds are scoped to the profile/account/proxy that produced the evidence.
+  After rate-limit/quota `retry_after`, one launch is a probe; others remain queued
+  until that generation reaches a successful first turn. A retry-after timestamp is
+  not proof of recovery.
+- Harness processes inherit daemon environment, profile `env`, then Eliot variables.
+  `env_clear = true` starts from an OS baseline (on Windows at least `SystemRoot`,
+  `USERPROFILE`, `HOME`, `PATH`, `TEMP`) plus profile/Eliot values.
+- Rust worktrees use separate `CARGO_TARGET_DIR`s. Eliot does not serialize Cargo
+  builds from different agents into one target directory.
+- Keep the data path short on Windows. Eliot passes `core.longpaths=true` through
+  process environment/config arguments for its own and agent Git calls; it fails
+  clearly if a tool still cannot address the path.
+- Project `[profiles.X]` replaces global `[profiles.X]` as a whole. Other tables merge
+  key by key, project over global.
+- Unknown keys are errors with file/line, except extra keys inside
+  `[plugins.<name>]`, which are handed to and validated by that plugin at initialize.
+- `eliot status` shows each effective value and source file; secret values are never
+  shown.
 
 ## Plugins
 
 | Key | Meaning |
 | --- | --- |
-| `cmd` | Command of an external plugin. Omitted for built-in plugins. |
-| `instances` | Plugin processes to run (default 1); agents are spread across them. |
-| anything else | Passed to the plugin as `plugin_config` (e.g. the fake plugin's `verbs`). |
+| `cmd` | External plugin command. Omitted for built-in plugins. |
+| `instances` | Pool size for a plugin whose manifest says `session_mode=shared` (default 1). Invalid for `per_agent`. |
+| anything else | Plugin-private configuration passed at `initialize`. |
 
-A second entry can reuse a plugin under another name
-(`[plugins.fake-narrow] cmd = ["eliot", "plugin", "fake"]`).
+The manifest, not config, chooses `per_agent` or `shared`; an operator cannot weaken
+custody by overriding it. A per-agent instance receives a private state directory for
+its agent/generation. A shared instance receives its shared directory and must keep
+its native-session mapping isolated internally.
 
-## Proxies
+A second plugin entry may reuse the same executable under another name and different
+private config. It is still validated against the returned manifest.
 
-A proxy entry describes a provider proxy (OpenCodex, any OpenAI/Anthropic-compatible
-gateway, or a [local model server](../harnesses/local-models.md)):
+## Proxies and managed services
+
+A proxy entry describes OpenCodex, another compatible gateway or a
+[local model server](../harnesses/local-models.md):
 
 | Key | Meaning |
 | --- | --- |
-| `attach` | Base URL of an already running proxy. Eliot checks `health` and never stops it. |
-| `max_live` | Optional cap on live agents across all profiles that use this proxy. |
-| `launch` | Command to start it. Eliot supervises it as a service: starts before the first agent that needs it, health-checks, restarts with backoff, stops when no agent uses it for `idle_stop` (default never). |
-| `idle_stop` | For `launch`ed proxies: stop after no agent used it for this long (default: never). |
-| `health` | Path for the health check (HTTP 200 = up). |
-| `api_key_env` | Env var with the key the harness must send to the proxy. |
-| `base_url_for` | Optional per-harness override, e.g. `{ claude = "http://127.0.0.1:10100/anthropic" }`. |
+| `attach` | Base URL of an owner-run service. Eliot health-checks it and never stops it. |
+| `launch` | Explicit argv for a managed service. Eliot starts it before first use, watches it, and may stop it after `idle_stop`. |
+| `max_live` | Optional live-agent cap across all profiles using this service/account. |
+| `idle_stop` | Managed service only; default never. |
+| `health` | HTTP path whose 200 response means available. |
+| `api_key_env` | Environment variable containing the client key. |
+| `base_url_for` | Optional harness-specific base URLs, e.g. `{ claude = ".../anthropic" }`. |
 
-How a profile's proxy reaches the harness is plugin knowledge (each plugin's manifest
-`proxy` section and its [harness page](../harnesses/README.md)): e.g. Claude Code via
-`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`, Codex via a `model_providers` entry,
-OpenCode via a provider `options.baseURL`. The plugin reports the effective endpoint
-in `session.ready`.
+A managed shared service has its own custody object, not an agent Job. Its endpoint and
+process birth identity are persisted before an agent uses it. Attached services carry
+no Eliot stop authority.
+
+How a profile reaches a proxy is plugin knowledge and documented on the harness page:
+Claude uses `ANTHROPIC_BASE_URL`, Codex uses a `model_providers` entry, OpenCode uses a
+provider `baseURL`, and so on. The plugin reports the effective endpoint in
+`session.ready`; requested URL alone is not proof that traffic used it.
