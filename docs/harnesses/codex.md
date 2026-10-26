@@ -36,6 +36,11 @@ schema generator before coding.
   app-server per agent, in that agent's custody (`multi_session: false`). Native
   subagent threads run inside the same app-server, so they share its environment:
   `child_environment: false`, and their `eliot` calls count as the parent's.
+- Tool environment: Codex filters it with the owner's `shell_environment_policy`. The
+  config reference (read 2026-10-26) documents `ignore_default_excludes` with default
+  `true`, which keeps names containing `KEY`/`SECRET`/`TOKEN`; an owner config with
+  `false` or an exclude filter would drop `ELIOT_AGENT_TOKEN`. The L2 live check runs
+  `eliot status` from a shell tool and expects `caller` = the agent.
 
 ## Auth
 

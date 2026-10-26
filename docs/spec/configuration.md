@@ -102,9 +102,12 @@ labels = { role = "manager" }
 Rules:
 
 - Credentials (API keys, OAuth tokens) never live in config, the Store, events or
-  messages. Config names environment variables (`api_key_env`, `pass_env`,
-  `secret_env`); the daemon passes their values to the harness process only. Agent
-  tokens are routing handles, not credentials ([D-07](../decisions.md)).
+  messages. A profile's literal `env` holds non-secret values only. Secrets are named:
+  `api_key_env` (proxy key) and `pass_env` (variables passed from the daemon's
+  environment); `secret_env` marks which `pass_env` names hold secrets, so their
+  values are masked in events and refused in stored writes. The daemon reads the
+  values only when it starts the process. Agent tokens are routing handles, not
+  credentials ([D-07](../decisions.md)).
 - `extends` merges one profile over another (one level; `extends` of an `extends` is
   an error). Missing fields take the [defaults](core.md#profile).
 - Rust projects: give each worktree its own `CARGO_TARGET_DIR` (profile `env`); two

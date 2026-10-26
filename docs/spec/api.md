@@ -15,14 +15,18 @@
   to the agent id. This is attribution and routing, not a security boundary
   ([decisions](../decisions.md) D-07). Every process Eliot starts for an agent gets
   that agent's token; a native child without its own environment (`own_identity =
-  false`) inherits its parent's and acts as the parent.
+  false`) inherits its parent's and acts as the parent. A process that has
+  `ELIOT_AGENT_ID` but no matching `ELIOT_AGENT_TOKEN` (a harness filtered its
+  environment) is refused `not_allowed` by the CLI and the daemon — an agent never
+  becomes the owner by losing its token. `daemon.status` reports the caller, so a
+  plugin can check what a tool inside the harness sees.
 - Max frame 4 MiB. Requests are multiplexed by `id`; a slow call never blocks others.
 
 ## Methods
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `daemon.status` | — | version, uptime, plugins, sources health, counts by state |
+| `daemon.status` | — | version, uptime, plugins, sources health, counts by state, `caller` (owner or agent id) |
 | `daemon.shutdown` | `drain?`, `force?` | with `drain`: no new launches, rules or timer firings; running turns finish, approvals, answers and results keep working; then stop. Without `drain` it refuses (`busy`) while any stdio session has a running turn, unless `force` — those turns would be lost. |
 | `agent.list` | `filter{state?, harness?, project?, label?, tree?, parent?}` (`tree` = the agent and all descendants), `after?`, `limit≤1000` | page of agents + `next` |
 | `agent.get` | `agent` | agent + pending requests + goal + last events |
@@ -63,7 +67,8 @@ keep their id in `commands`; other writes keep it in a small `writes` table
 
 Errors use JSON-RPC error objects with a stable `data.code`: `not_found`,
 `unsupported`, `not_allowed`, `bad_state`, `invalid`, `busy`, `unavailable`,
-`history_gap`, `internal`.
+`history_gap`, `internal`; `data.reason` refines it (e.g. `id_expired`,
+`secret_in_payload`).
 
 Script callers (rules' `run` actions) and any CLI call without `ELIOT_AGENT_TOKEN` act
 as the owner. Actions of a project rule — its `do` list and its scripts' stdout

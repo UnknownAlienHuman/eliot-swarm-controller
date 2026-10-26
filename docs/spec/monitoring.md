@@ -86,6 +86,9 @@ Per distinct worktree used by any live agent:
   `index.lock` and never competes with agents):
   - `status --porcelain=v2 --branch -z` → branch, HEAD, upstream, ahead/behind, dirty set;
   - on HEAD change: `log --format=%H%x00%ae%x00%s --name-only <old>..<new>` → `git.commit`;
+    after a daemon restart `<old>` is the `head` of the worktree's last stored
+    `git.status` event, so commits made while the daemon was down are reported too
+    (none stored → no baseline: `source.gap`, nothing invented);
   - committed-but-unmerged set (for `who`): paths in `diff --name-only <base>...HEAD`
     that still differ in `diff --name-only <base> HEAD` — after a squash merge the
     branch is not an ancestor of its base, and this drops the already-merged paths.

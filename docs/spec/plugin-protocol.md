@@ -73,7 +73,7 @@ never receives input in `agent.start`.
 
 | Method | Params |
 | --- | --- |
-| `event` | `{agent_id?, kind, ts?, data}` for an **ephemeral** kind (`message.delta`, `process.stats`, `usage.updated`, `fs.changed`) |
+| `event` | `{agent_id?, kind, ts?, data}` for an **ephemeral** kind (`message.delta`, `usage.updated` during a turn; the turn-end `usage.updated` is persisted and goes as a request) |
 | `process` | `{agent_id, pid, start_time, role}` — a native process the plugin knows about; the host records it only if it is inside that agent's custody (a shared server's processes belong to the service) |
 | `log` | `{level, message}` |
 
@@ -88,6 +88,9 @@ it derived from that source; the Store saves the latest value per (agent, `sourc
 the same transaction as the event. `agent.attach` and `agent.start` with `resume` hand
 the saved cursors back, and the plugin continues strictly after them. So a crash
 between commit and reply repeats nothing, and an uncommitted event is read again.
+When one native record (a transcript line, a page item) yields several events, only
+the last of them carries the record's cursor, and each has a `native_id`: a crash in
+the middle re-reads the record and the Store keeps the earlier events once.
 
 ```sql
 CREATE TABLE source_cursors (   -- migration of L3.4, the first replaying source
@@ -99,7 +102,9 @@ CREATE TABLE source_cursors (   -- migration of L3.4, the first replaying source
 
 Where a source can deliver the same fact twice (an SSE stream after reconnect, a
 paged readback that overlaps the live stream), the plugin sets `native_id` and the
-Store drops the repeat. A source with neither a cursor nor stable ids does not replay:
+Store drops the repeat. `native_id` covers only such recent overlap — its index lives
+with the events and is pruned with them — so a source that can re-read old history
+must use a cursor. A source with neither a cursor nor stable ids does not replay:
 after a reconnect the plugin emits `source.gap` and continues with new facts only.
 Silence or a gap never becomes a finished turn.
 
@@ -157,7 +162,9 @@ declared verbs. Harness versions are for display; they are never a gate.
 - Session lifecycle: `session.ready` once the native session accepts input;
   `session.ended` when it ends normally; `session.error` when the native side reports
   a fatal error while still running; `session.lost` when the native process exits
-  unexpectedly (an exit is never reported as `session.error`).
+  unexpectedly (an exit is never reported as `session.error`). `session.ready` always
+  comes before the session's first `turn.started`, also when the first input arrived
+  inside `agent.start`.
   The host derives `agent.*` state events; plugins never send `agent.*`.
 - Emit `turn.started` / `turn.completed` exactly once per native turn; `status`
   distinguishes completed, interrupted and failed. Non-terminal native statuses are not
@@ -221,8 +228,11 @@ than the frame limit.
 
 ## Lifecycle and errors
 
-- The host starts a per-agent plugin for `agent.start` or `agent.attach` and a
-  `multi_session` plugin on first use; it sends `initialize` first. Starting a plugin
+- The host reads each plugin's manifest once — a short-lived instance gets
+  `initialize`, then `shutdown` — and keeps it until the daemon restarts or the
+  plugin's `cmd` changes; launch preflight and verb checks use it. The host starts a
+  per-agent plugin for `agent.start` or `agent.attach` and a `multi_session` plugin on
+  first use; it sends `initialize` first. Starting a plugin
   or a service is single-flight per name (two launches share one start); a stop during
   a start cancels it and a late start result is discarded.
 - If a per-agent plugin exits, the host kills and verifies the rest of that agent's

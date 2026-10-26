@@ -34,7 +34,7 @@ limit = { max = 3, per = "agent", window = "1h" }
 | Trigger | Form | Notes |
 | --- | --- | --- |
 | Event | `event = "<kind glob>"`, optional `match` | Fires once per matching persisted event. |
-| Interval | `every = "30m"`, optional `anchor` (default: when the rule was first loaded) | Slot k fires at `anchor + k·period`; the slot number is the firing key, so a restart never re-fires a slot and missed slots coalesce to the latest. |
+| Interval | `every = "30m"`, optional `anchor` (default: when the rule was first loaded; stored in `timers`) | Slot k fires at `anchor + k·period`; the slot's instant is the firing key, so a restart never re-fires a slot and missed slots coalesce to the latest. |
 | Cron | `cron = "<5 fields>"`, optional `tz` (default local) | Standard 5-field cron. Time is kept as UTC instants; local time is used only to match fields. In the repeated hour of a DST fall-back each real instant fires once (v1 hit a scheduler failure there; test both sides of the fold); a local time inside a spring-forward gap fires at the first valid instant after it. |
 | Once | `at = "2026-11-01T09:00:00+03:00"` | Disabled after firing. |
 
@@ -51,8 +51,8 @@ once at startup) or `"none"`. Never a burst: Tokio intervals default to
 `MissedTickBehavior::Burst`, so use `Skip`. Waits use a monotonic clock; after sleep or
 a wall-clock jump the daemon recomputes next due times from UTC before firing.
 
-Every firing has a key: the triggering event's `seq`, or the timer slot (the interval
-slot number, or the scheduled UTC instant of a `cron`/`at` timer). The ids of the
+Every firing has a key: the triggering event's `seq`, or the timer slot's scheduled
+UTC instant (ms) for every timer kind. The ids of the
 commands a firing submits are derived from `rule id + key`, and they are committed in
 one transaction with the rule's bookkeeping: the timer row, or the event rule's
 **cursor** (the last `seq` it evaluated, table `rule_cursors`). A crash or restart can
@@ -61,6 +61,9 @@ committed is evaluated on the next pass.
 
 - A new rule starts at the current last `seq`: it never fires on history. Editing a
   rule keeps its cursor; events after it are evaluated with the new definition.
+- A timer keeps its `anchor` and last fired key in `timers`. Changing the trigger
+  (`every`, `anchor`, `cron`, `tz`, `at`) starts it afresh: the new anchor is the
+  reload time and nothing before it fires; editing only `do` keeps the schedule.
 - A disabled rule (or `eliot rules pause`) advances its cursor without firing and
   reports the skipped range once (`rule.suppressed reason=disabled`).
 - A firing that cannot be built — a placeholder that does not resolve, an action the
@@ -111,7 +114,19 @@ editor, inside the daemon's process custody, and emit `git.ref` / `rule.failed`.
 `push` is `git push --porcelain <remote> <ref>` (never forced). A push whose outcome is
 lost stays `unknown` until its git process tree is proven gone; only then is it checked
 with `git ls-remote` — never pushed again blindly — and until it is settled further
-pushes to that repository are refused.
+pushes to that repository are refused. Every git action has such a readback, run once
+its process tree is proven gone, so an interrupted action cannot block a timer
+forever:
+
+| Action | `unknown` settles as |
+| --- | --- |
+| `git.push` | `applied` if the remote ref (`ls-remote`) is the pushed OID, else `failed` |
+| `git.fetch` | `applied` if the remote-tracking refs equal `ls-remote`, else `failed` (the next firing fetches again) |
+| `git.pull` | `applied` if HEAD equals its upstream after the fetch readback, else stays `unknown` |
+| `git.worktree` | `applied` if `git worktree list` shows the path on the branch, else `failed` |
+
+A `run` action whose outcome is unknown stays `unknown` until the owner resolves it;
+its timer reports `rule.suppressed reason=unknown` instead of firing.
 
 ### Scripts
 
@@ -178,7 +193,10 @@ active Eliot goal:
    command — those are resolved by their own path, never by a goal message. With
    `cadence = on_idle`, also skip while the same agent has an active native goal: a
    native goal (Codex, Muse) continues by itself when the agent goes idle, and two
-   drivers would stack turns. `cadence = every <dur>` still sends (queued until idle).
+   drivers would stack turns. `cadence = every <dur>` still sends (queued until idle)
+   beside a native goal, but never stacks: a tick is skipped while the goal's
+   previous continuation is `queued`, `dispatched` or `unknown`, or its turn is still
+   running.
 2. Run `check` (if any) in the agent's workspace (timeout `automation.check_timeout`,
    default 10 min; at most `automation.max_parallel_checks`, default 2, checks run at
    once on the machine). Pass → `done`. With `marker:X`, done when the last `message.agent`
@@ -220,7 +238,8 @@ CREATE TABLE rule_cursors (
   rule TEXT PRIMARY KEY, seq INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE timers (
-  rule TEXT PRIMARY KEY, last_key INTEGER, last_fired_at INTEGER, next_due_at INTEGER
+  rule TEXT PRIMARY KEY, trigger TEXT NOT NULL, anchor INTEGER NOT NULL,
+  last_key INTEGER, last_fired_at INTEGER, next_due_at INTEGER
 );
 CREATE TABLE goals (
   agent INTEGER NOT NULL, mode TEXT NOT NULL, text TEXT NOT NULL, check_cmd TEXT,
@@ -237,7 +256,8 @@ A rule id of a project rule is `<project>/<id>`, so two projects cannot share a
 cursor. On start the daemon reloads cursors, timers and active goals and continues
 from them; nothing is kept only in a callback or a sleeping task.
 
-Rate-limit windows and loop-depth counters are in memory; a restart resets them.
+Rate-limit windows are counted from the stored `rule.fired` events, so a restart does
+not reset them; loop-depth counters travel in `cause`.
 
 ## Guardrails
 

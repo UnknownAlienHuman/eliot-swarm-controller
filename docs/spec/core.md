@@ -18,7 +18,8 @@ All timestamps are Unix milliseconds (UTC). Every stored integer fits SQLite's s
 | `native_id` | opaque string | Plugin | Optional id of one native fact (item, update, request). Unique per agent; used to drop a replayed fact ([plugin protocol](plugin-protocol.md#plugin--host-requests)). |
 
 Agents also have an optional unique `name` (e.g. `writer-1`); every CLI argument that
-takes an agent accepts id or name.
+takes an agent accepts id or name. A name may not look like an id (`a` followed by
+digits) or a selector (starting with `@`).
 
 **One native subject, one agent.** A (`native_scope`, `native_ref`) pair belongs to at
 most one agent row for its whole history. `attach` of a subject that already has a row
@@ -50,7 +51,8 @@ Agent {
   parent?, root, depth,                // tree; root = self for top-level agents
   origin: eliot | native | external,   // launched by us | subagent spawned by a harness | observed, not launched by us
   harness, profile,                    // plugin kind and profile name
-  profile_snapshot,                    // the resolved profile, frozen at launch/attach; resume and restart use it
+  profile_snapshot,                    // the resolved profile, frozen at launch/attach; resume and restart use it.
+                                       // Holds variable names, never values read from the environment.
   native_scope?, native_ref?,          // see Identifiers
   workspace?,                          // absolute path of the agent's checkout
   branch?, base_ref?, base_oid?,       // set when Eliot created a worktree (or detected a branch); used by `who`
@@ -103,7 +105,7 @@ Live states: `starting`, `idle`, `busy`, `waiting`, `stopping`.
 | any live | `session.ended` (the session ended natively) | `stopped` |
 | any live | `session.error` (fatal for this agent) | `failed` |
 | any live | `session.lost` (processes gone without `session.ended`, or re-attach failed) | `lost` |
-| `stopped`, `lost`, `failed` | `resume` dispatched | `starting` |
+| `stopped`, `lost`, `failed` | router input `start_dispatched` for an accepted `resume` (same slot rules as a launch) | `starting` |
 
 Entering `stopped`, `failed` or `lost` clears `active_turn` and `pending` and cancels
 the agent's queued commands (`command.cancelled`, reason = the new state); they are not
@@ -114,7 +116,7 @@ sets `stalled_since`; the next event of that agent clears it.
 
 The reducer `fn apply(agent: &mut Agent, input: &Input) -> Option<AgentState>` in
 `eliot-core` is the only code that changes `state`. `Input` is an event, an accepted
-command (`stop`, `resume`), or a router input (`start_dispatched`, `start_failed`);
+`stop`, or a router input (`start_dispatched` for a launch or resume, `start_failed`);
 deciding launch slots and holds is the router's job, not the reducer's. It is pure and
 table-tested against the table above. Every state change is published as a derived
 event `agent.<new state>`.
@@ -169,10 +171,13 @@ Event { seq?, ts, kind, agent?, source, native_id?, cause?, data }
   loop protection ([automation](automation.md#guardrails)).
 - `data`: kind-specific JSON, bounded (default 64 KiB; larger text is truncated with
   `truncated: true` and a pointer to the native transcript when known).
-- Before an event is persisted or fanned out, the daemon replaces the values of the
-  credential variables it knows (each proxy's `api_key_env`, the profile's `env` and
-  `pass_env` entries listed in `secret_env`, agent tokens) with `***`. Agents echo secrets into
-  commands and messages; the Store must not keep them. Pattern-based redaction is L7.
+- **Known secrets** are the values of each proxy's `api_key_env`, of the profile's
+  `secret_env` names, and agent tokens. Before an event is persisted or fanned out,
+  the daemon replaces them with `***` (events come from native output, which Eliot
+  cannot refuse). A write from a caller — command args, a message, a var, a claim
+  note — that contains a known secret is rejected `invalid` (`secret_in_payload`):
+  agents echo secrets, and the Store must not keep them. Pattern-based redaction is
+  L7.9.
 
 ### Event kinds
 
@@ -222,9 +227,9 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
 | --- | --- | --- | --- |
 | `launch` | `profile?`, `harness?`, `prompt?`, `workspace?`, `parent?`, `name?`, `project?`, `control?`, `labels?` | Create an agent and start a native session. A `prompt` becomes a separate linked `send` (below). | — |
 | `send` | `text` | New user turn. If the agent is busy, the command waits in the Store as `queued` (no native I/O) and is dispatched when the agent becomes idle, in order. Survives plugin and daemon restarts while the agent stays live. `applied` means a native turn started with this input; the turn's result is separate (`turn.completed`). | live |
-| `steer` | `text` | Add input to the **running** turn. Bound to the turn that is active at dispatch: if that turn has ended, or ends before the text lands, the command fails (`stale_turn` / `turn_ended`); it is never carried into a later turn. | `busy`; native support |
+| `steer` | `text` | Add input to the **running** turn. Bound to the turn that is active when the command is accepted: if that turn has ended by dispatch, or ends before the text lands, the command fails (`stale_turn` / `turn_ended`); it is never carried into a later turn. | `busy`; native support |
 | `inject` | `text` | Add context without starting a turn by itself; delivered at the next native safe point (hook `additionalContext`, pending-input queue, or prepended to the next `send`). | live; plugin decides mechanism and reports it |
-| `interrupt` (CLI alias `abort`) | — | Abort the turn that is active at dispatch; session stays alive. A different turn is never interrupted. | `busy`/`waiting` |
+| `interrupt` (CLI alias `abort`) | — | Abort the turn that is active when the command is accepted; session stays alive. A different turn is never interrupted. | `busy`/`waiting` |
 | `stop` | `force?` | End the session. `force` kills the agent's process tree (exact only where custody is exact, see [monitoring](monitoring.md#process-monitor)). (The CLI's `--tree` is the selector `@tree:<agent>`.) | any live |
 | `resume` | `prompt?` | Re-open a `stopped`/`lost`/`failed` session by `native_ref`. Never resends old input; a `prompt` is a linked `send`. | native support |
 | `approve` / `deny` | `request_id?` (default: the only pending request), `remember?` | Answer a pending approval. | request pending |
@@ -270,11 +275,12 @@ state  = accepted → [queued →] dispatched → applied | rejected | failed | 
   `applied` at `session.ready`; the send waits `queued` until the agent is idle and
   then runs like any other send. For a plugin whose harness cannot open a session
   without input (`features.start_requires_input`), the host hands the linked send's
-  text to `agent.start`; the send is still settled on its own (`applied` when a
-  `turn.started` names it). `session.ready` never proves the input was received, and
+  text to `agent.start` and the send becomes `dispatched` with the start; it is still
+  settled on its own (`applied` when a `turn.started` names it). `session.ready` never proves the input was received, and
   a lost start reply never causes a second start or a second input.
 - `turn_id`: the turn a `send` started (set when it is applied) or the turn a `steer`
-  or `interrupt` was aimed at (set at dispatch). `agent.wait --after-command` and
+  or `interrupt` was aimed at (the agent's `active_turn` when the command was
+  accepted). `agent.wait --after-command` and
   `send --wait` follow it.
 - Ordering: commands to one agent are dispatched to its plugin one at a time in
   acceptance order — the next one after the previous got its reply or became
@@ -283,10 +289,13 @@ state  = accepted → [queued →] dispatched → applied | rejected | failed | 
   reaches the running turn); queued sends leave in order when the agent is idle.
 - A client that disconnects or times out never cancels an accepted command; read its
   state back with `eliot cmd show ID`.
-- `rejected`: refused before any native I/O — by the router (invalid, unsupported,
-  not allowed, wrong state) or by a plugin that knows no native request was sent.
+- `rejected`: refused before any native I/O — by the router (unsupported, not
+  allowed, wrong state) or by a plugin that knows no native request was sent.
   A plugin that is not sure returns `unknown`, never `rejected`. Router rejections are
   stored too (with their reason), so `cmd show` and the same-id rule work for them.
+  A request the router cannot accept at all — malformed args, an id conflict,
+  `id_expired`, a selector over the limit — gets an `invalid` error and stores
+  nothing.
 - `failed`: native side reported an error — nothing applied.
 - `unknown`: may or may not have happened (timeout, plugin crash, lost reply). **Never
   resent** — not `send`, not `interrupt`, not `stop` (a late repeat can hit a newer

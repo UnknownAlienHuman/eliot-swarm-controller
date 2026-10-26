@@ -10,7 +10,10 @@ How to do a task: [AGENTS.md](../AGENTS.md).
 
 Live runs against real harnesses (`just live-<name>`, `just record-<name>`) are
 allowed on a developer machine where the harness is installed and logged in; keep them
-short (cheapest model/effort that shows the behavior). They never run in CI.
+short (cheapest model/effort that shows the behavior). They never run in CI. An exit
+test has a **CI part** (fake plugin, recordings, local Git) and, where it names a real
+harness, a **live part** (`just live-<name>` on the owner's machine, output pasted
+into the PR); both must pass.
 
 ## Code budgets
 
@@ -204,8 +207,9 @@ Specs: [Codex](harnesses/codex.md), [OpenCodex](harnesses/opencodex.md),
       `eliot hold`; Codex pointed at OpenCodex with the
       [default wiring](harnesses/codex.md#proxy-opencodex-or-any-responses-compatible-endpoint).
 - [ ] **L2.8 Live check.** `just live-codex`: launch, send, steer, inject, interrupt,
-      approve, goal, child — through OpenCodex and without. Paste the output into the
-      PR.
+      approve, goal, child — through OpenCodex and without; a shell tool inside the
+      session runs `eliot status` and sees `caller` = its agent. Paste the output into
+      the PR.
 
 **Exit test:** `eliot plugin-test` passes against the Codex plugin in replay mode (CI);
 `just live-codex` passes on a machine with Codex installed.
@@ -235,10 +239,12 @@ Specs: [monitoring](spec/monitoring.md).
       injectable clock for all timers (used again by L6).
 - [ ] **L3.6 Views.** `eliot top`, richer `show`, `watch` formatting.
 
-**Exit test:** killing a native Codex process yields `agent.lost` within 10 s; a
-commit in an agent worktree yields `git.commit` within 20 s; an idle-but-alive agent
-is never shown as lost; a Codex session started by hand is discovered and watched,
-and restarting the daemon while it is watched stores no event twice.
+**Exit test.** CI part: killing a fake agent's custody process yields `agent.lost`
+within 10 s; a commit in an agent worktree yields `git.commit` within 20 s, also when
+it was made while the daemon was down; an idle-but-alive agent is never shown as lost;
+a recorded rollout fixture is discovered and watched, and restarting the daemon while
+it is watched stores no event twice; `stop --force` leaves no process of the agent.
+Live part: the same with a real Codex process and a Codex session started by hand.
 
 ## L4 — Other harnesses
 
@@ -249,9 +255,11 @@ from what the recordings show; correct the harness page and the
 first (R11).
 
 - [ ] **L4.1 Hook shim.** `eliot hook`, `hook.event`, session-scoped hook config
-      generation, inject delivery via hook context, default on timeout. Build it with
-      the first plugin that needs it (Codex/Antigravity hooks or the Claude CLI port);
-      skip while no plugin uses it.
+      generation, inject delivery via hook context, default on timeout, late decisions
+      discarded. Built on Codex hooks (`PreToolUse`, `PermissionRequest`,
+      `UserPromptSubmit`; [Codex hooks](harnesses/codex.md#hooks)) so hook control
+      (owner point 5) exists before the other harnesses; reused by Antigravity and the
+      Claude CLI port.
 - [ ] **L4.2 Claude Code** (Agent SDK; in-process hooks for inject/steer/approvals).
 - [ ] **L4.3 Muse** (MSP over stdio; official Rust SDK or low-level connection).
 - [ ] **L4.4 OpenCode** (`opencode serve` HTTP + SSE; one server per agent; attach to a
@@ -260,9 +268,14 @@ first (R11).
 - [ ] **L4.6 ACP generic** (any ACP agent, e.g. Gemini CLI).
 - [ ] **L4.7 Others** ([Command Code, Kilo, Zed](harnesses/others.md)) — when needed.
 
-**Exit test:** the same scripted scenario (launch, send, steer, inject, interrupt,
-approve, stop) passes on every L4 harness, where each verb either works or is rejected with a
-reason that matches the harness page.
+**Exit test.** CI part: the conformance kit passes in replay mode for every L4 plugin;
+`eliot hook` fed a recorded Codex hook payload answers within the timeout and prints
+the default when the daemon is slow. Live part: the same scripted scenario (launch, send, steer,
+inject, interrupt, approve, stop) passes on every L4 harness, where each verb either
+works or is rejected with a reason that matches the harness page; and a manager agent
+on one harness launches workers on two others, gives them tasks with `send --wait` /
+`wait @children`, steers one and collects every result using only Eliot verbs
+(product acceptance 3).
 
 ## L5 — Coordination
 
@@ -285,9 +298,12 @@ Specs: [coordination](spec/coordination.md).
       reports whether the agent has actually used `eliot`/MCP yet (`unused` / `used`),
       so a harness that cannot reach it is visible.
 
-**Exit test:** two real agents (different harnesses) agree on a shared variable via
-messages; one runs `eliot who` and names the other; a claim conflict notifies both; an
-`eliot inbox` killed before its acknowledgement shows the same messages again.
+**Exit test.** CI part (fake agents; the test runs `eliot` with each agent's
+`ELIOT_AGENT_ID`/`ELIOT_AGENT_TOKEN`, as its tools would): two agents
+agree on a shared variable via messages and CAS; one runs `eliot who` and names the
+other; a claim conflict notifies both; an `eliot inbox` killed before its
+acknowledgement shows the same messages again; a message containing a known secret
+is refused. Live part: the same between two real agents on different harnesses.
 
 ## L6 — Automation
 
@@ -310,11 +326,13 @@ tests run in simulated time.
 - [ ] **L6.7 Recipes.** `examples/` with the [workflow recipes](spec/automation.md#workflow-recipes).
 
 **Exit test:** 24 h of simulated time with the fake plugin and a local Git remote: a
-rule firing every minute, a cron fetch, a goal reaching `done`, a goal hitting
-`no_progress`; the daemon is killed and restarted twice during the run; zero duplicate
-actions, zero missed timer firings, a rule with a broken placeholder fails once per
-event without blocking the next, and the loop guard suppresses a deliberately looping
-rule.
+rule `on git.commit (role=writer) → git.push`, an `every 30m` fetch, a cron rule, a
+goal reaching `done`, a goal hitting `no_progress`; the daemon is killed and restarted
+twice during the run, once in the middle of a push and once with a commit made while
+it is down. Every commit is pushed exactly once (the interrupted push is read back,
+not repeated), zero missed timer firings, a rule with a broken placeholder fails once
+per event without blocking the next, a `limit` window survives the restarts, and the
+loop guard suppresses a deliberately looping rule.
 
 ## L7 — Scale and hardening
 
@@ -350,9 +368,16 @@ rule.
       (token-shaped strings), on top of the L1 known-value masking; donor:
       `v1-final:vendor/atlas/crates/atlas-redact`.
 
+**Exit test:** L7.1 targets met in CI-sized form (1,000 agents, 10 min) on every PR and
+in full on the owner's machine; every item of the [product acceptance](vision.md#product-acceptance)
+list passes on the owner's Windows machine.
+
 ## L8 — Port to Rust
 
 - [ ] Port each non-Rust plugin and script that is kept, behind the same conformance kit.
+
+**Exit test:** every ported plugin passes the same conformance kit and live run as the
+version it replaces, and the old one is deleted in the same PR.
 
 ## L9 — Later (not planned yet)
 

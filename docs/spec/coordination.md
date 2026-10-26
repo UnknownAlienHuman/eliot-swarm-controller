@@ -179,7 +179,10 @@ CREATE TABLE claims (
 - Native subagents become `origin = native` children automatically. The limits cannot
   refuse a child the harness already created: it is recorded with
   `child.spawned over_limit=true`, gets `control = self` and no mail wake-ups, and
-  stays visible and stoppable.
+  stays visible and stoppable. A child's `control` limits calls made with the child's
+  own token; a child without its own identity cannot be told apart from its parent
+  (its tools run in the parent's process), so it acts with the parent's rights — give
+  a manager's profile `control = project` only if its native subagents may use it too.
 - Tree operations: `stop --tree A`, `send @tree:A`, `ls --tree A`, `watch @tree:A`.
 - Parent notifications: when a child reaches `stopped`, `failed`, `lost` or its goal
   becomes `done`/`blocked`, a `queue` message goes to the parent (profile
