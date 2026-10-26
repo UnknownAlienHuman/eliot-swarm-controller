@@ -14,13 +14,22 @@ incomplete supplied identity is rejected, never owner.
 | agent `self` | itself | project |
 | agent `tree` | itself + descendants | project |
 | agent `project` | project agents | project |
-| global rule/timer/script | owner | all |
-| project rule/timer/script | project agents | that project; no global vars/cross-project mail |
-| goal principal | its exact agent generation | that agent/project reads needed for check |
+| global rule/timer dispatcher | owner actions after durable rule admission | all |
+| project rule/timer dispatcher | project-agent actions after durable rule admission | that project; no global vars/cross-project mail |
+| goal dispatcher | its exact agent generation | that agent/project reads needed for check |
+| managed script/setup/check token | **read-only** queries in its principal/project scope | no direct mutation; script effects must be returned as stdout actions |
 
 This is a correctness boundary in a one-user system, not hostile same-user isolation.
 Commands still pass router generation/turn/request checks. Queue mail does not grant
 sender control; full send/steer/inject does.
+
+A rule principal belongs to the daemon, not to the process that evaluates a script.
+After a script exits successfully, the daemon validates its complete stdout action set,
+freezes exact targets and appends actions under the parent rule principal. The process
+token itself cannot call `command.submit`, mutate mail/vars, resolve unknown effects,
+run timers/rules or create another script. The same read-only restriction applies to
+workspace setup and Goal/check processes. Clearing the token cannot become owner because
+live custody classification fails closed.
 
 A child inherits project/root. Its requested `control` cannot exceed both the launching
 principal and its parent: self→self, tree parent may grant self/tree, project parent may
@@ -63,14 +72,14 @@ For queue + `wake_on_mail=true`:
 2. busy without inject → leave unread; when the same generation becomes idle, one short
    send notice may be admitted;
 3. idle → one short send notice;
-4. observe-only, draining, pending request, provider hold not designated for wake, or
-   unknown control/input/turn → no presentation.
+4. observe-only, draining, pending request, matching provider hold, or unknown
+   control/input/turn → no presentation.
 
-There is no send/steer substitute while busy. At most one open presentation command and
-one notice/minute/recipient. Unknown presentation is not retried. A new generation makes
-an old presentation stale but leaves unread mail eligible again. Startup/current-state
-reconciliation finds unread recipients with no open presentation; no volatile wake edge
-is required.
+A wake notice can never be a provider probe. There is no send/steer substitute while
+busy. At most one open presentation command and one notice/minute/recipient. Unknown
+presentation is not retried. A new generation makes an old presentation stale but
+leaves unread mail eligible again. Startup/current-state reconciliation finds unread
+recipients with no open presentation; no volatile wake edge is required.
 
 ### Inbox acknowledgement
 
@@ -79,10 +88,10 @@ most 1 MiB of encoded message data; excess unread messages wait for the next bat
 `mail.inbox` returns the same batch until acknowledged. It opens no read transaction
 while waiting: `--wait` sleeps on a bounded notification, then performs a short query.
 
-The CLI writes complete stdout, then calls `mail.ack(batch_id)` with a stable write id.
-A lost inbox reply leaves unread; a lost ack is idempotently read back. `mail.read ID`
-is allowed only when no open batch contains that message; otherwise acknowledge the
-batch. `--all` is paginated acknowledged history.
+The CLI writes complete stdout, then calls `mail.ack(batch_id)` with a stable external
+WriteId. A lost inbox reply leaves unread; a lost ack is idempotently read back.
+`mail.read ID` is allowed only when no open batch contains that message; otherwise
+acknowledge the batch. `--all` is paginated acknowledged history.
 
 ```sql
 CREATE TABLE messages (
@@ -108,6 +117,11 @@ CREATE TABLE mail_batches (
 CREATE UNIQUE INDEX mail_open_batch ON mail_batches(recipient)
   WHERE acknowledged_at IS NULL;
 ```
+
+Unread messages and open batches never age-prune. Acknowledged messages/batches may be
+removed after `retention.mail_days`; an old paginated history cursor then returns
+`history_gap`. Their external write receipts remain for the independent idempotency
+window.
 
 ## Shared variables
 
@@ -154,6 +168,21 @@ explicit release removes the old generation's claims in the same transaction as 
 control-state change. TTL is a fallback, not the primary cleanup path. A detached or
 lost agent therefore cannot continue advertising current intent. Project principals
 cannot claim outside their project.
+
+```sql
+CREATE TABLE claims (
+  id INTEGER PRIMARY KEY,
+  project TEXT NOT NULL,
+  agent INTEGER NOT NULL,
+  generation INTEGER NOT NULL,
+  glob TEXT NOT NULL,
+  note TEXT,
+  expires_at INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX claims_project ON claims(project,glob);
+CREATE INDEX claims_owner ON claims(agent,generation);
+```
 
 ## Hierarchy
 
