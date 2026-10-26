@@ -14,7 +14,7 @@ changes behavior; never append a contradictory addendum.
 | D-07 | One OS user is the trust boundary. Tokens are high-entropy generation routing handles, stored hashed and pattern-masked, not multi-user security. | Same-user agents can already access local resources; remote auth is a later boundary. |
 | D-08 | Control is `self|tree|project`; every principal still passes the same router/bindings. | Covers managers/children without epochs or policy receipts. |
 | D-09 | Native and Eliot goals may coexist; generation change pauses them until explicit rebind. | Old goals must not drive replacement sessions. |
-| D-10 | Rules are strict versioned TOML; daemon owns durable event cursors/timers and gap-free revision handoff. | Hot reload/restart must neither miss nor duplicate trigger admission. |
+| D-10 | Rules are strict versioned TOML; daemon owns durable event cursors/timers and gap-free activation handoff. | Hot reload/restart must neither miss nor duplicate trigger admission. |
 | D-11 | `who` uses Git facts, durable current edit attribution and advisory claims; history is provenance only. | Git cannot attribute shared-checkout dirty bytes by itself. |
 | D-12 | Claims are advisory, never locks. | Native shells can ignore fake locks. |
 | D-13 | First real harness is Codex app-server; first provider proxy is OpenCodex. | Rich native control protocol and direct Rust first path. |
@@ -37,42 +37,50 @@ changes behavior; never append a contradictory addendum.
 | D-30 | Environment defaults to a minimal allowlist. Inherit-all is explicit global-owner opt-in; named credentials resolve only at execution. | Inherit-all leaks unrelated secrets into every harness. |
 | D-31 | Event rules, timers, goals, unread-mail wakeups, workspace/launch queues and provider holds reconcile from durable current state after restart. | Volatile callback/timer edges can be lost. |
 | D-32 | Custody is honest per platform: Windows Job exact; Linux exact only with cgroup/equivalent + owner-death guardian; process-group fallback is degraded. | Unix process groups neither auto-die with daemon nor prevent `setsid` escape. |
-| D-33 | Persisted plugin facts use commit-acknowledged requests and a contiguous per-source sequence with one unacknowledged event. Store keeps one watermark/digest per source epoch. | Lost replies remain idempotent after event pruning without an unbounded receipt row per event. |
+| D-33 | Persisted plugin facts use commit-acknowledged requests and contiguous per-source sequence with one unacknowledged envelope. | Lost replies remain idempotent after event pruning without O(events) receipts. |
 | D-34 | Current edit attribution and turn results are compact projection tables, not reconstructed from retained events. | Retention/restart must not erase `who`, wait or result. |
-| D-35 | Global and project automation are distinct principals. Project rules/scripts cannot escape their registered project or become owner by omitting a token. | “One local user” does not justify accidental cross-project control. |
-| D-36 | Persisted events carry a bounded event-time subject snapshot; rules never join a later mutable Agent row. | Replay after labels/project/state changes must produce the same decision. |
-| D-37 | Active rule cursors bound retention; disabled rules advance, and excessive lag records an explicit skipped range and releases retention. | Durable triggers and bounded storage must coexist without silent loss or indefinite disk pinning. |
-| D-38 | Worktree creation/setup is a journaled pre-start phase. Exact Git effects are read back; unknown setup never reruns blindly. | `launch --worktree` otherwise repeats non-idempotent setup or starts half-built. |
-| D-39 | Mail uses capability-aware wake plus immutable inbox-batch acknowledgement. | Stored ≠ presented ≠ safely received; lost reply must not consume mail. |
-| D-40 | Historical replay exposes an explicit gap when requested events were pruned. | Silent jump from an old cursor falsely claims complete history. |
-| D-41 | Command admission and turn outcome are separate. A missing terminal result becomes an unknown turn that blocks further work in that generation until exact readback or constrained owner resolution. | `send applied` proves turn association, not completion; reconnect must neither invent success nor wedge recovery permanently. |
-| D-42 | Plugin Store idempotency is a compact source watermark: daemon-issued source key, contiguous sequence and last-envelope digest. Native cursor still suppresses vendor replay. | A lost `event.put` acknowledgement after event retention must not fire automation twice or grow O(events) dedupe state. |
-| D-43 | No-token owner fallback requires a live, birth-pinned OS check proving the peer is outside every current Eliot custody; ambiguity rejects. | Process registration can lag execution, so a projection miss is not proof that an Eliot-managed child is an owner process. |
-| D-44 | Routing-token presence follows control lifecycle, not generation alone. Terminal/detached/observe-only rows revoke by clearing the hash while preserving monotonic generation. | Detach must invalidate credentials without rewriting identity history. |
-| D-45 | A deterministic event-rule firing error is a durable failed run with no actions and advances the rule cursor atomically; only Store failure retries the event. | Missing placeholders or invalid actions must not wedge all later events behind one permanent error. |
-| D-46 | Script environment references are principal-scoped. Project scripts require both global automation approval and the project's own allowlist before any value is read. | A global credential allowed elsewhere must not leak into a project script before returned-action validation. |
-| D-47 | Editing an enabled event rule creates an old→new high-water handoff: old revision drains through H, new revision starts after H. Disable/pause instead records and skips through H. | Simply starting every new revision “at now” can lose events between the old cursor and reload boundary. |
-| D-48 | Synchronous hook decisions are deadline-bound, non-dispatchable Store proposals. Only the immediate hook response can apply them; timeout/late commit returns safe default and can never approve later. | An ordinary queued action can outlive the native hook deadline and mutate the wrong request. |
-| D-49 | On a degraded backend, exact controller/channel loss may mark the session lost while custody remains `orphan_possible`; it never proves all descendants died or makes force exact. | Otherwise the system either wedges forever or lies about process containment. |
-| D-50 | Provider recovery probes are explicit owner/current-agent `send` or linked launch/resume input commands. Automation, wakeups and hidden model calls can never become probes. | Recovery must not spend tokens invisibly or clear a hold from mere session creation. |
-| D-51 | Advisory claims exist only while their exact generation is live and controlled; terminal, resume or detach releases them transactionally. | A detached/lost agent must not keep advertising current ownership. |
-| D-52 | Every external daemon mutation uses a canonical ULID receipt within a configured idempotency window. Pruning advances a monotonic ULID floor; retries below it reject instead of reapplying. Internal derived IDs follow their durable owner lifecycle. | Bounded retention must not turn an old lost-reply retry into a new external effect. |
-| D-53 | External mutation receipts and command identity are separate. External commands use `id=receipt_id=WriteId`; linked, selector-child and automation commands use derived ids with no fake receipt. Input/turn mappings outlive pruned command history independently. | A foreign key from every command to external receipts makes internal automation impossible and conflicts with result-retention requirements. |
+| D-35 | Global and project automation are distinct principals. Project rules/scripts cannot escape their project or become owner by omitting token. | “One local user” does not justify accidental cross-project control. |
+| D-36 | Persisted events carry bounded event-time subject snapshot; rules never join later Agent row. | Replay after label/project/state changes must make same decision. |
+| D-37 | Active rule cursors bound retention; disabled rules advance, excessive lag records skipped range and releases retention. | Durable triggers and bounded storage must coexist without silent loss/disk pinning. |
+| D-38 | Worktree creation/setup is journaled pre-start. Exact Git effects are read back; unknown setup never reruns blindly. | `launch --worktree` otherwise repeats non-idempotent setup or starts half-built. |
+| D-39 | Mail uses capability-aware wake plus immutable inbox-batch acknowledgement. | Stored ≠ presented ≠ safely received. |
+| D-40 | Historical replay exposes explicit gap when requested events were pruned. | Silent jump falsely claims complete history. |
+| D-41 | Command admission and turn outcome are separate. Missing terminal result is unknown turn blocking more work until readback/resolution. | `send applied` proves association, not completion. |
+| D-42 | Plugin Store idempotency is compact source watermark: source key, contiguous sequence and last-envelope digest; native cursor suppresses vendor replay. | Lost acknowledgement after event pruning must not fire automation twice. |
+| D-43 | No-token owner fallback requires live birth-pinned OS proof peer is outside every current custody; ambiguity rejects. | Registration can lag execution. |
+| D-44 | Routing-token presence follows control lifecycle, not generation alone. Terminal/detached/observe-only revokes hash while preserving generation. | Detach must invalidate credential without rewriting identity history. |
+| D-45 | Deterministic rule firing error is durable failed run/no actions and advances cursor atomically; only Store failure retries. | Invalid template must not wedge later events. |
+| D-46 | Script environment is principal-scoped; project script requires global∩project allowlist before value lookup. | Global credential must not leak to another project. |
+| D-47 | Editing enabled event rule uses old→new high-water handoff; disable/pause records/skips through boundary. | Starting every edit “at now” loses backlog. |
+| D-48 | Synchronous hook decision is deadline-bound, non-dispatchable proposal usable only by immediate hook response. | Queued approval can outlive request deadline. |
+| D-49 | Degraded backend may prove session control lost while custody remains `orphan_possible`; never claim all descendants died or exact force. | Avoid both permanent wedge and false containment. |
+| D-50 | Provider probe is explicit owner/current-agent send or linked launch/resume input. Automation/wake/hidden call cannot probe. | Recovery must not invisibly spend tokens. |
+| D-51 | Claim exists only while exact generation live and controlled; terminal/resume/detach releases transactionally. | Detached/lost agent must not advertise current ownership. |
+| D-52 | Every external daemon mutation uses canonical ULID receipt. Pruning advances monotonic floor; retries below it reject. | Bounded retention must not turn old lost-reply retry into new effect. |
+| D-53 | External receipt and command identity are separate. External command uses `id=receipt_id=WriteId`; linked/selector/automation uses derived id/no receipt. | Universal receipt FK breaks internal automation and projection retention. |
+| D-54 | Routing tokens are deterministically re-derived from private `routing.key` and `(agent,generation,token_version)`; Store keeps only hash. | Lost child/reattach reply must return same token without plaintext-at-rest. |
+| D-55 | `source.open` uses stable plugin `open_id`; Store records open digest and one current owner row per event family. `process.put` only registers verified per-agent descendants; OS monitor owns lifecycle. | Lost open reply, overlapping sources or shared-service PID attribution must not duplicate/mis-own events. |
+| D-56 | Selector fanout is transactionally captured, bounded by configurable target limit and paginated; parent result is count/digest, not an unbounded array. | `@all` over large fleets must not explode one API frame/receipt or partially admit. |
+| D-57 | Rule definition digest and activation identity are distinct. Every activation persists canonical compiled definition until its interval/replay is closed. | A→B→A must not collide/reset cursors, and restart must drain old definition correctly. |
+| D-58 | Idempotency window is a minimum retention. A receipt referenced by retained command/domain row is not deleted until that reference is pruned. | SQLite restrictive FK and longer command retention otherwise make pruning impossible. |
+| D-59 | Worktree admission resolves requested base ref to immutable local commit OID; dispatch never re-resolves/fetches it. | Moving refs must not change queued workspace or readback target. |
+| D-60 | Automation run journal is generic `(kind,owner activation,trigger)` and rate limits are durable across restart. | Goals are not fake rules; crashes must not reset safety limits. |
 
 ## Defaults
 
 | Topic | Default |
 | --- | --- |
-| Environment | `minimal`; `inherit` requires a trusted global profile. |
-| Script environment | empty global allowlist; project scripts use global∩project. |
-| External idempotency window | 90 days; receipt floor is monotonic. |
-| Linux custody without exact backend | degraded; graceful control allowed, exact force rejected; controller loss may leave `orphan_possible`. |
-| New event-rule id | start at current high-water; no implicit historical replay. |
-| Edited enabled event rule | old revision drains to captured H; new revision starts after H. |
-| Paused/disabled event rule | record skipped range and advance cursor without firing. |
+| Environment | `minimal`; `inherit` requires trusted global profile. |
+| Script environment | empty global allowlist; project uses global∩project. |
+| External idempotency window | 90-day minimum; referenced receipts may live longer; floor monotonic. |
+| Selector fanout | 10,000 targets maximum per admission; no logical fleet limit. |
+| Linux custody without exact backend | degraded; graceful control only; possible orphan. |
+| New event-rule id | start current high-water; no implicit replay. |
+| Edited enabled event rule | fresh activation; old drains to H, new starts after H. |
+| Paused/disabled event rule | record skipped range and advance without firing. |
 | Project automation | project-scoped principal. |
 | Provider probe | explicit owner/current controlled-agent request only. |
-| Unknown live turn | block new send/goal; exact readback or owner resolution after native-not-active proof. |
+| Unknown live turn | block new send/goal; exact readback/resolution after not-active proof. |
 | L4.7 harnesses | Do not build until concrete need. |
 | Git identity | Per agent; explicit inherit opts out. |
 | Remote/multi-host/GUI/Memory OS | Not built without owner decision. |
