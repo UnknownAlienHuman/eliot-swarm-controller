@@ -6,25 +6,32 @@ fact owned by another source.
 ## Source ownership
 
 For each `(agent,generation,event family)` exactly one source is authoritative. Current
-projection stores owner, stable source open id/key, Store source-sequence watermark and
-last native cursor. Backup may track raw position privately but cannot publish duplicate
-lifecycle.
+projection stores owner, stable open id/key, Store sequence watermark, dedupe mode and
+last native cursor. A backup may track raw position privately but cannot publish
+lifecycle concurrently.
 
-Handoff begins strictly after last committed native cursor. Unprovable interval is a
-visible gap. Wrong generation/turn/request, stale source sequence and vendor replay are
-bounded diagnostics, never ordinary lifecycle or automation triggers.
+Initial epochs open before the first native start/input effect. Planned handoff is a
+single predecessor-aware `source.open` transaction that verifies old watermark/cursor,
+closes or gaps the predecessor and transfers family ownership. Separate close/open is an
+explicitly gapped boundary.
 
-A well-formed source-owned event that is a stale binding or vendor duplicate still
-advances source sequence transactionally: vendor duplicate returns original Store event
-seq; stale binding may create one bounded diagnostic. Malformed envelope, undeclared
-family or digest mismatch is source integrity failure and does not advance. Thus a
-valid late fact cannot wedge later input, while unauthorized families never enter bus.
+Dedupe modes:
+
+- `strict_cursor`: resume strictly after committed total-order vendor cursor;
+- `event_id`: compact native-event receipts survive event-row retention;
+- `none`: reconnect starts after a visible gap and never replays history.
+
+A well-formed source-owned stale binding or vendor duplicate may advance source sequence
+transactionally while returning the original Store event seq or one bounded diagnostic.
+Malformed envelope, undeclared family, missing required native identity or digest
+mismatch does not advance. Wrong generation/turn/request and replay are never ordinary
+lifecycle or automation triggers.
 
 ## Process identity and custody projections
 
 Process identity is `(host_boot_id,pid,start_time)`, never PID alone. Linux uses kernel
-boot id plus proc start ticks. Windows uses stable machine identity plus native boot
-session/time identity and `GetProcessTimes` creation time. Reboot cannot match old row.
+boot id plus proc start ticks. Windows uses stable machine identity plus boot-session
+identity and `GetProcessTimes` creation time. Reboot cannot match an old row.
 
 A custody owner is one stable string:
 
@@ -35,19 +42,19 @@ action:<run-id>/<action-index>
 workspace:<agent-id>/<step-index>
 ```
 
-A process belongs to exactly one owner. Shared-service membership of agents is session
-metadata, not duplicate process ownership.
+A process belongs to exactly one owner. Shared-service membership of Agents is native
+session metadata, not duplicate process ownership.
 
 ```sql
 CREATE TABLE custodies (
   owner TEXT PRIMARY KEY,
-  backend TEXT NOT NULL,              -- windows_job|linux_cgroup|process_group|external
-  capability TEXT NOT NULL,           -- exact|degraded|external
+  backend TEXT NOT NULL,
+  capability TEXT NOT NULL,
   native_id TEXT,
   guardian_boot TEXT,
   guardian_pid INTEGER,
   guardian_start INTEGER,
-  state TEXT NOT NULL,                 -- live|stopping|empty|orphan_possible|unknown
+  state TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
 
@@ -65,46 +72,20 @@ CREATE TABLE processes (
 CREATE INDEX processes_owner ON processes(owner,state);
 ```
 
-The daemon/OS process monitor is authoritative for `process.started`, `process.exited`
-and stats. It registers plugin/harness processes it spawns before execution where
-possible and enumerates exact custody. A per-agent plugin may additionally submit a
-commit-acknowledged sequenced `process.put` for an agent-owned descendant it discovered;
-the host verifies exact birth and custody membership, then upserts the same projection.
-Host enumeration and plugin registration of one identity publish only one start event.
-A lost `process.put` reply resends the same source sequence; process-history pruning
-cannot turn it into a new process.
-
-A shared plugin cannot assign the shared server or uncontained service children to an
-Agent owner. Managed/attached service processes are registered under `service:<name>` by
-service management. Session-attributed tool PID information may be a bounded harness
-diagnostic, never custody ownership. Agent stop therefore never kills a shared service
-process.
+Daemon/OS monitor is authoritative for `process.started`, `process.exited` and stats. It
+registers plugin/harness processes before execution where possible and enumerates exact
+custody. A per-agent plugin may additionally submit sequenced `process.put` for a
+descendant it discovered; host pins exact birth and verifies custody membership before
+upserting the same projection. Host enumeration and plugin registration publish one
+start event. Shared plugin cannot assign its server or uncontained service child to an
+Agent. Managed/attached service processes belong to `service:<name>`.
 
 Internal Git/script/check/workspace runners register their action owner directly in the
-same spawn/custody transaction. Restart never reconstructs custody from PID guesses.
+spawn/custody transaction. Restart never reconstructs custody from PID guesses.
 
-### Peer caller classification
-
-Persisted `processes` is an optimization/audit projection, **not proof that an unlisted
-peer is uncontrolled**. Before no-token owner fallback, API server:
-
-1. obtains peer PID and pins current boot/start identity;
-2. looks for exact projection row;
-3. on miss, checks live OS membership against every current custody:
-   - Windows: pinned peer + `IsProcessInJob` on live Job handles;
-   - Linux exact: pinned peer cgroup vs registered Eliot cgroups;
-   - degraded: pinned peer PGID vs registered live groups, without upgrading guarantee;
-4. rechecks birth/liveness;
-5. grants no-token owner only when local OS user and definitively outside every custody.
-
-Membership maps caller to custody principal and requires matching scoped token. Access
-failure, birth race, incomplete inventory or ambiguity rejects
-`caller_identity_unknown`. Containment applies before execution, so registration lag
-creates no authority window.
-
-Shared-service process still needs exact per-session token. Deliberate same-user escape
-from degraded group is outside declared containment/security guarantee; status reports
-that boundary rather than pretending hostile same-user isolation.
+Process custody does **not** choose API authority. Connected API calls require explicit
+owner/Agent/automation credentials; absence of a token is invalid. Process projection
+exists for ownership, cleanup and diagnostics only.
 
 ## Process custody backends
 
@@ -117,24 +98,24 @@ boot-scoped identity and zero active members.
 
 ### Linux exact and degraded
 
-Exact custody requires delegated cgroup v2 (or qualified equivalent) plus internal
-owner-death guardian. Guardian lives outside owned group, monitors daemon boot/process
-identity and kills/verifies group on abnormal daemon loss. Clean shutdown disarms only
-after group empty.
+Exact custody requires delegated cgroup v2 (or qualified equivalent) plus an internal
+owner-death guardian. Guardian lives outside the owned group, monitors daemon boot/
+process identity and kills/verifies the group on abnormal daemon loss. Clean shutdown
+disarms only after group empty.
 
 Guardian boot/PID/start and health are monitored. Missing/mismatched guardian blocks new
 exact launches and visibly downgrades existing groups; daemon never silently claims
 owner-death cleanup.
 
-Process-group fallback may observe/gracefully stop non-escaping members. Same-user child
-can `setsid`, so capability is degraded: exact force, kill-on-owner-loss and proof all
-descendants are gone are unsupported. Other Unix remains degraded until qualified.
+Process-group fallback may observe/gracefully stop non-escaping members. A same-user
+child can `setsid`, so capability is degraded: exact force, kill-on-owner-loss and proof
+all descendants are gone are unsupported. Other Unix remains degraded until qualified.
 
 ### Shared services
 
 Shared plugin/service is watched once. Agent stop uses exact native session control,
-never server kill. Attached owner service is external and never stopped. Managed service
-custody/process projection is separate from agents/actions.
+never server kill. Attached owner service is external and never stopped. Managed
+service custody/process projection is separate from Agents/actions.
 
 ## Process observation and terminal settlement
 
@@ -144,18 +125,18 @@ Session lifecycle and descendant containment are distinct:
 - `lost` when exact session control is proven gone:
   - exact backend empty plus authoritative source drained/gapped;
   - shared-session readback says subject absent; or
-  - degraded backend controlling plugin/native-controller identities gone and
-    authoritative channel EOF/gap, although escaped descendants cannot be ruled out;
+  - degraded backend controlling plugin/controller identities are gone and authoritative
+    channel is EOF/gapped, while escaped descendants remain possible;
 - degraded third case sets custody `orphan_possible`; `lost` describes session control,
   not proof every descendant died.
 
 Additional rules:
 
-- exact custody enumerates complete container; prior-boot rows are historical;
+- exact custody enumerates the complete container; prior-boot rows are historical;
 - stats are ephemeral and never model progress;
 - unknown exit code stays unknown;
-- process exit/final output may race; drain authoritative source to EOF or bounded
-  terminal deadline;
+- process exit/final native output may race; drain authoritative source to EOF or a
+  bounded terminal deadline;
 - timeout alone is not terminal evidence; one exact/shared/degraded control-loss
   condition must also hold;
 - live shared server says nothing about one session;
@@ -163,11 +144,11 @@ Additional rules:
 
 ## Starting processes
 
-- Resolve executable fully; argv/cwd/env separate and bounded.
+- Resolve executable fully; argv/cwd/env are separate and bounded.
 - Apply containment before execution.
-- Only intended child handles inheritable.
-- Long input uses stdin/files; Eliot text UTF-8 without BOM and LF.
-- Git prompts/editor disabled.
+- Only intended child handles are inheritable.
+- Long input uses stdin/files; Eliot text is UTF-8 without BOM and LF.
+- Git prompts/editor are disabled.
 - Environment follows minimal/inherit policy; Windows keys merge case-insensitively.
 - Running script/hook/plugin paths are immutable/versioned.
 - Normalize paths; never follow untrusted symlink/reparse point for cleanup,
@@ -176,32 +157,62 @@ Additional rules:
 ## Workspace preparation
 
 `launch --worktree` is durable pre-start work over a frozen
-[workspace binding](configuration.md#frozen-workspace-binding):
+[workspace binding](configuration.md#frozen-workspace-binding).
 
-1. create Agent generation 0, `workspace_state=preparing`, deterministic path;
-2. journal repo, requested branch, diagnostic base ref, exact `base_oid`, path and setup
-   revision;
+```sql
+CREATE TABLE workspaces (
+  agent INTEGER PRIMARY KEY REFERENCES agents(id),
+  project TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  requested_branch TEXT NOT NULL,
+  base_ref TEXT,
+  base_oid TEXT NOT NULL,
+  worktree_path TEXT NOT NULL UNIQUE,
+  setup_revision TEXT NOT NULL,
+  state TEXT NOT NULL,
+  outcome TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE workspace_steps (
+  agent INTEGER NOT NULL REFERENCES workspaces(agent),
+  idx INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  intent TEXT NOT NULL,
+  state TEXT NOT NULL,
+  outcome TEXT,
+  custody_owner TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(agent,idx)
+);
+CREATE INDEX workspace_steps_open ON workspace_steps(state)
+  WHERE state IN ('queued','dispatched','unknown');
+```
+
+Flow:
+
+1. create Agent generation 0 plus `workspaces.state=preparing`, deterministic path and
+   immutable binding;
+2. journal repo/branch/diagnostic base ref/exact `base_oid`/path/setup revision;
 3. run explicit `git worktree add` against frozen OID under workspace custody;
-4. read back `git worktree list --porcelain`, branch and exact HEAD OID;
-5. run setup argv sequentially, each in its own custody;
+4. read back worktree list, branch and exact HEAD OID;
+5. run immutable setup artifacts sequentially, each as its own journaled step/custody;
 6. commit ready; only then allow native start.
 
-No implicit fetch/ref re-resolution occurs at dispatch. If requested branch already
-exists, exact current OID must equal frozen `base_oid` (or explicit reuse policy must
-name it); otherwise fail. Moving branch/remote ref after admission cannot alter
-workspace.
+No implicit fetch/ref re-resolution occurs at dispatch. Existing branch/path must match
+frozen OID or an explicit reuse policy. Lost Git response is read back, never repeated
+blindly. Lost setup has no generic readback: workspace becomes unknown and launch stays
+blocked until owner resolution/removal/recreation. Setup is never assumed idempotent.
 
-Lost Git response is read back, never blindly repeated. Lost setup has no generic
-readback: workspace becomes unknown, launch stays blocked, owner resolves or removes/
-recreates. Setup is not assumed idempotent.
+Cancel/stop during preparation terminates the current exact action. Git step is read
+back; interrupted setup leaves workspace unknown. Native generation never starts from a
+partial workspace.
 
-Cancel/stop during preparation terminates current exact action. Git step is read back;
-interrupted setup leaves workspace unknown. Native generation never starts from partial
-workspace.
-
-Collision/mismatch fails. Cleanup is explicit, stopped-agent only, exact path under data
-root and Git-clean except allowlisted relative scratch. Scratch cleanup rejects symlink,
-device and alternate-stream escape. Branch remains.
+Cleanup is explicit, stopped-Agent only, exact path under data root and Git-clean except
+allowlisted relative scratch. Scratch cleanup rejects symlink/device/alternate-stream
+escape. Branch remains.
 
 ## Git and filesystem monitor
 
@@ -209,7 +220,7 @@ One monitor per distinct live worktree:
 
 - read-only `git --no-optional-locks status --porcelain=v2 --branch -z`;
 - bounded log on HEAD change;
-- frozen base-OID-vs-HEAD diff for still-unmerged paths;
+- frozen-base-OID-vs-HEAD diff for still-unmerged paths;
 - watcher debounce 500 ms, minimum refresh 2 s;
 - slow status backoff plus health;
 - remote refs only after explicit fetch or optional `ls-remote`.
@@ -230,9 +241,10 @@ CREATE TABLE agent_edits (
 CREATE INDEX agent_edits_workspace ON agent_edits(workspace,path);
 ```
 
-Generation-matched edit events upsert with event. When Git proves path clean, remove
-rows. Terminal/superseded generation remains until paths clean; restart never rebuilds
-from event history. Unowned shared-checkout path is `unattributed`.
+Generation-matched edit events upsert with their event. When Git proves a path clean,
+remove rows. Terminal/superseded generation remains until paths clean for provenance but
+is not a current worker. Restart loads the projection rather than replaying event history.
+Unowned shared-checkout path is `unattributed`.
 
 ### Read-only progress fingerprint
 
@@ -258,22 +270,25 @@ Only exact-generation model progress updates `last_progress_at`.
 | degraded controller gone + source EOF/gap | lost session control; custody orphan possible |
 | shared server live, session readback unknown | stale/unknown, not lost |
 | handoff gap | explicit gap; no inferred event |
-| old boot/generation/source sequence | historical diagnostic only |
+| old boot/generation/source sequence/native receipt | historical diagnostic only |
 
 ## Restart reconciliation
 
 1. compute current boot id; prior-boot live rows cannot match;
 2. reopen exact named custody/service/guardian identities for current boot;
 3. reattach sessions and snapshot commands, inputs, turns and source watermarks;
-4. settle missing exact groups/degraded controller loss only under terminal rules;
-5. reconcile preparing/unknown workspaces against frozen base OID/setup journal;
-6. rebuild Git facts and load edit projection;
-7. keep dispatched command/action/workspace effects unknown until readback;
-8. report `routing_key_error` and block token issuance if key identity mismatches.
+4. reconcile source dedupe mode: strict cursor resumes after cursor, event-id checks
+   receipts, none creates a gap;
+5. settle missing exact groups/degraded controller loss only under terminal rules;
+6. reconcile preparing/unknown workspaces against frozen base OID/setup journal;
+7. rebuild Git facts and load edit projection;
+8. keep dispatched command/action/workspace effects unknown until readback;
+9. report `routing_key_error` and block new Agent-token issuance if key identity
+   mismatches; owner credential remains independent.
 
 ## Views
 
 Expose boot-scoped process identity, custody owner, generation/turn/input gate/open stop,
 workspace binding/state, exact/degraded custody/guardian/orphan possibility, source
-open ids/keys/gaps/watermarks, model progress, usage, branch/edit, provider holds,
-caller-classification failures, routing-key health and Store/WAL health.
+open ids/keys/dedupe modes/gaps/watermarks, model progress, usage, branch/edit, provider
+holds, routing availability and Store/WAL health.
