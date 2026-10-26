@@ -1,8 +1,9 @@
 # Automation
 
-Automation turns events and time into ordinary Eliot commands or bounded local
-actions. It adds no Task/review/workflow product model. It does keep the minimum
-run/action journal required to survive a crash without repeating an external effect.
+Automation turns committed events and time into ordinary Eliot commands or bounded
+local actions. It adds no Task/review/workflow product model. It keeps only the
+run/action journal required to survive a crash without repeating an external effect or
+retargeting a replacement agent.
 
 ## Rules
 
@@ -28,79 +29,81 @@ do = [{ action = "resume", agent = "${agent.id}" }]
 limit = { max = 3, per = "agent", window = "1h" }
 ```
 
-The daemon reloads files on change. A parse/validation failure emits `rule.failed` and
-keeps the last valid version active. Unknown keys and duplicate rule ids are errors.
-Deleting/disable prevents new firings; already admitted runs remain visible and may be
-cancelled explicitly.
+The daemon reloads files on change. Parse/validation failure emits `rule.failed` and
+keeps the last valid version. Unknown keys and duplicate ids are errors. Disable/delete
+prevents new runs; already admitted immutable runs remain visible and may be cancelled
+only while their actions are queued.
 
-### Triggers (`on`)
+### Triggers
 
-| Trigger | Form | Semantics |
+| Trigger | Form | Firing key |
 | --- | --- | --- |
-| Event | `event = "<kind glob>"`, optional `match` | One trigger key per committed event `seq`. Ephemeral events cannot trigger durable actions. |
-| Interval | `every = "30m"`, optional `anchor` | Slot `k` is `anchor + k·period`; missed slots coalesce. |
-| Cron | `cron = "<5 fields>"`, optional `tz` | Match local fields, persist scheduled UTC instant as key. Repeated DST hour has two distinct instants; a spring gap fires at the first valid instant after it. |
-| Once | `at = "2026-11-01T09:00:00+03:00"` | One UTC-instant key, then consumed in timer state. |
+| Committed event | `event = "<kind glob>"`, optional `match` | event `seq` |
+| Interval | `every = "30m"`, optional `anchor` | anchored slot number |
+| Cron | `cron = "<5 fields>"`, optional `tz` | scheduled UTC instant |
+| Once | `at = "<RFC3339>"` | UTC instant |
+| Manual | `eliot timer run ID` | generated command id |
 
-A time-trigger firing is suppressed while the same rule has a run in
-`queued|running|unknown`; ticks do not stack behind slow work. Event firings remain
-independent because each event has its own key, subject to rate limits.
+Ephemeral events cannot trigger durable actions. A time firing is suppressed while the
+same rule has a run in `queued|running|unknown`; ticks do not stack. Event keys remain
+independent subject to rate limits.
 
-`eliot timer list` shows next due, last key and any in-flight run. `eliot timer run ID`
-creates a new manual key; it does not counterfeit a scheduled slot.
+Intervals use `anchor + k·period`. Cron persists the scheduled UTC instant; repeated
+DST hour gives two instants, a spring gap fires at the first valid instant after it.
+Missed daemon time uses `catch_up=latest` (default) or `none`, never a burst. Tokio
+intervals use Skip; due time is recomputed after sleep/wall-clock jump.
 
-Missed ticks while the daemon was down use `catch_up = "latest"` (default) or `none`.
-Never burst missed slots. Tokio intervals use `MissedTickBehavior::Skip`; waits use a
-monotonic clock and due times are recomputed from UTC after sleep/wall-clock jumps.
-
-## Durable firing and action journal
-
-A firing key is:
-
-- event trigger: event `seq`;
-- interval: slot number;
-- cron/at: scheduled UTC instant;
-- manual: generated command id.
+## Durable firing and target freeze
 
 `run_id = rule id + firing key`. In one Store transaction the daemon:
 
-1. verifies `(rule, key)` has no existing run;
-2. renders placeholders from the triggering snapshot;
-3. validates every action and stores the immutable rendered list;
-4. updates timer bookkeeping when applicable;
-5. emits `rule.fired` and `action.queued`.
+1. verifies `(rule,key)` is new;
+2. reads one consistent trigger snapshot;
+3. renders and validates every action;
+4. resolves every agent selector to concrete agent ids and their current generations;
+5. for current-turn/request actions, captures the exact trigger/native turn/request id
+   or rejects the run if the rule did not provide one;
+6. expands multi-target actions into immutable per-target actions;
+7. updates timer bookkeeping when applicable;
+8. persists run/actions and emits `rule.fired` / `action.queued`.
 
-This is **exactly-once admission**. It is not a claim that a network/process effect can
-be completed exactly once.
+This is **exactly-once admission**. It is not exactly-once external execution.
+
+A delayed action never resolves `@project`, `@tree`, a name or "current generation"
+again. Its payload stores `target_agent`, `expected_generation`, and where relevant
+`expected_turn_id` / `request_id`. Dispatch submits those expectations to the router.
+A replacement generation produces `stale_generation`; it is not silently targeted.
+Rules that intend to affect replacement work fire from a new event or are run again
+manually with a new firing key.
+
+Non-agent selectors such as a repository/workspace are normalized to their concrete
+path/remote/ref at firing. Credentials remain environment-variable references, not
+rendered values.
+
+## Action state and crash semantics
 
 Actions execute in order. A later action starts only after the previous one is
-`applied`; `failed`, `unknown` or cancelled stops the run. States are:
+`applied`; `failed`, `unknown` or cancellation stops the run.
 
 ```text
 queued → dispatched → applied | failed | unknown
 queued → cancelled
-unknown → applied | failed      // exact readback or owner resolution only
+unknown → applied | failed      // exact readback or owner resolution
 ```
 
-Crash rules:
-
-- `queued` actions resume after restart.
+- `queued` resumes after restart.
 - `dispatched` becomes `unknown` after restart.
-- an `unknown` action is never executed again automatically.
-- store-local actions and Eliot commands use stable ids, so repeating their **admission
-  call** with the same id only reads the existing result; this is not a repeated native
-  effect.
-- external actions require their specified readback. When no exact readback exists,
-  the run remains unknown until
-  `eliot action resolve RUN/INDEX --as applied|failed --reason TEXT`.
-
-`eliot rules pause` stops admitting new runs and dispatching queued actions; it does
-not cancel commands already accepted or processes already dispatched. `rule cancel`
-cancels only queued actions, never an unknown external effect.
+- `unknown` is never executed again automatically.
+- Store-local actions and command admissions use stable ids, so a repeated **admission
+  request** reads the same row; it does not replay native I/O.
+- External actions use the readback defined below. Without exact readback, they remain
+  unknown until `eliot action resolve RUN/INDEX --as applied|failed --reason TEXT`.
+- `rule cancel` cancels only queued actions. `rules pause` admits no new runs and
+  dispatches no queued actions; it does not undo accepted commands/running processes.
 
 ## Matching
 
-`match` is a map of dotted paths into `{event, agent, data}`:
+`match` maps dotted paths in the committed `{event,agent,data}` snapshot:
 
 - exact: `"data.status" = "completed"`
 - glob: `"data.command" = "glob:cargo test*"`
@@ -108,91 +111,91 @@ cancels only queued actions, never an unknown external effect.
 - one-of: `"agent.harness" = ["codex", "claude"]`
 - presence: `"data.error" = "exists"`
 
-All entries must match. Anything more complex is a script action. Matching sees the
-committed event and agent projection from the same snapshot, not mutable later state.
+All entries match conjunctively. Complex logic belongs in one script action. Matching
+never rereads a later mutable agent row.
 
-## Actions (`do`)
+## Rendering
 
-`${path}` placeholders may fill an argument **value** only—never executable, cwd, env
-name, option name, action kind or target control scope. Trigger data is untrusted.
-Unknown placeholders fail admission; no partially rendered run exists.
+`${path}` may fill an argument **value** only. It cannot choose executable, action
+kind, cwd root, environment-variable name, option name, control scope or credential.
+Unknown placeholders fail the firing transaction; no partial run exists.
+
+For event-triggered actions whose `agent` is omitted, the concrete trigger agent and
+its event generation are stored. An explicit id/name/selector is resolved at firing.
+A delayed `steer`/`interrupt` must name `${data.turn_id}` (or another exact snapshot
+path); approval/answer must name `${data.request_id}`. There is no "whatever is
+current when this finally runs" mode.
+
+## Actions
 
 | Action | Fields | Execution/readback |
 | --- | --- | --- |
-| any [verb](core.md#verbs) | `agent` (id/name/selector; default triggering agent), verb args | Submit a command with stable id `run_id/index`; command generation/turn/request binding is resolved by the router at admission. Action mirrors command result. |
-| `git.fetch` | `workspace|repo`, `remote?` | Explicit argv. On unknown, compare fetched refs only after process group is gone; never refetch merely to settle. |
-| `git.pull` | `workspace|repo`, `remote?`, `ref?` | `--ff-only`; unknown needs HEAD/ref readback and remains unknown if another writer could explain it. |
-| `git.push` | `workspace|repo`, `remote?`, `ref?` | Never force. Lost reply: prove process group gone, then exact `ls-remote`; never push again blindly. |
-| `git.worktree` | `repo`, `branch`, `base` | Stable intended path/branch; read back both. Existing mismatched path/branch fails. |
-| `msg.send` | `to`, `text`, `mode?` | Store transaction with stable action id; repeated admission returns same message. |
-| `var.set` | `scope`, `key`, `value`, `if_version?` | Store CAS with stable action id. |
-| `run` | `cmd:[..]`, `cwd?`, `timeout?`, `env?` | External process; no generic retry/readback. Unknown stays unknown. Successful bounded stdout may append more actions durably (below). |
-| `notify` | `text`, `via?: log|desktop|webhook`, `url?` | Log/desktop can settle locally. Webhook is at-most-one automatic attempt unless the endpoint accepts an idempotency key configured for the action. |
-| `emit` | `kind` (`x.user.*`), `data` | Persisted Store event with stable action id. |
+| any core verb | concrete target + frozen expected binding, verb args | `command.submit` with stable id `run_id/index`; mirror its state. Router rejects stale binding. |
+| `git.fetch` | concrete repo/workspace, remote? | explicit argv. Unknown: only inspect refs after process group is proven gone; do not refetch to settle. |
+| `git.pull` | repo/workspace, remote?, ref? | `--ff-only`. Unknown requires exact HEAD/ref evidence and remains unknown if another writer could explain it. |
+| `git.push` | repo/workspace, remote?, ref? | never force. Lost reply: prove process gone, then exact `ls-remote`; never push again blindly. |
+| `git.worktree` | repo, branch, base, intended path | read back branch+path; existing mismatch fails. |
+| `msg.send` | concrete recipients, text, mode?, reply_to? | one stable Store admission per recipient; presentation remains separately observable. |
+| `var.set` | concrete scope/key/value/expected version? | Store CAS with stable action id. |
+| `run` | fixed `cmd:[..]`, cwd?, timeout?, env refs? | external process; no generic retry/readback. Unknown remains unknown. Successful bounded stdout may append actions as below. |
+| `notify` | text, `via=log|desktop|webhook`, URL reference? | log/desktop settle locally. Webhook gets one automatic attempt unless endpoint has an explicit configured idempotency key. |
+| `emit` | `x.user.*`, data | persisted Store event with stable action id. |
 
-All process actions use explicit argv, resolved executable, bounded output and the
-custody rules in [monitoring](monitoring.md#starting-processes). Git sets
-`GIT_TERMINAL_PROMPT=0` and no editor.
-
-Further pushes to a repository are refused while an earlier push action there is
-`unknown`. This is a narrow external-write hold, not a global workflow lock.
+All process actions use resolved executable + argv, bounded streams and exact custody.
+Git disables prompts/editor. Further pushes to one repository are held while an older
+push there is unknown; this narrow writer hold is not a workflow lock.
 
 ## Scripts
 
-A `run` action receives one JSON object on stdin:
+A `run` action receives one bounded JSON object on stdin:
 
 ```json
 {"event": {}, "agent": {}, "rule": {}, "run": {}}
 ```
 
-Environment includes `ELIOT_HOME` and `ELIOT_RULE`; the script has no agent token, so
-explicit `eliot` CLI calls act as the owner. stderr goes to daemon logs. stdout is
-bounded to 1 MiB and may contain NDJSON action objects.
+Environment contains `ELIOT_HOME` and `ELIOT_RULE`, but no agent token. Script CLI
+calls therefore act as explicit owner calls; they still use normal command admission.
+stderr is bounded log text. stdout is ≤1 MiB NDJSON action objects.
 
-The daemon does **not** execute stdout actions while the script is still running. It:
+The daemon waits for exit 0 and complete output, parses/validates everything, resolves
+selectors/bindings against one post-script Store snapshot, and appends immutable
+per-target actions to the same run in one transaction. Only then are they dispatched.
+A generation that changes after this append becomes stale at router admission.
 
-1. waits for exit 0 and complete bounded stdout;
-2. parses and validates every action;
-3. appends them to the same run in one Store transaction;
-4. then dispatches them in order.
+Nonzero exit, invalid output or cap breach fails the action. Timeout kills/verifies its
+process group. If daemon loses the script after dispatch, it is unknown and is never
+rerun. Commands already submitted by the script remain independently durable by id.
 
-Nonzero exit, invalid output or output cap → `failed`. Timeout kills and verifies the
-whole process group. If the daemon loses the script after dispatch, the action is
-`unknown` and the script is not rerun. Eliot commands the script already submitted are
-separately durable under their own ids.
-
-Scripts are versioned under `.eliot/scripts/`; never edit a path that may be executing.
-Install a new file and update the rule for future runs.
+Scripts are versioned files; never overwrite a path that may execute.
 
 ## Approvals
 
-`approval.requested` events can trigger ordinary rules. `approve`/`deny` actions bind
-the exact agent generation, turn and request id. A stale rule run is rejected rather
-than answering whatever request is now pending.
+`approval.requested` can trigger a rule. The rendered approve/deny action stores exact
+agent generation, turn and request id from the event. A stale run fails rather than
+answering a later request.
 
-A synchronous hook decision evaluates matching rules within the hook deadline. No
-match means `ask`. An unanswered asynchronous request produces one queue message to
-the parent, else project manager, else owner. Timeout never picks a first/recommended
-choice and never means blanket deny.
+A synchronous hook decision evaluates matching rules inside the hook deadline against
+that exact request. No match means `ask`. An unanswered asynchronous request produces
+one coalesced queue message to parent/project manager/owner. Timeout never chooses the
+first/recommended option.
 
 ```toml
 [[rule]]
 id = "allow-tests"
 on = { event = "approval.requested", match = { "data.kind" = "command", "data.command" = "glob:cargo test*" } }
-do = [{ action = "approve" }]
+do = [{ action = "approve", request_id = "${data.request_id}", turn_id = "${data.turn_id}" }]
 ```
 
 ## Goal loop
 
-Two independent goal modes exist: the harness's **native goal** and an **Eliot goal**
-that sends ordinary turns. An agent may have one of each with different text.
+A harness native goal and one Eliot goal may coexist with separate text/budgets.
 
 ```text
 Goal {
   agent_generation,
   mode: native | eliot,
   text,
-  check?: argv | "marker:<TEXT>",
+  check?: argv | marker,
   budget: {max_turns [20], max_cost_usd?, no_progress [3]},
   cadence: on_idle | every <duration>,
   status, turns_used, revision, last_check?
@@ -201,43 +204,29 @@ Goal {
 
 ### Native goal
 
-The plugin maps native `goal.*` and emits `goal.updated`. Eliot can pause it when the
-configured turn/cost budget is exceeded. If native status says done and a `check`
-exists, Eliot runs the check; failure sets Eliot's projection to `blocked
-reason=check_failed`. It does not silently restart the native goal.
+Plugin maps native goal verbs and emits `goal.updated`. Eliot may pause when configured
+turn/cost budget is exceeded. If native says done and a check fails, Eliot marks its
+projection blocked; it does not silently restart the native goal.
 
-### Eliot goal round
+### Eliot round
 
-On a matching `agent.idle` or cadence tick:
+On matching idle/cadence:
 
-1. Read one consistent snapshot of agent generation, goal revision, pending requests,
-   open unknown commands and native-goal status.
-2. Skip if an approval/question or unknown command is open. With `on_idle`, also skip
-   while a native goal is active; `every` may intentionally queue a normal send.
-3. Run `check` in the workspace (default timeout 10 min; global
-   `max_parallel_checks = 2`). `marker:X` succeeds when the latest bounded
-   `message.agent` for this generation contains X.
-4. If check passes → `done`. If budget is exhausted → `blocked budget`.
-5. Progress is a change in check output or the read-only workspace fingerprint from
-   [monitoring](monitoring.md#read-only-workspace-fingerprint). An unavailable/incomplete
-   fingerprint never counts as "no change" by itself. `no_progress` consecutive
-   complete rounds → `blocked no_progress`.
-6. Otherwise submit one `send` with origin `goal:<agent>`, bound to the agent generation
-   and goal revision:
+1. read one snapshot: generation, goal revision, active/pending requests, unknown
+   commands and native-goal status;
+2. skip on pending request/unknown command; `on_idle` also waits for active native
+   goal, while `every` may intentionally queue a send;
+3. run bounded check in workspace (default 10 min, global parallel limit 2);
+4. pass → done; exhausted budget → blocked;
+5. progress = change in complete check output or complete read-only workspace
+   fingerprint. Incomplete/unavailable fingerprint alone is not no-progress;
+6. otherwise re-read generation/revision and submit one send with both expectations.
 
-   `Goal: <text>\nThe check `<cmd>` still fails:\n<last 40 lines>\nContinue.`
+Pause/clear/resume increments revision. Any generation/revision change invalidates the
+round before command admission. Repeated text is allowed only in a later valid round.
+Blocked/done sends one mailbox notification according to recipient wake policy.
 
-Before admitting the send, re-read generation/revision. Pause, clear, resume, a new
-native session or a concurrent successful check invalidates the round. A stale round
-creates no command. Repeating the same text in a later valid round is allowed.
-
-`pause`, `resume` and `clear` increment `revision`. `blocked`/`done` notify the parent
-or owner through the mailbox. Eliot-goal budgets do not limit a native goal beside it;
-that mode has its own budget.
-
-## Storage (L6 migration)
-
-Rules remain files. Store only execution state:
+## Storage (L6)
 
 ```sql
 CREATE TABLE automation_runs (
@@ -245,7 +234,7 @@ CREATE TABLE automation_runs (
   rule TEXT NOT NULL,
   trigger_key TEXT NOT NULL,
   trigger_seq INTEGER,
-  state TEXT NOT NULL,              -- queued|running|applied|failed|unknown|cancelled
+  state TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(rule, trigger_key)
@@ -254,9 +243,9 @@ CREATE TABLE automation_actions (
   run TEXT NOT NULL REFERENCES automation_runs(id),
   idx INTEGER NOT NULL,
   kind TEXT NOT NULL,
-  payload TEXT NOT NULL,            -- immutable rendered action
+  payload TEXT NOT NULL,          -- immutable rendered/expanded action incl. expected bindings
   state TEXT NOT NULL,
-  ref TEXT,                         -- command/message/process/native readback id
+  ref TEXT,
   outcome TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -293,33 +282,27 @@ CREATE TABLE goals (
 );
 ```
 
-Rate-limit windows and loop-depth counters are in memory; restart resets them. Durable
-run uniqueness still prevents repeated trigger keys.
+Rate/depth windows are in memory and reset after restart; durable run uniqueness still
+prevents repeated firing keys.
 
 ## Guardrails
 
-- Every generated command/event/action carries `cause.depth`; depth > 5 suppresses the
-  firing.
-- Per-rule default limit: 10 firings per minute; global default 120 actions/minute.
-- Excess is `rule.suppressed` once per window.
-- `eliot rule test ID --event FILE` renders and validates without admitting a run.
-- Events of agent A cannot create `send`/`steer`/`inject` to A unless
-  `allow_self = true`; this blocks status/failure ping-pong.
-- Automation paused or daemon draining admits no new runs and no goal continuation.
-- Every target is revalidated by the router at action admission. A stored action never
-  bypasses current generation, control or capability checks.
+- Generated effects carry `cause.depth`; >5 suppresses firing.
+- Default per-rule limit 10/min; global 120 actions/min; report suppression once/window.
+- `rule test` renders/validates from a supplied snapshot but admits nothing.
+- An event of agent A cannot send/steer/inject A unless `allow_self=true`.
+- Draining/paused automation admits no new run/goal continuation.
+- Every frozen target still passes current authority/capability/state and exact-binding
+  validation. Stored actions never bypass the router.
 
 ## Workflow recipes
 
-Workflows are rules + scripts + agents, not core product states:
+Recipes remain rules/scripts, not core states:
 
-- **Writer → reviewer:** on writer turn completion with dirty files, launch a reviewer;
-  parse one bounded review result and send all findings back once.
-- **Keep main fresh:** timer `git.fetch`; on a changed remote ref, inject/queue a notice
-  to agents whose base is that ref.
-- **Nightly:** cron launches a maintenance profile with a goal and exact check.
-- **Quota fallback:** only after a failed turn with no tool/side effect; otherwise
-  notify. Never rerun a half-done turn on another route.
-- **Session rotation:** request a checkpoint; after its exact turn completes and
-  children/requests are settled, stop and launch/resume a new generation from the
-  checkpoint. Old queued commands expire rather than crossing the rotation.
+- writer completion with dirty files → concrete reviewer launch; one bounded review
+  result returned once;
+- timer fetches main; changed ref produces generation-bound notice to concrete agents;
+- nightly launches one maintenance profile with goal/check;
+- quota error notifies or selects an owner-written new route only when no effect began;
+- rotation checkpoints, settles exact children/requests, then stops and creates a new
+  generation. Old queued actions fail stale rather than crossing it.
