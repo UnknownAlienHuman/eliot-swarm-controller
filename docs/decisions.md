@@ -38,13 +38,14 @@ changes behavior; never append a contradictory addendum.
 | D-31 | Event rules, timers, goals, unread-mail wakeups, workspace/launch queues and provider holds reconcile from durable current state after restart. | Volatile callback/timer edges can be lost. |
 | D-32 | Custody is honest per platform: Windows Job exact; Linux exact only with cgroup/equivalent + owner-death guardian; process-group fallback is degraded. | Unix process groups neither auto-die with daemon nor prevent `setsid` escape. |
 | D-33 | Persisted plugin lifecycle/process facts use commit-acknowledged requests plus stable native ids and Store uniqueness. | Fire-and-forget notifications can be lost between native read and Store commit. |
-| D-34 | Current edit attribution and completed turn results are compact projection tables, not reconstructed from retained events. | Retention/restart must not erase `who`, wait or result. |
+| D-34 | Current edit attribution and turn results are compact projection tables, not reconstructed from retained events. | Retention/restart must not erase `who`, wait or result. |
 | D-35 | Global and project automation are distinct principals. Project rules/scripts cannot escape their registered project or become owner by omitting a token. | “One local user” does not justify accidental cross-project control. |
 | D-36 | Persisted events carry a bounded event-time subject snapshot; rules never join a later mutable Agent row. | Replay after labels/project/state changes must produce the same decision. |
-| D-37 | Active rule cursors bound event retention; paused/disabled rules advance by policy, and excessive lag pauses visibly instead of pinning disk forever. | Durable triggers and bounded storage must coexist without silent loss. |
-| D-38 | Worktree creation/setup is a journaled pre-start phase. Exact Git effects are read back; unknown setup never reruns blindly. | `launch --worktree` otherwise repeats non-idempotent setup or starts in a half-built workspace. |
-| D-39 | Mail uses capability-aware wake plus explicit immutable inbox-batch acknowledgement. | Stored ≠ presented ≠ safely received; lost reply must not silently consume mail. |
+| D-37 | Active rule cursors bound retention; disabled rules advance, and excessive lag records an explicit skipped range and releases retention. | Durable triggers and bounded storage must coexist without silent loss or indefinite disk pinning. |
+| D-38 | Worktree creation/setup is a journaled pre-start phase. Exact Git effects are read back; unknown setup never reruns blindly. | `launch --worktree` otherwise repeats non-idempotent setup or starts half-built. |
+| D-39 | Mail uses capability-aware wake plus immutable inbox-batch acknowledgement. | Stored ≠ presented ≠ safely received; lost reply must not consume mail. |
 | D-40 | Historical replay exposes an explicit gap when requested events were pruned. | Silent jump from an old cursor falsely claims complete history. |
+| D-41 | Command admission and turn outcome are separate. A missing terminal result becomes an unknown turn that blocks further work in that generation until exact readback or constrained owner resolution. | `send applied` proves input admission, not completion; reconnect must neither invent success nor wedge recovery permanently. |
 
 ## Defaults
 
@@ -55,6 +56,7 @@ changes behavior; never append a contradictory addendum.
 | Event-rule first load/edit | start at current high-water; no implicit historical replay. |
 | Paused/disabled event rule | advance cursor without firing; no resume burst. |
 | Project automation | project-scoped principal. |
+| Unknown live turn | block new send/goal; exact readback or owner resolution after native-not-active proof. |
 | L4.7 harnesses | Do not build until concrete need. |
 | Git identity | Per agent; explicit inherit opts out. |
 | Remote/multi-host/GUI/Memory OS | Not built without owner decision. |
