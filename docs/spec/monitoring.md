@@ -15,11 +15,10 @@ visible gap. Wrong generation/turn/request, stale source sequence and vendor rep
 bounded diagnostics, never ordinary lifecycle or automation triggers.
 
 A well-formed source-owned event that is a stale binding or vendor duplicate still
-advances that source sequence transactionally: vendor duplicate returns the original
-Store event seq; stale binding may create one bounded diagnostic. Malformed envelope,
-undeclared family or digest mismatch is source integrity failure and does not advance.
-This prevents one deterministic bad native fact from wedging all later source input
-without letting an unauthorized family enter the bus.
+advances source sequence transactionally: vendor duplicate returns original Store event
+seq; stale binding may create one bounded diagnostic. Malformed envelope, undeclared
+family or digest mismatch is source integrity failure and does not advance. Thus a
+valid late fact cannot wedge later input, while unauthorized families never enter bus.
 
 ## Process identity and custody projections
 
@@ -66,15 +65,23 @@ CREATE TABLE processes (
 CREATE INDEX processes_owner ON processes(owner,state);
 ```
 
-Plugin `process.put` uses the same commit-acknowledged contiguous source-sequence
-contract as lifecycle events, normally through a separate process-family source key.
-Host verifies boot/start identity, then commits source watermark, process projection and
-normalized `process.started|exited` event in one transaction. A lost reply resends the
-same envelope; history pruning never makes it a new process fact. Internal Git/script/
-check/workspace runners register their action owner directly through daemon Store
-transactions.
+The daemon/OS process monitor is authoritative for `process.started`, `process.exited`
+and stats. It registers plugin/harness processes it spawns before execution where
+possible and enumerates exact custody. A per-agent plugin may additionally submit a
+commit-acknowledged sequenced `process.put` for an agent-owned descendant it discovered;
+the host verifies exact birth and custody membership, then upserts the same projection.
+Host enumeration and plugin registration of one identity publish only one start event.
+A lost `process.put` reply resends the same source sequence; process-history pruning
+cannot turn it into a new process.
 
-Restart never reconstructs custody from PID guesses.
+A shared plugin cannot assign the shared server or uncontained service children to an
+Agent owner. Managed/attached service processes are registered under `service:<name>` by
+service management. Session-attributed tool PID information may be a bounded harness
+diagnostic, never custody ownership. Agent stop therefore never kills a shared service
+process.
+
+Internal Git/script/check/workspace runners register their action owner directly in the
+same spawn/custody transaction. Restart never reconstructs custody from PID guesses.
 
 ### Peer caller classification
 
@@ -92,12 +99,12 @@ peer is uncontrolled**. Before no-token owner fallback, API server:
 
 Membership maps caller to custody principal and requires matching scoped token. Access
 failure, birth race, incomplete inventory or ambiguity rejects
-`caller_identity_unknown`. Containment applies before execution, so process-registration
-lag creates no authority window.
+`caller_identity_unknown`. Containment applies before execution, so registration lag
+creates no authority window.
 
 Shared-service process still needs exact per-session token. Deliberate same-user escape
-from a degraded group is outside the declared containment/security guarantee; status
-reports that boundary rather than pretending hostile same-user isolation.
+from degraded group is outside declared containment/security guarantee; status reports
+that boundary rather than pretending hostile same-user isolation.
 
 ## Process custody backends
 
@@ -174,14 +181,14 @@ Additional rules:
 1. create Agent generation 0, `workspace_state=preparing`, deterministic path;
 2. journal repo, requested branch, diagnostic base ref, exact `base_oid`, path and setup
    revision;
-3. run explicit `git worktree add` against the frozen OID under workspace custody;
+3. run explicit `git worktree add` against frozen OID under workspace custody;
 4. read back `git worktree list --porcelain`, branch and exact HEAD OID;
 5. run setup argv sequentially, each in its own custody;
 6. commit ready; only then allow native start.
 
 No implicit fetch/ref re-resolution occurs at dispatch. If requested branch already
-exists, its exact current OID must equal frozen `base_oid` (or explicit policy must name
-reuse); otherwise fail. A moving branch/remote ref after admission cannot alter the
+exists, exact current OID must equal frozen `base_oid` (or explicit reuse policy must
+name it); otherwise fail. Moving branch/remote ref after admission cannot alter
 workspace.
 
 Lost Git response is read back, never blindly repeated. Lost setup has no generic
