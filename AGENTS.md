@@ -53,9 +53,11 @@ Correct harness facts with exact installed/official source and date.
 - **Unknown stays unknown.** Never retry an effect that may have applied—not start,
   input, interrupt, stop, setup, script, push or webhook. Settle by exact readback or
   explicit owner resolution.
-- **Persisted plugin facts are acknowledged.** Advance native cursor/drop local spool
-  only after Store commit reply. Lost reply resends the same native event id. Dedupe
-  receipts survive event retention until the old generation can no longer replay.
+- **Persisted plugin facts are sequenced and acknowledged.** Each source ownership epoch
+  has one stable key, contiguous source sequence and at most one unacknowledged event.
+  Advance native cursor/drop spool only after Store commit reply. Lost reply resends the
+  same sequence/envelope; Store watermark/digest survives event retention. Never build
+  one permanent receipt row per event.
 - **No projection-miss owner escalation.** Before no-token owner fallback, pin the peer
   process and live-check every current Job/cgroup/process-group custody. Ambiguous
   membership rejects; a missing `processes` row proves nothing.
@@ -65,6 +67,9 @@ Correct harness facts with exact installed/official source and date.
   Duplicate/stale/wrong-turn native input cannot enter normal automation.
 - **Event replay is deterministic.** Match the stored event-time subject, never a later
   mutable Agent row.
+- **Rule edits have a boundary.** For enabled edit, capture H, drain old revision only
+  through H and start the new revision after H. Disable/pause explicitly records and
+  skips through H; do not silently lose the old backlog.
 - **A bad event cannot wedge a rule.** Missing placeholder, invalid action, authority
   violation or secret-bearing render creates one durable failed firing with no actions
   and advances the cursor. Store failure alone retries the same event.
@@ -95,7 +100,8 @@ Correct harness facts with exact installed/official source and date.
 - `thiserror` in libraries, `anyhow` at binary boundary, `tracing`, Tokio async I/O.
 - No production `unwrap`; `expect` states a true invariant.
 - `unsafe` only in the documented platform boundary.
-- SQLite ids fit signed 64-bit; derived ids are fixed and bounded.
+- SQLite ids fit signed 64-bit; derived ids are fixed and bounded; exhaustion fails
+  before mutation.
 - Explicit executable/argv/cwd/env; no implicit shell.
 - Windows: explicit handles, assign-before-resume Job, no child console, UTF-8 without
   BOM/LF, long input via stdin/file, case-insensitive environment keys.
