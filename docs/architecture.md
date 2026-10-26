@@ -10,12 +10,12 @@ owner / agents / scoped automation
 ┌──────────────────────────── Eliot daemon ─────────────────────────────┐
 │ API → Router → readiness lanes → Plugin host → native plugins/services│
 │  │       │                         ▲                                   │
-│  │       └─ commands/actions ──────┤ commit-ack event/process requests │
+│  │       └─ commands/actions ──────┤ commit-ack source requests        │
 │  ▼                                 │                                   │
 │ one SQLite WAL Store ↔ ordered persisted bus + bounded live fan-out  │
 │  ▲          ▲             ▲                 ▲                         │
 │ custody   Git/fs      Coordination        Automation                   │
-│ guardian  monitor     mail/vars/who       cursors/timers/goals/scripts│
+│ guardian  monitor     mail/vars/who       activations/timers/goals    │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -23,135 +23,147 @@ owner / agents / scoped automation
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| CLI/API | request syntax/output/current identity forwarding and peer classification | business state |
-| Router | principal/capability/state, expected/target generation, turn/request binding, durable admission | vendor translation |
-| Store | ids, canonical native subject, commands/events/source watermarks/turn/edit projections, cursors/timers/actions | native sessions |
-| Plugin host | instances, deadlines, commit acknowledgements, custody and attach | harness semantics |
-| Plugin | one harness protocol, native ids/readback/source normalization | Store writes or unknown retries |
-| Monitors | source-owned process/Git/fs/transcript facts and workspace preparation | agent workflow |
-| Coordination | durable mail/vars/claims/current edit view | locks or hidden model turns |
-| Automation | scoped principals, event-time matching, revision handoff, trigger cursors, frozen actions and goal rounds | Task/review engine |
+| CLI/API | request syntax/output, external WriteId, identity forwarding, peer classification | business state |
+| Router | principal/capability/state, exact bindings, immutable admission, selector fanout | vendor translation |
+| Store | ids/receipts, canonical native subject, commands/events/source ownership, input/turn/edit projections, activation/action state | native sessions |
+| Plugin host | instances, deadlines, source commit acknowledgements, custody and attach | harness semantics |
+| Plugin | one harness protocol, native ids/readback/source normalization | Store writes, source keys or unknown retry |
+| OS/Git/fs monitors | process lifecycle, workspaces, Git facts and source health | workflow |
+| Coordination | mail/vars/claims/current-work view | locks or hidden model turns |
+| Automation | scoped principals, persisted rule definitions/activations, cursors, frozen actions and goals | Task/review engine |
 
 ## Core invariants
 
-1. One semantic language; unsupported semantics fail before native I/O.
-2. Every effect has a stable Eliot id and exact generation plus turn/request where
-   relevant.
+1. One semantic command language; unsupported semantics fail before native I/O.
+2. Every external mutation has ULID receipt; internal linked/selector/automation effects
+   have bounded derived ids and no fake receipt.
 3. Unknown is never replayed automatically.
 4. One canonical Agent row represents one native subject.
-5. A controlled live generation has one routing-token hash; generation 0, terminal and
-   observe-only/detached rows have none. Revocation never rewrites generation history.
-6. Persisted plugin facts are commit-acknowledged. One contiguous sequence and last
-   envelope digest per source ownership epoch survive event-row retention with O(sources)
-   state rather than O(events) receipts.
-7. One source owns each lifecycle family; stale/duplicate/wrong-turn input cannot fire
-   ordinary automation.
-8. Session start and optional first prompt are separate linked command outcomes.
-9. Rules match the stored post-transition event-time subject and run under
-   global/project/goal principals; delayed actions freeze concrete targets.
-10. Enabled rule edits use a captured high-water handoff: old revision drains through
-    H, new revision begins after H. Disable/pause records an explicit skipped range.
-11. A deterministic render/authority error creates one failed firing with no actions
-    and advances its cursor. Only Store failure retries the same event.
-12. Event cursors, timers, goals, unread mail, workspace/launch queues and provider
-    holds reconcile from durable current state after restart.
-13. No-token owner fallback requires a birth-pinned live OS check proving the peer is
-    outside every current Eliot custody; missing projection or ambiguity rejects.
-14. Custody claims only what the OS backend proves; degraded Unix never advertises
-    exact force/owner-death cleanup.
-15. Environment is minimal by default. Project script references pass both the global
-    script allowlist and project allowlist before any value is read.
-16. Views are queries over projections/events, not parallel state machines.
+5. Session start and optional first input are separate linked outcomes; async inbox
+   acceptance is not send applied, and send applied is not turn completion.
+6. Generation/turn/request bindings fence replacement work. Unknown turn blocks more
+   turn work until exact readback or constrained owner resolution.
+7. Current routing token is re-derivable from private routing key + token version while
+   Store keeps only hash; terminal/detach revokes without rewriting generation.
+8. Persisted plugin facts use stable `source.open`, one current owner per family and
+   contiguous commit-ack sequence. Lost acknowledgement is idempotent after event
+   retention.
+9. Shared service PIDs belong to service custody, never an Agent. OS monitor alone owns
+   process exit/stats.
+10. Rules use stored event-time subject. Each install/reload has fresh activation id and
+    persisted compiled definition; A→B→A is three activations.
+11. Event edits hand off at captured high-water. Deterministic firing error advances
+    cursor as failed run; only Store failure retries.
+12. Selector fanout is one bounded atomic snapshot, paginated afterward; no partial
+    broadcast.
+13. Worktree base ref resolves to immutable local OID before admission.
+14. Restart is level-reconciled from Store: sources, rules, timers, goals, mail,
+    workspaces, launch queues and provider holds.
+15. No-token owner fallback needs live birth-pinned proof peer is outside every custody.
+16. Custody claims only OS-proven capability; degraded Unix never advertises exact
+    force/owner-death cleanup.
+17. Minimal environment/default project allowlists; secrets resolve only after authority
+    validation and never persist in semantic payloads.
+18. Receipt retention is a minimum window; referenced receipts live as long as retained
+    domain rows require them.
+19. Views query projections/events; they are not another state machine.
 
-## Start flow
+## Launch flow
 
 ```text
 eliot launch --worktree feat/x --profile codex "do X"
-  → transaction:
-      agent a12 generation 0, token_hash NULL, workspace_state=preparing
-      launch command L targets generation 1
-      linked send S targets generation 1
-  → journal/read back worktree + setup; workspace_state=ready
+  → one transaction:
+      external receipt + launch command L
+      agent a12 generation 0, no token
+      derived linked send S
+      frozen profile binding + base_oid workspace journal
+  → create/read back worktree at base_oid; run setup once
   → atomically reserve profile/account/proxy capacity and dispatch L
-  → transaction: a12 generation 1, new token hash, state starting
-  → plugin establishes native subject and source key
-  → event.put(session.ready, source_seq=1) commits watermark + event/projection
-  → L applied; a12 idle; S dispatches separately
-  → turn start/completion update events + compact input/turn projections
+  → a12 generation 1, increment token_version, hash derived token, starting
+  → plugin establishes native subject
+  → source.open(open_id, families) commits source key/family owners
+  → commit-ack session.ready applies L and makes a12 idle
+  → S dispatches separately; input association and terminal turn settle separately
 ```
 
-If the harness requires input to expose a native subject, `agent.start` may carry S,
-but session and input status remain separate. Ready never proves prompt admission.
-Resume expects terminal generation g, targets g+1, retains the same canonical subject,
-and moves the row/rotates token only when dispatch commits. Old queued work is stale;
-goals pause until explicitly rebound. Terminal or detach transition clears the current
-token hash without resetting g.
+A `start_requires_input` harness may carry S inside start but still reports session/input
+outcomes independently. Resume expects g/targets g+1, keeps canonical subject, moves row
+only at dispatch and pauses old goals. Detach preserves independently owned session,
+revokes token and releases claims.
 
-## Command and event flow
+## Command fanout and event flow
 
-A current-turn command captures generation and exact turn/request in one admission
-transaction. Ready native calls serialize; queued future sends do not block current
-controls/answers. Exact reply/readback settles applied/failed/unknown.
+Concrete command captures expected/target generation plus exact turn/request in one
+transaction. Queued future sends do not block current control/answers.
 
-For persisted native facts, each authoritative source assigns a durable contiguous
-`source_seq`, keeps at most one unacknowledged request and advances its native cursor or
-spool only after Store commit reply. The Store commits one compact source watermark,
-last-envelope digest and event/projections atomically. A lost acknowledgement resends
-the same sequence; the watermark returns the original result even after the event row
-is pruned. A hole or lost native interval becomes an explicit gap, never invented
-completion. Source rows are reclaimed only after generation/source closure, so storage
-scales with ownership epochs rather than event count.
+Selector command is a Store-only external parent. Transaction sorts concrete AgentIds,
+checks hard limit, creates derived children and records count/digest. Parent applied
+means expansion committed, not child effects. Child list/outcomes are paginated; retry
+same WriteId returns same fanout.
 
-Event rules scan persisted events by durable cursor. On enabled edit, old and new
-revisions meet at one captured H without overlap/gap. No match advances. A valid match
-admits one immutable run/actions and advances. A deterministic render, secret or
-authority error admits one failed run without actions and advances. A Store failure
-rolls back the cursor and retries only after Store recovery.
+For native facts:
+
+```text
+plugin source.open(stable open_id)
+  → daemon source_key + current watermark
+plugin event.put/process.put(source_key, next source_seq, envelope)
+  → source/family/binding validation
+  → one transaction: watermark + event/projection/reducer
+  → commit acknowledgement
+```
+
+One source owns each family. Vendor duplicate may advance source sequence but cannot
+fire lifecycle twice. Gap/hole is explicit. Per-agent `process.put` registers verified
+owned descendant; service processes are registered under service custody, and OS
+monitor publishes exits/stats.
+
+## Automation flow
+
+Rule file produces canonical definition digest and fresh immutable activation id. Store
+persists compiled definition for active/retiring/replay intervals. Enabled edit captures
+H: old activation drains through H; new starts after H. Reverting bytes creates another
+activation, never resets old cursor.
+
+A firing creates generic run identity `(principal,kind,owner activation,trigger)`,
+freezes concrete targets and derived commands/actions. Deterministic rendering/authority
+failure is one failed run with cursor advance. Rate limits derive from durable rows, so
+restart does not reset them.
 
 ## Caller identity and process topology
 
-Before granting no-token owner identity, local IPC pins peer PID/birth and checks live
-membership against every current Job/cgroup/process-group custody. The persisted process
-projection is only a fast path; a projection miss is not proof of independence.
-Ambiguous or unreadable membership returns `caller_identity_unknown`.
+Local IPC pins peer birth and checks live membership against every Job/cgroup/process
+group before no-token owner fallback. Process table is fast path only.
 
-- Windows exact: per-owner no-breakaway Job; daemon-owned groups use kill-on-close.
-- Linux exact: delegated cgroup/equivalent plus monitored owner-death guardian.
-- Linux/other Unix fallback: degraded process group; no exact force guarantee.
-- Shared control: only with per-session environment/tool attribution, canonical
-  identity, attach/readback and isolated stop.
-- Attached owner services are never killed; managed services have separate custody.
+- Windows exact: no-breakaway Job per owner; daemon-owned Jobs kill on close.
+- Linux exact: delegated cgroup/equivalent + monitored owner-death guardian.
+- Unix fallback: degraded process group; no exact force/complete descendant proof.
+- Shared control: per-session environment/identity/readback/isolated stop required.
+- Attached owner services never killed; managed services separate custody.
 
 ## Store and recovery
 
-One writer commits bounded batches. Read connections are query-only, paginated and
-released between pages. WAL/readers are monitored; hard pressure rejects new long reads
-rather than deleting evidence or blind-truncating.
+One writer commits bounded batches. Reads are query-only, paginated and release
+transactions. WAL/readers monitored; hard pressure rejects new work/long reads while
+preserving stop/request/result commits.
 
-Restart recovery is level-based:
+Restart:
 
 - dispatched effects remain unknown until exact readback;
-- plugin/session/source ownership reattaches by canonical subject and source watermark;
-- event rules resume active/retiring/replay revisions from durable interval boundaries;
-- timers/goals/mail/workspace/launch/provider queues reconcile rows;
-- Git facts rebuild from Git while edit/input/turn/source-watermark projections survive
-  event retention;
-- missing custody becomes lost only after authoritative-source drain rules.
-
-Project rules/scripts use a project principal and cannot escape to another project,
-global variables, plugin/service configuration, unallowlisted webhooks or environment
-references outside global-script∩project allowlists. Global rules are explicit owner
-configuration.
+- sessions/sources reattach by canonical subject/open id/watermark;
+- active/retiring/replay definitions and cursors resume from Store;
+- timers/goals/mail/workspace/launch/provider queues reconcile;
+- Git facts rebuild while edit/input/turn projections survive event pruning;
+- missing custody settles only under source-drain/session rules;
+- routing-key mismatch blocks new token issue, not owner readback/stop.
 
 ## Scale
 
-Idle/historical agents are indexed rows, not tasks. Fake and qualified shared services
-can multiplex many sessions; process-owning harnesses use one small plugin/custody unit
-per live agent. Lists/replays are paginated, subscriptions bounded and hot paths use
-indexes/due queues rather than O(all agents) scans.
+Idle/historical agents are indexed rows, not tasks. Qualified shared services multiplex;
+process-owning harnesses use one small plugin/custody unit per live agent. Lists,
+fanouts, histories and replays are paginated/bounded; hot paths use indexes/due queues.
 
-One host realistically runs tens to a few hundred native model sessions; 10,000 fake
-agents test controller bookkeeping. Multi-host is a later owner decision.
+One host realistically runs tens to a few hundred native sessions. 10,000 fake agents
+test bookkeeping. Multi-host is later decision.
 
 ## Target layout
 
@@ -167,4 +179,4 @@ plugins/
 docs/
 ```
 
-Add a crate/trait/service only after two current consumers require the boundary.
+Add crate/trait/service only after two current consumers require boundary.
