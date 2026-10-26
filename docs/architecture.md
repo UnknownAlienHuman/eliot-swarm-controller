@@ -1,160 +1,187 @@
 # Architecture
 
 This page is the map. Exact formats live in [spec/](spec/); build order lives in the
-[roadmap](roadmap.md). Rationale for each choice is in [decisions](decisions.md).
+[roadmap](roadmap.md). Rationale lives in [decisions](decisions.md).
 
 ## Picture
 
 ```text
- owner / manager agent / scripts                      vendor harnesses
- ───────────────────────────────                      ────────────────
-  eliot CLI ──┐                                   ┌─► codex app-server
-  eliot mcp ──┼─ local IPC (JSON-RPC) ─┐          │   claude (SDK / stream-json)
-  hook shim ──┘                        │          │   opencode serve
-                                       ▼          │   agy / gemini / acp ...
- ┌───────────────────────── eliot daemon ─────────┼──────────────────────┐
- │                                                │                      │
- │  API ──► Router ──► Plugin host ──stdio JSON-RPC──► plugin processes ─┘
- │            │             ▲  (per harness kind; many agents per process if it can)
- │            ▼             │ events                                     │
- │   ┌────────────── Bus (in-memory fan-out + persisted log) ──────────┐ │
- │   └──▲────────▲────────▲──────────▲─────────────▲──────────▲───────┘ │
- │      │        │        │          │             │          │         │
- │  Monitors:  process   git    transcripts     Automation  Coordination │
- │  (sysinfo) (git CLI) (file tail)  hooks      rules,timers  mail,vars, │
- │                                               goal loop    who,claims │
- │                                                                       │
- │  Store: one SQLite file (WAL), one writer task                        │
- └───────────────────────────────────────────────────────────────────────┘
-          proxies (OpenCodex, ...) = supervised or attached services
+ owner / manager agent / scripts                         vendor harnesses
+ ───────────────────────────────                         ────────────────
+  eliot CLI ──┐                                      ┌─► codex app-server
+  eliot mcp ──┼─ local IPC (JSON-RPC) ─┐             │   claude SDK / stream-json
+  hook shim ──┘                        │             │   opencode serve
+                                       ▼             │   agy / muse / acp ...
+ ┌───────────────────────── eliot daemon ────────────┼───────────────────┐
+ │                                                   │                   │
+ │ API ─► Router ─► Plugin host ──stdio JSON-RPC──► plugin processes ───┘
+ │          │             ▲              per-agent when they own native processes;
+ │          ▼             │ events       shared only for isolated native services
+ │   ┌──────────── Bus (persisted log + live fan-out) ────────────────┐
+ │   └──▲────────▲────────▲──────────▲────────────▲──────────▲──────┘
+ │      │        │        │          │            │          │
+ │   process    Git    transcripts  hooks      Automation  Coordination
+ │   monitor   monitor  (when owner) intake    rules/timers mail,vars,
+ │                                              goal loop   who,claims
+ │
+ │ Store: one SQLite file (WAL), one writer task
+ └─────────────────────────────────────────────────────────────────────┘
+          proxies / shared native servers = supervised or attached services
 ```
 
 ## Components
 
 | Component | Responsibility | Not its job |
 | --- | --- | --- |
-| `eliot` CLI | Thin client: parse args, call the daemon, print text or `--json`. Same binary also runs `daemon`, built-in plugins (`eliot plugin <name>`) and the hook shim (`eliot hook`). | Business logic. |
-| Daemon | Owns state, the bus, plugin processes, monitors, automation. One per data dir (lock file). | Model loops, harness internals. |
-| Router | Validates a command (target exists, verb supported, caller allowed, state allows it), persists it, hands it to the plugin, records the outcome. | Translating verbs — plugins do that. |
-| Plugin host | Starts/restarts plugin processes, speaks the [plugin protocol](spec/plugin-protocol.md), routes per-agent messages. | Knowing any harness. |
-| Plugins | One per harness kind. Translate semantic verbs to native calls, normalize native events, report native PIDs and session ids. Any language while prototyping. | Persisting Eliot state, retries of unknown effects. |
-| Bus | Single ordered event stream: persisted events get a `seq`; ephemeral events are fan-out only. Subscribers replay from a `seq` then follow live. | Business decisions. |
-| Monitors | Process, Git, filesystem, transcript tail, hook intake, source health. Each emits events. | Commanding agents. |
-| Automation | Rules (event → actions), timers (every/cron/at), scripts, approval policy, Eliot Goal loop. Emits ordinary commands. | A second state machine. |
-| Coordination | Mailbox, shared variables, area queries (`who`), advisory claims. | Locks or sandboxing. |
-| Store | SQLite schema, migrations by number, one writer task with group commit, read connections for queries. | Hashing documents or proving anything. |
+| `eliot` CLI | Thin client: parse args, call daemon, print text or `--json`. Same binary also runs daemon, built-in plugins, hook shim and MCP. | Business logic. |
+| Daemon | Own state, bus, plugin instances, custody, monitors, automation and coordination. One per data dir. | Model loops or harness internals. |
+| Router | Validate authority/capability/state and exact generation/turn/request binding; persist commands; schedule ready commands; record outcomes. | Translating vendor calls. |
+| Plugin host | Start/restart per-agent or shared plugin processes, enforce deadlines and process custody, route exact-generation messages. | Knowing a harness protocol. |
+| Plugins | Translate semantic verbs, normalize native facts, retain native mapping needed for readback, report processes and effective settings. | Writing Eliot's Store or retrying unknown effects. |
+| Bus | Ordered persisted events plus bounded live ephemeral fan-out. Subscribers replay from `seq` and then follow live. | Deciding workflow. |
+| Monitors | Process, Git, filesystem, transcript, hook and source health. Each owns a distinct fact family. | Commanding agents or duplicating plugin lifecycle events. |
+| Automation | Rules, timers, scripts, approval policy and Eliot Goal loop. It admits ordinary commands/actions and keeps only a small crash-safe run/action journal. | A Task/review/acceptance engine. |
+| Coordination | Mailbox, variables, `who`, advisory claims. | Locks or sandboxing. |
+| Store | SQLite schema/migrations, one writer with group commit, read pool. | Hashing documents or proving policy. |
 
 ## Core rules
 
-1. **One language.** Callers use [semantic verbs](spec/core.md#verbs). Plugins
-   translate. A plugin declares supported verbs; anything else is rejected **before**
-   any native I/O with `unsupported`.
-2. **Events are the truth of what happened; tables are the truth of what is.** State
-   tables (`agents`, `commands`, ...) are updated in the same transaction as the event
-   that changed them. Views (`ls`, `top`, `who`) are queries, never new state machines.
-3. **Never replay an uncertain effect.** If a `send`/`steer`/`launch`/`git push` may
-   have happened, the command becomes `unknown` and is resolved by readback, never by
-   resending.
-4. **Unknown is not zero.** A silent source is `stale`, a vanished process is `lost`,
-   a busy agent with no output is `stalled`. None of these means idle or done.
-5. **Native first.** Use the harness's own goal, hooks, subagents, permissions and
-   resume. Eliot adds only what the harness lacks.
-6. **Automation uses the same commands as people.** A rule, a timer, the Goal loop and
-   the owner all submit the same commands through the same router.
-7. **Plugins own native details; the core owns identity and history.** The core never
-   parses vendor payloads; plugins never write to the Store.
-8. **Routes are explicit.** Eliot never changes an agent's provider, model, effort,
-   permissions or billing route (subscription vs API key vs proxy) on its own.
-   Fallbacks exist only as rules the owner wrote.
+1. **One semantic language.** Callers use [verbs](spec/core.md#verbs). Plugins
+   translate. Unsupported verbs are rejected before native I/O.
+2. **Events say what happened; tables say what is.** State and its source event commit
+   together. Views are queries, not parallel state machines.
+3. **No uncertain effect is replayed.** `unknown` is settled by exact readback or an
+   explicit owner resolution. This includes `stop` and `interrupt`.
+4. **Unknown is not zero.** Silence may mean stalled; a source gap is a gap; a process
+   disappearance may mean lost. None means idle or complete.
+5. **Every native effect is scoped.** Agent generation, active turn and pending request
+   ids are first-class. Old tokens/events/commands cannot act on a replacement
+   session.
+6. **One owner per event family.** A stream, transcript or hook may own lifecycle for a
+   generation, but two of them never publish the same normalized event. Hand-off uses
+   a cursor/watermark and exposes gaps.
+7. **Native first.** Use native goals, hooks, subagents, permissions and resume where
+   their semantics match. Eliot fills missing capabilities explicitly.
+8. **Automation uses the same router.** People, rules, timers and goals submit the same
+   commands. External actions additionally use the automation action journal so a
+   crash never implies a blind repeat.
+9. **Plugins own vendor details; core owns logical identity/history.** Core never
+   parses vendor payloads; plugins never mutate Store directly.
+10. **Routes are explicit.** Eliot does not silently change provider, model, effort,
+    permissions or billing path. Fallback is an owner-written rule.
 
 ## Process and lifetime model
 
-- `eliot daemon` starts plugin processes on demand (first agent of that harness).
-- A plugin process may launch native processes (e.g. `codex app-server`) or attach to
-  external services (e.g. a running `opencode serve`). It reports every native PID it
-  owns so the process monitor can watch it.
-- Native processes launched by Eliot over stdio belong to the daemon's process tree
-  (Job object on Windows, process group on Unix): stopping the daemon ends those
-  sessions (use `eliot daemon stop --drain` before an upgrade). After a restart the
-  plugin re-attaches what still exists (`agent.attach`); the rest is `lost`, and
-  continuing it is an explicit `resume` — the last prompt is never resent.
-- Harnesses with a server mode (Codex `app-server --listen`, `opencode serve`) can run
-  their server as an Eliot **service** that lives outside the daemon (L7.6): a daemon
-  restart then re-attaches without interrupting running turns.
-- A plugin crash ends the stdio sessions it owned (they become `lost`; `resume`
-  continues them).
-- Upgrades: builds install into a versioned directory and the daemon never overwrites
-  its own executable (Windows cannot replace a running `.exe`). Upgrade = `eliot daemon
-  stop --drain`, then start the new build. External plugins (started via `cmd`) are
-  upgraded by restarting just that plugin.
-- Services (proxies, shared servers) are refcounted: the daemon starts a managed
-  service before the first agent that needs it and never kills an attached external
-  service.
+Two plugin topologies are intentional:
 
-## Data flow: a command
+- **Per-agent plugin.** Used when the plugin launches a native process whose tools
+  inherit process environment, or when force-stop must kill one exact tree. The daemon
+  puts the plugin and descendants in an agent-owned Windows Job / Unix process group.
+  Codex stdio, Claude CLI/SDK and Antigravity start here.
+- **Shared plugin.** Used when a native server already isolates sessions or for the
+  fake harness. It may multiplex many agents, but stopping one agent must be an exact
+  native session operation. The daemon never kills the shared plugin/service for one
+  agent.
+
+Consequences:
+
+- `eliot daemon` starts plugin instances on demand. Per-agent instances are cheap
+  controller processes; native harness processes dominate memory.
+- A per-agent plugin exit causes its owned process group to be terminated and verified
+  before the generation becomes `lost`. A shared-plugin crash re-attaches exact live
+  sessions where possible; absence becomes `lost`.
+- Native stdio sessions are daemon-owned in early layers. `daemon stop --drain`
+  rejects new work, keeps approvals/answers/results available, waits for active turns,
+  then closes their groups. `--force` terminates them.
+- Service mode (L7.6) runs supported native servers outside kill-on-close custody so a
+  daemon upgrade can re-attach without interrupting turns. Attached owner-run services
+  are never stopped by Eliot.
+- Resume is explicit, increments generation and rotates the routing token. It never
+  resends the old prompt.
+- Upgrades install into versioned paths; Windows executables/scripts in use are never
+  overwritten. External plugin upgrade restarts only instances of that plugin.
+- Managed services are refcounted; attached external services are observed, not owned.
+
+## Command flow
 
 ```text
 eliot steer a12 "use the v2 API"
- → CLI → IPC request command.submit {id, target: a12, verb: steer, args}
- → Router: a12 exists; plugin codex supports steer; caller may command a12; a12 is busy
-   (a failed check is stored as state=rejected with its reason and returned)
- → Store: insert command (state=accepted) + event command.accepted       (one tx)
- → Plugin host → plugin: agent.command {agent_id, command_id, verb, args}   (state=dispatched)
- → plugin → native: turn/steer {threadId, expectedTurnId, input}
- → plugin reply: {status: applied}  → Store: command applied + event      (one tx)
- → Bus fan-out → `eliot watch`, rules, ...
+ → command.submit {id, target:a12, verb:steer, args}
+ → router reads a12 generation 4 and active turn t9; validates control + capability
+ → transaction: command.accepted {generation:4, turn_id:t9}
+ → scheduler dispatches when its lane is ready
+ → plugin: agent.command {a12, generation:4, command_id, expected_turn_id:t9, steer}
+ → native: turn/steer {threadId, expectedTurnId:t9, input}
+ → plugin reply applied
+ → transaction: command.applied + event
+ → bus → subscribers/rules
 ```
 
-Timeout or plugin crash after hand-off → `unknown`; the plugin resolves it on restart
-with `agent.snapshot` when it can.
+A mismatched generation/turn is rejected before native I/O. Timeout or a lost reply is
+`unknown`; no automatic retry. A later snapshot may settle only that exact binding.
 
-## Data flow: an event
+Queued sends are future-turn requests. They remain FIFO within their generation but do
+not block steering/answering/interrupting the turn already running or a configuration
+that can apply immediately. Resume fails old queued sends as `stale_generation`.
+
+## Event flow
 
 ```text
-native notification (turn/completed)
- → plugin normalizes → event {agent_id, kind: turn.completed, data}
- → Daemon: reduce agent state (busy → idle), persist event + agent row      (one tx)
- → Bus fan-out → automation (e.g. a rule on turn.completed fires → command notify)
-               → goal loop (agent idle with active goal → check → continue / done)
-               → subscribers
+native turn/completed(t9)
+ → authoritative plugin stream normalizes
+   {agent:a12, generation:4, native_id:t9, kind:turn.completed, data}
+ → daemon validates source owner + generation + active turn
+ → transaction: persist event, busy→idle, clear active turn, derived agent.idle
+ → bus → rules / goal loop / clients
 ```
+
+A duplicate source, old generation or wrong turn never mutates current state or fires
+normal rules. A source that cannot bridge a reconnect records a gap instead of
+replaying history or fabricating completion.
+
+## Store failure boundary
+
+No external effect starts before command/action admission commits. If a later result
+cannot commit (disk full, locked file), the writer retains the same pending result,
+blocks new writes and exposes in-memory health. It does not repeat the native effect
+and cannot falsely claim that the failing database persisted its own failure event.
+After recovery it commits the pending result and one bounded outage/recovery record.
 
 ## Scale model
 
-Scale comes from cheap bookkeeping, not from many processes:
+Scale comes from bounded records and shared services where semantics permit them:
 
-- An agent is a row plus, while live, a small in-memory record (target ≤ 2 KB). No
-  thread or task per idle agent.
-- One plugin process multiplexes many agents when its native side keeps sessions
-  independent (manifest `features.multi_session`); otherwise it runs one agent per
-  process. The daemon can run several instances of a plugin (`instances = N`) and
-  shard agents across them.
-- Writes are batched (group commit). Ephemeral events (token deltas, CPU samples) are
-  never written.
-- Every list API is paginated; every subscription is filtered on the daemon side.
-- Trees use the `parent` and `root` indexes; tree operations never scan all agents.
+- An idle agent is a row plus a small indexed in-memory record; no task/thread per idle
+  agent.
+- Fake and service-backed shared plugins multiplex thousands of agents. Process-owned
+  live harnesses use one small plugin process per agent so custody remains exact.
+- Writes use bounded group commit. Token deltas and CPU samples are ephemeral.
+- Lists are paginated; subscriptions are filtered server-side with bounded buffers.
+- Parent/root indexes answer tree operations without O(all agents) scans.
+- No timer, rule or liveness loop scans every agent; due queues and indexed queries
+  drive work.
 
-Honest limit: a live native harness costs 100 MB–1 GB of RAM, so one machine runs
-tens to a few hundred **live** agents. Millions are supported as registered/historical
-agents and, later, across several hosts ([roadmap](roadmap.md) L9). The design never
-needs an O(all agents) pass on a hot path.
+A native coding harness commonly consumes far more memory than Eliot, so one machine
+runs tens to a few hundred live model sessions. The same controller can retain and
+simulate far more logical agents. Multi-host scale belongs to L9, not a premature
+cluster layer.
 
 ## Repository layout (target)
 
 ```text
-Cargo.toml                 workspace
+Cargo.toml
 crates/
-  eliot-core/              ids, agent model, events, verbs, commands, state reducer (no I/O)
-  eliot-store/             SQLite schema, migrations, writer task, queries
-  eliot-daemon/            router, bus, plugin host, monitors, automation, coordination
-  eliot-plugin/            small SDK for Rust plugins (stdio JSON-RPC loop, typed messages)
-  eliot/                   the binary: CLI, `daemon`, `plugin <builtin>`, `hook`, `mcp`
+  eliot-core/       ids, events, verbs, command bindings, pure reducer
+  eliot-store/      SQLite schema, migrations, writer task, queries
+  eliot-daemon/     router, bus, plugin host, custody, monitors, automation, coordination
+  eliot-plugin/     Rust plugin SDK, protocol, record/replay
+  eliot/            CLI + daemon + built-in plugin/hook/MCP entry points
 plugins/
-  fake/                    Rust crate, linked into `eliot`: deterministic simulated harness
-  codex/                   Rust crate, linked into `eliot`: first real harness
-  claude/ opencode/ ...    later; Rust crates (linked) or any-language programs started via `cmd`
-docs/                      this documentation
+  fake/             deterministic shared simulated harness
+  codex/            first real harness; per-agent plugin process
+  claude/ opencode/ ...
+docs/
 ```
 
-Crates are split only where a boundary is real (pure types, storage, runtime, SDK,
-binary). Do not add crates for future use.
+Crates are split only at real boundaries. Do not add crates, queues or services for
+future use.
