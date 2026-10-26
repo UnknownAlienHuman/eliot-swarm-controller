@@ -10,6 +10,7 @@ projections. Wire names are `snake_case`; every persisted integer fits SQLite si
 | --- | --- | --- |
 | `AgentId` | `a<1..i64::MAX>` | Transactional Store counter; stable logical row. |
 | generation | `0..i64::MAX` | 0 before first native start; first incarnation 1; explicit resume increments. |
+| binding revision | positive signed-64, per Agent generation | Immutable profile/route snapshot; current pointer may advance within one generation. |
 | external `WriteId` | canonical 26-character ULID | Required for every external daemon mutation. |
 | internal `DerivedId` | `d_` + unpadded base32 BLAKE3-256 | Domain tag + length-delimited canonical components. |
 | `CommandId` | `WriteId` or `DerivedId` | External concrete/fanout parent uses WriteId; internal child/automation uses DerivedId. |
@@ -66,13 +67,50 @@ Agent {
 }
 ```
 
-Every target native incarnation has one immutable `AgentBinding` row containing the
-fully resolved nonsecret profile/route/environment names/artifact references and its
-binding mode (`launch|resume|control_attach|observe_attach`). Launch creates the binding
-for target generation 1 while the Agent remains generation 0; resume creates `g+1`.
+### Immutable binding revisions
+
+Every target native incarnation has one or more immutable `AgentBinding` revisions. A
+revision contains the fully resolved nonsecret profile/route/environment names,
+ArtifactRefs and binding mode:
+
+```text
+AgentBinding {
+  agent, generation, revision,
+  supersedes_revision?,
+  mode: launch | resume | observe_attach | control_attach | detach_observe,
+  profile_name, profile_revision, binding,
+  created_at
+}
+```
+
+A separate current pointer selects exactly one revision for an Agent generation. Binding
+rows never change; only the pointer may advance atomically after the corresponding
+native effect is proven applied.
+
+- launch creates generation-1 revision 1 and current pointer while Agent is generation 0;
+- resume creates target generation `g+1`, revision 1 and pointer before dispatch;
+- first observe attach creates generation-1 observe revision and pointer after exact
+  observe attach/readback;
+- observe→control creates revision `n+1` that supersedes the observe revision; the attach
+  command references it, and success atomically moves the current pointer plus Agent
+  projection/routing/capacity state;
+- failed/unknown control attach never moves the pointer; its immutable candidate remains
+  referenced by the command until normal retention;
+- detach success creates/moves to a `detach_observe` revision, preserving the earlier
+  control revision for audit/readback;
+- control reattach creates another revision and rotates token version only after exact
+  environment/control proof.
+
+Thus native generation identifies one vendor incarnation while binding revision records
+Eliot control/profile changes within that incarnation. `Agent.profile` is only the
+current projection and changes with the pointer. Start/attach/resume commands store the
+exact binding revision they dispatch.
+
 Observe attach uses synthetic `observe:<harness>` binding. Control attach requires an
-owner-selected allowed profile and capacity reservation; plugin readback must prove its
-session is compatible before control is granted.
+owner-selected allowed profile and capacity reservation; plugin readback must prove the
+existing session is compatible before the pointer moves.
+
+### Routing token
 
 Native control and direct Eliot routing are independent. `routing_enabled=true` means
 Eliot has proved it can inject this Agent's distinct token/environment before its own
@@ -87,9 +125,10 @@ domain-separated constant-time-comparable hash. Token lifecycle:
 - controlled live + direct routing: positive version and one hash;
 - generation 0, terminal, detached, observe-only or routing-disabled: no hash;
 - terminal/detach clears hash without rewriting generation/version;
-- explicit control reattach preserves generation, increments version and enables routing
-  only after exact attach/environment proof;
-- recovery of the same already-controlled incarnation preserves version/hash;
+- explicit control reattach preserves generation, creates a new binding revision,
+  increments version and enables routing only after exact attach/environment proof;
+- recovery of the same already-controlled incarnation preserves binding revision,
+  version and hash;
 - resume increments generation and version when routing remains available.
 
 Missing/mismatched routing key blocks token issue/reissue but not verification of an
@@ -103,10 +142,10 @@ observed state; there is no synthetic `stopping` state.
 
 | From | Exact input | Effect |
 | --- | --- | --- |
-| — | launch admitted | `created`, generation 0, binding targets 1 |
+| — | launch admitted | `created`, generation 0; target-generation binding revision exists |
 | created | first start dispatched | generation 1, optional routing token install, `starting` |
 | created | cancel/stop before dispatch | launch/linked input cancelled, `stopped` |
-| terminal g | resume dispatched with expected g | generation g+1, new binding, clear turn/requests, `starting` |
+| terminal g | resume dispatched with expected g | generation g+1, target binding current, clear turn/requests, `starting` |
 | starting | matching ready | `idle` |
 | starting | definite no-effect start failure | `failed`, revoke token, linked input fails without I/O |
 | starting | possible start + lost reply | unchanged, start unknown, linked input blocked |
@@ -121,15 +160,15 @@ observed state; there is no synthetic `stopping` state.
 Resume row change occurs only when dispatch commits; only one resume may be open.
 Cancelling a queued resume cancels linked input and leaves generation g.
 
-Detach is valid only for independently owned/reattachable service lifetime. It preserves
-observed native state, sets observe-only, disables routing, revokes token, releases
-claims and releases Eliot control capacity only when the profile contract says detached
-sessions no longer count. Daemon-owned per-agent process must stop instead.
+Detach is valid only for independently owned/reattachable service lifetime. On exact
+success it advances to a detach-observe binding revision, sets observe-only, disables
+routing, revokes token, releases claims and releases Eliot control capacity only where
+the profile contract permits. Daemon-owned per-Agent process must stop instead.
 
 An already-created native child is always recorded. Controller launch/depth/tree limits
 block new Eliot-created fanout, not vendor reality. A native child beyond a guard gets
-`guard_exceeded`, `control=self`, `routing_enabled=false`, no automatic wake and no
-project authority; native observation and safe parent-mediated verbs remain available.
+`guard_exceeded`, `control=self`, `routing_enabled=false`, no automatic direct wake and
+no project authority; native observation and safe parent-mediated verbs remain.
 
 ### Input and unknown-turn gates
 
@@ -167,8 +206,8 @@ Profile {
 
 Owner global config defines executable routes. Project config may only apply a validated
 narrowing overlay to an allowed global profile; it never changes harness/plugin/account/
-proxy/argv/inherit policy. Environment/account/artifact/immutable binding semantics are
-in [configuration](configuration.md). Requested and effective facts remain separate.
+proxy/argv/inherit policy. Environment/account/artifact/binding semantics are in
+[configuration](configuration.md). Requested and effective facts remain separate.
 
 ## Events and authoritative sources
 
@@ -182,9 +221,9 @@ Event {
 Persisted `data` is at most 64 KiB; final assistant text projection is at most 64 KiB.
 Larger native detail is truncated with `truncated=true` and a safe native/artifact
 pointer when available. Agent event `subject` is a bounded post-transition snapshot:
-`{id,generation,project,parent,root,depth,harness,profile,state,workspace?,branch?,
-control,observe_only,routing_enabled,guard_exceeded?,labels}`. Rules never join a later
-Agent row.
+`{id,generation,project,parent,root,depth,harness,profile,binding_revision,state,
+workspace?,branch?,control,observe_only,routing_enabled,guard_exceeded?,labels}`. Rules
+never join a later Agent row.
 
 Known secrets/token patterns are masked in native output. Semantic durable writes with a
 known secret reject rather than storing altered text.
@@ -200,24 +239,24 @@ fields are integrity failure.
 Each source declares `dedupe_mode`:
 
 - `strict_cursor`: vendor guarantees a resumable total-order cursor and replay strictly
-  after the committed cursor; source watermark/cursor is sufficient;
+  after the committed cursor;
 - `event_id`: every persisted lifecycle fact carries a stable per-event native id and
-  Store retains a compact `native_event_receipts` row after event history pruning;
+  Store retains a compact native receipt after event history pruning;
 - `none`: source cannot claim lossless recovery; reconnect/handoff closes it with an
   explicit gap and starts only after a proven current boundary.
 
 Exactly one current owner exists per `(agent,generation,family)`. Initial open installs
 owners when absent. Planned replacement uses one predecessor-aware open transaction that
-verifies the old key/high-water/cursor, closes or gaps it, creates the new epoch and
-transfers owners. Separate close then open is only an explicitly gapped handoff.
+verifies old key/high-water/cursor, closes or gaps it, creates the new epoch and transfers
+owners. Separate close then open is only an explicitly gapped handoff.
 
 Each epoch emits contiguous positive `source_seq`, assigning the exact typed envelope
 before send and allowing at most one unacknowledged durable request. Daemon computes a
 canonical digest.
 
-- n=high+1: commit watermark plus native receipt (when required), normalized event or
+- n=high+1: commit watermark plus native receipt when required, normalized event or
   process projection and reducer changes;
-- n=high with matching digest: lost-reply duplicate, return the saved result;
+- n=high with matching digest: lost-reply duplicate, return saved result;
 - same n/different digest: integrity error;
 - n<high: stale source state, reject with watermark/cursor;
 - n>high+1: hole, admit nothing until replay or explicit gapped replacement.
@@ -249,16 +288,17 @@ outcomes remain separate. Ready never proves input.
 
 | Verb | Semantics |
 | --- | --- |
-| launch | generation 1 after preflight/capacity/workspace readiness |
+| launch | generation 1 after preflight/capacity/workspace readiness; exact binding revision |
+| attach | observe/control acquisition on canonical row; candidate binding pointer moves only after exact success |
 | send | FIFO input, applied only at exact turn/execution association |
 | steer/inject/interrupt | exact current-turn/native-safe-point semantics only |
 | stop | exact generation; force only with qualified custody/native isolation |
-| resume | next generation from same canonical subject and new binding |
+| resume | next generation from same canonical subject and revision-1 binding |
 | approve/deny/answer | exact pending request |
 | configure | explicit application point/readback; blocked by unresolved input |
 | goal.* | generation-bound; continuation blocked by unresolved input/turn |
 | cancel | queued command only; admitted input needs native cancel/readback |
-| detach | attached/service-backed lifetime only; release control/routing |
+| detach | attached/service-backed lifetime only; candidate observe revision becomes current on success |
 | compact/fork/background | native-only declared semantics |
 
 Input text is at most 512 KiB UTF-8. Large immutable notes/scripts/config payloads are
@@ -267,7 +307,8 @@ passed as bounded `ArtifactRef {digest,path,size}` rather than inline bytes.
 ```text
 Command {
   id: CommandId, receipt_id?: WriteId,
-  target?, selector?, expected_generation?, generation?, turn_id?, request_id?,
+  target?, selector?, expected_generation?, generation?, binding_revision?,
+  turn_id?, request_id?,
   verb, args, origin, cause?, state, outcome?, created_at, updated_at
 }
 state = accepted → [queued →] dispatched → applied | rejected | failed | unknown
@@ -276,6 +317,9 @@ state = accepted → [queued →] dispatched → applied | rejected | failed | u
 
 External concrete/fanout parent has `id=receipt_id=write_id`. Linked input, selector
 child, rule/timer/Goal command and daemon presentation use derived id/no receipt.
+Launch/resume/attach/detach commands that change native control or profile reference the
+exact candidate/current binding revision. A binding pointer never changes because a
+client disconnected; only an exact applied transition changes it.
 
 Interactive selector is a Store-only parent. One transaction resolves concrete targets,
 checks `max_selector_targets`, creates derived children/links and marks the parent
@@ -368,12 +412,29 @@ CREATE INDEX agents_state ON agents(state);
 CREATE TABLE agent_bindings (
   agent INTEGER NOT NULL REFERENCES agents(id),
   generation INTEGER NOT NULL CHECK(generation > 0),
+  revision INTEGER NOT NULL CHECK(revision > 0),
+  supersedes_revision INTEGER,
   mode TEXT NOT NULL,
   profile_name TEXT NOT NULL,
   profile_revision TEXT NOT NULL,
   binding TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  PRIMARY KEY(agent,generation)
+  PRIMARY KEY(agent,generation,revision),
+  FOREIGN KEY(agent,generation,supersedes_revision)
+    REFERENCES agent_bindings(agent,generation,revision),
+  CHECK((revision = 1 AND supersedes_revision IS NULL) OR
+        (revision > 1 AND supersedes_revision IS NOT NULL
+          AND supersedes_revision < revision))
+);
+
+CREATE TABLE agent_binding_current (
+  agent INTEGER NOT NULL,
+  generation INTEGER NOT NULL,
+  revision INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(agent,generation),
+  FOREIGN KEY(agent,generation,revision)
+    REFERENCES agent_bindings(agent,generation,revision)
 );
 
 CREATE TABLE events (
@@ -445,12 +506,17 @@ CREATE TABLE commands (
   receipt_id TEXT UNIQUE REFERENCES write_receipts(id),
   target INTEGER, selector TEXT,
   expected_generation INTEGER, generation INTEGER,
+  binding_revision INTEGER,
   turn_id TEXT, request_id TEXT,
   verb TEXT NOT NULL, args TEXT NOT NULL, origin TEXT NOT NULL,
   cause TEXT, state TEXT NOT NULL, outcome TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   CHECK((receipt_id IS NOT NULL AND id = receipt_id) OR
-        (receipt_id IS NULL AND id GLOB 'd_*'))
+        (receipt_id IS NULL AND id GLOB 'd_*')),
+  CHECK(binding_revision IS NULL OR
+        (target IS NOT NULL AND generation IS NOT NULL)),
+  FOREIGN KEY(target,generation,binding_revision)
+    REFERENCES agent_bindings(agent,generation,revision)
 );
 CREATE INDEX commands_target ON commands(target,created_at);
 CREATE INDEX commands_open ON commands(state)
@@ -516,6 +582,11 @@ have no fake receipts.
 `native_inputs.command_id` and `turn_inputs.command_id` intentionally lack command FKs so
 input/turn readback survives command pruning. Admission/association transaction still
 requires a command or retained link. Unresolved input/turn/link rows never age-prune.
+
+Binding rows are immutable. A failed candidate may prune only after every referencing
+command/receipt is prunable; every current pointer and its ancestry needed for readback
+remain. Pointer movement, Agent projection/routing/capacity change and applied command
+outcome commit together.
 
 Source open/handoff, source sequence, native receipt, event/projection/reducer changes
 commit atomically. Event retention never deletes current source watermarks or native
