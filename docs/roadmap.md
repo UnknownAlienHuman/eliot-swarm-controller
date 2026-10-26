@@ -46,18 +46,18 @@ durable trigger cursors and recovery—not a workflow engine.
 
 ## L1 — Core, Store, bus, fake path
 
-- [ ] **L1.1 Identity/reducer.** Signed-64-bit ids/counters, generation 0, fixed
-      derived ids, expected vs target generation, canonical native subject, exact
-      turn/request state, unknown-turn blocking/resolution, terminal token revocation,
-      terminal cleanup/goal pause and pure reducer.
+- [ ] **L1.1 Identity/reducer.** Signed-64-bit ids/counters with pre-mutation
+      exhaustion, generation 0, fixed derived ids, canonical native subject, exact
+      expected/target generation and turn/request state, unknown-turn blocking/
+      resolution, terminal token revocation, cleanup/goal pause and pure reducer.
 - [ ] **L1.2 Store.** Atomic root/id allocation, routing-lifecycle token hash/null
-      constraint, native subject uniqueness, retention-independent native-event
-      receipts, command/input/turn projections, one writer/group commit, query-only
-      paginated readers, commit-failure boundary and WAL pressure.
+      constraint, native subject uniqueness, compact per-source watermark/digest,
+      bounded event-time subject, command/input/turn projections, one writer/group
+      commit, query-only paginated readers, commit-failure boundary and WAL pressure.
 - [ ] **L1.3 Bus/event intake.** Persist-before-broadcast, live-buffer→watermark→paged
-      replay, explicit lag/history gap, commit-acknowledged plugin `event.put`/
-      `process.put`, stable native-id resend/dedupe after event-row pruning, safe receipt
-      reclamation and stale diagnostics excluded.
+      replay, explicit lag/history gap, commit-acknowledged `event.put` with stable
+      source key + contiguous sequence + one unacknowledged envelope, digest mismatch/
+      stale/hole handling, source-key handoff and stale diagnostics excluded.
 - [ ] **L1.4 Daemon/IPC.** Private data root, lock/birth identity, user-only local IPC,
       multiplexed JSON-RPC, live OS custody check before no-token owner fallback,
       fail-closed ambiguous peer identity, admission mode and exact drain/force.
@@ -65,30 +65,30 @@ durable trigger cursors and recovery—not a workflow engine.
       global∩project script pass-env validation, explicit secret refs/accounts/caps/
       provider holds, plugin modes, private paths, WAL/process/Git/backlog limits and
       named webhooks.
-- [ ] **L1.6 Plugin host/custody.** Framing/deadlines and bounded unacknowledged/pre-ready
-      spool; session vs linked initial outcome; attach `not_active_unknown`; canonical
-      child scope; Windows Job; Linux exact cgroup/equivalent + guardian and honest
-      degraded fallback; shared-control capability checks.
+- [ ] **L1.6 Plugin host/custody.** Framing/deadlines and bounded source spool;
+      watermark sync before publishing; session vs linked initial outcome; attach
+      `not_active_unknown`; canonical child scope; Windows Job; Linux exact cgroup/
+      equivalent + guardian and honest degraded fallback; shared-control checks.
 - [ ] **L1.7 Router/readiness.** Atomic exact binding, linked launch/resume send,
       FIFO future sends without blocking current controls, selector fixed ids,
       capacity reservations, stale expiry, no unknown retry and command/turn owner
       resolution with separate semantics.
-- [ ] **L1.8 Fake plugin.** Isolated shared sessions, stable event ids, commit-ack
-      resend, separate start/initial outcomes, exact snapshot including unknown turn,
-      requests/children/crash/hang/exit.
+- [ ] **L1.8 Fake plugin.** Isolated shared sessions, durable source key/sequence/spool,
+      lost-ack resend, separate start/initial outcomes, exact snapshot including unknown
+      turn, requests/children/crash/hang/exit.
 - [ ] **L1.9 CLI/API.** Linked command output/wait, turn show/resolve, exact wait/result
       through turn projection, canonical attach, replay gap, command/action/mail
       readback and exits.
 - [ ] **L1.10 Identity/secrets.** Complete token triple, hash-at-rest, terminal/detach
       revocation without generation reset, prefixed pattern redaction, invalid-token no
-      owner fallback, known-secret rejection/masking.
+      owner fallback and known-secret rejection/masking.
 - [ ] **L1.11 Qualification hooks.** Minimal recording/replay/plugin-test entrypoints;
       full cases deferred to L7.
 
-**Completion:** fake CLI path launches with linked prompt, preserves every event across
-commit/reconnect and event retention, answers requests, queues/controls exact turns,
-exposes missing terminal outcome as unknown without inventing completion, stops/resumes
-a new generation, survives restart and rejects stale/duplicate input.
+**Completion:** fake CLI path launches with linked prompt, preserves every persisted
+source event across commit/reconnect and event-row retention with O(sources) watermark
+state, answers requests, queues/controls exact turns, exposes missing terminal outcome
+as unknown, stops/resumes a new generation and rejects stale/duplicate input.
 
 ## L2 — Codex + provider route
 
@@ -120,11 +120,12 @@ a new generation, survives restart and rejects stale/duplicate input.
 - [ ] **L3.3 Git/fs/edit projection.** Read-only monitor, slow backoff, bounded
       fingerprint and durable `agent_edits` updated/cleared independently of events.
 - [ ] **L3.4 Discovery/source handoff.** Canonical attach, observe-only transcript,
-      exact cursor/ack handoff or visible gap, no duplicate lifecycle.
+      exact native-cursor + source-key boundary or visible gap, no duplicate lifecycle.
 - [ ] **L3.5 Liveness/restart.** Progress-only stalls and current-state reconciliation
-      of custody, source, workspace and unknown command/turn/action effects.
+      of custody, source watermarks, workspace and unknown command/turn/action effects.
 - [ ] **L3.6 Views.** Generation/turn/open stop/workspace state, custody/guardian,
-      caller-identity failures, source gaps, account holds, Store/WAL and Git/edit facts.
+      caller-identity failures, source gaps/watermarks, account holds, Store/WAL and
+      Git/edit facts.
 
 ## L4 — Other required harnesses
 
@@ -154,15 +155,16 @@ Each plugin selects mode from proven capabilities and rejects weaker substitutio
 ## L6 — Automation
 
 - [ ] **Principals/rule revisions.** Global vs project scope, canonical revision,
-      event-time subject snapshot, first-load high-water, strict rendering and durable
-      failed firing for deterministic render/authority errors.
-- [ ] **Durable cursor/retention.** Per-rule committed cursor, restart scanning,
-      deterministic-failure cursor advance, disabled/pause advance policy, explicit
-      skipped range on backlog limit and bounded retention floor.
+      event-time subject snapshot, first-load high-water, old→new high-water handoff for
+      enabled edits, explicit skip on disable/pause, strict rendering and durable failed
+      firing for deterministic render/authority errors.
+- [ ] **Durable cursor/retention.** Active/retiring/replay interval cursors, restart
+      scanning, deterministic-failure advance, explicit backlog skipped range and
+      bounded retention floor.
 - [ ] **Run/action journal.** Frozen concrete targets/bindings, fixed ids, ordered
       states and no unknown replay.
-- [ ] **Timers.** Schedule/action revisions, interval/cron/at, DST, latest catch-up and
-      startup reconciliation.
+- [ ] **Timers.** Reload time boundary, schedule/action revisions, interval/cron/at,
+      DST, latest catch-up and startup reconciliation.
 - [ ] **Actions.** Scoped commands/mail/vars, exact Git readback, named allowlisted
       webhooks, secret refs and narrow unknown writer hold.
 - [ ] **Scripts.** Scoped automation token, project-safe cwd, global∩project pass-env
@@ -184,9 +186,9 @@ qualification campaign.
 
 - [ ] all reducer rows, generation-0/no-token and live-token constraints, detach/
       terminal revocation without generation reset, stale/wrong/duplicate input;
-- [ ] id bounds/derived collisions/counters/root allocation/canonical native subject;
-- [ ] event commit-ack lost reply, original event-row pruning, resend dedupe through
-      compact receipt, and safe old-generation receipt reclamation;
+- [ ] id bounds/derived collisions/counter exhaustion/root allocation/canonical subject;
+- [ ] source sequence: lost acknowledgement, digest mismatch, stale/hole recovery,
+      original event-row pruning, restart watermark sync and safe old-source reclamation;
 - [ ] launch/resume linked input at every failure point;
 - [ ] turn projection survives retention; command applied vs turn terminal remain
       separate; reconnect missing terminal → unknown; active-turn manual resolve rejects;
@@ -197,10 +199,12 @@ qualification campaign.
 
 ### Recovery, automation and coordination
 
-- [ ] event commit before/after rule cursor, mutable labels after event, rule edit/
-      pause/restart/backlog skipped-range retention/replay;
-- [ ] matching event with missing placeholder/invalid action creates one failed run,
-      advances cursor and permits the next valid event; Store commit failure does not;
+- [ ] event commit before/after rule cursor and mutable labels after event;
+- [ ] enabled rule edit while old cursor lags: old drains exactly through H, new starts
+      after H, including crash/restart; disable/pause records skipped range;
+- [ ] missing placeholder/invalid action creates one failed run, advances cursor and
+      permits next valid event; Store commit failure does not;
+- [ ] timer edit at due boundary assigns old/new action revision exactly once;
 - [ ] global vs project principal escape negatives, including project script attempting
       a globally allowed but project-disallowed environment reference before process start;
 - [ ] timer/goal/mail/workspace/launch/provider startup reconciliation;
@@ -211,8 +215,8 @@ qualification campaign.
 
 ### Plugins, platform and live paths
 
-- [ ] ready vs initial, exact bindings, canonical children, commit-ack source handoff,
-      reconnect `not_active_unknown`, bounded buffers and unsupported-before-I/O;
+- [ ] ready vs initial, exact bindings, canonical children, source-key/cursor handoff,
+      reconnect `not_active_unknown`, bounded spool and unsupported-before-I/O;
 - [ ] Windows Job no-breakaway/daemon death;
 - [ ] Linux exact cgroup+guardian failure/restart and degraded fallback rejecting force;
 - [ ] workspace worktree/setup crash/readback/remove cases;
@@ -225,9 +229,9 @@ qualification campaign.
       escape negatives;
 - [ ] token pattern/hash/revocation, short/unredactable secret rejection and output masking;
 - [ ] private data/IPC/symlink/reparse/traversal/device path negatives;
-- [ ] 10,000 fake agents + 2,000 persisted events/s for one hour, bounded receipt/WAL/
-      RSS growth, responsive paginated reads and no persisted loss;
-- [ ] active-rule cursor/native receipt/turn/edit retention under long-running agents;
+- [ ] 10,000 fake agents + 2,000 persisted events/s for one hour, bounded source-
+      watermark/WAL/RSS growth, responsive paginated reads and no persisted loss;
+- [ ] active/retiring rule cursor, source watermark, turn/edit retention under long runs;
 - [ ] drain 1,000 busy fake agents without new automation or lost results.
 
 **Exit:** qualification green on Windows and supported Linux paths, current compact
