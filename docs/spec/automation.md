@@ -22,19 +22,30 @@ Required keys: `id`, `on`, `do`; optional `enabled`, `limit`, `catch_up`, `allow
 Canonical rule definition is bounded, contains named secret references only, and has
 stable `definition_digest`.
 
-### Definition digest is not activation identity
+### Definition digest, activation identity and immutable artifacts
 
-Each time a valid rule definition becomes current, Store creates a fresh immutable
-`activation_id`, even when bytes revert A→B→A. The id is a fixed derived value over
-principal, rule id, previous activation id, handoff boundary and definition digest.
-Therefore reverting to A does not reuse/reset the old A cursor or collide with it.
+A watcher event whose canonical definition, enabled state and principal scope are
+identical to the current active activation is a **no-op**. File mtime, duplicate watcher
+notifications or an atomic replace with identical bytes do not create another
+activation or timer boundary.
 
-Store persists canonical compiled definition (trigger, matchers, rendered action
-templates, limits/scope) for every `active|retiring|replay` activation. File reload is
-not needed to evaluate old backlog after restart. Definition may be pruned only when its
-activation interval is closed, no run/action references it and replay is impossible.
+A semantic install/edit/re-enable creates a fresh immutable `activation_id`, even when
+bytes revert A→B→A. The id is derived from principal, rule id, previous activation id,
+handoff boundary and definition digest. Reverting to A therefore does not reuse/reset
+the old A cursor.
 
-A parse/validation failure creates no activation and leaves current behavior intact.
+Compilation resolves every rule-owned script/system-note/template file under its allowed
+root, rejects symlink/device/alternate-stream escape, hashes bytes, and copies the exact
+bounded content into a current-user-only content-addressed artifact store. The persisted
+compiled definition references artifact digests, interpreters/executables and argv—not a
+mutable source path. Secret values are never copied; only named references remain.
+
+Store persists trigger, matchers, action templates, limits/scope and artifact digests for
+every `active|retiring|replay` activation. Old backlog after restart therefore runs the
+old definition and exact script snapshot even if the checkout file changed or vanished.
+Artifacts prune only when no activation/run/action/workspace binding references them.
+
+A parse/validation/snapshot failure creates no activation and leaves current behavior.
 
 ## Event-rule activation handoff
 
@@ -48,12 +59,12 @@ Editing enabled event rule uses one transaction:
 3. create fresh activation for new definition → `active`, `event_cursor=H`.
 
 Old evaluates `(old_cursor,H]`, new `(H,current]`; no overlap/gap. They may drain
-concurrently. Crash resumes both definitions from Store. Old becomes retired after
-cursor H and admitted runs settle. Backlog policy applies independently.
+concurrently. Crash resumes both definitions. Old becomes retired after cursor H and
+admitted runs settle. Backlog policy applies independently.
 
-Disable/delete/global pause instead captures H, records skipped `(cursor,H]`, advances
-cursor and marks activation disabled/paused. Re-enable creates fresh activation from-now.
-Explicit catch-up creates fresh replay activation over still-retained recorded range.
+Disable/delete/global pause captures H, records skipped `(cursor,H]`, advances cursor and
+marks activation disabled/paused. Re-enable creates fresh activation from-now. Explicit
+catch-up creates fresh replay activation over still-retained recorded range.
 
 ## Event cursor and deterministic failure
 
@@ -67,9 +78,10 @@ subject:
   + cursor advance;
 - Store failure → rollback including cursor; retry only after recovery.
 
-Deterministic errors: missing placeholder, invalid action, secret-bearing payload,
-missing target, selector over configured limit, authority violation, unsupported action.
-Capacity/provider hold/busy target is valid queued work, not render failure.
+Deterministic errors include missing placeholder, invalid action, secret-bearing payload,
+missing target, selector over configured limit, authority violation, unsupported action
+and unavailable/mismatched immutable artifact. Capacity/provider hold/busy target is
+valid queued work, not rendering failure.
 
 Crash before transaction repeats safely; after cannot lose/duplicate admission.
 Ephemeral/late diagnostics are ineligible unless explicitly matched by `x.*`.
@@ -84,12 +96,12 @@ Interval key is anchored slot; cron/once key UTC instant; manual key external Wr
 DST uses declared timezone, identity UTC. Missed is latest/none, never burst. Due rows
 reconcile on startup.
 
-Timer activation references the immutable rule activation/definition. Reload captures
-wall-clock T and reconciles old activation through T. Changed trigger creates new unique
-activation/anchor strictly after T. Action-only edit still creates new rule activation:
-slots through T use old activation; later slots new. Reverting bytes creates another
-activation, never collides. One schedule does not stack while prior run queued/running/
-unknown.
+Timer activation references immutable rule activation/definition. A no-op reload creates
+no schedule row. A semantic reload captures wall-clock T and reconciles old activation
+through T. Changed trigger creates new activation/anchor strictly after T. Action-only
+edit creates a new rule activation: slots through T use old activation; later slots new.
+Reverting bytes creates another activation, never collides. One schedule does not stack
+while prior run queued/running/unknown.
 
 ## Generic durable run identity
 
@@ -109,9 +121,9 @@ For rules/timers/manual, `owner_activation` is immutable rule activation id. For
 is goal revision. Run id is derived from this identity.
 
 One transaction verifies uniqueness, reads trigger snapshot, renders using persisted
-activation definition, resolves selectors (up to `max_selector_targets`), captures exact
-generation/turn/request, writes per-target actions, advances cursor/timer and emits
-state. Replacement generation is stale, never retargeted.
+activation definition/artifacts, resolves selectors up to `max_selector_targets`,
+captures exact generation/turn/request, writes per-target actions, advances cursor/timer
+and emits state. Replacement generation is stale, never retargeted.
 
 Core action gets derived command id from `(run,index,target)` and no external receipt.
 Multi-target order is AgentId; overflow fails firing with no partial rows.
@@ -143,7 +155,7 @@ exact turn/request.
 | core verb | derived command id + frozen binding under principal |
 | Git fetch/pull/push/worktree | explicit repo/remote/ref/OID/path; no force; exact readback |
 | mail/var | concrete recipient/scope under principal |
-| script | fixed executable/argv/project-safe cwd; scoped env; bounded streams; no rerun |
+| script | immutable content-addressed script snapshot + frozen interpreter/argv/cwd; scoped env; bounded streams; no rerun |
 | log/desktop | bounded local result |
 | webhook | named endpoint; project allowlist; no raw URL/secret |
 | emit | bounded `x.user.*` in principal scope |
@@ -166,7 +178,8 @@ Repository has narrow writer hold while older push/pull/worktree write unknown.
 
 ### Script environment and output
 
-Managed script starts minimal. Named environment refs validate before lookup/start:
+Managed script runs the persisted immutable artifact, not the mutable checkout path, and
+starts with minimal environment. Named environment refs validate before lookup/start:
 
 global script uses global automation allowlist; project script uses global∩project;
 returned actions cannot introduce refs. Resolved values exist in memory only/masked.
@@ -223,7 +236,7 @@ Goal rounds reconcile current rows. One round is generic run
 
 1. capture generation/revision/pending/unknown/native-goal;
 2. skip request/unknown; on-idle waits active native goal;
-3. marker read-only; argv check journaled process action;
+3. marker read-only; argv check uses immutable journaled process action;
 4. unknown check blocks/no rerun;
 5. pass done; exact budget blocked;
 6. progress = changed complete check/fingerprint;
@@ -252,6 +265,8 @@ CREATE TABLE rule_activations (
   PRIMARY KEY(principal,rule,activation_id)
 );
 CREATE INDEX rule_current ON rule_activations(principal,rule,state);
+CREATE UNIQUE INDEX rule_one_active ON rule_activations(principal,rule)
+  WHERE state='active';
 
 CREATE TABLE event_rule_state (
   principal TEXT NOT NULL,
@@ -310,6 +325,8 @@ CREATE TABLE timers (
   FOREIGN KEY(principal,rule,activation_id)
     REFERENCES rule_activations(principal,rule,activation_id)
 );
+CREATE UNIQUE INDEX timer_one_active ON timers(principal,rule)
+  WHERE state='active';
 
 CREATE TABLE goals (
   agent INTEGER NOT NULL, mode TEXT NOT NULL,
@@ -326,9 +343,10 @@ CREATE TABLE goals (
 );
 ```
 
-A-B-A produces three activation ids while definitions A may share digest. Restart can
-drain old activation because definition is persisted. Retired definition prunes only
-after interval closed, runs/actions terminal and replay impossible.
+A→B→A produces three activation ids while A definitions may share digest. Duplicate
+watcher reload of current A produces none. Restart drains old activation from persisted
+definition/artifacts. Retired activation/artifact prunes only after interval closed,
+runs/actions terminal and replay impossible.
 
 Terminal history prunes only behind cursor/key and with no open references. Open/
 unknown runs/actions and unresolved hook proposals never age-prune.
