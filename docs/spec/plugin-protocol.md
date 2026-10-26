@@ -43,7 +43,7 @@ attached server only when it gives each session its own environment and stop
 | `agent.start` | `agent_id`, `profile` (the agent's `profile_snapshot`), `workspace?`, `env` (the complete [environment](configuration.md#environment) for the harness), `system_note` (path of a [text file](coordination.md#communication-guidance-for-agent-prompts)), `parent_native_ref?`, `resume?: {native_scope, native_ref, cursors}`, `initial?: {command_id, text}` | `{native_scope, native_ref, pids: [Pid], effective: {model?, permissions?, system_note: native|prepended, endpoint?}, initial?: rejected|failed}` |
 | `agent.attach` | `agent_id`, `native_scope`, `native_ref`, `observe_only`, `profile?` (for control), `cursors`, `active_turn?` | `{state, pids, active_turn?, pending}` — after a plugin/daemon restart, for discovered sessions and for `attach --control`; error `not_found` if the session is gone. If `active_turn` was running and its end is not confirmed, the state is `busy` (no `turn.completed` is invented) and the host repeats `agent.snapshot` until the native side settles it. |
 | `agent.command` | `agent_id`, `command_id`, `verb`, `args`, `turn_id?` (steer, interrupt), `request_id?` (approve, deny, answer) | `{status: applied|rejected|failed|unknown, applies?: now|next_tool|next_turn|next_session, detail?}` |
-| `agent.snapshot` | `agent_id`, `commands?: [command_id]` | `{state, active_turn?, pending: [Request], goal?, usage?, commands?: {id: applied|not_applied|unknown}}` |
+| `agent.snapshot` | `agent_id`, `commands?: [command_id]` | `{state, active_turn?, pending: [Request], goal?, usage?, commands?: {id: applied|not_applied|unknown}}` — `not_applied` only when the native side proves it (it lists the inputs it received and this one is absent); a plugin that cannot tell, e.g. after a restart, answers `unknown` |
 | `agent.stop` | `agent_id`, `force` | `{}` once the native session ended (or `force` killed it) |
 | `discover` | `{cursor?, limit?}` (limit ≤ 1,000) | `{sessions: [{native_scope, native_ref, workspace?, started_at?, title?, live}], next?}` — native sessions on this machine, one page |
 | `shutdown` | `{}` | `{}`; plugin exits after replying |
@@ -287,6 +287,11 @@ parses as `{"steps": [...]}`; otherwise it is echoed (`message.agent` with the s
 text). `inject` shows up as `message.user {injected: true}` at the next step boundary
 of a running turn, or at the start of the next turn when idle. A `send` script runs as
 one turn: `turn.started` … `turn.completed`.
+
+A step is an object with one key, the step name. Its value is a scalar for `say`
+(the text) and `sleep_ms` (n), an object for `tool`, `approval`, `question`, `spawn`
+and `usage`, and `null` for `crash`, `hang` and `exit`:
+`{"steps": [{"say": "hi"}, {"sleep_ms": 500}, {"tool": {"name": "bash"}}, {"hang": null}]}`.
 
 | Step | Fields | Emits |
 | --- | --- | --- |

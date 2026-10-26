@@ -8,8 +8,9 @@ the owner. It adds no workflow state of its own beyond rule/timer bookkeeping.
 Rules live in TOML files: `<project>/.eliot/rules/*.toml` and `<data_dir>/rules/*.toml`.
 Rule keys: `id`, `on`, `do`, and optional `limit`, `catch_up`, `allow_self`,
 `enabled` (default true).
-The daemon reloads them on change; a file that fails to parse is reported
-(`rule.failed`) and the previous version stays active.
+The daemon reloads them on change; a file that fails to parse is reported as
+`source.health` for `config` naming the file and line, and the previous version stays
+active.
 
 ```toml
 [[rule]]
@@ -38,8 +39,9 @@ limit = { max = 3, per = "agent", window = "1h" }
 | Cron | `cron = "<5 fields>"`, optional `tz` (default local) | Standard 5-field cron. Time is kept as UTC instants; local time is used only to match fields. In the repeated hour of a DST fall-back each real instant fires once (v1 hit a scheduler failure there; test both sides of the fold); a local time inside a spring-forward gap fires at the first valid instant after it. |
 | Once | `at = "2026-11-01T09:00:00+03:00"` | Disabled after firing. |
 
-A timer firing is skipped (`rule.suppressed reason=in_flight`) while the same rule's
-previous firing still has commands `queued`, `dispatched` or `unknown`; skipped firings
+A timer firing is skipped while the same rule's previous firing still has commands
+`queued` or `dispatched` (`rule.suppressed reason=in_flight`) or `unknown`
+(`reason=unknown`); skipped firings
 are not queued behind it, so a slow `git fetch` never stacks copies. Event firings each
 run (each has its own key); a repeated `git.push` of the same branch is a no-op.
 
@@ -134,9 +136,9 @@ its timer reports `rule.suppressed reason=unknown` instead of firing.
 
 - stdin: one JSON object `{event, agent, rule}`;
 - env: the [minimal environment](configuration.md#environment), the action's literal
-  `env`, `ELIOT_HOME`, `ELIOT_RULE`; no agent token, so its `eliot` calls act as the
-  owner (a project script is still project code: use stdout actions, which keep the
-  project limit);
+  `env`, `ELIOT_HOME`, `ELIOT_RULE` and a run token in `ELIOT_AGENT_TOKEN` (kept only in
+  the daemon's memory, valid until the script exits): its `eliot` calls act as the rule — owner authority for a global
+  rule, that project only for a project rule;
 - stdout: zero or more NDJSON actions in the same shape as `do` entries — the daemon
   stores them as commands `<run action id>/<n>` and executes them with the same limits
   and the same project scope as the rule; stderr goes to the daemon log;
@@ -155,7 +157,8 @@ or `deny` answers it with an ordinary command; the plugin holds the native reque
 until that command arrives. A hook that must answer synchronously (the
 [hook shim](plugin-protocol.md#hooks)) gets the decision of matching `approve`/`deny`
 rules within the hook timeout; no match → `ask`; a decision reached after the timeout
-is discarded. An unanswered request is sent once as a `queue` message to the agent's
+is discarded. A request that no approval rule answered when it was raised is sent
+once as a `queue` message to the agent's
 parent (or the project's `role=manager` agent if there is no parent, else the owner),
 naming the request id. Nothing ever answers it by timeout, by picking the first or
 "recommended" option, or by denying everything.
@@ -197,7 +200,7 @@ active Eliot goal:
    beside a native goal, but never stacks: a tick is skipped while the goal's
    previous continuation is `queued`, `dispatched` or `unknown`, or its turn is still
    running.
-2. Run `check` (if any) in the agent's workspace (timeout `automation.check_timeout`,
+2. Run `check` (if any) in the agent's workspace, custody and environment (timeout `automation.check_timeout`,
    default 10 min; at most `automation.max_parallel_checks`, default 2, checks run at
    once on the machine). Pass → `done`. With `marker:X`, done when the last `message.agent`
    contains `X`.
@@ -246,7 +249,7 @@ CREATE TABLE goals (
   cadence TEXT NOT NULL DEFAULT 'on_idle',
   status TEXT NOT NULL, max_turns INTEGER NOT NULL, turns_used INTEGER NOT NULL DEFAULT 0,
   max_cost_usd REAL, cost_used REAL, no_progress INTEGER NOT NULL,   -- cost_used NULL = not reported
-  stale_turns INTEGER NOT NULL DEFAULT 0, last_fingerprint TEXT, last_check_hash TEXT,
+  stale_rounds INTEGER NOT NULL DEFAULT 0, last_fingerprint TEXT, last_check_hash TEXT,   -- stale_rounds: consecutive rounds without progress
   generation INTEGER NOT NULL DEFAULT 0, last_key INTEGER,
   updated_at INTEGER NOT NULL, PRIMARY KEY (agent, mode)
 );

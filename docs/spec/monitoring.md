@@ -92,7 +92,8 @@ Per distinct worktree used by any live agent:
   - committed-but-unmerged set (for `who`): paths in `diff --name-only <base>...HEAD`
     that still differ in `diff --name-only <base> HEAD` — after a squash merge the
     branch is not an ancestor of its base, and this drops the already-merged paths.
-    `<base>` is the agent's `base_oid` (frozen at launch, below), else its `base_ref`.
+    `<base>` is the agent's `base_oid` (frozen at launch, below), else its `base_ref`,
+    else `origin/HEAD` if it exists; with none of them there is no branch set.
 - Remote refs change only through an explicit fetch (rule action or command) or the
   optional `git.remote_poll` (`ls-remote`, default off). `git.ref` events report them.
 - Huge repos: if `status` takes longer than 2 s, the interval doubles (max 5 min) and
@@ -125,11 +126,12 @@ CREATE INDEX agent_edits_path ON agent_edits(workspace, path);
 2. At start: `git worktree add` under `<data_dir>/worktrees/<agent>` — `-b BRANCH
    <base_oid>` if BRANCH does not exist, otherwise check it out (it must exist
    locally). Then read back the worktree's branch and HEAD.
-3. Run the profile's `setup` argv lists once, in order, in the agent's custody (a new
-   worktree has no ignored files, submodules or LFS content). A setup that fails fails
+3. Run the profile's `setup` argv lists once, in order, in the agent's custody and
+   environment, token included (a new worktree has no ignored files, submodules or
+   LFS content). A setup that fails fails
    the launch. A setup interrupted by a daemon crash has an unknown effect: it is not
-   run again — the agent becomes `failed` (`setup_unknown`) and the owner removes the
-   worktree and launches again.
+   run again — the agent becomes `failed` (router input `start_failed`, reason
+   `setup_unknown`) and the owner removes the worktree and launches again.
 4. Only then `agent.start`.
 
 Worktrees are never removed automatically: `eliot worktree remove A` removes a stopped

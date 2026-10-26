@@ -14,7 +14,7 @@ Identity comes from `ELIOT_AGENT_TOKEN` (see [API](api.md#transport)). Rules:
 | agent with `control = tree` | itself and its descendants | its project |
 | agent with `control = project` (manager role) | every agent in its project | its project |
 | global rule / timer / script | everyone (owner authority) | everything |
-| project rule / timer (its `do` list and its scripts' stdout actions) | agents of that project | that project |
+| project rule / timer (its `do` list, its scripts' stdout actions and their `eliot` calls) | agents of that project | that project |
 
 `control` comes from the profile (`control = "tree"`) or `launch --control`. A child
 never gets more control than its parent. An agent without its own identity
@@ -30,7 +30,8 @@ or `inject`.
 Message { id, sender, recipient, thread?, reply_to?, mode, text (≤ 32 KiB),
           admitted_at, presented_at?, read_at? }
 // admitted = stored; presented = the plugin reports the text entered the model
-// (inject, prepend or turn start); read = acknowledged by `eliot inbox` (`mail.ack`) / `mail.read`
+// (the daemon's notice or text command — `inject` or `send`, origin `daemon` — is applied);
+// read = acknowledged by `eliot inbox` (`mail.ack`) / `mail.read`
 sender = origin string: agent:<id> | owner | rule:<id> | timer:<id>   (same form as command origins)
 ```
 
@@ -123,8 +124,8 @@ a9  tests-2   claude  claim   src/api/**  "adding integration tests" (expires 14
 
 Mapping commits to agents: each agent worktree has its branch recorded in the
 `agents` row, and Eliot gives each agent process its own Git identity through the
-environment (`GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` = agent name,
-`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` = `<agent-name>.<id>@agents.eliot`) unless
+environment (`GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` = agent name, or the id when it
+has none; `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` = `<name or id>.<id>@agents.eliot`) unless
 the profile sets `git_identity = "inherit"`. No repository config is written, so this
 also works in shared checkouts. `who --history` maps author emails of that form back to
 agents; other authors are shown as is.

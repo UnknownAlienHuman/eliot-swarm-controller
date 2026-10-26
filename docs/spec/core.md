@@ -41,6 +41,7 @@ keeps it. A fork is a new subject and a new agent.
   `<launch id>/send` (the linked first input of a launch or resume),
   `<selector command id>/<agent id>` (selector expansion),
   `rule:<rule id>@<key>/<n>` (rule firing, [automation](automation.md#rules)),
+  `<run action id>/<n>` (actions a `run` script printed),
   `goal:<agent id>@<key>` (Goal continuation).
 
 ## Agent
@@ -79,11 +80,18 @@ Eliot from launching more work, they cannot undo a child the harness already cre
 `attach --control` with a profile succeeds; the router rejects commands to
 observe-only agents with `not_allowed`.
 
+`profile` is never empty: a native child gets its parent's `profile` and
+`profile_snapshot` (it runs inside the parent's harness); an observed session gets
+`observe:<harness>` and a snapshot holding only the harness, until `attach --control`
+stores the chosen profile.
+
 `own_identity` is `token IS NOT NULL`. `false` means Eliot cannot put a token into the
 agent's process environment: a native child inside its parent's process (its `eliot`
 calls carry the parent's token and count as the parent's), or a session Eliot did not
-start (its calls carry no token, like any other owner process). `eliot show` says
-which.
+start. Such a session keeps the environment it was started with, so its calls carry
+no token and act as the owner — like every other process the owner started; attach for
+control only sessions you would let act as yourself. `eliot show` says which case
+applies.
 
 ### States
 
@@ -91,15 +99,16 @@ Live states: `starting`, `idle`, `busy`, `waiting`, `stopping`.
 
 | From | Trigger | To |
 | --- | --- | --- |
-| — | `launch` accepted (router creates the row) | `created` |
-| `created` | router input `start_dispatched` (it found a free launch slot: profile, account and proxy `max_live`, no provider hold) | `starting` |
+| — | `launch`, or `attach` of a subject without a row, accepted (router creates the row) | `created` |
+| `created` | router input `start_dispatched` (it found a free launch slot: profile, account and proxy `max_live`, no provider hold; an observe-only attach needs no slot) | `starting` |
 | `created` | `stop` accepted (the queued launch is cancelled; no native I/O) | `stopped` |
 | `starting` | `session.ready` | `idle` |
-| `starting` | router input `start_failed` (`agent.start` error or timeout), or `session.error` | `failed` |
+| `starting` | router input `start_failed` (workspace preparation failed, `agent.start` or `agent.attach` error, or timeout), or `session.error` | `failed` |
+| `starting`, any live | router input `attached` with the state `agent.attach` reported (`idle`, `busy`, `waiting`) — first attach of a discovered session, or re-attach after a restart | that state |
 | `idle` | `turn.started` | `busy` |
 | `busy` | `approval.requested` / `question.asked` | `waiting` |
 | `waiting` | last pending request resolved (`approval.resolved` / `question.answered`) | `busy` |
-| `busy`, `waiting` | `turn.completed` of the active turn (any status) | `idle` |
+| `busy`, `waiting` | `turn.completed` of the active turn (any status) | `idle`; requests of that turn are dropped from `pending` |
 | any live except `stopping` | `stop` accepted | `stopping` |
 | `stopping` | `agent.stop` reply, or `session.ended` | `stopped` |
 | any live | `session.ended` (the session ended natively) | `stopped` |
@@ -110,13 +119,17 @@ Live states: `starting`, `idle`, `busy`, `waiting`, `stopping`.
 Entering `stopped`, `failed` or `lost` clears `active_turn` and `pending` and cancels
 the agent's queued commands (`command.cancelled`, reason = the new state); they are not
 carried into a resumed session. `detach` leaves the state as it is and sets
-`observe_only`. Anything else leaves the state unchanged (and is a reducer test case).
+`observe_only`; a successful `attach --control` clears it. A request event while
+`idle` is added to `pending` without a state change. A re-attach that answers
+`not_found` is `session.lost`. Anything else leaves the state unchanged (and is a
+reducer test case).
 `stalled` is a flag, not a state: `busy`/`waiting` with no event for `stall_after`
 sets `stalled_since`; the next event of that agent clears it.
 
 The reducer `fn apply(agent: &mut Agent, input: &Input) -> Option<AgentState>` in
 `eliot-core` is the only code that changes `state`. `Input` is an event, an accepted
-`stop`, or a router input (`start_dispatched` for a launch or resume, `start_failed`);
+`stop`, or a router input (`start_dispatched` for a launch, attach or resume,
+`start_failed`, `attached`);
 deciding launch slots and holds is the router's job, not the reducer's. It is pure and
 table-tested against the table above. Every state change is published as a derived
 event `agent.<new state>`.
@@ -225,15 +238,15 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
 
 | Verb | Args | Semantics | Precondition |
 | --- | --- | --- | --- |
-| `launch` | `profile?`, `harness?`, `prompt?`, `workspace?`, `parent?`, `name?`, `project?`, `control?`, `labels?` | Create an agent and start a native session. A `prompt` becomes a separate linked `send` (below). | — |
+| `launch` | `profile?`, `harness?`, `prompt?`, `workspace?` or `worktree?` + `base?`, `parent?`, `name?`, `project?`, `control?`, `labels?` | Create an agent and start a native session. A `prompt` becomes a separate linked `send` (below). | — |
 | `send` | `text` | New user turn. If the agent is busy, the command waits in the Store as `queued` (no native I/O) and is dispatched when the agent becomes idle, in order. Survives plugin and daemon restarts while the agent stays live. `applied` means a native turn started with this input; the turn's result is separate (`turn.completed`). | live |
-| `steer` | `text` | Add input to the **running** turn. Bound to the turn that is active when the command is accepted: if that turn has ended by dispatch, or ends before the text lands, the command fails (`stale_turn` / `turn_ended`); it is never carried into a later turn. | `busy`; native support |
-| `inject` | `text` | Add context without starting a turn by itself; delivered at the next native safe point (hook `additionalContext`, pending-input queue, or prepended to the next `send`). | live; plugin decides mechanism and reports it |
+| `steer` | `text` | Add input to the **running** turn. Bound to the turn that is active when the command is accepted: if that turn has ended by dispatch it is `rejected` (`stale_turn`); if it ends before the text lands it is `failed` (`turn_ended`); it is never carried into a later turn. | `busy`; native support |
+| `inject` | `text` | Add context without starting a turn by itself; delivered at the next native safe point (hook `additionalContext`, pending-input queue, or prepended to the next `send`). `applied` when the plugin has placed the text there; `applies` says when the model sees it. | live; plugin decides mechanism and reports it |
 | `interrupt` (CLI alias `abort`) | — | Abort the turn that is active when the command is accepted; session stays alive. A different turn is never interrupted. | `busy`/`waiting` |
 | `stop` | `force?` | End the session. `force` kills the agent's process tree (exact only where custody is exact, see [monitoring](monitoring.md#process-monitor)). (The CLI's `--tree` is the selector `@tree:<agent>`.) | any live |
 | `resume` | `prompt?` | Re-open a `stopped`/`lost`/`failed` session by `native_ref`. Never resends old input; a `prompt` is a linked `send`. | native support |
-| `approve` / `deny` | `request_id?` (default: the only pending request), `remember?` | Answer a pending approval. | request pending |
-| `answer` | `request_id?`, `text` or `choice` | Answer a pending question. | request pending |
+| `approve` / `deny` | `request_id?` (default: the only pending request), `remember?` | Answer a pending approval. `remember` = allow the same kind of request for the rest of the session where the harness offers that (e.g. Codex `acceptForSession`), else `unsupported`. | request pending |
+| `answer` | `request_id?`, `text` or `choice` | Answer a pending question. `choice` is an option id from `question.asked.options` (the CLI's `--choice N` picks the N-th, 1-based). | request pending |
 | `configure` | `model?`, `effort?`, `permissions?` | Change settings; the reply says when it applies: `now`, `next_tool`, `next_turn`, `next_session`. | live |
 | `goal.set` | `text`, `mode?: auto|native|eliot`, `check?`, `budget?`, `cadence?` | `native` = the harness's own goal; `eliot` = the Eliot Goal loop ([automation](automation.md#goal-loop)); `auto` (default) = native if supported, else eliot. One goal per mode; a native and an Eliot goal may run at the same time with different texts. | live |
 | `goal.pause` / `goal.resume` / `goal.clear` | `mode?` (default: every active mode) | | goal exists |
@@ -247,8 +260,10 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
   `["cmd", "/C", "..."]`. Output is capped and kept as the tail.
 - `budget`: `{max_turns?, max_cost_usd?, no_progress?}`. `max_cost_usd` on a plugin
   that does not report cost (`features.cost = false`) is rejected `unsupported`.
-- `steer` has no implicit fallback: `steer --or-send` sends when steering is
-  impossible; without the flag the command is rejected.
+- `steer` has no implicit fallback: with `--or-send`, a steer that the router would
+  reject because the agent has no active turn or the plugin lacks `steer` is stored
+  as a `send` instead (same id, `outcome.or_send = true`); without the flag it is
+  rejected.
 - Handled by the daemon, never sent to a plugin: `cancel`, and `goal.*` in `eliot`
   mode. A plugin declares `goal.*` only for its native goal.
 - A queued `send` runs with the settings in effect when it is dispatched (a later
@@ -276,17 +291,23 @@ state  = accepted → [queued →] dispatched → applied | rejected | failed | 
   then runs like any other send. For a plugin whose harness cannot open a session
   without input (`features.start_requires_input`), the host hands the linked send's
   text to `agent.start` and the send becomes `dispatched` with the start; it is still
-  settled on its own (`applied` when a `turn.started` names it). `session.ready` never proves the input was received, and
-  a lost start reply never causes a second start or a second input.
+  settled on its own (`applied` when a `turn.started` names it). `session.ready`
+  never proves the input was received, and a lost start reply never causes a second
+  start or a second input.
+- The start command (launch, attach, resume) is `applied` at `session.ready` or
+  `attached`, `failed` on a definite error, and `unknown` on a timeout or plugin crash:
+  then the host first kills and verifies the agent's custody, so nothing keeps
+  running, and the agent becomes `failed`. A linked send that was still queued is
+  cancelled; one handed over in `initial` is `unknown`.
 - `turn_id`: the turn a `send` started (set when it is applied) or the turn a `steer`
   or `interrupt` was aimed at (the agent's `active_turn` when the command was
-  accepted). `agent.wait --after-command` and
-  `send --wait` follow it.
-- Ordering: commands to one agent are dispatched to its plugin one at a time in
-  acceptance order — the next one after the previous got its reply or became
+  accepted). `agent.wait --after-command` and `send --wait` follow it.
+- Ordering: commands to one agent that can be dispatched now go to its plugin one at
+  a time in acceptance order — the next one after the previous got its reply or became
   `unknown` — so `configure` then `send` cannot run on stale settings. `interrupt` and
-  `stop` skip the line. A `queued` send does not block other verbs (a `steer` still
-  reaches the running turn); queued sends leave in order when the agent is idle.
+  `stop` skip the line. A `send` to a busy agent is `queued` instead and leaves the
+  line, so later verbs (`steer`, `approve`, `configure`) pass it; queued sends leave in
+  order when the agent is idle.
 - A client that disconnects or times out never cancels an accepted command; read its
   state back with `eliot cmd show ID`.
 - `rejected`: refused before any native I/O — by the router (unsupported, not

@@ -15,10 +15,11 @@
   to the agent id. This is attribution and routing, not a security boundary
   ([decisions](../decisions.md) D-07). Every process Eliot starts for an agent gets
   that agent's token; a native child without its own environment (`own_identity =
-  false`) inherits its parent's and acts as the parent. A process that has
-  `ELIOT_AGENT_ID` but no matching `ELIOT_AGENT_TOKEN` (a harness filtered its
-  environment) is refused `not_allowed` by the CLI and the daemon — an agent never
-  becomes the owner by losing its token. `daemon.status` reports the caller, so a
+  false`) inherits its parent's and acts as the parent; a rule's script gets a run
+  token that acts as the rule ([automation](automation.md#scripts)). A process that
+  has `ELIOT_AGENT_ID` or `ELIOT_RULE` but no matching `ELIOT_AGENT_TOKEN` (a harness
+  filtered its environment) is refused `not_allowed` by the CLI and the daemon — an
+  agent or a project script never becomes the owner by losing its token. `daemon.status` reports the caller, so a
   plugin can check what a tool inside the harness sees.
 - Max frame 4 MiB. Requests are multiplexed by `id`; a slow call never blocks others.
 
@@ -41,13 +42,13 @@
 | `agent.discover` | `harness?`, `cursor?`, `limit≤1000` | page of native sessions found by plugins' `discover` + `next` |
 | `agent.attach` | `harness`, `native_scope`, `native_ref`, `control?`, `profile?` (required with `control`) | the agent of that subject: a new `origin=external` agent, or the existing row ([one subject, one agent](core.md#identifiers)). With `control`, the plugin must attach for control with that profile; on success the row stops being observe-only. `not_allowed` if the plugin cannot control it. |
 | `mail.send` | `to`, `text`, `mode?`, `reply_to?` | message ids ([coordination](coordination.md#mailbox)) |
-| `mail.inbox` | `wait_s?`, `all?` | caller's unread messages (does not mark them) |
+| `mail.inbox` | `wait_s?`, `all?`, `limit≤100` | caller's oldest unread messages (does not mark them); `all` pages through read ones with `after?` |
 | `mail.ack` | `through` (message id) | marks the caller's messages up to it read |
 | `mail.read` | `id` | one message; marks it read |
-| `var.get` / `var.set` / `var.list` / `var.watch` | `scope/key`, `value`, `expect_version?`, `note?` / prefix | value + version; `watch` streams `var.changed` ([coordination](coordination.md#shared-variables)) |
+| `var.get` / `var.set` / `var.list` / `var.watch` | `scope/key`, `value`, `expect_version?`, `note?` / prefix (+ `after?`, `limit≤1000` for `list`) | value + version; `watch` streams `var.changed` ([coordination](coordination.md#shared-variables)) |
 | `who` | `paths: [pathspec]`, `history?` | rows per agent ([coordination](coordination.md#who-works-on-this)) |
 | `claim.add` / `claim.release` | `glob`, `note?`, `ttl?` | claim / conflicts ([coordination](coordination.md#claims)) |
-| `rule.list` / `rule.get` / `rule.enable` / `rule.disable` / `rule.test` | `id`, `event?` | rules; `test` returns the actions it would run ([automation](automation.md#rules)) |
+| `rule.list` / `rule.get` / `rule.enable` / `rule.disable` / `rule.test` | `id`, `event?` (`list`: `after?`, `limit≤1000`) | rules; `test` returns the actions it would run ([automation](automation.md#rules)) |
 | `rules.pause` / `rules.resume` | — | global automation switch |
 | `timer.list` / `timer.run` | `id` | time-triggered rules with next fire time |
 
@@ -70,9 +71,10 @@ Errors use JSON-RPC error objects with a stable `data.code`: `not_found`,
 `history_gap`, `internal`; `data.reason` refines it (e.g. `id_expired`,
 `secret_in_payload`).
 
-Script callers (rules' `run` actions) and any CLI call without `ELIOT_AGENT_TOKEN` act
-as the owner. Actions of a project rule — its `do` list and its scripts' stdout
-actions — may target only agents of that project ([automation](automation.md#scripts)).
+Any CLI call without `ELIOT_AGENT_TOKEN` (and without `ELIOT_AGENT_ID`/`ELIOT_RULE`)
+acts as the owner. Actions of a project rule — its `do` list, its scripts' stdout
+actions and their `eliot` calls — may target only agents of that project
+([automation](automation.md#scripts)).
 
 ## CLI
 
@@ -90,17 +92,19 @@ running they fail with `unavailable` and say so.
 
 | Code | Meaning | Error codes |
 | --- | --- | --- |
-| 0 | ok (command `applied` or `queued`, `cmd cancel` succeeded, query answered) | — |
-| 1 | error | `not_found`, `invalid`, `busy`, `unavailable`, `internal`, command `failed` |
+| 0 | ok: command `applied` or `queued`, `cmd cancel` succeeded, query answered; with `--wait` / `wait`: the turn ended `completed` or the target reached the state | — |
+| 1 | error, or a definite bad outcome | `not_found`, `invalid`, `busy`, `unavailable`, `history_gap`, `internal`, command `failed`; with `--wait` / `wait`: the turn ended `failed` or `interrupted`, or the agent became `stopped`/`failed`/`lost` first |
 | 2 | CLI usage error (bad flags) | — |
-| 3 | rejected — nothing happened | `unsupported`, `not_allowed`, `bad_state`, command `rejected` |
+| 3 | rejected — nothing happened | `unsupported`, `not_allowed`, `bad_state`, command `rejected` or `cancelled` |
 | 4 | outcome unknown | command `unknown` |
 | 5 | `wait` timed out | — |
-| 6 | pending: the command is still `dispatched` when the CLI stops waiting; read it back with `eliot cmd show ID` | — |
+| 6 | pending: the command is still `accepted` or `dispatched` when the CLI stops waiting; read it back with `eliot cmd show ID` | — |
+
+`eliot cmd show ID` exits with the code of the command's state from this table.
 
 ```text
 eliot daemon [--foreground]                 start the daemon (default: background, returns when ready)
-eliot daemon stop [--drain | --force]       stop it (drain: let running turns finish, admit nothing new)
+eliot daemon stop [--drain | --force]       stop it (drain: no new work; running turns finish, answers and stops work)
 eliot status                                daemon, plugins, sources, where each profile's config came from
 eliot launch [--profile P] [--harness H] [--name N] [--parent A] [--label k=v]...
              [--project NAME] [--control self|tree|project]
@@ -145,7 +149,7 @@ eliot hold list | clear ACCOUNT             provider holds per account (L2.7)
 eliot worktree remove A                     remove a stopped agent's worktree (L3.2 rules)
 eliot doctor                                orphans, unused services, stale worktrees, disk use (L7.7)
 eliot daemon install | uninstall            per-user logon task (L7.8)
-eliot attach --harness H SCOPE/REF [--control --profile P]   watch a session from `discover`; with --control
+eliot attach --harness H --scope S --ref R [--control --profile P]   watch a session from `discover`; with --control
                                             also control it under profile P (same agent row either way)
 eliot plugin NAME                           (internal) run a built-in plugin on stdio
 eliot plugin-test CMD... [--replay-dir DIR]  run the plugin conformance suite against any plugin command

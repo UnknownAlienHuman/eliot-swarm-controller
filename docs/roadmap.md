@@ -90,8 +90,9 @@ Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-p
       most 64 KiB) with `events.lagged`; `history_gap` for pruned ranges. Test with a
       slow subscriber and with events committed during replay.
 - [ ] **L1.4 Daemon + IPC.** `eliot daemon [--foreground]`, `eliot daemon stop
-      [--drain | --force]` (drain = let running turns finish, admit nothing new;
-      without a flag it refuses while turns run), lock file, `daemon.json` with the PID +
+      [--drain | --force]` (drain = no new launches, sends, rule or timer firings;
+      running turns finish; approvals, answers, interrupts, stops and reads keep
+      working; without a flag it refuses while turns run), lock file, `daemon.json` with the PID +
       start-time liveness check, named pipe / Unix socket, JSON-RPC with
       multiplexing, `daemon.status`.
 - [ ] **L1.5 Config.** Load `config.toml` (global + project), profiles with defaults
@@ -110,7 +111,7 @@ Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-p
       create the agent; others: exists → supported → allowed → state), persistence,
       linked first send for `launch`/`resume` with a prompt (and `initial` for
       `start_requires_input`), per-agent ordered dispatch (`interrupt`/`stop` skip the
-      line, both carry the active `turn_id`), Store-held queue of sends to busy agents
+      line; `steer`/`interrupt` carry the `turn_id` captured at acceptance), Store-held queue of sends to busy agents
       and `cancel`, outcome recording, selectors with `max_selector_targets` and
       `command.children`, idempotent ids with `id_expired`, one agent row per native
       subject, profile + account `max_live` launch queue, restart turns `dispatched`
@@ -233,7 +234,8 @@ Specs: [monitoring](spec/monitoring.md).
       rollouts only) with [cursors](spec/plugin-protocol.md#cursors-and-replay)
       (`source_cursors`); `native_scope` of a rollout is `codex:<absolute CODEX_HOME>`;
       paged `eliot discover` (excluding sessions live agents already control), `eliot
-      attach` and `attach --control --profile P` on the same agent row; rollout
+      attach --harness H --scope S --ref R` and `--control --profile P` on the same
+      agent row; rollout
       fixtures recorded in this PR.
 - [ ] **L3.5 Liveness.** Stall flag, source health, `source.gap`, `unknown` display; an
       injectable clock for all timers (used again by L6).
@@ -291,12 +293,13 @@ Specs: [coordination](spec/coordination.md).
       `max_depth`, `max_children_per_agent`, `max_tree_agents`.
 - [ ] **L5.5 MCP server.** `eliot mcp` for harnesses that prefer tools over shell. The
       tool set follows the caller's control: `self` gets inbox, msg, var, who, claim,
-      ls; `tree`/`project` add launch, send, wait, result, steer, stop. One bridge per
+      ls; `tree`/`project` add launch, send, wait, result, steer, interrupt, stop. One bridge per
       session: it loads nothing at start (a v1 donor bridge that loaded its whole
       ledger used ~207 MiB each), holds no Store handle and exits when stdin closes.
       Optional: build it only if a harness cannot run shell commands. `eliot show`
-      reports whether the agent has actually used `eliot`/MCP yet (`unused` / `used`),
-      so a harness that cannot reach it is visible.
+      reports whether the daemon has seen a call with the agent's token since it
+      started (`unused` / `used`, kept in memory), so a harness that cannot reach
+      `eliot` is visible.
 
 **Exit test.** CI part (fake agents; the test runs `eliot` with each agent's
 `ELIOT_AGENT_ID`/`ELIOT_AGENT_TOKEN`, as its tools would): two agents
@@ -318,7 +321,8 @@ tests run in simulated time.
 - [ ] **L6.3 Actions.** Actions stored as commands and run in order; agent actions,
       git actions (fetch/pull/push/worktree with readback), `msg.send`, `var.set`,
       `notify`, `emit`; project rules limited to their project.
-- [ ] **L6.4 Scripts.** `run` action with the NDJSON contract; example scripts.
+- [ ] **L6.4 Scripts.** `run` action with the NDJSON contract and the run token
+      (project scripts limited to their project); example scripts.
 - [ ] **L6.5 Approvals policy.** Approval rules; synchronous answers for hook
       decisions; escalation of unanswered requests.
 - [ ] **L6.6 Goal loop.** Eliot mode and native-mode budgets, read-only progress

@@ -81,8 +81,9 @@ This page is the map. Exact formats live in [spec/](spec/); build order lives in
 - Native processes launched by Eliot over stdio belong to the daemon's process tree:
   stopping the daemon ends those sessions (use `eliot daemon stop --drain` before an
   upgrade). After a restart the daemon rebuilds its work from the Store — live agents
-  are re-attached (`agent.attach`, the rest become `lost`), `dispatched` commands are
-  `unknown`, queued sends, rule cursors, timers, goals and unread mail continue — and
+  are re-attached (`agent.attach`; the rest become `lost` and their queued sends are
+  cancelled), `dispatched` commands are `unknown`, queued sends of agents still live,
+  rule cursors, timers, goals and unread mail continue — and
   continuing a lost session is an explicit `resume`; the last prompt is never resent.
 - Harnesses with a server mode (Codex `app-server --listen`, `opencode serve`) can run
   their server as an Eliot **service** that lives outside the daemon (L7.6): a daemon
