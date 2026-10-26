@@ -45,13 +45,19 @@ changes behavior; never append a contradictory addendum.
 | D-38 | Worktree creation/setup is a journaled pre-start phase. Exact Git effects are read back; unknown setup never reruns blindly. | `launch --worktree` otherwise repeats non-idempotent setup or starts half-built. |
 | D-39 | Mail uses capability-aware wake plus immutable inbox-batch acknowledgement. | Stored ≠ presented ≠ safely received; lost reply must not consume mail. |
 | D-40 | Historical replay exposes an explicit gap when requested events were pruned. | Silent jump from an old cursor falsely claims complete history. |
-| D-41 | Command admission and turn outcome are separate. A missing terminal result becomes an unknown turn that blocks further work in that generation until exact readback or constrained owner resolution. | `send applied` proves input admission, not completion; reconnect must neither invent success nor wedge recovery permanently. |
+| D-41 | Command admission and turn outcome are separate. A missing terminal result becomes an unknown turn that blocks further work in that generation until exact readback or constrained owner resolution. | `send applied` proves turn association, not completion; reconnect must neither invent success nor wedge recovery permanently. |
+| D-42 | Native-event dedupe receipts are committed independently of retained event rows and remain through the current generation's replay lifetime. | A lost `event.put` acknowledgement after event retention must not fire automation twice. |
+| D-43 | No-token owner fallback requires a live, birth-pinned OS check proving the peer is outside every current Eliot custody; ambiguity rejects. | Process registration can lag execution, so a projection miss is not proof that an Eliot-managed child is an owner process. |
+| D-44 | Routing-token presence follows control lifecycle, not generation alone. Terminal/detached/observe-only rows revoke by clearing the hash while preserving monotonic generation. | Detach must invalidate credentials without rewriting identity history. |
+| D-45 | A deterministic event-rule firing error is a durable failed run with no actions and advances the rule cursor atomically; only Store failure retries the event. | Missing placeholders or invalid actions must not wedge all later events behind one permanent error. |
+| D-46 | Script environment references are principal-scoped. Project scripts require both global automation approval and the project's own allowlist before any value is read. | A global credential allowed elsewhere must not leak into a project script before returned-action validation. |
 
 ## Defaults
 
 | Topic | Default |
 | --- | --- |
 | Environment | `minimal`; `inherit` requires a trusted global profile. |
+| Script environment | empty global allowlist; project scripts use global∩project. |
 | Linux custody without exact backend | degraded; graceful control allowed, exact force rejected. |
 | Event-rule first load/edit | start at current high-water; no implicit historical replay. |
 | Paused/disabled event rule | advance cursor without firing; no resume burst. |
