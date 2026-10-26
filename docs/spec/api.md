@@ -3,8 +3,8 @@
 ## Transport/identity
 
 JSON-RPC 2.0 over UTF-8 NDJSON. Current-user-only Windows pipe or Unix `0600` socket
-inside private data root. One daemon/data-dir OS lock; `daemon.json` includes PID +
-process birth identity.
+inside private data root. One daemon/data-dir OS lock; `daemon.json` includes
+`host_boot_id`, PID and process birth identity.
 
 No token means owner. Any supplied/inherited agent identity must contain matching id,
 generation and valid raw token; invalid/incomplete/stale never falls back to owner.
@@ -15,11 +15,11 @@ are smaller.
 
 | Surface | Semantics |
 | --- | --- |
-| daemon status/shutdown | admission, Store/WAL, custody/source/account holds; exact drain/force |
+| daemon status/shutdown | admission, Store/WAL, boot-scoped custody/source/account holds; exact drain/force |
 | agent list/get | paginated current projections, generation/native subject/open effects |
 | agent wait/result | exact captured generation/turn/goal terminal result |
 | command submit/get | durable linked session/input commands and readback |
-| turn get/resolve | exact native/readback result or explicit owner resolution of an unknown, no-longer-active turn |
+| turn get/resolve | exact native/readback result or constrained owner resolution of unknown inactive turn |
 | events read/subscribe | bounded persisted replay + live stream with explicit gaps |
 | hook event | generation/request-bound synchronous decision |
 | discover/attach/detach | canonical native subject; one Agent row |
@@ -44,64 +44,70 @@ One transaction resolves target/selector, validates principal/capability/state a
 expected binding, captures immutable target generation/turn/request, and creates all
 rows/events.
 
-Ordinary expected=target current generation. Launch has no expected generation and
-targets 1. Resume expects terminal g and targets g+1; row/token change only when resume
-dispatch commits.
+Ordinary expected=target current generation. Launch targets 1. Resume expects terminal
+g and targets g+1; row/token change only when resume dispatch commits.
 
-Launch/resume with text returns session command + linked send. Waiting without `--wait`
-means session readiness only. `--wait` with text waits for the linked command's exact
-turn and prints it. Start and initial input never share one outcome.
+Launch/resume with text returns session command + linked send. Without `--wait`, launch
+wait means session readiness only. `--wait` with text waits for linked send's exact
+turn. Start and initial input never share one outcome.
 
 Interactive calls may omit expected fields; admission captures them. Durable automation
 supplies frozen values. Interactive selectors expand at admission; automation already
 stores concrete targets.
 
 Same external write id + canonical payload returns original result; different payload
-is invalid. Internal ids are fixed derived ids.
+invalid. Internal ids are fixed derived ids.
 
 Errors: `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`,
 `invalid`, `busy`, `unavailable`, `history_gap`, `secret_in_payload`, `internal`.
 
-## Turn outcome and wait
+## Async input, turn outcome and wait
 
-A send command becoming applied means native input was admitted. It does not settle the
-turn. `turn.get {agent,generation,turn_id}` returns `running|completed|unknown`, native/
-readback/owner resolution source, status, bounded final text and usage.
+For `send`, vendor transport/inbox acceptance is not an applied Eliot command. The
+command remains dispatched until exact native turn/execution association. Then Store
+commits the command→turn mapping and command becomes applied. Deadline after possible
+inbox admission makes command unknown and blocks later send/configure/goal in that
+generation until readback.
 
-On reconnect, if exact native history cannot prove terminal outcome, the turn is
-`unknown`. The live generation remains blocked from new send/goal continuation until
-exact readback or owner resolution. Owner may call:
+A send applied still does not settle turn terminal status. `turn.get` returns
+`running|completed|unknown`, ordered input command ids, resolution source, status,
+bounded final text and usage. Several input commands may map to one native turn.
+
+If reconnect cannot prove terminal outcome, turn is unknown and live generation remains
+blocked from new turn/goal work. Owner may call:
 
 ```text
 turn.resolve {
   id, agent, generation, turn_id,
   status: completed | interrupted | failed,
   reason,
-  final_text?          // optional owner-supplied bounded text, labelled owner
+  final_text?
 }
 ```
 
-Resolution is rejected while readback says that native turn is still active. It records
-`turn.resolved`, never fabricates a plugin completion. Unknown historical turn in a
-terminal old generation does not block resume/new generation.
+Resolution rejects while native readback says turn still active. It records
+`turn.resolved`, never fabricates plugin completion. Historical unknown in terminal old
+generation does not block resume.
 
-`agent.wait` captures each target generation at call start:
+`agent.wait` captures target generation at call start:
 
-- turn + `after_command`: exact turn linked to that command;
-- turn without it: current active turn, or first turn starting after call high-water;
-- idle: immediate only if no active/unknown turn in captured generation;
+- turn + `after_command`: find that command through `turn_inputs`; if its input is
+  dispatched/unknown but not associated, wait/read back that exact input;
+- turn without it: current active/unknown turn, or first turn starting after call
+  high-water;
+- idle: immediate only with no active, unknown or input-association gate;
 - stopped: stopped/failed/lost for captured generation;
 - goal: done/blocked for captured goal revision.
 
-Completed returns result; unknown returns outcome unknown/exit 4; replacement generation
-is stale, never success for different work. Timeout has no cancellation side effect.
+Several `after_command` waits may resolve from the same terminal turn. Unknown returns
+exit 4; replacement generation is stale. Timeout has no cancellation side effect.
 
 ## Attach/discover
 
 Discover returns subjects only. Attach looks up unique subject: return existing row,
-upgrade observe-only to control after exact native attach, or create one external row if
-absent. Another live control path/unverified takeover rejects. Detach changes same row.
-Native subject reuse requires a new scope.
+upgrade observe-only to control after exact native attach, or create one external row.
+Another live control path/unverified takeover rejects. Detach changes same row. Native
+subject reuse requires new scope.
 
 ## Drain/shutdown
 
@@ -111,29 +117,29 @@ turn/command/action readback and manual resolution. All pre-boundary work contin
 streams/readback stay alive.
 
 Exit waits for pre-drain effects and owned sessions. Unknown outcomes are blockers until
-resolved or explicitly abandoned by owner policy. Once admitted commands settle,
-external/attached service sessions may be detached without killing them. Without drain,
-shutdown refuses owned live work. Force kills only exact supported custody, marks
-ambiguous effects unknown and never kills attached services.
+resolved or explicitly abandoned by owner policy. External/attached sessions may be
+detached without kill after admitted work settles. Without drain, shutdown refuses
+owned live work. Force kills only exact supported custody, marks ambiguous effects
+unknown and never kills attached services.
 
 ## Event replay/gaps
 
-Subscribe registers a bounded live buffer, captures Store high-water, replays bounded
+Subscribe registers bounded live buffer, captures Store high-water, replays bounded
 pages `(after_seq,high_water]`, then releases buffered persisted events in order. No
 read transaction spans client wait. Ephemeral replay-window events are best effort.
 Overflow emits `events.lagged`.
 
 Store exposes `earliest_seq`. Request before it returns `history_gap`. Explicit
-`allow_gap=true` first emits `events.gap` and continues from earliest; no silent jump.
-Rule cursors use stricter retention coordination and never opt into a silent gap.
+`allow_gap=true` first emits `events.gap` and continues from earliest. Rule cursors use
+stricter retention and never opt into silent gap.
 
 ## Mail acknowledgement
 
-One open immutable inbox batch/recipient. `mail.inbox` returns the same batch until
-`mail.ack(batch_id,id)` commits; newly arrived messages wait for next batch. CLI writes
-complete stdout before ack. Lost inbox leaves unread; lost ack uses same id/readback.
-`mail.read ID` is allowed only when no open batch contains that message; otherwise the
-caller acknowledges the batch. `--all` includes history.
+One open immutable inbox batch/recipient. `mail.inbox` returns same batch until
+`mail.ack(batch_id,id)` commits; new messages wait for next batch. CLI writes complete
+stdout before ack. Lost inbox leaves unread; lost ack uses same id/readback.
+`mail.read ID` is allowed only when no open batch contains it; otherwise acknowledge
+the batch. `--all` includes history.
 
 ## CLI
 
