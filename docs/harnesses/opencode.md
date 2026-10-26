@@ -2,92 +2,95 @@
 
 Layer L4.4. Plugin: `plugins/opencode`. It may use `session_mode=shared` **only** when
 the installed server schema provides exact session identity, per-session tool
-environment, event/readback correlation and isolated session stop. Otherwise controllable
-OpenCode runs one server per Eliot agent (`per_agent`); a shared owner server may still
-be observe-only.
+environment, event/readback correlation and isolated session stop. Otherwise controlled
+OpenCode uses one server per Eliot agent; a shared owner server may be observe-only.
 
-Facts must be selected from the installed `GET /doc` schema. Public/current source
-review on 2026-10-26 also showed a stable `PUT /api/session/{sessionID}/environment`
-route and shell spawning from that session environment; this is promising but not a
-substitute for checking the owner's installed version.
+Facts are selected from installed `GET /doc`. Public source review on 2026-10-26 showed
+`PUT /api/session/{sessionID}/environment` and shell spawning from that environment;
+this is promising but does not replace installed live qualification.
 
 ## API generation selection
 
-OpenCode has had several endpoint generations. At initialize:
-
-1. read server version and OpenAPI document;
-2. select one supported generation as a complete contract;
-3. record it in manifest/effective settings/fixtures;
-4. reject missing required routes rather than mixing generations.
-
-A 404/405 proves absence only after the complete response from the intended server is
-read. A newly started server's temporary incomplete model catalogue may be retried only
-when the response proves no session/input was admitted.
+At initialize: read version/OpenAPI, select one complete supported generation, record it
+in manifest/effective settings/fixtures, and reject missing routes rather than mixing
+generations. A 404/405 proves absence only after complete response from intended server.
+Temporary model-catalogue refresh may be retried only when response proves no session/
+input was admitted.
 
 ## Shared-control prerequisites
 
-Before returning `session_mode=shared` for control, live qualification must prove:
+Live qualification must prove:
 
-- create/read one exact session and directory;
-- set/read its environment before first prompt;
-- shell/tool subprocess receives that session's Eliot token, generation and Git
-  identity, while another session receives different values;
-- session abort/close cannot affect another session;
-- events/messages/children carry exact session/native ids and can be rebuilt after SSE
+- exact session/directory create/read;
+- per-session environment set/read before first prompt;
+- two concurrent sessions' tools receive different Eliot token/generation/Git identity;
+- abort/close one cannot affect another;
+- events/messages/children carry exact session/input/execution ids and recover after SSE
   gap;
-- attached owner-run server is never stopped by agent lifecycle.
+- owner-run attached server is never stopped by agent lifecycle.
 
-If `session.environment` is absent or not applied to tools, use a per-agent managed
-server with profile environment. Do not share a server and silently attribute all tool
-CLI calls/Git commits to one token.
+If session environment is absent/not used by tools, use per-agent managed server. Never
+share and silently attribute all tools/commits to one token.
 
-## HTTP outcome rule
+## HTTP and async input outcome
 
-2xx uses endpoint-specific meaning; 204 async prompt is inbox admission, not turn
-completion. A complete 4xx may be rejected when endpoint semantics prove no effect.
-Timeout/transport/ambiguous server error after write is unknown and resolved only from
-exact native input/message/execution state—never retried against the current turn.
+2xx is endpoint-specific. `prompt_async` 204 proves only native inbox admission. The
+plugin retains exact Eliot command ↔ native input/message id, keeps `agent.command`
+pending, and does not free Eliot's send lane until:
+
+- exact execution/turn starts and includes that input → send applied + turn mapping;
+- exact readback proves rejection/drop before execution → failed;
+- absolute deadline expires after possible admission → unknown.
+
+Unknown inbox input blocks another send/configure/goal for that generation until exact
+readback. It is never resubmitted. If one native execution legitimately drains several
+already-admitted inputs, emit one turn with ordered `input_commands`; all waits resolve
+from that one terminal result.
+
+Complete 4xx is rejected only when endpoint semantics prove no effect. Transport/
+timeout/ambiguous server failure after write is unknown.
 
 ## Verb mapping
 
 | Eliot | OpenCode |
 | --- | --- |
-| launch | create exact session, set per-session environment, read effective directory/model/agent, then `session.ready`; optional initial input remains a separate linked command |
-| send | async prompt with retained native input/message identity |
-| steer | only a recorded exact-current-execution mechanism; queue is not steer |
-| inject | recorded instruction/safe-point mechanism, otherwise explicit prepend-next-send |
+| launch | create session, set per-session env, read effective directory/model/agent, ready; initial input is separate linked command |
+| send | async prompt; applied only at exact execution association, not 204 |
+| steer | only recorded exact-current-execution mechanism; queue is not steer |
+| inject | recorded safe point, otherwise explicit prepend-next-send |
 | interrupt | exact session/execution abort; verify child scope |
 | stop | close/abort exact session; never kill shared server for one agent |
-| resume | exact persisted session attach/resume; never resend old input |
+| resume | exact persisted session attach; never resend old input |
 | fork/background | installed native route with exact readback |
-| approve/deny/answer | exact native request id and offered values |
+| approve/deny/answer | exact native request id/offered values |
 | configure | installed session/per-prompt setters plus readback/application point |
-| goal | Eliot Goal until a native goal is qualified |
+| goal | Eliot Goal until native goal qualified |
 
-## Observation
+## Observation and recovery
 
-SSE is authoritative while connected. Final text/status comes from paged native reads;
-follow every cursor. Stable native event/message/part/execution ids suppress replay
-duplicates. After a gap, rebuild current state and report any unbridgeable interval.
-Session update timestamp/active-list absence is not liveness. Child queries are paged
-and parent disappearance does not finish children.
+SSE owns live facts. Final text/status comes from fully paged native reads. Stable event/
+message/part/input/execution ids suppress replay duplicates. After gap, rebuild current
+state and report unbridgeable interval. Active-list absence/update timestamp is not
+liveness. If execution disappeared without terminal result, return
+`not_active_unknown`, not idle completion.
 
-Read-only SQLite discovery is a fallback for facts absent from API and never writes the
-live WAL. It does not run concurrently as a duplicate lifecycle producer.
+Child queries are paged; parent disappearance does not finish children. Read-only SQLite
+discovery is a fallback for facts absent from API and never a concurrent duplicate
+source.
 
 ## Provider/proxy configuration
 
-Use installed provider schema and a generated per-agent/session configuration; never
-edit owner global config. Report requested and effective provider/model/endpoint/
-billing separately. Model ids containing `/` are split only where the selected schema
-defines provider + model.
+Use selected installed provider schema and generated per-session config; never edit
+owner global config. Report requested/effective provider/model/endpoint/billing
+separately. Split provider/model only where schema defines it.
 
 ## L7 retained failures
 
-- per-tool Git snapshots/index contention;
-- volatile SSE recovery;
-- owner desktop restarting its own attached service;
-- missing parent/input correlation in older schemas;
+- async 204 followed by delayed start, timeout, dropped input and multi-input execution;
+- volatile SSE recovery and missing terminal → unknown turn;
+- per-tool Git snapshot contention;
+- owner desktop restarting attached service;
+- old schemas missing parent/input correlation;
 - stale generation abort/result;
-- per-session environment isolation across two concurrent managed agents;
+- two-session environment/token/Git isolation;
 - session stop/force never affecting another shared session.
