@@ -41,7 +41,7 @@ API frame maximum is 4 MiB; semantic limits are smaller.
 | command submit/get | durable linked session/input commands and readback |
 | turn get/resolve | exact native/readback result or constrained owner assertion for unknown inactive turn |
 | events read/subscribe | bounded persisted replay + live stream with explicit gaps |
-| hook event | generation/request-bound synchronous proposal/decision |
+| hook event | exact request + deadline → committed non-dispatchable proposal or safe default |
 | discover/attach/detach | canonical native subject; one Agent row |
 | mail send/inbox/ack/read | durable coordination with explicit acknowledgement |
 | vars/who/claims | scoped coordination |
@@ -52,7 +52,8 @@ API frame maximum is 4 MiB; semantic limits are smaller.
 ```text
 params {
   id?, target?, verb, args,
-  expected_generation?, expected_turn_id?, request_id?, wait_ms?
+  expected_generation?, expected_turn_id?, request_id?,
+  probe? [false], wait_ms?
 }
 result {
   command_id, agent?, expected_generation?, generation?, state, outcome?,
@@ -82,6 +83,18 @@ different payload is invalid. Internal ids are fixed derived ids.
 Stable errors include `not_found`, `unsupported`, `not_allowed`, `bad_state`,
 `stale_generation`, `invalid`, `busy`, `unavailable`, `caller_identity_unknown`,
 `history_gap`, `secret_in_payload`, `internal`.
+
+### Explicit provider probe
+
+`probe=true` is valid only for an exact `send`, or for `launch|resume` that has a linked
+initial prompt. It is rejected unless a matching persisted provider hold has reached
+its retry boundary and no other probe command owns that hold. Admission atomically
+stores the probe command id.
+
+Only the owner or a currently controlled agent may explicitly set it. Rules, timers,
+mail wake, parent notices and Goal loop may not. For launch/resume, the linked send is
+the probe; session creation alone cannot clear the hold. The hold clears only from the
+exact successful provider-backed turn. Unknown keeps both hold and probe visible.
 
 ## Async input, turn outcome and wait
 
@@ -140,15 +153,45 @@ lanes:
   hold only with explicit `--unsafe-assert`.
 
 No rule, timer, script or agent may use unsafe assertion. Every assertion stores reason,
-principal and timestamp.
+principal and timestamp. `unknown_abandoned` lets shutdown report an intentional
+unresolved boundary; it does not convert the effect to applied/failed or make a live
+input lane safe.
 
-## Attach and discover
+## Synchronous hook event
+
+```text
+hook.event {
+  id, harness, hook,
+  agent, generation, turn_id?, request_id,
+  native_deadline_at, payload
+}
+→ { decision: allow|deny|ask|..., proposal_id? }
+```
+
+The daemon derives a fixed proposal id from the stable native hook/request id, validates
+the exact pending request and evaluates only bounded synchronous rules. It returns a
+non-default decision only when the `hook_decisions` proposal committed before the
+internal deadline margin and the request is still pending.
+
+The proposal is not an ordinary command/action and has no dispatcher path. It can affect
+the native request only through this response. Same-id retry before expiry may return
+the same proposal; timeout, Store failure, expiry or uncertain response returns `ask`
+for decision hooks (`allow` only for observation hooks). A late proposal can never
+approve later.
+
+## Attach, discover and detach
 
 Discover is paginated and returns native subjects only. Attach looks up the unique
 subject: return the existing row, upgrade observe-only to control after exact native
 attach, or create one external row. Another live control path or unverified takeover
-rejects. Detach changes that same row, sets observe-only and revokes its token without
-changing generation. Native subject reuse requires a new scope.
+rejects. Native subject reuse requires a new scope.
+
+Detach is supported only when native lifetime is independently owned by an attached or
+service-backed route and exact observation/reattach remains available. It changes that
+same row to observe-only, revokes the token and releases generation claims without
+changing generation or killing the native session. A daemon-owned per-agent stdio/
+process session cannot detach; it must stop. Detach never turns an unknown in-flight
+input into safe completion.
 
 ## Drain and shutdown
 
@@ -191,9 +234,9 @@ it. `--all` is paginated.
 ```text
 eliot daemon [--foreground] | daemon stop [--drain|--force|--abandon-degraded]
 eliot status
-eliot launch [profile/workspace/tree options] [PROMPT] [--wait]
+eliot launch [profile/workspace/tree options] [PROMPT] [--probe] [--wait]
 eliot ls | show A | watch [A|SELECTOR] | top
-eliot send|inject A TEXT [--generation N]
+eliot send|inject A TEXT [--generation N] [--probe]
 eliot steer A TEXT [--or-send] [--generation N] [--turn ID]
 eliot wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
 eliot result A [--generation N] [--turns N]
@@ -201,7 +244,7 @@ eliot turn show A TURN [--generation N]
 eliot turn resolve A TURN --generation N --as completed|interrupted|failed --reason T
 eliot interrupt|abort A [--generation N] [--turn ID]
 eliot stop A [--force] [--tree] [--generation N]
-eliot resume A [PROMPT] [--generation N] [--wait]
+eliot resume A [PROMPT] [--generation N] [--probe] [--wait]
 eliot approve|deny|answer ...
 eliot configure ... | compact|fork|background ... | goal ...
 eliot cmd show|cancel|resolve|abandon ...
