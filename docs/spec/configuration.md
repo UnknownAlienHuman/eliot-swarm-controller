@@ -13,22 +13,29 @@ symlink/reparse-point roots or unsafe ownership. Logs are private, rotated and b
   eliot.db, eliot.db-wal, eliot.db-shm
   daemon.json, daemon.lock
   client-write-id.state, client-write-id.lock
+  artifacts/<blake3-digest>/...
   logs/, rules/, plugins/, services/, worktrees/
 ```
 
 `routing.key` is atomically created before first database, never stored in SQLite/logs,
 and used only to re-derive current routing tokens. SQLite stores nonsecret key identity
 plus token hashes. File is current-user-only, never symlink-followed and never silently
-regenerated for nonempty data dir.
+regenerated for a nonempty data directory.
 
-Existing Store with missing/mismatched key enters `routing_key_error`: existing presented
-tokens still verify against hashes and owner readback/stop/query remains, but launch,
-resume, control reattach and child-token issuance block. Restore exact key or explicitly
-stop/abandon all controlled generations before replacement/revocation.
+Existing Store with missing/mismatched key enters `routing_key_error`: existing
+presented tokens still verify against hashes and owner readback/stop/query remains, but
+launch, resume, control reattach and child-token issuance block. Restore exact key or
+explicitly stop/abandon all controlled generations before replacement/revocation.
 
 `client-write-id.state` is monotonic ULID state only. CLI locks, re-reads, advances,
 atomically replaces, unlocks and prints id before sending. Missing state seeds from
 daemon floor plus randomness.
+
+`artifacts/` is current-user-only, content-addressed and immutable after publication.
+It contains bounded nonsecret snapshots of rule/setup/check scripts and system notes.
+Temporary writes are fsynced/renamed atomically; an existing digest is byte-compared
+before reuse. Artifacts are never executable by path supplied from an event or script
+output. Reference counting/Store reachability controls pruning.
 
 Project `.eliot/{config.toml,rules/,scripts/}` loads only from globally registered
 checkout, never agent worktree. Invalid reload retains last valid revision.
@@ -69,6 +76,7 @@ limits.max_depth = 8
 limits.max_children_per_agent = 20
 limits.max_tree_agents = 100
 limits.max_selector_targets = 10000
+limits.max_artifact_bytes = 1048576
 automation.max_runs_per_rule_per_minute = 10
 automation.max_actions_per_minute = 120
 automation.max_parallel_checks = 2
@@ -146,7 +154,7 @@ control = "project"
 labels = { role = "manager" }
 ```
 
-`max_selector_targets` is transaction guard, not logical fleet limit. Expansion above
+`max_selector_targets` is a transaction guard, not logical fleet limit. Expansion above
 it rejects before any row; caller narrows or batches. No partial fanout.
 
 ## Effective profile and launch binding
@@ -159,20 +167,26 @@ LaunchBinding {
   harness, plugin_name,
   model?, effort?, permissions,
   args, env_mode, literal_env, pass_env_names, secret_env_names,
-  workspace_mode, control, git_identity, system_note?, labels, setup, scratch,
+  workspace_mode, control, git_identity,
+  system_note_artifact?, setup_artifacts[], scratch,
+  labels,
   account_scope?, proxy_scope?, service_scope?,
   requested_endpoint?, billing?, source_config_files
 }
 ```
 
-Revision is BLAKE3-256 over effective profile/named refs, not resolved secrets. Binding
-is immutable. Queued work cannot adopt config changes.
+At admission every project/system note and setup script is resolved from its allowed
+root, read without following untrusted links, bounded, hashed and copied to immutable
+artifact storage. `profile_revision` includes canonical effective profile plus artifact
+digests and named references, never resolved secrets. A later checkout edit cannot
+change queued launch/setup/note semantics.
 
-Dispatch revalidates prohibitions without substitution: project allowlists/pass-env,
-owner-only inherit, plugin/service capabilities, paths, capacity, provider hold/probe,
-and routing-key availability. Revoked binding fails before native I/O. Positive defaults
-do not rewrite it. Secrets resolve once immediately before start. Resume gets new
-binding; exact recovery attach reuses current generation binding.
+Binding is immutable. Dispatch revalidates prohibitions without substitution:
+project allowlists/pass-env, owner-only inherit, plugin/service capabilities, artifact
+presence/digest, safe paths, capacity, provider hold/probe and routing-key availability.
+A revoked binding or missing/mismatched artifact fails before native I/O. Positive
+default changes do not rewrite it. Secrets resolve once immediately before start.
+Resume gets a new binding; exact recovery attach reuses current generation binding.
 
 ## Frozen workspace binding
 
@@ -180,20 +194,23 @@ binding; exact recovery attach reuses current generation binding.
 WorkspaceBinding {
   project, repo_path, requested_branch,
   base_ref?, base_oid,
-  worktree_path, setup_revision
+  worktree_path,
+  setup_artifacts[], setup_revision
 }
 ```
 
 Daemon resolves base ref read-only to exact local OID before admission; no implicit
 fetch. Ref is diagnostic, OID authoritative. Missing/ambiguous rejects; later ref
 movement cannot alter queued creation. Existing branch/path must match. Setup revision
-digests frozen argv/scripts/named env refs.
+digests frozen argv, immutable artifact digests and named env refs. Setup executes the
+artifact snapshot, never the mutable checkout file.
 
 ## Environment and secrets
 
-Default minimal baseline: PATH, home/profile, system root, temp, locale, required cert
-vars. Additional values are explicit literal nonsecret env, allowed pass-env, secret-env
-names, named proxy/account/plugin credentials and current scoped token.
+Default minimal baseline: PATH, home/profile, system root, temp, locale and required
+certificate variables. Additional values are explicit literal nonsecret env, allowed
+pass-env, secret-env names, named proxy/account/plugin credentials and current scoped
+token.
 
 Global scripts use only global script allowlist; project scripts use global∩project.
 Validation occurs before value lookup/start; returned actions cannot add env refs.
@@ -201,8 +218,8 @@ Validation occurs before value lookup/start; returned actions cannot add env ref
 Inherit is owner-only trusted profile and visibly warned. Too-short unmaskable secret
 rejects managed injection. Tokens are prefixed/high-entropy. Persisted source spools are
 masked with generation's frozen secret set; raw vendor detail stays private vendor
-store. Resolved secrets never enter config/Store/rule/action/log. Durable semantic text
-with known secret rejects.
+store. Resolved secrets never enter config/Store/rule/action/artifact/log. Durable
+semantic text containing known secret rejects.
 
 ## Capacity reservations and provider holds
 
@@ -233,26 +250,47 @@ CREATE TABLE provider_holds (
 );
 ```
 
-Queue selects oldest command whose all scopes available; unrelated scope is not
+Queue selects oldest command whose all scopes are available; unrelated scopes are not
 head-of-line blocked. Existing reservations count after limit lowering. Starting/live/
 unknown start retains reservation. Exact terminal/no-session failure releases. Detach
 of still-live independent session does not free until observed terminal.
 
-Hold blocks provider-backed launch/send/Goal in proven scope, not stop/interrupt/request
-reply/readback/local checks. Unknown coverage holds exact route/profile. After boundary,
-only explicit owner/current-agent `probe=true` send or linked launch/resume input can
-claim one probe. Automation/wake/hidden calls cannot. Exact successful provider turn
-clears; unknown keeps. Auth/model-gone requires explicit config change absent proof.
+A hold blocks provider-backed launch/send/Goal in proven scope, not stop/interrupt,
+request reply, readback or local checks. Unknown coverage holds exact route/profile.
+After retry boundary, only explicit owner/current-agent `probe=true` send or linked
+launch/resume input can claim one probe. Automation/wake/hidden calls cannot.
+
+Probe claim state is exact:
+
+- exact successful provider-backed turn clears hold and claim;
+- a new provider limitation replaces/extends the hold and releases or rebinds the claim
+  according to that exact response;
+- unknown after possible provider I/O keeps hold and `probe_command` reserved;
+- exact rejection/failure **before any provider request** (stale generation, workspace/
+  session start definite failure, local validation, pre-provider input drop) releases
+  `probe_command` in the same transaction but keeps the hold, allowing another explicit
+  probe;
+- owner cancellation before dispatch likewise releases the claim;
+- time alone never releases an in-flight/unknown probe.
+
+For launch/resume, only the linked input is the probe; session creation cannot clear the
+hold. Auth/model-gone requires explicit configuration/recovery evidence rather than a
+timed probe.
 
 ## Profiles, setup and paths
 
 One-level extends; project replacement after validation. Unknown keys error except
 plugin-private global keys. Values/counts bounded.
 
-Project setup is versioned repository-relative `.eliot/scripts/`; global owner may name
-configured executables. Setup gets project read-only automation token, minimal env and
-global∩project allowlist. Setup/scratch/scripts/notes reject absolute, `..`, symlink
-escape, alternate-stream/device forms. Rust worktrees use separate target dirs.
+Project setup source is repository-relative `.eliot/scripts/`; global owner may name
+configured executables. At admission, script bytes become immutable artifacts. Setup
+runs with project read-only automation token, minimal environment and global∩project
+allowlist. Setup/scratch/scripts/notes reject absolute, `..`, symlink escape,
+alternate-stream/device forms. Rust worktrees use separate target dirs.
+
+Interpreters/external executables are resolved to full configured paths. A queued binding
+stores the executable identity/path used for validation; if it is replaced incompatibly
+before dispatch, dispatch fails rather than silently selecting another executable.
 
 ## Plugins, sources, services and webhooks
 
@@ -269,30 +307,29 @@ Agent stop never stops shared service.
 Webhook stores named endpoint only. Project must allow it. Action id uses configured
 idempotency header when available; otherwise lost response stays unknown/no retry.
 
-## Retention, idempotency and WAL limits
+## Retention, artifacts, idempotency and WAL limits
 
-`retention.idempotency_days` is a **minimum eligibility age**, not a forced deletion
-age. Receipt lookup precedes floor checks, so an existing receipt remains readable below
+`retention.idempotency_days` is a **minimum eligibility age**, not forced deletion.
+Receipt lookup precedes floor checks, so an existing receipt remains readable below
 current floor.
 
-A terminal receipt may be deleted only when:
+A terminal receipt may be deleted only when older than the idempotency window, no
+retained domain row references it (including `commands.receipt_id`), no open/unknown
+linked effect needs it, and its final result is outside supported readback. Command
+history longer than receipt window therefore retains the referenced receipt longer.
+SQLite restrictive FK is intentional. Receipt/domain rows prune in dependency order;
+floor advances only through receipts actually deleted in the same transaction.
+Open/unknown receipts never age-prune.
 
-- it is older than idempotency window;
-- no retained domain row references it (including `commands.receipt_id`);
-- no open/unknown linked effect needs its result;
-- its bounded final result is no longer required by a supported readback window.
+An artifact may be removed only after no launch/workspace/rule activation/run/action/
+check record references its digest and no running process has it open. Artifacts are
+content-addressed implementation inputs, not an audit document hierarchy.
 
-Thus command history configured longer than receipt window automatically retains its
-referenced receipt longer. SQLite restrictive FK is intentional. Receipt/domain rows
-are pruned in dependency order, and floor advances only through receipts actually
-deleted in same transaction. Open/unknown receipts never age-prune.
+Other history may prune only after compact projections/summaries preserve readback.
+Unread mail, open batches, unresolved input/turn/action, held capacity, current source
+watermark, dirty edit attribution and `orphan_possible` custody never age-prune.
 
-Other domain history may prune only after compact projections/summaries preserve
-required readback. Unread mail, open batches, unresolved input/turn/action, held
-capacity, current source watermark, dirty edit attribution and `orphan_possible` custody
-never age-prune.
-
-Daemon passive-checkpoints, records WAL/database size and tracks Eliot readers. Replays
+Daemon passive-checkpoints, records WAL/database size and tracks readers. Replays
 paginate/release transactions. At hard size, reject new work/long reads while reserving
 short stop/interrupt/request/result commits. Real disk/SQLite failure enters Store error
 boundary. Never delete evidence, kill unknown reader or blind-truncate active readers.
