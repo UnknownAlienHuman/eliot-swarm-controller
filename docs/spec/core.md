@@ -10,13 +10,13 @@ Wire names are `snake_case`; every persisted integer fits SQLite signed 64-bit.
 | `AgentId` | `a<1..i64::MAX>` | Store counter; stable logical row. |
 | generation | `0..i64::MAX` | 0 before first native start; first incarnation 1; explicit resume increments. |
 | external command/write id | 1–128 UTF-8 bytes | Same id + canonical payload returns original admission; different payload invalid. |
-| internal derived id | fixed `d_<base32 digest>` | Domain tag + length-delimited components; parent identity stays in columns/cause. |
+| internal derived id | `d_` + unpadded base32 BLAKE3-256 | Domain tag + length-delimited canonical components; parent identity stays in columns/cause. |
 | event `seq`, message id | positive signed-64 Store counter | Transactional allocation; never `MAX(id)+1`. |
 | native subject | bounded `(native_scope,native_ref)` | Canonical vendor store/server namespace + opaque session/thread id. Scope changes before refs can be reused. |
 
 A counter allocation that would require `i64::MAX + 1` fails `id_exhausted` before any
-row is created. Derived ids cover selector children, linked initial sends, rule actions
-and all internal writes; no unbounded concatenation.
+row is created. A derived-id collision with a different canonical payload is an
+integrity failure, never idempotent success.
 
 ## Canonical native subject
 
@@ -47,8 +47,9 @@ Agent {
 ```
 
 Generation 0 has no routing token. First start/resume creates one raw high-entropy
-`eliot_at_<base64url>` token, stores only its constant-time hash and injects the raw
-value once. The prefix remains pattern-redactable after restart.
+`eliot_at_<base64url>` token, stores only a domain-separated BLAKE3-256 hash and injects
+the raw value once. Hash comparison is constant-time. The prefix remains
+pattern-redactable after restart.
 
 Token presence follows the **current routing lifecycle**, not generation alone:
 
@@ -85,8 +86,12 @@ the observed state, not as a synthetic `stopping` state.
 
 Resume expects g and targets g+1; the row moves only when dispatch commits. Only one
 resume may be open. Cancelling a queued resume also cancels its linked send and leaves g
-unchanged. Detach preserves the last observed native state, sets `observe_only=true`
-and revokes the token in one transaction.
+unchanged.
+
+Detach is valid only for an attached/service-backed native lifetime that remains
+independently observable and reattachable. It preserves the last observed state, sets
+`observe_only=true`, revokes the token and releases claims in one transaction. A
+daemon-owned per-agent process session must stop instead.
 
 An async input accepted by a vendor inbox but not yet associated with a native turn
 keeps `send` dispatched. `input.admitted` durably records the Eliot command and exact
@@ -148,36 +153,40 @@ writes containing a known secret are rejected rather than stored with altered te
 
 ### Commit-acknowledged source sequence
 
-Every authoritative plugin source ownership epoch has a stable bounded `source_key` and
-a strictly contiguous positive `source_seq`. The plugin durably assigns the sequence
-before sending and allows at most one unacknowledged persisted `event.put` per source
-key. Future native facts may accumulate in its bounded spool but are sent in order.
+The daemon allocates one bounded `source_key` for every authoritative plugin source
+ownership epoch. That source emits a strictly contiguous positive `source_seq`. The
+plugin durably assigns the sequence and exact envelope before sending and allows at
+most one unacknowledged persisted `event.put` per source key. Future native facts may
+accumulate in a bounded spool but are sent in order.
 
-The Store keeps one compact watermark per source key. For an `event.put` canonical
-envelope digest D and sequence n:
+The daemon computes the envelope digest itself using BLAKE3-256 over one
+versioned/domain-separated encoding: length-prefixed scalar fields and recursively
+key-sorted UTF-8 JSON with normalized JSON numbers. The plugin sends no digest and must
+resend the same typed envelope; JSON object insertion order is irrelevant.
 
-- `n = high_water + 1`: commit watermark, event and all reducer/projection changes in
-  one transaction, then acknowledge;
+For sequence n and computed digest D:
+
+- `n = high_water + 1`: commit watermark, event and reducer/projection changes in one
+  transaction, then acknowledge;
 - `n = high_water` and D equals `last_digest`: lost-reply duplicate; return the saved
-  Store event sequence without inserting or firing again, even if that event row was
-  pruned;
+  Store event sequence even if that event row was pruned;
 - `n = high_water` with another digest: source integrity error;
 - `n < high_water`: stale local source state; return current watermark and admit
   nothing;
 - `n > high_water + 1`: explicit source gap; admit nothing until the missing sequence
-  is replayed or the ownership epoch is closed as gapped.
+  is replayed or the ownership epoch closes as gapped.
 
 `native_id` remains the exact vendor event/request/turn/item id or cursor where one
 exists. It supports readback and vendor replay suppression, but Store crash idempotency
-does not depend on retaining one receipt row per native event. A source without a
-replayable vendor cursor must preserve its bounded spool; loss beyond that boundary is
-a visible gap, not invented history.
+does not depend on one receipt row per native event. A source without a replayable
+vendor cursor must preserve its bounded spool; loss beyond that boundary is a visible
+gap, not invented history.
 
 A plugin restart/attach reads the current source watermark before publishing. Normal
 restart reuses the same source key. A stream→transcript/hook ownership handoff creates a
 new source key only after the old cursor boundary is committed. Old source watermark
 rows may be removed after the Agent advances beyond that generation and every old
-source/spool is closed; row count is therefore O(source ownership epochs), not O(events).
+source/spool closes; row count is O(source ownership epochs), not O(events).
 
 Input/turn events:
 
@@ -212,7 +221,7 @@ inside start, but session/input outcomes remain separate. Ready never proves inp
 | configure | application point/readback; blocked by unresolved input |
 | goal.* | generation-bound; continuation blocked by unresolved input/turn |
 | cancel | queued command only; inbox input requires native cancel/readback |
-| detach | release control of the same canonical row and revoke token |
+| detach | attached/service-backed lifetime only; release control/revoke token |
 | compact/fork/background | native-only declared semantics |
 
 Input text is at most 512 KiB UTF-8; larger content is file-referenced.
@@ -275,7 +284,8 @@ CREATE TABLE agents (
   token_hash BLOB,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   CHECK(
-    (token_hash IS NOT NULL AND generation > 0 AND observe_only = 0
+    (token_hash IS NOT NULL AND length(token_hash) = 32
+      AND generation > 0 AND observe_only = 0
       AND state IN ('starting','idle','busy','waiting'))
     OR
     (token_hash IS NULL AND
@@ -321,7 +331,8 @@ CREATE TABLE plugin_source_watermarks (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(agent,generation,source_key),
   CHECK((high_water_seq = 0 AND last_digest IS NULL AND last_event_seq IS NULL) OR
-        (high_water_seq > 0 AND last_digest IS NOT NULL AND last_event_seq IS NOT NULL))
+        (high_water_seq > 0 AND length(last_digest) = 32
+          AND last_event_seq IS NOT NULL))
 );
 
 CREATE TABLE commands (
@@ -343,7 +354,8 @@ CREATE TABLE native_inputs (
   generation INTEGER NOT NULL,
   native_input_id TEXT NOT NULL,
   state TEXT NOT NULL,                   -- admitted|associated|dropped|unknown
-  admitted_at INTEGER NOT NULL,
+  admitted_at INTEGER,
+  first_observed_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(agent,generation,native_input_id)
 );
@@ -356,7 +368,9 @@ CREATE TABLE turns (
   status TEXT,                           -- completed|interrupted|failed
   resolution_source TEXT,                -- native|readback|owner
   final_text TEXT, usage TEXT,
-  started_at INTEGER NOT NULL, completed_at INTEGER,
+  started_at INTEGER,
+  first_observed_at INTEGER NOT NULL,
+  completed_at INTEGER,
   PRIMARY KEY(agent,generation,turn_id)
 );
 CREATE INDEX turns_recent ON turns(agent,generation,completed_at DESC)
@@ -386,11 +400,13 @@ generation (or is explicitly deleted) and every source/spool for the old generat
 closed. A terminal but still-current generation keeps its source rows. This is bounded
 by ownership epochs rather than event count.
 
-`input.admitted` updates `native_inputs` with event/command metadata. Association moves
-it to associated and inserts `turn_inputs` in the same transaction as the turn event.
-Drop/unknown/readback is similarly transactional. `wait --after-command` follows input
-then turn. Several commands may wait on the same turn. Results survive event retention;
-unresolved inputs/turns are never pruned.
+`input.admitted` updates `native_inputs`; unknown native admission time remains NULL and
+`first_observed_at` stays honest. Association moves it to associated and inserts
+`turn_inputs` in the same transaction as the turn event. A turn discovered by attach/
+readback may likewise have unknown `started_at`; `first_observed_at` is never presented
+as vendor start time. Drop/unknown/readback is transactional. `wait --after-command`
+follows input then turn. Several commands may wait on one turn. Results survive event
+retention; unresolved inputs/turns are never pruned.
 
 The counter allocates root id before self-reference. Event seq is transactional. A
 source-sequence duplicate is normal lost-reply readback, not Store failure.
