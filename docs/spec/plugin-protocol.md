@@ -55,10 +55,11 @@ native turn/execution association, not merely a write or HTTP inbox acknowledgem
 ### Start contract
 
 1. Establish exact native subject ↔ generation.
-2. Emit one commit-acknowledged ready when control is possible.
-3. If initial is required, admit it once; hold its command reply until exact turn/
+2. Register the authoritative source owner(s) and obtain daemon-issued source keys.
+3. Emit one commit-acknowledged ready when control is possible.
+4. If initial is required, admit it once; hold its command reply until exact turn/
    execution association, or return unknown on deadline after possible admission.
-4. Return matching session result and separate initial status/turn id.
+5. Return matching session result and separate initial status/turn id.
 
 Ready never proves initial input. Before ready commit, the plugin backpressures the
 native reader or keeps a bounded spool. If the spool cannot retain all persisted events,
@@ -105,20 +106,33 @@ Persisted facts are commit-acknowledged requests:
 
 | Method | Result |
 | --- | --- |
+| `source.open {agent,generation,source_name,families,mechanism,resume_source_key?,native_cursor?}` | daemon-issued source key + current watermark; validates exclusive family ownership |
 | `event.put {agent,generation,source_key,source_seq,kind,native_id?,native_cursor?,ts?,data}` | `{store_seq,duplicate,high_water_seq}` after Store watermark + event/projection commit |
 | `process.put {agent,generation,pid,start_time,role}` | committed identity/duplicate ack; host adds boot id |
 | `child {parent agent/generation, child scope/ref,...}` | canonical child row/generation/token |
-| `source.gap {agent,generation,source_key,expected_seq,reason,cursor?}` | committed source-gap state |
+| `source.close {source_key,native_cursor?,state=closed|gap,reason?}` | committed source terminal state/handoff boundary |
 | `log` notification | bounded diagnostic; no durability claim |
 | `event.ephemeral` notification | best-effort delta/sample only |
 
+The plugin never invents a source key. A normal reconnect reuses the key returned in
+host snapshot/attach. A new key is allocated only for a committed ownership epoch or
+source handoff, after the old owner is closed/gapped and the family boundary is stored.
+
 ### Source sequencing and lost acknowledgements
 
-Each authoritative source ownership epoch has one stable `source_key`. The plugin
-persists a strictly contiguous positive `source_seq` with the exact canonical event
-envelope before sending it and permits at most one unacknowledged persisted request per
-source key. It may continue reading native data into a bounded durable spool, but sends
-that spool in sequence order.
+Each source epoch has a strictly contiguous positive `source_seq`. The plugin durably
+assigns the sequence and exact event envelope before sending it and permits at most one
+unacknowledged persisted request per source key. It may continue reading native data
+into a bounded durable spool, but sends the spool in order.
+
+After a successful reply the plugin durably records the acknowledged watermark/removes
+that spool entry **before sending the next sequence**. On restart/attach it reads the
+host watermark first and reconciles local state.
+
+The daemon—not the plugin—computes `last_digest` from one shared canonical encoding:
+domain-separated, length-prefixed scalar fields plus recursively key-sorted UTF-8 JSON
+data with normalized JSON numbers. Retries must carry the same typed envelope; JSON
+object insertion order is irrelevant.
 
 The host maintains one compact watermark row per source key:
 
@@ -126,21 +140,18 @@ The host maintains one compact watermark row per source key:
 - resend of the current high-water sequence with the same envelope digest is the one
   possible lost-reply duplicate and returns the saved Store sequence;
 - the same sequence with a different digest is an integrity error;
-- an older sequence is rejected with the current watermark so the plugin can reconcile;
+- an older sequence is rejected with the current watermark;
 - a future sequence with a hole is rejected as a source gap.
 
-The plugin advances its native cursor or removes the spool entry only after commit
-reply. On restart/attach it reads the host watermark first. A normal reconnect reuses
-the same source key; stream→transcript/hook handoff creates a new key only after the
-old native cursor boundary is committed. `native_id` and `native_cursor` still suppress
-vendor replay; source sequence prevents Store-side duplicate admission after event-row
-retention without one receipt row per event.
+The plugin advances its native cursor only after commit reply. `native_id` and
+`native_cursor` still suppress vendor replay; source sequence prevents Store-side
+duplicate admission after event-row retention without one receipt row per event.
 
 If the vendor cannot replay/backpressure and the spool is lost or overflows, the plugin
-commits `source.gap` and stops claiming complete coverage. It never assigns fresh
-source sequences to old history as if it were current. Source watermark rows remain for
-the current generation and are reclaimed only after that generation is superseded and
-all old sources/spools are closed.
+closes the source as gapped and stops claiming complete coverage. It never assigns fresh
+source sequences to old history as if current. Source watermark rows remain for the
+current generation and are reclaimed only after that generation is superseded and all
+old sources/spools are closed.
 
 `child` upserts the canonical native subject; parent generation is provenance.
 
@@ -204,10 +215,16 @@ completion.
 
 ## Hooks and transcripts
 
-Hooks are session-scoped with current identity and one absolute deadline. Timeout
-returns native-safe allow for observation or ask for decisions. A synchronous decision
-returns only after durable admission commits; no Store commit means ask. There is no
-durable hook queue.
+Hooks are session-scoped with current identity, stable native hook/request id and one
+absolute deadline. The shim/SDK callback calls `hook.event`. Eliot returns either a
+committed non-dispatchable proposal plus decision, or native-safe `ask` for decision
+hooks (`allow` only for observation hooks).
+
+The proposal can affect the native request only through that immediate response. It is
+never queued in the ordinary action dispatcher. A response lost before expiry may be
+retried with the same hook id and return the same proposal; a late commit/response is
+expired and cannot approve later. No Store commit before the internal deadline means
+`ask`. There is no durable hook queue.
 
 Transcript readers persist cursors, wait only for an incomplete final line, and report
 a complete unparsable line or gap. They never infer end from silence or truncation.
@@ -219,14 +236,17 @@ a complete unparsable line or gap. They never infer end from silence or truncati
 - Linux exact: delegated cgroup v2/equivalent plus owner-death guardian; membership,
   group kill and readback prove termination.
 - Linux/other Unix fallback: process group plus guardian for non-escaping members,
-  degraded; exact force and daemon-death containment are unsupported.
+  degraded; exact force, complete descendant death and daemon-death containment are
+  unsupported.
 
 The guardian lives outside the owned group and disarms only after clean empty-group
 shutdown. Attached services are never killed; managed services have separate custody.
 
 When process exit races final output, drain the authoritative source to EOF or a bounded
-terminal-drain deadline. Deadline creates a gap; lost requires exact empty custody or
-session-not-found readback, never silence.
+terminal-drain deadline. Deadline creates a gap. Exact backend emptiness or exact shared
+session absence proves loss. On degraded backend, disappearance of the exact controlling
+plugin/native controller plus authoritative EOF proves session control lost but marks
+custody `orphan_possible`; it never claims every descendant died.
 
 ## Fake, recordings and L7
 
@@ -236,6 +256,7 @@ CI never calls a model.
 
 L7 conformance covers start versus initial input, async inbox association/timeout,
 multiple input commands per turn, lost `event.put` reply after event-row retention,
-source-sequence digest mismatch/hole/stale recovery, source-key handoff/gap, reconnect
-unknown turn, exact bindings, canonical children, no unknown retry, custody,
-attach/readback, bounded buffers and unsupported-before-I/O.
+source-sequence digest mismatch/hole/stale recovery, source-key allocation/handoff/gap,
+reconnect unknown turn, synchronous-hook timeout/late commit, exact bindings,
+canonical children, no unknown retry, exact/degraded custody, attach/readback, bounded
+buffers and unsupported-before-I/O.
