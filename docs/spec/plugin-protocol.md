@@ -1,7 +1,7 @@
 # Plugin protocol
 
 A plugin translates one native harness and normalizes facts. It never writes SQLite or
-retries an uncertain effect.
+retries an uncertain native effect.
 
 ## Modes
 
@@ -17,15 +17,15 @@ mode is not selected merely because the vendor hosts multiple chats.
 JSON-RPC 2.0 over UTF-8 NDJSON, at most 1 MiB per line. stdout is protocol; stderr is
 bounded logs. Both directions issue requests. Every scoped message carries agent and
 generation. Readers are continuously drained and cancel-safe. Protocol
-`eliot-plugin/1` allows additive fields only.
+`eliot-plugin/1` permits additive fields only.
 
 ## Host to plugin
 
 | Method | Key fields/result |
 | --- | --- |
 | `initialize` | config/private dir/instance → manifest |
-| `agent.start` | target generation, resolved profile/workspace/env/note, resume subject?, linked initial? → session result + separate initial status |
-| `agent.attach` | exact subject/generation/control mode + host-known active turn/source watermarks → exact native state, turn/source reconciliation, requests, pids/effective or not-found |
+| `agent.start` | target generation, frozen profile/workspace/env/note, resume subject?, linked initial? → session result + separate initial status |
+| `agent.attach` | exact subject/generation/control mode + host-known turn/source watermarks → exact native state, turn/source reconciliation, requests, pids/effective or not-found |
 | `agent.command` | command id, exact generation/turn/request, verb/args → applied/rejected/failed/unknown + mechanism/application point |
 | `agent.snapshot` | exact generation + command/turn ids → current state/readback + source watermarks |
 | `agent.stop` | exact generation/command/force → success only after generation ended |
@@ -40,120 +40,134 @@ start result = {
   initial_status?: applied | rejected | failed | unknown,
   initial_turn_id?: string
 }
-attach/snapshot turn readback =
+turn readback =
   { turn_id, state: running | completed | not_active_unknown,
     input_commands?: [id], status?, final_text?, usage? }
 source watermark =
-  { source_key, high_water_seq, last_native_cursor?, state }
+  { open_id, source_key, high_water_seq, last_native_cursor?, state }
 ```
 
 Most harnesses start without initial input. A plugin requiring input to obtain a native
 subject declares `start_requires_input=true`; it receives the linked command in
 `initial`. Session and initial command remain separate. Initial `applied` requires exact
-native turn/execution association, not merely a write or HTTP inbox acknowledgement.
+turn/execution association, not a write or HTTP inbox acknowledgement.
 
 ### Start contract
 
 1. Establish exact native subject ↔ generation.
-2. Register the authoritative source owner(s) and obtain daemon-issued source keys.
+2. Open authoritative sources with stable `open_id`s and obtain daemon source keys.
 3. Emit one commit-acknowledged ready when control is possible.
-4. If initial is required, admit it once; hold its command reply until exact turn/
-   execution association, or return unknown on deadline after possible admission.
+4. If initial is required, admit it once; hold its reply until exact turn association,
+   or return unknown on deadline after possible admission.
 5. Return matching session result and separate initial status/turn id.
 
-Ready never proves initial input. Before ready commit, the plugin backpressures the
-native reader or keeps a bounded spool. If the spool cannot retain all persisted events,
-report a gap, mark the initial effect unknown as needed and report session start from
-actual evidence; never falsely fail the whole session or silently drop terminal data.
+Ready never proves initial input. Before ready commit, the plugin backpressures native
+input or uses a bounded spool. Spool loss/overflow reports a gap and preserves actual
+session/input uncertainty; it never silently drops terminal data or falsely fails the
+whole session.
 
 Launch and resume both use `agent.start`. Resume supplies the same canonical subject and
-a new Eliot generation. Old input is never inferred or replayed. Exact recovery attach
-to the same live incarnation preserves generation.
+a new Eliot generation. Old input is never inferred/replayed. Recovery attach to the
+same live incarnation preserves generation.
 
 ### Send and asynchronous inboxes
 
-For `send`, transport/inbox acceptance such as HTTP 204 is an intermediate native fact,
-not an Eliot applied reply. The plugin keeps `agent.command` pending until:
+Transport/inbox acceptance such as HTTP 204 is an intermediate fact. The plugin keeps
+`agent.command` pending until:
 
-- an exact native turn/execution id is associated with that command, then replies
-  applied and emits/acks `turn.started` or `turn.inputs`;
-- exact readback proves no effect, then replies failed; or
-- an absolute deadline expires after possible admission, then replies unknown.
+- exact native turn/execution association → applied plus `turn.started|turn.inputs`;
+- exact readback proves no effect → failed; or
+- absolute deadline after possible admission → unknown.
 
-The daemon does not dispatch another send/configuration/goal continuation while input
-association is unresolved. A plugin must not return applied early merely to free the
-lane. If a native service legitimately associates several Eliot inputs with one
-execution, emit one turn plus exact ordered `input_commands`; the Store maps all waits
-to that terminal turn.
+The daemon does not dispatch another send/configuration/goal continuation while
+association is unresolved. If one native execution drains several admitted inputs, one
+turn carries the ordered `input_commands`; Store maps every wait to that result.
 
 ### Attach and turn reconciliation
 
-The host supplies its known active turn. The plugin must not answer idle merely because
-an active list is empty:
+The host supplies its known active turn. Empty active lists are not idle proof:
 
-- exact same turn running → running;
+- exact turn running → running;
 - exact terminal history/result → completed;
-- session exists, turn no longer active, no terminal proof → `not_active_unknown`;
+- session exists, turn not active, no terminal proof → `not_active_unknown`;
 - subject absent → not-found.
 
-Unknown turn keeps the live generation blocked from new turns until exact readback or
-owner resolution. The plugin never invents completion or silently starts the next
-input.
+Unknown turn blocks new turns until exact readback or constrained owner resolution.
 
-## Plugin to host requests and notifications
+## Plugin to host durable requests
 
 Persisted facts are commit-acknowledged requests:
 
 | Method | Result |
 | --- | --- |
-| `source.open {agent,generation,source_name,families,mechanism,resume_source_key?,native_cursor?}` | daemon-issued source key + current watermark; validates exclusive family ownership |
-| `event.put {agent,generation,source_key,source_seq,kind,native_id?,native_cursor?,ts?,data}` | `{store_seq,duplicate,high_water_seq}` after Store watermark + event/projection commit |
-| `process.put {agent,generation,pid,start_time,role}` | committed identity/duplicate ack; host adds boot id |
-| `child {parent agent/generation, child scope/ref,...}` | canonical child row/generation/token |
-| `source.close {source_key,native_cursor?,state=closed|gap,reason?}` | committed source terminal state/handoff boundary |
-| `log` notification | bounded diagnostic; no durability claim |
-| `event.ephemeral` notification | best-effort delta/sample only |
+| `source.open {open_id,agent,generation,source_name,families,mechanism,native_cursor?}` | idempotent daemon source key + current watermark; exclusive family ownership validated |
+| `event.put {agent,generation,source_key,source_seq,kind,native_id?,native_cursor?,ts?,data}` | Store event seq + duplicate/high-water after watermark/event/projection commit |
+| `process.put {agent,generation,source_key,source_seq,pid,start_time,role}` | Store event seq + duplicate/high-water after verified process projection and `process.started` commit |
+| `child {registration_id,parent agent/generation,child scope/ref,name?,labels?,request_token?}` | canonical child row/generation and, only when supported, the current re-derivable child token |
+| `source.close {source_key,native_cursor?,state=closed|gap,reason?}` | idempotent committed terminal/handoff boundary |
 
-The plugin never invents a source key. A normal reconnect reuses the key returned in
-host snapshot/attach. A new key is allocated only for a committed ownership epoch or
-source handoff, after the old owner is closed/gapped and the family boundary is stored.
+Best-effort `log` and `event.ephemeral` remain notifications and make no durability
+claim.
+
+### Idempotent source opening
+
+`open_id` is a bounded stable internal id durably chosen by the plugin **before** the
+first request for one ownership epoch. The Store has a unique
+`(agent,generation,open_id)` record. Same id + same canonical fields returns the same
+`source_key` and watermark after a lost reply; any field mismatch is integrity failure.
+A handoff/new epoch uses a new open id only after the old source closes or gaps.
+
+The plugin never invents a source key. Normal reconnect reuses the key returned by
+snapshot/attach. `source.close` retry is idempotent for the same final state/cursor;
+conflicting close data is an integrity error.
 
 ### Source sequencing and lost acknowledgements
 
-Each source epoch has a strictly contiguous positive `source_seq`. The plugin durably
-assigns the sequence and exact event envelope before sending it and permits at most one
-unacknowledged persisted request per source key. It may continue reading native data
-into a bounded durable spool, but sends the spool in order.
+Every durable `event.put` **and** `process.put` belongs to exactly one source epoch with
+a contiguous positive `source_seq`. A process source is normally a separate family/key
+from model lifecycle. The plugin durably assigns the sequence and typed envelope before
+send and permits at most one unacknowledged durable request per source key. Later facts
+may accumulate in a bounded durable spool but are sent in order.
 
-After a successful reply the plugin durably records the acknowledged watermark/removes
-that spool entry **before sending the next sequence**. On restart/attach it reads the
-host watermark first and reconciles local state.
+After reply, the plugin durably records the acknowledgement/removes the entry before
+sending the next sequence. On restart it reads the host watermark first.
 
-The daemon—not the plugin—computes `last_digest` from one shared canonical encoding:
-domain-separated, length-prefixed scalar fields plus recursively key-sorted UTF-8 JSON
-data with normalized JSON numbers. Retries must carry the same typed envelope; JSON
-object insertion order is irrelevant.
+The daemon computes the envelope digest over one versioned/domain-separated canonical
+encoding: length-prefixed scalar fields and recursively key-sorted normalized JSON.
+Host-derived process `host_boot_id` is projection data, not part of the plugin resend
+envelope.
 
-The host maintains one compact watermark row per source key:
+- next sequence commits watermark, event/process projection and normalized event in one
+  transaction;
+- resend of current high-water with matching digest returns the saved Store seq;
+- same sequence/different digest is integrity error;
+- older sequence is rejected with current watermark/cursor;
+- a hole is rejected until replay or explicit gapped close.
 
-- next sequence commits and advances the watermark atomically with event/projections;
-- resend of the current high-water sequence with the same envelope digest is the one
-  possible lost-reply duplicate and returns the saved Store sequence;
-- the same sequence with a different digest is an integrity error;
-- an older sequence is rejected with the current watermark;
-- a future sequence with a hole is rejected as a source gap.
+The plugin advances native cursor only after commit reply. `native_id`/cursor suppress
+vendor replay; source sequence prevents Store duplicate admission after event-row or
+process-history retention.
 
-The plugin advances its native cursor only after commit reply. `native_id` and
-`native_cursor` still suppress vendor replay; source sequence prevents Store-side
-duplicate admission after event-row retention without one receipt row per event.
+If vendor replay/backpressure is unavailable and spool is lost/overflows, close gapped
+and stop claiming complete coverage. Source watermark rows stay for the current
+generation and are reclaimed only after generation supersession and source/spool
+closure.
 
-If the vendor cannot replay/backpressure and the spool is lost or overflows, the plugin
-closes the source as gapped and stops claiming complete coverage. It never assigns fresh
-source sequences to old history as if current. Source watermark rows remain for the
-current generation and are reclaimed only after that generation is superseded and all
-old sources/spools are closed.
+### Native child registration and tokens
 
-`child` upserts the canonical native subject; parent generation is provenance.
+`registration_id` is stable across a lost child reply. Canonical child scope/ref is the
+identity; retries upsert the same Agent row. Manifest feature `child_environment`
+indicates whether the plugin can inject a distinct child environment/token.
+
+When `request_token=true` and that feature is qualified, the daemon returns the token
+for the row's current `token_version`. Routing tokens are re-derived from the private
+daemon routing key and therefore the same registration retry can return the same raw
+token without storing it in SQLite. The plugin durably stores the response before
+injecting/spawning the child. If distinct injection is unavailable, token is absent and
+child CLI activity is explicitly attributed to the parent.
+
+A different token version is issued only by an explicit routing lifecycle transition
+(control reattach/resume), never because a response was lost.
 
 ## Manifest
 
@@ -171,6 +185,7 @@ old sources/spools are closed.
     "start_requires_input": false,
     "native_goal": true,
     "native_children": true,
+    "child_environment": false,
     "hooks": false,
     "transcripts": true,
     "discover": true,
@@ -182,7 +197,7 @@ old sources/spools are closed.
 }
 ```
 
-Shared control requires session environment where native tools need Eliot identity and
+Shared control requires per-session environment where tools need Eliot identity and an
 exact isolated stop/interrupt. `instances=N` is shared-only. Versions are facts, not
 authority gates.
 
@@ -194,40 +209,33 @@ authority gates.
 4. Reject weaker substitutions and hidden route changes.
 5. Unknown is never retried.
 6. Preserve command/native input/turn/request/event correlation.
-7. The daemon owns queued-send order and generation expiry.
-8. Reject oversized or known-secret durable payloads before native I/O.
+7. Daemon owns queued-send order and generation expiry.
+8. Reject oversized/known-secret durable payloads before native I/O.
 
 ## Source ownership and normalization
 
-One source owns each family per generation. A live stream normally owns controlled
-lifecycle; a transcript owns observe-only/explicit recovery; hooks own assigned missing
+One source owns each family per generation. Live stream normally owns controlled
+lifecycle; transcript owns observe-only/explicit recovery; hooks own assigned missing
 facts or synchronous decisions only.
 
-There is one turn start and one terminal completion per native turn. `turn.started`
-identifies all known input commands; later exact coalesced inputs use `turn.inputs`.
-Intermediate status, inbox acceptance, process exit or silence is not completion. Final
-output commits before terminal event, or the plugin delays terminal publication until
-output drains.
+There is one start and one terminal completion per native turn. `turn.started`
+identifies known input commands; later coalesced inputs use `turn.inputs`. Intermediate
+status, inbox acceptance, process exit or silence is not completion. Final output
+commits before terminal event or publication waits for output drain.
 
-Reconnect resends only the one unacknowledged source sequence, then events newer than
-the committed native cursor. An unbridgeable interval is a gap, never replayed
-completion.
+Reconnect resends only the one unacknowledged source sequence, then facts newer than the
+committed native cursor. An unbridgeable interval is a gap, never replayed completion.
 
 ## Hooks and transcripts
 
 Hooks are session-scoped with current identity, stable native hook/request id and one
-absolute deadline. The shim/SDK callback calls `hook.event`. Eliot returns either a
-committed non-dispatchable proposal plus decision, or native-safe `ask` for decision
-hooks (`allow` only for observation hooks).
-
-The proposal can affect the native request only through that immediate response. It is
-never queued in the ordinary action dispatcher. A response lost before expiry may be
-retried with the same hook id and return the same proposal; a late commit/response is
-expired and cannot approve later. No Store commit before the internal deadline means
-`ask`. There is no durable hook queue.
+absolute deadline. `hook.event` returns either a committed non-dispatchable proposal or
+native-safe `ask` (`allow` only for observation hooks). The proposal can act only
+through that immediate response; late commit/response expires and never approves later.
+There is no durable hook queue.
 
 Transcript readers persist cursors, wait only for an incomplete final line, and report
-a complete unparsable line or gap. They never infer end from silence or truncation.
+complete unparsable input/gaps. They never infer end from silence/truncation.
 
 ## Custody
 
@@ -239,24 +247,23 @@ a complete unparsable line or gap. They never infer end from silence or truncati
   degraded; exact force, complete descendant death and daemon-death containment are
   unsupported.
 
-The guardian lives outside the owned group and disarms only after clean empty-group
-shutdown. Attached services are never killed; managed services have separate custody.
+Guardian lives outside the owned group and disarms only after clean empty shutdown.
+Attached services are never killed; managed services have separate custody.
 
-When process exit races final output, drain the authoritative source to EOF or a bounded
-terminal-drain deadline. Deadline creates a gap. Exact backend emptiness or exact shared
-session absence proves loss. On degraded backend, disappearance of the exact controlling
-plugin/native controller plus authoritative EOF proves session control lost but marks
-custody `orphan_possible`; it never claims every descendant died.
+When process exit races final output, drain authoritative source to EOF or terminal
+deadline. Deadline creates a gap. Exact backend emptiness or exact shared-session
+absence proves loss. On degraded backend, controlling process/channel loss may prove
+session control lost while custody remains `orphan_possible`; it never proves every
+descendant died.
 
 ## Fake, recordings and L7
 
-Fake is shared and isolated, generation-bound, persists source sequence/spool state and
-the minimum exact snapshot/resume state. Recordings are bounded sanitized native NDJSON.
+Fake is shared/isolated, generation-bound and persists source open ids, keys, sequences,
+spool state and exact session snapshots. Recordings are bounded sanitized native NDJSON.
 CI never calls a model.
 
-L7 conformance covers start versus initial input, async inbox association/timeout,
-multiple input commands per turn, lost `event.put` reply after event-row retention,
-source-sequence digest mismatch/hole/stale recovery, source-key allocation/handoff/gap,
-reconnect unknown turn, synchronous-hook timeout/late commit, exact bindings,
-canonical children, no unknown retry, exact/degraded custody, attach/readback, bounded
-buffers and unsupported-before-I/O.
+L7 conformance covers lost `source.open|close|event.put|process.put|child` replies,
+source digest mismatch/hole/stale recovery, process-history pruning, child-token retry,
+start versus initial input, async inbox association, coalesced inputs, source handoff/
+gap, unknown turn, hook timeout, exact bindings, no unknown retry, custody, readback,
+bounded buffers and unsupported-before-I/O.
