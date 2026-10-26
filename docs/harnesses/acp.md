@@ -1,30 +1,30 @@
 # ACP agents
 
-Layer L4.6. Generic Rust plugin using selected ACP v1 crate/schema; runtime mode
+Layer L4.6. Generic Rust plugin using a selected ACP v1 crate/schema; runtime mode is
 `per_agent`: one configured ACP subprocess/custody unit per Eliot generation.
 
 Facts checked 2026-10-25 against official ACP v1 transport/schema/registry and crate
-releases. Recheck installed agent capabilities; ACP v2 remains outside this slice.
+releases. Recheck installed Agent capabilities; ACP v2 remains outside this slice.
 
 ## Start and source setup
 
 ACP separates session creation and prompt:
 
-1. initialize/capability negotiation;
-2. `session/new` with exact cwd/frozen config;
-3. open authoritative source families and install update/response routing;
-4. commit ready with native session/effective capabilities;
+1. initialize/capability negotiation without creating a session;
+2. persist/open authoritative source epochs and install update/response routing;
+3. call `session/new` with exact cwd/frozen binding;
+4. commit-acknowledge `session.ready` with native session/effective capabilities;
 5. dispatch linked initial send through `session/prompt`.
 
-`start_requires_input=false`. Lost `session/new` and prompt are separate unknowns.
-Resume creates new generation/process and uses advertised load/resume; optional text is
-linked prompt, never old input replay. Routing must be installed before load/prompt so
-early updates enter bounded source spool rather than disappear.
+`start_requires_input=false`. Lost `session/new` and prompt replies are separate
+unknowns. Resume opens new-generation source epochs/routing first, then uses advertised
+load/resume; optional text is a linked prompt, never old-input replay. Routing must be
+installed before load/prompt so early updates enter the bounded source spool.
 
-ACP source uses stable open id/key, contiguous commit-ack sequence and exact native
-session/request/update identity where schema provides it. If installed agent has no
-replay cursor, reconnect combines exact current-state readback with explicit source gap;
-it never re-emits old terminal events as new.
+The live connection declares stable native update/event ids where available. If the
+installed Agent has only current-state readback and no replay cursor/id, recovery uses
+`dedupe_mode=none` and atomic gapped source replacement; it never re-emits old terminal
+events as new. Discovery/readback pages obey plugin item/byte limits.
 
 ## Verb mapping
 
@@ -33,57 +33,60 @@ it never re-emits old terminal events as new.
 | send | one `session/prompt`; applied only when exact prompt/turn association is known; terminal response ends turn, not product task |
 | steer | unsupported |
 | inject | explicit prepend-next-prompt only |
-| interrupt | exact active `session/cancel`; queued cancel/session close distinct |
-| stop | exact `session/close` if advertised, then per-agent custody |
+| interrupt | exact active `session/cancel`; queued cancel/session close are distinct |
+| stop | exact `session/close` if advertised, then per-Agent custody |
 | approve/deny | exact permission request + one offered option id |
 | answer | only advertised exact user-input capability |
 | configure | typed config/mode setters + application point/readback |
-| goal | Eliot goal only |
+| Goal | Eliot Goal only |
 
-Capability absence rejects before native I/O. Non-ACP headless CLI is never hidden
-fallback; it is separate harness/profile.
+Capability absence rejects before native I/O. A non-ACP headless CLI is never a hidden
+fallback; it is a separate harness/profile.
 
 ## Events and readback
 
-Live ACP connection owns controlled lifecycle. Map exact selected-schema variants and
-preserve session/turn/tool/request/update IDs. A successful transport write is not send
-applied until exact prompt/turn association. Prompt response defines terminal turn;
-process exit/silence does not.
+The live ACP connection owns controlled lifecycle. Map exact selected-schema variants
+and preserve session/turn/tool/request/update identities. A successful transport write
+is not send applied until exact command→prompt/turn association. A separate native input
+id is optional. Prompt response defines terminal turn; process exit/silence does not.
 
 Reconnect/load returns running, exact terminal, not-active-unknown or subject absent.
 Logs/transcripts cannot publish duplicate lifecycle. Old generation/request updates are
-diagnostic only.
+diagnostic only. Final text and event data obey persisted bounds; larger native detail
+stays in the Agent/native store.
 
-Per-agent subprocess/descendants may register only after custody verification. OS
+Per-Agent subprocess/descendants may register only after custody verification. OS
 monitor owns process exit/stats.
 
-## Children and environment
+## Children and routing
 
-ACP child support is capability-dependent. A native child is registered only with exact
+ACP child support is capability-dependent. A native child registers only with exact
 child scope/ref and stable registration id. Parent-local ids are scoped by parent
 subject; parent/root/project conflict rejects.
 
-Declare `child_environment=true` only when the installed ACP agent exposes a distinct
-child process/session environment and the plugin can inject child Eliot token/Git
-identity before child tools run. Otherwise child row may be observable but child CLI/Git
-activity is attributed to parent and token is omitted. L7 must cover lost child reply
-and retry-safe token injection for any true claim.
+Declare `child_environment=true` only when the installed ACP Agent exposes a distinct
+child process/session environment and plugin can inject child Eliot token/Git identity
+before tools run. Otherwise child row may be observable or natively controllable through
+parent, but `routing_enabled=false`; CLI/Git activity is attributed to parent and token
+is omitted. Guard-exceeding vendor children remain visible with reduced authority/wake.
 
 ## Profiles and routing
 
-Profile `cmd` names ACP agent (for example `gemini --acp`). Minimal environment passes
-only named agent auth/config and parent Eliot identity. One plugin may support many
-binaries; each process has independent custody/effective manifest. Prefer native
-Codex/Claude plugins for extra semantics, but never silently switch requested ACP route.
+Profile `cmd` names the ACP Agent (for example `gemini --acp`). Minimal environment
+passes only named auth/config and parent Eliot identity. One plugin may support many
+binaries; each process has an independent frozen binding/custody/effective manifest.
+Prefer native Codex/Claude plugins for extra semantics, but never silently switch a
+requested ACP route.
 
 ## L7 cases
 
+- source open/routing installed before `session/new`, load and prompt;
 - lost source-open/session-new/ready/linked-prompt acknowledgements;
-- response route before load/prompt and bounded early-update spool;
-- prompt association vs terminal turn vs product success;
+- prompt association with and without a separate native input id;
+- terminal turn versus product success;
 - advertised capability narrowing/unsupported verbs;
 - exact permission choices and stale generation/request;
-- reconnect current-state/gap/vendor duplicate;
-- child capability/parent attribution/token retry where supported;
-- descendant registration vs OS enumeration and no cross-agent force;
+- cursor/event-id/no-replay recovery, atomic gap handoff and page/frame bounds;
+- child capability/guard/parent attribution/token retry where supported;
+- descendant registration vs OS enumeration and no cross-Agent force;
 - ACPX backend replacement deletes old route, never two owners.

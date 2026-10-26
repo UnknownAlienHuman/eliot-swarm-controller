@@ -1,148 +1,135 @@
 # Client API and CLI
 
-## Transport and caller identity
+## Transport and principal identity
 
 JSON-RPC 2.0 over UTF-8 NDJSON. Windows pipe is current-user-only; Unix socket is mode
-`0600` in private data root. One daemon owns one data-dir lock; `daemon.json` includes
-`host_boot_id`, PID and process birth identity.
+`0600` inside the private data root. One daemon owns one data-directory lock;
+`daemon.json` includes `host_boot_id`, PID and process birth identity.
 
-Caller resolution uses credentials plus **live OS custody classification**:
+Every connected client presents exactly one explicit principal credential:
 
-1. obtain peer PID and pin `(host_boot_id,pid,start_time)`;
-2. if any agent/automation identity fields are supplied/inherited, require complete
-   matching identity; reject invalid/incomplete/revoked/stale;
-3. use exact process projection row as fast path;
-4. on miss, check pinned peer live against every current Job/cgroup/registered process
-   group before owner fallback;
-5. recheck birth/liveness;
-6. no token means owner only for local OS user definitively outside every Eliot custody.
+- owner: `eliot --owner ...` reads private `owner.token`;
+- Agent: complete `(agent_id,generation,agent_token)`;
+- managed automation/check/setup process: complete scoped automation token;
+- plugin: daemon-created instance credential on its private pipe.
 
-Unavailable peer credential, membership failure, birth race or incomplete inventory is
-`caller_identity_unknown`. Projection miss never proves independence. Shared-service
-tool still needs exact per-session token because service PID is not agent identity.
-This is attribution inside one-user trust boundary, not hostile same-user isolation.
+Missing, incomplete, revoked or mismatched credentials reject. There is no no-token owner
+fallback and process/PID identity never grants API authority. This is attribution inside
+one trusted OS user, not hostile same-user security.
 
-API frame maximum 4 MiB; semantic limits smaller. Handshake/status returns
-`write_id_floor_ms`, `idempotency_window_ms`, `write_id_future_skew_ms`.
+API frame maximum is 4 MiB; semantic limits are smaller. Handshake/status returns write
+id floor/window/skew, page limits and Store/WAL/routing-key health.
 
 ## External write IDs
 
-Every mutation through running daemon carries canonical ULID `write_id` generated before
-send. CLI uses locked, atomically replaced monotonic state and advances to at least
-daemon floor + 1. `--id` accepts canonical ULID. Internal automation uses derived IDs.
+Every external daemon mutation carries a canonical ULID `write_id` generated before
+send. CLI locks and atomically updates its monotonic ULID state, advancing to at least
+daemon floor + 1. `--id` accepts one canonical ULID. Internal automation uses derived
+ids.
 
 Receipt canonicalization includes semantic mutation fields only: method, principal,
-target/selector, verb/action, normalized args, expected bindings and probe choice. It
-excludes JSON-RPC id, connection metadata, wait/display/pager/client-timeout options.
-Thus same intended mutation may retry with another `wait_ms` or `--json` using same id.
+target/selector, verb/action, normalized args, expected binding revision and probe
+choice. It excludes JSON-RPC id, connection metadata, output/pager/client timeout and
+`wait_ms`.
 
-Receipt lookup follows [core](core.md#external-write-idempotency-and-retention): same
-id/payload returns current result; mismatch `id_conflict`; absent old/below-floor id
-`id_expired`; absent excessive-future id `id_future`. Lost reply reuses same id. Receipt
-outlives shorter domain history; floor prevents reapply after receipt expiry.
+Receipt lookup follows [core](core.md#external-write-idempotency): same id/payload
+returns retained result; mismatch `id_conflict`; absent below floor/window `id_expired`;
+absent too far in future `id_future`. Lost reply reuses the same id. Linked input,
+selector child, rule/timer/Goal/action writes use derived ids and no fake receipts.
 
-Internal rule/timer/goal/action, linked-input and selector-child writes use `d_…` IDs and
-no fake receipts.
-
-Daemon bootstrap/OS integration (`eliot daemon`, install/uninstall) are out-of-process
-owner desired-state operations with exact OS readback, not Store mutations. Connected
-`daemon.shutdown` is receipted; lost success can be read after next explicit start.
+Daemon bootstrap/install is OS desired-state work with exact readback, not a connected
+Store mutation. Connected `daemon.shutdown` is receipted.
 
 ## Methods
 
 | Surface | Semantics |
 | --- | --- |
-| daemon status/shutdown | admission, Store/WAL, write-id floor, custody/source/account holds |
-| agent list/get | paginated projections, generation/native subject/open effects |
-| agent wait/result | exact captured generation/turn/goal result |
-| command submit/get/children | parent/child/session/input commands, paginated captured fanout and readback |
+| daemon status/shutdown | admission, Store/WAL, write-id floor, routing key, custody/source/account holds |
+| agent list/get | paginated projection, generation, current binding revision/history cursor, native subject, open effects |
+| agent wait/result | exact captured generation/turn/Goal result |
+| command submit/get/children | parent/child/session/input commands, exact binding revision and paged fanout |
 | turn get/resolve | native/readback result or constrained owner assertion |
-| events read/subscribe | paged replay + bounded live stream with gaps |
-| hook event | deadline-bound committed proposal or safe default |
-| discover/attach/detach | canonical native subject, one Agent row |
+| events read/subscribe | paged replay + bounded live stream with explicit gaps |
+| hook event | internal deadline-bound committed proposal or safe default |
+| discover/attach/detach | paged native subjects; one canonical Agent row and versioned binding transitions |
 | mail send/inbox/ack/read | durable coordination with explicit acknowledgement |
 | vars/who/claims | scoped coordination |
-| rule/timer/action/goal | scoped automation state/dry run/cancel/readback/assertion |
+| rule/timer/action/Goal | scoped automation state, dry run, cancel, readback/assertion |
 
-Every external mutating daemon method accepts `write_id`, except internal plugin/source
-requests with exact open/sequence/registration contract. Reads allocate no receipts.
+Every external mutation accepts `write_id`. Internal plugin/source/hook requests use
+instance/open/sequence/hook identities. Reads allocate no receipt.
 
 ## Command admission
 
 ```text
 params {
   write_id, target?, selector?, verb, args,
-  expected_generation?, expected_turn_id?, request_id?,
-  probe? [false], wait_ms?
+  expected_generation?, expected_binding_revision?,
+  expected_turn_id?, request_id?, probe? [false], wait_ms?
 }
 result {
-  command_id, agent?, expected_generation?, generation?, state, outcome?,
-  linked_command?,
-  fanout?: { count, digest }
+  command_id, agent?, expected_generation?, generation?, binding_revision?,
+  state, outcome?, linked_command?, fanout?: {count,digest}
 }
 ```
 
-External concrete/fanout parent command has `command_id=write_id` and references that
-receipt. Internal automation uses derived id and run/action cause.
+External concrete/fanout parent has `command_id=write_id`; internal automation has a
+derived id. One transaction resolves target/selector, validates principal/capability/
+state and expected binding, captures target generation/binding revision/turn/request,
+inserts receipt and creates command/link/event rows.
 
-One transaction resolves target/selector, validates principal/capability/state and
-expected binding, captures generation/turn/request, inserts receipt where applicable,
-and creates command/link/event rows.
+Ordinary expected generation equals current target. Launch targets generation 1 binding
+revision 1. Resume expects terminal g and targets `g+1` revision 1; Agent generation and
+routing change only when dispatch commits.
 
-Ordinary expected generation equals current target. Launch targets 1. Resume expects
-terminal g and targets g+1; row/token change only when dispatch commits.
-
-Launch/resume with text returns session command plus derived linked send. Without
-`--wait`, wait means session readiness. `--wait` with text follows linked send to exact
-turn. Session start/input never share one outcome.
+Launch/resume with text returns session command plus a derived linked send. Without
+`--wait`, launch waits for session readiness only. `--wait` with text follows linked
+send to its exact terminal turn. Session start, input association and terminal result
+remain separate.
 
 ### Selector fanout
 
-Interactive selector creates one external Store-only parent and fixed derived child per
-concrete target captured in the admission transaction. Expansion:
+Interactive selector creates one external Store-only parent and one derived child per
+concrete target captured in the admission transaction. Expansion is sorted by AgentId,
+checks `max_selector_targets` before rows, stores links/count/digest and marks parent
+applied when expansion commits. It says nothing about child native effects.
 
-- is sorted deterministically by AgentId;
-- fails before any row when target count exceeds `limits.max_selector_targets`;
-- stores child links and parent `{count,digest}`;
-- marks parent applied when expansion commits, which says nothing about child effects.
-
-Children queue/dispatch/settle independently. Repeating parent WriteId returns same
-count/digest. `command.children {command,after?,limit<=1000}` pages exact captured child
-ids/outcomes from `command_links`; `--wait` waits that set and returns paged/per-child
-summary. Later agents are not included. After terminal link retention expires,
-`command.children` returns `history_gap` while receipt still proves no replay and retains
-count/digest/aggregate summary.
+`command.children {command,after?,limit<=1000}` pages the captured set. Repeating the
+same WriteId returns the same count/digest. `--wait` waits only that set and returns a
+paged summary. After link retention, child detail returns `history_gap`; receipt summary
+still prevents replay.
 
 Interactive concrete calls may omit expected fields; admission captures them. Durable
 automation supplies frozen values. Internal child/linked commands need no receipt.
 
-Stable errors include `not_found`, `unsupported`, `not_allowed`, `bad_state`,
-`stale_generation`, `invalid`, `busy`, `unavailable`, `caller_identity_unknown`,
+Stable errors include `missing_principal`, `invalid_principal`, `not_found`,
+`unsupported`, `not_allowed`, `bad_state`, `stale_generation`,
+`stale_binding_revision`, `invalid`, `busy`, `unavailable`, `capacity_unavailable`,
 `id_conflict`, `id_expired`, `id_future`, `history_gap`, `secret_in_payload`,
-`internal`.
+`frame_too_large`, `internal`.
 
 ### Explicit provider probe
 
-`probe=true` valid only for exact send or launch/resume with linked prompt. Matching
-persisted hold must be past retry boundary and one command atomically claims it. Only
-owner/current controlled agent may request; rules/timers/wakes/parent notices/Goal may
-not. For launch/resume linked send—not session creation—is probe. Hold clears only from
-that exact successful provider turn; unknown keeps hold/probe.
+`probe=true` is valid only for exact send or launch/resume with linked prompt. A matching
+hold must be past retry boundary and one command atomically claims it. Only owner/current
+directly routed Agent may request it; rules/timers/wakes/parent notices/Goal may not.
+For launch/resume the linked input—not session creation—is the probe. Exact successful
+provider turn clears hold; possible provider I/O keeps hold/probe unknown.
 
 ## Async input, turn outcome and wait
 
-Vendor inbox acceptance is not `send applied`. `input.admitted` stores native input id
-while command remains dispatched. Command applies only at exact turn/execution
-association. Deadline after possible admission makes unknown and blocks later send/
-configure/goal in generation pending readback.
+Vendor inbox acceptance is not send applied. `input.admitted` stores optional native
+input id while command remains dispatched. Command applies only at exact command→turn/
+execution association. Deadline after possible admission makes it unknown and blocks
+later send/configure/Goal in that generation.
 
 Applied send does not settle turn. `turn.get` returns `running|completed|unknown`,
-ordered input command ids, resolution source, status, bounded final text and usage.
-Several input commands may map one turn.
+ordered input command ids, optional native input ids, resolution source, status, bounded
+final text and usage. Several inputs may map to one native turn.
 
 If reconnect cannot prove terminal outcome, turn is unknown and live generation remains
-blocked. Owner assertion allowed only when native readback proves not active or
-generation terminal:
+blocked. Owner assertion is allowed only after native-not-active proof or terminal
+generation:
 
 ```text
 turn.resolve {
@@ -152,34 +139,35 @@ turn.resolve {
 }
 ```
 
-It records `resolution_source=owner`, never plugin completion. Historical unknown in old
-terminal generation does not block resume.
+It records `resolution_source=owner`, never plugin completion. Historical unknown in an
+old terminal generation does not block resume.
 
-`agent.wait` captures target generation:
+`agent.wait` captures target generation and current binding revision:
 
-- turn + `after_command`: follow native input then turn mapping;
-- turn without it: active/unknown turn or first after call high-water;
-- idle: only no active/unknown turn/input gate;
+- turn + `after_command`: follow input then turn mapping;
+- turn without it: active/unknown turn or first turn after call high-water;
+- idle: only with no active/unknown turn or input gate;
 - stopped: stopped/failed/lost for captured generation;
-- goal: done/blocked for captured revision.
+- Goal: done/blocked for captured Goal revision.
 
-Several waits may resolve from one turn. Unknown exit 4; replacement generation stale;
-timeout never cancels.
+Several waits may resolve from one turn. Unknown exits 4; replacement generation/binding
+is stale. Timeout never cancels.
 
 ## Unknown-effect resolution
 
 Automatic settlement is verb/action-specific readback. Generic owner assertions cannot
 synthesize identity or free unsafe lanes:
 
-- start applied requires exact attach/ready subject;
+- start applied requires exact attach/ready subject and referenced binding revision;
+- observe/control attach applied requires exact native attach/readback and only then
+  moves the current binding pointer;
+- detach applied requires exact release/readback and only then moves to the candidate
+  detach-observe revision;
 - send applied requires turn association; failed requires exact pre-turn drop/not-found;
-  otherwise `unknown_abandoned` retains input gate;
 - interrupt/stop require exact turn/generation readback;
-- Git/webhook/script assertions are `owner_assertion` and release narrow hold only with
-  `--unsafe-assert`.
+- Git/webhook/script assertions need `--unsafe-assert` and release only narrow holds.
 
-Rules/timers/scripts/agents cannot unsafe-assert. Every assertion stores reason,
-principal and timestamp.
+Rules/timers/scripts/Agents cannot unsafe-assert. Assertions store reason/principal/time.
 
 ## Synchronous hook event
 
@@ -189,47 +177,89 @@ hook.event {
   agent, generation, turn_id?, request_id,
   native_deadline_at, payload
 }
-→ { decision: allow|deny|ask|..., proposal_id? }
+→ {decision: allow|deny|ask|..., proposal_id?}
 ```
 
-`hook_id` is stable native invocation, not WriteId. Daemon derives proposal id,
-validates pending request and evaluates bounded synchronous rules. Non-default response
-requires proposal commit before internal margin while request remains pending. Proposal
-has no dispatcher and acts only through immediate response. Same-id retry before expiry
-may return it; timeout/Store failure/expiry/uncertain response returns `ask` for decision
-hooks (`allow` only observation). Late proposal never approves later.
+This is an internal authenticated plugin/hook request, not external WriteId mutation.
+Daemon derives proposal id, validates exact pending request and evaluates bounded rules.
+A non-default response requires proposal commit before margin while request remains
+pending. Proposal has no dispatcher and acts only through the immediate response.
+Same-id retry before expiry may return it; timeout/Store failure/expiry/uncertain
+response returns `ask` for decisions (`allow` only for observation). Late proposal never
+approves later.
 
-## Attach, discover and detach
+## Discover, attach and detach
 
-Discover is paginated and returns subjects. Attach returns existing row, upgrades
-observe-only after exact attach, or creates one external row. Another control path/
-unverified takeover rejects. Subject reuse requires new scope.
+`agent.discover {harness?,cursor?,limit<=1000}` is paginated and each frame remains below
+the API cap. It returns native subjects and bounded metadata only.
 
-Control reattach to same live observe-only incarnation preserves generation, increments
-`token_version`, installs fresh hash and returns re-derived raw token after attach.
-Retrying same WriteId returns same version/token. Recovery of already-controlled row
-does not rotate.
+`agent.attach` is owner-only in the first local slice:
 
-Detach requires independently owned/observable service lifetime. It sets observe-only,
-revokes token and releases claims without changing generation/killing session.
-Daemon-owned per-agent process cannot detach. Detach does not settle unknown input.
+```text
+attach {
+  write_id, harness, native_scope, native_ref,
+  mode: observe | control,
+  profile?, project?, name?
+}
+```
+
+### First observe attach
+
+For an absent subject, daemon creates generation-1 external Agent and immutable binding
+revision 1, `mode=observe_attach`, profile `observe:<harness>`. After exact plugin
+observe attach/readback commits, current pointer becomes revision 1,
+`observe_only=true`, `routing_enabled=false`. Lost client reply returns the same result
+through the WriteId receipt.
+
+### Observe → control
+
+Daemon validates owner-selected allowed profile, project, capacity and native
+compatibility, then creates immutable candidate revision `current+1` with
+`supersedes_revision=current` and a durable attach command referencing it. Current
+pointer/Agent profile/routing/capacity do **not** change yet.
+
+- exact attach/environment/readback success: one transaction applies command, moves
+  pointer to candidate, updates Agent profile/control/observe/routing/token version and
+  commits capacity reservation/effective facts;
+- definite failure: pointer remains observe; candidate is historical and command fails;
+- unknown: pointer remains observe and no new control work is admitted until exact
+  readback/owner resolution. Retrying same WriteId returns the same candidate/command.
+
+Control may remain `routing_enabled=false` when native API can control but cannot inject
+a distinct Eliot environment. If capacity is unavailable, no candidate/effect is
+admitted.
+
+### Detach and control reattach
+
+Detach is valid only for independently owned/observable service lifetime. It creates a
+candidate `detach_observe` revision. Exact success atomically moves the pointer, sets
+observe-only, disables routing/revokes token and releases claims. Capacity for a still-
+live provider session remains until exact terminal observation. Failed/unknown detach
+leaves the control pointer/state unchanged. Daemon-owned per-Agent process cannot detach.
+
+A later control reattach creates another immutable control revision; exact success moves
+pointer and rotates token version. Recovery of an already-controlled incarnation reuses
+the current control revision/version rather than creating a new revision.
+
+Another live control path or unverified takeover returns `not_allowed`. Attach/detach do
+not settle unknown input/turn.
 
 ## Drain and shutdown
 
 Drain commits admission mode, rejects new work but permits exact interrupt/stop/request
-replies/cancel/detach/goal pause-clear, queries/readback/assertions. Pre-boundary work
+replies/cancel/detach/Goal pause-clear, queries/readback/assertions. Pre-boundary work
 continues.
 
 Exit waits for effects/sessions. Unknown blocks unless safely resolved/abandoned.
-Attached session may detach after admitted work settles. `--force` kills only exact
-backends. Degraded remains blocker; `--abandon-degraded` records possible orphans and is
-not clean success.
+Attached session may detach after admitted work settles. Force kills only exact backends.
+Degraded remains blocker; `--abandon-degraded` records possible orphans and is not clean
+success.
 
 ## Event replay and gaps
 
 Subscribe registers bounded live buffer, captures Store high-water, replays pages
-`(after_seq,high_water]`, then releases buffered persisted events in order. No read
-transaction spans client wait. Ephemeral events are best effort; overflow emits lag.
+`(after_seq,high_water]`, then releases buffered persisted events. No read transaction
+spans client wait. Ephemeral events are best effort; overflow emits lag.
 
 Request before `earliest_seq` returns `history_gap`. `allow_gap=true` emits gap then
 continues. Rule cursors never silently gap.
@@ -237,46 +267,51 @@ continues. Rule cursors never silently gap.
 ## Mail acknowledgement
 
 One open immutable inbox batch per recipient. `mail.inbox` returns it until receipted
-`mail.ack`; new messages wait for next. CLI writes full stdout before ack. Lost inbox
-leaves unread; lost ack reuses id. `mail.read` is receipted and prohibited for a message
-inside open batch. History is paginated.
+`mail.ack`; new messages wait for next batch. CLI writes stdout before ack. Lost inbox
+leaves unread; lost ack reuses WriteId. `mail.read` is receipted and prohibited for a
+message in an open batch. History is paginated.
 
 ## CLI
 
-Every daemon mutation accepts `--id ULID`; CLI generates/persists/prints before send.
+Every connected mutation accepts `--id ULID`; CLI generates/persists/prints it before
+send. Owner calls explicitly use `--owner`; routed Agent CLI supplies its credential.
 Bootstrap/install uses OS desired-state readback.
 
 ```text
-eliot daemon [--foreground] | daemon stop [--drain|--force|--abandon-degraded] [--id ULID]
-eliot status
-eliot launch [profile/workspace/tree options] [PROMPT] [--probe] [--wait] [--id ULID]
+eliot --owner daemon stop [--drain|--force|--abandon-degraded] [--id ULID]
+eliot --owner status
+eliot --owner launch [profile/workspace/tree options] [PROMPT] [--probe] [--wait] [--id ULID]
 eliot ls | show A | watch [A|SELECTOR] | top
 eliot send|inject A TEXT [--generation N] [--probe] [--id ULID]
 eliot steer A TEXT [--or-send] [--generation N] [--turn ID] [--id ULID]
 eliot wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
 eliot result A [--generation N] [--turns N]
 eliot turn show A TURN [--generation N]
-eliot turn resolve A TURN --generation N --as completed|interrupted|failed --reason T --id ULID
+eliot --owner turn resolve A TURN --generation N --as completed|interrupted|failed --reason T --id ULID
 eliot interrupt|abort A [--generation N] [--turn ID] [--id ULID]
 eliot stop A [--force] [--tree] [--generation N] [--id ULID]
 eliot resume A [PROMPT] [--generation N] [--probe] [--wait] [--id ULID]
 eliot approve|deny|answer ... [--id ULID]
 eliot configure ... | compact|fork|background ... | goal ... [--id ULID]
-eliot cmd show|children|cancel|resolve|abandon ... [--id ULID where mutating]
-eliot action show|cancel|resolve ... [--unsafe-assert] [--id ULID where mutating]
+eliot cmd show|children|cancel|resolve|abandon ...
+eliot action show|cancel|resolve ...
 eliot events [--since SEQ] [--allow-gap]
 eliot msg send ... | inbox [--wait SECS] [--all]
 eliot var ... | who ... | claim ... | release ...
 eliot rule ... | rules pause|resume | timer list|run
-eliot discover [--cursor C] [--limit N] | attach ... | detach A
-eliot service list|stop | worktree remove | doctor
-eliot daemon install | daemon uninstall
+eliot --owner discover [--cursor C] [--limit N]
+eliot --owner attach --harness H SCOPE/REF --observe [--id ULID]
+eliot --owner attach --harness H SCOPE/REF --control --profile P [--id ULID]
+eliot detach A [--id ULID]
+eliot --owner service list|stop | worktree remove | doctor
+eliot daemon [--foreground] | daemon install | daemon uninstall
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 
 Exit codes: 0 success/queued; 1 definite error; 2 usage; 3 rejected before effect; 4
 unknown; 5 wait timeout; 6 still pending/dispatched.
 
-Daemon injects home, agent id/generation/raw token and CLI path. Store has token hash/
-version only. Known credentials are masked from native output and rejected in durable
-semantic payloads.
+Daemon injects home, Agent id/generation/raw token and CLI path only when
+`routing_enabled=true`. Routing-disabled native children receive no independent Agent
+credential. Store contains token hash/version only. Known credentials are masked from
+native output and rejected in durable semantic payloads.
