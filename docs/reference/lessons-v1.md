@@ -1,6 +1,7 @@
 # Lessons from v1
 
-v1's last pre-reset commit is `dc6f70aa` and is archived as `v1-final`. Measured sizes
+v1's frozen pre-reset commit is `dc6f70aa`; roadmap L0.1 creates tag `v1-final` at
+that commit before deleting v1 code. Until then use the commit directly. Measured sizes
 below were read from that tree on 2026-10-25. Operational observations come from v1
 records/owner runs unless explicitly re-qualified; they are requirements/risk evidence,
 not fresh benchmark claims.
