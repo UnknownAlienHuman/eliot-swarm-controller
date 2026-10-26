@@ -43,7 +43,7 @@ changes behavior; never append a contradictory addendum.
 | D-36 | Persisted events carry bounded event-time subject snapshot; rules never join a later Agent row. | Replay after label/project/state changes must make the same decision. |
 | D-37 | Active rule cursors bound retention; disabled rules advance, excessive lag records skipped range and releases retention. | Durable triggers and bounded storage must coexist without silent loss/disk pinning. |
 | D-38 | Worktree creation/setup is journaled pre-start. Exact Git effects are read back; unknown setup never reruns blindly. | `launch --worktree` otherwise repeats non-idempotent setup or starts half-built. |
-| D-39 | Mail uses capability-aware wake plus immutable inbox-batch acknowledgement. Short notice requires direct routing; a routing-disabled native child needs explicit full native delivery policy or parent relay. | Stored ≠ presented ≠ safely received; “run inbox” is useless to an Agent with no token. |
+| D-39 | Queue mail keeps one boolean `wake_on_mail`: routed Agents may receive a coalesced inbox notice; routing-disabled native children use routed-parent relay or remain queue-only. Full-content delivery requires an explicit inject/send/steer command with control rights. Inbox acknowledgement is separate and durable. | Stored ≠ presented ≠ safely received; “run inbox” is useless to an Agent with no token, while an automatic full-message fallback would bypass sender authority. |
 | D-40 | Historical replay exposes explicit gap when requested events were pruned. | Silent jump falsely claims complete history. |
 | D-41 | Command admission and turn outcome are separate. Missing terminal result is unknown turn blocking more work until readback/resolution. | `send applied` proves association, not completion. |
 | D-42 | Source sequence stores the last Store envelope; native-event receipts store `(agent,generation,kind,native_id,payload_digest,first_seq)` until replay can no longer target that generation. | These are different idempotency boundaries and neither can replace the other. |
@@ -77,7 +77,7 @@ changes behavior; never append a contradictory addendum.
 | --- | --- |
 | Environment | `minimal`; `inherit` requires a trusted global profile. |
 | Owner API | explicit `eliot --owner`; missing credential rejects. |
-| Native child without isolated environment | `routing_enabled=false`; direct CLI/mail notice attributed to parent or disabled. |
+| Native child without isolated environment | `routing_enabled=false`; with `wake_on_mail=true`, notify a routed parent or leave queue-only. |
 | Script environment | empty global allowlist; project uses global∩project. |
 | External idempotency window | 90-day minimum; referenced receipts may live longer; floor monotonic. |
 | Selector fanout | 10,000 targets maximum per admission; no logical fleet limit. |
