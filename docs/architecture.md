@@ -25,12 +25,12 @@ owner / agents / scoped automation
 | --- | --- | --- |
 | CLI/API | request syntax/output/current identity forwarding and peer classification | business state |
 | Router | principal/capability/state, expected/target generation, turn/request binding, durable admission | vendor translation |
-| Store | ids, canonical native subject, commands/events/receipts/turn/edit projections, cursors/timers/actions | native sessions |
+| Store | ids, canonical native subject, commands/events/source watermarks/turn/edit projections, cursors/timers/actions | native sessions |
 | Plugin host | instances, deadlines, commit acknowledgements, custody and attach | harness semantics |
 | Plugin | one harness protocol, native ids/readback/source normalization | Store writes or unknown retries |
 | Monitors | source-owned process/Git/fs/transcript facts and workspace preparation | agent workflow |
 | Coordination | durable mail/vars/claims/current edit view | locks or hidden model turns |
-| Automation | scoped principals, event-time matching, trigger cursors, frozen actions and goal rounds | Task/review engine |
+| Automation | scoped principals, event-time matching, revision handoff, trigger cursors, frozen actions and goal rounds | Task/review engine |
 
 ## Core invariants
 
@@ -41,24 +41,27 @@ owner / agents / scoped automation
 4. One canonical Agent row represents one native subject.
 5. A controlled live generation has one routing-token hash; generation 0, terminal and
    observe-only/detached rows have none. Revocation never rewrites generation history.
-6. Persisted plugin facts are commit-acknowledged. Stable native-event receipts survive
-   event-row retention for the current generation's complete replay lifetime.
+6. Persisted plugin facts are commit-acknowledged. One contiguous sequence and last
+   envelope digest per source ownership epoch survive event-row retention with O(sources)
+   state rather than O(events) receipts.
 7. One source owns each lifecycle family; stale/duplicate/wrong-turn input cannot fire
    ordinary automation.
 8. Session start and optional first prompt are separate linked command outcomes.
 9. Rules match the stored post-transition event-time subject and run under
    global/project/goal principals; delayed actions freeze concrete targets.
-10. A deterministic render/authority error creates one failed firing with no actions
+10. Enabled rule edits use a captured high-water handoff: old revision drains through
+    H, new revision begins after H. Disable/pause records an explicit skipped range.
+11. A deterministic render/authority error creates one failed firing with no actions
     and advances its cursor. Only Store failure retries the same event.
-11. Event cursors, timers, goals, unread mail, workspace/launch queues and provider
+12. Event cursors, timers, goals, unread mail, workspace/launch queues and provider
     holds reconcile from durable current state after restart.
-12. No-token owner fallback requires a birth-pinned live OS check proving the peer is
+13. No-token owner fallback requires a birth-pinned live OS check proving the peer is
     outside every current Eliot custody; missing projection or ambiguity rejects.
-13. Custody claims only what the OS backend proves; degraded Unix never advertises
+14. Custody claims only what the OS backend proves; degraded Unix never advertises
     exact force/owner-death cleanup.
-14. Environment is minimal by default. Project script references pass both the global
+15. Environment is minimal by default. Project script references pass both the global
     script allowlist and project allowlist before any value is read.
-15. Views are queries over projections/events, not parallel state machines.
+16. Views are queries over projections/events, not parallel state machines.
 
 ## Start flow
 
@@ -71,8 +74,8 @@ eliot launch --worktree feat/x --profile codex "do X"
   → journal/read back worktree + setup; workspace_state=ready
   → atomically reserve profile/account/proxy capacity and dispatch L
   → transaction: a12 generation 1, new token hash, state starting
-  → plugin establishes native subject
-  → plugin event.put(session.ready) commits receipt + event/projection and is acknowledged
+  → plugin establishes native subject and source key
+  → event.put(session.ready, source_seq=1) commits watermark + event/projection
   → L applied; a12 idle; S dispatches separately
   → turn start/completion update events + compact input/turn projections
 ```
@@ -90,15 +93,17 @@ A current-turn command captures generation and exact turn/request in one admissi
 transaction. Ready native calls serialize; queued future sends do not block current
 controls/answers. Exact reply/readback settles applied/failed/unknown.
 
-For persisted native facts, the plugin sends `event.put` and advances its native cursor
-or unacknowledged spool only after Store commit reply. The Store commits a compact
-native-event receipt atomically with the event/projections. A lost acknowledgement
-resends the same native id and receives the original receipt even after the event row is
-pruned. Receipt reclamation waits until the agent has advanced beyond that generation
-and every old source/spool is closed. An unbridgeable source interval becomes a gap,
-never invented completion.
+For persisted native facts, each authoritative source assigns a durable contiguous
+`source_seq`, keeps at most one unacknowledged request and advances its native cursor or
+spool only after Store commit reply. The Store commits one compact source watermark,
+last-envelope digest and event/projections atomically. A lost acknowledgement resends
+the same sequence; the watermark returns the original result even after the event row
+is pruned. A hole or lost native interval becomes an explicit gap, never invented
+completion. Source rows are reclaimed only after generation/source closure, so storage
+scales with ownership epochs rather than event count.
 
-Event rules scan persisted events by durable cursor. No match advances. A valid match
+Event rules scan persisted events by durable cursor. On enabled edit, old and new
+revisions meet at one captured H without overlap/gap. No match advances. A valid match
 admits one immutable run/actions and advances. A deterministic render, secret or
 authority error admits one failed run without actions and advances. A Store failure
 rolls back the cursor and retries only after Store recovery.
@@ -126,10 +131,10 @@ rather than deleting evidence or blind-truncating.
 Restart recovery is level-based:
 
 - dispatched effects remain unknown until exact readback;
-- plugin/session/source ownership reattaches by canonical subject;
-- event rules scan from durable cursors over stored event-time subjects;
+- plugin/session/source ownership reattaches by canonical subject and source watermark;
+- event rules resume active/retiring/replay revisions from durable interval boundaries;
 - timers/goals/mail/workspace/launch/provider queues reconcile rows;
-- Git facts rebuild from Git while edit/input/turn/native-receipt projections survive
+- Git facts rebuild from Git while edit/input/turn/source-watermark projections survive
   event retention;
 - missing custody becomes lost only after authoritative-source drain rules.
 
