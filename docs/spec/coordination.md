@@ -5,7 +5,7 @@ coordinate without another scheduler.
 
 ## Authority
 
-Caller identity is exact `(agent,generation)` or an automation principal. Invalid/
+Caller identity is exact `(agent,generation)` or an automation principal. Invalid or
 incomplete supplied identity is rejected, never owner.
 
 | Principal | Command scope | Coordination scope |
@@ -21,6 +21,12 @@ incomplete supplied identity is rejected, never owner.
 This is a correctness boundary in a one-user system, not hostile same-user isolation.
 Commands still pass router generation/turn/request checks. Queue mail does not grant
 sender control; full send/steer/inject does.
+
+A child inherits project/root. Its requested `control` cannot exceed both the launching
+principal and its parent: self→self, tree parent may grant self/tree, project parent may
+grant self/tree/project. Native children default to self unless the harness provides an
+explicit owner-approved profile rule. A project principal cannot change project,
+parent/root or select a profile outside the project's allowlist.
 
 ## Mailbox
 
@@ -40,10 +46,10 @@ fails. Large broadcast requires explicit owner/global-rule confirmation.
 
 ### Modes
 
-- queue: durable unread mail, recipient wake policy decides presentation;
-- inject: full text at declared exact safe point, requires command rights;
-- send: full text as a new turn, requires command rights;
-- steer: full text into exact active turn, requires exact steer/control.
+- queue: durable unread mail; recipient wake policy decides presentation;
+- inject: full text at declared exact safe point; requires command rights;
+- send: full text as a new turn; requires command rights;
+- steer: full text into exact active turn; requires exact steer/control.
 
 `presentation_kind=notice|full` distinguishes a mailbox notice from full message
 context. Presented is not acknowledged/read.
@@ -53,11 +59,11 @@ context. Presented is not acknowledged/read.
 For queue + `wake_on_mail=true`:
 
 1. busy with exact inject → one generation-bound notice inject;
-2. busy without inject → leave unread; when same generation becomes idle, one short
+2. busy without inject → leave unread; when the same generation becomes idle, one short
    send notice may be admitted;
 3. idle → one short send notice;
 4. observe-only, draining, pending request, provider hold not designated for wake, or
-   unknown control → no presentation.
+   unknown control/input/turn → no presentation.
 
 No send/steer substitute while busy. At most one open presentation command and one
 notice/minute/recipient. Unknown presentation is not retried. New generation makes old
@@ -66,11 +72,15 @@ finds unread recipients with no open presentation; no volatile wake edge is requ
 
 ### Inbox acknowledgement
 
-One immutable open batch exists per recipient. `mail.inbox` returns that same batch
-until acknowledged; messages arriving later remain for the next batch. It does not
-mark read. CLI writes complete stdout, then `mail.ack(batch_id)` with a stable write id.
-Lost inbox leaves unread; lost ack is idempotently read back. `mail.read ID` explicitly
-acknowledges one message. `--all` includes history.
+One immutable open batch exists per recipient. It contains at most 100 messages and at
+most 1 MiB of encoded message data; excess unread messages wait for the next batch.
+`mail.inbox` returns the same batch until acknowledged. It opens no read transaction
+while waiting: `--wait` sleeps on a bounded notification, then performs a short query.
+
+The CLI writes complete stdout, then calls `mail.ack(batch_id)` with a stable write id.
+Lost inbox leaves unread; lost ack is idempotently read back. `mail.read ID` is allowed
+only when no open batch contains that message; otherwise acknowledge the batch.
+`--all` is paginated acknowledged history.
 
 ```sql
 CREATE TABLE messages (
@@ -84,7 +94,7 @@ CREATE TABLE messages (
   presentation_kind TEXT, presentation_command TEXT,
   acknowledged_at INTEGER
 );
-CREATE INDEX messages_inbox ON messages(recipient, acknowledged_at, id);
+CREATE INDEX messages_inbox ON messages(recipient,acknowledged_at,id);
 
 CREATE TABLE mail_batches (
   id TEXT PRIMARY KEY,
