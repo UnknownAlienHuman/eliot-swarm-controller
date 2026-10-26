@@ -16,27 +16,24 @@ symlink/reparse-point roots or unsafe ownership. Logs are private, rotated and b
   logs/, rules/, plugins/, services/, worktrees/
 ```
 
-`routing.key` is generated atomically before the first database creation, never written
-to SQLite/logs and used only to re-derive current-version routing tokens. SQLite stores
-its nonsecret key identity plus token hashes. The file has current-user-only permissions
-and is neither followed through a symlink nor silently regenerated for a nonempty data
-directory.
+`routing.key` is generated atomically before first database creation, never written to
+SQLite/logs and used only to re-derive current-version routing tokens. SQLite stores its
+nonsecret key identity plus token hashes. The file is current-user-only, never followed
+through a symlink and never silently regenerated for a nonempty data directory.
 
-If an existing Store has a missing/mismatched key, daemon enters `routing_key_error`:
-existing raw agent tokens can still be verified against stored hashes, and owner
-readback/stop/query remains available, but launch/resume/control-reattach/child-token
-issuance is blocked. Restoring the exact key clears the condition. Replacing it requires
-an explicit owner recovery that first stops or abandons every controlled live
-generation and revokes their token hashes; Eliot never rotates them silently.
+If an existing Store has missing/mismatched key, daemon enters `routing_key_error`:
+existing presented tokens can still verify against hashes and owner readback/stop/query
+remains, but launch/resume/control-reattach/child-token issuance is blocked. Restoring
+the exact key clears it. Replacement is explicit owner recovery after stopping or
+abandoning all controlled live generations and revoking hashes.
 
-`client-write-id.state` contains only monotonic ULID generator state. CLI takes the
-adjacent lock, re-reads state, advances it, atomically replaces the file, releases the
-lock and prints the id before sending. Missing state is seeded from daemon floor plus
-fresh randomness; it is not a credential.
+`client-write-id.state` contains monotonic ULID generator state only. CLI takes adjacent
+lock, re-reads, advances, atomically replaces, releases and prints id before sending.
+Missing state seeds from daemon floor plus fresh randomness; it is not a credential.
 
 Project `.eliot/{config.toml,rules/,scripts/}` is loaded only from a globally registered
-checkout, never an agent worktree. Agent edits take effect only after reaching that
-checkout. Invalid reload keeps the last valid revision and reports health.
+checkout, never an agent worktree. Edits apply only after reaching that checkout.
+Invalid reload keeps last valid revision and reports health.
 
 ## Configuration authority
 
@@ -56,9 +53,12 @@ proxies, services, webhooks, `env_mode=inherit`, arbitrary `pass_env`, daemon li
 another project path. Project rules/scripts execute under that project principal.
 
 A project agent/rule may launch only an effective profile in
-`[projects.<name>].profiles_allow`. Router checks this at admission and dispatch. Owner
-may launch any global profile. Thus project control cannot select a profile carrying
-another project's account, inherited environment, plugin command or proxy credential.
+`[projects.<name>].profiles_allow`. Every `extends` base must also be allowed. Router
+validates the fully resolved profile at admission and dispatch: effective
+`env_mode=inherit` is always owner-only, every effective `pass_env` name must be in the
+project allowlist, and account/proxy references must be allowed. The owner may launch
+any global profile. This prevents an allowlisted alias from smuggling another project's
+credential/environment through inheritance.
 
 ## Example
 
@@ -77,6 +77,7 @@ store.wal_hard_bytes = 2147483648
 limits.max_depth = 8
 limits.max_children_per_agent = 20
 limits.max_tree_agents = 100
+limits.max_selector_targets = 10000
 automation.max_runs_per_rule_per_minute = 10
 automation.max_actions_per_minute = 120
 automation.max_parallel_checks = 2
@@ -155,6 +156,10 @@ control = "project"
 labels = { role = "manager" }
 ```
 
+`max_selector_targets` is an accident/transaction guard, not a logical agent limit.
+Selector expansion above it fails before creating parent/child rows; callers narrow the
+selector or submit explicit batches. No partial fanout is admitted.
+
 ## Effective profile and launch binding
 
 Profile inheritance/project override resolves into one bounded canonical nonsecret
@@ -172,31 +177,31 @@ LaunchBinding {
 }
 ```
 
-`profile_revision` is a BLAKE3-256 digest of canonical effective profile and named
-references, never resolved secrets. Binding is stored with launch/resume and immutable.
-Queued work cannot silently adopt a new model/proxy/account/permission/environment name
-or setup after reload.
+`profile_revision` is BLAKE3-256 of canonical effective profile and named references,
+never resolved secrets. Binding is stored with launch/resume and immutable. Queued work
+cannot adopt new model/proxy/account/permission/environment/setup after reload.
 
 At dispatch daemon revalidates current prohibitions without substituting values:
 
-- project profile/account/proxy allowlists still permit frozen binding;
+- project profile/base/account/proxy and every effective `pass_env` remain allowed;
+- `env_mode=inherit` is not used by a project principal;
 - plugin/service exists and declares required mode/capability;
 - referenced paths remain safe;
 - capacity policy admits reservations;
 - provider hold permits operation or exact linked input is explicit probe;
-- routing key is available when a new/reissued token is required.
+- routing key is available when new/reissued token is required.
 
-A revoked binding fails before native I/O. Changed positive defaults do not rewrite it;
-caller cancels and submits a new command. Secret references resolve once immediately
-before start from frozen names and are never stored. Requested/effective facts are
-compared after start.
+A revoked binding fails before native I/O. Positive default changes do not rewrite it;
+caller cancels/submits new command. Secret references resolve immediately before start
+from frozen names and are never stored. Requested/effective facts are compared after
+start.
 
-Resume creates a new generation and binding from Agent profile (or explicit allowed
-owner profile). Exact recovery attach to same controlled generation reuses its binding.
+Resume creates new generation/binding from Agent profile (or explicit allowed owner
+profile). Exact recovery attach to same controlled generation reuses existing binding.
 
 ## Frozen workspace binding
 
-A worktree request is separate from profile and is frozen at admission:
+A worktree request is separate from profile and frozen at admission:
 
 ```text
 WorkspaceBinding {
@@ -206,11 +211,10 @@ WorkspaceBinding {
 }
 ```
 
-The daemon resolves `base_ref` with read-only local Git to one exact commit OID before
-admission; no implicit fetch occurs. `base_ref` is diagnostic, while `base_oid` is the
-authoritative creation/readback target. A missing/ambiguous ref rejects. Later movement
-of the branch/remote ref cannot change queued workspace creation. Existing branch/path
-must match the frozen OID or fail visibly. Setup revision is a digest of frozen argv/
+Daemon resolves `base_ref` with read-only local Git to exact commit OID before
+admission; no implicit fetch. `base_ref` is diagnostic, `base_oid` authoritative. A
+missing/ambiguous ref rejects. Later ref movement cannot change queued creation.
+Existing branch/path must match frozen OID or fail. Setup revision digests frozen argv/
 script identities and named environment references.
 
 ## Environment and secrets
@@ -223,7 +227,7 @@ certificate variables. Additional values are explicit:
 - profile `pass_env`: globally/project-allowed daemon value resolved at launch and
   treated as secret;
 - script environment references: resolved only after principal validation;
-- `secret_env`: literal environment names requiring masking;
+- `secret_env`: literal names requiring masking;
 - proxy/account/plugin credentials: automatically secret and delivered only where
   needed;
 - agent/automation token: automatically secret.
@@ -231,27 +235,25 @@ certificate variables. Additional values are explicit:
 Script rules are stricter:
 
 - global scripts may reference only `daemon.automation.script_pass_env_allow`;
-- project scripts require intersection of that list and project `pass_env_allow`;
+- project scripts require intersection with project `pass_env_allow`;
 - validation occurs before reading daemon environment or starting process;
 - returned script actions cannot request another environment reference.
 
-`env_mode="inherit"` is global-owner opt-in for trusted global profile and is shown as
-a warning. Secret values shorter than safe redaction minimum are rejected for managed
-injection rather than pretending masking is reliable. Agent tokens use a prefixed,
-high-entropy pattern that remains maskable after restart.
+`env_mode="inherit"` is global-owner opt-in for trusted global profile and shown as
+warning. Secret values shorter than safe redaction minimum reject managed injection
+rather than pretending masking is reliable. Agent tokens use prefixed high-entropy
+pattern maskable after restart.
 
-Normalized persisted source-spool envelopes are masked with the generation's frozen
-known-secret set before durable spooling. Eliot does not copy raw vendor streams into
-its spool; full raw detail stays in private vendor store. Resolved secret values never
-enter config, Store, rule/action payload or logs. Native output is masked; semantic
-durable text containing known secret rejects.
+Persisted source-spool envelopes are masked with generation's frozen known-secret set
+before spooling. Eliot does not copy raw vendor streams; full raw detail stays in
+private vendor store. Resolved secrets never enter config, Store, rule/action payload
+or logs. Native output is masked; semantic durable text containing known secret rejects.
 
 ## Capacity reservations and provider holds
 
-A frozen binding names capacity scopes: `profile:<name>`, optional `account:<id>` and
-`proxy|service:<id>`. In the same transaction that dispatches start and moves Agent to
-target generation, scheduler checks current limits and inserts a reservation per scope.
-All checks/inserts are atomic.
+Frozen binding names capacity scopes: `profile:<name>`, optional `account:<id>` and
+`proxy|service:<id>`. In transaction dispatching start/moving generation, scheduler
+checks limits and inserts reservation per scope atomically.
 
 ```sql
 CREATE TABLE capacity_reservations (
@@ -277,51 +279,46 @@ CREATE TABLE provider_holds (
 );
 ```
 
-Queue selects oldest command whose **all** frozen scopes are available; blocked account
-does not head-of-line-block unrelated scopes. Existing reservations count after limit
-lowering. Config edits affect future dispatch, never move existing generation.
+Queue selects oldest command whose all frozen scopes are available; blocked account does
+not block unrelated scopes. Existing reservations count after limit lowering. Config
+edits affect future dispatch, never move existing generation.
 
 Starting/live and unresolved start/session outcomes retain reservations. Exact terminal
-or definite no-session start failure releases. Detach of independently live session
-does not free reservation merely by surrendering control; exact observed terminal does.
+or definite no-session failure releases. Detach of independently live session does not
+free capacity until observed terminal.
 
 Provider hold blocks provider-backed launch, send and Goal continuation in proven scope,
 not stop/interrupt/request reply/readback/local checks. Unknown coverage holds exact
 route/profile only.
 
-After `retry_after`, recovery requires explicit `probe=true` on:
-
-- send to exact generation; or
-- launch/resume with linked prompt, where linked send—not session creation—is probe.
-
-Router atomically claims `probe_command`; one probe exists. Owner/current controlled
-agent may request. Rules, timers, Goal, mail/parent wake and hidden model calls cannot.
-Hold clears only after exact successful provider turn. Unknown keeps hold/probe. Auth/
-model-gone requires explicit config change absent recovery evidence.
+After `retry_after`, recovery requires explicit `probe=true` on exact send or
+launch/resume with linked prompt (linked send is probe). Router atomically claims one
+probe. Owner/current controlled agent may request; rules, timers, Goal, mail/parent wake
+and hidden calls cannot. Hold clears only after exact successful provider turn. Unknown
+keeps hold/probe. Auth/model-gone requires explicit config change absent recovery proof.
 
 ## Profiles, setup and paths
 
-One-level `extends`; project profile replaces global profile after project validation.
-Unknown keys error except plugin-private global keys validated at initialize. Names,
-labels, argv/environment counts and values are bounded.
+One-level `extends`; project profile replaces global after project validation. Unknown
+keys error except plugin-private global keys. Names, labels, argv/environment counts and
+values are bounded.
 
-Project setup executables are repository-relative versioned files under
-`.eliot/scripts/`; global owner profiles may additionally name configured resolved
-executables. Setup runs with project principal's scoped read-only automation token,
-minimal environment and global∩project allowlist. It never gets owner by omission.
+Project setup executables are repository-relative versioned `.eliot/scripts/` files;
+global owner profiles may name configured resolved executables. Setup runs with project
+principal's read-only automation token, minimal environment and global∩project allowlist.
 
 `setup`, `scratch`, scripts and system notes are repository-relative and reject absolute
-paths, `..`, symlink escape and alternate-stream/device forms. Different Rust worktrees
-use distinct `CARGO_TARGET_DIR`s.
+paths, `..`, symlink escape and alternate-stream/device forms. Rust worktrees use
+distinct `CARGO_TARGET_DIR`s.
 
 ## Plugins, sources, services and webhooks
 
-External plugin `cmd` is global-only. `instances` is shared-only; per-agent gets a
-private instance/data directory per generation. Operator cannot override custody mode.
-Shared control proves per-session environment, identity, readback and isolated stop.
+External plugin `cmd` is global-only. `instances` is shared-only; per-agent gets private
+instance/data directory per generation. Operator cannot override custody mode. Shared
+control proves per-session environment, identity, readback and isolated stop.
 
-Source spool limits apply per authoritative source key. Plugin backpressures or commits
-explicit gap at cap; it never drops lifecycle silently or expands without bound.
+Source spool limits apply per source key. Plugin backpressures or commits explicit gap
+at cap; never drops lifecycle silently or expands unboundedly.
 
 Attached service is owner-run and never stopped/reconfigured. Managed service has
 separate custody and persisted endpoint/process identity. Agent stop never stops shared
@@ -334,17 +331,17 @@ otherwise lost response remains unknown and is never retried.
 ## Retention, idempotency and WAL limits
 
 `retention.idempotency_days` is at least largest automatic retry/support window and at
-least 30 days. Receipt lookup precedes floor checks, so existing open/final receipt is
-readable even below current floor; only absent id at/below floor is expired.
+least 30 days. Receipt lookup precedes floor checks, so existing receipt remains
+readable below floor; only absent id at/below floor expires.
 
-Terminal receipts expire by `admitted_at`; pruning advances floor through their ULID
-timestamps transactionally. Open/unknown receipts never age-prune. Domain history may
-use other retention only after compact projections/receipt summaries preserve readback.
-Unread mail, open batches, unresolved input/turn/action, held capacity, current source
-watermark, dirty edit attribution and `orphan_possible` custody never age-prune.
+Terminal receipts expire by `admitted_at`; pruning advances floor transactionally.
+Open/unknown receipts never age-prune. Domain history may use other retention only after
+compact projections/receipt summaries preserve readback. Unread mail, open batches,
+unresolved input/turn/action, held capacity, current source watermark, dirty edit
+attribution and `orphan_possible` custody never age-prune.
 
 Daemon passive-checkpoints, records WAL/database size and tracks Eliot-owned readers.
-Replays paginate/release transactions. At hard size, reject new work and long reads
-while reserving short commits for stop/interrupt/request replies/results. Real disk/
-SQLite failure enters Store error boundary; configured limit is not claimed to defeat
-full disk. Never delete evidence, kill unknown reader or blind-truncate active readers.
+Replays paginate/release transactions. At hard size, reject new work/long reads while
+reserving short commits for stop/interrupt/request replies/results. Real disk/SQLite
+failure enters Store error boundary. Never delete evidence, kill unknown reader or
+blind-truncate active readers.
