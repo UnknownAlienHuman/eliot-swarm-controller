@@ -1,155 +1,141 @@
 # Client API and CLI
 
-## Transport and caller identity
+## Transport/identity
 
-- JSON-RPC 2.0 over UTF-8 NDJSON.
-- Windows named pipe is current-user ACL only; Unix socket is mode `0600` inside a
-  private data directory.
-- One daemon owns one data directory and OS lock. `daemon.json` records PID plus process
-  birth identity; clients reject stale PID reuse.
-- No supplied agent token means owner. A supplied invalid, incomplete or stale token is
-  rejected and never downgraded to owner. If any `ELIOT_AGENT_*` variable is present,
-  the CLI requires the complete current triple.
-- API frame maximum is 4 MiB; command/mail/var limits are smaller.
+JSON-RPC 2.0 over UTF-8 NDJSON. Current-user-only Windows pipe or Unix `0600` socket
+inside private data root. One daemon/data-dir OS lock; `daemon.json` includes PID +
+process birth identity.
 
-## Main methods
+No token means owner. Any supplied/inherited agent identity must contain matching id,
+generation and valid raw token; invalid/incomplete/stale never falls back to owner.
+Automation scripts receive a scoped automation token. API frame ≤4 MiB; semantic limits
+are smaller.
 
-| Method | Result/semantics |
+## Methods
+
+| Surface | Semantics |
 | --- | --- |
-| `daemon.status` | version, uptime, admission mode, Store/WAL health, plugin/custody backends, source gaps, account/provider holds, state/open-effect counts |
-| `daemon.shutdown` | exact drain/force semantics below |
-| `agent.list/get` | paginated rows; get includes current/target generation, native subject, goals, requests, open commands/actions and source ownership |
-| `agent.wait` | captures target generation at call start; replacement generation is stale, not success |
-| `agent.result` | bounded completed turns for explicit/current generation |
-| `command.submit/get` | durable command admission/readback |
-| `events.read/subscribe` | persisted replay plus bounded live stream |
-| `hook.event` | generation-bound synchronous hook decision |
-| `agent.discover` | native subjects not yet attached/controlled |
-| `agent.attach` | return the canonical existing agent row for that native subject, or create one; optionally acquire control after exact attach |
-| mailbox/vars/who/claims | coordination methods |
-| rule/timer/action methods | automation state, dry run, cancellation and manual resolution |
+| daemon status/shutdown | admission, Store/WAL, custody/source/account holds; exact drain/force |
+| agent list/get | paginated current projections, generation/native subject/open effects |
+| agent wait/result | exact captured generation/turn/goal terminal result |
+| command submit/get | durable linked session/input commands and readback |
+| events read/subscribe | bounded persisted replay + live stream with explicit gaps |
+| hook event | generation/request-bound synchronous decision |
+| discover/attach/detach | canonical native subject; one Agent row |
+| mail send/inbox/ack/read | durable coordination with explicit acknowledgement |
+| vars/who/claims | scoped coordination |
+| rule/timer/action/goal | scoped automation state/dry run/cancel/manual resolution |
 
-### `command.submit`
+## Command admission
 
 ```text
 params {
   id?, target?, verb, args,
-  expected_generation?, expected_turn_id?, request_id?,
-  wait_ms? [10000]
+  expected_generation?, expected_turn_id?, request_id?, wait_ms?
 }
 result {
   command_id, agent?, expected_generation?, generation?, state, outcome?,
-  linked_command?      // initial send created by launch/resume prompt sugar
+  linked_command?
 }
 ```
 
-Admission is one Store transaction:
+One transaction resolves target/selector, validates principal/capability/state and any
+expected binding, captures immutable target generation/turn/request, and creates all
+rows/events.
 
-1. resolve target/selector;
-2. validate authority/capability/state and any expected binding;
-3. capture immutable expected/target generation, turn and request;
-4. create command rows/events, including linked initial send where requested.
+Ordinary expected=target current generation. Launch has no expected generation and
+targets 1. Resume expects terminal g and targets g+1; row/token change only when resume
+dispatch commits.
 
-For an ordinary command, expected and target generation are the current generation.
-Launch targets generation 1 with no expected generation. Resume validates terminal
-`g`, targets `g+1`, and moves the agent row only when resume dispatch commits.
+Launch/resume with text returns session command + linked send. Waiting without `--wait`
+means session readiness only. `--wait` with text waits for the linked command's exact
+turn and prints it. Start and initial input never share one outcome.
 
-`eliot launch ... PROMPT` and `eliot resume ... PROMPT` return a session command plus a
-separate linked send command. Waiting on launch/resume waits for session readiness, not
-turn completion. `--wait` with a prompt waits for the linked send's exact turn and
-prints that result. A lost session-start reply never silently settles the input.
+Interactive calls may omit expected fields; the admission transaction captures them.
+Durable automation supplies frozen values. Interactive selectors expand at admission;
+automation already stores concrete targets.
 
-Interactive callers may omit expected fields; the transaction captures them. Durable
-rules/scripts must supply the frozen values from their admitted action. A selector
-submitted interactively expands at command admission. Automation selectors are already
-expanded at rule firing.
+Same external write id + canonical payload returns original result; different payload
+is invalid. Internal ids are fixed derived ids.
 
-All writes accept an optional external id. Reusing the same id and canonical payload
-returns the original row; different payload is invalid. Internal child ids are fixed
-length derived ids, not string concatenations.
+Errors: `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`,
+`invalid`, `busy`, `unavailable`, `history_gap`, `secret_in_payload`, `internal`.
 
-Stable error codes: `not_found`, `unsupported`, `not_allowed`, `bad_state`,
-`stale_generation`, `invalid`, `busy`, `unavailable`, `internal`,
-`secret_in_payload`.
+## Wait semantics
 
-### Attach/discover
+`agent.wait` captures each target's generation at call start.
 
-`agent.discover` returns native subjects only; it does not create rows. `agent.attach`
-looks up the unique (`native_scope`,`native_ref`):
+- `turn` with `after_command`: wait for the exact turn correlated to that command;
+- `turn` without it: if busy/waiting, wait for current active turn; if idle, wait for
+  the first turn starting after the call's event high-water;
+- `idle`: immediate if captured generation is idle;
+- `stopped`: stopped/failed/lost for captured generation;
+- `goal`: done/blocked for captured goal revision.
 
-- existing row → return it; an observe-only caller simply subscribes;
-- existing observe-only row + control requested → exact plugin attach, then update the
-  same row if allowed;
-- absent subject → create one external row and attach;
-- another live control path or unverified takeover → `not_allowed`.
+Replacement generation returns `stale_generation`, never success for different work.
+Timeout has no cancellation side effect.
 
-This prevents duplicate agent rows and duplicate rule firings for one native session.
+## Attach/discover
 
-## Drain and shutdown
+Discover returns subjects only. Attach looks up unique subject: return existing row,
+upgrade observe-only to control after exact native attach, or create one external row if
+absent. Another live control path/unverified takeover rejects. Detach changes the same
+row. Native subject reuse requires a new scope.
 
-`daemon.shutdown {drain:true}` first commits admission mode `draining`.
+## Drain/shutdown
 
-During drain:
+Drain commits admission mode first. It rejects new work-starting commands/runs but
+allows exact interrupt/stop/request replies/cancel/detach/goal pause-clear, queries and
+manual resolution. All pre-boundary work continues, including queued sends/action
+chains; streams/readback stay alive.
 
-- reject launch/send/steer/inject/resume/fork/background/goal set or resume;
-- allow exact interrupt/stop/approve/deny/answer/cancel/detach/goal pause or clear,
-  queries and manual unknown resolution;
-- admit no new rule/timer/goal rounds and dispatch no newly admitted automation action;
-- continue all work admitted before the drain boundary, including queued sends and
-  action chains;
-- keep native streams, requests, results and readback alive.
+Exit waits for pre-drain effects and daemon-owned sessions. Unknown outcomes are
+blockers. Once admitted commands settle, external/attached service sessions may be
+detached without killing them. Without drain, shutdown refuses owned live work. Force
+kills only exact supported custody, marks ambiguous effects unknown and never kills
+attached owner services.
 
-Exit waits for pre-drain work to settle, process actions to end, and daemon-owned
-sessions to end/stop. Unknown effects are reported blockers; drain never fabricates a
-resolution. Without drain, shutdown refuses while owned work is live. `force` kills
-only exact supported custody groups/sessions, marks ambiguous outcomes unknown, and
-never kills attached owner services.
+## Event replay/gaps
 
-## Event subscription boundary
+Subscribe registers bounded live buffer, captures Store high-water, replays bounded
+pages `(after_seq,high_water]`, then releases buffered persisted events in order. No
+read transaction spans client wait. Ephemeral replay-window events are best effort.
+Overflow emits `events.lagged`.
 
-The daemon registers a bounded live buffer, captures Store high-water `seq`, replays
-persisted pages through it, then releases buffered persisted events above the
-watermark in order. It never holds a SQLite read transaction while waiting on a client.
-Ephemeral events buffered during replay are best effort and have no total-order claim.
-Overflow emits `events.lagged`; it is never silent.
+Store exposes `earliest_seq`. If caller requests an already-pruned sequence, default is
+`history_gap {requested,earliest}`. With explicit `allow_gap=true`, stream first emits
+`events.gap` and continues from earliest. No silent jump. Rule cursors use stricter
+retention coordination and never opt into a silent gap.
 
-## Mail read semantics
+## Mail acknowledgement
 
-`mail.inbox` returns unread messages and a stable delivery batch id. It does not mark
-them read until the same client acknowledges that batch (`mail.ack`, used automatically
-by the CLI after writing complete stdout successfully). A lost reply therefore leaves
-the batch unread and recoverable. `mail.read ID` is an explicit one-message read/ack.
-`--all` includes acknowledged history.
+One open immutable inbox batch/recipient. `mail.inbox` repeatedly returns it until
+`mail.ack(batch_id,id)` commits; newly arrived messages wait for next batch. CLI writes
+complete stdout before ack. Lost inbox leaves unread; lost ack uses same id/readback.
+`mail.read ID` explicitly acknowledges one message. `--all` includes acknowledged
+history.
 
 ## CLI
 
-Every write supports `--id`; the CLI generates and prints one otherwise. Delayed
-scripts may pass `--generation`, `--turn` and `--request`. User-facing commands:
-
 ```text
-eliot daemon [--foreground]
-eliot daemon stop [--drain | --force]
+eliot daemon [--foreground] | daemon stop [--drain|--force]
 eliot status
 eliot launch [profile/workspace/tree options] [PROMPT] [--wait]
 eliot ls | show A | watch [A|SELECTOR] | top
 eliot send|inject A TEXT [--generation N]
 eliot steer A TEXT [--or-send] [--generation N] [--turn ID]
-eliot wait TARGET... [--for turn|idle|stopped|goal] [--timeout DUR]
+eliot wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
 eliot result A [--generation N] [--turns N]
 eliot interrupt|abort A [--generation N] [--turn ID]
 eliot stop A [--force] [--tree] [--generation N]
 eliot resume A [PROMPT] [--generation N] [--wait]
-eliot approve|deny A [--request R] [--remember] [--generation N]
-eliot answer A [TEXT] [--request R] [--choice N] [--generation N]
-eliot configure A [--model M] [--effort E] [--permissions P]
-eliot compact|fork|background A
-eliot goal set|pause|resume|clear|show ...
+eliot approve|deny|answer ...
+eliot configure ... | compact|fork|background ... | goal ...
 eliot cmd show|cancel|resolve ...
 eliot action show|cancel|resolve ...
-eliot events ...
+eliot events [--since SEQ] [--allow-gap]
 eliot msg send ... | inbox [--wait SECS] [--all]
-eliot var get|set|list|watch ...
-eliot who ... | claim ... | release ...
+eliot var ... | who ... | claim ... | release ...
 eliot rule ... | rules pause|resume | timer list|run
 eliot discover | attach ... | detach A
 eliot service list|stop | worktree remove | doctor
@@ -157,18 +143,9 @@ eliot daemon install|uninstall
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 
-### Exit codes
+Exit codes: 0 success/queued; 1 definite error; 2 usage; 3 rejected before effect; 4
+unknown; 5 wait timeout; 6 still pending/dispatched.
 
-| Code | Meaning |
-| --- | --- |
-| 0 | query ok; effect applied/queued; cancellation succeeded |
-| 1 | definite error/failure |
-| 2 | CLI usage error |
-| 3 | rejected before native/external effect |
-| 4 | outcome unknown |
-| 5 | wait timed out |
-| 6 | still dispatched/pending when the CLI stopped waiting |
-
-The daemon injects `ELIOT_HOME`, agent id, generation, raw token and `eliot` on PATH.
-The Store contains only token hash. Known token/credential values are masked from native
-output and rejected from durable user payloads.
+Daemon injects home, agent id/generation/raw token and CLI path. Store has only token
+hash. Known credentials are masked from native output and rejected in durable semantic
+payloads.
