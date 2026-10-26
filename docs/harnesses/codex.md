@@ -2,99 +2,122 @@
 
 Layer L2, first real harness. Rust plugin, default `per_agent`: one plugin + one
 app-server per Eliot generation because tools inherit app-server environment. Shared
-service mode remains per-agent endpoint unless upstream proves per-thread environment
-isolation.
+service remains one endpoint per agent unless upstream proves per-thread environment,
+identity and isolated stop.
 
-Facts checked 2026-10-25 against `openai/codex` main/release `rust-v0.164.0` and
-official app-server/config/hook docs. App-server is experimental; commit the schema
-from the owner's installed binary before implementation.
+Facts checked 2026-10-25 against `openai/codex` main/release `rust-v0.164.0` and official
+app-server/config/hook docs. App-server is experimental; commit schema from owner's
+installed binary before implementation.
 
-## Transport
+## Transport and custody
 
-`codex app-server --listen stdio://` uses newline JSON-RPC-shaped messages without the
-`jsonrpc` field. Initialize with generated-schema capabilities and send the exact
-initialized notification from that schema. Do not use a strict JSON-RPC codec requiring
-`jsonrpc:2.0`.
+`codex app-server --listen stdio://` uses newline JSON-RPC-shaped messages without
+`jsonrpc` field. Initialize with generated-schema capabilities and exact initialized
+notification; do not use strict JSON-RPC codec requiring `jsonrpc:2.0`.
 
-One app-server/thread is bound to one Eliot `(agent,generation)`, profile environment,
-workspace and account. `CODEX_HOME` login is owner-managed; Eliot never runs login or
-silently changes subscription/API/proxy route.
+One app-server/thread is bound to one Eliot `(agent,generation)`, frozen profile,
+workspace/account and per-agent custody. `CODEX_HOME` login is owner-managed; Eliot
+never logs in or changes subscription/API/proxy route silently.
+
+The plugin opens stable source epochs before publishing persisted facts:
+
+- app-server stream owns session/turn/message/tool/request/goal families;
+- optional per-agent descendant registration has a separate process-registration
+  source;
+- rollouts own only observe-only or explicit recovery after handoff.
+
+Every persisted fact is commit-acknowledged with contiguous source sequence. Lost reply
+resends identical envelope; vendor reconnect duplicate cannot fire lifecycle twice.
 
 ## Start and initial input
 
 Codex supports session start without input:
 
 1. `agent.start` → `thread/start` only;
-2. read/validate effective thread id, cwd, model/provider/permissions;
-3. emit `session.ready` and return session success;
-4. dispatch the linked initial `send` separately through `turn/start`.
+2. validate effective thread id, cwd, model/provider/permissions;
+3. open source families and commit `session.ready`;
+4. return session success;
+5. dispatch linked initial `send` separately via `turn/start`.
 
-`features.start_requires_input=false`. Never combine launch and first turn in one
-outcome. A lost `thread/start` reply is read back or remains unknown; no replacement
-thread. A lost `turn/start` reply affects only the linked send.
+`start_requires_input=false`. Never combine launch/first turn. Lost thread-start reply
+is read back or unknown; no replacement thread. Lost turn-start affects only linked
+send. Native/HTTP write acceptance is not applied until exact Codex turn association.
 
-Resume creates a new Eliot generation/app-server and calls `thread/resume` for the
-retained canonical thread subject. Old prompt is never resent; optional resume text is
-a separate linked send.
+Resume creates new Eliot generation/app-server and calls `thread/resume` for retained
+canonical thread subject. Old prompt is never resent; optional text is linked send.
 
 ## Verb mapping
 
 | Eliot | Codex |
 | --- | --- |
-| send | `turn/start`; use Eliot command id as native correlation where accepted, never as vendor idempotency proof |
-| steer | `turn/steer` with exact active `expectedTurnId`; page thread turns to the end for readback |
-| inject | exact steer while busy or explicit prepend-next-send while idle; report mechanism |
-| interrupt | `turn/interrupt` for exact turn; unknown is not retried |
-| stop | exact interrupt if active, clear native goal, close/end thread if available, then stop this app-server custody unit |
-| approve/deny | exact command/file/permission request reply and offered native choice |
+| send | `turn/start`; Eliot command id may correlate where accepted, never vendor idempotency proof |
+| steer | `turn/steer` with exact `expectedTurnId`; page history to end for readback |
+| inject | exact steer while busy or explicit prepend-next-send while idle |
+| interrupt | `turn/interrupt` exact turn; unknown never retried |
+| stop | exact interrupt if active, clear native goal, close/end thread if available, then stop per-agent app-server custody |
+| approve/deny | exact native request id and offered choice |
 | answer | exact `requestUserInput` id |
-| configure | supported turn/session fields; report `now|next_turn|next_session` and effective readback |
-| goal | native `thread/goal/set|clear` and status mapping; generation change pauses Eliot projection |
-| fork | native `thread/fork`; resulting thread is a new canonical Agent row |
+| configure | supported turn/session fields, application point + effective readback |
+| goal | native set/clear/status; generation change pauses projection |
+| fork | native `thread/fork`; new thread is new canonical Agent row |
 
-`stop --force` is exact only on an exact custody backend. Degraded Unix fallback rejects
-that guarantee. Stop clears native goal because v1 observed stopped sessions waking.
+Force is exact only on exact custody backend. Degraded Unix rejects exact force. Stop
+clears native goal because v1 observed stopped sessions waking.
 
-## Events/source ownership
+## Events and readback
 
-The controlled app-server stream owns live session/turn/message/tool/request/goal
-families. Rollouts are for discovery/observe-only or explicit cursor recovery, never a
-concurrent duplicate source.
+The app-server stream is authoritative while controlled. Map exact thread/turn/item/
+request/update ids. One item producing multiple kinds needs distinct per-event IDs.
+Final output commits before terminal completion.
 
-Map exact thread/turn/item/request ids. One native item may yield different normalized
-kinds; use unique event/update ids so Store dedupe does not erase valid transitions.
-A reconnect suppresses committed ids. If app-server/rollout cannot prove a cursor
-boundary, report a gap rather than replaying completion.
+Reconnect first reads daemon source watermark and native thread history. If app-server/
+rollout cannot bridge exact native cursor, close source gapped rather than replaying old
+completion. Empty active-list without terminal history becomes `not_active_unknown`,
+not idle/completed.
 
-Children are registered from exact parent/child thread ids using filtered, paginated
-`thread/list` plus notifications. Child scope/ref must be canonical; unfiltered lists
-can hide subagents and are not atomic, so coverage may be partial.
+Observe-only attach reads thread/rollout and never resumes/sends/goals/forks. Read is not
+subscription; silence is not liveness.
 
-Observe-only attach reads thread/rollout and never resumes/sends/goals/forks. Read is
-not subscription. Silence is not liveness.
+## Native children and attribution
+
+Subagent threads are registered from exact parent/child thread ids using filtered,
+paginated `thread/list` plus notifications. Child scope/ref is canonical; unfiltered
+list may hide children and pagination is not atomic, so coverage can be partial.
+
+Current app-server process environment is shared by its threads. Until installed
+upstream behavior proves per-thread child environment injection, manifest declares
+`child_environment=false`: child row exists for observation/control verbs the native
+protocol exposes, but child shell/CLI calls inherit parent Eliot token/Git identity and
+are attributed to parent. Eliot never invents a distinct child token. L7 must test any
+future claim before changing this.
+
+Shared/app-server PID belongs to this per-agent custody. Under future shared service
+mode the server PID would be `service:<name>` custody, never assigned to child/agent
+sessions.
 
 ## Permissions and proxy
 
 Confirm installed enum fields, then map normalized permissions to Codex sandbox/
-approval policy. Requested and effective values remain separate.
+approval policy. Requested/effective values remain separate.
 
-OpenCodex/Responses-compatible route uses a named provider with explicit `/v1`,
-`wire_api=responses`, named environment key and required headers. Launch overrides are
-per-agent; never edit owner global config. Account and proxy capacity are shared scopes.
-A successful main turn verifies only that request path, not titles/compaction/subagents.
+OpenCodex/Responses route uses named provider with explicit `/v1`, Responses wire API,
+named env key and required headers. Frozen per-agent binding never edits owner global
+config. Account/proxy capacity are shared scopes. Main turn verifies only that request
+path, not auxiliary/title/compaction/subagent calls.
 
 ## L7 cases
 
-- thread start vs linked first turn at every lost-reply point;
+- lost `source.open`, ready and linked first-turn acknowledgements;
 - effective model/provider/cwd mismatch;
-- long-thread pagination and stale expected turn;
-- exact approvals/questions and goal wake-on-stop prevention;
-- duplicate reconnect events/source gap;
-- child coverage and canonical subject;
-- daemon death/force on Windows exact and Linux exact/degraded backends;
-- direct and OpenCodex route, requested vs effective billing;
-- upstream facts still unverified: initialized notification/setting fields, `-c`
-  override behavior, steer during approval, stdin-close behavior and exact close API.
+- long-history pagination, stale expected turn and missing terminal → unknown;
+- exact approvals/questions and goal clear on stop;
+- reconnect vendor duplicate/source gap;
+- child canonical subject, partial coverage and parent attribution with no child env;
+- descendant process registration vs OS enumeration exactly once;
+- Windows exact and Linux exact/degraded daemon death/force;
+- direct/OpenCodex requested vs effective route and auxiliary calls;
+- installed facts still unverified: initialized notification/settings, `-c` overrides,
+  steer during approval, stdin-close and exact close API.
 
-Useful v1 protocol edge cases are at
+Useful v1 edge cases:
 `dc6f70aa:crates/swarm-adapter-codex/src/lib.rs`; do not port journals/checkpoints.
