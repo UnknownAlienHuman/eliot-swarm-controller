@@ -22,25 +22,23 @@ different canonical payload is an integrity failure, never idempotent success.
 ### External write idempotency and retention
 
 Every owner/agent/API mutation obtains a `WriteId` before the request leaves the
-client. The daemon performs receipt lookup **before** timestamp-floor checks:
+client. Receipt lookup happens **before** timestamp-floor checks:
 
-1. existing id + same principal/method/canonical payload returns the original/current
-   result;
+1. existing id + same principal/method/canonical semantic payload returns the
+   original/current result;
 2. existing id with any mismatch fails `id_conflict`;
 3. only an absent id is checked against the persisted floor, live idempotency window
    and future-skew limit;
 4. a valid absent id inserts one compact receipt in the same transaction as the domain
    mutation.
 
-The receipt stores a BLAKE3-256 payload digest and a bounded sanitized result/reference.
+The receipt stores a BLAKE3-256 payload digest and bounded sanitized result/reference.
 Terminal domain rows may be pruned earlier. Receipt pruning advances
 `write_id_floor_ms` monotonically through the largest pruned ULID timestamp in the same
 transaction, so a later retry is `id_expired`, never a new effect.
 
 The CLI uses a current-user-only, locked monotonic ULID state file. Generation and file
-replacement are atomic; concurrent CLI processes cannot intentionally reuse one local
-state transition. A missing file is seeded from daemon `write_id_floor_ms` plus fresh
-randomness.
+replacement are atomic. A missing file is seeded from daemon floor plus fresh randomness.
 
 Internal derived ids never consume the external receipt namespace. Their dedupe lifetime
 is defined by the durable parent command, rule/action, timer, goal or source object.
@@ -49,62 +47,63 @@ is defined by the durable parent command, rule/action, timer, goal or source obj
 
 One native subject maps to one Agent row for its history. Observe clients subscribe to
 that row. Attach returns or upgrades it; detach changes control on the same row. Resume
-retains the subject; a different subject is a fork/new Agent. Scope must change before
-a vendor may reuse refs.
+retains the subject; a different subject is a fork/new Agent. Scope changes before a
+vendor may reuse refs.
 
-Native child registration supplies child scope/ref. Parent-local child ids use a scope
-containing the exact parent native subject. Parent generation is provenance, not
-identity.
+Native child registration supplies child scope/ref. Parent-local ids use a scope
+containing the exact parent subject. Parent generation is provenance, not identity.
 
 ## Agent
 
 ```text
 Agent {
-  id, generation, name?, project,
-  parent?, root, depth,
+  id, generation, token_version,
+  name?, project, parent?, root, depth,
   origin: eliot | native | external,
-  harness, profile,
-  native_scope?, native_ref?,
+  harness, profile, native_scope?, native_ref?,
   workspace?, workspace_state?, branch?, base_ref?,
   state, active_turn?, stalled_since?, last_progress_at?,
-  pending: [Request],
-  goal?, effective?, labels,
-  control: self | tree | project,
-  observe_only,
+  pending: [Request], goal?, effective?, labels,
+  control: self | tree | project, observe_only,
   created_at, updated_at
 }
 ```
 
-Generation 0 has no routing token. First start/resume creates one raw high-entropy
-`eliot_at_<base64url>` token, stores only a domain-separated BLAKE3-256 hash and injects
-the raw value once. Hash comparison is constant-time; the prefix remains pattern-
-redactable after restart.
+The private data directory contains one current-user-only `routing.key`, generated
+atomically and never stored in SQLite/logs. Raw routing token is deterministically
+re-derived with keyed BLAKE3 from `(agent id,generation,token_version)` and encoded as
+`eliot_at_<base64url>`. Store keeps only a domain-separated hash of the raw token;
+comparison is constant-time. Deterministic derivation makes a lost child/control-attach
+reply retryable without persisting raw tokens.
 
 Token presence follows routing lifecycle:
 
-- controlled live (`starting|idle|busy|waiting`, not observe-only) has one hash;
+- controlled live (`starting|idle|busy|waiting`, not observe-only) has one hash and
+  positive token version;
 - generation 0, terminal, detached and observe-only have no hash;
-- terminal/detach revocation clears the hash in the same transaction without changing
-  generation;
-- an explicit control reattach to the same still-live incarnation preserves generation
-  but issues a fresh token after exact native attach;
-- daemon/plugin recovery of an already controlled incarnation preserves its existing
-  hash/token; resume creates the next generation and a new token.
+- terminal/detach clears hash transactionally without changing generation/version;
+- explicit control reattach to the same live incarnation preserves generation,
+  increments token version and installs a fresh token after exact native attach;
+- daemon/plugin recovery of an already controlled incarnation preserves its current
+  version/hash; resume increments generation and token version.
 
-Invalid, revoked or stale supplied identity is rejected, never owner.
+If `routing.key` is unavailable, existing raw tokens can still be verified against their
+stored hashes, but Eliot cannot re-derive/reissue one. Operations requiring token
+reinstallation fail visibly until exact rotation is possible; they never mint an
+unrelated token silently.
 
 ### States
 
-Live states are `starting`, `idle`, `busy`, `waiting`. An open stop is displayed beside
-the observed state, never as synthetic `stopping`.
+Live states are `starting`, `idle`, `busy`, `waiting`. Open stop is displayed beside
+observed state, never synthetic `stopping`.
 
 | From | Exact input | Effect |
 | --- | --- | --- |
-| — | launch admitted | `created`, generation 0 |
-| created | first start dispatched | generation 1, token rotation, `starting` |
-| created | cancel/stop before dispatch | launch and linked send cancelled, `stopped` |
-| terminal g | resume dispatched with expected g | generation g+1, token rotation, clear turn/requests, `starting` |
-| starting | matching `session.ready` | `idle` |
+| — | launch admitted | `created`, generation 0, token version 0 |
+| created | first start dispatched | generation 1, increment token version, hash token, `starting` |
+| created | cancel/stop before dispatch | launch/linked send cancelled, `stopped` |
+| terminal g | resume dispatched with expected g | generation g+1, increment token version, hash token, clear turn/requests, `starting` |
+| starting | matching ready | `idle` |
 | starting | definite no-effect start failure | `failed`, revoke token; linked send fails without I/O |
 | starting | lost reply after possible start | state unchanged; start unknown; linked send blocked |
 | idle | exact turn start t | `busy`, `active_turn=t` |
@@ -115,28 +114,27 @@ the observed state, never as synthetic `stopping`.
 | any live | fatal session error | `failed`, revoke token, clear turn/requests, pause goals |
 | any live | exact custody/session loss | `lost`, revoke token, clear turn/requests, pause goals |
 
-Resume expects g and targets g+1; the row changes only when dispatch commits. Only one
-resume may be open. Cancelling a queued resume cancels its linked send and leaves g.
+Resume expects g and targets g+1; row change occurs only when dispatch commits. Only one
+resume may be open. Cancelling queued resume cancels its linked send and leaves g.
 
-Detach is valid only for an attached/service-backed lifetime that remains independently
-observable and reattachable. It preserves observed state, sets observe-only, revokes the
-token and releases claims transactionally. A daemon-owned per-agent process must stop.
+Detach is valid only for attached/service-backed lifetime that remains independently
+observable and reattachable. It preserves observed state, sets observe-only, revokes
+token and releases claims transactionally. Daemon-owned per-agent process must stop.
 
 An asynchronous input accepted by a vendor inbox but not associated with a native turn
-keeps `send` dispatched. `input.admitted` records the command and native input id without
-changing Agent state or freeing the input lane. Another send, configure or goal
-continuation is blocked; exact control/stop/readback remains allowed. Exact pre-turn
-drop settles failed. Exact turn association settles command applied. Deadline after
-possible admission produces unknown and preserves the same readback key/lane.
+keeps `send` dispatched. `input.admitted` records command/native input id without
+changing Agent state or freeing the lane. Another send/configure/goal continuation is
+blocked; exact control/stop/readback remains. Exact pre-turn drop settles failed. Exact
+turn association settles command applied. Deadline after possible admission produces
+unknown and preserves the same readback key/lane.
 
-If reconnect proves the session exists but cannot prove the active turn terminal
-outcome, the turn becomes unknown. A live Agent remains busy/waiting and blocks new
-turn/goal work. Exact history may settle it. Owner `turn.resolve` is allowed only when
-native readback proves not active or generation terminal; it records `turn.resolved`,
-never fabricated plugin completion.
+If reconnect proves session exists but not active-turn terminal outcome, turn becomes
+unknown. Live Agent remains busy/waiting and blocks new turn/goal work. Owner
+`turn.resolve` is allowed only after native-not-active proof or terminal generation and
+records `turn.resolved`, never fabricated plugin completion.
 
-A terminal generation may retain historical unknown work; resume starts a new
-generation and unknown never crosses it. Only exact-generation model progress updates
+Terminal generation may retain historical unknown work; resume starts a new generation
+and unknown never crosses it. Only exact-generation model progress updates
 `last_progress_at`.
 
 ## Profile
@@ -153,7 +151,7 @@ Profile {
 ```
 
 Environment/account semantics are in [configuration](configuration.md). Profile cap is
-a local narrowing; account/proxy caps are shared. Requested/effective route facts stay
+local narrowing; account/proxy caps are shared. Requested/effective route facts stay
 separate and are never silently substituted.
 
 ## Events
@@ -168,52 +166,52 @@ Event {
 For an agent event, `subject` is a bounded post-transition snapshot:
 `{id,generation,project,parent,root,depth,harness,profile,state,workspace?,branch?,
 control,observe_only,labels}`. It contains no token, credential, request text or
-unbounded effective settings. Rules use this snapshot, never a later Agent row.
+unbounded effective settings. Rules use this snapshot, never later Agent state.
 
 Known secrets/token patterns are masked in native output/logs. Semantic durable writes
 containing a known secret reject rather than storing altered text.
 
 ### Commit-acknowledged source sequence
 
-The daemon allocates one bounded `source_key` per authoritative ownership epoch. The
-source emits a strictly contiguous positive `source_seq`, durably assigning the exact
-typed envelope before send and permitting at most one unacknowledged persisted
-`event.put` per key. Later native facts may enter a bounded spool but are sent in order.
+The plugin durably creates a stable `open_id` before `source.open`. Store uniquely maps
+`(agent,generation,open_id)` to one daemon `source_key`; lost open reply returns the same
+key/watermark. Each ownership epoch emits a strictly contiguous positive `source_seq`,
+assigning its exact typed envelope before send and allowing at most one unacknowledged
+durable request. Later facts may spool boundedly in order.
 
-The daemon computes a versioned/domain-separated BLAKE3-256 digest over length-prefixed
-scalar fields and recursively key-sorted normalized JSON.
+Daemon computes a versioned/domain-separated BLAKE3-256 digest over length-prefixed
+scalars and recursively key-sorted normalized JSON.
 
-- `n = high_water + 1`: commit watermark, event and reducer/projection changes, then
-  acknowledge;
+- `n = high_water + 1`: commit watermark, normalized event/process projection and
+  reducer changes, then acknowledge;
 - `n = high_water` with matching digest: lost-reply duplicate; return saved Store seq
-  even if the event row was pruned;
+  even after history pruning;
 - same sequence/different digest: integrity error;
 - older sequence: reject with current watermark/cursor;
-- future sequence with a hole: gap; admit nothing until replay or explicit gapped close.
+- future sequence with hole: gap; admit nothing until replay or explicit gapped close.
 
-`native_id`/native cursor suppress vendor replay. A plugin restart reads the host
-watermark before publishing. Normal reconnect reuses source key; a source handoff gets
-a new key only after the old boundary is committed. Current-generation source rows
-remain while legal reattach/replay is possible; reclaim only after generation
-supersession/deletion and source/spool closure. Storage is O(ownership epochs), not
-events.
+Both `event.put` and `process.put` use this contract; process facts normally have a
+separate process-family source key. `native_id`/cursor suppress vendor replay. Normal
+restart reuses key; handoff gets a new open id only after old boundary commits. Current-
+generation source rows remain while legal reattach/replay is possible; reclaim after
+generation supersession/deletion and source/spool closure. Storage is O(ownership
+epochs), not events/processes.
 
 Input/turn events:
 
 - `input.admitted {command_id,native_input_id}` — inbox/transport acceptance only;
 - `input.dropped` — exact pre-turn terminal rejection/drop;
 - `turn.started {turn_id,input_commands[]}`;
-- `turn.inputs` — additional exact commands coalesced into the same turn;
+- `turn.inputs` — additional exact commands coalesced into same turn;
 - `turn.completed` — exact native terminal status/output/usage;
 - `turn.resolved` — readback/owner resolution, distinct from plugin completion.
 
-A command belongs to at most one turn. Multiple commands may map to one native turn
-without inventing multiple terminal results.
+A command belongs to at most one turn. Multiple commands may map to one native turn.
 
 ## Verbs and linked initial input
 
-Launch/resume with text creates a session command plus linked send. Normally send waits
-for ready. A `start_requires_input` plugin receives the linked command inside start, but
+Launch/resume with text creates session command plus linked send. Normally send waits
+for ready. A `start_requires_input` plugin receives linked command inside start, but
 session/input outcomes remain separate; ready never proves input.
 
 | Verb | Semantics |
@@ -222,7 +220,7 @@ session/input outcomes remain separate; ready never proves input.
 | send | one input; FIFO; applied only at exact turn/execution association |
 | steer/inject/interrupt | exact current-turn/native-safe-point semantics only |
 | stop | exact generation; force only with qualified custody/native isolation |
-| resume | next generation from the same canonical subject |
+| resume | next generation from same canonical subject |
 | approve/deny/answer | exact pending request |
 | configure | explicit application point/readback; blocked by unresolved input |
 | goal.* | generation-bound; continuation blocked by unresolved input/turn |
@@ -236,8 +234,7 @@ Input text is at most 512 KiB UTF-8; larger content is file-referenced.
 
 ```text
 Command {
-  id: CommandId,
-  receipt_id?: WriteId,
+  id: CommandId, receipt_id?: WriteId,
   target?, selector?, expected_generation?, generation?, turn_id?, request_id?,
   verb, args, origin, cause?, state, outcome?, created_at, updated_at
 }
@@ -245,29 +242,27 @@ state = accepted → [queued →] dispatched → applied | rejected | failed | u
         queued → cancelled
 ```
 
-An external command has `id = receipt_id = write_id`. A linked initial send, selector
-child, rule/timer/goal command or daemon presentation has a derived id and no external
-receipt. The parent external receipt returns their ids through its bounded result.
+External command has `id=receipt_id=write_id`. Linked initial, selector child,
+rule/timer/goal command and daemon presentation use derived id and no external receipt.
+Parent external receipt returns their ids.
 
-An interactive selector command is a Store-only fan-out parent. Its transaction creates
-concrete derived child commands and links, then marks the parent applied with the child
-set; it does **not** claim the child native effects applied. Child commands execute and
-settle independently. CLI `--wait` on a selector waits the exact child set captured at
-admission and returns per-child outcomes.
+Interactive selector command is a Store-only fan-out parent. Its transaction creates
+concrete derived children/links and marks parent applied with captured child set; it
+does not claim child native effects. Children settle independently. `--wait` waits the
+captured set and returns per-child outcomes.
 
-Ordinary expected generation equals target generation. Launch targets 1. Resume expects
-g and targets g+1. Ready calls serialize. Queued inputs remain FIFO; one dispatched/
-unknown input gate blocks later send/configure/goal in that generation but not exact
-control, stop or readback.
+Ordinary expected generation equals target. Launch targets 1. Resume expects g and
+targets g+1. Ready calls serialize. One dispatched/unknown input gate blocks later
+send/configure/goal in that generation but not exact control, stop or readback.
 
-Rejected means no native I/O; failed means exact no-effect; unknown may have applied and
-is never retried. Restart makes dispatched unknown. Generation change stales older
-queued work. Exact readback or constrained owner resolution settles unknown; time/newer
-generation does not infer an old result.
+Rejected means no native I/O; failed exact no-effect; unknown may have applied and is
+never retried. Restart makes dispatched unknown. Generation change stales older queued
+work. Exact readback/constrained owner resolution settles unknown; time/new generation
+does not infer.
 
-For send, applied means exact turn/execution association, not inbox acceptance or
-terminal success. Resolving send never manufactures a turn. Resolving start applied
-does not synthesize ready.
+Send applied means exact turn association, not inbox acceptance or terminal success.
+Resolving send never manufactures a turn; resolving start applied does not synthesize
+ready.
 
 ## Storage
 
@@ -280,7 +275,7 @@ CREATE TABLE store_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
--- store_meta['write_id_floor_ms'] is a monotonically increasing integer string.
+-- write_id_floor_ms and routing-key identity/status are metadata, never raw key bytes.
 
 CREATE TABLE id_counters (
   name TEXT PRIMARY KEY,
@@ -305,6 +300,7 @@ CREATE INDEX write_receipts_expiry ON write_receipts(admitted_at)
 CREATE TABLE agents (
   id INTEGER PRIMARY KEY,
   generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+  token_version INTEGER NOT NULL DEFAULT 0 CHECK(token_version >= 0),
   name TEXT UNIQUE, project TEXT NOT NULL,
   parent INTEGER REFERENCES agents(id),
   root INTEGER NOT NULL REFERENCES agents(id),
@@ -321,13 +317,14 @@ CREATE TABLE agents (
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   CHECK(
     (token_hash IS NOT NULL AND length(token_hash) = 32
-      AND generation > 0 AND observe_only = 0
+      AND generation > 0 AND token_version > 0 AND observe_only = 0
       AND state IN ('starting','idle','busy','waiting'))
     OR
     (token_hash IS NULL AND
       (generation = 0 OR observe_only = 1
        OR state NOT IN ('starting','idle','busy','waiting')))
-  )
+  ),
+  CHECK(generation > 0 OR token_version = 0)
 );
 CREATE UNIQUE INDEX agents_native_subject ON agents(native_scope,native_ref)
   WHERE native_scope IS NOT NULL AND native_ref IS NOT NULL;
@@ -357,6 +354,7 @@ CREATE UNIQUE INDEX events_native_dedupe
 CREATE TABLE plugin_source_watermarks (
   agent INTEGER NOT NULL,
   generation INTEGER NOT NULL,
+  open_id TEXT NOT NULL,
   source_key TEXT NOT NULL,
   source_name TEXT NOT NULL,
   high_water_seq INTEGER NOT NULL CHECK(high_water_seq >= 0),
@@ -366,6 +364,7 @@ CREATE TABLE plugin_source_watermarks (
   state TEXT NOT NULL,                 -- open|closed|gap
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(agent,generation,source_key),
+  UNIQUE(agent,generation,open_id),
   CHECK((high_water_seq = 0 AND last_digest IS NULL AND last_event_seq IS NULL) OR
         (high_water_seq > 0 AND length(last_digest) = 32
           AND last_event_seq IS NOT NULL))
@@ -390,7 +389,7 @@ CREATE INDEX commands_open ON commands(state)
 CREATE TABLE command_links (
   parent_id TEXT NOT NULL REFERENCES commands(id),
   child_id TEXT NOT NULL UNIQUE REFERENCES commands(id),
-  kind TEXT NOT NULL,                   -- linked_input|selector_child|presentation
+  kind TEXT NOT NULL,                   -- linked_input|selector_child
   ordinal INTEGER NOT NULL,
   PRIMARY KEY(parent_id,child_id),
   UNIQUE(parent_id,ordinal)
@@ -437,42 +436,36 @@ CREATE TABLE turn_inputs (
 );
 ```
 
-External mutation receipt and domain row commit together. An open receipt follows its
-domain object; terminalization stores a bounded sanitized summary. The receipt outlives
-pruned domain history until its independent idempotency window expires.
+External receipt/domain admission commits together. Receipt may outlive domain history;
+its bounded result preserves stable object/child ids, while current outcomes are read
+from projections. Internal commands have no fake receipts.
 
-`commands.receipt_id` is nullable by design: internal commands are durable through their
-parent/run/cause, not fake external receipts. `native_inputs.command_id` and
-`turn_inputs.command_id` intentionally have no command FK so compact command history may
-be pruned while exact command→native-input→turn readback survives. Their insert/update
-transactions still require the command/link to exist at admission time. Unresolved
-input/turn/link rows are never age-pruned.
+`native_inputs.command_id` and `turn_inputs.command_id` intentionally have no command
+FK so command history may be pruned while exact input/turn readback survives. Admission
+transactions still require the command/link to exist. Unresolved input/turn/link rows
+are never age-pruned.
 
-Selector/linked command rows and links remain while any child is open. After all child
-work is terminal and normal command retention permits pruning, the external receipt's
-bounded final summary preserves the captured child ids/outcomes.
+Selector/linked rows remain while child work is open. After terminal retention, receipt
+summary preserves captured ids; it need not freeze later child outcomes.
 
-Receipt pruning advances the ULID floor transactionally. `event.put` locks the source
-watermark and commits watermark, event and projections together. A duplicate of the one
-possible unacknowledged sequence returns `last_event_seq`; event retention never deletes
-source watermarks.
+Receipt pruning advances ULID floor transactionally. `source.open` upserts by open id.
+`event.put`/`process.put` lock source watermark and commit watermark plus projection and
+normalized event. Duplicate current sequence returns `last_event_seq`; history
+retention never deletes source watermark.
 
-A current-generation source row remains while legal reattach/replay is possible. It is
-reclaimed only after generation supersession/deletion and source/spool closure. A
-terminal but still-current generation keeps it.
+Current-generation source rows remain while legal reattach/replay is possible and are
+reclaimed only after generation supersession/deletion plus source/spool closure.
 
-`input.admitted` updates `native_inputs`; unknown native admission time stays NULL and
-`first_observed_at` is honest. Association inserts `turn_inputs` with the turn event.
-Attach/readback may discover a turn with unknown `started_at`; observation time is never
-presented as vendor start time. Wait follows input then turn, and results survive event
-and command-history retention.
+`input.admitted` updates `native_inputs`; unknown native admission/start time remains
+NULL and `first_observed_at` stays honest. Association inserts `turn_inputs` with turn
+event. Wait follows input then turn; results survive event and command retention.
 
 Counter/root/event allocation is transactional. Failed result commit blocks writes,
-retains the same pending commit where possible and never repeats the external cause;
-crash leaves dispatched effects unknown.
+retains the same pending commit where possible and never repeats external cause; crash
+leaves dispatched effects unknown.
 
 WAL/readers are monitored. Replays release transactions; hard pressure rejects new long
-reads and exposes the pin, never deleting evidence or blind-truncating active readers.
+reads and exposes pins, never deleting evidence or blind-truncating active readers.
 Event retention follows active automation cursors. Current input/edit/turn state,
-external receipts and source watermarks live in compact projections. Native stores are
-never generically cleaned.
+receipts and source watermarks live in compact projections. Native stores are never
+generically cleaned.
