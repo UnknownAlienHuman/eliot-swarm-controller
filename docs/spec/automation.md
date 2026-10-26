@@ -4,7 +4,7 @@ Automation turns committed events/time into ordinary commands or bounded local a
 It has no Task/review workflow model. Durable state exists only to avoid missed
 triggers, retargeting and blind replay.
 
-## Rule scope, files and revisions
+## Rule scope and files
 
 - `<data_dir>/rules/*.toml`: global rule, owner authority.
 - `<registered project>/.eliot/rules/*.toml`: project rule, limited to that project.
@@ -13,7 +13,7 @@ Project rules may command/message project agents, use project/tree vars, run scr
 the registered project and act on that repository. They cannot target another project,
 global vars, arbitrary cwd, plugin/service/account config or an undeclared webhook.
 Project event rules implicitly require `subject.project` to equal their registered
-project even when the TOML omits that match. This is a correctness boundary inside the
+project even when TOML omits that match. This is a correctness boundary inside the
 one-user trust model, not hostile-process security.
 
 Scripts receive an ephemeral scoped automation token; omitting it does not turn them
@@ -23,17 +23,36 @@ Required keys are `id`, `on`, `do`; optional keys are `enabled`, `limit`, `catch
 `allow_self`. Canonical rule bytes produce a fixed `revision`. Admitted runs retain the
 revision they were rendered from; editing never mutates an old run.
 
-First load of a new event-rule revision starts at current event high-water; there is no
-implicit historical replay. Restart with the same revision resumes its durable cursor.
-Disabled or globally paused event rules advance to current high-water without firing,
-so pause does not create a later burst or pin retention. Re-enable starts from that
-cursor.
+## Revision handoff
+
+A new rule id starts at the current persisted event high-water H; it does not backfill
+history implicitly. Restart with the same revision resumes its durable cursor.
+
+Editing an existing enabled event rule uses one Store transaction:
+
+1. capture current event high-water H;
+2. mark the old revision `retiring` with `retire_at_seq=H`;
+3. create the new revision `active` with `event_cursor=H`.
+
+The old revision evaluates only `(old_cursor,H]`; the new revision evaluates only
+`(H,current]`. They may drain concurrently but never overlap or leave a gap. After the
+old cursor reaches H and all its admitted runs settle, it becomes `retired`. A crash
+resumes both rows from Store. If the old backlog exceeds policy, the normal explicit
+backlog skip/pause rule applies to that retiring revision.
+
+Disable, delete or global pause is intentionally different: in one transaction capture
+H, record the exact skipped range `(cursor,H]`, advance the cursor to H and set
+`disabled|paused`. Re-enable defaults to from-now. Explicit catch-up creates a separate
+replay revision over an existing recorded range; it never mutates the original.
+
+A parse/validation failure does not install a new revision or retire the last valid one.
+It reports config source health and leaves current behavior intact.
 
 ## Event cursor and retention
 
 Event rules reconcile from the persisted log:
 
-1. read a bounded page `(cursor, high_water]`;
+1. read a bounded page within that revision's active interval;
 2. evaluate the committed event and its stored post-transition subject snapshot;
 3. handle one event transactionally as described below;
 4. continue in sequence order.
@@ -61,18 +80,18 @@ Crash before the transaction repeats safely; crash after it cannot lose or dupli
 the firing admission. Ephemeral and bounded late-diagnostic events are ineligible
 unless a rule explicitly matches their `x.*` kind.
 
-Retention deletes only through the minimum cursor of active event-rule revisions. Rule
-lag is visible and bounded by configured count/age. When a rule exceeds that limit,
-one transaction:
+Retention deletes only through the minimum cursor of `active|retiring|replay` event-rule
+revisions. Rule lag is visible and bounded by configured count/age. When a revision
+exceeds that limit, one transaction:
 
 1. records `rule.paused reason=backlog_limit` and the exact skipped sequence range;
-2. advances its normal cursor to current high-water so it no longer pins storage;
-3. leaves the rule disabled until explicit owner action.
+2. advances its cursor to its current interval boundary so it no longer pins storage;
+3. leaves the revision disabled until explicit owner action.
 
-`resume --from-now` continues from that cursor. `resume --catch-up` creates an explicit
-new replay revision over the recorded range only while those events still exist; if
-retention removed any part, it fails `history_gap`. Nothing is silently discarded or
-allowed to pin disk indefinitely.
+`resume --from-now` continues from current high-water. `resume --catch-up` creates an
+explicit replay revision only while the complete recorded range still exists; otherwise
+it fails `history_gap`. Nothing is silently discarded or allowed to pin disk
+indefinitely.
 
 ## Timers and revisions
 
@@ -80,9 +99,12 @@ An interval key is its anchored slot; cron/once key is scheduled UTC instant; ma
 key is caller id. DST is evaluated in the declared timezone but identity is UTC. Missed
 time uses `latest` or `none`, never a burst. Due rows reconcile on startup.
 
-Changing `on` creates a schedule revision/new anchor. An action-only edit changes action
-revision but never re-fires an admitted slot; future slots use the new actions. One
-schedule does not stack while its previous run is queued, running or unknown.
+A timer reload transaction captures wall-clock boundary T and reconciles the old
+schedule through T according to its catch-up policy before closing it. A changed `on`
+creates a new schedule revision/anchor strictly after T. An action-only edit keeps the
+schedule identity: slots through T use the old action revision; later slots use the new
+one. Already admitted runs always retain their old revision. One schedule does not stack
+while its previous run is queued, running or unknown.
 
 ## Durable firing and frozen target
 
@@ -210,13 +232,16 @@ CREATE TABLE rule_state (
   principal TEXT NOT NULL,
   rule TEXT NOT NULL,
   revision TEXT NOT NULL,
-  active INTEGER NOT NULL,
+  state TEXT NOT NULL,                 -- active|retiring|retired|paused|disabled|replay
   event_cursor INTEGER NOT NULL,
+  retire_at_seq INTEGER,
   paused_reason TEXT,
   skipped_from INTEGER,
   skipped_through INTEGER,
   loaded_at INTEGER NOT NULL,
-  PRIMARY KEY(principal, rule, revision)
+  PRIMARY KEY(principal, rule, revision),
+  CHECK((state = 'retiring' AND retire_at_seq IS NOT NULL) OR
+        (state <> 'retiring'))
 );
 
 CREATE TABLE automation_runs (
@@ -251,6 +276,8 @@ CREATE TABLE timers (
   rule TEXT NOT NULL,
   schedule_revision TEXT NOT NULL,
   action_revision TEXT NOT NULL,
+  state TEXT NOT NULL,                 -- active|retired|paused|disabled
+  boundary_at INTEGER,
   last_key TEXT, next_due_at INTEGER,
   PRIMARY KEY(principal, rule, schedule_revision)
 );
@@ -269,6 +296,10 @@ CREATE TABLE goals (
   PRIMARY KEY(agent, mode)
 );
 ```
+
+Retired rule/timer revisions may be pruned only after no open/unknown run references
+them and their event/time interval can no longer be revisited. Open and unknown
+runs/actions are never removed by history retention.
 
 ## Guardrails
 
