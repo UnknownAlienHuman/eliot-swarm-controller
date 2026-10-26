@@ -1,12 +1,20 @@
 # Donors
 
-A donor supplies one mechanism or a protocol fact; it is never a reason to import an
-application or its architecture. Recheck source, version, license and MSRV before
-copying code. Vendor facts live on the [harness pages](../harnesses/README.md).
+A donor supplies one mechanism or protocol fact; it is never a reason to import an
+application or architecture. Recheck source, version, license and MSRV before copying.
+Vendor facts live on the [harness pages](../harnesses/README.md).
 
-## v1 code (`git show v1-final:<path>`)
+## v1 code
 
-Copy the narrow part into v2 and cut every old dependency. Paths are from `dc6f70aa`.
+Frozen source is commit `dc6f70aa`; after roadmap L0.1 creates the archive tag, the
+same tree is `v1-final`.
+
+```text
+git show dc6f70aa:<path>      # before L0.1
+git show v1-final:<path>      # after L0.1
+```
+
+Copy the narrow part into v2 and cut every old dependency.
 
 | Mechanism | v1 path | Use in | Keep / reject |
 | --- | --- | --- | --- |
@@ -27,8 +35,8 @@ one-shot CI patchers, audit/remediation machinery.
 
 ## Rust dependencies
 
-Check the current release, license, maintenance and MSRV at the PR date. Add only when
-the linked task has a caller.
+Check current release, license, maintenance and MSRV at PR date. Add only when the
+linked task has a caller.
 
 | Crate | Concrete use |
 | --- | --- |
@@ -43,10 +51,10 @@ the linked task has a caller.
 | one maintained cron parser | L6.3; verify timezone/DST semantics before selecting |
 | `windows-sys` | exact Job, process, handle and ACL calls in the platform module |
 | `agent-client-protocol` | L4.6 ACP native schema/client |
-| `rmcp` | L5.5 only if a required harness cannot use the CLI |
+| `rmcp` | L5.5 only if a required harness cannot use CLI |
 
-Do not add dependencies merely because this table lists them. Prefer standard library
-or already-selected crates when the implementation stays direct.
+Do not add a dependency merely because this table lists it. Prefer standard library
+or already-selected crates when the path stays direct.
 
 ## External patterns
 
@@ -61,10 +69,10 @@ or already-selected crates when the implementation stays direct.
 | `MCP Agent Mail` | restrictive rider | exact recipients, mail not chat, advisory path announcements | code copying, liveness chatter, implicit identities |
 | `CCCC` | Apache-2.0 | delivery id, recipient scope, reply/cancel binding, size limits | scheduler, JSONL ledger, PTY heuristics |
 | `Petri` | MIT | pure `apply(state,event)` reducer and table/replay cases | workflow DSL |
-| `controller-runtime` | Apache-2.0 | level-based reconcile and stable dedupe keys for read-only/current-state reconciliation | Kubernetes stack and retrying non-idempotent effects |
-| `OpenCodex` | MIT | read-only management health/usage facts | provider translation or config authority inside Eliot |
+| `controller-runtime` | Apache-2.0 | level-based reconcile and stable dedupe keys for current-state reconciliation | Kubernetes stack and retrying non-idempotent effects |
+| `OpenCodex` | MIT | read-only management health/usage facts | provider translation/config authority inside Eliot |
 | old Claude swarm scripts | recheck | corrections before fresh work, explicit route, compact assignments, batch review findings | marker files, lockdirs, newest-log ownership, hidden fallback |
 
 Other systems reviewed in v1 are not current implementation inputs. Their notes remain
-at `v1-final`; do not re-import them without a concrete missing mechanism and owner of
-the resulting code.
+at the frozen commit/tag; do not re-import them without a concrete missing mechanism
+and owner of the resulting code.
