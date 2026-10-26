@@ -1,113 +1,179 @@
 # Monitoring
 
-Every source runs independently, emits normalized events on the bus and reports its
-own health (`source.health`). A failing source never blocks another one or the router.
+Every source runs independently, emits bounded facts and reports its own health. A
+failed source never blocks the router or another source. It also never gets to invent
+facts owned by a healthier source.
 
 ## Sources
 
 | Source | What it sees | How | Events |
 | --- | --- | --- | --- |
-| Native stream | turns, messages, tools, approvals, children, goal, usage | plugin protocol (live) | `turn.*`, `message.*`, `tool.*`, `approval.*`, `child.spawned`, `goal.updated`, `usage.updated` |
-| Native transcripts | the same, for sessions Eliot did not launch or after a restart | plugin tails native files | same kinds, `source=transcript` |
-| Native hooks | tool calls, prompts, stops, subagent stops, compaction | hook shim → daemon | `tool.*`, `approval.requested`, `x.<harness>.*` |
-| Processes | life of native processes and their descendants | `sysinfo` + plugin-registered PIDs | `process.started/exited`, `process.stats` (E), `session.lost` |
-| Git | branch, HEAD, dirty files, new commits, ahead/behind, remote refs | `git` CLI, read-only flags | `git.status`, `git.commit`, `git.ref` |
-| Filesystem | changes in agent workspaces | `notify` watcher, debounced | `fs.changed` (E), triggers Git refresh |
-| Proxy/provider | proxy health, usage, limits | proxy management API when configured | `source.health`, `provider.limited` |
-| Derived | stalls, idle time, turn durations | timers over the above | `agent.stalled/unstalled` |
-| Store / config | failed commits; config reloads and parse errors | the daemon itself | `source.health` (`store`, `config`) |
+| Native stream | session, turns, messages, tools, approvals, children, goals, usage | plugin protocol | `session.*`, `turn.*`, `message.*`, `tool.*`, `approval.*`, `child.spawned`, `goal.updated`, `usage.updated` |
+| Native transcript | the same for discovered/observe-only sessions, or explicit stream recovery | plugin tails native files | only the event families assigned to it |
+| Native hooks | synchronous decisions and facts missing from the primary stream | hook shim / SDK callback | assigned `approval.*`, tool/prompt facts, `x.<harness>.*` |
+| Processes | life and resource use of owned processes | Job/process-group custody + registered PIDs | `process.started/exited`, `process.stats`, `session.lost` |
+| Git | branch, HEAD, dirty files, commits, ahead/behind, remote refs | read-only Git CLI | `git.status`, `git.commit`, `git.ref` |
+| Filesystem | workspace changes | `notify`, debounced | `fs.changed`, Git refresh |
+| Proxy/provider | health, usage, limits | configured management API | `source.health`, `provider.limited` |
+| Derived | stalls, durations, idle time | timers over progress facts | `agent.stalled/unstalled` |
+| Store/config | commit availability and config reload | daemon | `source.health` |
 
-## Process monitor
+## Source ownership
 
-- Identity is `(pid, start_time)`, never PID alone (PIDs are reused). `start_time` is
-  the OS creation time at full resolution (Windows `GetProcessTimes`, 100 ns; Linux
-  `/proc/<pid>/stat` start ticks), not a seconds value.
-- Descendants come from custody, not from walking parent PIDs (a parent chain breaks
-  when an intermediate process exits): on Windows the Job's process list
-  (`JOBOBJECT_BASIC_PROCESS_ID_LIST`), on Unix the process group. Scan every
-  `process.scan_interval` (default 2 s). Plugins also register native PIDs they know.
-  CPU/RSS sampling uses one `sysinfo::System`, refreshed only for watched PIDs.
-- `process.exited` when a watched identity disappears. If all `harness`/`server`
-  processes of an agent are gone and the plugin reported no `session.ended` within
-  3 s, emit `session.lost` (the reducer then moves the agent to `lost`).
-- `process.stats` (CPU, RSS) every 5 s for watched processes; ephemeral.
-- A process that disappears while its identity is being read counts as gone (liveness
-  loss), not as a monitor error.
-- After a crash the exit code of a Job member may be unrecoverable: record it as
-  `unknown` (never `0`); prove that a tree is gone by the Job's active-process count
-  (Windows) or the process group being empty (Unix), not by one PID missing.
-- Stop/kill: Windows Job object per plugin instance with `KILL_ON_JOB_CLOSE` (if the
-  daemon dies, the stdio sessions it launched die too — no orphans); Unix process
-  group. Services (L7.6) get their own Job without kill-on-close.
-  `stop --force` terminates the agent's process tree and verifies the identities are
-  gone; if not, the agent stays `stopping` and an event says which PIDs survived.
-  Processes Eliot only attached to (external services) are never killed.
-- Shared processes (an app-server serving several agents, a proxy) are watched once
-  and attributed to all their agents; they are not killed by stopping one agent.
+For each `(agent, generation, event family)`, exactly one source is authoritative.
+Examples: the live Codex app-server stream owns turns/messages/tools; a transcript may
+own those families for an observe-only thread; a hook may own permission decisions
+while the stream owns tool lifecycle.
+
+Rules:
+
+1. `session.ready` records the selected owners and any native cursor/watermark in
+   `effective.event_owners` when the harness has several possible sources.
+2. A backup source does not publish the same normalized family concurrently. It may
+   collect raw position privately.
+3. Handoff starts after the last committed native id/cursor. If the old and new formats
+   cannot prove a complete boundary, emit `source.health status=stale` with a bounded
+   gap description; do not replay old completions or treat the missing interval as
+   empty.
+4. Duplicate native ids from reconnect/replay are suppressed by the plugin before the
+   bus. The daemon additionally rejects wrong-generation input.
+5. Hooks and transcripts may still emit harness-specific `x.<harness>.*` diagnostics,
+   but those diagnostics never drive core state unless that family was assigned to the
+   source.
+
+This prevents a live stream plus transcript tail from firing two `turn.completed`
+events and therefore two rules.
+
+## Process monitor and custody
+
+Process identity is `(pid, start_time)`, never PID alone. `start_time` is the OS
+creation time at native resolution (Windows `GetProcessTimes`; Linux proc start ticks).
+
+### Per-agent mode
+
+A per-agent plugin and every native child it launches are placed in one agent-owned
+Windows Job / Unix process group before the child can run:
+
+- Windows: create suspended, assign to Job, then resume. The Job uses
+  `KILL_ON_JOB_CLOSE` for daemon-owned stdio sessions.
+- Unix: create the process group before exec. The plugin must exit when stdin closes;
+  on plugin failure the daemon explicitly terminates and verifies the group.
+
+The daemon owns the custody handle. A plugin exit causes it to stop the remaining
+exact group and verify every known `(pid,start_time)` is gone. Only then may it emit
+`session.lost`. `stop --force` targets this group and cannot affect another agent.
+
+### Shared mode and services
+
+A shared plugin may attach to a native service or launch one daemon-managed service.
+The service is watched once and attributed to its users. Stopping one agent uses an
+exact native session operation; it never kills the shared plugin/service. If the
+native service has no isolated force operation, `stop --force` is `unsupported`.
+Attached owner-run services are never killed.
+
+Service mode (L7.6) uses a separate custody object without kill-on-close so a daemon
+upgrade can re-attach. Its endpoint, process identity and native session refs are
+persisted before use.
+
+### Observation
+
+- Plugins register every PID they know; custody enumerates descendants so an
+  intermediate parent exiting does not hide grandchildren.
+- Scan `process.scan_interval` (default 2 s). One `sysinfo::System` is refreshed only
+  for watched PIDs; platform calls provide exact birth identity.
+- `process.exited` is emitted when the identity disappears. Exit code may be unknown
+  after a crash; never record unknown as 0.
+- A process disappearing while identity is read counts as gone, not monitor failure.
+- If all owned harness processes for a generation are gone and no `session.ended`
+  arrived within 3 s, emit `session.lost`. For a shared service, plugin/session
+  readback—not the shared process alone—decides which agents were lost.
+- `process.stats` is ephemeral every 5 s. It never counts as model progress and never
+  clears a stall.
 
 ## Starting processes
 
-These rules apply to plugins, services, hook shims, scripts and git actions:
+These rules apply to plugins, services, hook shims, scripts and Git actions:
 
-- Resolve the executable to a full path before spawning; pass argv as a list, never a
-  shell string (scripts that want a shell say so in `cmd`).
-- Windows: create console children with `CREATE_NO_WINDOW` (not `DETACHED_PROCESS`,
-  which breaks console-dependent tools); put a child into its Job at creation
-  (`CREATE_SUSPENDED` → assign → resume) so grandchildren cannot escape; when merging
-  environment variables, treat `PATH`/`Path` case-insensitively; resolve PowerShell 7
-  as `pwsh.exe` by full path, not `powershell.exe`.
-- Long inputs (prompts, scripts) go through files or stdin, never argv (Windows
-  command-line limit ~32 KiB).
-- Text files Eliot writes are UTF-8 without BOM with LF line endings; Git always
-  runs with `GIT_TERMINAL_PROMPT=0` and no editor.
-- Never edit a script or hook file that may be running; write a new file and switch.
-- Windows: a file cannot be replaced or deleted while any handle to it is open (also
-  SQLite files with an open connection — close them first in tests).
-- Paths are normalized before comparison (strip the `\\?\` verbatim prefix that
-  `canonicalize` returns on Windows, unify separators, compare case-insensitively on
-  Windows).
+- Resolve executables to full paths; pass argv as a list, never an implicit shell.
+- Long input uses stdin or files, never argv.
+- Windows console children use `CREATE_NO_WINDOW`, not `DETACHED_PROCESS`.
+  Environment keys such as PATH are merged case-insensitively; PowerShell 7 is
+  `pwsh.exe` resolved by path.
+- Eliot-written text is UTF-8 without BOM and LF. Git always has
+  `GIT_TERMINAL_PROMPT=0` and no editor.
+- Do not replace a script/hook binary that may be running; install a new versioned
+  path and switch future launches.
+- Normalize paths before comparison: remove Windows verbatim prefixes, unify
+  separators and compare case-insensitively on Windows.
+- Windows file deletion/replacement can fail while a handle is open; tests close
+  SQLite/files before cleanup rather than looping forever.
 
 ## Git monitor
 
-Per distinct worktree used by any live agent:
+One monitor exists per distinct worktree used by a live agent.
 
-- Refresh on `fs.changed` (debounce 500 ms) and every `git.poll_interval` (default
-  15 s), never more often than every 2 s per worktree.
-- Commands (always `git --no-optional-locks`, so the monitor never takes
-  `index.lock` and never competes with agents):
-  - `status --porcelain=v2 --branch -z` → branch, HEAD, upstream, ahead/behind, dirty set;
-  - on HEAD change: `log --format=%H%x00%ae%x00%s --name-only <old>..<new>` → `git.commit`;
-  - committed-but-unmerged set (for `who`): paths in `diff --name-only <base>...HEAD`
-    that still differ in `diff --name-only <base> HEAD` — after a squash merge the
-    branch is not an ancestor of its base, and this drops the already-merged paths.
-- Remote refs change only through an explicit fetch (rule action or command) or the
-  optional `git.remote_poll` (`ls-remote`, default off). `git.ref` events report them.
-- The monitor keeps per-worktree sets in memory (`dirty`, `branch_changes`) for
-  [`who`](coordination.md#who-works-on-this). They are rebuilt from Git after restart;
-  they are not stored.
-- Huge repos: if `status` takes longer than 2 s, the interval doubles (max 5 min) and
-  `source.health` reports `slow`.
+- Refresh on `fs.changed` (500 ms debounce) and every `git.poll_interval` (15 s), but
+  no more often than every 2 s per worktree.
+- All monitor commands use `git --no-optional-locks` and never write the index:
+  - `status --porcelain=v2 --branch -z` → branch, HEAD, upstream, dirty set;
+  - on HEAD change, bounded `log --format=%H%x00%ae%x00%s --name-only old..new` →
+    `git.commit`;
+  - current branch-change set = paths in `diff --name-only base...HEAD` that still
+    differ in `diff --name-only base HEAD`.
+- Remote refs change only after explicit fetch or optional `git.remote_poll`
+  (`ls-remote`, default off).
+- Dirty/branch sets live in memory for [`who`](coordination.md#who-works-on-this) and
+  are rebuilt after restart.
+- If status exceeds 2 s, back off the interval up to 5 minutes and report
+  `source.health status=slow`.
 
-## Liveness rules
+### Read-only workspace fingerprint
+
+The Eliot Goal loop needs a progress signal without `git add`, a temporary index or
+writing objects into the repository.
+
+For a Git workspace, the monitor exposes a fingerprint of:
+
+```text
+HEAD + sorted(dirty/untracked path, file type, size, content hash)
+```
+
+It hashes only paths already reported dirty/untracked, excludes ignored files and
+profile `scratch` paths, reads symlink targets rather than following them, and caches
+hashes until filesystem metadata/a watcher event changes. The content hash is computed
+in Eliot (for example BLAKE3); `git hash-object -w`, `git add` and `write-tree` are
+forbidden. A configurable byte/file cap protects huge workspaces. Crossing the cap
+returns `unavailable`, never a fake stable fingerprint; a no-progress budget cannot
+block solely on incomplete fingerprint data. Non-Git workspaces use the same bounded
+file-set mechanism when the plugin supplies changed paths, otherwise check output is
+the only progress signal.
+
+## Liveness
+
+Only progress-bearing native facts update `last_progress_at`: turn/message/tool/plan,
+file-change, request/answer and explicit plugin heartbeat that proves the model loop
+advanced. Process samples, Git polling, mail and source-health events do not.
 
 | Observation | Conclusion |
 | --- | --- |
-| No events while `busy` for `stall_after` | `agent.stalled` (flag), nothing else |
-| Parent idle, children busy | parent is idle; the tree is not done |
-| Process alive, stream disconnected | source `stale`; agent state unchanged |
-| Process gone, no terminal event | `session.lost` → `agent.lost` |
-| Polled source (process, Git, proxy) not read for 3 × its interval | `source.health status=stale`; values shown as `unknown` |
-| Event-driven source (native stream, transcript, hooks) lost its connection | `stale` until it reconnects; silence alone is not staleness |
-| Provider 429 | `provider.limited kind=rate_limit`; not quota, model unchanged |
+| No progress fact while `busy`/`waiting` for `stall_after` | `agent.stalled` flag; no state change or automatic restart |
+| Parent idle, children busy | parent idle; tree not done |
+| Process alive, stream disconnected | source stale; state unchanged |
+| Exact owned process group gone, no terminal event | `session.lost` for that generation |
+| Polled source unread for 3 × interval | source `stale`; its values display unknown |
+| Event-driven connection lost | source `stale` until recovery; silence itself is not terminal |
+| Handoff cursor cannot cover an interval | explicit source gap; no inferred events |
+| Provider 429 | `rate_limit`, not quota unless native evidence says quota |
+| Old-generation notification | ignored from normal bus; counted/logged as stale input |
 
 ## Views
 
-- `eliot watch` — stream with filters; text format
-  `HH:MM:SS a12 writer  turn.completed  ok 2m14s 18k tok`.
-- `eliot top` — refreshes every second: id, name, harness, state (+stalled), current
-  turn time, tokens, cost, CPU, RSS, branch, dirty count, last event age. Sort and
-  filter keys. Built on `agent.list` + `events.subscribe`; no separate state.
-- `eliot show A` — one agent: profile, effective settings, pending requests, goal,
-  processes, workspace, last 20 events (unread mail from L5.1).
-- `daemon.status` — per-source health table. A stale source is shown as stale, never
-  hidden.
+- `eliot watch`: filtered event stream, for example
+  `12:14:03 a12#4 writer turn.completed ok 2m14s 18k tok`.
+- `eliot top`: id/generation, name, harness, state + stalled/open stop, turn age,
+  tokens/cost, CPU/RSS, branch, dirty count, source health and last-progress age. It is
+  `agent.list` + event subscription, not separate state.
+- `eliot show A`: profile/effective settings, generation/native refs, event owners and
+  gaps, pending requests/commands, goal, processes, workspace and recent events.
+- `daemon.status`: every source and plugin instance with health, custody mode, last
+  successful read and gaps. Stale/unknown values are shown, never hidden.
