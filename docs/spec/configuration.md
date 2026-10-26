@@ -104,7 +104,8 @@ Rules:
 - Credentials (API keys, OAuth tokens) never live in config, the Store, events or
   messages. A profile's literal `env` holds non-secret values only. Secrets are named:
   `api_key_env` (proxy key) and `pass_env` (variables passed from the daemon's
-  environment); `secret_env` marks which `pass_env` names hold secrets, so their
+  environment); `secret_env` marks which `pass_env` names hold secrets (a name not
+  in `pass_env` is a load error), so their
   values are masked in events and refused in stored writes. The daemon reads the
   values only when it starts the process. Agent tokens are routing handles, not
   credentials ([D-07](../decisions.md)).

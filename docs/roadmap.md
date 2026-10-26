@@ -90,9 +90,8 @@ Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-p
       most 64 KiB) with `events.lagged`; `history_gap` for pruned ranges. Test with a
       slow subscriber and with events committed during replay.
 - [ ] **L1.4 Daemon + IPC.** `eliot daemon [--foreground]`, `eliot daemon stop
-      [--drain | --force]` (drain = no new launches, sends, rule or timer firings;
-      running turns finish; approvals, answers, interrupts, stops and reads keep
-      working; without a flag it refuses while turns run), lock file, `daemon.json` with the PID +
+      [--drain | --force]` ([drain](spec/api.md#methods) as defined by
+      `daemon.shutdown`; without a flag it refuses while turns run), lock file, `daemon.json` with the PID +
       start-time liveness check, named pipe / Unix socket, JSON-RPC with
       multiplexing, `daemon.status`.
 - [ ] **L1.5 Config.** Load `config.toml` (global + project), profiles with defaults
@@ -111,7 +110,8 @@ Specs: [core](spec/core.md), [API](spec/api.md), [plugin protocol](spec/plugin-p
       create the agent; others: exists → supported → allowed → state), persistence,
       linked first send for `launch`/`resume` with a prompt (and `initial` for
       `start_requires_input`), per-agent ordered dispatch (`interrupt`/`stop` skip the
-      line; `steer`/`interrupt` carry the `turn_id` captured at acceptance), Store-held queue of sends to busy agents
+      line; `steer`/`interrupt` carry the `turn_id` captured at acceptance — stale
+      → `rejected`, ended before landing → `failed`), Store-held queue of sends to busy agents
       and `cancel`, outcome recording, selectors with `max_selector_targets` and
       `command.children`, idempotent ids with `id_expired`, one agent row per native
       subject, profile + account `max_live` launch queue, restart turns `dispatched`
@@ -151,9 +151,9 @@ dir and drive it only through the `eliot` binary:
 5. with a plugin entry `[plugins.fake-narrow]` (`cmd = ["eliot", "plugin",
    "fake"]`, `verbs = ["launch","send","stop"]`) and `launch --harness fake-narrow`,
    `steer` → exit code 3 (`unsupported`) and the plugin received no request;
-6. `send A '{"steps":[{"hang":null}]}'`, then `eliot steer A x --id S1` (no reply
-   comes; after its wait the CLI exits 6, pending), then kill the fake plugin process
-   → `eliot cmd show S1` reports `unknown` (exit 4) and the steer is not resent; the
+6. `send A '{"steps":[{"hang":null}]}'`, then `eliot steer A x --id $S1` (`$S1` a
+   fresh ULID; no reply comes; after its wait the CLI exits 6, pending), then kill the
+   fake plugin process → `eliot cmd show $S1` reports `unknown` (exit 4) and the steer is not resent; the
    plugin restarts; A, B and C are `lost` (their sessions died with it) and every
    event stored before the kill appears exactly once; `resume A` → `agent.idle` with
    no `message.user` repeating an old prompt;
@@ -350,9 +350,9 @@ loop guard suppresses a deliberately looping rule.
       too; until then Unix custody stays `degraded`.
 - [ ] **L7.3 Retention.** Event and command pruning in batches; DB size stable in the
       load test.
-- [ ] **L7.4 Drain under load.** Verify that drain stops rule, timer and goal-loop
-      firings while approvals, answers and results keep working, with 1,000 busy
-      agents.
+- [ ] **L7.4 Drain under load.** Verify [drain](spec/api.md#methods) with 1,000 busy
+      agents: no new sends, rule, timer or goal firings; approvals, answers,
+      interrupts, stops and results keep working.
 - [ ] **L7.5 Windows hardening.** Edge-case tests for the
       [process start rules](spec/monitoring.md#starting-processes) (applied since
       L1.6): paths with spaces and non-ASCII characters, very long prompts, `PATH`/

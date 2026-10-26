@@ -18,7 +18,8 @@ Identity comes from `ELIOT_AGENT_TOKEN` (see [API](api.md#transport)). Rules:
 
 `control` comes from the profile (`control = "tree"`) or `launch --control`. A child
 never gets more control than its parent. An agent without its own identity
-(`own_identity = false`, see [core](core.md#agent)) acts as its parent. This is the
+(`own_identity = false`, see [core](core.md#agent)) acts as its parent if it is a
+native child, and as the owner if it is a session Eliot did not start. This is the
 whole permission model. Message
 modes that start or change a turn (`send`, `steer`) count as commands: a sender needs
 command rights on the recipient, otherwise it gets `not_allowed` and can use `queue`

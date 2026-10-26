@@ -124,7 +124,7 @@ forever:
 | --- | --- |
 | `git.push` | `applied` if the remote ref (`ls-remote`) is the pushed OID, else `failed` |
 | `git.fetch` | `applied` if the remote-tracking refs equal `ls-remote`, else `failed` (the next firing fetches again) |
-| `git.pull` | `applied` if HEAD equals its upstream after the fetch readback, else stays `unknown` |
+| `git.pull` (`--ff-only`) | `applied` if HEAD equals its upstream after the fetch readback, else `failed` |
 | `git.worktree` | `applied` if `git worktree list` shows the path on the branch, else `failed` |
 
 A `run` action whose outcome is unknown stays `unknown` until the owner resolves it;
@@ -196,10 +196,10 @@ active Eliot goal:
    command — those are resolved by their own path, never by a goal message. With
    `cadence = on_idle`, also skip while the same agent has an active native goal: a
    native goal (Codex, Muse) continues by itself when the agent goes idle, and two
-   drivers would stack turns. `cadence = every <dur>` still sends (queued until idle)
-   beside a native goal, but never stacks: a tick is skipped while the goal's
-   previous continuation is `queued`, `dispatched` or `unknown`, or its turn is still
-   running.
+   drivers would stack turns. `cadence = every <dur>` still sends beside a native
+   goal (queued until idle). Any cadence never stacks: a round is skipped while the
+   goal's previous continuation is `queued`, `dispatched` or `unknown`, or its turn is
+   still running.
 2. Run `check` (if any) in the agent's workspace, custody and environment (timeout `automation.check_timeout`,
    default 10 min; at most `automation.max_parallel_checks`, default 2, checks run at
    once on the machine). Pass → `done`. With `marker:X`, done when the last `message.agent`

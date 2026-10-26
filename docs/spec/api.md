@@ -28,7 +28,7 @@
 | Method | Params | Result |
 | --- | --- | --- |
 | `daemon.status` | — | version, uptime, plugins, sources health, counts by state, `caller` (owner or agent id) |
-| `daemon.shutdown` | `drain?`, `force?` | with `drain`: no new launches, rules or timer firings; running turns finish, approvals, answers and results keep working; then stop. Without `drain` it refuses (`busy`) while any stdio session has a running turn, unless `force` — those turns would be lost. |
+| `daemon.shutdown` | `drain?`, `force?` | with `drain` (**the** definition of drain): no new launches, sends, rule or timer firings or goal rounds; running turns finish; approvals, answers, interrupts, stops, cancels and reads keep working; then stop. Without `drain` it refuses (`busy`) while any stdio session has a running turn, unless `force` — those turns would be lost. |
 | `agent.list` | `filter{state?, harness?, project?, label?, tree?, parent?}` (`tree` = the agent and all descendants), `after?`, `limit≤1000` | page of agents + `next` |
 | `agent.get` | `agent` | agent + pending requests + goal + last events |
 | `agent.wait` | `targets` (ids/names/selector), `for: turn|idle|stopped|goal`, `after_command?`, `timeout_ms` | per agent: state reached or not, state, last `final_text`. `turn` = the running or next turn ends — with `after_command`, the turn started by that command's dispatch, so a late end of an earlier turn never satisfies it (`send --wait` always passes it); `idle` = state is `idle` (immediate if already); `stopped` = `stopped`/`failed`/`lost`; `goal` = goal `done`/`blocked`. |
@@ -93,7 +93,7 @@ running they fail with `unavailable` and say so.
 | Code | Meaning | Error codes |
 | --- | --- | --- |
 | 0 | ok: command `applied` or `queued`, `cmd cancel` succeeded, query answered; with `--wait` / `wait`: the turn ended `completed` or the target reached the state | — |
-| 1 | error, or a definite bad outcome | `not_found`, `invalid`, `busy`, `unavailable`, `history_gap`, `internal`, command `failed`; with `--wait` / `wait`: the turn ended `failed` or `interrupted`, or the agent became `stopped`/`failed`/`lost` first |
+| 1 | error, or a definite bad outcome | `not_found`, `invalid`, `busy`, `unavailable`, `history_gap`, `internal`, command `failed`; with `--wait` / `wait`: the turn ended `failed` or `interrupted`, a goal ended `blocked`, or the agent became `stopped`/`failed`/`lost` first |
 | 2 | CLI usage error (bad flags) | — |
 | 3 | rejected — nothing happened | `unsupported`, `not_allowed`, `bad_state`, command `rejected` or `cancelled` |
 | 4 | outcome unknown | command `unknown` |
@@ -104,8 +104,8 @@ running they fail with `unavailable` and say so.
 
 ```text
 eliot daemon [--foreground]                 start the daemon (default: background, returns when ready)
-eliot daemon stop [--drain | --force]       stop it (drain: no new work; running turns finish, answers and stops work)
-eliot status                                daemon, plugins, sources, where each profile's config came from
+eliot daemon stop [--drain | --force]       stop it (--drain: see `daemon.shutdown`)
+eliot status                                daemon, plugins, sources, the caller, where each profile's config came from
 eliot launch [--profile P] [--harness H] [--name N] [--parent A] [--label k=v]...
              [--project NAME] [--control self|tree|project]
              [--workspace PATH | --worktree BRANCH [--base REF]] [PROMPT] [--wait]

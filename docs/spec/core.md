@@ -103,7 +103,7 @@ Live states: `starting`, `idle`, `busy`, `waiting`, `stopping`.
 | `created` | router input `start_dispatched` (it found a free launch slot: profile, account and proxy `max_live`, no provider hold; an observe-only attach needs no slot) | `starting` |
 | `created` | `stop` accepted (the queued launch is cancelled; no native I/O) | `stopped` |
 | `starting` | `session.ready` | `idle` |
-| `starting` | router input `start_failed` (workspace preparation failed, `agent.start` or `agent.attach` error, or timeout), or `session.error` | `failed` |
+| `starting` | router input `start_failed` (workspace preparation failed; `agent.start` or first `agent.attach` error or timeout; the plugin exited or the processes vanished before `session.ready`/`attached`), or `session.error` | `failed` |
 | `starting`, any live | router input `attached` with the state `agent.attach` reported (`idle`, `busy`, `waiting`) — first attach of a discovered session, or re-attach after a restart | that state |
 | `idle` | `turn.started` | `busy` |
 | `busy` | `approval.requested` / `question.asked` | `waiting` |
@@ -113,7 +113,7 @@ Live states: `starting`, `idle`, `busy`, `waiting`, `stopping`.
 | `stopping` | `agent.stop` reply, or `session.ended` | `stopped` |
 | any live | `session.ended` (the session ended natively) | `stopped` |
 | any live | `session.error` (fatal for this agent) | `failed` |
-| any live | `session.lost` (processes gone without `session.ended`, or re-attach failed) | `lost` |
+| any live except `starting` | `session.lost` (processes gone without `session.ended`, or a re-attach after a restart answered `not_found`) | `lost` |
 | `stopped`, `lost`, `failed` | router input `start_dispatched` for an accepted `resume` (same slot rules as a launch) | `starting` |
 
 Entering `stopped`, `failed` or `lost` clears `active_turn` and `pending` and cancels
@@ -223,7 +223,7 @@ the core ignores them except for display and rule matching.
 | `git.ref` | P | `remote`, `ref`, `old`, `new` |
 | `fs.changed` | E | `worktree`, `paths` (debounced) |
 | `command.accepted` / `command.queued` / `command.dispatched` / `command.applied` / `command.rejected` / `command.failed` / `command.unknown` / `command.cancelled` / `command.resolved` | P | `command`, `verb`, `reason?` (`resolved`: `as`, `by`, `reason`) |
-| `rule.fired` / `rule.failed` / `rule.suppressed` | P | `rule`, `actions`, `reason?` |
+| `rule.fired` / `rule.failed` / `rule.suppressed` | P | `rule`, `key`, `actions`, `reason?` (the event's `agent` is the triggering event's agent) |
 | `mail.sent` / `mail.presented` / `mail.read` | P | `message`, `from`, `to` |
 | `var.changed` | P | `scope`, `key`, `version` |
 | `claim.added` / `claim.released` / `claim.conflict` | P | `glob`, `agents` |
@@ -239,10 +239,11 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
 | Verb | Args | Semantics | Precondition |
 | --- | --- | --- | --- |
 | `launch` | `profile?`, `harness?`, `prompt?`, `workspace?` or `worktree?` + `base?`, `parent?`, `name?`, `project?`, `control?`, `labels?` | Create an agent and start a native session. A `prompt` becomes a separate linked `send` (below). | — |
+| `attach` | `harness`, `native_scope`, `native_ref`, `control?`, `profile?` (with `control`) | Watch — and with `control`, control — a native session Eliot did not start (submitted by `agent.attach` / `eliot attach`). A subject without a row gets a new `origin=external` row; an existing row is reused. The first attach is a start: its failure is `start_failed`. Re-attaching live agents after a restart is not a command. | plugin declares `discover`; `control` needs the plugin to support it |
 | `send` | `text` | New user turn. If the agent is busy, the command waits in the Store as `queued` (no native I/O) and is dispatched when the agent becomes idle, in order. Survives plugin and daemon restarts while the agent stays live. `applied` means a native turn started with this input; the turn's result is separate (`turn.completed`). | live |
 | `steer` | `text` | Add input to the **running** turn. Bound to the turn that is active when the command is accepted: if that turn has ended by dispatch it is `rejected` (`stale_turn`); if it ends before the text lands it is `failed` (`turn_ended`); it is never carried into a later turn. | `busy`; native support |
 | `inject` | `text` | Add context without starting a turn by itself; delivered at the next native safe point (hook `additionalContext`, pending-input queue, or prepended to the next `send`). `applied` when the plugin has placed the text there; `applies` says when the model sees it. | live; plugin decides mechanism and reports it |
-| `interrupt` (CLI alias `abort`) | — | Abort the turn that is active when the command is accepted; session stays alive. A different turn is never interrupted. | `busy`/`waiting` |
+| `interrupt` (CLI alias `abort`) | — | Abort the turn that is active when the command is accepted; session stays alive. A different turn is never interrupted: if that turn has ended by dispatch it is `rejected` (`stale_turn`); if it ends on its own before the interrupt lands, `failed` (`turn_ended`). | `busy`/`waiting` |
 | `stop` | `force?` | End the session. `force` kills the agent's process tree (exact only where custody is exact, see [monitoring](monitoring.md#process-monitor)). (The CLI's `--tree` is the selector `@tree:<agent>`.) | any live |
 | `resume` | `prompt?` | Re-open a `stopped`/`lost`/`failed` session by `native_ref`. Never resends old input; a `prompt` is a linked `send`. | native support |
 | `approve` / `deny` | `request_id?` (default: the only pending request), `remember?` | Answer a pending approval. `remember` = allow the same kind of request for the rest of the session where the harness offers that (e.g. Codex `acceptForSession`), else `unsupported`. | request pending |
@@ -276,7 +277,7 @@ The closed command language. A plugin declares which verbs it supports (`verbs`,
 ```text
 Command { id, target?: AgentId, selector?, verb, args, origin, cause?, turn_id?,
           state, outcome?, created_at, updated_at }
-origin = owner | agent:<id> | rule:<id> | timer:<id> | goal:<agent>
+origin = owner | agent:<id> | rule:<id> | timer:<id> | goal:<agent> | daemon   // daemon: mail notices
 state  = accepted → [queued →] dispatched → applied | rejected | failed | unknown
          queued → cancelled
 ```
@@ -325,8 +326,9 @@ state  = accepted → [queued →] dispatched → applied | rejected | failed | 
   `unknown`. An open `stop` is `applied` once the agent reaches `stopped`, `failed` or
   `lost`.
 - A daemon restart turns every `dispatched` command into `unknown` (queued ones stay
-  queued). Rule actions that were running (`run`, git actions) are settled only by
-  readback after their process tree is proven gone, never by running them again.
+  queued). Rule actions that were running are never run again: git actions are
+  settled by [readback](automation.md#actions-do) once their process tree is proven
+  gone; a `run` stays `unknown` until the owner resolves it.
 - Only readback or the owner's `eliot cmd resolve ID --as applied|failed --reason
   TEXT` clears `unknown`; time never does. The resolution is recorded as an event.
 - `launch` checks before creating the agent: the profile resolves, the workspace

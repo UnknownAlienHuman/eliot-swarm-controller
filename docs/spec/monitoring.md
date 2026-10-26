@@ -126,8 +126,9 @@ CREATE INDEX agent_edits_path ON agent_edits(workspace, path);
 2. At start: `git worktree add` under `<data_dir>/worktrees/<agent>` — `-b BRANCH
    <base_oid>` if BRANCH does not exist, otherwise check it out (it must exist
    locally). Then read back the worktree's branch and HEAD.
-3. Run the profile's `setup` argv lists once, in order, in the agent's custody and
-   environment, token included (a new worktree has no ignored files, submodules or
+3. Run the profile's `setup` argv lists once, in order, in the agent's custody — the
+   daemon creates the agent's Job before setup and the plugin joins it at
+   `agent.start` — and with the agent's environment, token included (a new worktree has no ignored files, submodules or
    LFS content). A setup that fails fails
    the launch. A setup interrupted by a daemon crash has an unknown effect: it is not
    run again — the agent becomes `failed` (router input `start_failed`, reason

@@ -146,8 +146,9 @@ declared verbs. Harness versions are for display; they are never a gate.
 4. Report `applies` for `configure` and for mechanisms that land later
    (`next_tool` = after the current tool call).
 5. `steer` and `interrupt` act only on `turn_id`. If the native current turn is a
-   different one, return `rejected` (`stale_turn`); a steer that has not landed when
-   its turn ends is `failed` (`turn_ended`), never delivered into the next turn.
+   different one, return `rejected` (`stale_turn`); a steer or interrupt that has not
+   landed when its turn ends is `failed` (`turn_ended`) — a steer is never delivered
+   into the next turn.
 6. Approval/question ids are native ids passed through unchanged as `request_id`.
 7. Children: when the harness spawns a subagent, call `child` once, then send that
    child's events with the returned `agent_id`.
@@ -236,7 +237,8 @@ than the frame limit.
   or a service is single-flight per name (two launches share one start); a stop during
   a start cancels it and a late start result is discarded.
 - If a per-agent plugin exits, the host kills and verifies the rest of that agent's
-  process tree and the agent becomes `lost` (an open `stop` then counts as applied);
+  process tree; before `session.ready` that is `start_failed` (agent `failed`), after
+  it the agent becomes `lost` (an open `stop` then counts as applied);
   `resume` starts a new plugin. A `multi_session` plugin is restarted with backoff
   (1 s → 30 s); it re-attaches every live agent (`not_found` → `session.lost`) and the
   host asks `agent.snapshot` for open commands.
