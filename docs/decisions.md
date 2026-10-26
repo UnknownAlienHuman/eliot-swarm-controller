@@ -1,43 +1,43 @@
 # Decisions
 
-Short records of choices that are not obvious from the specs. Change a decision by
-editing its entry in a PR that the owner approves; do not add addenda.
+Short records of choices not obvious from the specs. Change an entry in the PR that
+changes the product; never append a contradictory addendum.
 
 | ID | Decision | Why |
 | --- | --- | --- |
-| D-01 | **v2 is a fresh build in layers; v1 is archived at tag `v1-final`.** v1 code is a donor to read, not a base to refactor. | v1 grew to 533k lines of Rust and 61k lines of docs/audits while core paths stayed unqualified; refactoring it produced audit cycles, not features ([lessons](reference/lessons-v1.md)). |
-| D-02 | One binary `eliot` (CLI, daemon, built-in plugins, hook shim, MCP). | Light install, one version, no sibling-artifact provenance checks. |
-| D-03 | Plugins are separate processes speaking JSON-RPC over stdio. A plugin that launches an agent-owned native process runs **per agent**; a shared plugin is allowed only when the native service already isolates sessions and stopping one agent never requires killing the shared process. | Crash isolation and exact process custody matter more than saving one small plugin process. This keeps `stop --force` honest while still allowing a shared fake plugin and service-backed harnesses to multiplex thousands of records. |
-| D-04 | One SQLite file, WAL, one writer task, numbered migrations via `user_version`. | Enough for one host and millions of rows; no server; v1's schema hashing and reference-DDL checks added nothing. |
-| D-05 | Events persisted with a global `seq`; streaming deltas and samples are ephemeral. | Replayable history without storing token streams. Native transcripts remain the full record. |
-| D-06 | The core has no Task/Issue/review/acceptance/publication engine. | Not in the owner's statement; it was v1's largest source of code and bureaucracy. Build such workflows from rules, scripts and agents. |
-| D-07 | Local trust model: one OS user owns everything; agent tokens are for attribution and routing, not security. | Agents run as the same user and can read the same files; pretending otherwise produced v1's grant/epoch/scope machinery. Remote access (L9) will need real auth. |
-| D-08 | Control model is `self` / `tree` / `project` per agent; the owner and rules can do everything. | Covers "main agent commands others" and "children of any depth" with three values instead of GM epochs and handovers. |
-| D-09 | Eliot Goal loop is allowed for any harness, with budgets (`max_turns`, `max_cost_usd`) and `no_progress` detection. Native goal is used where available. | Owner point 6. Supersedes v1 owner decision #3 ("no automatic re-prompt loop for OpenCode"); the risk it addressed (token ping-pong) is handled by the guardrails. |
-| D-10 | Rules are TOML files (project or data dir), hot-reloaded; the owner or an agent creates one by writing a file; cron expressions are supported. | Owner point 7. Supersedes v1 owner decision #4 (configuration-only, no cron in the first slice). |
-| D-11 | `who` is answered from Git facts (dirty files, branch diff, history), the agents' own file-change events, and advisory claims. | Owner point 10. Supersedes v1's "Git history is not ownership": it is not authority, but it is the right answer to "who works here". |
-| D-12 | Claims are advisory; Eliot does not lock files. | Eliot cannot sandbox a native shell; a lock that does not hold is worse than an announcement. |
-| D-13 | First real harness is Codex (app-server, Rust plugin); OpenCodex is the first proxy. | Most complete documented control protocol (threads, turns, steer, interrupt, approvals, goals) over stdio; OpenCodex targets Codex; no Node/Python needed for L2. |
-| D-14 | **No unknown native or external effect is retried automatically, including `interrupt` and `stop`.** Read back the exact session/turn/request or leave it `unknown`. | A late retry can hit a newer turn or session. Duplicate prompts and pushes were among v1's costliest failures; allegedly idempotent control verbs are not harmless without an exact generation and target. |
-| D-15 | Documentation in `docs/` is specification and roadmap only; status is the roadmap checkboxes plus tests. No audit, report, inventory, packet or readiness documents in the repo. | v1 spent most of its later effort producing documents about documents. |
-| D-16 | Docs are in English; the owner statement in [vision](vision.md) stays verbatim in Russian. | English is what implementing agents and vendor docs use; the original wording remains the source of truth. |
-| D-17 | Harness versions are reported and displayed, never used as gates. | v1 version/provenance gates blocked work without preventing failures. |
-| D-18 | Sessions started over stdio end with the daemon or their per-agent plugin (they become `lost`; `resume` continues them). `daemon stop` refuses to cut running turns unless `--drain` or `--force`. Server-capable harnesses get service mode (L7.6) so upgrades and crashes can preserve turns. | Simple and orphan-free first; long-lived work gets a real service and exact re-attach, not detached processes with ambiguous ownership. |
-| D-19 | Native goal and Eliot goal are independent; one of each may be active on an agent. While a native goal is active, an `on_idle` Eliot goal waits (the native goal drives); an `every` cadence still sends. | Owner decision of 2026-10-18 (v1 `agent_swarm.md` §10): the native goal is the default, the Eliot goal sends ordinary messages, and either or both may be used. |
-| D-20 | Commands use explicit readiness lanes, not a fake total order. Commands that are ready for native I/O are serialized per agent; queued `send`s remain FIFO but do not block controls for the current turn or a `configure` that can apply now. Every dispatched command is bound to the current generation and, where relevant, the exact turn/request. | This preserves `configure` → `send` ordering without making a future-turn request block `steer`, approval, or interrupt of the turn already running. A queued command never crosses a session generation. |
-| D-21 | Per-profile `max_live` queues launches instead of overloading an account. | Quotas and subscriptions are per account. v1 field data: 7 of 10 lines ran on one model route that was about to be withdrawn; 429s and weekly quota windows stalled lines. |
-| D-22 | Every live incarnation has a monotonically increasing `generation`. Agent tokens, plugin messages, commands, pending requests and turn events carry it. A resume rotates the token and increments the generation; re-attaching the same still-live incarnation preserves it. | Late output or a stale process must not command, complete, interrupt or wake a replacement session. This keeps the useful v1 binding-generation invariant without proof packets, receipts or policy hashes. |
-| D-23 | For each agent and normalized event family, one source is authoritative at a time. Live streams, transcripts and hooks may complement one another, but they never independently publish the same lifecycle event. Source hand-off uses a cursor/watermark and reports gaps. | Duplicate `turn.completed` events would run rules twice and corrupt state. Silence is still not completion; an uncovered interval remains explicit. |
-| D-24 | Rule firing is exactly-once **admission**, not exactly-once external execution. A small durable run/action journal records rendered actions and their states. After `dispatched` or `unknown`, an action is read back or resolved; it is never blindly run again. | Commands are already durable, but scripts, Git and webhooks also need crash semantics. This is execution bookkeeping, not a Task/workflow engine. |
-| D-25 | Store failure cannot be reported durably through the failing store. During an outage the daemon logs and exposes in-memory health, stops admitting writes, and retains pending commit results; after recovery it persists one bounded outage/recovery event. | Claiming a persisted `source.health` event on a failed commit is impossible. The specification must describe an implementable failure path. |
+| D-01 | **v2 is a fresh layered build; v1 is archived at `v1-final`.** v1 is a narrow donor, not a refactor base. | v1 reached about 533k Rust lines and 61k process/audit docs without qualified core paths. |
+| D-02 | One `eliot` binary contains CLI, daemon entry, built-in plugin entry, hook shim and optional MCP entry. | Simple installation/versioning; no sibling-artifact provenance platform. |
+| D-03 | Plugins speak JSON-RPC over stdio. A plugin that owns native processes runs **per agent generation**; shared mode is allowed only for a native service that already isolates sessions and can stop one without killing the service. | Exact custody and honest force-stop matter more than one small controller process. Fake and service-backed harnesses can still multiplex. |
+| D-04 | One SQLite database in WAL mode, one writer task, numbered `user_version` migrations. | Enough for one host/millions of rows; no database server or schema-hash ceremony. |
+| D-05 | Persist bounded normalized events with global `seq`; deltas/samples are ephemeral. Native transcripts keep full detail. | Replayable state without token-stream storage. |
+| D-06 | Core has no Task/Issue/review/acceptance/publication engine. | Not requested; it was v1's largest source of code/bureaucracy. Workflows are rules/scripts/agents. |
+| D-07 | One local OS user is the trust boundary. Agent tokens provide current-generation attribution/routing, not isolation from that user. | Agents can already read the same local files. Real remote/multi-user auth belongs to a later gateway. |
+| D-08 | Agent control is `self`, `tree` or `project`; owner and automation have owner authority. | Covers manager/child/project operation without GM epochs/handovers. |
+| D-09 | Eliot Goal is available for any harness with budgets/no-progress. Native Goal is used where qualified; one of each may coexist. | Owner requirements need automatic continuation; guardrails replace the old blanket prohibition. |
+| D-10 | Rules are strict TOML in project/data-dir, hot-reloaded; `every`, cron and one-shot timers are daemon-owned. | Programmability/cron are explicit owner requirements. |
+| D-11 | `who` combines live Git facts, generation-matched native file changes and advisory claims; history is provenance, not authority. | Answers the requested question without pretending Git knows uncommitted authors in a shared checkout. |
+| D-12 | Claims are advisory and never lock files. | Eliot cannot enforce a lock against an unrestricted native shell; a fake lock is worse than a visible warning. |
+| D-13 | First real harness is Codex app-server; first proxy is OpenCodex. | Codex exposes threads/turns/steer/interrupt/requests/goals over a documented headless protocol and fits a Rust first slice. |
+| D-14 | **No unknown native/external effect is retried automatically—not even interrupt or stop.** | A late retry can hit a newer turn/session; exact readback or owner resolution is the only safe settlement. |
+| D-15 | `docs/` contains current specification, roadmap and compact evidence references only. Status is roadmap checkboxes during implementation and executable L7 qualification after feature completion. | v1 spent most later work writing readiness/audit documents about other documents. |
+| D-16 | Documentation is English; the owner's source statement in vision remains verbatim Russian. | Implementers/vendor docs use English; original intent stays exact. |
+| D-17 | Harness/software versions are reported/recorded with fixtures, never authorization gates. | Version/provenance gates blocked work but did not establish semantics. |
+| D-18 | Early stdio sessions are daemon/per-agent-plugin owned and become lost if that custody dies. Daemon stop refuses active work unless drain/force. Service mode comes only after exact re-attach is qualified. | Orphan-free first; continuity later through a real service, not detached ambiguous processes. |
+| D-19 | Native and Eliot goals are independent. `on_idle` Eliot goal waits while native goal actively drives; explicit `every` may still send. | Preserves native autonomy and owner choice without two accidental idle loops. |
+| D-20 | Commands use readiness lanes, not one fake total order. Ready native calls serialize; queued sends stay FIFO but do not block exact control/answer/configuration that can apply now. | Future work must not obstruct control of the current turn. |
+| D-21 | Per-profile/proxy `max_live` queues launches. | Subscription/quota/capacity is account/route scoped; Eliot does not overload or silently reroute it. |
+| D-22 | Every incarnation has monotonic Eliot `generation`. Tokens, commands, events, turns and requests carry it. Resume increments/rotates; exact re-attach to the same live incarnation preserves it. | Late process/output cannot command or complete replacement work. This preserves the useful v1 binding invariant without proof packets. |
+| D-23 | One authoritative source owns each normalized event family per agent generation. Source handoff uses native cursor/watermark or reports a gap. | Duplicate completion would corrupt state/run rules twice; silence/gaps remain explicit. |
+| D-24 | Automation provides exactly-once **run/action admission**, not exactly-once external execution. Dispatched/unknown actions use exact readback/manual resolution and are never blindly rerun. | Commands, scripts, Git and webhooks need crash semantics, but not a workflow platform. |
+| D-25 | A Store commit failure is exposed in memory/logs, blocks new writes and retains the same pending result. Recovery persists one bounded outage record; the failed commit cannot persist its own failure. | This is the only implementable boundary and avoids repeating external effects. |
+| D-26 | Automation resolves selectors and freezes concrete target generation/turn/request at firing. A delayed run never retargets whatever agent/session is current later. | Durable automation otherwise turns an old event into control of a replacement session. |
+| D-27 | L0–L6 are implementation-first: format + smallest changed-package Clippy. The broad deterministic/live/platform/load campaign starts once the feature-complete product exists, in L7. | Rebuilding test infrastructure after every partial layer would recreate v1 ceremony; runtime claims still require one complete real-path qualification before release. |
 
 ## Defaults
 
-Choices made so work never waits. Change them by editing this table.
-
 | Topic | Default |
 | --- | --- |
-| L4.7 harnesses (Command Code, Kilo, Zed) | Not built until someone needs them. |
-| Git identity of agent commits | Per agent (`<name>.<id>@agents.eliot`); `git_identity = "inherit"` opts out. |
-| Remote access (L9) | Not planned. |
-| Eliot Memory OS integration | Not built until the owner asks (L9). |
+| L4.7 harnesses (Command Code, Kilo, Zed) | Do not build until a concrete need. |
+| Git identity | Per agent (`<name>.<id>@agents.eliot`); `git_identity="inherit"` opts out. |
+| Remote access / multi-host / GUI | Not planned; each needs an owner decision. |
+| Eliot Memory OS integration | Not built until explicitly requested. |
