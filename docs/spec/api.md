@@ -29,13 +29,41 @@ per-session token because a service PID is not an agent identity.
 This is an attribution/correctness fence inside the declared one-user trust boundary,
 not protection against an arbitrary malicious same-user process outside Eliot custody.
 
-API frame maximum is 4 MiB; semantic limits are smaller.
+API frame maximum is 4 MiB; semantic limits are smaller. Every successful handshake/
+`daemon.status` returns `write_id_floor_ms`, `idempotency_window_ms` and
+`write_id_future_skew_ms` so clients can generate valid monotonic write IDs.
+
+## External write IDs
+
+Every mutation initiated through CLI/API by owner or agent carries `write_id`, a
+canonical 26-character ULID generated **before** sending. The CLI persists a small
+current-user-only monotonic generator state and advances its timestamp to at least
+`write_id_floor_ms + 1` after each daemon handshake. `--id` accepts only canonical
+ULID; internal automation uses separate fixed derived IDs and never consumes the
+external namespace.
+
+One mutation transaction inserts/reads the compact receipt described in
+[core](core.md#external-write-idempotency-and-retention):
+
+- same id + same principal/method/canonical payload → return current/original result;
+- any mismatch → `id_conflict`;
+- timestamp at/below floor or older than the live window → `id_expired`;
+- timestamp too far ahead → `id_future`.
+
+The receipt remains after terminal domain history is pruned. Once the receipt itself is
+expired and the floor advances, the old id is rejected rather than executed again. A
+client that loses a reply retries with the same id. It never generates a replacement id
+for the same intended mutation.
+
+Internal rule/timer/goal/action writes use `d_…` IDs derived from their durable trigger
+identity. Their dedupe lifetime is tied to the owning run/cursor/timer interval, not the
+external ULID window.
 
 ## Methods
 
 | Surface | Semantics |
 | --- | --- |
-| daemon status/shutdown | admission, Store/WAL, boot-scoped custody/source/account holds; exact drain/force |
+| daemon status/shutdown | admission, Store/WAL, write-id floor, boot-scoped custody/source/account holds; exact drain/force |
 | agent list/get | paginated current projections, generation/native subject/open effects |
 | agent wait/result | exact captured generation/turn/goal terminal result |
 | command submit/get | durable linked session/input commands and readback |
@@ -47,11 +75,14 @@ API frame maximum is 4 MiB; semantic limits are smaller.
 | vars/who/claims | scoped coordination |
 | rule/timer/action/goal | scoped automation state/dry run/cancel/readback/manual assertion |
 
+Every mutating method accepts external `write_id` unless it is an internal plugin/source
+request with its own exact sequence/id contract. Read methods never allocate receipts.
+
 ## Command admission
 
 ```text
 params {
-  id?, target?, verb, args,
+  write_id, target?, verb, args,
   expected_generation?, expected_turn_id?, request_id?,
   probe? [false], wait_ms?
 }
@@ -61,28 +92,30 @@ result {
 }
 ```
 
+For an external command, `command_id = write_id`. Internal automation commands use a
+fixed derived command id and their owning run/action as cause.
+
 One transaction resolves target/selector, validates principal/capability/state and any
-expected binding, captures immutable target generation/turn/request, and creates all
-rows/events.
+expected binding, captures immutable target generation/turn/request, inserts the
+external receipt when applicable, and creates all command/event rows.
 
 Ordinary expected generation equals target current generation. Launch targets 1. Resume
 expects terminal g and targets g+1; the row and token change only when resume dispatch
 commits.
 
-Launch/resume with text returns a session command plus a linked send. Without `--wait`,
+Launch/resume with text returns a session command plus a linked send. The linked command
+uses a fixed derived id from the parent command and target generation. Without `--wait`,
 a launch wait means session readiness only. `--wait` with text waits for the linked
 send's exact turn. Start and initial input never share one outcome.
 
 Interactive calls may omit expected fields; admission captures them. Durable automation
-supplies frozen values. Interactive selectors expand at admission; automation already
-stores concrete targets.
-
-The same external write id plus canonical payload returns the original result; a
-different payload is invalid. Internal ids are fixed derived ids.
+supplies frozen values. Interactive selectors expand at admission into fixed derived
+child command IDs; automation already stores concrete targets.
 
 Stable errors include `not_found`, `unsupported`, `not_allowed`, `bad_state`,
 `stale_generation`, `invalid`, `busy`, `unavailable`, `caller_identity_unknown`,
-`history_gap`, `secret_in_payload`, `internal`.
+`id_conflict`, `id_expired`, `id_future`, `history_gap`, `secret_in_payload`,
+`internal`.
 
 ### Explicit provider probe
 
@@ -114,7 +147,7 @@ when native readback proves the turn no longer active, or the generation is term
 
 ```text
 turn.resolve {
-  id, agent, generation, turn_id,
+  write_id, agent, generation, turn_id,
   status: completed | interrupted | failed,
   reason,
   final_text?
@@ -161,17 +194,18 @@ input lane safe.
 
 ```text
 hook.event {
-  id, harness, hook,
+  hook_id, harness, hook,
   agent, generation, turn_id?, request_id,
   native_deadline_at, payload
 }
 → { decision: allow|deny|ask|..., proposal_id? }
 ```
 
-The daemon derives a fixed proposal id from the stable native hook/request id, validates
-the exact pending request and evaluates only bounded synchronous rules. It returns a
-non-default decision only when the `hook_decisions` proposal committed before the
-internal deadline margin and the request is still pending.
+`hook_id` is the stable native invocation identity, not an external WriteId. The daemon
+derives a fixed internal proposal id from it, validates the exact pending request and
+evaluates only bounded synchronous rules. It returns a non-default decision only when
+the `hook_decisions` proposal committed before the internal deadline margin and the
+request is still pending.
 
 The proposal is not an ordinary command/action and has no dispatcher path. It can affect
 the native request only through this response. Same-id retry before expiry may return
@@ -224,31 +258,36 @@ stricter retention and never opt into a silent gap.
 ## Mail acknowledgement
 
 One open immutable inbox batch exists per recipient. `mail.inbox` returns the same batch
-until `mail.ack(batch_id,id)` commits; new messages wait for the next batch. The CLI
-writes complete stdout before ack. A lost inbox reply leaves messages unread; a lost ack
-uses the same id/readback. `mail.read ID` is allowed only when no open batch contains
-it. `--all` is paginated.
+until `mail.ack(batch_id,write_id)` commits; new messages wait for the next batch. The
+CLI writes complete stdout before ack. A lost inbox reply leaves messages unread; a lost
+ack reuses the same WriteId and receipt. `mail.read ID` is a mutation with its own
+WriteId and is allowed only when no open batch contains that message. `--all` is
+paginated.
 
 ## CLI
+
+Every mutating CLI command accepts `--id ULID`; the CLI generates/persists one before
+sending when omitted and prints it immediately. A retry after an uncertain client reply
+must reuse that printed id.
 
 ```text
 eliot daemon [--foreground] | daemon stop [--drain|--force|--abandon-degraded]
 eliot status
-eliot launch [profile/workspace/tree options] [PROMPT] [--probe] [--wait]
+eliot launch [profile/workspace/tree options] [PROMPT] [--probe] [--wait] [--id ULID]
 eliot ls | show A | watch [A|SELECTOR] | top
-eliot send|inject A TEXT [--generation N] [--probe]
-eliot steer A TEXT [--or-send] [--generation N] [--turn ID]
+eliot send|inject A TEXT [--generation N] [--probe] [--id ULID]
+eliot steer A TEXT [--or-send] [--generation N] [--turn ID] [--id ULID]
 eliot wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
 eliot result A [--generation N] [--turns N]
 eliot turn show A TURN [--generation N]
-eliot turn resolve A TURN --generation N --as completed|interrupted|failed --reason T
-eliot interrupt|abort A [--generation N] [--turn ID]
-eliot stop A [--force] [--tree] [--generation N]
-eliot resume A [PROMPT] [--generation N] [--probe] [--wait]
-eliot approve|deny|answer ...
-eliot configure ... | compact|fork|background ... | goal ...
-eliot cmd show|cancel|resolve|abandon ...
-eliot action show|cancel|resolve ... [--unsafe-assert]
+eliot turn resolve A TURN --generation N --as completed|interrupted|failed --reason T --id ULID
+eliot interrupt|abort A [--generation N] [--turn ID] [--id ULID]
+eliot stop A [--force] [--tree] [--generation N] [--id ULID]
+eliot resume A [PROMPT] [--generation N] [--probe] [--wait] [--id ULID]
+eliot approve|deny|answer ... [--id ULID]
+eliot configure ... | compact|fork|background ... | goal ... [--id ULID]
+eliot cmd show|cancel|resolve|abandon ... [--id ULID where mutating]
+eliot action show|cancel|resolve ... [--unsafe-assert] [--id ULID where external]
 eliot events [--since SEQ] [--allow-gap]
 eliot msg send ... | inbox [--wait SECS] [--all]
 eliot var ... | who ... | claim ... | release ...
