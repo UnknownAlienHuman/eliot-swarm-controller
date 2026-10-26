@@ -1,43 +1,40 @@
 # Coordination
 
-Durable mail, small variables, Git-backed `who` and advisory claims let agents
+Durable mail, small variables, Git-backed `who` and advisory claims let Agents
 coordinate without another scheduler.
 
 ## Authority
 
-Caller identity is exact `(agent,generation)` or automation principal. Invalid or
-incomplete supplied identity is rejected, never owner.
+Caller identity is an explicit owner, Agent/generation or automation principal
+credential. Missing/incomplete/revoked identity rejects; it never becomes owner.
 
 | Principal | Command scope | Coordination scope |
 | --- | --- | --- |
 | owner | all | all |
-| agent `self` | itself | project |
-| agent `tree` | itself + descendants | project |
-| agent `project` | project agents | project |
+| Agent `self` | itself | project |
+| Agent `tree` | itself + descendants | project |
+| Agent `project` | project Agents | project |
 | global rule/timer dispatcher | owner actions after durable admission | all |
-| project rule/timer dispatcher | project-agent actions after durable admission | project only |
-| goal dispatcher | exact agent generation | that agent/project reads for check |
-| managed script/setup/check token | read-only in principal/project scope | no direct mutation; return stdout actions |
+| project rule/timer dispatcher | project-Agent actions after durable admission | project only |
+| Goal dispatcher | exact Agent generation | that Agent/project reads for check |
+| managed script/setup/check | read-only in principal/project scope | no direct mutation; return stdout actions |
 
 This is correctness in a one-user system, not hostile same-user isolation. Commands pass
 router generation/turn/request checks. Queue mail does not grant sender control; full
 send/steer/inject does.
 
-A rule principal belongs to daemon, not script process. After script exits 0, daemon
-validates complete stdout, freezes targets and appends actions under parent principal.
-Process token cannot mutate commands/mail/vars, resolve unknowns, run timers/rules or
-spawn another script through Eliot. Workspace setup and Goal checks have same read-only
-restriction.
-
-A process still inside registered exact/degraded custody cannot obtain no-token owner by
-clearing env: live membership classification requires scoped token or rejects. Deliberate
-same-user `setsid` escape from degraded process group is outside declared containment
-boundary and is reported as such; exact Windows/qualified Linux custody closes it.
+A rule principal belongs to daemon, not the script process. After exit 0, daemon
+validates complete stdout, freezes targets and appends actions under the parent
+principal. Process credential cannot mutate commands/mail/vars, resolve unknowns, run
+timers/rules or spawn another script through Eliot. Workspace setup and Goal checks use
+the same read-only restriction.
 
 Child inherits project/root. Requested control cannot exceed launcher and parent:
 self→self; tree parent grants self/tree; project parent grants self/tree/project. Native
-children default self unless owner-approved harness profile rule. Project principal
-cannot change project/parent/root or choose profile outside allowlist.
+children default self. A guard-exceeding native child is still recorded but gets
+`control=self`, `routing_enabled=false`, no project authority and no automatic wake.
+Project principal cannot change project/parent/root or select a profile outside its
+allowlist.
 
 ## Mailbox
 
@@ -51,43 +48,61 @@ Message {
 }
 ```
 
-Text ≤32 KiB; known secrets reject. Selector expansion is transactional, deterministic
-by AgentId and subject to `max_selector_targets`; overflow rejects before any message.
-Agent/project selectors cannot escape project. Unknown recipient fails. Broadcast above
-a separate confirmation threshold requires owner/global-rule explicit confirmation but
-still cannot exceed hard fanout limit.
+Text is at most 32 KiB and known secrets reject. Selector expansion is transactional,
+deterministic by AgentId and subject to `max_selector_targets`; overflow rejects before
+any message. Agent/project selectors cannot escape project. Unknown recipient fails.
+Broadcast above a separate confirmation threshold requires owner/global-rule explicit
+confirmation but still cannot exceed the hard fanout limit.
 
 Modes:
 
-- queue: durable unread; recipient wake policy decides presentation;
-- inject: full text at exact safe point; command rights required;
-- send: full text as new turn; command rights required;
-- steer: full text into exact active turn; exact steer/control required.
+- `queue`: durable unread; recipient delivery policy decides presentation;
+- `inject`: full text at exact safe point; command rights required;
+- `send`: full text as a new turn; command rights required;
+- `steer`: full text into exact active turn; exact steer/control required.
 
-`presentation_kind=notice|full`; presented is not acknowledged.
+`presentation_kind=notice|full|parent`; presented is not acknowledged.
 
-### Capability-aware wake
+### Delivery policy
 
-For queue + `wake_on_mail=true`:
+Profile field is:
 
-1. busy with exact inject → one generation-bound notice inject;
-2. busy without inject → unread; same generation idle may get one short send notice;
-3. idle → one short send notice;
+```text
+mail_delivery = off | notice | full | parent
+```
+
+- `off`: queue only; recipient reads explicitly.
+- `notice`: daemon presents `[eliot] N unread messages; run eliot inbox`. This requires
+  `routing_enabled=true`, because the recipient needs its own credential to read inbox.
+- `full`: daemon may present the full bounded message through a qualified native
+  inject/send mechanism. It does not require recipient CLI routing, but it does require
+  exact generation binding and declared native delivery semantics.
+- `parent`: queue one coalesced notice to the nearest live routed parent/project manager;
+  original message remains addressed to the child.
+
+For `notice`/`full`:
+
+1. busy + qualified exact inject → one generation-bound presentation at safe point;
+2. busy without inject → leave unread; same generation idle may receive one short send
+   or full send according to policy;
+3. idle → one bounded send presentation if supported;
 4. observe-only, draining, pending request, matching provider hold or unknown control/
    input/turn → no presentation.
 
-Wake can never be provider probe. No send/steer substitution while busy. At most one open
-presentation command and one notice/minute/recipient. Unknown presentation is not
-retried. New generation stales presentation but unread mail remains eligible. Startup
-reconciles unread recipients with no open presentation.
+A routing-disabled Agent with `notice` is treated as queue-only and reports
+`delivery_unavailable`; it never receives an unusable CLI instruction. Wake can never be
+a provider probe. No send/steer substitution while busy. At most one open presentation
+command and one presentation/minute/recipient. Unknown presentation is not retried. A
+new generation stales presentation but unread mail remains eligible. Startup reconciles
+unread recipients with no open presentation.
 
 ### Inbox acknowledgement
 
-One immutable open batch/recipient, max 100 messages and 1 MiB encoded data. Excess
-waits next batch. `mail.inbox` returns same batch until acknowledged and holds no read
-transaction while waiting. CLI writes complete stdout then receipted `mail.ack`. Lost
-inbox leaves unread; lost ack reuses WriteId. `mail.read` rejects when message belongs to
-open batch. History is paginated.
+One immutable open batch per recipient, at most 100 messages and 1 MiB encoded data.
+Excess waits for the next batch. `mail.inbox` returns the same batch until acknowledged
+and holds no read transaction while waiting. CLI writes complete stdout then sends a
+receipted `mail.ack`. Lost inbox leaves unread; lost ack reuses WriteId. `mail.read`
+rejects when the message belongs to an open batch. History is paginated.
 
 ```sql
 CREATE TABLE messages (
@@ -115,14 +130,14 @@ CREATE UNIQUE INDEX mail_open_batch ON mail_batches(recipient)
 ```
 
 Unread/open batches never age-prune. Acknowledged history may prune after configured
-retention; old cursor returns `history_gap`. Receipts follow independent minimum window
-and FK rules.
+retention; an old cursor returns `history_gap`. Receipts follow their independent
+minimum window and FK rules.
 
 ## Shared variables
 
-Scopes: project (agent/project rule default), tree root, global. Only owner/global rule
-writes global. Values ≤16 KiB JSON/string, reject known secrets, increment version and
-record principal/generation. `expect_version` is CAS.
+Scopes are project (Agent/project-rule default), tree root or global. Only owner/global
+rule writes global. Values are at most 16 KiB JSON/string, reject known secrets,
+increment version and record principal/generation. `expect_version` is CAS.
 
 ```sql
 CREATE TABLE vars (
@@ -138,29 +153,31 @@ CREATE TABLE vars (
 | Signal | Meaning |
 | --- | --- |
 | edited | live controlled current-generation edit projection whose path remains dirty |
-| dirty | Git dirty path in a single-agent worktree |
+| dirty | Git dirty path in a single-Agent worktree |
 | branch | committed path still different from frozen base OID |
 | claim | current live controlled advisory intention |
 | history | optional bounded authorship provenance only |
 
-Current edit state comes from [durable attribution](monitoring.md#durable-edit-attribution),
-not retained events. `agent_edits` rows for terminal/detached generations may remain
-until path clean for provenance/cleanup, but `who` never reports them as current worker;
-shared dirty paths with no live controlled attribution are `unattributed`. Queries use
-cached projections and grant no authority.
+Current edit state comes from
+[durable attribution](monitoring.md#durable-edit-attribution), not retained events.
+Rows for terminal/detached generations may remain until the path is clean for cleanup
+provenance, but `who` never reports them as current workers. Shared dirty paths with no
+live controlled attribution are `unattributed`. Queries use cached projections and grant
+no authority.
 
-Git identity is environment-only. Shared-checkout agents stage explicit paths; one
+Git identity is environment-only. Shared-checkout Agents stage explicit paths; one
 manager commits, or writers use worktrees.
 
 ## Claims
 
 Claims are bounded repository-relative normalized globs with note/TTL and exact owner
-`(agent,generation)`. Active only while generation live and controlled. Overlap with
-another active claim or dirty/branch path emits conflict + one coalesced queue message.
-Claims never prevent writes.
+`(agent,generation)`. They are active only while generation is live and controlled.
+Overlap with another active claim or dirty/branch path emits conflict plus one coalesced
+queue message. Claims never prevent writes.
 
-Terminal, resume, detach/observe-only or explicit release removes old generation claims
-in same transaction. TTL is fallback. Project principal cannot claim outside project.
+Terminal, resume, detach/observe-only or explicit release removes old-generation claims
+in the same transaction. TTL is fallback. Project principal cannot claim outside its
+project.
 
 ```sql
 CREATE TABLE claims (
@@ -180,15 +197,17 @@ CREATE INDEX claims_owner ON claims(agent,generation);
 
 ## Hierarchy
 
-Parent/root/depth are logical. Config limits fanout/depth. Native children upsert by
-canonical subject with parent-generation provenance. Parent completion/goal notification
-uses ordinary queue mail/wake.
+Parent/root/depth are logical. Config limits controller-created fanout/depth. Native
+children upsert by canonical subject with parent-generation provenance even when guards
+are exceeded. Parent completion/Goal notification uses ordinary queue mail and the
+recipient delivery policy.
 
-Tree selectors resolve at admission; later work not included. Synchronous manager uses
-exact send/wait/result; queue remains asynchronous.
+Tree selectors resolve at admission; later work is not included. Synchronous manager
+uses exact send/wait/result; queue remains asynchronous.
 
 ## Prompt guidance
 
 Default note lists available commands and says vars/`who` first, specific mail second,
-no acknowledgements/status chatter/credentials. Manager profiles add exact launch/send/
-wait/result/steer/interrupt/stop guidance.
+no acknowledgements/status chatter/credentials. A routing-disabled native child is not
+told to use Eliot CLI. Manager profiles add exact launch/send/wait/result/steer/
+interrupt/stop guidance.
