@@ -18,13 +18,17 @@ on:
       - 'docs/**'
       - 'tools/ci/validate-v2-docs.py'
       - '.github/workflows/v2-docs.yml'
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   links:
     name: Active v2 links and anchors
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Validate relative links and GitHub-style anchors
-        run: python tools/ci/validate-v2-docs.py
+        with:
+          persist-credentials: false
+      - name: Validate local links, images and GitHub-style anchors
+        run: python3 -I tools/ci/validate-v2-docs.py
