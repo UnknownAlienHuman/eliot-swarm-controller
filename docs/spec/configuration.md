@@ -1,44 +1,35 @@
 # Configuration
 
-## Data directory
+## Private data directory
 
-Default `%LOCALAPPDATA%\Eliot` on Windows or `~/.local/share/eliot`; override with
-`--data-dir` or `ELIOT_HOME`. One daemon owns one data directory and holds
-`daemon.lock`.
+Default `%LOCALAPPDATA%\Eliot` (Windows) or `~/.local/share/eliot`; override with
+`--data-dir` / `ELIOT_HOME`. Create the directory and files with current-user-only
+permissions/ACL. Refuse symlink/reparse-point data roots and unsafe ownership. Logs are
+rotated/bounded/private.
 
 ```text
 <data_dir>/
   config.toml
-  eliot.db
-  daemon.json             pid, endpoint, version, start identity
-  daemon.lock
-  logs/daemon.log         rotated and bounded
-  rules/*.toml
-  plugins/<name>/         shared-plugin state
-  plugins/<name>/<agent>-g<generation>/   per-agent plugin state
-  services/<name>/        managed service endpoint/process state
-  worktrees/<agent>/      worktrees created by Eliot
+  eliot.db, eliot.db-wal, eliot.db-shm
+  daemon.json, daemon.lock
+  logs/
+  rules/
+  plugins/<name>/...
+  services/<name>/...
+  worktrees/<agent>/...
 ```
 
-Project files are versioned in the registered repository:
+Project `.eliot/{config.toml,rules/,scripts/}` is loaded only from a globally registered
+checkout, never an agent worktree. Agent changes take effect only after reaching that
+checkout. Reload errors keep the last valid config/rules and report source health.
 
-```text
-<repo>/.eliot/
-  config.toml
-  rules/*.toml
-  scripts/
-```
-
-Project files are loaded only for repositories registered in global config and only
-from that registered checkout, never from an agent worktree. A rule an agent writes in
-a worktree takes effect only after it reaches the registered checkout. Every reload or
-parse failure is reported by the config source.
-
-## `config.toml`
+## Example
 
 ```toml
 [daemon]
 retention.events_days = 30
+store.wal_warn_bytes = 536870912
+store.wal_hard_bytes = 2147483648
 limits.max_depth = 8
 limits.max_children_per_agent = 20
 limits.max_tree_agents = 100
@@ -48,126 +39,154 @@ automation.check_timeout = "10m"
 
 [process]
 scan_interval = "2s"
+terminal_drain_timeout = "3s"
+linux_exact_custody = "auto"      # require|auto|off; auto reports degraded fallback
 
 [git]
 poll_interval = "15s"
-remote_poll = "off"                 # or "10m": periodic ls-remote
+remote_poll = "off"
 fingerprint_max_files = 5000
 fingerprint_max_bytes = 67108864
-
-# Built-in per-agent plugin. Session mode comes from its manifest, not config.
-[plugins.codex]
-
-# External per-agent plugin. The host starts this command once per live agent.
-[plugins.claude]
-cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]
-
-# Shared plugins may run a small pool; per-agent plugins reject `instances`.
-[plugins.fake]
-instances = 1
-verbs = ["launch", "send", "steer", "inject", "interrupt", "stop", "resume",
-         "approve", "deny", "answer", "configure"]
 
 [projects.app]
 path = "C:/src/app"
 
+[accounts.codex-main]
+max_live = 8
+
+[plugins.codex]
+
+[plugins.claude]
+cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]
+
+[plugins.fake]
+instances = 1                       # only shared plugins accept this
+
 [proxies.opencodex]
 max_live = 8
-attach = "http://127.0.0.1:10100"    # attach to owner-run service
-# launch = ["opencodex", "..."]       # or supervise a managed service
+attach = "http://127.0.0.1:10100"
 health = "/api/system/health"
 api_key_env = "OPENCODEX_API_KEY"
+
+[webhooks.ops]
+url_env = "ELIOT_OPS_WEBHOOK_URL"
+secret_env = ["ELIOT_OPS_WEBHOOK_TOKEN"]
 
 [profiles.codex]
 harness = "codex"
 model = "<native model id>"
 effort = "high"
 billing = "subscription"
-account = "main"
+account = "codex-main"
 permissions = "workspace-write"
+env_mode = "minimal"
+pass_env = ["CODEX_HOME"]
 workspace_mode = "shared"
 labels = { role = "writer" }
 
 [profiles.codex-opencodex]
 extends = "codex"
 proxy = "opencodex"
+pass_env = ["CODEX_HOME", "OPENCODEX_API_KEY"]
 
 [profiles.manager]
 harness = "claude"
+account = "claude-main"
 permissions = "workspace-write"
+env_mode = "minimal"
+pass_env = ["CLAUDE_CONFIG_DIR"]
 workspace_mode = "worktree"
 control = "project"
 labels = { role = "manager" }
 ```
 
-## General rules
+## Environment policy
 
-- Credentials never live in config values, Store, events or messages. Config names
-  environment variables (`api_key_env`, `secret_env`); the daemon resolves them in
-  memory for the native process.
-- Agent tokens are generation-scoped routing handles. `ELIOT_AGENT_ID`,
-  `ELIOT_AGENT_GENERATION`, `ELIOT_AGENT_TOKEN` and endpoint are injected after the
-  profile environment; users do not configure them.
-- `extends` merges one base profile (one level). Missing fields use
-  [core defaults](core.md#profile).
-- Separate native accounts are separate profiles whose environment points to distinct
-  auth/config directories (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, ...). `max_live` applies
-  per profile; a proxy may add another cap shared by profiles.
-- Provider holds are scoped to the profile/account/proxy that produced the evidence.
-  After rate-limit/quota `retry_after`, one launch is a probe; others remain queued
-  until that generation reaches a successful first turn. A retry-after timestamp is
-  not proof of recovery.
-- Harness processes inherit daemon environment, profile `env`, then Eliot variables.
-  `env_clear = true` starts from an OS baseline (on Windows at least `SystemRoot`,
-  `USERPROFILE`, `HOME`, `PATH`, `TEMP`) plus profile/Eliot values.
-- Rust worktrees use separate `CARGO_TARGET_DIR`s. Eliot does not serialize Cargo
-  builds from different agents into one target directory.
-- Keep the data path short on Windows. Eliot passes `core.longpaths=true` through
-  process environment/config arguments for its own and agent Git calls; it fails
-  clearly if a tool still cannot address the path.
-- Project `[profiles.X]` replaces global `[profiles.X]` as a whole. Other tables merge
-  key by key, project over global.
-- Unknown keys are errors with file/line, except extra keys inside
-  `[plugins.<name>]`, which are handed to and validated by that plugin at initialize.
-- `eliot status` shows each effective value and source file; secret values are never
-  shown.
+Default `env_mode="minimal"`; agents do **not** inherit the daemon's complete
+environment. The baseline contains only OS essentials needed to spawn programs
+(PATH, home/profile, system root, temp, locale and platform certificate variables).
+Everything else is explicit:
+
+- `env = { NAME="literal nonsecret value" }`;
+- `pass_env = ["NAME"]` copies the daemon environment value at launch and treats it as
+  secret for masking;
+- `secret_env` marks literal `env` names whose values also require masking;
+- proxy/account/plugin credential variables are automatically secret and passed only
+  to the process/session that needs them;
+- current agent token is automatically secret.
+
+`env_mode="inherit"` is an explicit owner opt-in for a trusted profile. `eliot status`
+warns that the full daemon environment reaches the harness. Empty/minimal is not
+implemented by deleting Windows `SystemRoot`/profile/temp/PATH.
+
+Known secret values are never stored in resolved config, command args, mail, vars,
+rules or logs. Durable semantic payloads containing them are rejected; native output is
+masked. Named environment references are persisted, not their values.
+
+## Accounts, capacity and provider holds
+
+A profile's `account` references `[accounts.<id>]`. Capacity is the minimum of:
+
+- profile `max_live` (optional local narrowing);
+- shared account `max_live`;
+- proxy/service `max_live`.
+
+Profiles with different model/permission settings but the same subscription/account
+therefore share one cap. If `account` is omitted, the profile itself is the capacity
+scope and status warns that cross-profile sharing is unknown.
+
+Provider limitation records are persisted:
+
+```sql
+CREATE TABLE provider_holds (
+  scope TEXT PRIMARY KEY,            -- exact route/model/account scope
+  kind TEXT NOT NULL,
+  coverage TEXT NOT NULL,
+  retry_after INTEGER,
+  probe_agent INTEGER,
+  probe_generation INTEGER,
+  state TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+```
+
+The plugin reports limitation scope/coverage. Unknown coverage holds only the exact
+profile route, not every account. `retry_after` permits one future **real user turn** as
+a probe; Eliot never generates a hidden model call. The hold clears only after a
+successful provider-backed turn/readback in that scope. Restart restores holds/probe
+state.
+
+## Profiles and merges
+
+One-level `extends`; project profile replaces the global profile as a whole. Other
+tables merge key-by-key. Unknown keys are errors except plugin-private keys validated
+at initialize. Names, labels, argv/env counts and values are bounded.
+
+`setup` and `scratch` entries are relative to the worktree, reject absolute/`..` paths,
+and never authorize cleanup outside it. Rust worktrees use distinct
+`CARGO_TARGET_DIR`s. Eliot does not serialize independent builds into one target dir.
 
 ## Plugins
 
-| Key | Meaning |
-| --- | --- |
-| `cmd` | External plugin command. Omitted for built-in plugins. |
-| `instances` | Pool size for a plugin whose manifest says `session_mode=shared` (default 1). Invalid for `per_agent`. |
-| anything else | Plugin-private configuration passed at `initialize`. |
+`cmd` selects an external plugin. `instances` is valid only when the returned manifest
+is `shared`; per-agent mode gets one private instance/data directory per generation.
+The operator cannot override manifest custody mode. A shared controlling plugin must
+prove per-session environment and isolated stop where tools require them.
 
-The manifest, not config, chooses `per_agent` or `shared`; an operator cannot weaken
-custody by overriding it. A per-agent instance receives a private state directory for
-its agent/generation. A shared instance receives its shared directory and must keep
-its native-session mapping isolated internally.
+## Proxies, services and webhooks
 
-A second plugin entry may reuse the same executable under another name and different
-private config. It is still validated against the returned manifest.
+`attach` means external owner service: health-check/read-only management, never stop or
+reconfigure. `launch` means managed service with separate custody, persisted endpoint
+and process identity. Agent stop never stops a shared service.
 
-## Proxies and managed services
+Proxy API keys and webhook URLs/tokens come from named environment variables. Rule
+actions store endpoint name (`ops`), never raw URL/header/secret. Effective proxy/model/
+billing route is reported by the plugin; requested configuration alone is not proof.
 
-A proxy entry describes OpenCodex, another compatible gateway or a
-[local model server](../harnesses/local-models.md):
+## Store/WAL limits
 
-| Key | Meaning |
-| --- | --- |
-| `attach` | Base URL of an owner-run service. Eliot health-checks it and never stops it. |
-| `launch` | Explicit argv for a managed service. Eliot starts it before first use, watches it, and may stop it after `idle_stop`. |
-| `max_live` | Optional live-agent cap across all profiles using this service/account. |
-| `idle_stop` | Managed service only; default never. |
-| `health` | HTTP path whose 200 response means available. |
-| `api_key_env` | Environment variable containing the client key. |
-| `base_url_for` | Optional harness-specific base URLs, e.g. `{ claude = ".../anthropic" }`. |
-
-A managed shared service has its own custody object, not an agent Job. Its endpoint and
-process birth identity are persisted before an agent uses it. Attached services carry
-no Eliot stop authority.
-
-How a profile reaches a proxy is plugin knowledge and documented on the harness page:
-Claude uses `ANTHROPIC_BASE_URL`, Codex uses a `model_providers` entry, OpenCode uses a
-provider `baseURL`, and so on. The plugin reports the effective endpoint in
-`session.ready`; requested URL alone is not proof that traffic used it.
+The daemon periodically passive-checkpoints WAL, records size and identifies long
+readers. API replays paginate and release read transactions between pages. At warning
+size status/source health reports pressure. At hard size the daemon refuses new long
+read/replay operations while continuing short control/result commits; it never deletes
+rows, kills readers blindly or runs an unsafe truncate checkpoint.
