@@ -1,102 +1,90 @@
 # Plugin protocol
 
-A plugin translates Eliot's semantic commands to one harness and normalizes native
+A plugin translates Eliot semantic commands to one harness and normalizes native
 facts. It is a process speaking this protocol on stdin/stdout.
 
-- **Built-in plugins** are Rust crates in `plugins/<name>/` linked into `eliot` and
-  executed as `eliot plugin <name>`.
-- **External plugins** may use any language and are started from
-  `[plugins.<name>] cmd = [...]`.
-- A plugin declares `session_mode = per_agent | shared`:
-  - `per_agent`: one plugin process owns one agent incarnation and any native child
-    processes. This is the default for stdio/CLI harnesses and gives the daemon one
-    exact Job/process group for `stop --force`.
-  - `shared`: one plugin process multiplexes sessions already isolated by a native
-    service, or simulated sessions. It must not require killing the shared plugin or
-    service to stop one agent. Fake, an attached OpenCode server and ACP gateways are
-    typical shared cases.
+- Built-in plugins are Rust crates invoked as `eliot plugin <name>`.
+- External plugins may use any language and are started from plugin config.
+- Manifest `session_mode` is:
+  - `per_agent`: one plugin process owns one Eliot agent generation and every native
+    child process it launches; default for stdio/CLI/SDK harnesses;
+  - `shared`: one plugin process talks to a native service that already isolates
+    sessions, or simulates isolated sessions. One agent stop never kills the shared
+    plugin/service. Fake and an attached OpenCode server are examples.
 
-The daemon may run many per-agent plugin processes. A few MiB of controller overhead
-is preferable to an untrue process-ownership model.
+Many small per-agent controller processes are acceptable. Exact custody is more
+important than saving a few MiB.
 
 ## Framing
 
-- JSON-RPC 2.0, one UTF-8 JSON object per line, no BOM, maximum 1 MiB per line.
-- Rust uses `tokio_util::codec::LinesCodec` / `FramedRead`; never cancel a partial
-  `read_line` in `select!`. A long-lived native reader has its own task.
-- stderr is bounded plugin log text; stdout is protocol only.
-- Both directions may send requests and notifications. Request ids are unique per
-  direction.
-- Every agent-scoped request, reply context, notification and plugin request carries
-  `agent_id` and `generation`. The plugin keeps an exact mapping to native session,
-  active turn and pending requests for that generation.
-- Protocol version is `eliot-plugin/1`. Within it, fields may be added but existing
-  meaning cannot change.
+- JSON-RPC 2.0, one UTF-8 JSON object per line, no BOM, maximum 1 MiB/line.
+- stdout is protocol only; stderr is bounded log text.
+- Both directions may issue requests/notifications; ids are unique per direction.
+- Every agent-scoped message carries `agent_id` and `generation`.
+- A long-lived reader has its own task. Do not cancel a partial line read in a select.
+- Protocol version is `eliot-plugin/1`; fields may be added compatibly, meaning may not
+  be changed.
 
 ## Host → plugin requests
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `initialize` | `protocol`, `plugin_config`, `data_dir`, `instance_id` | `Manifest` |
-| `agent.start` | `agent_id`, `generation`, resolved `profile`, `workspace?`, `prompt?`, `env`, `system_note`, `parent_native_ref?` | `{native_scope, native_ref, pids, effective}` after the generation is ready |
-| `agent.attach` | `agent_id`, `generation`, `native_scope`, `native_ref`, `observe_only` | `{state, active_turn?, pending, pids, effective?}` for the exact still-live incarnation; `not_found` if absent |
-| `agent.command` | `agent_id`, `generation`, `command_id`, `verb`, `args`, `expected_turn_id?`, `request_id?` | `{status: applied|rejected|failed|unknown, applies?: now|next_tool|next_turn|next_session, detail?}` |
-| `agent.snapshot` | `agent_id`, `generation`, `commands?: [command_id]` | `{state, active_turn?, pending, goal?, usage?, commands?: {id: applied|not_applied|unknown}}` |
-| `agent.stop` | `agent_id`, `generation`, `command_id`, `force` | `{}` only after that generation ended |
-| `discover` | `{}` | `[{native_scope, native_ref, workspace?, started_at?, title?, live}]` |
-| `shutdown` | `{}` | `{}`; the plugin exits after replying |
+| `initialize` | `protocol`, plugin config, data dir, instance id | `Manifest` |
+| `agent.start` | `agent_id`, `generation`, resolved profile, workspace?, prompt?, `resume_from?`, env, system note, parent native ref? | native scope/ref, pids, effective after generation is ready |
+| `agent.attach` | agent/generation, native scope/ref, observe-only | exact still-live state/turn/pending/pids/effective or `not_found` |
+| `agent.command` | agent/generation, command id, verb, args, expected turn?, request id? | `applied|rejected|failed|unknown`, application point/detail |
+| `agent.snapshot` | agent/generation, optional command ids | state, active turn, pending, goal, usage, exact command readback |
+| `agent.stop` | agent/generation, command id, force | success only after that generation ended |
+| `discover` | — | native sessions with scope/ref/workspace/time/title/live |
+| `shutdown` | — | reply then exit |
 
-`Pid = {pid, start_time, role}`; `role = harness | server | tool | proxy`.
+```text
+resume_from = { native_scope, native_ref, prompt? }
+Pid = { pid, start_time, role: harness|server|tool|proxy }
+```
+
+`resume` is a semantic core command handled by the daemon as a new-generation
+`agent.start` with `resume_from`. It is **not** sent through `agent.command`. The
+manifest still declares `resume` to say the plugin supports this start mode. The old
+prompt is never inferred or resent; only an explicit new `prompt` field may start a
+new turn after native resume.
 
 ### Start contract
 
-A successful `agent.start` has one unambiguous sequence:
+Launch and resume share one contract:
 
-1. establish the exact native session and generation mapping;
-2. emit exactly one `session.ready` event with the same `native_scope`, `native_ref`,
-   effective settings and generation;
-3. return the matching result.
+1. establish the exact native session ↔ Eliot generation mapping;
+2. emit exactly one `session.ready` with matching native scope/ref/effective settings;
+3. return the same mapping.
 
-The daemon does not dispatch another command for the generation until both facts are
-consistent. Events that race ahead of `session.ready` are buffered for that connection
-and released after `session.ready` commits. If `session.ready` committed but the start
-reply was lost, it is exact readback that the launch applied. If native I/O may have
-occurred but neither the ready fact nor a negative readback exists, the launch is
-`unknown`, not `failed` and never retried.
+The host does not dispatch another command until the ready event is committed and the
+reply agrees. Earlier native events are buffered for that connection and released
+after ready commits.
 
-`resume` is routed through `agent.command` only for native APIs that reopen within the
-same plugin process; the host has already created a new Eliot generation. A
-per-agent plugin may instead implement resume during `agent.start` using the retained
-`native_scope/native_ref` supplied in `profile`/start context. The harness page states
-which mapping it uses. Old input is never resent.
+If ready committed but the reply was lost, it proves that exact start applied. If
+native I/O may have occurred but neither ready nor negative exact readback exists, the
+launch/resume command is unknown and is never repeated. A definite pre-I/O failure is
+failed/rejected as appropriate.
 
-`agent.attach` is for daemon/plugin recovery and discovered sessions. Re-attaching the
-same still-live incarnation preserves generation. Starting a replacement session is
-`resume` and increments generation.
+Re-attaching the same still-live incarnation after host/plugin recovery preserves
+Eliot generation. `resume_from` after terminal/lost state creates a new generation and
+rotates token even when native ref is reused.
 
-## Plugin → host notifications
+## Plugin → host notifications and requests
 
 | Method | Params |
 | --- | --- |
-| `event` | `{agent_id, generation, kind, ts?, native_id?, data}` |
-| `process` | `{agent_id, generation, pid, start_time, role}` |
-| `log` | `{level, message}` |
+| `event` | agent, generation, kind, optional timestamp/native id, data |
+| `process` | agent, generation, pid, start time, role |
+| `log` | level/message |
+| `child` (request) | parent agent/generation, native ref, optional name/labels |
 
-The host rejects stale-generation notifications before they reach the normal event
-bus. Repeated notifications must carry a stable `native_id` where the native protocol
-has one; the plugin itself suppresses repeats from reconnect/replay.
+Host rejects stale-generation notification before the normal bus. Plugin suppresses
+native reconnect/replay duplicates and includes stable native ids where available.
 
-## Plugin → host requests
-
-| Method | Params | Result |
-| --- | --- | --- |
-| `child` | `{parent_agent_id, parent_generation, native_ref, name?, labels?}` | `{agent_id, generation, token}` |
-
-`child` is idempotent for `(parent agent, parent generation, native_ref)`. The host
-creates an `origin=native` child at generation 1. Where the harness can set child
-environment, the plugin gives it the returned token. If native subagents share the
-parent process/environment and cannot receive a distinct token, their own `eliot`
-CLI calls are attributed to the parent; `eliot show` says so.
+`child` is idempotent for `(parent agent,parent generation,native ref)`. Host returns
+child id/generation/token. If native children cannot receive separate environment,
+their Eliot CLI calls are attributed to parent and `show` states that limitation.
 
 ## Manifest
 
@@ -124,201 +112,155 @@ CLI calls are attributed to the parent; `eliot show` says so.
 }
 ```
 
-`available` means the native harness was found and can be started. `proxy` is
-`config | env | none`. Harness versions are display facts, never gates.
+`available` means the native route can currently start. `proxy` is `config|env|none`.
+Versions are display/fixture facts, not gates. Shared plugins may declare native
+`max_sessions`; `instances=N` applies only to shared plugins. Each live per-agent
+session gets its own instance/state directory.
 
-A `shared` plugin may declare a finite `max_sessions` if its native service has a hard
-limit. `per_agent` plugins do not declare multiplexing or rely on `[plugins.X]
-instances`; each live agent gets its own instance.
+## Binding and translation
 
-## Binding and translation rules
-
-1. Validate `generation` before any native I/O. For a stale generation return
-   `rejected {reason: stale_generation}`.
-2. `steer` and `interrupt` require `expected_turn_id` equal to the current native turn.
-   Approval/deny/answer require the exact pending `request_id`. A mismatch is
-   `rejected`, never redirected to whatever is current.
-3. Translate one Eliot verb to exactly one documented native mechanism and return it
-   in `detail.mechanism` (for example `turn/steer`, `hook:additionalContext`,
-   `queued:next_send`).
-4. If the native side cannot express the semantics, return `rejected` with a reason.
-   Never silently substitute `send` for `steer`, restart for resume, or default choice
-   for an answer.
-5. `unknown` means native I/O may have happened but no exact outcome is available.
-   The plugin never retries it, including `interrupt` and `stop`.
-6. Report `applies` for `configure` and delayed mechanisms.
-7. Native request ids pass through unchanged. Do not use list position or "the newest"
-   request when an id exists.
-8. A queued `send` arrives at the plugin only when its bound generation is idle. The
-   daemon, not the plugin, owns its FIFO queue.
+1. Validate generation before native I/O; stale returns rejected.
+2. Steer/interrupt require exact expected active turn. Approval/deny/answer require
+   exact pending request. Never redirect to whatever is current.
+3. Translate one verb to one documented native mechanism and report it plus
+   application point (`now|next_tool|next_turn|next_session`).
+4. Unsupported semantics are rejected. Never silently map steer→send,
+   resume→fresh launch, answer→default option or force-stop→shared service kill.
+5. Unknown means native effect may have happened. Plugin never retries it, including
+   interrupt/stop/start.
+6. Preserve native request/item/turn ids. No newest/list-position identity.
+7. Daemon owns queued-send FIFO. Plugin receives a send only when its bound generation
+   is idle.
+8. A payload over its semantic/frame limit fails before native I/O.
 
 ## Event normalization
 
-- The successful start result is preceded by one `session.ready`; normal end is
-  `session.ended`; an unexpected owned-process exit is `session.lost`; a fatal native
-  protocol/session error while the process remains is `session.error`.
-- Emit `turn.started` / `turn.completed` exactly once per native turn id. A terminal
-  turn status is `completed`, `interrupted` or `failed`. Intermediate statuses are not
-  completions.
-- `message.agent` carries bounded final assistant text. Deltas are ephemeral
-  `message.delta` and carry `turn_id`.
-- Tool summaries are short; full output stays native. Every tool/request event carries
-  the exact turn/request/item id available from the harness.
-- Usage counters state their scope (`turn` or `session`). Never sum cumulative values.
-  Unknown quota is unknown, not zero.
-- Provider errors map to `provider.limited.kind`: `rate_limit`, `quota`, `model_gone`,
-  `auth`. A 429 is `rate_limit` unless the native error proves quota exhaustion.
-- Unknown native events may be forwarded as `x.<harness>.<name>`.
-- Events may precede the command reply that caused them. Correlate through generation,
-  command/native ids and turn ids, not arrival order.
-- Child usage belongs to the child unless the native source explicitly reports an
-  aggregate; then mark it as aggregate.
+- Start produces one `session.ready`; normal end `session.ended`; disappearance of
+  exact owned process/session `session.lost`; fatal live protocol/session error
+  `session.error`.
+- Emit one `turn.started` and one terminal `turn.completed` per native turn id.
+  Terminal status is completed/interrupted/failed; intermediate native states are not
+  completion.
+- Final assistant text is bounded persisted `message.agent`; deltas are ephemeral and
+  carry turn id. Full detail remains native.
+- Tool/plan/file/request facts carry exact native turn/item/request ids.
+- Usage states scope (turn/session); cumulative values replace, never sum.
+- Provider errors distinguish rate limit, quota, model removed and auth when native
+  evidence supports it.
+- Unknown native events may be `x.<harness>.*` but never change core state.
+- Events may precede command reply. Correlate by generation/native ids, not arrival.
 
 ## Source ownership
 
-For one agent generation, exactly one source owns each normalized family:
+For each agent generation and normalized family, one source is authoritative:
 
-- a controlled live native stream normally owns session/turn/message/tool/request;
-- a transcript is primary for observe-only sessions or takes over after a recorded
-  stream cursor/watermark;
-- hooks own only facts unavailable from the primary stream, or synchronous decisions;
+- controlled live stream normally owns session/turn/message/tool/request;
+- transcript owns those families for observe-only sessions or after an explicit cursor
+  handoff;
+- hooks own only assigned missing facts or synchronous decisions;
 - process/Git/filesystem sources own their separate families.
 
-A plugin must not tail a transcript and publish duplicate lifecycle events while its
-live stream already owns them. On hand-off it records the last native id/cursor it has
-published and starts after it. If the formats cannot establish a lossless boundary,
-it reports an explicit source gap and continues without inventing or replaying a
-completion. See [monitoring](monitoring.md#source-ownership).
+A plugin never tails a transcript to publish duplicate lifecycle while its live stream
+owns it. Handoff starts after the last committed native cursor/id. If lossless boundary
+cannot be proved, report a source gap; do not replay completion or treat interval as
+empty.
 
 ## Hooks
 
-For a harness with native command hooks, the plugin writes a **session-scoped** hook
-configuration; never edit the user's global settings. The command is:
+Where native command hooks are necessary, generate **session-scoped** config and invoke:
 
 ```text
 eliot hook --harness <name> --event <HookName>
 ```
 
-The shim receives `ELIOT_AGENT_ID`, `ELIOT_AGENT_GENERATION` and the current token,
-reads bounded hook JSON from stdin, calls `hook.event`, and prints the harness-native
-decision. The daemon normalizes only event families assigned to hooks, runs matching
-approval rules and may return pending `inject` text when the hook supports it.
-
-Default timeout is 2 s. On timeout the shim returns the configured safe native default
-(`allow` for observation-only hooks, `ask` for decision hooks) and exits 0. If the
-daemon is unreachable it tries at 0, 100 and 400 ms, then drops the hook event and
-records source-health loss after reconnection; there is no durable hook queue. SDK
-plugins use in-process callbacks rather than the shim.
+Shim receives agent id, generation and current token; reads bounded JSON; calls
+`hook.event`; prints native decision. It normalizes only event families assigned to
+that hook. Default deadline 2 s. Timeout returns configured safe native default
+(observation: allow; decision: ask) and exits successfully. If daemon is unreachable,
+try immediately, 100 ms and 400 ms, then drop and report source loss after reconnect.
+There is no durable hook queue. SDK plugins use in-process callbacks.
 
 ## Transcripts and discovery
 
-A plugin with `features.transcripts` may tail native transcript files for discovery,
-observe-only sessions and explicit stream recovery. It stores cursors in
-`<data_dir>/plugins/<name>/`; the host does not parse vendor transcripts.
+Plugins may tail native transcripts for discovery, observe-only agents or explicit
+stream recovery. Cursors live under plugin data dir; host never parses vendor format.
 
-For a file still being written, only a final unterminated line waits. A complete line
-that cannot be parsed produces a source gap, never silent loss or a reconnect loop.
-On Windows, open/read/close each poll so the writer can rotate the file.
+Wait only for an incomplete final line. A complete unparsable line creates a source
+gap, not silent loss/reconnect loop. On Windows open/read/close each poll for rotation.
+Never emit old history as new live turns or infer terminal state from silence,
+truncation or list absence.
 
-Transcript readers must obey source ownership. They never emit old history as new live
-turns and never infer a terminal event from silence, truncation or list absence.
+## Lifecycle and custody
 
-## Lifecycle and process custody
-
-- Plugin start is single-flight for an instance. Stop during start cancels the start;
-  a late result with the cancelled instance id is discarded and its owned process tree
-  is terminated.
-- In `per_agent` mode the daemon starts the plugin in an agent-owned Windows Job / Unix
-  process group. Every native child it launches belongs to that custody boundary.
-  Plugin exit causes the daemon to terminate and verify the remainder of that group;
-  only that agent is affected.
-- In `shared` mode the plugin must not launch unisolated per-agent child trees. A
-  per-session `force` is accepted only when the native service exposes an exact force
-  operation; otherwise it is `unsupported`. Stopping one agent never kills the shared
-  plugin or service.
-- Closing a per-agent plugin's stdin requests shutdown. If it or its children remain
-  after 10 s, the daemon terminates the exact group and verifies `(pid,start_time)`.
-  A shared plugin closes only sessions it owns according to its native protocol; an
-  attached owner-run service is never stopped.
-- Windows child stdio uses an explicit inheritable-handle list. Unrelated children may
-  not inherit the parent's pipe ends. Unix children enter the assigned process group
-  before exec.
-- Requests time out (default 30 s; start 120 s) against one absolute deadline. Timeout
-  produces `unknown` when native I/O may have occurred. No timeout extends because a
-  peer trickles bytes.
-- After a shared plugin restart, the host re-attaches its live generations and asks
-  snapshots for open commands. A per-agent plugin restart normally loses its owned
-  stdio native process; if a service-backed native session survived, exact attach may
-  recover it. `not_found` becomes `session.lost`.
-- On daemon restart, every `dispatched` command is `unknown`; no plugin is instructed
-  to replay it. Readback may settle it.
-- A child process exit and its final stdout line can arrive in either order. Finish a
-  turn/request only after terminal native input or stdout EOF, never from exit alone.
-- Bound every native payload (default 1 MiB). Oversize input becomes an explicit gap.
-- Read plugin stdout continuously. Replies and plugin requests never wait behind
-  telemetry; under pressure ephemeral events are dropped and subscribers see lag,
-  while persisted events apply backpressure.
-- A plugin stdin reader never waits for native I/O. Slow native work for one session
-  cannot block control of another shared session.
+- Plugin start is single-flight per instance. Stop during start cancels it; late result
+  from cancelled instance is discarded and owned group terminated.
+- Per-agent plugin starts in an agent-owned Windows Job / Unix process group before it
+  can launch native children. Exit causes host to terminate/verify remainder; only
+  that agent is affected.
+- Shared plugin may not launch unisolated per-agent process trees. Per-session force is
+  supported only through an exact native operation; otherwise unsupported.
+- Closing per-agent plugin stdin requests shutdown. After 10 s, terminate/verify exact
+  group. Shared plugin closes only native sessions it owns; attached owner service is
+  never stopped.
+- Windows uses explicit inheritable handle list; Unix sets process group before exec.
+- Requests use one absolute deadline (default 30 s; start 120 s). Timeout after possible
+  native I/O is unknown; trickled bytes do not extend deadline.
+- Shared plugin restart re-attaches exact generations and snapshots open commands.
+  Per-agent restart normally loses stdio-owned native process; service-backed exact
+  attach may recover. `not_found` yields lost.
+- Daemon restart turns dispatched into unknown; no replay instruction is sent.
+- Process exit and final stdout can race. Finish only after terminal native input or
+  stdout EOF, never exit alone.
+- Continuously drain stdout. Replies/requests outrank ephemeral telemetry; persisted
+  events apply backpressure, ephemeral may drop with lag health.
+- Shared plugin reader never waits on one session's native I/O.
 
 ## Fake plugin
 
-`plugins/fake` uses `session_mode = shared` and simulates many independent sessions in
-one process. It is deterministic and used by all L1 and load tests. Its declared verbs
-may be narrowed by config.
+`plugins/fake` is shared and simulates isolated generation-bound sessions. It persists
+minimal state for resume/readback and emits stable step ids. Wrong generation, turn or
+request is rejected before effects.
 
-Any launch/send/steer/inject text is a script if it parses as
-`{"steps": [...]}`; otherwise it is echoed. A send/launch script is one turn.
+A launch/send script is `{"steps":[...]}`; other text is echoed. Steps:
 
-| Step | Fields | Emits |
-| --- | --- | --- |
-| `say` | `text` | `message.agent` |
-| `sleep_ms` | `n` | no progress for n ms; steer may arrive |
-| `tool` | `{name, ok?=true, ms?=0}` | `tool.started`, then `tool.completed` |
-| `approval` | `{kind, command?, path?}` | request, wait, resolution |
-| `question` | `{text, options?}` | question, wait, answer |
-| `spawn` | `{name?, steps}` | `child`, then child's first turn |
-| `usage` | `{tokens_in, tokens_out}` | turn usage |
-| `crash` | — | plugin exits |
-| `hang` | — | stops replying |
-| `exit` | — | `session.ended` |
+| Step | Behavior |
+| --- | --- |
+| `say {text}` | assistant message |
+| `sleep_ms {n}` | no progress; exact steer/interrupt may arrive |
+| `tool {name,ok?,ms?}` | tool lifecycle |
+| `approval {...}` / `question {...}` | exact pending request and wait |
+| `spawn {name?,steps}` | child registration/turn |
+| `usage {...}` | turn usage |
+| `crash` / `hang` / `exit` | process crash, no reply, normal session end |
 
-Every emitted event contains the script session's generation and stable step id.
-`interrupt` only affects the supplied expected turn. A stale generation, turn or
-request is rejected. Fake session state is persisted under its plugin data directory
-so exact resume/readback tests survive plugin restart; old steps are not replayed.
+Interrupt affects only supplied turn. Old steps are not replayed after restart.
 
 ## Recordings
 
-Real harness traffic is recorded once and replayed in tests; CI never calls a model.
+Real native traffic can be recorded for later L7 replay; CI never calls a model.
 
-- `ELIOT_RECORD=<file>` appends bounded lines
-  `{"t":ms,"dir":"out|in","chan":"stdio|http|sse|...","msg":...}`.
-- `ELIOT_REPLAY=<file>` checks outgoing method/path and stable payload fields, ignoring
-  generated ids/timestamps, then delivers recorded input. `{"dir":"hang"}` and
-  `{"dir":"exit","code":N}` simulate failure.
-- Fixtures live in `plugins/<name>/fixtures/` with a first-line metadata object
-  containing harness version, date and scenario. Secrets are removed before commit.
+```text
+{"t":ms,"dir":"out|in","chan":"stdio|http|sse|...","msg":...}
+```
 
-`eliot-plugin` supplies record/replay transports for Rust; external plugins use the
-same format.
+`ELIOT_RECORD=<file>` appends bounded sanitized lines. `ELIOT_REPLAY=<file>` checks
+stable outgoing method/path/payload fields (ignoring generated ids/timestamps) and
+delivers recorded input; special hang/exit records simulate failure. Fixtures include
+harness version/date/scenario and no secrets.
 
 ## Conformance kit
 
-`eliot plugin-test <cmd...> [--replay-dir DIR]` verifies every declared capability:
+L7 completes `eliot plugin-test <cmd...>` and verifies:
 
-1. valid initialize/manifest and the declared session mode;
-2. start emits one matching `session.ready` before success;
-3. send starts exactly one turn and carries the current generation;
-4. wrong generation, turn and request ids are rejected before native I/O;
-5. steer, interrupt, approvals, answers, goals and child mapping behave as declared;
-6. duplicate/replayed native events do not create duplicate normalized lifecycle
-   events;
-7. no unknown command is retried after hang, disconnect or restart;
-8. per-agent stdin close/force ends and verifies only its process group; shared-mode
-   stop never kills the service or another session;
-9. attach either restores the exact incarnation or reports `not_found`;
-10. source hand-off reports a gap when it cannot prove a complete cursor boundary.
+1. manifest/protocol/session mode;
+2. one matching ready-before-start-success;
+3. one turn per send with current generation;
+4. stale generation/turn/request rejection before native I/O;
+5. declared verbs/requests/goals/children only;
+6. reconnect/replay does not duplicate lifecycle;
+7. no unknown retry after timeout/disconnect/restart;
+8. per-agent stop affects only exact group; shared stop never kills service/other session;
+9. attach restores exact incarnation or reports not found;
+10. unbridgeable source handoff reports a gap.
 
-Real plugins run the kit against recordings; fake runs live. A plugin passes before
-merge.
+Real plugins run against recordings and compact live runs; fake runs deterministically.
