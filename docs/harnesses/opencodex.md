@@ -1,7 +1,7 @@
 # OpenCodex provider proxy
 
 OpenCodex is an inference proxy, not a harness/session authority. Eliot treats it as an
-attached or managed shared [service](../spec/configuration.md#plugins-services-and-webhooks);
+attached or managed shared [service](../spec/configuration.md#plugins-sources-services-and-webhooks);
 agent sessions remain owned by their harness plugins. Layer L2.7.
 
 Facts checked 2026-10-25 against the then-current OpenCodex release/source. Recheck the
