@@ -4,7 +4,7 @@ This is the map. Exact contracts live in `docs/spec/`; work order is the
 [roadmap](roadmap.md); rationale is [decisions](decisions.md).
 
 ```text
-owner / agents / scoped automation
+owner / Agents / scoped automation
                 │ explicit principal credential over local JSON-RPC
                 ▼
 ┌──────────────────────────── Eliot daemon ─────────────────────────────┐
@@ -15,7 +15,7 @@ owner / agents / scoped automation
 │ one SQLite WAL Store ↔ ordered persisted bus + bounded live fan-out  │
 │  ▲          ▲             ▲                 ▲                         │
 │ custody   Git/fs      Coordination        Automation                   │
-│ guardian  monitor     mail/vars/who       activations/timers/goals    │
+│ guardian  monitor     mail/vars/who       activations/timers/Goals    │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -23,180 +23,186 @@ owner / agents / scoped automation
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| CLI/API | request syntax/output, external WriteId and principal credential forwarding | business state or process-based authority inference |
-| Router | principal/capability/state, exact bindings, immutable admission, selector fanout | vendor translation |
-| Store | ids/receipts, canonical native subject, commands/events/source ownership, input/turn/edit projections, activation/action state | native sessions |
-| Plugin host | instances, deadlines, source commit acknowledgements, custody and attach | harness semantics |
-| Plugin | one harness protocol, native ids/readback/source normalization | Store writes, source keys or unknown retry |
+| CLI/API | syntax/output, external WriteId and principal credential forwarding | business state or process-based authority inference |
+| Router | authority/capability/state, exact generation/binding/turn/request, durable admission, selector fanout | vendor translation |
+| Store | ids/receipts, canonical native subject, immutable binding revisions/current pointer, commands/events/source ownership and projections | native sessions |
+| Plugin host | instances, deadlines, source commit acknowledgements, custody and attach | harness semantics or Store mutation |
+| Plugin | one harness protocol, native ids/readback/source normalization | unknown retry or binding-pointer movement |
 | OS/Git/fs monitors | process lifecycle, workspaces, Git facts and source health | API principal selection or workflow |
 | Coordination | mail/vars/claims/current-work view | locks or hidden model turns |
-| Automation | scoped principals, persisted definitions/activations, cursors, frozen actions and goals | Task/review engine |
+| Automation | scoped principals, persisted activations/cursors/actions and Goals | Task/review engine |
 
 ## Core invariants
 
 1. One semantic command language; unsupported semantics fail before native I/O.
-2. Every connected caller presents one explicit principal credential. Owner mode reads a
-   private owner token; agents and automation use scoped tokens. Missing credentials
-   reject—owner authority is never inferred from a missing token or PID lookup.
+2. Every connected caller presents one explicit principal credential. Missing credentials
+   reject; owner authority is never inferred from a missing token or PID.
 3. Every external mutation has a ULID receipt; internal linked/selector/automation
-   effects have bounded derived ids and no fake receipt.
+   effects have derived ids and no fake receipt.
 4. Unknown is never replayed automatically.
 5. One canonical Agent row represents one native subject.
-6. Native control and direct routing are separate: a child may be controllable through
-   its parent plugin while having no independently injectable routing token.
-7. Session start and optional first input are separate linked outcomes. Async inbox
-   acceptance is not send applied; send applied is not turn completion.
-8. Generation/turn/request bindings fence replacement work. Unknown turn blocks more
-   turn work until exact readback or constrained owner resolution.
-9. Authoritative source epochs open before the first native start/input effect.
-   Persisted facts use contiguous commit-ack sequence, one family owner and compact
-   native-event receipts that survive event pruning.
-10. Source replacement is one atomic handoff naming predecessor and exact cursor/gap
-    boundary; two sources never concurrently own one family.
-11. Shared service PIDs belong to service custody, never an Agent. OS monitor alone owns
-    process exit/stats.
-12. Rules use stored event-time subject. Every semantic install has a fresh activation
-    id and persisted compiled definition; A→B→A is three activations.
-13. Event edits hand off at captured high-water. Deterministic firing error advances
-    cursor as failed run; only Store failure retries.
-14. Goal continuation uses a durable eligibility key or cadence slot; restart cannot
-    duplicate the same round or suppress a genuinely new eligible state.
-15. Selector fanout is one bounded atomic snapshot, paginated afterward; plugin
-    discovery/snapshots are also paginated below the frame limit.
-16. Worktree base ref resolves to immutable local OID before admission.
-17. Restart is level-reconciled from Store: sources, rules, timers, goals, mail,
-    workspaces, launch queues and provider holds.
-18. Custody claims only OS-proven capability; degraded Unix never advertises exact
-    force/owner-death cleanup.
-19. Minimal environment and project overlays only narrow owner-defined global profiles;
-    secrets resolve only after authority validation and never persist in semantic data.
-20. Receipt retention is a minimum window; referenced receipts live as long as retained
-    domain rows require them.
-21. Protocol and Store payloads have explicit bounds. Large immutable inputs travel by
-    artifact reference, not an oversized JSON frame.
-22. Views query projections/events; they are not another state machine.
+6. Native generation and Eliot binding revision are distinct. Generation identifies the
+   vendor incarnation; immutable binding revisions record observe/control/profile lease
+   changes within it. One current pointer selects the active revision.
+7. Every native command is scoped to expected and target
+   `(agent,generation,binding_revision)`. Pointer movement stales queued old-revision
+   commands but never rewrites historical readback.
+8. Native control and direct routing are separate: parent-mediated child control may
+   exist while `routing_enabled=false` and no child token exists.
+9. Session start, first input and turn completion are separate outcomes. Inbox
+   acceptance is not send applied; send applied is not completion.
+10. Unknown turn blocks more work until exact readback/constrained resolution.
+11. Sources open before the first native start/input effect. Durable facts use contiguous
+    commit-ack sequence and vendor replay protection that survives event pruning.
+12. Source replacement is one predecessor-aware atomic handoff or explicit gap.
+13. Shared service PIDs belong to service custody, never an Agent; OS monitor owns
+    process lifecycle.
+14. Rules evaluate stored event-time subject. Each semantic install has a fresh
+    activation and persisted compiled definition; A→B→A is three activations.
+15. Rule edits hand off at captured high-water; deterministic firing error advances as a
+    failed run, only Store failure retries.
+16. Goal is bound to generation **and binding revision** and uses durable eligibility key
+    or cadence slot. Binding change pauses it until explicit rebind.
+17. Selector fanout and plugin discovery/history are bounded/paginated below frame caps.
+18. Worktree base resolves to immutable local OID before admission.
+19. Restart is level-reconciled from Store: sources, bindings, rules, timers, Goals,
+    mail, workspaces, launch queues and holds.
+20. Custody claims only OS-proven capability; degraded Unix never claims exact force or
+    all descendants dead.
+21. Project overlays only narrow owner-defined profiles; secrets resolve after authority
+    validation and never persist in semantic data.
+22. Receipt window is a minimum; referenced receipts outlive domain rows that need them.
+23. Large immutable inputs use ArtifactRefs, not oversized JSON frames.
+24. Views query projections/events; they are not another state machine.
 
 ## Launch flow
 
 ```text
 eliot --owner launch --worktree feat/x --profile codex "do X"
-  → one transaction:
+  → transaction:
       external receipt + launch command L
-      agent a12 generation 0, no routing token
-      derived linked send S
-      frozen profile binding + base_oid workspace journal
+      Agent a12 generation 0
+      immutable target binding (g1,r1) + current pointer for g1
+      derived linked send S bound to (g1,r1)
+      frozen workspace base_oid/setup artifacts
   → create/read back worktree at base_oid; run setup once
-  → atomically reserve profile/account/proxy capacity and dispatch L
-  → a12 generation 1, increment token_version; enable/hash routing only when
-    this session can receive its own environment
-  → start per-agent plugin / bind shared plugin session
-  → plugin source.open(open_id, families) before native start/input
-  → plugin establishes native subject and effective settings
-  → commit-ack session.ready applies L and makes a12 idle
-  → S dispatches separately; input association and terminal turn settle separately
+  → reserve profile/account/proxy capacity and dispatch L
+  → a12 generation 1; optional routing token; state starting
+  → plugin opens source epochs before native session/input
+  → native subject/effective settings established
+  → commit-ack ready applies L and makes a12 idle
+  → S dispatches; input association and terminal turn settle separately
 ```
 
-A `start_requires_input` harness opens provisional source epochs first, then performs one
-linked start+input native operation. It still reports session and input outcomes
-independently. Resume expects g/targets g+1, keeps canonical subject, moves the row only
-at dispatch and pauses old goals.
+A `start_requires_input` harness opens provisional sources first, then performs one
+linked start+input operation. Session and input outcomes remain independent. Resume
+expects old generation/current binding and targets `(g+1,r1)`.
 
-## Attach and native children
+## Attach and binding transitions
 
-Observe-only attach uses a synthetic `observe:<harness>` profile, no routing token and
-no launch capacity claim unless the owner supplies an account observation. Control
-attach requires an allowed frozen profile, exact native attach/readback, environment
-binding where tools need identity, and a capacity reservation representing the already
-live session. Existing usage may make the scope overcommitted; it is counted and blocks
-new starts rather than being ignored.
+First observe attach creates an external Agent and observe binding revision 1. Pointer
+moves to it only after exact read attach/readback.
 
-An already-created native child is always recorded when its canonical subject is known.
-Controller launch/depth/tree limits prevent new Eliot-created fanout; they do not erase
-native reality. A child beyond a guard remains observable/native-controllable where
-supported but receives no project authority, automatic wake or direct routing token.
+Observe→control creates immutable candidate revision n+1 and an attach command that
+expects current n. Until exact success:
+
+- current pointer and Agent profile/routing remain observe;
+- candidate capacity is reserved;
+- failed/unknown native attach cannot partially upgrade the row.
+
+Exact success atomically applies command, moves pointer, updates Agent projection,
+installs/rotates routing token when qualified, converts capacity reservation and pauses
+or rebinds Goals as specified. Detach similarly creates a candidate observe revision;
+failed/unknown detach leaves control pointer unchanged. Recovery of the same current
+controlled lease reuses its revision; it is not another revision.
+
+All queued old-revision native commands become stale on pointer movement. Already
+applied/dispatched/unknown commands and turns remain historical and are read back using
+their stored revision.
+
+An already-created native child is always recorded. Controller guards block new
+Eliot-created fanout but do not erase native reality. Guard-exceeding child receives no
+project authority/direct routing/automatic direct wake; safe parent-mediated native
+verbs remain possible.
 
 ## Command fanout and event flow
 
-A concrete command captures expected/target generation plus exact turn/request in one
-transaction. Queued future sends do not block current control/answers.
+Concrete command captures expected/target generation and binding revision plus exact
+turn/request. Queued future sends do not block current controls in the same revision.
 
-A selector command is a Store-only external parent. The transaction sorts concrete
-AgentIds, checks the hard limit, creates derived children and records count/digest.
-Parent applied means expansion committed, not child effects. Child list/outcomes are
-paginated; retrying the same WriteId returns the same fanout.
+A selector command is Store-only external parent. Transaction sorts concrete AgentIds,
+checks hard limit, captures each target's current generation/revision, creates derived
+children and stores count/digest. Parent applied means expansion committed, not child
+native effects. Children/results are paginated.
 
-For native facts:
+Native facts:
 
 ```text
-plugin source.open(stable open_id, family set)     # before native effect
+plugin source.open(stable open_id, family set)      # before native effect
   → daemon source_key + watermark
 plugin event.put/process.put(source_key, next source_seq, envelope)
-  → source/family/binding/native-id validation
-  → one transaction: source watermark + native receipt + event/projection/reducer
+  → source/family/generation/turn/request/native-id validation
+  → transaction: watermark + native receipt + event/projection/reducer
   → commit acknowledgement
 ```
 
-A lost acknowledgement resends the same sequence. A vendor replay with the same native
-id returns the original Store sequence even after the event row was pruned. Sources
-without stable replay identity cannot claim lossless recovery: they close with a visible
-gap and publish only facts after a proven new boundary.
+Lost acknowledgement resends same sequence. Vendor replay with same native identity
+returns original Store seq even after event pruning. Sources without stable cursor/id
+close with a visible gap.
 
-Planned source replacement is atomic: the new open request names the old source,
-expected watermark and exact cursor/gap boundary; the transaction closes/gaps the old
-source and transfers family ownership to the new source.
+Planned replacement atomically verifies predecessor watermark/cursor, closes/gaps old
+source, creates new source and transfers family ownership.
 
 ## Automation flow
 
-A rule file produces canonical definition digest and fresh immutable activation id.
-Store persists compiled definition/artifacts for active/retiring/replay intervals.
-Enabled edit captures H: old drains through H; new starts after H. Reverting bytes
-creates another activation, never resets an old cursor.
+A rule file produces definition digest and fresh immutable activation id. Store keeps
+compiled definition/artifacts for active/retiring/replay intervals. Enabled edit captures
+H: old drains through H; new starts after H. Reverting bytes creates another activation.
 
-A firing creates generic run identity `(principal,kind,owner activation,trigger)`,
-freezes concrete targets and derived commands/actions. Deterministic rendering/authority
-failure is one failed run with cursor advance. Rate limits derive from durable rows.
+Firing creates generic run identity, freezes target generation/binding/turn/request and
+writes derived commands/actions. Deterministic render/authority failure is one failed run
+with cursor advance. Rate limits derive from durable rows.
 
-For Eliot Goal, `on_idle` trigger is the latest committed eligibility sequence; cadence
-uses the exact anchored slot. Eligibility changes when generation/state, pending
-request, input/turn gate, native-goal state or goal revision changes. The same eligible
-state therefore has one round, while a real change can create the next.
+For Goal, `on_idle` trigger is latest committed eligibility sequence and includes current
+binding pointer; cadence uses exact slot. Pointer movement pauses Goal and changes
+eligibility. Same state has one round; a real generation/binding/turn/Goal change can
+create the next.
 
 ## Principal and process topology
 
-The private owner token is an attribution credential inside the one-OS-user trust
-boundary, not multi-user security. `eliot --owner` reads it explicitly; a scoped agent or
-automation context never falls back to owner when its credential is missing.
+Private owner token is attribution inside one-OS-user trust boundary, not multi-user
+security. `eliot --owner` reads it explicitly; Agent/automation never falls back to owner.
 
 - Windows exact: no-breakaway Job per process owner; daemon-owned Jobs kill on close.
-- Linux exact: delegated cgroup/equivalent plus monitored owner-death guardian.
+- Linux exact: delegated cgroup/equivalent + monitored owner-death guardian.
 - Unix fallback: degraded process group; no exact force/complete descendant proof.
 - Shared control: per-session environment/identity/readback/isolated stop required.
 - Attached owner services are never killed; managed services have separate custody.
 
 ## Store and recovery
 
-One writer commits bounded batches. Reads are query-only, paginated and release
-transactions. WAL/readers are monitored; hard pressure rejects new work/long reads while
+One writer commits bounded batches. Reads are query-only/paginated and release
+transactions. WAL/readers are monitored; pressure rejects new work/long reads while
 preserving stop/request/result commits.
 
 Restart:
 
 - dispatched effects remain unknown until exact readback;
 - sessions/sources reattach by canonical subject/open id/watermark;
-- active/retiring/replay definitions and cursors resume from Store;
-- timers/goals/mail/workspace/launch/provider queues reconcile;
+- current binding pointer and candidate attach commands determine control lease;
+- active/retiring/replay definitions/cursors resume from Store;
+- timers/Goals/mail/workspace/launch/provider queues reconcile;
 - Git facts rebuild while edit/input/turn projections survive event pruning;
-- missing custody settles only under source-drain/session rules;
-- routing-key mismatch blocks new agent-token issue, not owner readback/stop.
+- missing custody settles only under source/session rules;
+- routing-key mismatch blocks new token issue, not owner readback/stop.
 
 ## Scale
 
-Idle/historical agents are indexed rows, not tasks. Qualified shared services multiplex;
-process-owning harnesses use one small plugin/custody unit per live agent. Lists,
-discovery, fanouts, histories and replay are paginated/bounded; hot paths use indexes and
-due queues.
+Idle/historical Agents are indexed rows, not tasks. Qualified shared services multiplex;
+process-owning harnesses use one plugin/custody unit per live Agent. Lists, discovery,
+fanouts, histories and replay are paginated; hot paths use indexes/due queues.
 
-One host realistically runs tens to a few hundred native sessions. 10,000 fake agents
+One host realistically runs tens to a few hundred native sessions. 10,000 fake Agents
 test bookkeeping. Multi-host is a later decision.
 
 ## Target layout
