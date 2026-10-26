@@ -36,7 +36,8 @@ generation. Readers are continuously drained and cancel-safe. Protocol
 resume_from = { native_scope, native_ref }
 initial = { command_id, text }
 start result = {
-  native_scope, native_ref, agent_owned_pids, effective,
+  native_scope?, native_ref?, agent_owned_pids, effective?,
+  session_status: applied | failed | unknown,
   initial_status?: applied | rejected | failed | unknown,
   initial_turn_id?: string
 }
@@ -49,35 +50,55 @@ source watermark = {
 }
 ```
 
-## Start and input
+## Start and initial input
 
-Most harnesses start without input. A harness requiring first input to obtain a native
-subject declares `start_requires_input=true` and receives the linked command in
-`initial`. Session and input remain separate Eliot outcomes; `session.ready` never
-proves the input ran.
+`source.open` is Store-only and keyed by Eliot agent/generation, so authoritative
+sources are opened **before any native start/input effect**, even if the native subject
+is not known yet. This gives the first native frame a durable sequence/spool path.
 
-Start sequence:
+### Session-first harness (`start_requires_input=false`)
 
-1. establish exact native subject ↔ generation;
-2. open authoritative sources with stable `open_id`s and obtain daemon source keys;
-3. commit-acknowledge one `session.ready` when control is possible;
-4. if initial input is required, admit it once and hold its reply until exact native
-   turn/execution association, or return unknown after possible admission;
-5. return the matching session result plus separate initial status/turn id.
+1. open source epochs with stable `open_id`s;
+2. start/resume the native session without user input;
+3. establish exact native subject and effective settings;
+4. commit-acknowledge `session.ready` and return session applied;
+5. daemon dispatches the linked initial `send` normally.
+
+### Input-created session (`start_requires_input=true`)
+
+Some harnesses reveal/create the native subject only when the first user input is sent.
+For them:
+
+1. open provisional source epochs before native I/O;
+2. receive exactly one linked `initial` command from the daemon;
+3. perform exactly one native start+input operation bound to that command;
+4. spool every resulting native fact under the opened source epoch;
+5. when the native subject/control channel becomes known, commit `session.ready` for the
+   session outcome;
+6. then commit the buffered `input.admitted`/turn association facts and report the
+   separate initial-command outcome.
+
+`session.ready` still proves only session control, never input association. Valid outcome
+combinations include session applied + initial unknown, session applied + initial
+applied, and both unknown after an ambiguous transport loss. A definite pre-I/O failure
+fails both; a definite session creation with exact pre-turn input rejection applies the
+session and fails only the initial command. The plugin never sends a replacement input
+or replacement session to resolve uncertainty.
 
 Before ready commits, the plugin backpressures native input or uses a bounded durable
-spool. Loss/overflow reports a source gap and preserves uncertainty; it never silently
-drops terminal data or falsely fails the whole session.
+spool. Loss/overflow reports a source gap and preserves actual uncertainty; it never
+silently drops terminal data or falsely converts an ambiguous effect into failure.
 
 Launch and resume both use `agent.start`. Resume supplies the same canonical subject and
 a new Eliot generation. Old input is never inferred or replayed. Recovery attach to the
 same live incarnation preserves generation.
 
-For `send`, transport/inbox acceptance such as HTTP 204 is intermediate only. The
-plugin keeps `agent.command` pending until exact turn association (applied), exact
-no-effect readback (failed), or deadline after possible admission (unknown). One native
-execution may drain several admitted inputs; emit one ordered `input_commands` mapping.
-The daemon blocks later send/configure/Goal continuation while association is unresolved.
+For every later `send`, transport/inbox acceptance such as HTTP 204 is intermediate
+only. The plugin keeps `agent.command` pending until exact turn association (applied),
+exact no-effect readback (failed), or deadline after possible admission (unknown). One
+native execution may drain several admitted inputs; emit one ordered
+`input_commands` mapping. The daemon blocks later send/configure/Goal continuation while
+association is unresolved.
 
 ## Attach and turn reconciliation
 
@@ -160,11 +181,12 @@ returns the same token without plaintext in SQLite.
 **The raw token is never written to plugin state, recordings, logs or source spools.**
 The plugin persists only nonsecret registration data: registration id, child subject,
 Agent id, generation and token version. Immediately before native environment injection
-it repeats the same idempotent child request, holds the returned token in memory, injects
-it and zeroizes/drops it. A crash or lost reply before injection repeats the request; it
-does not mint a new version or store the credential. If the native platform cannot make
-injection-before-tools reliable, `child_environment=false`, no token is returned and
-child CLI/Git activity is explicitly attributed to the parent.
+it repeats the same idempotent child request, holds the returned token only in memory,
+injects it, and promptly drops the reference (zeroizing owned buffers where the runtime
+permits). A crash or lost reply before injection repeats the request; it does not mint a
+new version or persist the credential. If injection-before-tools cannot be reliable,
+`child_environment=false`, no token is returned and child CLI/Git activity is attributed
+to the parent.
 
 A new token version is issued only by an explicit routing-lifecycle transition such as
 control reattach or resume, never by response loss.
@@ -252,9 +274,10 @@ Fake is shared/isolated, generation-bound and persists source open ids, keys, se
 spool state and exact session snapshots. Recordings are bounded sanitized native NDJSON
 and exclude every raw routing token/credential. CI never calls a model.
 
-L7 conformance covers lost `source.open|close|event.put|process.put|child` replies,
-source digest mismatch/hole/stale/vendor duplicate, process registration versus OS
-enumeration/history pruning, rejection of shared-service PID ownership, child parent
-conflict and memory-only retry-safe token injection, start versus initial input, async
-inbox/coalesced inputs, source handoff/gap, unknown turn, hook timeout, exact bindings,
-no unknown retry, custody, readback, bounded buffers and unsupported-before-I/O.
+L7 conformance covers both start branches and every lost session/input reply,
+`session.ready` without input proof, lost `source.open|close|event.put|process.put|child`
+replies, source digest mismatch/hole/stale/vendor duplicate, process registration versus
+OS enumeration/history pruning, rejection of shared-service PID ownership, child parent
+conflict and memory-only retry-safe token injection, async inbox/coalesced inputs,
+source handoff/gap, unknown turn, hook timeout, exact bindings, no unknown retry,
+custody, readback, bounded buffers and unsupported-before-I/O.
