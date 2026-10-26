@@ -1,7 +1,7 @@
 # Local model servers
 
 A local model server is an inference endpoint, not an agent harness. Eliot treats it as
-an attached or managed [proxy/service](../spec/configuration.md#plugins-services-and-webhooks).
+an attached or managed [proxy/service](../spec/configuration.md#plugins-sources-services-and-webhooks).
 These notes are inherited from v1 and require installed-server verification.
 
 ## Wiring
