@@ -1,79 +1,50 @@
-# OpenCodex (provider proxy)
+# OpenCodex provider proxy
 
-OpenCodex is a provider proxy, not an agent harness. Eliot treats it as an attached or
-managed **shared service**
-([configuration](../spec/configuration.md#proxies-and-managed-services)); agent
-sessions remain owned by their harness plugins. Layer L2.7.
+OpenCodex is an inference proxy, not a harness/session authority. Eliot treats it as an
+attached or managed shared [service](../spec/configuration.md#proxies-services-and-webhooks);
+agent sessions remain owned by their harness plugins. Layer L2.7.
 
-Facts checked 2026-10-25 against `lidge-jun/opencodex` (MIT; release v2.92.0 dated
-2026-10-24). It is fast-moving; re-read its official README/API source before L2.7 and
-record the installed version.
+Facts checked 2026-10-25 against the then-current OpenCodex release/source. Recheck the
+owner's installed version and Management API before implementation.
 
-## What it does
+## Ownership
 
-It accepts Codex Responses-style and Anthropic-style client requests and routes them
-to configured providers/accounts. Eliot does not use it as a scheduler, session store
-or authority; it is only the explicit inference route selected by a profile.
+Owner install/login/init remains owner work. `attach` means health/read-only management
+only and Eliot never stops/reconfigures it. `launch` means a separately supervised
+managed service with its own custody; one agent stop never kills the proxy.
 
-## Run and ownership
-
-- Owner install/init remains an owner action.
-- Default documented service port is 10100; inference base is the service origin plus
-  `/v1`.
-- Home directory is selected by `OPENCODEX_HOME`; tokens stay there or in named
-  environment variables and never enter Eliot config/events.
-- Client requests use the documented OpenCodex client-key header. Binding beyond
-  loopback requires the proxy's own authentication configuration.
-
-```toml
-[proxies.opencodex]
-attach = "http://127.0.0.1:10100"
-health = "/api/system/health"        # verify against installed version
-api_key_env = "OPENCODEX_API_KEY"
-# launch = ["ocx", "start"]         # only after foreground/lifecycle is recorded
-```
-
-`attach` is the default: Eliot health-checks but never stops/reconfigures the owner's
-service. `launch` creates one separately supervised service; its process group is not
-an agent group and stopping one agent never kills it.
+Client/admin keys, home paths and provider credentials are named environment references.
+They never enter resolved config, rules, events or logs. Binding beyond loopback follows
+OpenCodex's own auth requirements; Eliot never opens firewall/listen addresses.
 
 ## Harness wiring
 
-| Harness | Wiring |
+| Harness | Route |
 | --- | --- |
-| Codex | named `model_providers` entry with `<origin>/v1` and Responses wire API ([Codex page](codex.md#proxy-opencodex-or-another-responses-compatible-endpoint)) |
-| Claude Code | documented `ANTHROPIC_BASE_URL`/auth/header variables, equivalent to the proxy's own Claude wrapper |
+| Codex | named Responses provider at `<origin>/v1` ([Codex permissions/proxy](codex.md#permissions-and-proxy)) |
+| Claude | explicit documented base URL/auth/custom headers in that per-agent minimal environment |
 
-Eliot sets route configuration only in the per-agent harness environment/launch
-arguments. It never runs global integration installers or edits owner client config.
-Requested base URL is not proof of use: the harness reports effective provider/
-endpoint where possible, and the L7 live run verifies main chat plus auxiliary calls.
+Eliot never runs global client integration installers or edits owner global configs.
+Requested URL is not proof: plugin reports effective endpoint/provider/model/account,
+and L7 verifies main plus auxiliary/title/compaction/subagent calls separately.
 
-## Management reads
+## Management and holds
 
-The optional management API can feed `source.health`, provider/model availability and
-usage. Use read endpoints only and the separate admin credential. The exact health,
-provider, model and usage paths/headers are versioned facts to confirm against the
-installed OpenCodex source; v1's v2.75 paths are donors, not a current contract.
+Read-only management data may feed proxy health, provider/model availability, usage and
+limitation scope. Exact paths/headers are installed-version facts. Management timeout
+only makes that source stale; it never changes live agent state, retries input or
+selects fallback.
 
-A management timeout or stale response does not alter a live agent state and does not
-trigger provider fallback. It marks only the proxy source stale/unknown.
+OpenCodex auth mode determines which subscription/key/account spends. Profiles refer to
+an explicit Eliot account scope shared across relevant profiles. Provider limitation
+coverage is preserved; unknown coverage holds only the exact route, not every account.
+A future probe is a real user turn, never a hidden model call.
 
-## Billing and route visibility
+## L7 cases
 
-OpenCodex provider auth mode determines which subscription/key/account is spent.
-Eliot profiles name the intended billing/account and display effective facts the
-proxy/harness exposes. It never changes route because one account is limited.
-
-A successful main completion does not prove title, compaction, subagent or auxiliary
-requests used the same route. Until recorded, `show` labels only the verified scope.
-
-## v1 failures retained for L7
-
-- Claude routed through an OpenCodex OAuth provider may spend the account stored in
-  OpenCodex rather than Claude's native login; keep route/billing visible.
-- `activeTurnCount = 0` does not prove native children stopped.
-- A 409/stale integration plan is not blindly retried.
-- Attached service ownership is external: Eliot never restarts or kills it.
-- Client key and admin key are different credentials and must not be confused or
-  persisted.
+- client vs admin credential separation/masking;
+- attached service never stopped and managed service lifecycle isolated;
+- effective billing/route for Codex and Claude main + auxiliary requests;
+- 409/stale plan and ambiguous write response never blindly retried;
+- proxy `activeTurnCount=0` never used as native child/session completion;
+- account/proxy cap and persisted hold recovery across daemon restart.
