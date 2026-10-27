@@ -1,191 +1,147 @@
-# Codex (app-server)
+# Codex app-server
 
-Layer L2 — the first real harness ([D-13](../decisions.md)). Plugin: `plugins/codex`
-(Rust, built in as `eliot plugin codex`).
+Layer L2, first real harness. Plugin `plugins/codex` is Rust/built-in and
+`mode=per_agent`: one plugin process and one app-server process per controlled Eliot
+Agent generation.
 
-Facts checked 2026-10-25 against `openai/codex` `main` (latest release
-`rust-v0.164.0`, 2026-10-23) and learn.chatgpt.com docs. The app-server is marked
-experimental upstream: re-check method names against the installed version with the
-schema generator before coding.
+Facts checked 2026-10-25 against `openai/codex` main/release `rust-v0.164.0` and the
+app-server/config/hook documentation. The protocol is experimental; generate schema
+from the installed binary immediately before implementation.
 
 ## Sources
 
-- Protocol source: [app-server-protocol `common.rs`](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/common.rs),
-  [v2 `thread.rs`](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread.rs),
-  [v2 `turn.rs`](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/turn.rs),
-  [`rpc.rs`](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/rpc.rs)
-- Docs: [app-server](https://learn.chatgpt.com/docs/app-server),
-  [hooks](https://learn.chatgpt.com/docs/hooks),
-  [config reference](https://learn.chatgpt.com/docs/config-file/config-reference),
-  [advanced config](https://learn.chatgpt.com/docs/config-file/config-advanced)
-- Schema from the installed binary: `codex app-server generate-json-schema`,
-  `codex app-server generate-ts` (experimental).
+- app-server protocol: upstream `codex-rs/app-server-protocol` (`common.rs`, v2 thread/
+  turn types, RPC definitions);
+- installed schema: `codex app-server generate-json-schema` / `generate-ts`;
+- official app-server, hook and configuration documentation.
 
-## Transport
+## Transport, identity and custody
 
-- Launch `codex app-server` (default `--listen stdio://`; also `unix://`, `ws://IP:PORT`).
-- Framing: newline-delimited JSON over stdio. It is JSON-RPC-shaped (`id`, `method`,
-  `params`, `result`/`error`) **without** the `"jsonrpc": "2.0"` field; do not use a
-  strict JSON-RPC 2.0 library that requires it.
-- Handshake: request `initialize` with `clientInfo` and `capabilities`
-  (`experimentalApi: true` is needed for child discovery filters), then the client
-  initialized notification (exact name: check the generated schema).
-- One app-server process can host many threads, but tools run by any thread inherit
-  that process's environment — so agents sharing an app-server would share
-  `ELIOT_AGENT_TOKEN` and Git identity. Topology: one plugin process and one
-  app-server per agent, in that agent's custody (`multi_session: false`). Native
-  subagent threads run inside the same app-server, so they share its environment:
-  `child_environment: false`, and their `eliot` calls count as the parent's.
-- Tool environment: Codex filters it with the owner's `shell_environment_policy`. The
-  config reference (read 2026-10-26) documents `ignore_default_excludes` with default
-  `true`, which keeps names containing `KEY`/`SECRET`/`TOKEN`; an owner config with
-  `false` or an exclude filter would drop `ELIOT_AGENT_TOKEN`. The L2 live check runs
-  `eliot status` from a shell tool and expects `caller` = the agent.
+- launch `codex app-server --listen stdio://`;
+- newline-delimited JSON shaped like JSON-RPC but without mandatory `jsonrpc:"2.0"`;
+- initialize, then initialized notification from the generated installed schema;
+- one app-server may technically host many threads, but every tool inherits one process
+  environment. Eliot therefore uses one app-server per controlled Agent generation so
+  Agent token, Git identity, account/profile and proxy route remain exact;
+- native subagent threads inside it share that environment: they are child Agents with
+  `own_identity=false` and act through the parent plugin;
+- plugin/app-server/tool tree belongs to the Agent Job/process group.
 
-## Auth
+Canonical subject:
 
-The app-server reuses the existing Codex login of its `CODEX_HOME` (ChatGPT login or
-API key). Logging in is the owner's job, done once per account with the Codex CLI;
-Eliot never runs a login flow.
+```text
+native_scope = codex:<canonical CODEX_HOME or equivalent installed store identity>
+native_ref   = exact Codex thread id
+```
 
-The token-sharing route (SIWC, owner-supplied OpenAI guide, not live-checked) uses
-access tokens of about 1 h; a refreshed token reaches the app-server only through a
-restart plus `thread/resume`. A usage or 5xx error never deletes credentials.
+First start creates generation 1. Resume starts a new plugin/app-server and calls
+`thread/resume` for the same subject as the next Eliot generation. A later service-mode
+transport reconnect may preserve generation only when exact current controller/source
+ownership is proven; uncertain/new takeover increments it. Every app-server request and
+normalized event carries Eliot generation in the plugin envelope.
 
-v1 attached to an owner-run, shared app-server (WebSocket). v2 L2 launches its own
-over stdio; attaching to a long-lived server is the service mode of L7.6.
+## Source ownership and recovery
+
+For a controlled stdio generation, app-server stream owns `session`, `turn`, `message`,
+`tool`, `request`, `child`, `goal` and `usage`. L2 does not install hooks or tail rollout
+lifecycle beside it.
+
+Before `thread/start`/`thread/resume`, the plugin arms its app-server reader and receives
+the committed source-owner plan. `session.ready` commits before start success and before
+the first `turn.started`.
+
+The stdio stream has no qualified replay cursor. If it breaks while a service-backed
+app-server remains, the replacement source starts at live edge, records `source.gap` and
+uses exact `thread/read`/turn/request readback to reconstruct current projection; it does
+not republish old lifecycle history.
+
+Rollout JSONL is used for discovery/observe-only sessions or explicit recovery after a
+source handoff. Its opaque exclusive cursor is the committed file identity+byte offset.
+It resumes strictly after that offset. A complete unparsable record becomes a gap.
+Rollout and live stream never own the same family concurrently.
+
+## Authentication and route
+
+The app-server uses the login/config under its profile's `CODEX_HOME`; owner performs
+login. Eliot never starts an interactive auth flow and never deletes credentials on
+usage/5xx errors.
+
+Requested model/provider/cwd/permissions are compared with effective start/readback
+facts. A mismatch fails the command; Eliot does not silently adopt a substituted route.
 
 ## Verb mapping
 
-| Eliot verb | Codex | Notes |
+Every operation below is additionally bound to Eliot Agent generation. Turn controls
+carry exact Codex turn id; replies carry exact native request id.
+
+| Eliot verb | Codex mechanism | Settlement |
 | --- | --- | --- |
-| `launch` | `thread/start` → `session.ready`; the prompt is the linked send (`turn/start`) | `start_requires_input: false`. `thread/start` has no caller correlation id: a lost reply is `unknown`; never start a second thread to "retry". Compare the effective model, provider and cwd in the `thread/start` response with the request before using the thread; a mismatch fails the launch with the readback attached (v1 adopted a server-substituted config and wedged). |
-| `send` | `turn/start` (Eliot holds sends for a busy agent and dispatches them when it is idle) | `applied` once `turn/started` for this input arrives; a lost `turn/start` reply is `unknown` (no idempotency key, see pitfalls). |
-| `steer` | `turn/steer` with the active `expectedTurnId` | Rejected if no active turn. Track the active turn id from `turn/started`; if it must be looked up, page through the thread's turns to the end (v1 read only the first 20 and missed it in long threads). A goal continuation starts a new turn and makes the old id stale: that steer fails `bad_state` and is not retried. |
-| `inject` | `turn/steer` when busy; prepend to next `turn/start` when idle | Report mechanism. Hooks (`UserPromptSubmit`/`PostToolUse`) are an alternative if session-scoped hook config proves workable. The Codex SDK has an `ExternalMessage` input type for untrusted text from another agent or tool (grants no authority); check whether the app-server accepts it for messages from peers. |
-| `interrupt` | `turn/interrupt` | |
-| `stop` | interrupt active turn, `thread/goal/clear` if a goal is set, then close the thread and end the agent's app-server (close the plugin's stdin) | v1 field failure: a server-side goal woke a stopped session. |
-| `resume` | new plugin + app-server, `thread/resume` | Never re-send the previous input; a prompt is a linked send. |
-| `fork` | `thread/fork` | |
-| `approve` / `deny` | reply to `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`: `approve` → `accept`, `approve --remember` → `acceptForSession`, `deny` → `decline` | `cancel` (ends the turn) is used only by `interrupt` while a request is pending. |
-| `answer` | reply to `item/tool/requestUserInput` | Any other server request (elicitation, dynamic tool calls, unknown methods) is answered with an error or decline — never with an empty `{}` — and reported as `x.codex.request`. |
-| `goal.*` | `goal.set` → `thread/goal/set` (on an idle thread this starts a turn at once — send `configure` first); `goal.pause`/`goal.resume` → `thread/goal/set` with `status` `paused`/`active`; `goal.clear` → `thread/goal/clear` | Needs the Goals feature and an allowed provider. An active native goal continues by itself when the thread goes idle (Eliot goal `on_idle` rounds therefore pause). Status → `goal.updated.status`: active → `active`, paused → `paused`, complete → `done`, blocked / usage-limited / budget-limited → `blocked` (`reason` = native status), cleared → `cleared`. |
-| `configure` | per-turn settings on `turn/start`; session-level settings `applies: next_session` | Check which fields `turn/start` accepts in the schema. |
+| `launch` | `thread/start` without user prompt | emit/commit `session.ready` with thread id/effective settings, then start command applies |
+| linked first input / `send` | `turn/start` | applied only when `turn/started` associates this command with exact turn; client message id is correlation, not idempotency |
+| `steer` | `turn/steer` + `expectedTurnId` | wrong/ended turn rejects/fails; never moves into another turn |
+| `inject` | exact steer while busy, otherwise prepend to next `turn/start` | report actual mechanism/application point |
+| `interrupt` | `turn/interrupt` for captured turn | unknown is read back from that turn and never retried |
+| `stop` | interrupt exact active turn if needed, clear native Goal, then end this per-Agent app-server | applied only after bound generation ended; force targets only its custody |
+| `resume` | new Eliot generation + new app-server + `thread/resume` | old input never resent |
+| `fork` | `thread/fork` | resulting thread is a new native subject/Agent |
+| `approve|deny` | exact command/file/permissions request reply | accept / accept-for-session / decline according to offered native choices |
+| `answer` | exact `requestUserInput` reply | unknown request type is rejected/typed error, never empty default |
+| `goal.*` | native thread Goal methods | status maps to Eliot Goal; stop clears it |
+| `configure` | per-turn fields where supported; otherwise next session | report `applies`; verify installed schema/readback |
 
-## Permissions
+Permissions map to installed Codex sandbox/approval enums. Confirm enum names from the
+generated schema; requested and effective values are both shown.
 
-| Eliot `permissions` | Codex `sandbox_mode` | Codex `approval_policy` |
-| --- | --- | --- |
-| `read-only` | `read-only` | `never` |
-| `workspace-write` | `workspace-write` | `never` |
-| `ask` | `workspace-write` | `on-request` (requests surface as `approval.requested`) |
-| `full` | `danger-full-access` | `never` |
+## Event normalization
 
-Passed per thread on `thread/start` when the schema allows it, else as launch-time
-overrides. Value names are from the long-standing config keys; confirm them in the
-generated schema of the installed version.
-
-## Events
-
-| Codex notification | Eliot event |
+| Native fact | Eliot fact |
 | --- | --- |
-| `thread/started` | `session.ready` (`native_ref` = thread id) |
-| `turn/started` / `turn/completed` | `turn.started` / `turn.completed` (+ usage) |
-| `item/started` / `item/completed` | `tool.*`, `message.agent`, `file.changed`, `plan.updated` by item type |
-| `item/agentMessage/delta`, `item/commandExecution/outputDelta` | `message.delta` (E) |
-| approval / user-input requests | `approval.requested` / `question.asked` |
-| `serverRequest/resolved` | `approval.resolved` / `question.answered` |
-| `error` | `turn.completed status=failed` or `provider.limited` by error content |
-| items `collabAgentToolCall` (`receiverThreadIds`), `subAgentActivity` (`agentThreadId`) | `child` registration |
+| established thread/start readback | one `session.ready` |
+| exact turn start/end | `turn.started` / `turn.completed` with turn id |
+| item start/end | tool/message/file/plan facts keyed by item id + kind |
+| deltas | ephemeral message/tool delta |
+| approval/user-input request | exact request event and pending projection |
+| request resolved | exact resolution |
+| provider/native error | turn failure, provider limit or fatal session error according to scope |
+| subagent thread/provenance | canonical child registration with parent generation |
 
-`native_id`: the item id plus the event kind (`<itemId>:tool.started`), the turn id
-plus the kind for turn events — one item yields several events. The live stdio stream
-has no replay; a rollout tail ([L3.4](../roadmap.md#l3--monitoring)) uses the byte
-offset in the rollout file as its cursor.
+Final assistant text commits before terminal turn. Intermediate statuses and process
+exit are not terminal turn events. Duplicate native ids with another canonical payload
+are source-integrity failures.
 
-Children: discover with `thread/list` filters `parentThreadId` / `ancestorThreadId`
-(experimental) and `sourceKinds` `subAgent*`. `thread/list` without filters hides
-subagent threads (v1 observation). `thread/list` pages are not an atomic snapshot and
-lifecycle notifications cover only the current connection: family coverage can be
-partial — show it as such.
+Child discovery uses exact parent/ancestor thread ids and paged filters; never count,
+title/cwd/time heuristics. Parent completion does not imply child completion.
 
-## Observation without control
+## Observe-only behavior
 
-- Route events by thread id; attribute children by their exact parent thread id,
-  never by counting. Whether events of subagent threads arrive on the root's stream is
-  unverified (v1 research says a root subscription does not include them) — check in
-  L2.6 and read child threads explicitly if needed. `thread/read` is neither resume nor
-  subscription. Connection health is a separate check, not "time since the last
-  event".
-- Observe-only attach reads (`thread/read`, rollouts) and never calls
-  `thread/resume`, `goal.set`, `fork` or `send` — each of those can start billed work.
-- Rollouts: `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl`
-  (`CODEX_HOME` defaults to `~/.codex`; archived under `archived_sessions/`). Tail
-  them for `discover` / `attach` (observe-only). The format is internal; parse
-  defensively.
-- `notify = [...]` in user config runs a command on `agent-turn-complete` only; it
-  is reportedly ignored in app-server mode (openai/codex#13019, unverified). Not needed
-  when Eliot owns the app-server.
+- `thread/read` and rollouts are read-only; do not call resume/Goal/fork/send merely to
+  observe;
+- route by exact thread id and store scope;
+- pagination is not an atomic snapshot; coverage limitations are shown as source health/
+  gaps;
+- connection silence is not completion.
 
 ## Hooks
 
-Codex has hooks: `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`,
-`PostCompact`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, `Stop`,
-`Interrupt`, `SessionStart`, `SessionEnd`; configured in `config.toml` `[hooks]` or
-`hooks.json` under `~/.codex/` or `<repo>/.codex/` (project hooks need a trusted
-project), feature flag `[features] hooks`. Command hooks get JSON on stdin with
-`session_id`, `transcript_path`, `cwd`, `hook_event_name`, `model`. L2 does not need
-hooks (the app-server stream has the same facts); use them only if a fact is missing.
+Codex documents tool, permission, prompt, subagent, compact, stop/interrupt and session
+hooks. Do not enable a hook for lifecycle already owned by app-server stream. Add one only
+for a proven missing fact or immediate decision, assign that family explicitly and keep
+configuration session-scoped.
 
-## Proxy (OpenCodex or any Responses-compatible endpoint)
+## OpenCodex proxy
 
-```toml
-model_provider = "eliot-proxy"
-[model_providers.eliot-proxy]
-name = "eliot-proxy"
-base_url = "http://127.0.0.1:10100/v1"
-env_key = "OPENCODEX_API_KEY"     # env var holding the key
-wire_api = "responses"            # the only accepted value; "chat" is rejected
-```
+Use a named Codex provider pointed at the explicit OpenCodex `/v1` endpoint; inject
+configuration per Agent launch, never edit owner global config. Client/admin credentials
+remain separate environment references. Effective provider/endpoint must be observed;
+requested URL alone is not proof.
 
-- Project-local `.codex/config.toml` cannot set `model_provider`/`model_providers`.
-  Default: the plugin starts the app-server with config overrides
-  (`codex -c model_provider=... -c model_providers.eliot-proxy.base_url=... app-server`),
-  so the owner's global config is never edited.
-- OpenCodex expects its client key in header `x-opencodex-api-key`. Default: set both
-  `env_key = "OPENCODEX_API_KEY"` (bearer) and
-  `env_http_headers = { "x-opencodex-api-key" = "OPENCODEX_API_KEY" }`; drop whichever
-  OpenCodex does not need once the L2.8 live run shows it.
-- `openai_base_url` (top level) overrides the built-in provider's URL; prefer a named
-  provider so the proxy is explicit.
+## Retained failure cases for L7
 
-## v1 pitfalls
-
-- A lost `thread/start` reply leaves the outcome unknown; do not create another thread.
-- `clientUserMessageId` correlates input with history; it is not an idempotency key
-  (upstream proposal openai/codex#32254 is open).
-- `-32601` from history reads had no known cause; failed readback stays `unknown`.
-- Settings like `agents.max_concurrent_threads_per_session` apply at `thread/start`.
-- v1 code with protocol details: `git show v1-final:crates/swarm-adapter-codex/src/lib.rs`.
-
-## Scenarios
-
-`just record-codex` records these into `plugins/codex/fixtures/` (cheapest model, tiny
-prompts in a scratch repo): `turn` (launch + one turn), `two-turns`, `steer`,
-`interrupt`, `approve-command`, `deny-command`, `approve-file`, `user-input`, `goal`
-(set, pause, resume, clear), `subagent`, `resume`, `bad-model` (error), plus two
-replay-only scenarios built from those recordings with control lines: `no-reply`
-(`{"dir": "hang"}`) and `reattach` (`{"dir": "exit"}` then a new session).
-
-## Unverified
-
-Facts the docs did not settle; the recordings answer them. Correct this page when they
-do.
-
-- Name of the client's initialized notification and the settings fields `turn/start`
-  and `thread/start` accept (generated schema).
-- Whether `-c` overrides reach `codex app-server`, or per-thread config is needed.
-  If neither works, proxy routing for Codex falls back to OpenCodex's own
-  `ocx codex-shim` and the plugin reports `proxy: none`.
-- Whether `turn/steer` is accepted while an approval is pending.
-- Whether the app-server exits when its stdin closes.
+- lost `thread/start` reply: no replacement thread;
+- lost `turn/start` reply: no repeated prompt;
+- stale generation/turn/request rejected before native I/O;
+- long history read pages to the end;
+- live stream vs rollout never duplicate lifecycle;
+- stream break with no replay cursor records gap and readbacks current state;
+- stopped generation clears native Goal and late old events cannot wake replacement;
+- child threads share parent environment and are not given fake independent identity.
