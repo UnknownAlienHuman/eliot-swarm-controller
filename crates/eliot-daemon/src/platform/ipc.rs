@@ -67,7 +67,7 @@ impl IpcListener {
                     "Unix socket path cannot be represented as UTF-8",
                 )
             })?;
-            if endpoint.as_bytes().len() > 107 {
+            if endpoint.len() > 107 {
                 return Err(Error::new(
                     "invalid_endpoint",
                     "Unix socket path exceeds the platform limit",
