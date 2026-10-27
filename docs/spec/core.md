@@ -374,6 +374,7 @@ CREATE TABLE source_state (
         (last_batch_id IS NOT NULL AND last_batch_digest IS NOT NULL
          AND length(last_batch_digest)=32
          AND last_batch_first_seq IS NOT NULL
+         AND last_batch_last_seq IS NOT NULL
          AND last_batch_last_seq >= last_batch_first_seq)),
   CHECK((gap_id IS NULL AND gap_digest IS NULL
          AND gap_from IS NULL AND gap_to IS NULL)
@@ -391,7 +392,8 @@ CREATE TABLE commands (
   state TEXT NOT NULL, outcome TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   CHECK((parent_command IS NULL AND link_kind IS NULL AND ordinal IS NULL) OR
-        (parent_command IS NOT NULL AND link_kind IS NOT NULL AND ordinal >= 0))
+        (parent_command IS NOT NULL AND link_kind IS NOT NULL
+         AND ordinal IS NOT NULL AND ordinal >= 0))
 );
 CREATE INDEX commands_target ON commands(target,created_at);
 CREATE INDEX commands_open ON commands(state)
