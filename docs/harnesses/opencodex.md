@@ -26,12 +26,19 @@ attach = "http://127.0.0.1:10100"
 health = "/api/system/health"       # verify on installed version
 api_key_env = "OPENCODEX_API_KEY"
 max_live = 8
-# launch = ["ocx", "start"]        # only after foreground/lifecycle is recorded
+# launch = ["C:/tools/opencodex/ocx.exe", "start"]  # absolute owner-controlled path
 ```
 
+The admitted profile freezes the selected proxy mode, direct endpoint or exact managed
+launch argv, health path, per-harness base URLs, capacity scope and secret-variable
+names. Reload affects future admissions only. A managed service is reused only when the
+frozen proxy name/config digest and endpoint/custody readback match; Eliot never swaps a
+queued/running Agent onto a different OpenCodex process because configuration changed.
+
 Owner performs install/init/login. `OPENCODEX_HOME` and provider credentials stay owner
-configuration; Eliot stores only environment-variable names. Client and management
-credentials are distinct and never persisted in events/messages/fixtures.
+configuration; Eliot stores only frozen nonsecret route/store selectors and environment-
+variable names, never token values. Client and management credentials are distinct and
+never persisted in events/messages/fixtures.
 
 ## Harness wiring
 
@@ -66,7 +73,9 @@ route; unverified scope remains labelled unknown.
 ## Retained L7 cases
 
 - adopted service is never signalled/restarted by Agent stop or daemon recovery;
-- managed service uses separate custody and exact endpoint/PID birth identity;
+- managed service uses separate custody and exact frozen endpoint/launch/PID birth
+  identity;
+- config reload does not alter an admitted Agent's proxy binding;
 - client/admin keys never cross roles or persist;
 - stale/failed management read does not reroute or complete Agent work;
 - effective Codex/Claude route and auxiliary calls are verified;
